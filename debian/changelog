@@ -1,0 +1,12 @@
+yggterm (0.1.1-1) unstable; urgency=medium
+
+  * Improve GUI chrome and settings UX.
+  * Package deb with ghostty-ffi runtime wrapper and bundled libghostty.so.
+
+ -- Avikalpa Kundu <avi@gour.top>  Wed, 25 Feb 2026 00:00:00 +0000
+
+yggterm (0.1.0-1) unstable; urgency=medium
+
+  * Initial package.
+
+ -- Avikalpa Kundu <avi@gour.top>  Wed, 25 Feb 2026 00:00:00 +0000

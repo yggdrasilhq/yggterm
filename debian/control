@@ -1,0 +1,15 @@
+Source: yggterm
+Section: utils
+Priority: optional
+Maintainer: Avikalpa Kundu <avi@gour.top>
+Build-Depends: debhelper-compat (= 13), cargo, rustc
+Standards-Version: 4.6.2
+Homepage: https://github.com/avikalpa/yggterm
+Rules-Requires-Root: no
+
+Package: yggterm
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Yggdrasil Terminal
+ Rust-first terminal workspace integrating Ghostty terminal capabilities
+ with a Zed-inspired UI model and nested terminal session organization.

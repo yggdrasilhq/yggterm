@@ -1,0 +1,5 @@
+yggterm Debian notes
+====================
+
+This package is generated from server-side release scripts in this repository.
+Dependencies are computed from the built ELF binary using dpkg-shlibdeps.

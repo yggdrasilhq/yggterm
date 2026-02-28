@@ -1,0 +1,10 @@
+[package]
+name = "yggterm-ui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+yggterm-core = { path = "../yggterm-core" }
+anyhow.workspace = true
