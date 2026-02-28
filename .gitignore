@@ -1,0 +1,6 @@
+/target/
+/dist/
+/.yggterm-state/
+*.swp
+*.swo
+.DS_Store

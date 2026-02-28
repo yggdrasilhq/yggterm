@@ -1,0 +1,16 @@
+[package]
+name = "yggterm-ghostty-bridge"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[features]
+default = []
+ghostty-ffi = []
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]

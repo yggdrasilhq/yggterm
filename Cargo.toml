@@ -1,0 +1,27 @@
+[workspace]
+members = [
+  "apps/yggterm",
+  "crates/yggterm-core",
+  "crates/yggterm-ui",
+  "crates/yggterm-platform",
+  "crates/yggterm-ghostty-bridge",
+  "crates/yggterm-zed-shell",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.1"
+edition = "2024"
+authors = ["Avikalpa Kundu <avi@gour.top>"]
+license = "Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+dirs = "6"
+clap = { version = "4", features = ["derive"] }
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }

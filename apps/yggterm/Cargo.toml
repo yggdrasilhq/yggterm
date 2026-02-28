@@ -1,0 +1,27 @@
+[package]
+name = "yggterm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "yggterm"
+path = "src/main.rs"
+
+[features]
+default = []
+ghostty-ffi = ["yggterm-ghostty-bridge/ghostty-ffi"]
+zed-upstream = ["yggterm-zed-shell/zed-upstream"]
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+eframe = { version = "0.31.1", default-features = false, features = ["glow", "wayland", "x11"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+yggterm-core = { path = "../../crates/yggterm-core" }
+yggterm-ui = { path = "../../crates/yggterm-ui" }
+yggterm-platform = { path = "../../crates/yggterm-platform" }
+yggterm-ghostty-bridge = { path = "../../crates/yggterm-ghostty-bridge" }
+yggterm-zed-shell = { path = "../../crates/yggterm-zed-shell" }
