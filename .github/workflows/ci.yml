@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            fakeroot \
+            jq \
+            pkg-config \
+            ripgrep \
+            libgl1-mesa-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxkbcommon-dev
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Zig
+        run: ./scripts/setup-zig.sh
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Check shell scripts
+        run: |
+          bash -n scripts/install.sh
+          bash -n scripts/package-deb.sh
+          bash -n scripts/package-release.sh
+
+      - name: Smoke test CLI
+        run: |
+          ./target/release/yggterm --version
+          ./target/release/yggterm tree
