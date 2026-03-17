@@ -1,7 +1,7 @@
-use crate::SessionNode;
+use crate::{SessionNode, resolve_codex_sessions_root};
 use dirs::home_dir;
-use std::path::Path;
 use std::collections::HashSet;
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowserRowKind {
@@ -221,7 +221,9 @@ fn matches_filter(node: &SessionNode, filter: &str) -> bool {
         return true;
     }
 
-    node.children.iter().any(|child| matches_filter(child, filter))
+    node.children
+        .iter()
+        .any(|child| matches_filter(child, filter))
 }
 
 fn count_leaf_sessions(node: &SessionNode) -> usize {
@@ -236,9 +238,7 @@ fn is_codex_leaf(node: &SessionNode, full_path: &str) -> bool {
     let name = node.name.as_str();
     let lower_name = name.to_ascii_lowercase();
     let lower_path = full_path.to_ascii_lowercase();
-    lower_name.contains("codex")
-        || lower_path.contains("codex")
-        || looks_like_uuid(name)
+    lower_name.contains("codex") || lower_path.contains("codex") || looks_like_uuid(name)
 }
 
 fn looks_like_uuid(value: &str) -> bool {
@@ -250,25 +250,21 @@ fn looks_like_uuid(value: &str) -> bool {
 }
 
 fn host_label_for_path(path: &str, depth: usize) -> String {
-    if depth == 0 {
-        return "workspace".to_string();
+    if depth == 0 || depth == 1 {
+        return String::new();
     }
-    if depth == 1 {
-        return "fleet".to_string();
+    if path.starts_with("live::") {
+        return "live".to_string();
     }
-    if path.contains("/prod/") {
-        return "prod-app-01".to_string();
-    }
-    if path.contains("codex") {
-        return "codex".to_string();
-    }
-    if path.contains("ghostty") {
-        return "ghostty".to_string();
+    if let Ok(codex_root) = resolve_codex_sessions_root() {
+        if path.starts_with(&codex_root.display().to_string()) {
+            return "local".to_string();
+        }
     }
     if path.contains("local") {
         return "local".to_string();
     }
-    "ssh".to_string()
+    String::new()
 }
 
 fn browser_display_path(path: &str) -> String {

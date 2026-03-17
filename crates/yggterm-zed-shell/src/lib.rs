@@ -2,31 +2,28 @@ use anyhow::Result;
 use assets::Assets;
 use editor::{Editor, EditorElement, EditorStyle};
 use gpui::{
-    AnyElement, App, Bounds, Context, CursorStyle, Decorations, Entity, FocusHandle, Focusable, Global,
-    HitboxBehavior, Hsla, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point,
-    ResizeEdge, SharedString, Size, TextStyle, Tiling, Window, WindowBounds, WindowDecorations,
-    WindowOptions, actions, canvas, div, point, prelude::*, px, size, transparent_black,
-    StatefulInteractiveElement, relative,
+    AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, Decorations, Entity, FocusHandle,
+    Focusable, Global, HitboxBehavior, Hsla, KeyBinding, MouseButton, MouseDownEvent,
+    MouseMoveEvent, Pixels, Point, ResizeEdge, SharedString, Size, StatefulInteractiveElement,
+    TextStyle, Tiling, Window, WindowBounds, WindowDecorations, WindowOptions, actions, canvas,
+    div, point, prelude::*, px, relative, size, transparent_black,
 };
 use gpui_platform::application;
 use serde::{Deserialize, Serialize};
 use settings::Settings;
 use std::fs;
 use std::path::PathBuf;
-use theme::{
-    ActiveTheme, Appearance, ThemeRegistry, ThemeSelection, ThemeSettings,
-};
+use theme::{ActiveTheme, Appearance, ThemeRegistry, ThemeSelection, ThemeSettings};
 use ui::{
-    Button, ButtonCommon, ButtonSize, ButtonStyle, Clickable, Color, ContextMenu, Disclosure,
-    Disableable, Divider, FixedWidth, Icon, IconButton, IconButtonShape, IconName, IconSize, Label,
+    Button, ButtonCommon, ButtonSize, ButtonStyle, Clickable, Color, ContextMenu, Disableable,
+    Disclosure, Divider, FixedWidth, Icon, IconButton, IconButtonShape, IconName, IconSize, Label,
     LabelCommon, LabelSize, ListHeader, ListItem, ListItemSpacing, ListSubHeader, PopoverMenu,
     PopoverMenuHandle, StyledExt, Toggleable, Tooltip, h_flex, v_flex,
 };
 use workspace::CloseWindow;
 use yggterm_core::{
-    BrowserRow, BrowserRowKind, PreviewTone, SessionMetadataEntry, SessionNode,
-    SessionBrowserState, SessionSource, TerminalBackend, UiTheme, WorkspaceViewMode,
-    YggtermServer,
+    BrowserRow, BrowserRowKind, PreviewTone, SessionBrowserState, SessionMetadataEntry,
+    SessionNode, SessionSource, TerminalBackend, UiTheme, WorkspaceViewMode, YggtermServer,
 };
 
 actions!(
@@ -74,6 +71,7 @@ pub fn shell_plan() -> ZedShellPlan {
 #[derive(Debug, Clone)]
 pub struct ShellBootstrap {
     pub tree: SessionNode,
+    pub browser_tree: SessionNode,
     pub theme: UiTheme,
     pub ghostty_bridge_enabled: bool,
     pub prefer_ghostty_backend: bool,
@@ -334,7 +332,7 @@ impl GpuiShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let browser = SessionBrowserState::new(bootstrap.tree.clone());
+        let browser = SessionBrowserState::new(bootstrap.browser_tree.clone());
         let focus_handle = cx.focus_handle();
         let search_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
@@ -348,7 +346,7 @@ impl GpuiShell {
         });
         focus_handle.focus(window, cx);
         let server = YggtermServer::new(
-            &bootstrap.tree,
+            &bootstrap.browser_tree,
             bootstrap.prefer_ghostty_backend,
             bootstrap.ghostty_bridge_enabled,
             bootstrap.theme,
@@ -403,7 +401,9 @@ impl GpuiShell {
     }
 
     fn selected_dock(&self) -> &DockEntry {
-        &self.dock_entries[self.selected_dock_ix.min(self.dock_entries.len().saturating_sub(1))]
+        &self.dock_entries[self
+            .selected_dock_ix
+            .min(self.dock_entries.len().saturating_sub(1))]
     }
 
     fn set_last_action(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
@@ -477,7 +477,10 @@ impl GpuiShell {
 
     fn connect_ssh_target(&mut self, target_ix: usize, cx: &mut Context<Self>) {
         if let Some(session_key) = self.server.connect_ssh_target(target_ix) {
-            self.set_last_action(format!("ssh session {}", session_key.trim_start_matches("live::")), cx);
+            self.set_last_action(
+                format!("ssh session {}", session_key.trim_start_matches("live::")),
+                cx,
+            );
         }
     }
 
@@ -708,6 +711,13 @@ impl GpuiShell {
             },
             border,
         )
+        .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+            if event.click_count() >= 2 {
+                this.titlebar_should_move = false;
+                window.zoom_window();
+                cx.stop_propagation();
+            }
+        }))
         .on_mouse_down_out(cx.listener(|this, _ev, _window, _cx| {
             this.titlebar_should_move = false;
         }))
@@ -739,7 +749,11 @@ impl GpuiShell {
             .with_handle(self.chrome_menu_handle.clone())
             .anchor(gpui::Corner::BottomLeft)
             .trigger_with_tooltip(
-                self.chrome_icon("window-menu", IconName::Menu, self.chrome_menu_handle.is_deployed()),
+                self.chrome_icon(
+                    "window-menu",
+                    IconName::Menu,
+                    self.chrome_menu_handle.is_deployed(),
+                ),
                 Tooltip::text("Open Window Menu"),
             )
             .menu({
@@ -844,9 +858,7 @@ impl GpuiShell {
                 .style(ButtonStyle::Transparent)
                 .disabled(self.browser.filter_query().is_empty())
                 .tooltip(Tooltip::text("Clear Search"))
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.clear_browser_filter(window, cx)
-                })),
+                .on_click(cx.listener(|this, _, window, cx| this.clear_browser_filter(window, cx))),
             )
             .into_any_element()
     }
@@ -876,75 +888,53 @@ impl GpuiShell {
             .border_color(colors.border)
             .child(
                 h_flex()
-                    .h(px(42.))
+                    .h(px(34.))
                     .items_center()
                     .justify_between()
                     .px_2()
                     .child(
-                        Label::new("Remote Session Tree")
+                        Label::new("Browser")
                             .size(LabelSize::Small)
                             .color(Color::Muted),
                     )
                     .child(
-                        self.chrome_icon("sidebar-filter", IconName::MagnifyingGlass, false)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.set_last_action("session filter", cx)
-                            })),
+                        Label::new(format!("{} selected", self.total_leaf_sessions()))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
                     ),
             )
             .child(
                 div()
                     .px_2()
-                    .pt_1()
-                    .pb_1()
+                    .pt_2()
+                    .pb_2()
                     .flex()
                     .flex_col()
-                    .gap_2()
+                    .gap_1()
                     .child(
                         h_flex()
                             .justify_between()
                             .items_center()
                             .child(
-                                ListHeader::new("yggterm")
+                                ListHeader::new("local [ok]")
                                     .start_slot(Icon::new(IconName::FolderOpen).size(IconSize::Small))
                                     .end_slot(
-                                        h_flex()
-                                            .gap_1()
-                                            .child(
-                                                self.chrome_icon("new-session", IconName::Plus, false)
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.set_last_action("new session", cx)
-                                                    })),
-                                            )
-                                            .child(
-                                                self.chrome_icon(
-                                                    "session-filter",
-                                                    IconName::ListFilter,
-                                                    false,
-                                                )
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.set_last_action("session filter", cx)
-                                                })),
-                                            ),
+                                        Label::new("folder+sessions")
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted)
+                                            .into_any_element(),
                                     ),
                             )
                             .child(div()),
                     )
                     .child(
-                        Button::new(
-                            "mock-filter",
-                            if self.browser.filter_query().is_empty() {
-                                "Filter virtual sessions".to_string()
-                            } else {
-                                self.browser.filter_query().to_string()
-                            },
-                        )
-                            .icon(IconName::MagnifyingGlass)
-                            .style(ButtonStyle::Subtle)
-                            .full_width()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.focus_search(window, cx)
-                            })),
+                        Label::new(if self.browser.filter_query().is_empty() {
+                            "Search sessions in titlebar".to_string()
+                        } else {
+                            format!("filter: {}", self.browser.filter_query())
+                        })
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
                     )
                     .child(
                         ListSubHeader::new("Codex Sessions")
@@ -965,8 +955,8 @@ impl GpuiShell {
                     .id("session-tree-scroll")
                     .overflow_y_scroll()
                     .px_1()
-                    .py_2()
-                    .gap_1()
+                    .py_1()
+                    .gap(px(2.))
                     .children(rows),
             )
             .child(Divider::horizontal())
@@ -1001,9 +991,9 @@ impl GpuiShell {
                                 this.select_dock(2, cx)
                             })),
                     )
-                    .child(
-                        Label::new(
-                            "This mock tree is the future filesystem-backed session model under ~/.yggterm.",
+                            .child(
+                                Label::new(
+                            "The browser follows Codex session files under ~/.codex/sessions while yggterm keeps runtime state under ~/.yggterm.",
                         )
                         .size(LabelSize::Small)
                         .color(Color::Muted),
@@ -1093,40 +1083,24 @@ impl GpuiShell {
             .flex_1()
             .h_full()
             .flex()
-            .flex_col()
+            .overflow_hidden()
             .bg(colors.surface_background)
             .child(
                 div()
                     .flex_1()
                     .flex()
-                    .overflow_hidden()
-                    .child(self.primary_body(cx, colors)),
-            )
-                .when(self.bottom_panel_open, |this| {
-                    this.child(self.bottom_dock_resize_handle(cx, colors))
-                        .child(self.bottom_dock(cx, colors))
-                })
-            .into_any_element()
-    }
-
-    fn primary_body(&self, cx: &mut Context<Self>, colors: &theme::ThemeColors) -> AnyElement {
-        div()
-            .flex_1()
-            .h_full()
-            .flex()
-            .flex_col()
-            .overflow_hidden()
-            .child(
-                div()
-                    .flex_1()
-                    .flex()
+                    .flex_col()
                     .overflow_hidden()
                     .child(self.viewport(cx, colors))
-                    .when(self.right_panel_open, |this| {
-                        this.child(self.right_panel_resize_handle(cx, colors))
-                            .child(self.inspector(colors))
+                    .when(self.bottom_panel_open, |this| {
+                        this.child(self.bottom_dock_resize_handle(cx, colors))
+                            .child(self.bottom_dock(cx, colors))
                     }),
             )
+            .when(self.right_panel_open, |this| {
+                this.child(self.right_panel_resize_handle(cx, colors))
+                    .child(self.inspector(colors))
+            })
             .into_any_element()
     }
 
@@ -1142,10 +1116,18 @@ impl GpuiShell {
             .flex_shrink_0()
             .bg(colors.surface_background)
             .child(div().mx_auto().w(px(1.)).h_full().bg(colors.border))
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                this.begin_panel_drag(DragTarget::Sidebar, event.position, this.sidebar_width, cx);
-                cx.stop_propagation();
-            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    this.begin_panel_drag(
+                        DragTarget::Sidebar,
+                        event.position,
+                        this.sidebar_width,
+                        cx,
+                    );
+                    cx.stop_propagation();
+                }),
+            )
             .into_any_element()
     }
 
@@ -1161,15 +1143,18 @@ impl GpuiShell {
             .flex_shrink_0()
             .bg(colors.surface_background)
             .child(div().mx_auto().w(px(1.)).h_full().bg(colors.border))
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                this.begin_panel_drag(
-                    DragTarget::RightPanel,
-                    event.position,
-                    this.right_panel_width,
-                    cx,
-                );
-                cx.stop_propagation();
-            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    this.begin_panel_drag(
+                        DragTarget::RightPanel,
+                        event.position,
+                        this.right_panel_width,
+                        cx,
+                    );
+                    cx.stop_propagation();
+                }),
+            )
             .into_any_element()
     }
 
@@ -1529,15 +1514,18 @@ impl GpuiShell {
             .flex_shrink_0()
             .bg(colors.surface_background)
             .child(div().my_auto().h(px(1.)).w_full().bg(colors.border))
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                this.begin_panel_drag(
-                    DragTarget::BottomDock,
-                    event.position,
-                    this.bottom_dock_height,
-                    cx,
-                );
-                cx.stop_propagation();
-            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    this.begin_panel_drag(
+                        DragTarget::BottomDock,
+                        event.position,
+                        this.bottom_dock_height,
+                        cx,
+                    );
+                    cx.stop_propagation();
+                }),
+            )
             .into_any_element()
     }
 
@@ -1685,13 +1673,17 @@ impl GpuiShell {
                         .map(|line| {
                             Label::new(line.clone())
                                 .size(LabelSize::Small)
-                                .color(if !query.is_empty()
-                                    && line.to_ascii_lowercase().contains(&query.to_ascii_lowercase())
-                                {
-                                    Color::Accent
-                                } else {
-                                    Color::Default
-                                })
+                                .color(
+                                    if !query.is_empty()
+                                        && line
+                                            .to_ascii_lowercase()
+                                            .contains(&query.to_ascii_lowercase())
+                                    {
+                                        Color::Accent
+                                    } else {
+                                        Color::Default
+                                    },
+                                )
                                 .into_any_element()
                         })
                         .collect::<Vec<_>>(),
@@ -1706,7 +1698,8 @@ impl GpuiShell {
         let palette_query = self.palette_query(cx);
         let palette_query_lower = palette_query.to_lowercase();
         let query_matches = |candidate: &str| {
-            palette_query_lower.is_empty() || candidate.to_lowercase().contains(&palette_query_lower)
+            palette_query_lower.is_empty()
+                || candidate.to_lowercase().contains(&palette_query_lower)
         };
         let settings = ThemeSettings::get_global(cx);
         let palette_focused = self.palette_editor.read(cx).is_focused(window);
@@ -1747,36 +1740,36 @@ impl GpuiShell {
             .inset_0()
             .occlude()
             .bg(wash)
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                this.dismiss_command_palette(cx);
-            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.dismiss_command_palette(cx);
+                }),
+            )
             .child(
-                v_flex()
-                    .size_full()
-                    .justify_center()
-                    .items_center()
-                    .child(
-                        v_flex()
-                            .w(px(720.))
-                            .max_h(px(520.))
-                            .occlude()
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .elevation_3(cx)
-                            .bg(cx.theme().colors().elevated_surface_background)
-                            .rounded_lg()
-                            .border_1()
-                            .border_color(cx.theme().colors().border)
-                            .overflow_hidden()
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .h(px(46.))
-                                    .px_3()
-                                    .items_center()
-                                    .gap_2()
-                                    .border_b_1()
-                                    .border_color(cx.theme().colors().border_variant)
-                                    .child(h_flex()
+                v_flex().size_full().justify_center().items_center().child(
+                    v_flex()
+                        .w(px(720.))
+                        .max_h(px(520.))
+                        .occlude()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .elevation_3(cx)
+                        .bg(cx.theme().colors().elevated_surface_background)
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(cx.theme().colors().border)
+                        .overflow_hidden()
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .h(px(46.))
+                                .px_3()
+                                .items_center()
+                                .gap_2()
+                                .border_b_1()
+                                .border_color(cx.theme().colors().border_variant)
+                                .child(
+                                    h_flex()
                                         .flex_1()
                                         .h(px(32.))
                                         .items_center()
@@ -1795,15 +1788,10 @@ impl GpuiShell {
                                                 .size(IconSize::Small)
                                                 .color(Color::Muted),
                                         )
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .h_full()
-                                                .child(EditorElement::new(
-                                                    &self.palette_editor,
-                                                    palette_editor_style,
-                                                )),
-                                        )
+                                        .child(div().flex_1().h_full().child(EditorElement::new(
+                                            &self.palette_editor,
+                                            palette_editor_style,
+                                        )))
                                         .child(
                                             IconButton::new(
                                                 "palette-search-clear",
@@ -1815,144 +1803,145 @@ impl GpuiShell {
                                             .style(ButtonStyle::Transparent)
                                             .disabled(palette_query.is_empty())
                                             .tooltip(Tooltip::text("Clear Search"))
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.palette_editor.update(cx, |editor, cx| {
-                                                    editor.set_text("", window, cx);
-                                                });
-                                                this.focus_palette(window, cx);
-                                            })),
+                                            .on_click(
+                                                cx.listener(|this, _, window, cx| {
+                                                    this.palette_editor.update(cx, |editor, cx| {
+                                                        editor.set_text("", window, cx);
+                                                    });
+                                                    this.focus_palette(window, cx);
+                                                }),
+                                            ),
                                         ),
-                                    )
-                                    .child(div().flex_1())
-                                    .child(
-                                        Label::new(active_theme)
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted),
-                                    ),
-                            )
-                            .child(
-                                v_flex()
-                                    .w_full()
-                                    .max_h(px(514.))
-                                    .id("command-palette-scroll")
-                                    .overflow_y_scroll()
-                                    .px_2()
-                                    .py_2()
-                                    .gap_2()
-                                    .child(
-                                        ListSubHeader::new("Actions")
-                                            .left_icon(Some(IconName::Settings)),
-                                    )
-                                    .when(query_matches("Open Settings"), |this| {
-                                        this.child(
-                                            Button::new("palette-settings", "Open Settings")
-                                                .style(ButtonStyle::Subtle)
-                                                .full_width()
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.open_settings_window(cx);
-                                                })),
-                                        )
-                                    })
-                                    .when(query_matches("Toggle Default Light Dark Theme"), |this| {
-                                        this.child(
-                                            Button::new(
-                                                "palette-toggle-theme-mode",
-                                                "Toggle Default Light/Dark Theme",
-                                            )
+                                )
+                                .child(div().flex_1())
+                                .child(
+                                    Label::new(active_theme)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                        .child(
+                            v_flex()
+                                .w_full()
+                                .max_h(px(514.))
+                                .id("command-palette-scroll")
+                                .overflow_y_scroll()
+                                .px_2()
+                                .py_2()
+                                .gap_2()
+                                .child(
+                                    ListSubHeader::new("Actions")
+                                        .left_icon(Some(IconName::Settings)),
+                                )
+                                .when(query_matches("Open Settings"), |this| {
+                                    this.child(
+                                        Button::new("palette-settings", "Open Settings")
                                             .style(ButtonStyle::Subtle)
                                             .full_width()
                                             .on_click(cx.listener(|this, _, _, cx| {
+                                                this.open_settings_window(cx);
+                                            })),
+                                    )
+                                })
+                                .when(query_matches("Toggle Default Light Dark Theme"), |this| {
+                                    this.child(
+                                        Button::new(
+                                            "palette-toggle-theme-mode",
+                                            "Toggle Default Light/Dark Theme",
+                                        )
+                                        .style(ButtonStyle::Subtle)
+                                        .full_width()
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
                                                 toggle_theme_mode_and_save(cx);
                                                 this.dismiss_command_palette(cx);
-                                            })),
+                                            }),
+                                        ),
+                                    )
+                                })
+                                .when(query_matches("Switch to Terminal View"), |this| {
+                                    this.child(
+                                        Button::new(
+                                            "palette-terminal-view",
+                                            "Switch to Terminal View",
                                         )
-                                    })
-                                    .when(query_matches("Switch to Terminal View"), |this| {
-                                        this.child(
-                                            Button::new(
-                                                "palette-terminal-view",
-                                                "Switch to Terminal View",
-                                            )
-                                            .style(ButtonStyle::Subtle)
-                                            .full_width()
-                                            .on_click(cx.listener(|this, _, _, cx| {
+                                        .style(ButtonStyle::Subtle)
+                                        .full_width()
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
                                                 this.set_view_mode(WorkspaceViewMode::Terminal, cx);
                                                 this.dismiss_command_palette(cx);
-                                            })),
+                                            }),
+                                        ),
+                                    )
+                                })
+                                .when(query_matches("Switch to Rendered View"), |this| {
+                                    this.child(
+                                        Button::new(
+                                            "palette-rendered-view",
+                                            "Switch to Rendered View",
                                         )
-                                    })
-                                    .when(query_matches("Switch to Rendered View"), |this| {
-                                        this.child(
-                                            Button::new(
-                                                "palette-rendered-view",
-                                                "Switch to Rendered View",
-                                            )
-                                            .style(ButtonStyle::Subtle)
-                                            .full_width()
-                                            .on_click(cx.listener(|this, _, _, cx| {
+                                        .style(ButtonStyle::Subtle)
+                                        .full_width()
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
                                                 this.set_view_mode(WorkspaceViewMode::Rendered, cx);
                                                 this.dismiss_command_palette(cx);
-                                            })),
-                                        )
-                                    })
-                                    .when(query_matches("Focus Session Search"), |this| {
-                                        this.child(
-                                            Button::new(
-                                                "palette-focus-search",
-                                                "Focus Session Search",
-                                            )
+                                            }),
+                                        ),
+                                    )
+                                })
+                                .when(query_matches("Focus Session Search"), |this| {
+                                    this.child(
+                                        Button::new("palette-focus-search", "Focus Session Search")
                                             .style(ButtonStyle::Subtle)
                                             .full_width()
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.dismiss_command_palette(cx);
                                                 this.focus_search(window, cx);
                                             })),
-                                        )
-                                    })
-                                    .child(Divider::horizontal())
-                                    .child(
-                                        ListSubHeader::new("Bundled Zed Themes")
-                                            .left_icon(Some(IconName::SwatchBook)),
                                     )
-                                    .children(
-                                        theme_names
-                                            .into_iter()
-                                            .filter(|theme_name| query_matches(theme_name))
-                                            .map(|theme_name| {
-                                                let is_active = theme_name == cx.theme().name.to_string();
-                                                Button::new(
-                                                    format!("palette-theme-{theme_name}"),
-                                                    theme_name.clone(),
-                                                )
-                                                .style(if is_active {
-                                                    ButtonStyle::Outlined
-                                                } else {
-                                                    ButtonStyle::Subtle
-                                                })
-                                                .full_width()
-                                                .on_click({
-                                                    let theme_name = theme_name.clone();
-                                                    cx.listener(move |this, _, _, cx| {
-                                                        set_theme_name_and_save(&theme_name, cx);
-                                                        this.dismiss_command_palette(cx);
-                                                    })
-                                                })
-                                                .into_any_element()
+                                })
+                                .child(Divider::horizontal())
+                                .child(
+                                    ListSubHeader::new("Bundled Zed Themes")
+                                        .left_icon(Some(IconName::SwatchBook)),
+                                )
+                                .children(
+                                    theme_names
+                                        .into_iter()
+                                        .filter(|theme_name| query_matches(theme_name))
+                                        .map(|theme_name| {
+                                            let is_active =
+                                                theme_name == cx.theme().name.to_string();
+                                            Button::new(
+                                                format!("palette-theme-{theme_name}"),
+                                                theme_name.clone(),
+                                            )
+                                            .style(if is_active {
+                                                ButtonStyle::Outlined
+                                            } else {
+                                                ButtonStyle::Subtle
                                             })
-                                            .collect::<Vec<_>>(),
-                                    ),
-                            ),
-                    ),
+                                            .full_width()
+                                            .on_click({
+                                                let theme_name = theme_name.clone();
+                                                cx.listener(move |this, _, _, cx| {
+                                                    set_theme_name_and_save(&theme_name, cx);
+                                                    this.dismiss_command_palette(cx);
+                                                })
+                                            })
+                                            .into_any_element()
+                                        })
+                                        .collect::<Vec<_>>(),
+                                ),
+                        ),
+                ),
             )
             .into_any_element()
     }
 
-    fn session_tree_row(
-        &self,
-        ix: usize,
-        row: &BrowserRow,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn session_tree_row(&self, ix: usize, row: &BrowserRow, cx: &mut Context<Self>) -> AnyElement {
         let is_session = row.kind == BrowserRowKind::Session;
         let is_selected = self
             .browser
@@ -1968,7 +1957,10 @@ impl GpuiShell {
             h_flex()
                 .items_center()
                 .gap(px(2.))
-                .child(Disclosure::new(format!("disclosure-{}", row.full_path), row.expanded))
+                .child(Disclosure::new(
+                    format!("disclosure-{}", row.full_path),
+                    row.expanded,
+                ))
                 .child(Icon::new(IconName::FolderOpen).size(IconSize::Small))
                 .into_any_element()
         };
@@ -1980,27 +1972,20 @@ impl GpuiShell {
             .toggle_state(is_selected)
             .on_click(cx.listener(move |this, _, _, cx| this.select_row(ix, cx)))
             .child(
-                v_flex()
-                    .gap(px(2.))
-                    .child(
-                        Label::new(row.label.clone())
-                            .size(LabelSize::Small)
-                            .color(Color::Default),
-                    )
-                    .child(
-                        Label::new(row.detail_label.clone())
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
-            )
-            .end_slot(
-                Label::new(row.host_label.clone())
+                Label::new(row.label.clone())
                     .size(LabelSize::Small)
-                    .color(Color::Muted),
+                    .color(Color::Default),
             )
+            .when(!row.host_label.is_empty(), |this| {
+                this.end_slot(
+                    Label::new(row.host_label.clone())
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
+            .tooltip(Tooltip::text(row.detail_label.clone()))
             .into_any_element()
     }
-
 }
 
 impl Render for GpuiShell {
@@ -2037,9 +2022,12 @@ impl Render for GpuiShell {
                 .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                     this.update_panel_drag(event.position, window, cx);
                 }))
-                .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.end_panel_drag(cx);
-                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.end_panel_drag(cx);
+                    }),
+                )
                 .map(|this| {
                     self.sync_browser_filter_from_editor(cx);
                     this
@@ -2091,9 +2079,7 @@ fn yggterm_client_side_decorations(
     };
 
     match decorations {
-        Decorations::Client { .. } => {
-            window.set_client_inset(theme::CLIENT_SIDE_DECORATION_SHADOW)
-        }
+        Decorations::Client { .. } => window.set_client_inset(theme::CLIENT_SIDE_DECORATION_SHADOW),
         Decorations::Server => window.set_client_inset(px(0.0)),
     }
 
@@ -2145,8 +2131,12 @@ fn yggterm_client_side_decorations(
                 })
                 .on_mouse_move(move |e, window, cx| {
                     let size = window.window_bounds().get_bounds().size;
-                    let new_edge =
-                        resize_edge(e.position, theme::CLIENT_SIDE_DECORATION_SHADOW, size, tiling);
+                    let new_edge = resize_edge(
+                        e.position,
+                        theme::CLIENT_SIDE_DECORATION_SHADOW,
+                        size,
+                        tiling,
+                    );
                     let edge = cx.try_global::<GlobalResizeEdge>().and_then(|edge| edge.0);
                     if new_edge != edge {
                         cx.set_global(GlobalResizeEdge(new_edge));
@@ -2163,9 +2153,12 @@ fn yggterm_client_side_decorations(
                 })
                 .on_mouse_down(MouseButton::Left, move |e, window, _| {
                     let size = window.window_bounds().get_bounds().size;
-                    let Some(edge) =
-                        resize_edge(e.position, theme::CLIENT_SIDE_DECORATION_SHADOW, size, tiling)
-                    else {
+                    let Some(edge) = resize_edge(
+                        e.position,
+                        theme::CLIENT_SIDE_DECORATION_SHADOW,
+                        size,
+                        tiling,
+                    ) else {
                         return;
                     };
                     window.start_window_resize(edge);
@@ -2410,11 +2403,7 @@ fn metadata_row(label: &'static str, value: impl Into<SharedString>) -> AnyEleme
     ListItem::new(format!("meta-{label}"))
         .spacing(ListItemSpacing::Dense)
         .selectable(false)
-        .start_slot(
-            Label::new(label)
-                .size(LabelSize::Small)
-                .color(Color::Muted),
-        )
+        .start_slot(Label::new(label).size(LabelSize::Small).color(Color::Muted))
         .child(
             Label::new(value)
                 .size(LabelSize::Small)
@@ -2442,11 +2431,7 @@ fn session_block<S: AsRef<str>>(
                 .items_center()
                 .justify_between()
                 .child(Label::new(title).size(LabelSize::Small))
-                .child(
-                    Label::new(badge)
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                ),
+                .child(Label::new(badge).size(LabelSize::Small).color(Color::Muted)),
         )
         .children(
             lines

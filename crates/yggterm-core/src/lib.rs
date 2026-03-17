@@ -10,12 +10,13 @@ use std::path::{Path, PathBuf};
 pub use browser::{BrowserRow, BrowserRowKind, SessionBrowserState};
 pub use server::{
     ManagedSessionView, PreviewTone, RemoteDeployState, SessionMetadataEntry, SessionPreview,
-    SessionPreviewBlock, SessionRenderedSection, SessionSource, SshConnectTarget,
-    TerminalBackend, TerminalLaunchPhase, WorkspaceViewMode, YggtermServer,
+    SessionPreviewBlock, SessionRenderedSection, SessionSource, SshConnectTarget, TerminalBackend,
+    TerminalLaunchPhase, WorkspaceViewMode, YggtermServer,
 };
 
 pub const ENV_YGGTERM_HOME: &str = "YGGTERM_HOME";
 pub const DEFAULT_HOME_DIRNAME: &str = ".yggterm";
+pub const DEFAULT_CODEX_HOME_DIRNAME: &str = ".codex";
 pub const SESSIONS_DIRNAME: &str = "sessions";
 pub const SETTINGS_FILENAME: &str = "settings.json";
 
@@ -69,8 +70,12 @@ impl SessionStore {
         let home = resolve_yggterm_home()?;
         let sessions_root = home.join(SESSIONS_DIRNAME);
 
-        fs::create_dir_all(&sessions_root)
-            .with_context(|| format!("failed to create sessions root at {}", sessions_root.display()))?;
+        fs::create_dir_all(&sessions_root).with_context(|| {
+            format!(
+                "failed to create sessions root at {}",
+                sessions_root.display()
+            )
+        })?;
 
         Ok(Self {
             home,
@@ -105,7 +110,8 @@ impl SessionStore {
 
     pub fn save_settings(&self, settings: &AppSettings) -> Result<()> {
         let path = self.settings_path();
-        let data = serde_json::to_string_pretty(settings).context("failed to serialize settings")?;
+        let data =
+            serde_json::to_string_pretty(settings).context("failed to serialize settings")?;
         fs::write(&path, data)
             .with_context(|| format!("failed to write settings file {}", path.display()))?;
         Ok(())
@@ -120,32 +126,26 @@ impl SessionStore {
     }
 
     pub fn load_tree(&self) -> Result<SessionNode> {
-        fn walk(path: &Path) -> Result<SessionNode> {
-            let name = path
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| String::from("sessions"));
+        walk_directory_tree(&self.sessions_root, false)
+    }
 
-            let mut children = Vec::new();
-            for entry in fs::read_dir(path)
-                .with_context(|| format!("failed to read dir {}", path.display()))?
-            {
-                let entry = entry?;
-                let entry_path = entry.path();
-                if entry.file_type()?.is_dir() {
-                    children.push(walk(&entry_path)?);
-                }
+    pub fn load_codex_tree(&self) -> Result<SessionNode> {
+        let codex_root = resolve_codex_sessions_root()?;
+        let sessions = if codex_root.exists() {
+            walk_directory_tree(&codex_root, true)?
+        } else {
+            SessionNode {
+                name: String::from("sessions"),
+                path: codex_root.clone(),
+                children: Vec::new(),
             }
-            children.sort_by(|a, b| a.name.cmp(&b.name));
+        };
 
-            Ok(SessionNode {
-                name,
-                path: path.to_path_buf(),
-                children,
-            })
-        }
-
-        walk(&self.sessions_root)
+        Ok(SessionNode {
+            name: String::from("local [ok]"),
+            path: codex_root,
+            children: vec![sessions],
+        })
     }
 }
 
@@ -157,6 +157,13 @@ pub fn resolve_yggterm_home() -> Result<PathBuf> {
 
     let home_dir = dirs::home_dir().context("unable to resolve home directory")?;
     Ok(home_dir.join(DEFAULT_HOME_DIRNAME))
+}
+
+pub fn resolve_codex_sessions_root() -> Result<PathBuf> {
+    let home_dir = dirs::home_dir().context("unable to resolve home directory")?;
+    Ok(home_dir
+        .join(DEFAULT_CODEX_HOME_DIRNAME)
+        .join(SESSIONS_DIRNAME))
 }
 
 fn expand_tilde(path: PathBuf) -> PathBuf {
@@ -200,4 +207,73 @@ fn sanitize_relative_session_path(input: &str) -> Result<PathBuf> {
     }
 
     Ok(out)
+}
+
+fn walk_directory_tree(path: &Path, include_codex_files: bool) -> Result<SessionNode> {
+    let name = session_node_name(path, include_codex_files);
+
+    let mut children = Vec::new();
+    for entry in
+        fs::read_dir(path).with_context(|| format!("failed to read dir {}", path.display()))?
+    {
+        let entry = entry?;
+        let entry_path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            children.push(walk_directory_tree(&entry_path, include_codex_files)?);
+        } else if include_codex_files && is_codex_session_file(&entry_path) {
+            children.push(SessionNode {
+                name: codex_leaf_label(&entry_path),
+                path: entry_path,
+                children: Vec::new(),
+            });
+        }
+    }
+    children.sort_by(|a, b| a.name.cmp(&b.name));
+
+    Ok(SessionNode {
+        name,
+        path: path.to_path_buf(),
+        children,
+    })
+}
+
+fn session_node_name(path: &Path, include_codex_files: bool) -> String {
+    if include_codex_files
+        && path == resolve_codex_sessions_root().unwrap_or_else(|_| path.to_path_buf())
+    {
+        return String::from("sessions");
+    }
+
+    path.file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| String::from("sessions"))
+}
+
+fn is_codex_session_file(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+
+    file_name.starts_with("rollout-")
+        && file_name.ends_with(".jsonl")
+        && !file_name.contains(".bak.")
+}
+
+fn codex_leaf_label(path: &Path) -> String {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return String::from("session");
+    };
+    let stem = file_name.trim_end_matches(".jsonl");
+    let uuid_candidate = stem.get(stem.len().saturating_sub(36)..).unwrap_or(stem);
+    let compact = uuid_candidate
+        .chars()
+        .filter(|ch| *ch != '-')
+        .collect::<String>();
+
+    if compact.len() >= 7 {
+        return format!("Q{}", &compact[compact.len() - 7..]);
+    }
+
+    stem.to_string()
 }

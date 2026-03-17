@@ -1,7 +1,7 @@
-use gpui::{AnyElement, Hsla, Stateful, Window, div, px};
 use gpui::Div;
+use gpui::{AnyElement, Hsla, Stateful, Window, div, px};
 use ui::{
-    ButtonStyle, Color, IconButton, IconButtonShape, IconName, IconSize, h_flex,
+    ButtonSize, ButtonStyle, Color, IconButton, IconButtonShape, IconName, IconSize, h_flex,
     prelude::*,
 };
 
@@ -31,7 +31,7 @@ pub fn titlebar_frame(
     h_flex()
         .id("yggterm-titlebar")
         .w_full()
-        .h(px(38.))
+        .h(px(40.))
         .items_center()
         .justify_between()
         .bg(background)
@@ -39,7 +39,7 @@ pub fn titlebar_frame(
         .border_color(border)
         .child(
             div()
-                .w(px(220.))
+                .w(px(228.))
                 .flex_none()
                 .h_full()
                 .flex()
@@ -59,7 +59,7 @@ pub fn titlebar_frame(
         )
         .child(
             div()
-                .w(px(220.))
+                .w(px(228.))
                 .flex_none()
                 .h_full()
                 .flex()
@@ -96,11 +96,13 @@ fn window_controls(window: &mut Window) -> AnyElement {
         .gap_1()
         .items_center()
         .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .child(
-            window_control("minimize", IconName::GenericMinimize, move |window| {
+        .child(window_control(
+            "minimize",
+            IconName::GenericMinimize,
+            move |window| {
                 window.minimize_window();
-            }),
-        )
+            },
+        ))
         .child(window_control(
             "maximize-or-restore",
             if window.is_maximized() {
@@ -112,9 +114,13 @@ fn window_controls(window: &mut Window) -> AnyElement {
                 window.zoom_window();
             },
         ))
-        .child(window_control("close", IconName::GenericClose, move |window| {
-            window.remove_window();
-        }))
+        .child(window_control(
+            "close",
+            IconName::GenericClose,
+            move |window| {
+                window.remove_window();
+            },
+        ))
         .into_any_element()
 }
 
@@ -125,7 +131,8 @@ fn window_control(
 ) -> impl IntoElement {
     IconButton::new(id, icon)
         .shape(IconButtonShape::Square)
-        .icon_size(IconSize::XSmall)
+        .size(ButtonSize::Medium)
+        .icon_size(IconSize::Small)
         .icon_color(Color::Muted)
         .style(ButtonStyle::Transparent)
         .on_click(move |_, window, cx| {

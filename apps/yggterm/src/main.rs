@@ -74,21 +74,35 @@ fn main() -> Result<()> {
                 Err(e) => {
                     println!("Ghostty bridge init status: disabled");
                     println!("Bridge detail: {e}");
-                    println!("Hint: use packaged .deb build (ghostty-ffi) or build with --features ghostty-ffi");
+                    println!(
+                        "Hint: use packaged .deb build (ghostty-ffi) or build with --features ghostty-ffi"
+                    );
                 }
             }
         }
         Command::ZedPlan => {
             let plan = yggterm_zed_shell::shell_plan();
             println!("Use workspace::Item: {}", plan.uses_upstream_workspace_item);
-            println!("Use project_panel tree: {}", plan.uses_upstream_project_panel);
-            println!("Use terminal_view items: {}", plan.uses_upstream_terminal_view);
+            println!(
+                "Use project_panel tree: {}",
+                plan.uses_upstream_project_panel
+            );
+            println!(
+                "Use terminal_view items: {}",
+                plan.uses_upstream_terminal_view
+            );
             println!(
                 "Center viewport replaced by terminals: {}",
                 plan.center_viewport_replaced_by_terminals
             );
-            println!("GPUI shell scaffold present: {}", plan.uses_gpui_shell_scaffold);
-            println!("Virtual session tree present: {}", plan.uses_virtual_session_tree);
+            println!(
+                "GPUI shell scaffold present: {}",
+                plan.uses_gpui_shell_scaffold
+            );
+            println!(
+                "Virtual session tree present: {}",
+                plan.uses_virtual_session_tree
+            );
             println!(
                 "Ghostty bridge status integrated: {}",
                 plan.integrates_ghostty_bridge_status
@@ -106,11 +120,13 @@ fn main() -> Result<()> {
 
 fn launch_gpui_gui(store: SessionStore) -> Result<()> {
     let tree = store.load_tree()?;
+    let browser_tree = store.load_codex_tree().unwrap_or_else(|_| tree.clone());
     let settings = store.load_settings().unwrap_or_default();
     let ghostty_bridge_enabled = yggterm_ghostty_bridge::initialize_bridge().is_ok();
 
     yggterm_zed_shell::launch_gpui_shell(yggterm_zed_shell::ShellBootstrap {
         tree,
+        browser_tree,
         theme: settings.theme,
         ghostty_bridge_enabled,
         prefer_ghostty_backend: settings.prefer_ghostty_backend,
@@ -143,8 +159,12 @@ fn launch_gui(store: SessionStore) -> Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native("Yggdrasil Terminal", options, Box::new(|_| Ok(Box::new(app))))
-        .map_err(|err| anyhow::anyhow!("failed to launch GUI: {err}"))?;
+    eframe::run_native(
+        "Yggdrasil Terminal",
+        options,
+        Box::new(|_| Ok(Box::new(app))),
+    )
+    .map_err(|err| anyhow::anyhow!("failed to launch GUI: {err}"))?;
     Ok(())
 }
 
@@ -203,7 +223,10 @@ impl ManagedTerminal {
         let stderr = child.stderr.take().context("failed to open child stderr")?;
 
         let output = Arc::new(Mutex::new(Vec::new()));
-        push_output_line(&output, format!("[yggterm] terminal started in {working_dir}"));
+        push_output_line(
+            &output,
+            format!("[yggterm] terminal started in {working_dir}"),
+        );
 
         {
             let output_clone = Arc::clone(&output);
@@ -414,74 +437,71 @@ impl eframe::App for YggtermGuiApp {
         egui::TopBottomPanel::top("top_bar")
             .exact_height(66.0)
             .show(ctx, |ui| {
-            chrome_frame(ui).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.menu_button("Menu", |ui| {
-                        if ui.button("Open Selected Terminal").clicked() {
-                            self.open_or_focus_selected();
-                            ui.close_menu();
-                        }
-                        if ui.button("Close Active Terminal").clicked() {
-                            self.close_active_terminal();
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        if ui.button("Toggle Session Sidebar").clicked() {
+                chrome_frame(ui).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.menu_button("Menu", |ui| {
+                            if ui.button("Open Selected Terminal").clicked() {
+                                self.open_or_focus_selected();
+                                ui.close_menu();
+                            }
+                            if ui.button("Close Active Terminal").clicked() {
+                                self.close_active_terminal();
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            if ui.button("Toggle Session Sidebar").clicked() {
+                                self.settings.show_tree = !self.settings.show_tree;
+                                self.persist_settings();
+                                ui.close_menu();
+                            }
+                            if ui.button("Toggle Settings Panel").clicked() {
+                                self.settings.show_settings = !self.settings.show_settings;
+                                self.persist_settings();
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            ui.label("Theme");
+                            if ui.button("Zed Dark").clicked() {
+                                self.settings.theme = UiTheme::ZedDark;
+                                self.persist_settings();
+                                ui.close_menu();
+                            }
+                            if ui.button("Zed Light").clicked() {
+                                self.settings.theme = UiTheme::ZedLight;
+                                self.persist_settings();
+                                ui.close_menu();
+                            }
+                        });
+
+                        if ui
+                            .selectable_label(self.settings.show_tree, "Sidebar")
+                            .clicked()
+                        {
                             self.settings.show_tree = !self.settings.show_tree;
                             self.persist_settings();
-                            ui.close_menu();
                         }
-                        if ui.button("Toggle Settings Panel").clicked() {
+                        if ui
+                            .selectable_label(self.settings.show_settings, "Settings")
+                            .clicked()
+                        {
                             self.settings.show_settings = !self.settings.show_settings;
                             self.persist_settings();
-                            ui.close_menu();
                         }
+
                         ui.separator();
-                        ui.label("Theme");
-                        if ui.button("Zed Dark").clicked() {
-                            self.settings.theme = UiTheme::ZedDark;
-                            self.persist_settings();
-                            ui.close_menu();
-                        }
-                        if ui.button("Zed Light").clicked() {
-                            self.settings.theme = UiTheme::ZedLight;
-                            self.persist_settings();
-                            ui.close_menu();
-                        }
-                    });
+                        ui.vertical(|ui| {
+                            ui.heading("Yggdrasil Terminal");
+                            ui.small("Remote-first Ghostty workspace shaped after Zed");
+                        });
 
-                    if ui
-                        .selectable_label(self.settings.show_tree, "Sidebar")
-                        .clicked()
-                    {
-                        self.settings.show_tree = !self.settings.show_tree;
-                        self.persist_settings();
-                    }
-                    if ui
-                        .selectable_label(self.settings.show_settings, "Settings")
-                        .clicked()
-                    {
-                        self.settings.show_settings = !self.settings.show_settings;
-                        self.persist_settings();
-                    }
-
-                    ui.separator();
-                    ui.vertical(|ui| {
-                        ui.heading("Yggdrasil Terminal");
-                        ui.small("Remote-first Ghostty workspace shaped after Zed");
-                    });
-
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             status_chip(ui, backend_label);
                             status_chip(ui, &format!("{} open tabs", self.terminals.len()));
                             status_chip(ui, &format!("{} sessions", total_sessions));
-                        },
-                    );
+                        });
+                    });
                 });
             });
-        });
 
         if self.settings.show_tree {
             egui::SidePanel::left("sessions_panel")
@@ -644,13 +664,10 @@ impl eframe::App for YggtermGuiApp {
                     if ui.button("Close active").clicked() {
                         self.close_active_terminal();
                     }
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            status_chip(ui, backend_label);
-                            status_chip(ui, &selected_label);
-                        },
-                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        status_chip(ui, backend_label);
+                        status_chip(ui, &selected_label);
+                    });
                 });
                 ui.separator();
 
@@ -659,7 +676,9 @@ impl eframe::App for YggtermGuiApp {
                     ui.add_space(8.0);
                     ui.label("- target shell: GPUI and Zed-like chrome");
                     ui.label("- target engine: Ghostty surfaces in the center pane");
-                    ui.label("- target workflow: many remote sessions with durable restore metadata");
+                    ui.label(
+                        "- target workflow: many remote sessions with durable restore metadata",
+                    );
                     ui.add_space(8.0);
                     if ui.button("Open selected terminal").clicked() {
                         self.open_or_focus_selected();
@@ -715,7 +734,10 @@ impl eframe::App for YggtermGuiApp {
 
                     surface_frame(ui).show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
-                            status_chip(ui, &format!("Session {}", short_session_label(&term.session_path)));
+                            status_chip(
+                                ui,
+                                &format!("Session {}", short_session_label(&term.session_path)),
+                            );
                             status_chip(ui, if term.is_alive { "Running" } else { "Exited" });
                             status_chip(ui, "Remote clipboard planned");
                             status_chip(ui, "Restore-all planned");
@@ -769,18 +791,20 @@ impl eframe::App for YggtermGuiApp {
         egui::TopBottomPanel::bottom("status_bar")
             .exact_height(34.0)
             .show(ctx, |ui| {
-            chrome_frame(ui).show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.small(format!("Selected: {selected_label}"));
-                    ui.separator();
-                    ui.small(format!("Saved sessions: {total_sessions}"));
-                    ui.separator();
-                    ui.small(format!("Open terminals: {}", self.terminals.len()));
-                    ui.separator();
-                    ui.small("Reference Zed window is running on this X11 session for chrome checks");
+                chrome_frame(ui).show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.small(format!("Selected: {selected_label}"));
+                        ui.separator();
+                        ui.small(format!("Saved sessions: {total_sessions}"));
+                        ui.separator();
+                        ui.small(format!("Open terminals: {}", self.terminals.len()));
+                        ui.separator();
+                        ui.small(
+                            "Reference Zed window is running on this X11 session for chrome checks",
+                        );
+                    });
                 });
             });
-        });
     }
 }
 
@@ -889,7 +913,15 @@ fn render_session_node(
         }
 
         for (child_path, child) in child_entries {
-            let _ = render_session_node(ui, child, depth + 1, selected_path, &child_path, filter, open_now);
+            let _ = render_session_node(
+                ui,
+                child,
+                depth + 1,
+                selected_path,
+                &child_path,
+                filter,
+                open_now,
+            );
         }
     });
 
@@ -903,7 +935,9 @@ fn node_matches_filter(node: &SessionNode, filter_lc: &str) -> bool {
     if node.name.to_lowercase().contains(filter_lc) {
         return true;
     }
-    node.children.iter().any(|child| node_matches_filter(child, filter_lc))
+    node.children
+        .iter()
+        .any(|child| node_matches_filter(child, filter_lc))
 }
 
 fn push_output_line(output: &Arc<Mutex<Vec<String>>>, line: String) {
