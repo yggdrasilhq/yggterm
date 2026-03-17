@@ -19,8 +19,11 @@ pub struct GhosttyEnvironment {
 
 impl GhosttyEnvironment {
     pub fn discover() -> Self {
+        let header_path = option_env!("YGGTERM_GHOSTTY_HEADER")
+            .map(ToOwned::to_owned)
+            .filter(|path| std::path::Path::new(path).exists());
         Self {
-            header_path: option_env!("YGGTERM_GHOSTTY_HEADER").map(ToOwned::to_owned),
+            header_path,
         }
     }
 }

@@ -10,9 +10,9 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.4"
 edition = "2024"
-authors = ["Avikalpa Kundu <avi@gour.top>"]
+authors = ["Yggdrasil HQ"]
 license = "Apache-2.0"
 
 [workspace.dependencies]
