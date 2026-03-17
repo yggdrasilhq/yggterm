@@ -22,5 +22,4 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 dirs = "6"
-clap = { version = "4", features = ["derive"] }
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }

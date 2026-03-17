@@ -16,12 +16,8 @@ zed-upstream = ["yggterm-zed-shell/zed-upstream"]
 
 [dependencies]
 anyhow.workspace = true
-clap.workspace = true
-eframe = { version = "0.31.1", default-features = false, features = ["glow", "wayland", "x11"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 yggterm-core = { path = "../../crates/yggterm-core" }
-yggterm-ui = { path = "../../crates/yggterm-ui" }
-yggterm-platform = { path = "../../crates/yggterm-platform" }
 yggterm-ghostty-bridge = { path = "../../crates/yggterm-ghostty-bridge" }
 yggterm-zed-shell = { path = "../../crates/yggterm-zed-shell" }
