@@ -7,7 +7,7 @@ PREFIX_DIR="${ROOT_DIR}/.yggterm-state/ghostty-prefix"
 LIB_DIR="${PREFIX_DIR}/lib"
 TARGET_LABEL="${1:-linux-x86_64}"
 PKG_DIR="${DIST_DIR}/yggterm-${TARGET_LABEL}-ghostty-ffi"
-RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.93.0}"
+RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.94.0}"
 CARGO_CMD=(cargo "+${RUSTUP_TOOLCHAIN}")
 
 if [[ ! -d "$LIB_DIR" ]]; then

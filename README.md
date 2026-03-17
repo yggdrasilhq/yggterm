@@ -66,7 +66,7 @@ yggterm
 Requirements:
 
 - Rust stable
-- Rust `1.92+` is required for the local GPUI/Zed dependency stack. In this environment `cargo +1.93.0 build` is the known-good path.
+- Rust `1.94.0` is the current pinned toolchain for the local GPUI/Zed dependency stack.
 - Zig stable
 - adjacent checkouts of `../ghostty` and `../zed` for integration work
 
@@ -90,13 +90,13 @@ Current upstream constraint:
 Build the workspace:
 
 ```bash
-cargo +1.93.0 build
+cargo +1.94.0 build
 ```
 
 Run locally:
 
 ```bash
-cargo +1.93.0 run
+cargo +1.94.0 run
 ```
 
 ## Release artifacts
