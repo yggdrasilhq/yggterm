@@ -68,4 +68,5 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 ## Licensing
 
 - Repository license: Apache License 2.0.
+- Markdown documentation license: CC BY-SA 4.0.
 - Copyright owner: Avikalpa Kundu.

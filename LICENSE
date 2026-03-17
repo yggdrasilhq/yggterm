@@ -1,10 +1,6 @@
-This repository is mixed-license.
+Repository licensing:
 
-- `apps/yggterm` is licensed under `GPL-3.0-or-later`.
-- `crates/yggterm-zed-shell` is licensed under `GPL-3.0-or-later`.
-- `crates/yggterm-core`, `crates/yggterm-ui`, `crates/yggterm-platform`, and
-  `crates/yggterm-ghostty-bridge` are licensed under `Apache-2.0`.
+- Source code is licensed under `Apache-2.0`.
 - Markdown documentation is licensed under `CC BY-SA 4.0`.
 
-See `LICENSE-APACHE`, `LICENSE-GPL-3.0-or-later`, and
-`LICENSE-CC-BY-SA-4.0` for the full license texts.
+See `LICENSE-APACHE` and `LICENSE-CC-BY-SA-4.0` for the full license texts.
