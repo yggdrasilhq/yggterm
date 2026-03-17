@@ -3,7 +3,7 @@ use gpui::{AnyElement, Hsla, Stateful, Window, div, px};
 use theme::ThemeColors;
 use ui::{
     ButtonSize, ButtonStyle, Color, Divider, Icon, IconButton, IconButtonShape, IconName, IconSize,
-    Label, LabelSize, ListItem, ListItemSpacing, h_flex, prelude::*, v_flex,
+    Label, LabelSize, ListItem, ListItemSpacing, Switch, ToggleState, h_flex, prelude::*, v_flex,
 };
 
 pub fn render_session_tree_text(root: &yggterm_core::SessionNode) -> anyhow::Result<String> {
@@ -144,6 +144,45 @@ pub fn titlebar_icon_button(id: &'static str, icon: IconName) -> IconButton {
         .style(ButtonStyle::Transparent)
 }
 
+pub fn titlebar_mode_toggle(
+    id: &'static str,
+    label: &str,
+    enabled: bool,
+    on_toggle: impl Fn(&ToggleState, &mut Window, &mut gpui::App) + 'static,
+    colors: &ThemeColors,
+) -> AnyElement {
+    h_flex()
+        .gap_2()
+        .items_center()
+        .px_2()
+        .py_1()
+        .rounded_full()
+        .bg(colors.element_background)
+        .border_1()
+        .border_color(if enabled {
+            colors.border_focused
+        } else {
+            colors.border_variant
+        })
+        .child(
+            Label::new(label.to_string())
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+        )
+        .child(
+            Switch::new(
+                id,
+                if enabled {
+                    ToggleState::Selected
+                } else {
+                    ToggleState::Unselected
+                },
+            )
+            .on_click(on_toggle),
+        )
+        .into_any_element()
+}
+
 fn window_control(
     id: &'static str,
     icon: IconName,
@@ -280,58 +319,69 @@ pub fn chat_preview_card(
         ),
     };
 
-    v_flex()
-        .gap_2()
-        .p_3()
-        .rounded_md()
-        .bg(bg)
-        .border_1()
-        .border_color(border)
+    div()
+        .w_full()
+        .flex()
+        .justify_start()
+        .when(matches!(tone, ChatBubbleTone::User), |this| {
+            this.justify_end()
+        })
         .child(
-            h_flex()
-                .items_center()
-                .justify_between()
+            v_flex()
+                .w(px(720.))
+                .max_w_full()
+                .gap_2()
+                .p_3()
+                .rounded_md()
+                .bg(bg)
+                .border_1()
+                .border_color(border)
                 .child(
                     h_flex()
-                        .gap_2()
                         .items_center()
-                        .child(Icon::new(icon).size(IconSize::Small))
+                        .justify_between()
                         .child(
-                            Label::new(role.to_string())
-                                .size(LabelSize::Small)
-                                .color(Color::Default),
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(Icon::new(icon).size(IconSize::Small))
+                                .child(
+                                    Label::new(role.to_string())
+                                        .size(LabelSize::Small)
+                                        .color(Color::Default),
+                                )
+                                .child(
+                                    Label::new(timestamp.to_string())
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
                         )
                         .child(
-                            Label::new(timestamp.to_string())
+                            Label::new(if folded { "collapsed" } else { "expanded" })
                                 .size(LabelSize::Small)
                                 .color(Color::Muted),
                         ),
                 )
-                .child(
-                    Label::new(if folded { "collapsed" } else { "expanded" })
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                ),
-        )
-        .when(!query.is_empty(), |this| {
-            this.child(
-                Label::new(format!("query: {query}"))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
-        })
-        .when(!folded, |this| {
-            this.children(
-                lines
-                    .iter()
-                    .map(|line| {
-                        Label::new(line.clone())
+                .when(!query.is_empty(), |this| {
+                    this.child(
+                        Label::new(format!("query: {query}"))
                             .size(LabelSize::Small)
-                            .color(Color::Default)
-                            .into_any_element()
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        })
+                            .color(Color::Muted),
+                    )
+                })
+                .when(!folded, |this| {
+                    this.children(
+                        lines
+                            .iter()
+                            .map(|line| {
+                                Label::new(line.clone())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Default)
+                                    .into_any_element()
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                }),
+        )
         .into_any_element()
 }

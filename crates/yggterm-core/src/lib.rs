@@ -3,6 +3,8 @@ mod server;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -25,6 +27,8 @@ pub struct SessionNode {
     pub name: String,
     pub path: PathBuf,
     pub children: Vec<SessionNode>,
+    pub session_id: Option<String>,
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -131,21 +135,7 @@ impl SessionStore {
 
     pub fn load_codex_tree(&self) -> Result<SessionNode> {
         let codex_root = resolve_codex_sessions_root()?;
-        let sessions = if codex_root.exists() {
-            compress_session_tree(walk_directory_tree(&codex_root, true)?, true)
-        } else {
-            SessionNode {
-                name: String::from("sessions"),
-                path: codex_root.clone(),
-                children: Vec::new(),
-            }
-        };
-
-        Ok(SessionNode {
-            name: String::from("local [ok]"),
-            path: codex_root,
-            children: vec![sessions],
-        })
+        build_codex_browser_tree(&codex_root)
     }
 }
 
@@ -226,6 +216,8 @@ fn walk_directory_tree(path: &Path, include_codex_files: bool) -> Result<Session
                 name: codex_leaf_label(&entry_path),
                 path: entry_path,
                 children: Vec::new(),
+                session_id: None,
+                cwd: None,
             });
         }
     }
@@ -235,6 +227,8 @@ fn walk_directory_tree(path: &Path, include_codex_files: bool) -> Result<Session
         name,
         path: path.to_path_buf(),
         children,
+        session_id: None,
+        cwd: None,
     })
 }
 
@@ -306,5 +300,284 @@ fn join_session_label(left: &str, right: &str) -> String {
         format!("{left}{right}")
     } else {
         format!("{left}/{right}")
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CodexSessionSummary {
+    file_path: PathBuf,
+    session_id: String,
+    cwd: String,
+}
+
+#[derive(Debug, Clone)]
+struct CodexProjectBucket {
+    cwd: String,
+    sessions: Vec<CodexSessionSummary>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CodexBrowserTreeNode {
+    name: String,
+    full_path: String,
+    project: Option<CodexProjectBucket>,
+    children: BTreeMap<String, CodexBrowserTreeNode>,
+}
+
+fn build_codex_browser_tree(codex_root: &Path) -> Result<SessionNode> {
+    let sessions = if codex_root.exists() {
+        scan_codex_sessions(codex_root)?
+    } else {
+        Vec::new()
+    };
+
+    let mut projects = BTreeMap::<String, Vec<CodexSessionSummary>>::new();
+    for session in sessions {
+        projects
+            .entry(session.cwd.clone())
+            .or_default()
+            .push(session);
+    }
+
+    let mut buckets = Vec::new();
+    for (cwd, mut project_sessions) in projects {
+        project_sessions.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        buckets.push(CodexProjectBucket {
+            cwd,
+            sessions: project_sessions,
+        });
+    }
+
+    let mut root = CodexBrowserTreeNode {
+        name: String::from("local [ok]"),
+        full_path: String::from("local"),
+        project: None,
+        children: BTreeMap::new(),
+    };
+    for bucket in buckets {
+        insert_codex_browser_project(&mut root, &bucket);
+    }
+    compress_codex_browser_tree(&mut root, false);
+
+    Ok(codex_browser_tree_to_session_node(&root))
+}
+
+fn scan_codex_sessions(root: &Path) -> Result<Vec<CodexSessionSummary>> {
+    let mut sessions = Vec::new();
+    for entry in
+        fs::read_dir(root).with_context(|| format!("failed to read dir {}", root.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            sessions.extend(scan_codex_sessions(&path)?);
+        } else if is_codex_session_file(&path) {
+            if let Some(summary) = read_codex_session_summary(&path)? {
+                sessions.push(summary);
+            }
+        }
+    }
+    Ok(sessions)
+}
+
+fn read_codex_session_summary(path: &Path) -> Result<Option<CodexSessionSummary>> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read codex session {}", path.display()))?;
+
+    let fallback_id = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| stem.trim_start_matches("rollout-").to_string())
+        .unwrap_or_else(|| String::from("unknown-session"));
+
+    let mut session_id = None;
+    let mut cwd = None;
+
+    for line in content.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+
+        if session_id.is_none() {
+            session_id = find_string_field(&value, &["id"]);
+        }
+        if cwd.is_none() {
+            cwd = find_string_field(&value, &["cwd"]);
+        }
+        if session_id.is_some() && cwd.is_some() {
+            break;
+        }
+    }
+
+    let Some(cwd) = cwd.map(normalize_codex_cwd) else {
+        return Ok(None);
+    };
+
+    Ok(Some(CodexSessionSummary {
+        file_path: path.to_path_buf(),
+        session_id: session_id.unwrap_or(fallback_id),
+        cwd,
+    }))
+}
+
+fn find_string_field(value: &Value, keys: &[&str]) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            for key in keys {
+                if let Some(Value::String(found)) = map.get(*key) {
+                    if !found.trim().is_empty() {
+                        return Some(found.clone());
+                    }
+                }
+            }
+            map.values()
+                .find_map(|child| find_string_field(child, keys))
+        }
+        Value::Array(items) => items
+            .iter()
+            .find_map(|child| find_string_field(child, keys)),
+        _ => None,
+    }
+}
+
+fn normalize_codex_cwd(raw: String) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::from("/");
+    }
+    if trimmed == "/" {
+        return String::from("/");
+    }
+    if trimmed.starts_with('/') {
+        format!("/{}", trimmed.trim_start_matches('/'))
+            .trim_end_matches('/')
+            .to_string()
+    } else {
+        format!("/{}", trimmed.trim_matches('/'))
+    }
+}
+
+fn insert_codex_browser_project(root: &mut CodexBrowserTreeNode, project: &CodexProjectBucket) {
+    let segments = browser_tree_segments(&project.cwd);
+    insert_codex_browser_path(root, &segments, project.clone());
+}
+
+fn insert_codex_browser_path(
+    node: &mut CodexBrowserTreeNode,
+    segments: &[String],
+    project: CodexProjectBucket,
+) {
+    if segments.is_empty() {
+        node.project = Some(project);
+        return;
+    }
+
+    let segment = &segments[0];
+    let child_path = browser_tree_child_path(&node.full_path, segment);
+    let child = node
+        .children
+        .entry(segment.clone())
+        .or_insert_with(|| CodexBrowserTreeNode {
+            name: segment.clone(),
+            full_path: child_path,
+            ..Default::default()
+        });
+    insert_codex_browser_path(child, &segments[1..], project);
+}
+
+fn browser_tree_segments(cwd: &str) -> Vec<String> {
+    if cwd == "/" {
+        return vec![String::from("/")];
+    }
+    if cwd == "/root" {
+        return vec![String::from("/root")];
+    }
+    if let Some(rest) = cwd.strip_prefix("/root/") {
+        let mut parts = vec![String::from("/root")];
+        parts.extend(rest.split('/').map(|part| part.to_string()));
+        return parts;
+    }
+
+    let mut parts = vec![String::from("/")];
+    parts.extend(
+        cwd.trim_start_matches('/')
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .map(|part| part.to_string()),
+    );
+    parts
+}
+
+fn browser_tree_child_path(parent: &str, segment: &str) -> String {
+    if segment == "/" {
+        return format!("{}/", parent.trim_end_matches('/'));
+    }
+    if parent.ends_with('/') {
+        format!("{parent}{segment}")
+    } else {
+        format!("{parent}/{segment}")
+    }
+}
+
+fn compress_codex_browser_tree(node: &mut CodexBrowserTreeNode, can_compress_self: bool) {
+    let child_keys = node.children.keys().cloned().collect::<Vec<_>>();
+    for key in child_keys {
+        if let Some(child) = node.children.get_mut(&key) {
+            compress_codex_browser_tree(child, true);
+        }
+    }
+
+    if !can_compress_self {
+        return;
+    }
+
+    while node.project.is_none() && node.children.len() == 1 {
+        let (_, child) = node.children.pop_first().expect("single child exists");
+        node.name = join_session_label(&node.name, &child.name);
+        node.full_path = child.full_path;
+        node.project = child.project;
+        node.children = child.children;
+    }
+}
+
+fn codex_browser_tree_to_session_node(node: &CodexBrowserTreeNode) -> SessionNode {
+    let mut children = Vec::new();
+
+    if let Some(project) = &node.project {
+        children.extend(project.sessions.iter().map(|session| SessionNode {
+            name: short_session_id(&session.session_id),
+            path: session.file_path.clone(),
+            children: Vec::new(),
+            session_id: Some(session.session_id.clone()),
+            cwd: Some(project.cwd.clone()),
+        }));
+    }
+
+    children.extend(
+        node.children
+            .values()
+            .map(codex_browser_tree_to_session_node)
+            .collect::<Vec<_>>(),
+    );
+
+    SessionNode {
+        name: node.name.clone(),
+        path: PathBuf::from(node.full_path.clone()),
+        children,
+        session_id: None,
+        cwd: node.project.as_ref().map(|project| project.cwd.clone()),
+    }
+}
+
+fn short_session_id(session_id: &str) -> String {
+    let compact = session_id
+        .chars()
+        .filter(|ch| *ch != '-')
+        .collect::<String>();
+    if compact.len() >= 7 {
+        format!("Q{}", &compact[compact.len() - 7..])
+    } else {
+        session_id.to_string()
     }
 }
