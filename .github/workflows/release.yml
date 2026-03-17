@@ -40,6 +40,9 @@ jobs:
       - name: Clone Ghostty sibling repo
         run: git clone --depth 1 https://github.com/ghostty-org/ghostty ../ghostty
 
+      - name: Clone Zed sibling repo
+        run: git clone --depth 1 https://github.com/zed-industries/zed ../zed
+
       - name: Package release artifacts
         run: ./scripts/package-release.sh linux-x86_64
 
