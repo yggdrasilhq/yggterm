@@ -9,3 +9,4 @@ license = "Apache-2.0"
 yggterm-core = { path = "../yggterm-core" }
 anyhow.workspace = true
 gpui = { path = "../../../zed/crates/gpui", default-features = false, features = ["wayland", "x11"] }
+gpui_platform = { path = "../../../zed/crates/gpui_platform", default-features = false, features = ["wayland", "x11"] }

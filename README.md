@@ -135,22 +135,12 @@ Build the FFI bundle archive:
 - `crates/yggterm-ui`: shared UI helpers
 - `crates/yggterm-platform`: platform detection
 - `crates/yggterm-ghostty-bridge`: Ghostty runtime bridge
-- `crates/yggterm-zed-shell`: Zed integration planning surface
 - `scripts/`: packaging, installer, and toolchain helpers
 - `debian/`: Debian package metadata
 
 ## License
 
-This repository is mixed-license.
-
-- `apps/yggterm`: `GPL-3.0-or-later`
-- `crates/yggterm-zed-shell`: `GPL-3.0-or-later`
-- `crates/yggterm-core`: `Apache-2.0`
-- `crates/yggterm-ui`: `Apache-2.0`
-- `crates/yggterm-platform`: `Apache-2.0`
-- `crates/yggterm-ghostty-bridge`: `Apache-2.0`
+- source code: `Apache-2.0`
 - repository documentation (`*.md`): `CC BY-SA 4.0`
 
-The GPL crates exist because the current shell directly reuses GPL-licensed Zed crates. If the app is later separated from those dependencies, the binary and UI layer can be revisited.
-
-See `LICENSE`, `LICENSE-APACHE`, `LICENSE-GPL-3.0-or-later`, `LICENSE-CC-BY-SA-4.0`, and `NOTICE`.
+See `LICENSE`, `LICENSE-APACHE`, `LICENSE-CC-BY-SA-4.0`, and `NOTICE`.

@@ -6,7 +6,6 @@ members = [
   "crates/yggterm-gtk-glue",
   "crates/yggterm-platform",
   "crates/yggterm-ghostty-bridge",
-  "crates/yggterm-zed-shell",
 ]
 resolver = "2"
 

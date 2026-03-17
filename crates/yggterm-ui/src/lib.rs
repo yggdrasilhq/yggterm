@@ -5,6 +5,10 @@ use gpui::{
 };
 use gpui::prelude::*;
 
+mod shell;
+
+pub use shell::{ShellBootstrap, launch_shell};
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct UiPalette {
     pub window_background: Hsla,
@@ -57,6 +61,8 @@ pub enum ToggleState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TitlebarIcon {
     ConnectSsh,
+    Info,
+    Sidebar,
 }
 
 pub fn render_session_tree_text(root: &yggterm_core::SessionNode) -> anyhow::Result<String> {
@@ -86,7 +92,6 @@ pub fn titlebar_frame(
     left: AnyElement,
     center: AnyElement,
     right: AnyElement,
-    window: &mut Window,
     background: Hsla,
     border: Hsla,
 ) -> Stateful<Div> {
@@ -129,8 +134,7 @@ pub fn titlebar_frame(
                 .justify_end()
                 .gap_1()
                 .px_2()
-                .child(right)
-                .child(window_controls(window)),
+                .child(right),
         )
 }
 
@@ -154,7 +158,7 @@ pub fn statusbar_frame(
         .child(right)
 }
 
-fn window_controls(window: &mut Window) -> AnyElement {
+pub fn window_controls(window: &mut Window) -> AnyElement {
     row()
         .id("yggterm-window-controls")
         .gap_1()
@@ -442,6 +446,8 @@ fn horizontal_divider(color: Hsla) -> Div {
 fn icon_glyph(icon: TitlebarIcon) -> &'static str {
     match icon {
         TitlebarIcon::ConnectSsh => "⇄",
+        TitlebarIcon::Info => "i",
+        TitlebarIcon::Sidebar => "☰",
     }
 }
 
