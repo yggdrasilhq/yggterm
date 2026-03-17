@@ -132,7 +132,7 @@ impl SessionStore {
     pub fn load_codex_tree(&self) -> Result<SessionNode> {
         let codex_root = resolve_codex_sessions_root()?;
         let sessions = if codex_root.exists() {
-            walk_directory_tree(&codex_root, true)?
+            compress_session_tree(walk_directory_tree(&codex_root, true)?, true)
         } else {
             SessionNode {
                 name: String::from("sessions"),
@@ -276,4 +276,35 @@ fn codex_leaf_label(path: &Path) -> String {
     }
 
     stem.to_string()
+}
+
+fn compress_session_tree(mut node: SessionNode, keep_root: bool) -> SessionNode {
+    node.children = node
+        .children
+        .into_iter()
+        .map(|child| compress_session_tree(child, false))
+        .collect();
+
+    if keep_root {
+        return node;
+    }
+
+    while node.children.len() == 1 && !node.children[0].children.is_empty() {
+        let child = node.children.pop().expect("single child exists");
+        node.name = join_session_label(&node.name, &child.name);
+        node.path = child.path;
+        node.children = child.children;
+    }
+
+    node
+}
+
+fn join_session_label(left: &str, right: &str) -> String {
+    if left == "/" {
+        format!("/{right}")
+    } else if left.ends_with('/') {
+        format!("{left}{right}")
+    } else {
+        format!("{left}/{right}")
+    }
 }

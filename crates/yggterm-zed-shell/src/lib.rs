@@ -383,7 +383,7 @@ impl GpuiShell {
             right_panel_open: ui_config.right_panel_open,
             command_palette_open: false,
             selected_right_panel: RightPanel::Metadata,
-            sidebar_width: px(248.),
+            sidebar_width: px(224.),
             right_panel_width: px(286.),
             bottom_dock_height: px(168.),
             active_panel_drag: None,
@@ -665,28 +665,41 @@ impl GpuiShell {
         cx.theme().name.clone()
     }
 
-    fn titlebar_children(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        vec![
-            h_flex()
-                .items_center()
-                .justify_start()
-                .child(
-                    h_flex()
-                        .gap_1()
-                        .items_center()
-                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(
-                            self.chrome_icon(
-                                "toggle-nav",
-                                IconName::WorkspaceNavOpen,
-                                self.sidebar_open,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
+    fn titlebar_left(&self, cx: &mut Context<Self>) -> AnyElement {
+        h_flex()
+            .items_center()
+            .justify_start()
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        self.chrome_icon(
+                            "toggle-nav",
+                            IconName::WorkspaceNavOpen,
+                            self.sidebar_open,
                         )
-                        .child(self.chrome_menu(cx)),
-                )
-                .into_any_element(),
-        ]
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
+                    )
+                    .child(self.chrome_menu(cx)),
+            )
+            .into_any_element()
+    }
+
+    fn titlebar_right(&self, cx: &mut Context<Self>) -> AnyElement {
+        h_flex()
+            .gap_1()
+            .items_center()
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                yggterm_ui::titlebar_icon_button("titlebar-connect-ssh", IconName::Server)
+                    .tooltip(Tooltip::text("Connect SSH Session"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.connect_ssh_target(0, cx);
+                    })),
+            )
+            .into_any_element()
     }
 
     fn window_chrome(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -694,15 +707,13 @@ impl GpuiShell {
         let title_bar_background = colors.title_bar_background;
         let title_bar_inactive_background = colors.title_bar_inactive_background;
         let border = colors.border;
-        let left = self
-            .titlebar_children(cx)
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| div().into_any_element());
+        let left = self.titlebar_left(cx);
         let center = self.titlebar_search(window, cx);
+        let right = self.titlebar_right(cx);
         yggterm_ui::titlebar_frame(
             left,
             center,
+            right,
             window,
             if window.is_window_active() && !self.titlebar_should_move {
                 title_bar_background
@@ -868,8 +879,6 @@ impl GpuiShell {
             return div().into_any_element();
         }
 
-        let ssh_targets = self.server.ssh_targets().to_vec();
-        let live_sessions = self.server.live_sessions();
         let rows = self
             .browser
             .rows()
@@ -893,60 +902,15 @@ impl GpuiShell {
                     .justify_between()
                     .px_2()
                     .child(
-                        Label::new("Browser")
+                        Label::new("Codex Sessions")
                             .size(LabelSize::Small)
                             .color(Color::Muted),
                     )
                     .child(
-                        Label::new(format!("{} selected", self.total_leaf_sessions()))
+                        Label::new(self.total_leaf_sessions().to_string())
                             .size(LabelSize::Small)
                             .color(Color::Muted),
                     ),
-            )
-            .child(
-                div()
-                    .px_2()
-                    .pt_2()
-                    .pb_2()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        h_flex()
-                            .justify_between()
-                            .items_center()
-                            .child(
-                                ListHeader::new("local [ok]")
-                                    .start_slot(Icon::new(IconName::FolderOpen).size(IconSize::Small))
-                                    .end_slot(
-                                        Label::new("folder+sessions")
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted)
-                                            .into_any_element(),
-                                    ),
-                            )
-                            .child(div()),
-                    )
-                    .child(
-                        Label::new(if self.browser.filter_query().is_empty() {
-                            "Search sessions in titlebar".to_string()
-                        } else {
-                            format!("filter: {}", self.browser.filter_query())
-                        })
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                    )
-                    .child(
-                        ListSubHeader::new("Codex Sessions")
-                            .left_icon(Some(IconName::TerminalGhost))
-                            .end_slot(
-                                Label::new(self.total_leaf_sessions().to_string())
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted)
-                                    .into_any_element(),
-                            ),
-                    )
-                    .into_any_element(),
             )
             .child(Divider::horizontal())
             .child(
@@ -958,117 +922,6 @@ impl GpuiShell {
                     .py_1()
                     .gap(px(2.))
                     .children(rows),
-            )
-            .child(Divider::horizontal())
-            .child(
-                div()
-                    .px_2()
-                    .py_2()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        ListSubHeader::new("Restore Preview")
-                            .left_icon(Some(IconName::HistoryRerun))
-                            .end_slot(
-                                Label::new("last_session")
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted)
-                                    .into_any_element(),
-                            ),
-                    )
-                    .child(
-                        ListItem::new("restore-group")
-                            .spacing(ListItemSpacing::Dense)
-                            .start_slot(Icon::new(IconName::RotateCcw).size(IconSize::Small))
-                            .child(Label::new("workspace-2026-03-17").size(LabelSize::Small))
-                            .end_slot(
-                                Label::new("4 panes")
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.select_dock(2, cx)
-                            })),
-                    )
-                            .child(
-                                Label::new(
-                            "The browser follows Codex session files under ~/.codex/sessions while yggterm keeps runtime state under ~/.yggterm.",
-                        )
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                    )
-                    .child(Divider::horizontal().inset())
-                    .child(
-                        ListSubHeader::new("Connect SSH")
-                            .left_icon(Some(IconName::Server))
-                            .end_slot(
-                                Label::new(ssh_targets.len().to_string())
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted)
-                                    .into_any_element(),
-                            ),
-                    )
-                    .children(
-                        ssh_targets
-                            .into_iter()
-                            .enumerate()
-                            .map(|(ix, target)| {
-                                ListItem::new(format!("ssh-target-{ix}"))
-                                    .spacing(ListItemSpacing::Dense)
-                                    .start_slot(Icon::new(IconName::ArrowUpRight).size(IconSize::Small))
-                                    .child(Label::new(target.label).size(LabelSize::Small))
-                                    .end_slot(
-                                        Label::new(
-                                            target
-                                                .prefix
-                                                .clone()
-                                                .unwrap_or_else(|| String::from("plain ssh")),
-                                        )
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
-                                    )
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.connect_ssh_target(ix, cx);
-                                    }))
-                                    .into_any_element()
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                    .child(Divider::horizontal().inset())
-                    .child(
-                        ListSubHeader::new("Live Sessions")
-                            .left_icon(Some(IconName::ToolTerminal))
-                            .end_slot(
-                                Label::new(live_sessions.len().to_string())
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted)
-                                    .into_any_element(),
-                            ),
-                    )
-                    .children(
-                        live_sessions
-                            .into_iter()
-                            .map(|session| {
-                                let session_key = format!("live::{}", session.id);
-                                let session_id = session.id.clone();
-                                ListItem::new(format!("live-session-{}", session.id))
-                                    .spacing(ListItemSpacing::Dense)
-                                    .start_slot(Icon::new(IconName::TerminalGhost).size(IconSize::Small))
-                                    .child(Label::new(session_id).size(LabelSize::Small))
-                                    .end_slot(
-                                        Label::new(session.host_label)
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted),
-                                    )
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.focus_live_session(&session_key, cx);
-                                    }))
-                                    .into_any_element()
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                    .into_any_element(),
             )
             .into_any_element()
     }
@@ -1289,7 +1142,7 @@ impl GpuiShell {
                     .gap_3()
                     .children(match active_session {
                         Some(session) if self.server.active_view_mode() == WorkspaceViewMode::Terminal => vec![
-                            session_block(
+                            yggterm_ui::terminal_surface_card(
                                 match session.source {
                                     SessionSource::Stored => "Server Terminal",
                                     SessionSource::LiveSsh => "Ghostty Launch Request",
@@ -1298,7 +1151,7 @@ impl GpuiShell {
                                 Some(&session.status_line),
                                 colors,
                             ),
-                            session_block(
+                            yggterm_ui::terminal_surface_card(
                                 "Ghostty Integration",
                                 &[
                                     if self.bootstrap.ghostty_bridge_enabled {
@@ -1324,7 +1177,7 @@ impl GpuiShell {
                                 })
                                 .collect::<Vec<_>>();
                             let mut blocks = Vec::new();
-                            blocks.push(session_preview_summary(
+                            blocks.push(yggterm_ui::preview_summary_card(
                                 &session.preview.summary,
                                 preview_query.as_str(),
                                 matching_blocks.len(),
@@ -1337,7 +1190,7 @@ impl GpuiShell {
                                 }),
                             );
                             if blocks.len() == 1 {
-                                blocks.push(session_block(
+                                blocks.push(yggterm_ui::terminal_surface_card(
                                     "No Preview Matches",
                                     &[
                                         "The active search query does not match this session preview.",
@@ -1349,7 +1202,7 @@ impl GpuiShell {
                             }
                             blocks
                         }
-                        None => vec![session_block(
+                        None => vec![yggterm_ui::terminal_surface_card(
                             "No Session Selected",
                             &[
                                 "Select a saved session from the sidebar to open its rendered preview first.",
@@ -1626,69 +1479,23 @@ impl GpuiShell {
         cx: &mut Context<Self>,
         colors: &theme::ThemeColors,
     ) -> AnyElement {
-        let border = match block.tone {
-            PreviewTone::User => colors.text_accent.opacity(0.32),
-            PreviewTone::Assistant => colors.border_variant,
-        };
-        let bg = match block.tone {
-            PreviewTone::User => colors.text_accent.opacity(0.08),
-            PreviewTone::Assistant => colors.surface_background,
-        };
-
-        v_flex()
-            .gap_2()
-            .p_3()
-            .rounded_md()
-            .bg(bg)
-            .border_1()
-            .border_color(border)
-            .child(
-                Button::new(
-                    format!("preview-block-{block_ix}"),
-                    format!(
-                        "{}  {}  {}",
-                        if block.folded { "▶" } else { "▼" },
-                        block.role,
-                        block.timestamp
-                    ),
-                )
-                .style(ButtonStyle::Transparent)
-                .full_width()
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.toggle_preview_block(block_ix, cx);
-                })),
-            )
-            .when(!query.is_empty(), |this| {
-                this.child(
-                    Label::new(format!("query: {query}"))
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-            })
-            .when(!block.folded, |this| {
-                this.children(
-                    block
-                        .lines
-                        .iter()
-                        .map(|line| {
-                            Label::new(line.clone())
-                                .size(LabelSize::Small)
-                                .color(
-                                    if !query.is_empty()
-                                        && line
-                                            .to_ascii_lowercase()
-                                            .contains(&query.to_ascii_lowercase())
-                                    {
-                                        Color::Accent
-                                    } else {
-                                        Color::Default
-                                    },
-                                )
-                                .into_any_element()
-                        })
-                        .collect::<Vec<_>>(),
-                )
-            })
+        div()
+            .cursor(CursorStyle::PointingHand)
+            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                this.toggle_preview_block(block_ix, cx);
+            }))
+            .child(yggterm_ui::chat_preview_card(
+                block.role,
+                &block.timestamp,
+                match block.tone {
+                    PreviewTone::User => yggterm_ui::ChatBubbleTone::User,
+                    PreviewTone::Assistant => yggterm_ui::ChatBubbleTone::Assistant,
+                },
+                block.folded,
+                query,
+                &block.lines,
+                colors,
+            ))
             .into_any_element()
     }
 
@@ -2408,84 +2215,6 @@ fn metadata_row(label: &'static str, value: impl Into<SharedString>) -> AnyEleme
             Label::new(value)
                 .size(LabelSize::Small)
                 .color(Color::Default),
-        )
-        .into_any_element()
-}
-
-fn session_block<S: AsRef<str>>(
-    title: &'static str,
-    lines: &[S],
-    badge: Option<&str>,
-    colors: &theme::ThemeColors,
-) -> AnyElement {
-    let badge = badge.unwrap_or("session").to_string();
-    v_flex()
-        .gap_2()
-        .p_3()
-        .rounded_md()
-        .bg(colors.surface_background)
-        .border_1()
-        .border_color(colors.border_variant)
-        .child(
-            h_flex()
-                .items_center()
-                .justify_between()
-                .child(Label::new(title).size(LabelSize::Small))
-                .child(Label::new(badge).size(LabelSize::Small).color(Color::Muted)),
-        )
-        .children(
-            lines
-                .iter()
-                .enumerate()
-                .map(|(ix, line)| {
-                    let line = line.as_ref();
-                    Label::new(format!("{:02}  {line}", ix + 1))
-                        .size(LabelSize::Small)
-                        .color(if line.starts_with('$') {
-                            Color::Accent
-                        } else {
-                            Color::Default
-                        })
-                        .into_any_element()
-                })
-                .collect::<Vec<_>>(),
-        )
-        .into_any_element()
-}
-
-fn session_preview_summary(
-    summary: &[SessionMetadataEntry],
-    query: &str,
-    matching_blocks: usize,
-    total_blocks: usize,
-    colors: &theme::ThemeColors,
-) -> AnyElement {
-    v_flex()
-        .gap_1()
-        .p_3()
-        .rounded_md()
-        .bg(colors.surface_background)
-        .border_1()
-        .border_color(colors.border_variant)
-        .child(
-            Label::new("Preview")
-                .size(LabelSize::Small)
-                .color(Color::Default),
-        )
-        .when(!query.is_empty(), |this| {
-            this.child(
-                Label::new(format!(
-                    "Filtered by \"{query}\" · {matching_blocks}/{total_blocks} blocks"
-                ))
-                .size(LabelSize::Small)
-                .color(Color::Muted),
-            )
-        })
-        .children(
-            summary
-                .iter()
-                .map(|entry| metadata_row(entry.label, entry.value.clone()))
-                .collect::<Vec<_>>(),
         )
         .into_any_element()
 }
