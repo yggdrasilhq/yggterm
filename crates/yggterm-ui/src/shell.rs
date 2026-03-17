@@ -1,7 +1,7 @@
 use anyhow::Result;
 use gpui::{
-    AnyElement, App, AppContext, Bounds, Context, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, UniformListScrollHandle, Window,
+    AnyElement, App, AppContext, Bounds, Context, InteractiveElement, IntoElement, ParentElement,
+    Render, StatefulInteractiveElement, Styled, UniformListScrollHandle, Window,
     WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions, div, px, size,
     uniform_list,
 };
@@ -14,7 +14,7 @@ use yggterm_core::{
 use crate::{
     ChatBubbleTone, TitlebarIcon, ToggleState, UiPalette, chat_preview_card, preview_summary_card,
     statusbar_frame, terminal_surface_card, titlebar_frame, titlebar_icon_button,
-    titlebar_mode_toggle,
+    titlebar_mode_toggle, toolbar_chip_button,
 };
 
 #[derive(Debug, Clone)]
@@ -167,29 +167,69 @@ impl GpuiShell {
         cx.notify();
     }
 
+    fn expand_preview_blocks(&mut self, cx: &mut Context<Self>) {
+        self.server.set_all_preview_blocks_folded(false);
+        self.last_action = "expanded preview".to_string();
+        cx.notify();
+    }
+
+    fn collapse_preview_blocks(&mut self, cx: &mut Context<Self>) {
+        self.server.set_all_preview_blocks_folded(true);
+        self.last_action = "collapsed preview".to_string();
+        cx.notify();
+    }
+
+    fn resolve_ghostty_window(&mut self, cx: &mut Context<Self>) {
+        self.last_action = self.server.sync_external_terminal_window_for_active();
+        cx.notify();
+    }
+
+    fn focus_ghostty_window(&mut self, cx: &mut Context<Self>) {
+        self.last_action = self.server.raise_external_terminal_window_for_active();
+        cx.notify();
+    }
+
     fn search_placeholder(&self, palette: &UiPalette) -> AnyElement {
         div()
-            .w(px(360.))
+            .w(px(380.))
             .h(px(30.))
             .flex()
             .items_center()
+            .justify_between()
             .px_3()
-            .rounded_md()
+            .rounded_lg()
             .bg(palette.element_background)
             .border_1()
             .border_color(palette.border_variant)
             .text_sm()
             .text_color(palette.text_muted)
             .child("Search sessions…")
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(palette.text_muted)
+                    .child(format!("{} sessions", self.total_leaf_sessions())),
+            )
             .into_any_element()
     }
 
-    fn titlebar(&self, _window: &mut Window, cx: &mut Context<Self>, palette: &UiPalette) -> AnyElement {
+    fn titlebar(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+        palette: &UiPalette,
+    ) -> AnyElement {
         let left = div()
             .flex()
             .flex_row()
             .gap_2()
             .items_center()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(palette.text_muted)
+                    .child("yggterm"),
+            )
             .child(titlebar_mode_toggle(
                 "preview-toggle",
                 "Preview",
@@ -218,7 +258,7 @@ impl GpuiShell {
             .gap_2()
             .items_center()
             .child(
-                titlebar_icon_button("connect-ssh", TitlebarIcon::ConnectSsh, palette)
+                toolbar_chip_button("connect-ssh", "SSH", false, palette)
                     .on_click(cx.listener(|this, _, _, cx| this.connect_ssh_target(0, cx))),
             )
             .child(
@@ -244,7 +284,7 @@ impl GpuiShell {
 
         let row_count = self.browser.rows().len();
         div()
-            .w(px(248.))
+            .w(px(224.))
             .h_full()
             .flex()
             .flex_col()
@@ -254,25 +294,42 @@ impl GpuiShell {
             .child(
                 div()
                     .px_3()
-                    .py_2()
+                    .py_2p5()
                     .border_b_1()
                     .border_color(palette.border_variant)
+                    .flex()
+                    .flex_col()
+                    .gap_1()
                     .child(
                         div()
                             .text_sm()
+                            .text_color(palette.text)
+                            .child("Codex Sessions"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
                             .text_color(palette.text_muted)
-                            .child(format!("Codex Sessions {}", self.total_leaf_sessions())),
+                            .child(format!(
+                                "{} stored sessions{}",
+                                self.total_leaf_sessions(),
+                                self.active_session()
+                                    .map(|session| format!(" · viewing {}", session.title))
+                                    .unwrap_or_default()
+                            )),
                     ),
             )
             .child(
-                uniform_list("shell-sidebar-rows", row_count, cx.processor(
-                    |this, range: std::ops::Range<usize>, _, cx| {
+                uniform_list(
+                    "shell-sidebar-rows",
+                    row_count,
+                    cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
                         let palette = this.palette();
                         range
                             .map(|ix| this.sidebar_row(ix, cx, &palette))
                             .collect::<Vec<_>>()
-                    },
-                ))
+                    }),
+                )
                 .track_scroll(&self.sidebar_scroll_handle)
                 .h_full(),
             )
@@ -299,46 +356,66 @@ impl GpuiShell {
             BrowserRowKind::Session => "•",
         };
 
-        let detail: SharedString = if row.kind == BrowserRowKind::Session {
-            row.session_id
-                .as_deref()
-                .map(short_tail)
-                .unwrap_or_default()
+        let detail = if row.kind == BrowserRowKind::Session {
+            row.detail_label.clone()
         } else {
-            row.descendant_sessions.to_string().into()
+            format!(
+                "{} sessions{}",
+                row.descendant_sessions,
+                if row.detail_label.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {}", row.detail_label)
+                }
+            )
         };
 
         div()
             .id(("sidebar-row", ix))
             .w_full()
-            .h(px(30.))
+            .min_h(px(42.))
             .flex()
-            .items_center()
+            .flex_row()
+            .items_start()
             .justify_between()
             .px_2()
+            .py_2()
             .pl(px(12. + row.depth as f32 * 14.))
             .bg(if is_selected {
                 palette.text_accent.opacity(0.14)
             } else {
                 palette.window_background
             })
-            .text_sm()
-            .text_color(palette.text)
             .on_click(cx.listener(move |this, _, _, cx| this.select_row(ix, cx)))
             .child(
                 div()
                     .flex()
-                    .flex_row()
+                    .flex_col()
                     .gap_2()
-                    .items_center()
-                    .child(div().text_color(palette.text_muted).child(glyph))
-                    .child(div().text_ellipsis().child(row.label)),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(palette.text_muted)
-                    .child(detail),
+                    .flex_1()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .items_center()
+                            .child(div().text_color(palette.text_muted).child(glyph))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(palette.text)
+                                    .text_ellipsis()
+                                    .child(row.label),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .pl(px(18.))
+                            .text_xs()
+                            .text_color(palette.text_muted)
+                            .text_ellipsis()
+                            .child(detail),
+                    ),
             )
             .into_any_element()
     }
@@ -356,6 +433,20 @@ impl GpuiShell {
                     .flex()
                     .flex_col()
                     .gap_3()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .child(
+                                toolbar_chip_button("focus-ghostty", "Focus Ghostty", false, palette)
+                                    .on_click(cx.listener(|this, _, _, cx| this.focus_ghostty_window(cx))),
+                            )
+                            .child(
+                                toolbar_chip_button("resolve-window", "Resolve Window", false, palette)
+                                    .on_click(cx.listener(|this, _, _, cx| this.resolve_ghostty_window(cx))),
+                            ),
+                    )
                     .child(terminal_surface_card(
                         "Server Terminal",
                         &session.terminal_lines,
@@ -393,7 +484,29 @@ impl GpuiShell {
                     .flex()
                     .flex_col()
                     .gap_3()
-                    .child(preview_summary_card("", blocks.len(), blocks.len(), palette))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .child(preview_summary_card("Conversation", "", blocks.len(), blocks.len(), palette))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap_2()
+                                    .child(
+                                        toolbar_chip_button("expand-preview", "Expand All", false, palette)
+                                            .on_click(cx.listener(|this, _, _, cx| this.expand_preview_blocks(cx))),
+                                    )
+                                    .child(
+                                        toolbar_chip_button("collapse-preview", "Collapse All", false, palette)
+                                            .on_click(cx.listener(|this, _, _, cx| this.collapse_preview_blocks(cx))),
+                                    ),
+                            ),
+                    )
                     .children(blocks)
                     .into_any_element()
             }
@@ -426,14 +539,61 @@ impl GpuiShell {
                     .justify_between()
                     .border_b_1()
                     .border_color(palette.border_variant)
+                    .bg(palette.window_background)
                     .child(
                         div()
                             .text_sm()
                             .text_color(palette.text_muted)
                             .child(selected_path),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .child(
+                                toolbar_chip_button(
+                                    "view-preview",
+                                    "Preview",
+                                    self.server.active_view_mode() == WorkspaceViewMode::Rendered,
+                                    palette,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.set_view_mode(WorkspaceViewMode::Rendered, cx)
+                                    },
+                                )),
+                            )
+                            .child(
+                                toolbar_chip_button(
+                                    "view-terminal",
+                                    "Terminal",
+                                    self.server.active_view_mode() == WorkspaceViewMode::Terminal,
+                                    palette,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.set_view_mode(WorkspaceViewMode::Terminal, cx)
+                                    },
+                                )),
+                            ),
                     ),
             )
-            .child(div().flex_1().overflow_hidden().p_3().child(body))
+            .child(
+                div()
+                    .id("viewport-scroll")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .scrollbar_width(px(10.))
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .justify_center()
+                            .p_3()
+                            .child(div().w_full().max_w(px(980.)).child(body)),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -494,7 +654,18 @@ impl GpuiShell {
                             .child("Session Metadata"),
                     ),
             )
-            .children(metadata.into_iter().map(|entry| metadata_row(entry, palette)))
+            .child(
+                div()
+                    .id("inspector-scroll")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .scrollbar_width(px(10.))
+                    .children(
+                        metadata
+                            .into_iter()
+                            .map(|entry| metadata_row(entry, palette)),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -511,24 +682,28 @@ impl GpuiShell {
                         .text_color(palette.text)
                         .child(format!("{} codex sessions", self.total_leaf_sessions())),
                 )
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(palette.text)
-                        .child(format!(
-                            "selected {}",
+                .child(div().text_sm().text_color(palette.text).child(format!(
+                            "{} view · {}",
+                            match self.server.active_view_mode() {
+                                WorkspaceViewMode::Rendered => "preview",
+                                WorkspaceViewMode::Terminal => "terminal",
+                            },
                             self.active_session()
                                 .map(|session| session.title.as_str())
                                 .unwrap_or("none")
-                        )),
-                )
+                        )))
                 .into_any_element(),
             div()
                 .flex()
                 .flex_row()
                 .gap_2()
                 .items_center()
-                .child(div().text_sm().text_color(palette.text).child(self.last_action.clone()))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(palette.text_muted)
+                        .child(self.last_action.clone()),
+                )
                 .child(
                     titlebar_icon_button("status-meta", TitlebarIcon::Info, palette)
                         .on_click(cx.listener(|this, _, _, cx| this.toggle_right_panel(cx))),
@@ -566,7 +741,7 @@ impl Render for GpuiShell {
 fn metadata_row(entry: SessionMetadataEntry, palette: &UiPalette) -> AnyElement {
     div()
         .px_3()
-        .py_2()
+        .py_2p5()
         .border_b_1()
         .border_color(palette.border_variant.opacity(0.65))
         .child(
@@ -580,19 +755,13 @@ fn metadata_row(entry: SessionMetadataEntry, palette: &UiPalette) -> AnyElement 
                         .text_color(palette.text_muted)
                         .child(entry.label),
                 )
-                .child(div().text_sm().text_color(palette.text).child(entry.value)),
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(palette.text)
+                        .whitespace_normal()
+                        .child(entry.value),
+                ),
         )
         .into_any_element()
-}
-
-fn short_tail(session_id: &str) -> SharedString {
-    let tail = session_id
-        .chars()
-        .rev()
-        .take(8)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>();
-    tail.into()
 }

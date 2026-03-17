@@ -51,12 +51,12 @@ impl SessionBrowserState {
             selected_path: None,
             metrics: BrowserMetrics::default(),
         };
+        if !this.root.children.is_empty() {
+            this.expanded_paths
+                .insert(this.root.path.display().to_string());
+        }
         this.rebuild_rows();
-        this.selected_path = this
-            .rows
-            .iter()
-            .find(|row| row.kind == BrowserRowKind::Session)
-            .map(|row| row.full_path.clone());
+        this.selected_path = first_session_path(&this.root);
         this
     }
 
@@ -141,6 +141,20 @@ impl SessionBrowserState {
         self.metrics.rebuild_count += 1;
         self.metrics.last_rebuild_ms = started_at.elapsed().as_secs_f32() * 1000.0;
     }
+}
+
+fn first_session_path(node: &SessionNode) -> Option<String> {
+    if node.children.is_empty() && node.session_id.is_some() {
+        return Some(node.path.display().to_string());
+    }
+
+    for child in &node.children {
+        if let Some(path) = first_session_path(child) {
+            return Some(path);
+        }
+    }
+
+    None
 }
 
 fn flatten_rows(

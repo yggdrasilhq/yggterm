@@ -1,9 +1,9 @@
 use gpui::Div;
-use gpui::{
-    AnyElement, App, Hsla, InteractiveElement, IntoElement, MouseButton,
-    Stateful, StatefulInteractiveElement, Styled, Window, div, hsla, px,
-};
 use gpui::prelude::*;
+use gpui::{
+    AnyElement, App, FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton, Stateful,
+    StatefulInteractiveElement, Styled, Window, div, hsla, px,
+};
 
 mod shell;
 
@@ -98,7 +98,7 @@ pub fn titlebar_frame(
     row()
         .id("yggterm-titlebar")
         .w_full()
-        .h(px(42.))
+        .h(px(46.))
         .items_center()
         .justify_between()
         .bg(background)
@@ -106,7 +106,7 @@ pub fn titlebar_frame(
         .border_color(border)
         .child(
             div()
-                .w(px(228.))
+                .w(px(248.))
                 .flex_none()
                 .h_full()
                 .flex()
@@ -126,7 +126,7 @@ pub fn titlebar_frame(
         )
         .child(
             div()
-                .w(px(228.))
+                .w(px(248.))
                 .flex_none()
                 .h_full()
                 .flex()
@@ -163,14 +163,12 @@ pub fn window_controls(window: &mut Window) -> AnyElement {
         .id("yggterm-window-controls")
         .gap_1()
         .items_center()
-        .on_mouse_down(MouseButton::Left, |_, _, cx: &mut App| cx.stop_propagation())
-        .child(window_control(
-            "minimize",
-            "−",
-            move |window| {
-                window.minimize_window();
-            },
-        ))
+        .on_mouse_down(MouseButton::Left, |_, _, cx: &mut App| {
+            cx.stop_propagation()
+        })
+        .child(window_control("minimize", "−", move |window| {
+            window.minimize_window();
+        }))
         .child(window_control(
             "maximize-or-restore",
             if window.is_maximized() { "❐" } else { "□" },
@@ -178,18 +176,59 @@ pub fn window_controls(window: &mut Window) -> AnyElement {
                 window.zoom_window();
             },
         ))
-        .child(window_control(
-            "close",
-            "×",
-            move |window| {
-                window.remove_window();
-            },
-        ))
+        .child(window_control("close", "×", move |window| {
+            window.remove_window();
+        }))
         .into_any_element()
 }
 
-pub fn titlebar_icon_button(id: &'static str, icon: TitlebarIcon, palette: &UiPalette) -> Stateful<Div> {
-    chrome_button(id, icon_glyph(icon), palette.text_muted, palette.element_background, palette.border_variant)
+pub fn titlebar_icon_button(
+    id: &'static str,
+    icon: TitlebarIcon,
+    palette: &UiPalette,
+) -> Stateful<Div> {
+    chrome_button(
+        id,
+        icon_glyph(icon),
+        palette.text_muted,
+        palette.element_background,
+        palette.border_variant,
+    )
+}
+
+pub fn toolbar_chip_button(
+    id: &'static str,
+    label: impl Into<String>,
+    selected: bool,
+    palette: &UiPalette,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .h(px(28.))
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .px_3()
+        .rounded_lg()
+        .bg(if selected {
+            palette.text_accent.opacity(0.14)
+        } else {
+            palette.element_background
+        })
+        .border_1()
+        .border_color(if selected {
+            palette.border_focused
+        } else {
+            palette.border_variant
+        })
+        .text_sm()
+        .text_color(if selected {
+            palette.text
+        } else {
+            palette.text_muted
+        })
+        .child(label.into())
 }
 
 pub fn titlebar_mode_toggle(
@@ -267,7 +306,12 @@ pub fn terminal_surface_card<S: AsRef<str>>(
             row()
                 .items_center()
                 .justify_between()
-                .child(div().text_sm().text_color(palette.text).child(title.to_string()))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(palette.text)
+                        .child(title.to_string()),
+                )
                 .child(div().text_sm().text_color(palette.text_muted).child(badge)),
         )
         .children(
@@ -292,6 +336,7 @@ pub fn terminal_surface_card<S: AsRef<str>>(
 }
 
 pub fn preview_summary_card(
+    title: &str,
     query: &str,
     matching_blocks: usize,
     total_blocks: usize,
@@ -299,14 +344,22 @@ pub fn preview_summary_card(
 ) -> AnyElement {
     column()
         .gap_2()
-        .px_1()
-        .pt_1()
-        .pb_2()
+        .p_3()
+        .rounded_lg()
+        .bg(palette.surface_background)
+        .border_1()
+        .border_color(palette.border_variant)
         .child(
             row()
                 .items_center()
                 .justify_between()
-                .child(div().text_sm().text_color(palette.text).child("Conversation"))
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(palette.text)
+                        .child(title.to_string()),
+                )
                 .child(
                     div()
                         .text_sm()
@@ -322,7 +375,6 @@ pub fn preview_summary_card(
                     .child(format!("Filtered by \"{query}\"")),
             )
         })
-        .child(horizontal_divider(palette.border_variant))
         .into_any_element()
 }
 
@@ -356,7 +408,7 @@ pub fn chat_preview_card(
     div()
         .w_full()
         .flex()
-        .py_1()
+        .py_1p5()
         .justify_start()
         .when(matches!(tone, ChatBubbleTone::User), |this| {
             this.justify_end()
@@ -365,12 +417,12 @@ pub fn chat_preview_card(
             column()
                 .w_full()
                 .max_w(px(match tone {
-                    ChatBubbleTone::User => 760.,
-                    ChatBubbleTone::Assistant | ChatBubbleTone::Neutral => 860.,
+                    ChatBubbleTone::User => 720.,
+                    ChatBubbleTone::Assistant | ChatBubbleTone::Neutral => 880.,
                 }))
                 .gap_2()
                 .px_4()
-                .py_3()
+                .py_3p5()
                 .rounded_xl()
                 .bg(bg)
                 .border_1()
@@ -389,7 +441,7 @@ pub fn chat_preview_card(
                             .iter()
                             .map(|line| {
                                 div()
-                                    .text_sm()
+                                    .text_base()
                                     .text_color(palette.text)
                                     .whitespace_normal()
                                     .child(line.clone())
@@ -439,10 +491,6 @@ fn column() -> Div {
     div().flex().flex_col()
 }
 
-fn horizontal_divider(color: Hsla) -> Div {
-    div().w_full().h(px(1.)).bg(color)
-}
-
 fn icon_glyph(icon: TitlebarIcon) -> &'static str {
     match icon {
         TitlebarIcon::ConnectSsh => "⇄",
@@ -486,11 +534,11 @@ fn chrome_button(
 ) -> Stateful<Div> {
     div()
         .id(id)
-        .size(px(28.))
+        .size(px(30.))
         .flex()
         .items_center()
         .justify_center()
-        .rounded_md()
+        .rounded_lg()
         .bg(background)
         .border_1()
         .border_color(border)
