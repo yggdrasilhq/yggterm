@@ -26,9 +26,11 @@ fn main() {
 
     if let Some(lib_dir) = env::var_os("GHOSTTY_LIB_DIR") {
         let dir = PathBuf::from(lib_dir);
+        println!("cargo:rustc-env=YGGTERM_GHOSTTY_LIB_DIR={}", dir.display());
         println!("cargo:rustc-link-search=native={}", dir.display());
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", dir.display());
     } else if let Some(dir) = discover_ghostty_lib_dir(&ghostty_dir) {
+        println!("cargo:rustc-env=YGGTERM_GHOSTTY_LIB_DIR={}", dir.display());
         println!("cargo:rustc-link-search=native={}", dir.display());
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", dir.display());
     }

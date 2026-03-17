@@ -62,22 +62,38 @@ fn main() -> Result<()> {
         Command::Doctor => {
             let platform = yggterm_platform::host_platform();
             let env = yggterm_ghostty_bridge::GhosttyEnvironment::discover();
-            let bridge = yggterm_ghostty_bridge::initialize_bridge();
+            let bridge = yggterm_ghostty_bridge::bridge_status();
             println!("Host platform: {:?}", platform);
             println!("YGGTERM_HOME: {}", store.home_dir().display());
             println!(
                 "Ghostty header discovered: {}",
                 env.header_path.unwrap_or_else(|| "not found".to_string())
             );
-            match bridge {
-                Ok(()) => println!("Ghostty bridge init status: enabled"),
-                Err(e) => {
-                    println!("Ghostty bridge init status: disabled");
-                    println!("Bridge detail: {e}");
-                    println!(
-                        "Hint: use packaged .deb build (ghostty-ffi) or build with --features ghostty-ffi"
-                    );
+            println!(
+                "Ghostty library discovered: {}",
+                env.lib_dir.unwrap_or_else(|| "not found".to_string())
+            );
+            println!(
+                "Ghostty bridge init status: {}",
+                if bridge.ffi_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
                 }
+            );
+            println!(
+                "Ghostty embedded surface host: {}",
+                if bridge.embedded_surface_available() {
+                    "available"
+                } else {
+                    "unavailable"
+                }
+            );
+            println!("Bridge detail: {}", bridge.detail);
+            if !bridge.ffi_enabled {
+                println!(
+                    "Hint: use packaged .deb build (ghostty-ffi) or build with --features ghostty-ffi"
+                );
             }
         }
         Command::ZedPlan => {
@@ -122,13 +138,15 @@ fn launch_gpui_gui(store: SessionStore) -> Result<()> {
     let tree = store.load_tree()?;
     let browser_tree = store.load_codex_tree().unwrap_or_else(|_| tree.clone());
     let settings = store.load_settings().unwrap_or_default();
-    let ghostty_bridge_enabled = yggterm_ghostty_bridge::initialize_bridge().is_ok();
+    let ghostty_bridge = yggterm_ghostty_bridge::bridge_status();
 
     yggterm_zed_shell::launch_gpui_shell(yggterm_zed_shell::ShellBootstrap {
         tree,
         browser_tree,
         theme: settings.theme,
-        ghostty_bridge_enabled,
+        ghostty_bridge_enabled: ghostty_bridge.linked_runtime_available(),
+        ghostty_embedded_surface_supported: ghostty_bridge.embedded_surface_available(),
+        ghostty_bridge_detail: ghostty_bridge.detail,
         prefer_ghostty_backend: settings.prefer_ghostty_backend,
     })
 }

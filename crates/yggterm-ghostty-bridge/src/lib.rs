@@ -6,8 +6,6 @@ use thiserror::Error;
 pub enum GhosttyBridgeError {
     #[error("ghostty FFI is not enabled in this build")]
     FfiDisabled,
-    #[error("ghostty app initialization returned null")]
-    AppInitFailed,
 }
 
 pub type Result<T> = std::result::Result<T, GhosttyBridgeError>;
@@ -15,6 +13,7 @@ pub type Result<T> = std::result::Result<T, GhosttyBridgeError>;
 #[derive(Debug, Clone)]
 pub struct GhosttyEnvironment {
     pub header_path: Option<String>,
+    pub lib_dir: Option<String>,
 }
 
 impl GhosttyEnvironment {
@@ -22,19 +21,84 @@ impl GhosttyEnvironment {
         let header_path = option_env!("YGGTERM_GHOSTTY_HEADER")
             .map(ToOwned::to_owned)
             .filter(|path| std::path::Path::new(path).exists());
-        Self { header_path }
+        let lib_dir = option_env!("YGGTERM_GHOSTTY_LIB_DIR")
+            .map(ToOwned::to_owned)
+            .filter(|path| std::path::Path::new(path).exists());
+        Self {
+            header_path,
+            lib_dir,
+        }
     }
 }
 
-pub fn initialize_bridge() -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GhosttySurfaceEmbedding {
+    Supported,
+    Unsupported,
+}
+
+#[derive(Debug, Clone)]
+pub struct GhosttyBridgeStatus {
+    pub ffi_enabled: bool,
+    pub embedded_surface_support: GhosttySurfaceEmbedding,
+    pub detail: String,
+}
+
+impl GhosttyBridgeStatus {
+    pub fn linked_runtime_available(&self) -> bool {
+        self.ffi_enabled
+    }
+
+    pub fn embedded_surface_available(&self) -> bool {
+        self.embedded_surface_support == GhosttySurfaceEmbedding::Supported
+    }
+}
+
+pub fn bridge_status() -> GhosttyBridgeStatus {
     #[cfg(feature = "ghostty-ffi")]
     {
-        Ok(())
+        GhosttyBridgeStatus {
+            ffi_enabled: true,
+            embedded_surface_support: embedded_surface_support(),
+            detail: embedding_detail().to_string(),
+        }
     }
 
     #[cfg(not(feature = "ghostty-ffi"))]
     {
+        GhosttyBridgeStatus {
+            ffi_enabled: false,
+            embedded_surface_support: GhosttySurfaceEmbedding::Unsupported,
+            detail: "libghostty FFI is disabled in this build".to_string(),
+        }
+    }
+}
+
+pub fn initialize_bridge() -> Result<()> {
+    if bridge_status().ffi_enabled {
+        Ok(())
+    } else {
         Err(GhosttyBridgeError::FfiDisabled)
+    }
+}
+
+#[cfg(feature = "ghostty-ffi")]
+fn embedded_surface_support() -> GhosttySurfaceEmbedding {
+    if cfg!(any(target_os = "macos", target_os = "ios")) {
+        GhosttySurfaceEmbedding::Supported
+    } else {
+        GhosttySurfaceEmbedding::Unsupported
+    }
+}
+
+#[cfg(feature = "ghostty-ffi")]
+fn embedding_detail() -> &'static str {
+    if cfg!(any(target_os = "macos", target_os = "ios")) {
+        "libghostty is linked and the upstream embedded surface host is available on this platform"
+    } else if cfg!(target_os = "linux") {
+        "libghostty is linked, but Ghostty's current embedded surface host only exposes macOS/iOS platform views; Linux uses the external Ghostty process fallback for now"
+    } else {
+        "libghostty is linked, but this platform does not currently expose an upstream embedded surface host"
     }
 }
 
@@ -46,27 +110,9 @@ pub mod ffi {
     pub type ghostty_config_t = *mut c_void;
     pub type ghostty_surface_t = *mut c_void;
 
-    #[repr(C)]
-    #[derive(Debug, Copy, Clone)]
-    pub struct ghostty_runtime_config_s {
-        _private: [u8; 0],
-    }
-
     #[link(name = "ghostty")]
     unsafe extern "C" {
-        pub fn ghostty_app_new(
-            runtime: *const ghostty_runtime_config_s,
-            config: ghostty_config_t,
-        ) -> ghostty_app_t;
-        pub fn ghostty_app_free(app: ghostty_app_t);
         pub fn ghostty_app_tick(app: ghostty_app_t);
-
-        pub fn ghostty_surface_new(
-            app: ghostty_app_t,
-            surface_config: *const c_void,
-        ) -> ghostty_surface_t;
-        pub fn ghostty_surface_free(surface: ghostty_surface_t);
-        pub fn ghostty_surface_draw(surface: ghostty_surface_t);
     }
 }
 
@@ -77,11 +123,8 @@ pub struct GhosttyApp {
 
 #[cfg(feature = "ghostty-ffi")]
 impl GhosttyApp {
-    pub fn from_raw(raw: ffi::ghostty_app_t) -> Result<Self> {
-        if raw.is_null() {
-            return Err(GhosttyBridgeError::AppInitFailed);
-        }
-        Ok(Self { raw })
+    pub fn from_raw(raw: ffi::ghostty_app_t) -> Self {
+        Self { raw }
     }
 
     pub fn tick(&self) {
@@ -92,14 +135,5 @@ impl GhosttyApp {
 
     pub fn raw(&self) -> ffi::ghostty_app_t {
         self.raw
-    }
-}
-
-#[cfg(feature = "ghostty-ffi")]
-impl Drop for GhosttyApp {
-    fn drop(&mut self) {
-        unsafe {
-            ffi::ghostty_app_free(self.raw);
-        }
     }
 }
