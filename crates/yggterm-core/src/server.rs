@@ -1,5 +1,7 @@
 use crate::{SessionNode, UiTheme};
+use serde_json::Value;
 use std::collections::BTreeMap;
+use std::fs;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -148,8 +150,12 @@ impl YggtermServer {
             live_session_order: Vec::new(),
         };
 
-        if let Some(first_session) = first_session_path(tree) {
-            this.open_or_focus_session(&first_session);
+        if let Some(first_session) = first_session_leaf(tree) {
+            this.open_or_focus_session(
+                &first_session.path,
+                Some(&first_session.session_id),
+                Some(&first_session.cwd),
+            );
         }
 
         this
@@ -192,11 +198,33 @@ impl YggtermServer {
         }
     }
 
-    pub fn open_or_focus_session(&mut self, path: &str) {
+    pub fn open_or_focus_session(
+        &mut self,
+        path: &str,
+        session_id: Option<&str>,
+        cwd: Option<&str>,
+    ) {
         let entry = self.sessions.entry(path.to_string()).or_insert_with(|| {
-            build_session(path, self.backend, self.theme, self.ghostty_bridge_enabled)
+            build_session(
+                path,
+                session_id,
+                cwd,
+                self.backend,
+                self.theme,
+                self.ghostty_bridge_enabled,
+            )
         });
         entry.backend = self.backend;
+        if let Some(session_id) = session_id {
+            entry.id = session_id.to_string();
+        }
+        if let Some(cwd) = cwd {
+            entry.metadata.retain(|entry| entry.label != "Cwd");
+            entry.metadata.push(SessionMetadataEntry {
+                label: "Cwd",
+                value: cwd.to_string(),
+            });
+        }
         self.active_session_path = Some(path.to_string());
     }
 
@@ -318,13 +346,34 @@ impl YggtermServer {
     }
 }
 
-fn first_session_path(node: &SessionNode) -> Option<String> {
+struct StoredLeaf {
+    path: String,
+    session_id: String,
+    cwd: String,
+}
+
+#[derive(Debug, Clone)]
+struct StoredTranscript {
+    started_at: String,
+    user_messages: usize,
+    assistant_messages: usize,
+    blocks: Vec<SessionPreviewBlock>,
+}
+
+fn first_session_leaf(node: &SessionNode) -> Option<StoredLeaf> {
     if node.children.is_empty() {
-        return Some(node.path.display().to_string());
+        return Some(StoredLeaf {
+            path: node.path.display().to_string(),
+            session_id: node.session_id.clone().unwrap_or_else(|| node.name.clone()),
+            cwd: node
+                .cwd
+                .clone()
+                .unwrap_or_else(|| session_preview_cwd(&node.path.display().to_string())),
+        });
     }
 
     for child in &node.children {
-        if let Some(path) = first_session_path(child) {
+        if let Some(path) = first_session_leaf(child) {
             return Some(path);
         }
     }
@@ -334,21 +383,17 @@ fn first_session_path(node: &SessionNode) -> Option<String> {
 
 fn build_session(
     path: &str,
+    session_id: Option<&str>,
+    cwd: Option<&str>,
     backend: TerminalBackend,
     theme: UiTheme,
     ghostty_bridge_enabled: bool,
 ) -> ManagedSessionView {
-    let title = path.rsplit('/').next().unwrap_or(path).to_string();
-    let host_label = if path.contains("/prod/") {
-        "prod-app-01"
-    } else if path.contains("ghostty") {
-        "ghostty-admin"
-    } else if path.contains("local") {
-        "localhost"
-    } else {
-        "ssh-target"
-    }
-    .to_string();
+    let session_id = session_id
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| path.rsplit('/').next().unwrap_or(path).to_string());
+    let title = short_session_id(&session_id);
+    let host_label = String::from("localhost");
 
     let appearance = match theme {
         UiTheme::ZedDark => "dark",
@@ -361,15 +406,27 @@ fn build_session(
         TerminalBackend::Ghostty => "Ghostty",
         TerminalBackend::Mock => "Mock",
     };
-    let cwd = session_preview_cwd(path);
+    let cwd = cwd
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| session_preview_cwd(path));
+    let launch_command = format!(
+        "cd '{}' && codex resume {}",
+        cwd.replace('\'', "'\\''"),
+        session_id
+    );
+    let transcript = parse_stored_transcript(path, &started_at);
+    let started_at = transcript
+        .as_ref()
+        .map(|transcript| transcript.started_at.clone())
+        .unwrap_or(started_at);
     let preview = SessionPreview {
         summary: vec![
             SessionMetadataEntry {
                 label: "Session",
-                value: title.clone(),
+                value: session_id.clone(),
             },
             SessionMetadataEntry {
-                label: "Path",
+                label: "Storage",
                 value: path.to_string(),
             },
             SessionMetadataEntry {
@@ -380,44 +437,52 @@ fn build_session(
                 label: "Started",
                 value: started_at.clone(),
             },
-        ],
-        blocks: vec![
-            SessionPreviewBlock {
-                role: "USER",
-                timestamp: started_at.clone(),
-                tone: PreviewTone::User,
-                folded: false,
-                lines: vec![
-                    format!("Attach {title} on {host_label} and restore the last multiplexed shell."),
-                    format!("Open the persisted workspace rooted at {cwd}."),
-                ],
-            },
-            SessionPreviewBlock {
-                role: "ASSISTANT",
-                timestamp: "server:restore".to_string(),
-                tone: PreviewTone::Assistant,
-                folded: false,
-                lines: vec![
-                    format!("{backend_label} backend reserved for the live terminal surface."),
-                    "Rendered preview follows codex-session-tui structure: scan browser first, inspect transcript second.".to_string(),
-                    "The Yggterm server stays authoritative for restore, attach, and remote orchestration.".to_string(),
-                ],
-            },
-            SessionPreviewBlock {
-                role: "USER",
-                timestamp: "session:notes".to_string(),
-                tone: PreviewTone::User,
-                folded: true,
-                lines: vec![
-                    "Future rich rendering will show screenshots, search hits, command summaries, and clipboard transfers here.".to_string(),
-                    "Switch back to Terminal in the titlebar when the Ghostty surface is active.".to_string(),
-                ],
+            SessionMetadataEntry {
+                label: "Messages",
+                value: transcript
+                    .as_ref()
+                    .map(|transcript| {
+                        format!(
+                            "{} user · {} assistant",
+                            transcript.user_messages, transcript.assistant_messages
+                        )
+                    })
+                    .unwrap_or_else(|| "preview unavailable".to_string()),
             },
         ],
+        blocks: transcript
+            .as_ref()
+            .map(|transcript| transcript.blocks.clone())
+            .filter(|blocks| !blocks.is_empty())
+            .unwrap_or_else(|| {
+                vec![
+                    SessionPreviewBlock {
+                        role: "USER",
+                        timestamp: started_at.clone(),
+                        tone: PreviewTone::User,
+                        folded: false,
+                        lines: vec![
+                            format!("Resume Codex session {session_id}."),
+                            format!("Open the workspace rooted at {cwd}."),
+                        ],
+                    },
+                    SessionPreviewBlock {
+                        role: "ASSISTANT",
+                        timestamp: "server:restore".to_string(),
+                        tone: PreviewTone::Assistant,
+                        folded: false,
+                        lines: vec![
+                            format!("{backend_label} backend reserved for the live terminal surface."),
+                            "Rendered preview follows the session transcript first and tool activity second.".to_string(),
+                            format!("Terminal launch command: {launch_command}"),
+                        ],
+                    },
+                ]
+            }),
     };
 
     ManagedSessionView {
-        id: format!("stored:{title}"),
+        id: session_id.clone(),
         session_path: path.to_string(),
         title: title.clone(),
         host_label: host_label.clone(),
@@ -430,7 +495,7 @@ fn build_session(
             TerminalLaunchPhase::BridgePending
         },
         remote_deploy_state: RemoteDeployState::NotRequired,
-        launch_command: format!("yggterm server attach {title}"),
+        launch_command: launch_command.clone(),
         status_line: describe_status_line(
             backend,
             theme,
@@ -444,20 +509,18 @@ fn build_session(
             ghostty_bridge_enabled,
         ),
         terminal_lines: vec![
-            format!("$ attach {title}"),
-            format!("Connected to {host_label}"),
-            format!("$ cd {}", path.replace("sessions/", "~/gh/")),
-            "$ cargo test -p session-ui".to_string(),
-            "running 16 tests".to_string(),
-            "test session_restore::persists_metadata ... ok".to_string(),
-            "test ssh_clipboard::pastes_image_payloads ... pending".to_string(),
+            format!("$ cd {cwd}"),
+            format!("$ codex resume {session_id}"),
+            format!("Ghostty terminal host: {backend_label}"),
+            "waiting for embedded terminal surface".to_string(),
+            "server will attach stdin/stdout here once libghostty is mounted".to_string(),
         ],
         rendered_sections: vec![
             SessionRenderedSection {
                 title: "Rendered Session",
                 lines: vec![
-                    "This pane is the future Zed-rendered session view.".to_string(),
-                    "Selections, rich transcript rendering, search, and command summaries land here.".to_string(),
+                    "Preview mode renders the stored Codex transcript as a chat surface.".to_string(),
+                    "Turn Preview off in the titlebar to hand the main viewport back to Ghostty.".to_string(),
                     "The terminal/server session stays authoritative underneath.".to_string(),
                 ],
             },
@@ -476,16 +539,12 @@ fn build_session(
                 value: "stored".to_string(),
             },
             SessionMetadataEntry {
-                label: "Host",
-                value: host_label,
-            },
-            SessionMetadataEntry {
                 label: "Session",
-                value: title,
+                value: session_id,
             },
             SessionMetadataEntry {
                 label: "Storage",
-                value: "~/.yggterm".to_string(),
+                value: path.to_string(),
             },
             SessionMetadataEntry {
                 label: "Cwd",
@@ -509,7 +568,7 @@ fn build_session(
             },
             SessionMetadataEntry {
                 label: "Restore",
-                value: "last_session".to_string(),
+                value: launch_command,
             },
         ],
     }
@@ -731,6 +790,150 @@ fn build_live_terminal_lines(session: &ManagedSessionView) -> Vec<String> {
     ]
 }
 
+fn parse_stored_transcript(path: &str, fallback_started_at: &str) -> Option<StoredTranscript> {
+    let content = fs::read_to_string(path).ok()?;
+    let mut started_at = None;
+    let mut user_messages = 0usize;
+    let mut assistant_messages = 0usize;
+    let mut blocks = Vec::new();
+
+    for line in content.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let event_type = value.get("type").and_then(Value::as_str);
+
+        match event_type {
+            Some("session_meta") => {
+                if let Some(payload) = value.get("payload") {
+                    started_at = payload
+                        .get("timestamp")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .or(started_at);
+                }
+            }
+            Some("response_item") => {
+                let Some(payload) = value.get("payload") else {
+                    continue;
+                };
+                if payload.get("type").and_then(Value::as_str) != Some("message") {
+                    continue;
+                }
+
+                let role = payload
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .unwrap_or("assistant");
+                let lines = message_lines_from_payload(payload);
+                if lines.is_empty() {
+                    continue;
+                }
+
+                match role {
+                    "user" | "developer" => user_messages += 1,
+                    "assistant" => assistant_messages += 1,
+                    _ => {}
+                }
+
+                blocks.push(SessionPreviewBlock {
+                    role: session_role_label(role),
+                    timestamp: extract_timestamp(&value).unwrap_or_else(|| {
+                        started_at
+                            .clone()
+                            .unwrap_or_else(|| fallback_started_at.to_string())
+                    }),
+                    tone: session_preview_tone(role),
+                    folded: blocks.len() >= 8,
+                    lines,
+                });
+            }
+            Some("event_msg") => {
+                let Some(payload) = value.get("payload") else {
+                    continue;
+                };
+                if payload.get("type").and_then(Value::as_str) != Some("user_message") {
+                    continue;
+                }
+                let Some(text) = payload.get("message").and_then(Value::as_str) else {
+                    continue;
+                };
+                user_messages += 1;
+                blocks.push(SessionPreviewBlock {
+                    role: "USER",
+                    timestamp: extract_timestamp(&value)
+                        .unwrap_or_else(|| fallback_started_at.to_string()),
+                    tone: PreviewTone::User,
+                    folded: blocks.len() >= 8,
+                    lines: normalize_preview_text(text),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    Some(StoredTranscript {
+        started_at: started_at.unwrap_or_else(|| fallback_started_at.to_string()),
+        user_messages,
+        assistant_messages,
+        blocks,
+    })
+}
+
+fn message_lines_from_payload(payload: &Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(content_items) = payload.get("content").and_then(Value::as_array) {
+        for item in content_items {
+            if let Some(text) = item
+                .get("text")
+                .or_else(|| item.get("input_text"))
+                .or_else(|| item.get("output_text"))
+                .and_then(Value::as_str)
+            {
+                lines.extend(normalize_preview_text(text));
+            }
+        }
+    }
+    lines
+}
+
+fn normalize_preview_text(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn extract_timestamp(value: &Value) -> Option<String> {
+    value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            value
+                .get("payload")
+                .and_then(|payload| payload.get("timestamp"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn session_role_label(role: &str) -> &'static str {
+    match role {
+        "user" | "developer" => "USER",
+        "assistant" => "ASSISTANT",
+        _ => "SYSTEM",
+    }
+}
+
+fn session_preview_tone(role: &str) -> PreviewTone {
+    match role {
+        "user" | "developer" => PreviewTone::User,
+        _ => PreviewTone::Assistant,
+    }
+}
+
 fn session_preview_cwd(path: &str) -> String {
     let trimmed = path.trim_end_matches('/');
     let parent = trimmed
@@ -748,4 +951,16 @@ fn session_preview_cwd(path: &str) -> String {
         }
     }
     parent.to_string()
+}
+
+fn short_session_id(session_id: &str) -> String {
+    let compact = session_id
+        .chars()
+        .filter(|ch| *ch != '-')
+        .collect::<String>();
+    if compact.len() >= 7 {
+        format!("Q{}", &compact[compact.len() - 7..])
+    } else {
+        session_id.to_string()
+    }
 }
