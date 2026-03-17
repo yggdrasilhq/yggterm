@@ -143,13 +143,17 @@ fn flatten_rows(
     rows: &mut Vec<BrowserRow>,
     include_root: bool,
 ) -> bool {
-    if !matches_filter(node, filter) {
+    let is_session = node.children.is_empty();
+    let full_path = node.path.display().to_string();
+    let is_codex_session = is_session && is_codex_leaf(node, &full_path);
+    if !matches_filter(node, filter) || (is_session && !is_codex_session) {
         return false;
     }
 
-    let full_path = node.path.display().to_string();
-    let is_session = node.children.is_empty();
     let descendant_sessions = count_leaf_sessions(node);
+    if !is_session && descendant_sessions == 0 {
+        return false;
+    }
     let expanded = is_session || expanded_paths.contains(&full_path);
 
     if include_root {
@@ -222,10 +226,27 @@ fn matches_filter(node: &SessionNode, filter: &str) -> bool {
 
 fn count_leaf_sessions(node: &SessionNode) -> usize {
     if node.children.is_empty() {
-        return 1;
+        return usize::from(is_codex_leaf(node, &node.path.display().to_string()));
     }
 
     node.children.iter().map(count_leaf_sessions).sum()
+}
+
+fn is_codex_leaf(node: &SessionNode, full_path: &str) -> bool {
+    let name = node.name.as_str();
+    let lower_name = name.to_ascii_lowercase();
+    let lower_path = full_path.to_ascii_lowercase();
+    lower_name.contains("codex")
+        || lower_path.contains("codex")
+        || looks_like_uuid(name)
+}
+
+fn looks_like_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.chars().enumerate().all(|(ix, ch)| match ix {
+            8 | 13 | 18 | 23 => ch == '-',
+            _ => ch.is_ascii_hexdigit(),
+        })
 }
 
 fn host_label_for_path(path: &str, depth: usize) -> String {

@@ -9,7 +9,6 @@ use gpui::{
     StatefulInteractiveElement, relative,
 };
 use gpui_platform::application;
-use platform_title_bar::PlatformTitleBar;
 use serde::{Deserialize, Serialize};
 use settings::Settings;
 use std::fs;
@@ -85,7 +84,6 @@ pub fn launch_gpui_shell(bootstrap: ShellBootstrap) -> Result<()> {
     application().with_assets(Assets).run(move |cx: &mut App| {
         component::init();
         settings::init(cx);
-        PlatformTitleBar::init(cx);
         theme::init(theme::LoadThemes::All(Box::new(Assets)), cx);
         Assets
             .load_fonts(cx)
@@ -302,7 +300,6 @@ struct PanelDrag {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RightPanel {
     Metadata,
-    Extensions,
 }
 
 #[derive(Clone)]
@@ -310,7 +307,6 @@ struct GpuiShell {
     bootstrap: ShellBootstrap,
     ui_config: ShellUiConfig,
     focus_handle: FocusHandle,
-    titlebar: Entity<PlatformTitleBar>,
     chrome_menu_handle: PopoverMenuHandle<ContextMenu>,
     search_editor: Entity<Editor>,
     palette_editor: Entity<Editor>,
@@ -327,6 +323,7 @@ struct GpuiShell {
     right_panel_width: Pixels,
     bottom_dock_height: Pixels,
     active_panel_drag: Option<PanelDrag>,
+    titlebar_should_move: bool,
     last_action: String,
 }
 
@@ -339,7 +336,6 @@ impl GpuiShell {
     ) -> Self {
         let browser = SessionBrowserState::new(bootstrap.tree.clone());
         let focus_handle = cx.focus_handle();
-        let titlebar = cx.new(|cx| PlatformTitleBar::new("yggterm-platform-titlebar", cx));
         let search_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             editor.set_placeholder_text("Search sessions…", window, cx);
@@ -377,7 +373,6 @@ impl GpuiShell {
             bootstrap,
             ui_config: ui_config.clone(),
             focus_handle,
-            titlebar,
             chrome_menu_handle: PopoverMenuHandle::default(),
             search_editor,
             palette_editor,
@@ -390,10 +385,11 @@ impl GpuiShell {
             right_panel_open: ui_config.right_panel_open,
             command_palette_open: false,
             selected_right_panel: RightPanel::Metadata,
-            sidebar_width: px(300.),
+            sidebar_width: px(248.),
             right_panel_width: px(286.),
             bottom_dock_height: px(168.),
             active_panel_drag: None,
+            titlebar_should_move: false,
             last_action: "ready".to_string(),
         }
     }
@@ -423,9 +419,6 @@ impl GpuiShell {
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar_open = !self.sidebar_open;
-        self.titlebar.update(cx, |titlebar, cx| {
-            titlebar.set_workspace_sidebar_open(self.sidebar_open, cx);
-        });
         self.set_last_action(
             if self.sidebar_open {
                 "sidebar opened"
@@ -464,27 +457,6 @@ impl GpuiShell {
             self.set_last_action(format!("dock {}", self.dock_entries[ix].title), cx);
             self.save_ui_config();
         }
-    }
-
-    fn toggle_right_panel(&mut self, panel: RightPanel, cx: &mut Context<Self>) {
-        if self.selected_right_panel == panel {
-            self.right_panel_open = !self.right_panel_open;
-        } else {
-            self.selected_right_panel = panel;
-            self.right_panel_open = true;
-        }
-        self.set_last_action(
-            if self.right_panel_open {
-                match self.selected_right_panel {
-                    RightPanel::Metadata => "right panel metadata",
-                    RightPanel::Extensions => "right panel extensions",
-                }
-            } else {
-                "right panel closed"
-            },
-            cx,
-        );
-        self.save_ui_config();
     }
 
     fn set_view_mode(&mut self, mode: WorkspaceViewMode, cx: &mut Context<Self>) {
@@ -690,11 +662,9 @@ impl GpuiShell {
         cx.theme().name.clone()
     }
 
-    fn titlebar_children(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn titlebar_children(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         vec![
             h_flex()
-                .w(px(520.))
-                .flex_none()
                 .items_center()
                 .justify_start()
                 .child(
@@ -713,101 +683,53 @@ impl GpuiShell {
                         .child(self.chrome_menu(cx)),
                 )
                 .into_any_element(),
-            h_flex()
-                .flex_1()
-                .items_center()
-                .justify_center()
-                .child(self.titlebar_search(window, cx))
-                .into_any_element(),
-            h_flex()
-                .w(px(520.))
-                .flex_none()
-                .items_center()
-                .justify_end()
-                .child(
-                    h_flex()
-                        .gap_1()
-                        .items_center()
-                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(
-                            Button::new("titlebar-restore-all", "Restore All")
-                                .style(ButtonStyle::Subtle)
-                                .size(ButtonSize::Compact)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.set_last_action("restore all", cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("titlebar-paste-screenshot", "Paste Screenshot")
-                                .style(ButtonStyle::Subtle)
-                                .size(ButtonSize::Compact)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.set_last_action("paste screenshot", cx)
-                                })),
-                        )
-                        .child(
-                            Button::new(
-                                "view-mode-toggle",
-                                match self.server.active_view_mode() {
-                                    WorkspaceViewMode::Terminal => "Terminal",
-                                    WorkspaceViewMode::Rendered => "Rendered",
-                                },
-                            )
-                            .style(ButtonStyle::Subtle)
-                            .size(ButtonSize::Compact)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                let next_mode = match this.server.active_view_mode() {
-                                    WorkspaceViewMode::Terminal => WorkspaceViewMode::Rendered,
-                                    WorkspaceViewMode::Rendered => WorkspaceViewMode::Terminal,
-                                };
-                                this.set_view_mode(next_mode, cx);
-                            })),
-                        )
-                        .child(
-                            self.chrome_icon(
-                                "metadata-panel",
-                                IconName::Info,
-                                self.right_panel_open
-                                    && self.selected_right_panel == RightPanel::Metadata,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.toggle_right_panel(RightPanel::Metadata, cx)
-                            })),
-                        )
-                        .child(
-                            self.chrome_icon(
-                                "extensions-panel",
-                                IconName::Code,
-                                self.right_panel_open
-                                    && self.selected_right_panel == RightPanel::Extensions,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.toggle_right_panel(RightPanel::Extensions, cx)
-                            })),
-                        )
-                        .child(
-                            Label::new(self.active_theme_label(cx))
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
-                        .child(
-                            self.chrome_icon("window-settings", IconName::Settings, false)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.open_settings_window(cx)
-                                })),
-                        ),
-                )
-                .into_any_element(),
         ]
     }
 
     fn window_chrome(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let children = self.titlebar_children(window, cx);
-        self.titlebar.update(cx, |titlebar, cx| {
-            titlebar.set_workspace_sidebar_open(self.sidebar_open, cx);
-            titlebar.set_children(children);
-        });
-        self.titlebar.clone().into_any_element()
+        let colors = cx.theme().colors();
+        let title_bar_background = colors.title_bar_background;
+        let title_bar_inactive_background = colors.title_bar_inactive_background;
+        let border = colors.border;
+        let left = self
+            .titlebar_children(cx)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| div().into_any_element());
+        let center = self.titlebar_search(window, cx);
+        yggterm_ui::titlebar_frame(
+            left,
+            center,
+            window,
+            if window.is_window_active() && !self.titlebar_should_move {
+                title_bar_background
+            } else {
+                title_bar_inactive_background
+            },
+            border,
+        )
+        .on_mouse_down_out(cx.listener(|this, _ev, _window, _cx| {
+            this.titlebar_should_move = false;
+        }))
+        .on_mouse_up(
+            gpui::MouseButton::Left,
+            cx.listener(|this, _ev, _window, _cx| {
+                this.titlebar_should_move = false;
+            }),
+        )
+        .on_mouse_down(
+            gpui::MouseButton::Left,
+            cx.listener(|this, _ev, _window, _cx| {
+                this.titlebar_should_move = true;
+            }),
+        )
+        .on_mouse_move(cx.listener(|this, _ev, window, _| {
+            if this.titlebar_should_move {
+                this.titlebar_should_move = false;
+                window.start_window_move();
+            }
+        }))
+        .into_any_element()
     }
 
     fn chrome_menu(&self, cx: &mut Context<Self>) -> PopoverMenu<ContextMenu> {
@@ -876,7 +798,7 @@ impl GpuiShell {
         };
 
         h_flex()
-            .w(px(392.))
+            .w(px(360.))
             .h(px(26.))
             .items_center()
             .gap_2()
@@ -1025,7 +947,7 @@ impl GpuiShell {
                             })),
                     )
                     .child(
-                        ListSubHeader::new("Remote Session Tree")
+                        ListSubHeader::new("Codex Sessions")
                             .left_icon(Some(IconName::TerminalGhost))
                             .end_slot(
                                 Label::new(self.total_leaf_sessions().to_string())
@@ -1180,11 +1102,10 @@ impl GpuiShell {
                     .overflow_hidden()
                     .child(self.primary_body(cx, colors)),
             )
-            .when(self.bottom_panel_open, |this| {
-                this.child(self.bottom_dock_resize_handle(cx, colors))
-                    .child(self.bottom_dock(cx, colors))
-            })
-            .child(self.status_bar(cx, colors))
+                .when(self.bottom_panel_open, |this| {
+                    this.child(self.bottom_dock_resize_handle(cx, colors))
+                        .child(self.bottom_dock(cx, colors))
+                })
             .into_any_element()
     }
 
@@ -1487,12 +1408,10 @@ impl GpuiShell {
                     .child(
                         ListHeader::new(match self.selected_right_panel {
                             RightPanel::Metadata => "Session Metadata",
-                            RightPanel::Extensions => "Session Extensions",
                         })
                         .start_slot(
                             Icon::new(match self.selected_right_panel {
                                 RightPanel::Metadata => IconName::Info,
-                                RightPanel::Extensions => IconName::Code,
                             })
                             .size(IconSize::Small),
                         ),
@@ -1530,19 +1449,6 @@ impl GpuiShell {
                                 .into_any_element(),
                             ])
                             .collect::<Vec<_>>(),
-                        RightPanel::Extensions => vec![
-                            metadata_row("Metadata", "session-info.ygg"),
-                            metadata_row("Clipboard", "remote-image-paste"),
-                            metadata_row("Restore", "workspace-rehydrate"),
-                            metadata_row("Rendered View", "rich transcript surface"),
-                            Divider::horizontal().inset().into_any_element(),
-                            Label::new(
-                                "This panel will host Yggterm-specific session actions, metadata extensions, and remote capabilities rather than editor extensions.",
-                            )
-                            .size(LabelSize::Small)
-                            .color(Color::Default)
-                            .into_any_element(),
-                        ],
                     }),
             )
             .into_any_element()
@@ -1653,65 +1559,57 @@ impl GpuiShell {
             })
             .collect::<Vec<_>>();
 
-        div()
-            .w_full()
-            .h(px(30.))
-            .px_2()
-            .flex()
-            .items_center()
-            .justify_between()
-            .bg(colors.status_bar_background)
-            .border_t_1()
-            .border_color(colors.border)
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .children(dock_tabs)
-                    .child(Divider::vertical().inset())
-                    .child(
-                        Label::new(format!("{} saved sessions", self.total_leaf_sessions()))
-                            .size(LabelSize::Small)
-                            .color(Color::Default),
-                    )
-                    .child(
-                        Label::new(format!(
-                            "selected {}",
-                            self.active_session()
-                                .map(|session| session.title.as_str())
-                                .unwrap_or("none")
-                        ))
-                            .size(LabelSize::Small)
-                            .color(Color::Default),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        Label::new(match self.server.active_view_mode() {
-                            WorkspaceViewMode::Terminal => "terminal",
-                            WorkspaceViewMode::Rendered => "rendered",
-                        })
+        yggterm_ui::statusbar_frame(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .children(dock_tabs)
+                .child(Divider::vertical().inset())
+                .child(
+                    Label::new(format!("{} codex sessions", self.total_leaf_sessions()))
                         .size(LabelSize::Small)
                         .color(Color::Default),
-                    )
-                    .child(
-                        Label::new(self.last_action.clone())
+                )
+                .child(
+                    Label::new(format!(
+                        "selected {}",
+                        self.active_session()
+                            .map(|session| session.title.as_str())
+                            .unwrap_or("none")
+                    ))
+                    .size(LabelSize::Small)
+                    .color(Color::Default),
+                )
+                .into_any_element(),
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(
+                    Label::new(match self.server.active_view_mode() {
+                        WorkspaceViewMode::Terminal => "terminal",
+                        WorkspaceViewMode::Rendered => "rendered",
+                    })
+                    .size(LabelSize::Small)
+                    .color(Color::Default),
+                )
+                .child(
+                    Label::new(self.last_action.clone())
                         .size(LabelSize::Small)
                         .color(Color::Default),
-                    )
-                    .child(self.chrome_icon(
-                        "status-remote",
-                        match self.server.backend() {
-                            TerminalBackend::Ghostty => IconName::TerminalGhost,
-                            TerminalBackend::Mock => IconName::Disconnected,
-                        },
-                        false,
-                    )),
-            )
-            .into_any_element()
+                )
+                .child(self.chrome_icon(
+                    "status-remote",
+                    match self.server.backend() {
+                        TerminalBackend::Ghostty => IconName::TerminalGhost,
+                        TerminalBackend::Mock => IconName::Disconnected,
+                    },
+                    false,
+                ))
+                .into_any_element(),
+            colors.status_bar_background,
+            colors.border,
+        )
+        .into_any_element()
     }
 
     fn chrome_icon(
@@ -2164,6 +2062,7 @@ impl Render for GpuiShell {
                         })
                         .child(self.workspace(window, cx, &colors)),
                 )
+                .child(self.status_bar(cx, &colors))
                 .when(self.command_palette_open, |this| {
                     this.child(self.command_palette_overlay(window, cx))
                 }),
