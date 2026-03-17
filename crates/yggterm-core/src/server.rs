@@ -154,6 +154,18 @@ impl YggtermServer {
         };
         block.folded = !block.folded;
     }
+
+    pub fn set_all_preview_blocks_folded(&mut self, folded: bool) {
+        let Some(path) = self.active_session_path.as_ref() else {
+            return;
+        };
+        let Some(session) = self.sessions.get_mut(path) else {
+            return;
+        };
+        for block in &mut session.preview.blocks {
+            block.folded = folded;
+        }
+    }
 }
 
 fn first_session_path(node: &SessionNode) -> Option<String> {
