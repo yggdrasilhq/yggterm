@@ -10,7 +10,7 @@ name = "yggterm"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["ghostty-ffi"]
 ghostty-ffi = ["yggterm-ghostty-bridge/ghostty-ffi"]
 zed-upstream = ["yggterm-zed-shell/zed-upstream"]
 

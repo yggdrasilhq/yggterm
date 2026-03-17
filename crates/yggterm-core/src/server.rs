@@ -160,6 +160,7 @@ impl YggtermServer {
                 Some(&first_session.session_id),
                 Some(&first_session.cwd),
             );
+            this.request_terminal_launch_for_active();
         }
 
         this
@@ -178,6 +179,9 @@ impl YggtermServer {
     }
 
     pub fn sync_theme(&mut self, theme: UiTheme) {
+        if self.theme == theme {
+            return;
+        }
         self.theme = theme;
         for session in self.sessions.values_mut() {
             let appearance = match theme {
