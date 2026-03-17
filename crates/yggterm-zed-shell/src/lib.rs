@@ -502,6 +502,39 @@ impl GpuiShell {
         self.set_last_action(format!("preview block {}", block_ix + 1), cx);
     }
 
+    fn set_all_preview_blocks_folded(&mut self, folded: bool, cx: &mut Context<Self>) {
+        self.server.set_all_preview_blocks_folded(folded);
+        self.set_last_action(
+            if folded {
+                "preview collapsed"
+            } else {
+                "preview expanded"
+            },
+            cx,
+        );
+    }
+
+    fn preview_query(&self) -> &str {
+        self.browser.filter_query()
+    }
+
+    fn preview_block_matches(
+        &self,
+        block: &yggterm_core::SessionPreviewBlock,
+        query: &str,
+    ) -> bool {
+        if query.is_empty() {
+            return true;
+        }
+        let query = query.to_ascii_lowercase();
+        block.role.to_ascii_lowercase().contains(&query)
+            || block.timestamp.to_ascii_lowercase().contains(&query)
+            || block
+                .lines
+                .iter()
+                .any(|line| line.to_ascii_lowercase().contains(&query))
+    }
+
     fn set_browser_filter(&mut self, query: impl Into<String>, cx: &mut Context<Self>) {
         let query = query.into();
         self.browser.set_filter_query(query.clone());
@@ -1134,6 +1167,7 @@ impl GpuiShell {
             .or_else(|| self.selected_row().map(|row| row.full_path.clone()))
             .unwrap_or_else(|| "~/.yggterm/sessions".to_string());
         let active_session = self.active_session();
+        let preview_query = self.preview_query().trim().to_string();
         let mode_label = match self.server.active_view_mode() {
             WorkspaceViewMode::Terminal => "Terminal View",
             WorkspaceViewMode::Rendered => "Rendered View",
@@ -1176,6 +1210,40 @@ impl GpuiShell {
                     .child(
                         h_flex()
                             .gap_1()
+                            .when(
+                                self.server.active_view_mode() == WorkspaceViewMode::Rendered,
+                                |this| {
+                                    this.child(
+                                        Button::new("preview-expand-all", "Expand All")
+                                            .style(ButtonStyle::Subtle)
+                                            .size(ButtonSize::Compact)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.set_all_preview_blocks_folded(false, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("preview-collapse-all", "Collapse All")
+                                            .style(ButtonStyle::Subtle)
+                                            .size(ButtonSize::Compact)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.set_all_preview_blocks_folded(true, cx);
+                                            })),
+                                    )
+                                },
+                            )
+                            .when(!preview_query.is_empty(), |this| {
+                                this.child(
+                                    Button::new(
+                                        "preview-clear-query",
+                                        format!("Matches: {}", preview_query),
+                                    )
+                                    .style(ButtonStyle::Subtle)
+                                    .size(ButtonSize::Compact)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.clear_browser_filter(window, cx);
+                                    })),
+                                )
+                            })
                             .child(
                                 Button::new("runtime-mode", mode_label)
                                     .icon(IconName::ToolTerminal)
@@ -1224,18 +1292,39 @@ impl GpuiShell {
                             ),
                         ],
                         Some(session) => {
+                            let matching_blocks = session
+                                .preview
+                                .blocks
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, block)| {
+                                    self.preview_block_matches(block, preview_query.as_str())
+                                })
+                                .collect::<Vec<_>>();
                             let mut blocks = Vec::new();
-                            blocks.push(session_preview_summary(&session.preview.summary, colors));
+                            blocks.push(session_preview_summary(
+                                &session.preview.summary,
+                                preview_query.as_str(),
+                                matching_blocks.len(),
+                                session.preview.blocks.len(),
+                                colors,
+                            ));
                             blocks.extend(
-                                session
-                                    .preview
-                                    .blocks
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(ix, block)| {
-                                        self.session_preview_block_element(ix, block, cx, colors)
-                                    }),
+                                matching_blocks.into_iter().map(|(ix, block)| {
+                                    self.session_preview_block_element(ix, block, preview_query.as_str(), cx, colors)
+                                }),
                             );
+                            if blocks.len() == 1 {
+                                blocks.push(session_block(
+                                    "No Preview Matches",
+                                    &[
+                                        "The active search query does not match this session preview.",
+                                        "Clear the search field to return to the full transcript.",
+                                    ],
+                                    Some("search"),
+                                    colors,
+                                ));
+                            }
                             blocks
                         }
                         None => vec![session_block(
@@ -1531,6 +1620,7 @@ impl GpuiShell {
         &self,
         block_ix: usize,
         block: &yggterm_core::SessionPreviewBlock,
+        query: &str,
         cx: &mut Context<Self>,
         colors: &theme::ThemeColors,
     ) -> AnyElement {
@@ -1566,6 +1656,13 @@ impl GpuiShell {
                     this.toggle_preview_block(block_ix, cx);
                 })),
             )
+            .when(!query.is_empty(), |this| {
+                this.child(
+                    Label::new(format!("query: {query}"))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
             .when(!block.folded, |this| {
                 this.children(
                     block
@@ -1574,7 +1671,13 @@ impl GpuiShell {
                         .map(|line| {
                             Label::new(line.clone())
                                 .size(LabelSize::Small)
-                                .color(Color::Default)
+                                .color(if !query.is_empty()
+                                    && line.to_ascii_lowercase().contains(&query.to_ascii_lowercase())
+                                {
+                                    Color::Accent
+                                } else {
+                                    Color::Default
+                                })
                                 .into_any_element()
                         })
                         .collect::<Vec<_>>(),
@@ -2352,6 +2455,9 @@ fn session_block<S: AsRef<str>>(
 
 fn session_preview_summary(
     summary: &[SessionMetadataEntry],
+    query: &str,
+    matching_blocks: usize,
+    total_blocks: usize,
     colors: &theme::ThemeColors,
 ) -> AnyElement {
     v_flex()
@@ -2366,6 +2472,15 @@ fn session_preview_summary(
                 .size(LabelSize::Small)
                 .color(Color::Default),
         )
+        .when(!query.is_empty(), |this| {
+            this.child(
+                Label::new(format!(
+                    "Filtered by \"{query}\" · {matching_blocks}/{total_blocks} blocks"
+                ))
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+            )
+        })
         .children(
             summary
                 .iter()
