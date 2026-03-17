@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 
 pub use browser::{BrowserRow, BrowserRowKind, SessionBrowserState};
 pub use server::{
-    ManagedSessionView, SessionMetadataEntry, SessionRenderedSection, TerminalBackend,
-    WorkspaceViewMode, YggtermServer,
+    ManagedSessionView, PreviewTone, SessionMetadataEntry, SessionPreview, SessionPreviewBlock,
+    SessionRenderedSection, TerminalBackend, WorkspaceViewMode, YggtermServer,
 };
 
 pub const ENV_YGGTERM_HOME: &str = "YGGTERM_HOME";

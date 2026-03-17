@@ -25,8 +25,8 @@ use ui::{
 };
 use workspace::CloseWindow;
 use yggterm_core::{
-    BrowserRow, BrowserRowKind, SessionMetadataEntry, SessionNode, SessionBrowserState,
-    TerminalBackend, UiTheme, WorkspaceViewMode, YggtermServer,
+    BrowserRow, BrowserRowKind, PreviewTone, SessionMetadataEntry, SessionNode,
+    SessionBrowserState, TerminalBackend, UiTheme, WorkspaceViewMode, YggtermServer,
 };
 
 actions!(
@@ -445,6 +445,7 @@ impl GpuiShell {
                 BrowserRowKind::Session => {
                     self.browser.select_path(row.full_path.clone());
                     self.server.open_or_focus_session(&row.full_path);
+                    self.server.set_view_mode(WorkspaceViewMode::Rendered);
                     self.set_last_action(format!("session {}", row.label), cx);
                 }
             }
@@ -634,8 +635,11 @@ impl GpuiShell {
     fn titlebar_children(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         vec![
             h_flex()
+                .w(px(520.))
+                .flex_none()
                 .gap_1()
                 .items_center()
+                .justify_start()
                 .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(
                     self.chrome_icon("toggle-nav", IconName::WorkspaceNavOpen, self.sidebar_open)
@@ -650,8 +654,11 @@ impl GpuiShell {
                 .child(self.titlebar_search(window, cx))
                 .into_any_element(),
             h_flex()
+                .w(px(520.))
+                .flex_none()
                 .gap_1()
                 .items_center()
+                .justify_end()
                 .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(
                     Button::new("titlebar-restore-all", "Restore All")
@@ -795,8 +802,8 @@ impl GpuiShell {
         };
 
         h_flex()
-            .w(px(430.))
-            .h(px(28.))
+            .w(px(392.))
+            .h(px(26.))
             .items_center()
             .gap_2()
             .px_2()
@@ -1132,7 +1139,13 @@ impl GpuiShell {
                         h_flex()
                             .gap_2()
                             .items_center()
-                            .child(Icon::new(IconName::TerminalGhost).size(IconSize::Small))
+                            .child(
+                                Icon::new(match self.server.active_view_mode() {
+                                    WorkspaceViewMode::Terminal => IconName::TerminalGhost,
+                                    WorkspaceViewMode::Rendered => IconName::BookCopy,
+                                })
+                                .size(IconSize::Small),
+                            )
                             .child(
                                 Label::new(selected_path)
                                     .size(LabelSize::Small)
@@ -1189,18 +1202,23 @@ impl GpuiShell {
                                 colors,
                             ),
                         ],
-                        Some(session) => session
-                            .rendered_sections
-                            .iter()
-                            .map(|section| {
-                                session_block(section.title, &section.lines, Some("rendered"), colors)
-                            })
-                            .collect::<Vec<_>>(),
+                        Some(session) => {
+                            let mut blocks = Vec::new();
+                            blocks.push(session_preview_summary(&session.preview.summary, colors));
+                            blocks.extend(
+                                session
+                                    .preview
+                                    .blocks
+                                    .iter()
+                                    .map(|block| session_preview_block(block.role, &block.timestamp, &block.lines, block.tone, colors)),
+                            );
+                            blocks
+                        }
                         None => vec![session_block(
                             "No Session Selected",
                             &[
-                                "Select a saved session from the sidebar to ask the Yggterm server to open it.",
-                                "The terminal surface lives in the center viewport; the rendered view is a secondary mode.",
+                                "Select a saved session from the sidebar to open its rendered preview first.",
+                                "The terminal surface lives alongside the preview and will take over this viewport once Ghostty is embedded.",
                             ],
                             Some("idle"),
                             colors,
@@ -1765,9 +1783,18 @@ impl GpuiShell {
             .toggle_state(is_selected)
             .on_click(cx.listener(move |this, _, _, cx| this.select_row(ix, cx)))
             .child(
-                Label::new(row.label.clone())
-                    .size(LabelSize::Small)
-                    .color(Color::Default),
+                v_flex()
+                    .gap(px(2.))
+                    .child(
+                        Label::new(row.label.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Default),
+                    )
+                    .child(
+                        Label::new(row.detail_label.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
             )
             .end_slot(
                 Label::new(row.host_label.clone())
@@ -2236,6 +2263,86 @@ fn session_block<S: AsRef<str>>(
                         } else {
                             Color::Default
                         })
+                        .into_any_element()
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_any_element()
+}
+
+fn session_preview_summary(
+    summary: &[SessionMetadataEntry],
+    colors: &theme::ThemeColors,
+) -> AnyElement {
+    v_flex()
+        .gap_1()
+        .p_3()
+        .rounded_md()
+        .bg(colors.surface_background)
+        .border_1()
+        .border_color(colors.border_variant)
+        .child(
+            Label::new("Preview")
+                .size(LabelSize::Small)
+                .color(Color::Default),
+        )
+        .children(
+            summary
+                .iter()
+                .map(|entry| metadata_row(entry.label, entry.value.clone()))
+                .collect::<Vec<_>>(),
+        )
+        .into_any_element()
+}
+
+fn session_preview_block<S: AsRef<str>>(
+    role: &str,
+    timestamp: &str,
+    lines: &[S],
+    tone: PreviewTone,
+    colors: &theme::ThemeColors,
+) -> AnyElement {
+    let border = match tone {
+        PreviewTone::User => colors.text_accent.opacity(0.32),
+        PreviewTone::Assistant => colors.border_variant,
+    };
+    let bg = match tone {
+        PreviewTone::User => colors.text_accent.opacity(0.08),
+        PreviewTone::Assistant => colors.surface_background,
+    };
+
+    v_flex()
+        .gap_2()
+        .p_3()
+        .rounded_md()
+        .bg(bg)
+        .border_1()
+        .border_color(border)
+        .child(
+            h_flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    Label::new(role.to_string())
+                        .size(LabelSize::Small)
+                        .color(match tone {
+                            PreviewTone::User => Color::Accent,
+                            PreviewTone::Assistant => Color::Default,
+                        }),
+                )
+                .child(
+                    Label::new(timestamp.to_string())
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                ),
+        )
+        .children(
+            lines
+                .iter()
+                .map(|line| {
+                    Label::new(line.as_ref().to_string())
+                        .size(LabelSize::Small)
+                        .color(Color::Default)
                         .into_any_element()
                 })
                 .collect::<Vec<_>>(),

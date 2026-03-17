@@ -1,4 +1,6 @@
 use crate::SessionNode;
+use dirs::home_dir;
+use std::path::Path;
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,6 +14,7 @@ pub struct BrowserRow {
     pub kind: BrowserRowKind,
     pub full_path: String,
     pub label: String,
+    pub detail_label: String,
     pub depth: usize,
     pub host_label: String,
     pub descendant_sessions: usize,
@@ -157,6 +160,7 @@ fn flatten_rows(
                 BrowserRowKind::Group
             },
             label: format_row_label(node, depth, descendant_sessions, is_session),
+            detail_label: detail_label_for_row(node, &full_path, is_session),
             full_path: full_path.clone(),
             depth,
             host_label: host_label_for_path(&full_path, depth),
@@ -186,6 +190,19 @@ fn format_row_label(
         node.name.clone()
     } else {
         format!("{} ({descendant_sessions})", node.name)
+    }
+}
+
+fn detail_label_for_row(node: &SessionNode, full_path: &str, is_session: bool) -> String {
+    if is_session {
+        browser_display_path(
+            node.path
+                .parent()
+                .and_then(|parent| parent.to_str())
+                .unwrap_or(full_path),
+        )
+    } else {
+        browser_display_path(full_path)
     }
 }
 
@@ -231,4 +248,41 @@ fn host_label_for_path(path: &str, depth: usize) -> String {
         return "local".to_string();
     }
     "ssh".to_string()
+}
+
+fn browser_display_path(path: &str) -> String {
+    let normalized = if path == "/" {
+        String::from("/")
+    } else if path.starts_with('/') {
+        format!("/{}", path.trim_start_matches('/'))
+    } else {
+        path.to_string()
+    };
+
+    if normalized == "/" {
+        return normalized;
+    }
+
+    if let Some(home) = home_dir() {
+        let home = home.to_string_lossy().to_string();
+        if normalized == home {
+            return String::from("~");
+        }
+        let with_slash = format!("{home}/");
+        if let Some(rest) = normalized.strip_prefix(&with_slash) {
+            return format!("~/{rest}");
+        }
+    }
+
+    let path = Path::new(&normalized);
+    let mut parts = path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    if parts.len() > 4 {
+        let tail = parts.split_off(parts.len() - 4);
+        return format!("…/{}", tail.join("/"));
+    }
+
+    normalized
 }
