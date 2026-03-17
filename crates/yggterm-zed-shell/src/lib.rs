@@ -73,6 +73,20 @@ pub fn shell_plan() -> ZedShellPlan {
     ZedShellPlan::default()
 }
 
+fn ui_palette(colors: &theme::ThemeColors) -> yggterm_ui::UiPalette {
+    yggterm_ui::UiPalette {
+        window_background: colors.background,
+        border: colors.border,
+        border_variant: colors.border_variant,
+        border_focused: colors.border_focused,
+        surface_background: colors.surface_background,
+        element_background: colors.element_background,
+        text: colors.text,
+        text_muted: colors.text_muted,
+        text_accent: colors.text_accent,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ShellBootstrap {
     pub tree: SessionNode,
@@ -964,6 +978,7 @@ impl GpuiShell {
     }
 
     fn titlebar_left(&self, cx: &mut Context<Self>) -> AnyElement {
+        let palette = ui_palette(&cx.theme().colors());
         h_flex()
             .gap_2()
             .items_center()
@@ -979,7 +994,7 @@ impl GpuiShell {
                         self.server.active_view_mode() == WorkspaceViewMode::Rendered,
                         cx.listener(|this, state, _, cx| {
                             this.set_view_mode(
-                                if *state == ui::ToggleState::Selected {
+                                if *state == yggterm_ui::ToggleState::Selected {
                                     WorkspaceViewMode::Rendered
                                 } else {
                                     WorkspaceViewMode::Terminal
@@ -987,7 +1002,7 @@ impl GpuiShell {
                                 cx,
                             );
                         }),
-                        &cx.theme().colors(),
+                        &palette,
                     ))
                     .child(
                         self.chrome_icon(
@@ -1003,6 +1018,7 @@ impl GpuiShell {
     }
 
     fn titlebar_right(&self, cx: &mut Context<Self>) -> AnyElement {
+        let palette = ui_palette(&cx.theme().colors());
         h_flex()
             .gap_1()
             .items_center()
@@ -1022,8 +1038,11 @@ impl GpuiShell {
                 )
             })
             .child(
-                yggterm_ui::titlebar_icon_button("titlebar-connect-ssh", IconName::Server)
-                    .tooltip(Tooltip::text("Connect SSH Session"))
+                yggterm_ui::titlebar_icon_button(
+                    "titlebar-connect-ssh",
+                    yggterm_ui::TitlebarIcon::ConnectSsh,
+                    &palette,
+                )
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.connect_ssh_target(0, cx);
                     })),
@@ -1381,6 +1400,7 @@ impl GpuiShell {
     }
 
     fn viewport(&mut self, cx: &mut Context<Self>, colors: &theme::ThemeColors) -> AnyElement {
+        let palette = ui_palette(colors);
         let selected_path = self
             .active_session()
             .map(|session| match session.source {
@@ -1405,7 +1425,7 @@ impl GpuiShell {
                     },
                     &session.terminal_lines,
                     Some(&session.status_line),
-                    colors,
+                    &palette,
                 ),
                 yggterm_ui::terminal_surface_card(
                     "Ghostty Integration",
@@ -1423,7 +1443,7 @@ impl GpuiShell {
                         &self.bootstrap.ghostty_bridge_detail,
                     ],
                     Some(self.active_mode_label()),
-                    colors,
+                    &palette,
                 ),
             ],
             Some(session) => {
@@ -1435,7 +1455,7 @@ impl GpuiShell {
                     preview_query.as_str(),
                     self.preview_cache.visible_blocks.len(),
                     session.preview.blocks.len(),
-                    colors,
+                    &palette,
                 ));
                 if self.preview_cache.visible_blocks.is_empty() {
                     blocks.push(yggterm_ui::terminal_surface_card(
@@ -1445,7 +1465,7 @@ impl GpuiShell {
                             "Clear the search field to return to the full transcript.",
                         ],
                         Some("search"),
-                        colors,
+                        &palette,
                     ));
                 } else {
                     blocks.push(
@@ -1487,7 +1507,7 @@ impl GpuiShell {
                     &self.bootstrap.ghostty_bridge_detail,
                 ],
                 Some("idle"),
-                colors,
+                &palette,
             )],
         };
         if cfg!(debug_assertions) {
@@ -1882,6 +1902,7 @@ impl GpuiShell {
         cx: &mut Context<Self>,
         colors: &theme::ThemeColors,
     ) -> AnyElement {
+        let palette = ui_palette(colors);
         div()
             .cursor(CursorStyle::PointingHand)
             .on_mouse_down(
@@ -1900,7 +1921,7 @@ impl GpuiShell {
                 block.folded,
                 query,
                 &block.lines,
-                colors,
+                &palette,
             ))
             .into_any_element()
     }

@@ -9,5 +9,3 @@ license = "GPL-3.0-or-later"
 yggterm-core = { path = "../yggterm-core" }
 anyhow.workspace = true
 gpui = { path = "../../../zed/crates/gpui", default-features = false, features = ["wayland", "x11"] }
-theme = { path = "../../../zed/crates/theme" }
-ui = { path = "../../../zed/crates/ui" }
