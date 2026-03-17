@@ -11,9 +11,12 @@ use gpui::{
 use gpui_platform::application;
 use serde::{Deserialize, Serialize};
 use settings::Settings;
+use std::collections::VecDeque;
 use std::fs;
 use std::path::PathBuf;
+use std::time::Instant;
 use theme::{ActiveTheme, Appearance, ThemeRegistry, ThemeSelection, ThemeSettings};
+use time::OffsetDateTime;
 use ui::{
     Button, ButtonCommon, ButtonSize, ButtonStyle, Clickable, Color, ContextMenu, Disableable,
     Disclosure, Divider, FixedWidth, Icon, IconButton, IconButtonShape, IconName, IconSize, Label,
@@ -281,6 +284,14 @@ struct DockEntry {
     body: &'static str,
 }
 
+#[derive(Clone, Debug)]
+struct DebugTelemetry {
+    last_frame_at: Option<Instant>,
+    last_log_at: Option<Instant>,
+    smoothed_fps: f32,
+    last_render_ms: f32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DragTarget {
     Sidebar,
@@ -323,6 +334,8 @@ struct GpuiShell {
     active_panel_drag: Option<PanelDrag>,
     titlebar_should_move: bool,
     last_action: String,
+    debug_telemetry: DebugTelemetry,
+    debug_logs: VecDeque<String>,
 }
 
 impl GpuiShell {
@@ -389,6 +402,13 @@ impl GpuiShell {
             active_panel_drag: None,
             titlebar_should_move: false,
             last_action: "ready".to_string(),
+            debug_telemetry: DebugTelemetry {
+                last_frame_at: None,
+                last_log_at: None,
+                smoothed_fps: 0.0,
+                last_render_ms: 0.0,
+            },
+            debug_logs: VecDeque::new(),
         }
     }
 
@@ -407,8 +427,71 @@ impl GpuiShell {
     }
 
     fn set_last_action(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
-        self.last_action = message.into();
+        let message = message.into();
+        self.last_action = message.clone();
+        self.push_debug_log(message);
         cx.notify();
+    }
+
+    fn push_debug_log(&mut self, message: impl Into<String>) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let timestamp = OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| "unknown".to_string());
+        self.debug_logs
+            .push_front(format!("{timestamp}  {}", message.into()));
+        while self.debug_logs.len() > 48 {
+            self.debug_logs.pop_back();
+        }
+    }
+
+    fn update_debug_telemetry(&mut self) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let now = Instant::now();
+        if let Some(last_frame_at) = self.debug_telemetry.last_frame_at {
+            let frame_ms = now.duration_since(last_frame_at).as_secs_f32() * 1000.0;
+            if frame_ms > 0.0 {
+                let fps = 1000.0 / frame_ms;
+                self.debug_telemetry.smoothed_fps = if self.debug_telemetry.smoothed_fps == 0.0 {
+                    fps
+                } else {
+                    self.debug_telemetry.smoothed_fps * 0.85 + fps * 0.15
+                };
+            }
+        }
+        self.debug_telemetry.last_frame_at = Some(now);
+    }
+
+    fn record_render_cost(&mut self, started_at: Instant) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        self.debug_telemetry.last_render_ms = started_at.elapsed().as_secs_f32() * 1000.0;
+        let should_log = self
+            .debug_telemetry
+            .last_log_at
+            .is_none_or(|last_log_at| last_log_at.elapsed().as_millis() >= 800);
+        if should_log {
+            self.debug_telemetry.last_log_at = Some(Instant::now());
+            let preview_blocks = self
+                .active_session()
+                .map(|session| session.preview.blocks.len())
+                .unwrap_or(0);
+            self.push_debug_log(format!(
+                "fps {:.1} render {:.2}ms preview_blocks={} mode={}",
+                self.debug_telemetry.smoothed_fps,
+                self.debug_telemetry.last_render_ms,
+                preview_blocks,
+                match self.server.active_view_mode() {
+                    WorkspaceViewMode::Terminal => "terminal",
+                    WorkspaceViewMode::Rendered => "preview",
+                }
+            ));
+        }
     }
 
     fn save_ui_config(&mut self) {
@@ -718,6 +801,16 @@ impl GpuiShell {
             .gap_1()
             .items_center()
             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .when(cfg!(debug_assertions), |this| {
+                this.child(
+                    Label::new(format!(
+                        "{:.1} fps  {:.2} ms",
+                        self.debug_telemetry.smoothed_fps, self.debug_telemetry.last_render_ms,
+                    ))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                )
+            })
             .child(
                 yggterm_ui::titlebar_icon_button("titlebar-connect-ssh", IconName::Server)
                     .tooltip(Tooltip::text("Connect SSH Session"))
@@ -1249,20 +1342,17 @@ impl GpuiShell {
             .flex_col()
             .bg(colors.panel_background)
             .child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .child(
-                        ListHeader::new(match self.selected_right_panel {
-                            RightPanel::Metadata => "Session Metadata",
+                div().px_3().py_2().child(
+                    ListHeader::new(match self.selected_right_panel {
+                        RightPanel::Metadata => "Session Metadata",
+                    })
+                    .start_slot(
+                        Icon::new(match self.selected_right_panel {
+                            RightPanel::Metadata => IconName::Info,
                         })
-                        .start_slot(
-                            Icon::new(match self.selected_right_panel {
-                                RightPanel::Metadata => IconName::Info,
-                            })
-                            .size(IconSize::Small),
-                        ),
+                        .size(IconSize::Small),
                     ),
+                ),
             )
             .child(Divider::horizontal())
             .child(
@@ -1277,24 +1367,6 @@ impl GpuiShell {
                         RightPanel::Metadata => metadata_rows
                             .iter()
                             .map(|entry| metadata_row(entry.label, entry.value.clone()))
-                            .chain([
-                                Divider::horizontal().inset().into_any_element(),
-                                ListSubHeader::new("Next Lift")
-                                    .left_icon(Some(IconName::ToolHammer))
-                                    .end_slot(
-                                        Label::new("from Zed")
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted)
-                                            .into_any_element(),
-                                    )
-                                    .into_any_element(),
-                                Label::new(
-                                    "The sidebar now follows a codex-session-tui style browser model, but pane groups and true Ghostty surfaces still need upstream-backed integration.",
-                                )
-                                .size(LabelSize::Small)
-                                .color(Color::Default)
-                                .into_any_element(),
-                            ])
                             .collect::<Vec<_>>(),
                     }),
             )
@@ -1303,6 +1375,11 @@ impl GpuiShell {
 
     fn bottom_dock(&self, cx: &mut Context<Self>, colors: &theme::ThemeColors) -> AnyElement {
         let selected = self.selected_dock();
+        let debug_log_lines = if cfg!(debug_assertions) && selected.title == "Logs" {
+            self.debug_logs.iter().cloned().collect::<Vec<_>>()
+        } else {
+            vec![selected.body.to_string()]
+        };
 
         div()
             .w_full()
@@ -1352,13 +1429,28 @@ impl GpuiShell {
                     .px_4()
                     .py_3()
                     .gap_2()
-                    .child(Label::new(selected.body).size(LabelSize::Small).color(Color::Default))
-                    .child(
-                        Label::new(
-                            "Mock dock content stays fake on purpose until the Zed shell shape is stable enough to host real terminal surfaces.",
-                        )
-                        .size(LabelSize::Small)
-                        .color(Color::Default),
+                    .children(
+                        debug_log_lines
+                            .into_iter()
+                            .map(|line| {
+                                Label::new(line)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Default)
+                                    .into_any_element()
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .when(
+                        !cfg!(debug_assertions) && selected.title == "Logs",
+                        |this| {
+                            this.child(
+                                Label::new(
+                                    "Telemetry is debug-only so release builds keep the status bar quiet.",
+                                )
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                            )
+                        },
                     ),
             )
             .into_any_element()
@@ -1434,6 +1526,16 @@ impl GpuiShell {
             h_flex()
                 .gap_2()
                 .items_center()
+                .when(cfg!(debug_assertions), |this| {
+                    this.child(
+                        Label::new(format!(
+                            "fps {:.1} render {:.2}ms",
+                            self.debug_telemetry.smoothed_fps, self.debug_telemetry.last_render_ms,
+                        ))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    )
+                })
                 .child(
                     Label::new(match self.server.active_view_mode() {
                         WorkspaceViewMode::Terminal => "terminal",
@@ -1830,12 +1932,14 @@ impl GpuiShell {
 
 impl Render for GpuiShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let render_started_at = Instant::now();
+        self.update_debug_telemetry();
         let colors = cx.theme().colors().clone();
         self.server.sync_theme(match cx.theme().appearance {
             Appearance::Light => UiTheme::ZedLight,
             Appearance::Dark => UiTheme::ZedDark,
         });
-        yggterm_client_side_decorations(
+        let decorations = yggterm_client_side_decorations(
             div()
                 .track_focus(&self.focus_handle)
                 .on_action(cx.listener(|this, _: &OpenCommandPalette, window, cx| {
@@ -1897,7 +2001,9 @@ impl Render for GpuiShell {
             window,
             cx,
             Tiling::default(),
-        )
+        );
+        self.record_render_cost(render_started_at);
+        decorations
     }
 }
 

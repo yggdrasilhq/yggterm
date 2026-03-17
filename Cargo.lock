@@ -11526,6 +11526,7 @@ dependencies = [
  "serde",
  "settings",
  "theme",
+ "time",
  "toml 0.8.23",
  "ui",
  "workspace",
