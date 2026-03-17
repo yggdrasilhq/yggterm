@@ -1,8 +1,17 @@
+mod browser;
+mod server;
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+pub use browser::{BrowserRow, BrowserRowKind, SessionBrowserState};
+pub use server::{
+    ManagedSessionView, SessionMetadataEntry, SessionRenderedSection, TerminalBackend,
+    WorkspaceViewMode, YggtermServer,
+};
 
 pub const ENV_YGGTERM_HOME: &str = "YGGTERM_HOME";
 pub const DEFAULT_HOME_DIRNAME: &str = ".yggterm";
