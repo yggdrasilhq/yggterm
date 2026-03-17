@@ -317,7 +317,7 @@ struct DebugTelemetry {
 struct PreviewRenderCache {
     session_path: Option<String>,
     query: String,
-    visible_block_indices: Vec<usize>,
+    visible_blocks: Vec<(usize, yggterm_core::SessionPreviewBlock)>,
     hidden_blocks: usize,
     total_blocks: usize,
 }
@@ -764,7 +764,7 @@ impl GpuiShell {
         }
 
         let started_at = Instant::now();
-        let mut visible_block_indices = Vec::new();
+        let mut visible_blocks = Vec::new();
         let mut hidden_blocks = 0usize;
         if let Some(session) = active_session.as_ref() {
             let mut matching = session
@@ -774,25 +774,25 @@ impl GpuiShell {
                 .enumerate()
                 .filter_map(|(ix, block)| {
                     self.preview_block_matches(block, query.as_str())
-                        .then_some(ix)
+                        .then_some((ix, block.clone()))
                 })
                 .collect::<Vec<_>>();
             hidden_blocks = matching.len().saturating_sub(Self::PREVIEW_RENDER_LIMIT);
             if hidden_blocks > 0 {
                 matching.drain(0..hidden_blocks);
             }
-            visible_block_indices = matching;
+            visible_blocks = matching;
         }
 
         self.preview_cache = PreviewRenderCache {
             session_path,
             query,
-            visible_block_indices,
+            visible_blocks,
             hidden_blocks,
             total_blocks,
         };
         self.preview_list_state
-            .reset(self.preview_cache.visible_block_indices.len());
+            .reset(self.preview_cache.visible_blocks.len());
         started_at.elapsed().as_secs_f32() * 1000.0
     }
 
@@ -1216,8 +1216,7 @@ impl GpuiShell {
                                     this.browser
                                         .rows()
                                         .get(ix)
-                                        .cloned()
-                                        .map(|row| this.session_tree_row(ix, &row, cx))
+                                        .map(|row| this.session_tree_row(ix, row, cx))
                                 })
                                 .collect::<Vec<_>>()
                         }),
@@ -1362,14 +1361,13 @@ impl GpuiShell {
             ],
             Some(session) => {
                 total_preview_blocks = session.preview.blocks.len();
-                visible_preview_blocks = self.preview_cache.visible_block_indices.len();
+                visible_preview_blocks = self.preview_cache.visible_blocks.len();
                 let preview_build_started_at = Instant::now();
                 let mut blocks = Vec::with_capacity(3);
                 blocks.push(yggterm_ui::preview_summary_card(
                     &session.preview.summary,
                     preview_query.as_str(),
-                    self.preview_cache.visible_block_indices.len()
-                        + self.preview_cache.hidden_blocks,
+                    self.preview_cache.visible_blocks.len() + self.preview_cache.hidden_blocks,
                     session.preview.blocks.len(),
                     colors,
                 ));
@@ -1384,7 +1382,7 @@ impl GpuiShell {
                         colors,
                     ));
                 }
-                if self.preview_cache.visible_block_indices.is_empty() {
+                if self.preview_cache.visible_blocks.is_empty() {
                     blocks.push(yggterm_ui::terminal_surface_card(
                         "No Preview Matches",
                         &[
@@ -1404,23 +1402,13 @@ impl GpuiShell {
                                     self.preview_list_state.clone(),
                                     cx.processor(|this, ix: usize, _window, cx| {
                                         let colors = cx.theme().colors().clone();
-                                        let Some(session) = this.active_session().cloned() else {
-                                            return div().into_any_element();
-                                        };
-                                        let Some(block_ix) = this
-                                            .preview_cache
-                                            .visible_block_indices
-                                            .get(ix)
-                                            .copied()
-                                        else {
-                                            return div().into_any_element();
-                                        };
-                                        let Some(block) = session.preview.blocks.get(block_ix)
+                                        let Some((block_ix, block)) =
+                                            this.preview_cache.visible_blocks.get(ix)
                                         else {
                                             return div().into_any_element();
                                         };
                                         this.session_preview_block_element(
-                                            block_ix,
+                                            *block_ix,
                                             block,
                                             this.preview_cache.query.as_str(),
                                             cx,
