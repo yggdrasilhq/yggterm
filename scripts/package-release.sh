@@ -5,11 +5,13 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DIST_DIR="${ROOT_DIR}/dist"
 BIN_PATH="${ROOT_DIR}/target/release/yggterm"
 TARGET_LABEL="${1:-linux-x86_64}"
+RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.93.0}"
+CARGO_CMD=(cargo "+${RUSTUP_TOOLCHAIN}")
 
 mkdir -p "$DIST_DIR"
 
 pushd "$ROOT_DIR" >/dev/null
-cargo build --release
+"${CARGO_CMD[@]}" build --release
 popd >/dev/null
 
 cp "$BIN_PATH" "$DIST_DIR/yggterm-${TARGET_LABEL}"

@@ -7,6 +7,8 @@ PREFIX_DIR="${ROOT_DIR}/.yggterm-state/ghostty-prefix"
 LIB_DIR="${PREFIX_DIR}/lib"
 TARGET_LABEL="${1:-linux-x86_64}"
 PKG_DIR="${DIST_DIR}/yggterm-${TARGET_LABEL}-ghostty-ffi"
+RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.93.0}"
+CARGO_CMD=(cargo "+${RUSTUP_TOOLCHAIN}")
 
 if [[ ! -d "$LIB_DIR" ]]; then
   echo "Ghostty lib dir not found: $LIB_DIR" >&2
@@ -19,7 +21,7 @@ mkdir -p "$DIST_DIR"
 pushd "$ROOT_DIR" >/dev/null
 GHOSTTY_DIR="${ROOT_DIR}/../ghostty" \
 GHOSTTY_LIB_DIR="$LIB_DIR" \
-cargo build --release --features ghostty-ffi
+"${CARGO_CMD[@]}" build --release --features ghostty-ffi
 popd >/dev/null
 
 rm -rf "$PKG_DIR"

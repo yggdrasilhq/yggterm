@@ -1,10 +1,10 @@
 Source: yggterm
 Section: utils
 Priority: optional
-Maintainer: Avikalpa Kundu <avi@gour.top>
+Maintainer: Yggdrasil HQ <opensource@yggdrasilhq.invalid>
 Build-Depends: debhelper-compat (= 13), cargo, rustc
 Standards-Version: 4.6.2
-Homepage: https://github.com/avikalpa/yggterm
+Homepage: https://github.com/yggdrasilhq/yggterm
 Rules-Requires-Root: no
 
 Package: yggterm
