@@ -438,8 +438,14 @@ impl GpuiShell {
                 }
                 BrowserRowKind::Session => {
                     self.browser.select_path(row.full_path.clone());
-                    self.server.open_or_focus_session(&row.full_path);
-                    self.server.set_view_mode(WorkspaceViewMode::Rendered);
+                    self.server.open_or_focus_session(
+                        &row.full_path,
+                        row.session_id.as_deref(),
+                        row.session_cwd.as_deref(),
+                    );
+                    if self.server.active_view_mode() == WorkspaceViewMode::Terminal {
+                        self.server.request_terminal_launch_for_active();
+                    }
                     self.set_last_action(format!("session {}", row.label), cx);
                 }
             }
@@ -461,6 +467,9 @@ impl GpuiShell {
 
     fn set_view_mode(&mut self, mode: WorkspaceViewMode, cx: &mut Context<Self>) {
         self.server.set_view_mode(mode);
+        if mode == WorkspaceViewMode::Terminal {
+            self.server.request_terminal_launch_for_active();
+        }
         self.set_last_action(
             match mode {
                 WorkspaceViewMode::Terminal => "terminal view",
@@ -667,13 +676,30 @@ impl GpuiShell {
 
     fn titlebar_left(&self, cx: &mut Context<Self>) -> AnyElement {
         h_flex()
+            .gap_2()
             .items_center()
             .justify_start()
             .child(
                 h_flex()
-                    .gap_1()
+                    .gap_2()
                     .items_center()
                     .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(yggterm_ui::titlebar_mode_toggle(
+                        "titlebar-preview-toggle",
+                        "Preview",
+                        self.server.active_view_mode() == WorkspaceViewMode::Rendered,
+                        cx.listener(|this, state, _, cx| {
+                            this.set_view_mode(
+                                if *state == ui::ToggleState::Selected {
+                                    WorkspaceViewMode::Rendered
+                                } else {
+                                    WorkspaceViewMode::Terminal
+                                },
+                                cx,
+                            );
+                        }),
+                        &cx.theme().colors(),
+                    ))
                     .child(
                         self.chrome_icon(
                             "toggle-nav",
@@ -1022,10 +1048,6 @@ impl GpuiShell {
             .unwrap_or_else(|| "~/.yggterm/sessions".to_string());
         let active_session = self.active_session();
         let preview_query = self.preview_query().trim().to_string();
-        let mode_label = match self.server.active_view_mode() {
-            WorkspaceViewMode::Terminal => "Terminal View",
-            WorkspaceViewMode::Rendered => "Rendered View",
-        };
 
         div()
             .flex_1()
@@ -1111,19 +1133,6 @@ impl GpuiShell {
                                     })),
                                 )
                             })
-                            .child(
-                                Button::new("runtime-mode", mode_label)
-                                    .icon(IconName::ToolTerminal)
-                                    .style(ButtonStyle::Subtle)
-                                    .size(ButtonSize::Compact)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        let next_mode = match this.server.active_view_mode() {
-                                            WorkspaceViewMode::Terminal => WorkspaceViewMode::Rendered,
-                                            WorkspaceViewMode::Rendered => WorkspaceViewMode::Terminal,
-                                        };
-                                        this.set_view_mode(next_mode, cx);
-                                    })),
-                            )
                             .child(
                                 self.chrome_icon("viewport-menu", IconName::Ellipsis, false)
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -1481,9 +1490,12 @@ impl GpuiShell {
     ) -> AnyElement {
         div()
             .cursor(CursorStyle::PointingHand)
-            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                this.toggle_preview_block(block_ix, cx);
-            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.toggle_preview_block(block_ix, cx);
+                }),
+            )
             .child(yggterm_ui::chat_preview_card(
                 block.role,
                 &block.timestamp,
@@ -1783,6 +1795,27 @@ impl GpuiShell {
                     .size(LabelSize::Small)
                     .color(Color::Default),
             )
+            .when(is_session, |this| {
+                this.end_slot(
+                    Label::new(
+                        row.session_id
+                            .as_deref()
+                            .map(|session_id| {
+                                session_id
+                                    .chars()
+                                    .rev()
+                                    .take(8)
+                                    .collect::<String>()
+                                    .chars()
+                                    .rev()
+                                    .collect::<String>()
+                            })
+                            .unwrap_or_default(),
+                    )
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+                )
+            })
             .when(!row.host_label.is_empty(), |this| {
                 this.end_slot(
                     Label::new(row.host_label.clone())

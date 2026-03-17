@@ -1,4 +1,4 @@
-use crate::{SessionNode, resolve_codex_sessions_root};
+use crate::SessionNode;
 use dirs::home_dir;
 use std::collections::HashSet;
 use std::path::Path;
@@ -19,6 +19,8 @@ pub struct BrowserRow {
     pub host_label: String,
     pub descendant_sessions: usize,
     pub expanded: bool,
+    pub session_id: Option<String>,
+    pub session_cwd: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -145,8 +147,7 @@ fn flatten_rows(
 ) -> bool {
     let is_session = node.children.is_empty();
     let full_path = node.path.display().to_string();
-    let is_codex_session = is_session && is_codex_leaf(node, &full_path);
-    if !matches_filter(node, filter) || (is_session && !is_codex_session) {
+    if !matches_filter(node, filter) || (is_session && node.session_id.is_none()) {
         return false;
     }
 
@@ -167,9 +168,11 @@ fn flatten_rows(
             detail_label: detail_label_for_row(node, &full_path, is_session),
             full_path: full_path.clone(),
             depth,
-            host_label: host_label_for_path(&full_path, depth),
+            host_label: host_label_for_row(node, depth),
             descendant_sessions,
             expanded,
+            session_id: node.session_id.clone(),
+            session_cwd: node.cwd.clone(),
         });
     }
 
@@ -199,14 +202,18 @@ fn format_row_label(
 
 fn detail_label_for_row(node: &SessionNode, full_path: &str, is_session: bool) -> String {
     if is_session {
-        browser_display_path(
-            node.path
-                .parent()
-                .and_then(|parent| parent.to_str())
-                .unwrap_or(full_path),
-        )
+        match (node.cwd.as_deref(), node.session_id.as_deref()) {
+            (Some(cwd), Some(session_id)) => {
+                format!("{} · {}", browser_display_path(cwd), session_id)
+            }
+            (Some(cwd), None) => browser_display_path(cwd),
+            _ => browser_display_path(full_path),
+        }
     } else {
-        browser_display_path(full_path)
+        node.cwd
+            .as_deref()
+            .map(browser_display_path)
+            .unwrap_or_else(|| browser_display_path(full_path))
     }
 }
 
@@ -228,41 +235,18 @@ fn matches_filter(node: &SessionNode, filter: &str) -> bool {
 
 fn count_leaf_sessions(node: &SessionNode) -> usize {
     if node.children.is_empty() {
-        return usize::from(is_codex_leaf(node, &node.path.display().to_string()));
+        return usize::from(node.session_id.is_some());
     }
 
     node.children.iter().map(count_leaf_sessions).sum()
 }
 
-fn is_codex_leaf(node: &SessionNode, full_path: &str) -> bool {
-    let name = node.name.as_str();
-    let lower_name = name.to_ascii_lowercase();
-    let lower_path = full_path.to_ascii_lowercase();
-    lower_name.contains("codex") || lower_path.contains("codex") || looks_like_uuid(name)
-}
-
-fn looks_like_uuid(value: &str) -> bool {
-    value.len() == 36
-        && value.chars().enumerate().all(|(ix, ch)| match ix {
-            8 | 13 | 18 | 23 => ch == '-',
-            _ => ch.is_ascii_hexdigit(),
-        })
-}
-
-fn host_label_for_path(path: &str, depth: usize) -> String {
+fn host_label_for_row(node: &SessionNode, depth: usize) -> String {
     if depth == 0 || depth == 1 {
         return String::new();
     }
-    if path.starts_with("live::") {
+    if node.path.display().to_string().starts_with("live::") {
         return "live".to_string();
-    }
-    if let Ok(codex_root) = resolve_codex_sessions_root() {
-        if path.starts_with(&codex_root.display().to_string()) {
-            return "local".to_string();
-        }
-    }
-    if path.contains("local") {
-        return "local".to_string();
     }
     String::new()
 }
