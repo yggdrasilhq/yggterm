@@ -318,7 +318,6 @@ struct PreviewRenderCache {
     session_path: Option<String>,
     query: String,
     visible_blocks: Vec<(usize, yggterm_core::SessionPreviewBlock)>,
-    hidden_blocks: usize,
     total_blocks: usize,
 }
 
@@ -373,8 +372,6 @@ struct GpuiShell {
 }
 
 impl GpuiShell {
-    const PREVIEW_RENDER_LIMIT: usize = 20;
-
     fn new(
         bootstrap: ShellBootstrap,
         ui_config: ShellUiConfig,
@@ -765,9 +762,8 @@ impl GpuiShell {
 
         let started_at = Instant::now();
         let mut visible_blocks = Vec::new();
-        let mut hidden_blocks = 0usize;
         if let Some(session) = active_session.as_ref() {
-            let mut matching = session
+            visible_blocks = session
                 .preview
                 .blocks
                 .iter()
@@ -777,18 +773,12 @@ impl GpuiShell {
                         .then_some((ix, block.clone()))
                 })
                 .collect::<Vec<_>>();
-            hidden_blocks = matching.len().saturating_sub(Self::PREVIEW_RENDER_LIMIT);
-            if hidden_blocks > 0 {
-                matching.drain(0..hidden_blocks);
-            }
-            visible_blocks = matching;
         }
 
         self.preview_cache = PreviewRenderCache {
             session_path,
             query,
             visible_blocks,
-            hidden_blocks,
             total_blocks,
         };
         self.preview_list_state
@@ -1367,21 +1357,10 @@ impl GpuiShell {
                 blocks.push(yggterm_ui::preview_summary_card(
                     &session.preview.summary,
                     preview_query.as_str(),
-                    self.preview_cache.visible_blocks.len() + self.preview_cache.hidden_blocks,
+                    self.preview_cache.visible_blocks.len(),
                     session.preview.blocks.len(),
                     colors,
                 ));
-                if self.preview_cache.hidden_blocks > 0 {
-                    blocks.push(yggterm_ui::terminal_surface_card(
-                        "Preview Window",
-                        &[format!(
-                            "{} older conversation blocks are hidden to keep preview rendering responsive.",
-                            self.preview_cache.hidden_blocks
-                        )],
-                        Some("windowed"),
-                        colors,
-                    ));
-                }
                 if self.preview_cache.visible_blocks.is_empty() {
                     blocks.push(yggterm_ui::terminal_surface_card(
                         "No Preview Matches",
