@@ -8,3 +8,5 @@ license = "Apache-2.0"
 [dependencies]
 yggterm-core = { path = "../yggterm-core" }
 anyhow.workspace = true
+gpui = { path = "../../../zed/crates/gpui", default-features = false, features = ["wayland", "x11"] }
+ui = { path = "../../../zed/crates/ui" }
