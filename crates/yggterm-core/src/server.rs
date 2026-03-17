@@ -327,8 +327,7 @@ impl YggtermServer {
                                 format!("ghostty pid {pid}"),
                                 "server launched the terminal in an external Ghostty window"
                                     .to_string(),
-                                "the embedded libghostty surface is the next integration step"
-                                    .to_string(),
+                                embedded_surface_note(session.bridge_available),
                             ];
                         }
                         Err(error) => {
@@ -606,7 +605,7 @@ fn build_session(
             format!("$ codex resume {session_id}"),
             format!("Ghostty terminal host: {backend_label}"),
             "yggterm server launches ghostty for terminal mode".to_string(),
-            "embedded libghostty remains the next integration step".to_string(),
+            embedded_surface_note(ghostty_bridge_enabled),
         ],
         rendered_sections: vec![
             SessionRenderedSection {
@@ -1094,6 +1093,19 @@ fn message_lines_from_payload(payload: &Value) -> Vec<String> {
         }
     }
     lines
+}
+
+fn embedded_surface_note(bridge_available: bool) -> String {
+    if !bridge_available {
+        return "libghostty is not linked in this build, so terminal mode stays on the external fallback path.".to_string();
+    }
+
+    if cfg!(target_os = "linux") {
+        "libghostty is linked, but Ghostty's current embedded surface host only exposes macOS/iOS views, so Linux still falls back to an external Ghostty window.".to_string()
+    } else {
+        "libghostty is linked and the embedded surface host remains the active integration target."
+            .to_string()
+    }
 }
 
 fn normalize_preview_text(text: &str) -> Vec<String> {

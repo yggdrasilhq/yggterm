@@ -77,6 +77,8 @@ pub struct ShellBootstrap {
     pub browser_tree: SessionNode,
     pub theme: UiTheme,
     pub ghostty_bridge_enabled: bool,
+    pub ghostty_embedded_surface_supported: bool,
+    pub ghostty_bridge_detail: String,
     pub prefer_ghostty_backend: bool,
 }
 
@@ -1280,12 +1282,16 @@ impl GpuiShell {
                                 "Ghostty Integration",
                                 &[
                                     if self.bootstrap.ghostty_bridge_enabled {
-                                        "libghostty bridge is available in this build."
+                                        if self.bootstrap.ghostty_embedded_surface_supported {
+                                            "libghostty bridge is available and the embedded surface host is enabled on this platform."
+                                        } else {
+                                            "libghostty is linked in this build, but the current upstream embedded surface host is not available on this platform."
+                                        }
                                     } else {
                                         "libghostty bridge is not linked in this build."
                                     },
                                     "The shell color scheme is synchronized to the active Zed light/dark theme.",
-                                    "The Yggterm server owns terminal launch requests and would hand live sessions to Ghostty surfaces here.",
+                                    &self.bootstrap.ghostty_bridge_detail,
                                 ],
                                 Some(self.active_mode_label()),
                                 colors,
@@ -1337,7 +1343,7 @@ impl GpuiShell {
                             "No Session Selected",
                             &[
                                 "Select a saved session from the sidebar to open its rendered preview first.",
-                                "The terminal surface lives alongside the preview and will take over this viewport once Ghostty is embedded.",
+                                &self.bootstrap.ghostty_bridge_detail,
                             ],
                             Some("idle"),
                             colors,

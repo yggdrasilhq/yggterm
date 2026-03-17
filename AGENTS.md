@@ -47,6 +47,7 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 - Use the running X11 session and screenshots of a live Zed window when validating visual changes to the scaffold.
 - Treat `libghostty` C APIs as the terminal engine contract (app/surface lifecycle, input, render/tick hooks).
 - Keep Rust-to-Ghostty interop thin and explicit via `ghostty-bridge`.
+- On Linux today, `libghostty` links but the upstream embedded surface host remains macOS/iOS-only, so external Ghostty process fallback is still the expected terminal path until upstream support changes.
 - Rust is the primary language for product code.
 - Zig is required for Ghostty integration work; prefer stable Zig releases (including official stable tarballs) for reproducible builds.
 - Quality-of-life features such as full session restore, clipboard and screenshot paste into remote sessions, and durable session metadata are first-class product goals.
