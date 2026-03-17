@@ -301,6 +301,7 @@ pub fn chat_preview_card(
     lines: &[String],
     colors: &ThemeColors,
 ) -> AnyElement {
+    const LINE_RENDER_LIMIT: usize = 8;
     let (bg, border) = match tone {
         ChatBubbleTone::User => (
             colors.text_accent.opacity(0.10),
@@ -335,9 +336,11 @@ pub fn chat_preview_card(
                     )
                 })
                 .when(!folded, |this| {
+                    let hidden_line_count = lines.len().saturating_sub(LINE_RENDER_LIMIT);
                     this.children(
                         lines
                             .iter()
+                            .take(LINE_RENDER_LIMIT)
                             .map(|line| {
                                 Label::new(line.clone())
                                     .size(LabelSize::Small)
@@ -346,6 +349,13 @@ pub fn chat_preview_card(
                             })
                             .collect::<Vec<_>>(),
                     )
+                    .when(hidden_line_count > 0, |this| {
+                        this.child(
+                            Label::new(format!("… {} more lines", hidden_line_count))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                    })
                 })
                 .child(
                     h_flex()
