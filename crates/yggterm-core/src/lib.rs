@@ -9,7 +9,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub use browser::{BrowserRow, BrowserRowKind, SessionBrowserState};
+pub use browser::{BrowserMetrics, BrowserRow, BrowserRowKind, SessionBrowserState};
 pub use server::{
     ManagedSessionView, PreviewTone, RemoteDeployState, SessionMetadataEntry, SessionPreview,
     SessionPreviewBlock, SessionRenderedSection, SessionSource, SshConnectTarget, TerminalBackend,
