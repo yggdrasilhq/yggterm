@@ -607,6 +607,16 @@ impl GpuiShell {
         self.set_last_action("terminal launch requested", cx);
     }
 
+    fn sync_terminal_window(&mut self, cx: &mut Context<Self>) {
+        let status = self.server.sync_external_terminal_window_for_active();
+        self.set_last_action(status, cx);
+    }
+
+    fn raise_terminal_window(&mut self, cx: &mut Context<Self>) {
+        let status = self.server.raise_external_terminal_window_for_active();
+        self.set_last_action(status, cx);
+    }
+
     fn preview_query(&self) -> &str {
         self.browser.filter_query()
     }
@@ -1234,6 +1244,22 @@ impl GpuiShell {
                                             .size(ButtonSize::Compact)
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.request_terminal_launch(cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("resolve-terminal-window", "Resolve Window")
+                                            .style(ButtonStyle::Subtle)
+                                            .size(ButtonSize::Compact)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.sync_terminal_window(cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("raise-terminal-window", "Focus Ghostty")
+                                            .style(ButtonStyle::Subtle)
+                                            .size(ButtonSize::Compact)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.raise_terminal_window(cx);
                                             })),
                                     )
                                 },
