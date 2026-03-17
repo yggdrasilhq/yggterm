@@ -3,7 +3,7 @@ name = "yggterm-ghostty-bridge"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-license.workspace = true
+license = "Apache-2.0"
 
 [features]
 default = []
