@@ -1,48 +1,57 @@
 # yggterm
 
-Yggdrasil Terminal (`yggterm`) is a terminal workspace for people who operate many shells at once.
-It is built around a persistent session tree in `~/.yggterm`, a desktop GUI, and an eventual Ghostty-backed terminal viewport with a Zed-inspired application shell.
+Yggdrasil Terminal (`yggterm`) is a Rust-first terminal workspace that aims to combine Ghostty terminal semantics with a GPUI shell shaped like Zed.
 
-## Status
+The product target is not "an editor with terminals". It is a remote-first terminal application with a strong sidebar, persistent session metadata, and room for many long-lived shells across different machines.
 
-`yggterm` is usable today as an early GUI session manager.
+## Product direction
 
-- It has a desktop app: `yggterm gui`
-- It persists session folders under `~/.yggterm/sessions`
-- It opens and manages live shell processes per selected session
-- It includes a settings pane, theme switching, and a session tree filter
-- It packages a Ghostty-enabled runtime path, but the center viewport is still PTY-backed UI rather than full embedded Ghostty rendering
+- GPUI is the intended app shell and Zed is the primary visual and structural reference.
+- Ghostty is the terminal engine contract.
+- The left sidebar is a vertical tree of virtual folders and sessions.
+- Sidebar nodes represent session metadata, not a direct mirror of the local filesystem.
+- Session entries may point at Codex workflows, SSH targets, local shells, and other terminal contexts.
+- Example paths should feel like `remote/prod/codex-session-tui`, `machines/pi/ghostty-admin`, or `local/design/zed-chrome-study`.
+- Restoring all sessions, durable terminal metadata, and clipboard or screenshot paste into remote sessions are explicit quality-of-life goals.
 
-## Install
+## Current status
 
-Quick install from the latest GitHub release:
+This repository is still scaffolding.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/yggdrasilhq/yggterm/main/scripts/install.sh | sh
-```
+- Rust workspace structure is in place.
+- Ghostty bridge packaging and runtime probing exist.
+- A temporary desktop shell exists for fast iteration on layout and interaction.
+- The current shell is useful for shape and workflow experiments, but it is not the final GPUI implementation yet.
+- `yggterm gui` now opens the GPUI shell prototype.
+- `yggterm gui-scaffold` keeps the older `eframe` shell available while features are being migrated.
+- The GPUI shell should prefer direct reuse of Zed crates such as `ui`, `theme`, and `settings` over local visual reimplementation.
+- Mock sidebars, tabs, docks, and bodies are acceptable only as placeholders inside Zed-derived chrome while Ghostty embedding is still pending.
 
-Installer behavior:
+When working in this repo, optimize for getting the application closer to "Zed chrome + Ghostty sessions + virtual session tree", not for deepening temporary scaffolding choices.
 
-- On Debian-like systems with `dpkg` and `sudo`, it installs the latest `.deb`
-- Otherwise it downloads the matching release tarball and installs `yggterm` into `~/.local/bin`
-- Current automated asset detection supports `Linux x86_64`
+## Why Zed
 
-Manual install from a release:
+Yggterm should inherit the parts of Zed that already work well for a dense workstation UI:
 
-1. Download a release asset from GitHub Releases.
-2. On Debian/Ubuntu/Raspberry Pi OS:
+- title bar and window chrome proportions
+- left-sidebar rhythm and hierarchy
+- pane and tab vocabulary
+- focus routing and panel behavior
+- theme and settings behavior
 
-```bash
-sudo dpkg -i yggterm_<version>_amd64.deb
-```
+The key change is that the center of the app is Ghostty sessions and session groups instead of editors and projects.
 
-3. Or install the standalone binary:
+## Session model
 
-```bash
-tar -xzf yggterm-linux-x86_64.tar.gz
-chmod +x yggterm-linux-x86_64
-mv yggterm-linux-x86_64 ~/.local/bin/yggterm
-```
+`YGGTERM_HOME` defaults to `~/.yggterm`.
+
+Today, the scaffold persists session state under `~/.yggterm/sessions`, but that storage layout is only a stepping stone. The long-term model is metadata-first: the sidebar tree should be able to describe terminal sessions that map to SSH hosts, Codex workspaces, Ghostty sessions, restore groups, and other non-file concepts.
+
+References to keep in mind while iterating:
+
+- local Zed checkout: `../zed`
+- local Ghostty checkout: `../ghostty`
+- Codex session UI reference: `~/gh/codex-session-tui`
 
 ## Usage
 
@@ -52,12 +61,12 @@ Initialize local state:
 yggterm init
 ```
 
-Create nested sessions:
+Create scaffold session entries:
 
 ```bash
-yggterm mk-session prod/api
-yggterm mk-session prod/db
-yggterm mk-session staging/web
+yggterm mk-session remote/prod/codex-session-tui
+yggterm mk-session remote/prod/ghostty-admin
+yggterm mk-session local/design/zed-chrome-study
 ```
 
 Print the stored tree:
@@ -66,53 +75,24 @@ Print the stored tree:
 yggterm tree
 ```
 
-Launch the desktop app:
-
-```bash
-yggterm gui
-```
-
-Inspect runtime/backend status:
+Inspect runtime and Ghostty bridge status:
 
 ```bash
 yggterm doctor
 ```
 
-Example `doctor` output for a packaged build:
+Launch the current desktop scaffold:
 
-```text
-Host platform: Linux
-YGGTERM_HOME: /home/user/.yggterm
-Ghostty header discovered: not found
-Ghostty bridge init status: enabled
+```bash
+yggterm gui
 ```
 
-Notes:
-
-- `Ghostty header discovered` may be `not found` on installed machines; that is fine
-- What matters for end users is whether the Ghostty bridge runtime is enabled
-
-## GUI behavior
-
-Current GUI features:
-
-- left session tree with filter and quick session creation
-- top chrome with hamburger menu actions
-- persisted settings in `~/.yggterm/settings.json`
-- light and dark Zed-inspired themes
-- live shell processes in the main workspace
-- multiple open terminal tabs with focus and close controls
-
-Current limitation:
-
-- the terminal viewport is not yet drawing embedded Ghostty surfaces
-- Ghostty is packaged and linked for runtime, but the actual center-pane rendering integration is still in progress
-
-## Build From Source
+## Build from source
 
 Requirements:
 
 - Rust stable
+- Rust `1.92+` is required for the local GPUI/Zed dependency stack. In this environment `cargo +1.93.0 build` is the known-good path.
 - Zig stable
 - adjacent checkouts of `../ghostty` and `../zed` for integration work
 
@@ -128,19 +108,25 @@ Build Ghostty runtime artifacts:
 ./scripts/build-ghostty-lib.sh
 ```
 
-Build release:
+Build the workspace:
 
 ```bash
-cargo build --release
+cargo +1.93.0 build
 ```
 
 Run locally:
 
 ```bash
-./target/release/yggterm gui
+cargo +1.93.0 run -- gui
 ```
 
-## Release Artifacts
+Run the older scaffold:
+
+```bash
+cargo +1.93.0 run -- gui-scaffold
+```
+
+## Release artifacts
 
 Release packaging is generated from this repository and written to `dist/`.
 
@@ -169,14 +155,14 @@ Build the FFI bundle archive:
 ./scripts/package-release-ffi.sh linux-x86_64
 ```
 
-## Repository Layout
+## Repository layout
 
-- `apps/yggterm`: CLI entrypoint and desktop app
+- `apps/yggterm`: CLI entrypoint and current desktop scaffold
 - `crates/yggterm-core`: session model and settings persistence
 - `crates/yggterm-ui`: shared UI helpers
 - `crates/yggterm-platform`: platform detection
 - `crates/yggterm-ghostty-bridge`: Ghostty runtime bridge
-- `crates/yggterm-zed-shell`: Zed-integration planning surface
+- `crates/yggterm-zed-shell`: Zed integration planning surface
 - `scripts/`: packaging, installer, and toolchain helpers
 - `debian/`: Debian package metadata
 

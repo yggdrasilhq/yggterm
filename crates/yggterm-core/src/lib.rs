@@ -46,9 +46,9 @@ impl Default for AppSettings {
             theme: UiTheme::ZedLight,
             show_tree: true,
             show_settings: false,
-            tree_width: 320.0,
+            tree_width: 300.0,
             terminal_font_size: 13.0,
-            ui_font_size: 15.0,
+            ui_font_size: 14.0,
             prefer_ghostty_backend: true,
         }
     }

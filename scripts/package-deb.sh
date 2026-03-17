@@ -6,7 +6,9 @@ DIST_DIR="${ROOT_DIR}/dist"
 BIN_PATH="${ROOT_DIR}/target/release/yggterm"
 DEB_REVISION="${DEB_REVISION:-1}"
 ARCH="$(dpkg-architecture -qDEB_HOST_ARCH)"
-VERSION="$(cargo pkgid -p yggterm | sed 's/.*#//')"
+RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.93.0}"
+CARGO_CMD=(cargo "+${RUSTUP_TOOLCHAIN}")
+VERSION="$("${CARGO_CMD[@]}" pkgid -p yggterm | sed 's/.*#//')"
 DEB_VERSION="${VERSION}-${DEB_REVISION}"
 PKG_NAME="yggterm"
 STAGE_DIR="${ROOT_DIR}/.yggterm-state/deb/${PKG_NAME}_${DEB_VERSION}_${ARCH}"
@@ -21,7 +23,7 @@ if [[ ! -f "${GHOSTTY_LIB_DIR}/libghostty.so" ]]; then
 fi
 
 pushd "$ROOT_DIR" >/dev/null
-GHOSTTY_DIR="${GHOSTTY_DIR}" GHOSTTY_LIB_DIR="${GHOSTTY_LIB_DIR}" cargo build --release --features ghostty-ffi
+GHOSTTY_DIR="${GHOSTTY_DIR}" GHOSTTY_LIB_DIR="${GHOSTTY_LIB_DIR}" "${CARGO_CMD[@]}" build --release --features ghostty-ffi
 popd >/dev/null
 
 rm -rf "$STAGE_DIR"

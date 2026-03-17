@@ -1,3 +1,11 @@
+yggterm (0.1.4-1) unstable; urgency=medium
+
+  * Stabilize the Zed-style shell frame and command palette overlay.
+  * Improve top-level window dragging and resize interactions.
+  * Add draggable mock pane splitters for the inspector and bottom dock.
+
+ -- Yggdrasil HQ <opensource@yggdrasilhq.invalid>  Tue, 17 Mar 2026 00:00:00 +0000
+
 yggterm (0.1.3-1) unstable; urgency=medium
 
   * Fix Ghostty doctor output to avoid leaking stale build-time header paths.

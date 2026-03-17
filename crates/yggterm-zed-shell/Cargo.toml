@@ -11,3 +11,16 @@ zed-upstream = []
 
 [dependencies]
 anyhow.workspace = true
+assets = { path = "../../../zed/crates/assets" }
+component = { path = "../../../zed/crates/component" }
+dirs.workspace = true
+gpui = { path = "../../../zed/crates/gpui", default-features = false, features = ["wayland", "x11"] }
+gpui_platform = { path = "../../../zed/crates/gpui_platform", default-features = false, features = ["wayland", "x11"] }
+platform_title_bar = { path = "../../../zed/crates/platform_title_bar" }
+serde.workspace = true
+settings = { path = "../../../zed/crates/settings" }
+theme = { path = "../../../zed/crates/theme" }
+toml = "0.8"
+ui = { path = "../../../zed/crates/ui" }
+workspace = { path = "../../../zed/crates/workspace" }
+yggterm-core = { path = "../yggterm-core" }
