@@ -493,6 +493,7 @@ struct StoredTranscript {
     started_at: String,
     user_messages: usize,
     assistant_messages: usize,
+    metadata_entries: Vec<SessionMetadataEntry>,
     blocks: Vec<SessionPreviewBlock>,
 }
 
@@ -568,44 +569,50 @@ fn build_session(
         .as_ref()
         .map(|transcript| transcript.user_messages + transcript.assistant_messages)
         .unwrap_or(0);
+    let mut preview_summary = vec![
+        SessionMetadataEntry {
+            label: "Session",
+            value: session_id.clone(),
+        },
+        SessionMetadataEntry {
+            label: "Storage",
+            value: path.to_string(),
+        },
+        SessionMetadataEntry {
+            label: "Cwd",
+            value: cwd.clone(),
+        },
+        SessionMetadataEntry {
+            label: "Started",
+            value: started_at.clone(),
+        },
+        SessionMetadataEntry {
+            label: "Messages",
+            value: transcript
+                .as_ref()
+                .map(|transcript| {
+                    format!(
+                        "{} user · {} assistant",
+                        transcript.user_messages, transcript.assistant_messages
+                    )
+                })
+                .unwrap_or_else(|| "preview unavailable".to_string()),
+        },
+        SessionMetadataEntry {
+            label: "Updated",
+            value: file_snapshot
+                .updated_at
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+        },
+    ];
+    if let Some(transcript) = &transcript {
+        for entry in &transcript.metadata_entries {
+            upsert_session_metadata(&mut preview_summary, entry.label, entry.value.clone());
+        }
+    }
     let preview = SessionPreview {
-        summary: vec![
-            SessionMetadataEntry {
-                label: "Session",
-                value: session_id.clone(),
-            },
-            SessionMetadataEntry {
-                label: "Storage",
-                value: path.to_string(),
-            },
-            SessionMetadataEntry {
-                label: "Cwd",
-                value: cwd.clone(),
-            },
-            SessionMetadataEntry {
-                label: "Started",
-                value: started_at.clone(),
-            },
-            SessionMetadataEntry {
-                label: "Messages",
-                value: transcript
-                    .as_ref()
-                    .map(|transcript| {
-                        format!(
-                            "{} user · {} assistant",
-                            transcript.user_messages, transcript.assistant_messages
-                        )
-                    })
-                    .unwrap_or_else(|| "preview unavailable".to_string()),
-            },
-            SessionMetadataEntry {
-                label: "Updated",
-                value: file_snapshot
-                    .updated_at
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string()),
-            },
-        ],
+        summary: preview_summary,
         blocks: transcript
             .as_ref()
             .map(|transcript| transcript.blocks.clone())
@@ -636,6 +643,92 @@ fn build_session(
                 ]
             }),
     };
+
+    let mut metadata = vec![
+        SessionMetadataEntry {
+            label: "Source",
+            value: "stored".to_string(),
+        },
+        SessionMetadataEntry {
+            label: "Host",
+            value: host_label.clone(),
+        },
+        SessionMetadataEntry {
+            label: "Session",
+            value: session_id.clone(),
+        },
+        SessionMetadataEntry {
+            label: "Storage",
+            value: path.to_string(),
+        },
+        SessionMetadataEntry {
+            label: "Cwd",
+            value: cwd.clone(),
+        },
+        SessionMetadataEntry {
+            label: "Started",
+            value: started_at.clone(),
+        },
+        SessionMetadataEntry {
+            label: "Updated",
+            value: file_snapshot
+                .updated_at
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+        },
+        SessionMetadataEntry {
+            label: "Bytes",
+            value: file_snapshot
+                .bytes
+                .map(|bytes| bytes.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+        },
+        SessionMetadataEntry {
+            label: "Messages",
+            value: message_count.to_string(),
+        },
+        SessionMetadataEntry {
+            label: "Preview Blocks",
+            value: preview_block_count.to_string(),
+        },
+        SessionMetadataEntry {
+            label: "Backend",
+            value: backend_label.to_string(),
+        },
+        SessionMetadataEntry {
+            label: "Launch PID",
+            value: "not launched".to_string(),
+        },
+        SessionMetadataEntry {
+            label: "Launch Error",
+            value: "none".to_string(),
+        },
+        SessionMetadataEntry {
+            label: "Status",
+            value: "queued".to_string(),
+        },
+        SessionMetadataEntry {
+            label: "Bridge",
+            value: if ghostty_bridge_enabled {
+                "available".to_string()
+            } else {
+                "not linked".to_string()
+            },
+        },
+        SessionMetadataEntry {
+            label: "Theme",
+            value: appearance.to_string(),
+        },
+        SessionMetadataEntry {
+            label: "Restore",
+            value: launch_command.clone(),
+        },
+    ];
+    if let Some(transcript) = &transcript {
+        for entry in &transcript.metadata_entries {
+            upsert_session_metadata(&mut metadata, entry.label, entry.value.clone());
+        }
+    }
 
     ManagedSessionView {
         id: session_id.clone(),
@@ -689,86 +782,7 @@ fn build_session(
             },
         ],
         preview,
-        metadata: vec![
-            SessionMetadataEntry {
-                label: "Source",
-                value: "stored".to_string(),
-            },
-            SessionMetadataEntry {
-                label: "Host",
-                value: host_label.clone(),
-            },
-            SessionMetadataEntry {
-                label: "Session",
-                value: session_id,
-            },
-            SessionMetadataEntry {
-                label: "Storage",
-                value: path.to_string(),
-            },
-            SessionMetadataEntry {
-                label: "Cwd",
-                value: cwd,
-            },
-            SessionMetadataEntry {
-                label: "Started",
-                value: started_at,
-            },
-            SessionMetadataEntry {
-                label: "Updated",
-                value: file_snapshot
-                    .updated_at
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string()),
-            },
-            SessionMetadataEntry {
-                label: "Bytes",
-                value: file_snapshot
-                    .bytes
-                    .map(|bytes| bytes.to_string())
-                    .unwrap_or_else(|| "unknown".to_string()),
-            },
-            SessionMetadataEntry {
-                label: "Messages",
-                value: message_count.to_string(),
-            },
-            SessionMetadataEntry {
-                label: "Preview Blocks",
-                value: preview_block_count.to_string(),
-            },
-            SessionMetadataEntry {
-                label: "Backend",
-                value: backend_label.to_string(),
-            },
-            SessionMetadataEntry {
-                label: "Launch PID",
-                value: "not launched".to_string(),
-            },
-            SessionMetadataEntry {
-                label: "Launch Error",
-                value: "none".to_string(),
-            },
-            SessionMetadataEntry {
-                label: "Status",
-                value: "queued".to_string(),
-            },
-            SessionMetadataEntry {
-                label: "Bridge",
-                value: if ghostty_bridge_enabled {
-                    "available".to_string()
-                } else {
-                    "not linked".to_string()
-                },
-            },
-            SessionMetadataEntry {
-                label: "Theme",
-                value: appearance.to_string(),
-            },
-            SessionMetadataEntry {
-                label: "Restore",
-                value: launch_command,
-            },
-        ],
+        metadata,
         terminal_process_id: None,
         terminal_window_id: None,
         last_launch_error: None,
@@ -1145,6 +1159,7 @@ fn parse_stored_transcript(path: &str, fallback_started_at: &str) -> Option<Stor
     let mut started_at = None;
     let mut user_messages = 0usize;
     let mut assistant_messages = 0usize;
+    let mut metadata_entries = Vec::new();
     let mut blocks = Vec::new();
 
     for line in content.lines() {
@@ -1183,6 +1198,7 @@ fn parse_stored_transcript(path: &str, fallback_started_at: &str) -> Option<Stor
                     && blocks.is_empty()
                     && looks_like_session_metadata_block(&lines)
                 {
+                    metadata_entries = parse_session_metadata_lines(&lines);
                     continue;
                 }
 
@@ -1232,6 +1248,7 @@ fn parse_stored_transcript(path: &str, fallback_started_at: &str) -> Option<Stor
         started_at: started_at.unwrap_or_else(|| fallback_started_at.to_string()),
         user_messages,
         assistant_messages,
+        metadata_entries,
         blocks,
     })
 }
@@ -1253,6 +1270,32 @@ fn looks_like_session_metadata_block(lines: &[String]) -> bool {
         .filter(|line| known_prefixes.iter().any(|prefix| line.starts_with(prefix)))
         .count();
     matches >= 3
+}
+
+fn parse_session_metadata_lines(lines: &[String]) -> Vec<SessionMetadataEntry> {
+    const KNOWN_PREFIXES: [(&str, &'static str); 9] = [
+        ("Session ", "Session"),
+        ("Storage ", "Storage"),
+        ("Cwd ", "Cwd"),
+        ("Started ", "Started"),
+        ("Updated ", "Updated"),
+        ("Messages ", "Messages"),
+        ("Host ", "Host"),
+        ("Source ", "Source"),
+        ("Backend ", "Backend"),
+    ];
+
+    lines
+        .iter()
+        .filter_map(|line| {
+            KNOWN_PREFIXES.iter().find_map(|(prefix, label)| {
+                line.strip_prefix(prefix).map(|value| SessionMetadataEntry {
+                    label,
+                    value: value.trim().to_string(),
+                })
+            })
+        })
+        .collect()
 }
 
 fn message_lines_from_payload(payload: &Value) -> Vec<String> {
