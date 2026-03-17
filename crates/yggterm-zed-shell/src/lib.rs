@@ -632,20 +632,11 @@ impl GpuiShell {
     }
 
     fn titlebar_children(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let selected = self
-            .active_session()
-            .map(|session| session.title.as_str())
-            .unwrap_or("no-session");
         vec![
             h_flex()
                 .gap_1()
                 .items_center()
                 .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(
-                    Label::new("yggterm")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
                 .child(
                     self.chrome_icon("toggle-nav", IconName::WorkspaceNavOpen, self.sidebar_open)
                         .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
@@ -653,10 +644,10 @@ impl GpuiShell {
                 .child(self.chrome_menu(cx))
                 .into_any_element(),
             h_flex()
-                .gap_3()
+                .flex_1()
                 .items_center()
+                .justify_center()
                 .child(self.titlebar_search(window, cx))
-                .child(Label::new(format!("pi@dev: ~/gh/yggterm  ·  {selected}")).size(LabelSize::Small).color(Color::Muted))
                 .into_any_element(),
             h_flex()
                 .gap_1()
@@ -804,8 +795,8 @@ impl GpuiShell {
         };
 
         h_flex()
-            .w(px(380.))
-            .h(px(32.))
+            .w(px(430.))
+            .h(px(28.))
             .items_center()
             .gap_2()
             .px_2()
