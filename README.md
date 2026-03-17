@@ -22,8 +22,8 @@ This repository is still scaffolding.
 - Ghostty bridge packaging and runtime probing exist.
 - A temporary desktop shell exists for fast iteration on layout and interaction.
 - The current shell is useful for shape and workflow experiments, but it is not the final GPUI implementation yet.
-- `yggterm gui` now opens the GPUI shell prototype.
-- `yggterm gui-scaffold` keeps the older `eframe` shell available while features are being migrated.
+- `yggterm` now opens the GPUI shell prototype directly.
+- The old CLI subcommands and the `eframe` scaffold path have been removed.
 - The GPUI shell should prefer direct reuse of Zed crates such as `ui`, `theme`, and `settings` over local visual reimplementation.
 - Mock sidebars, tabs, docks, and bodies are acceptable only as placeholders inside Zed-derived chrome while Ghostty embedding is still pending.
 
@@ -55,36 +55,10 @@ References to keep in mind while iterating:
 
 ## Usage
 
-Initialize local state:
+Launch the current desktop shell:
 
 ```bash
-yggterm init
-```
-
-Create scaffold session entries:
-
-```bash
-yggterm mk-session remote/prod/codex-session-tui
-yggterm mk-session remote/prod/ghostty-admin
-yggterm mk-session local/design/zed-chrome-study
-```
-
-Print the stored tree:
-
-```bash
-yggterm tree
-```
-
-Inspect runtime and Ghostty bridge status:
-
-```bash
-yggterm doctor
-```
-
-Launch the current desktop scaffold:
-
-```bash
-yggterm gui
+yggterm
 ```
 
 ## Build from source
@@ -121,13 +95,7 @@ cargo +1.93.0 build
 Run locally:
 
 ```bash
-cargo +1.93.0 run -- gui
-```
-
-Run the older scaffold:
-
-```bash
-cargo +1.93.0 run -- gui-scaffold
+cargo +1.93.0 run
 ```
 
 ## Release artifacts
