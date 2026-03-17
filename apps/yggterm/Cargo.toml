@@ -20,4 +20,5 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 yggterm-core = { path = "../../crates/yggterm-core" }
 yggterm-ghostty-bridge = { path = "../../crates/yggterm-ghostty-bridge" }
+yggterm-gtk-glue = { path = "../../crates/yggterm-gtk-glue" }
 yggterm-zed-shell = { path = "../../crates/yggterm-zed-shell" }

@@ -2,6 +2,7 @@ use crate::SessionNode;
 use dirs::home_dir;
 use std::collections::HashSet;
 use std::path::Path;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowserRowKind {
@@ -30,19 +31,25 @@ pub struct SessionBrowserState {
     expanded_paths: HashSet<String>,
     rows: Vec<BrowserRow>,
     selected_path: Option<String>,
+    metrics: BrowserMetrics,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BrowserMetrics {
+    pub row_count: usize,
+    pub rebuild_count: usize,
+    pub last_rebuild_ms: f32,
 }
 
 impl SessionBrowserState {
     pub fn new(root: SessionNode) -> Self {
-        let mut expanded_paths = HashSet::new();
-        expand_all_groups(&root, &mut expanded_paths);
-
         let mut this = Self {
             root,
             filter_query: String::new(),
-            expanded_paths,
+            expanded_paths: HashSet::new(),
             rows: Vec::new(),
             selected_path: None,
+            metrics: BrowserMetrics::default(),
         };
         this.rebuild_rows();
         this.selected_path = this
@@ -76,6 +83,10 @@ impl SessionBrowserState {
             .as_deref()
             .and_then(|path| self.rows.iter().find(|row| row.full_path == path))
             .or_else(|| self.rows.first())
+    }
+
+    pub fn metrics(&self) -> BrowserMetrics {
+        self.metrics
     }
 
     pub fn select_path(&mut self, path: impl Into<String>) {
@@ -115,6 +126,7 @@ impl SessionBrowserState {
     }
 
     fn rebuild_rows(&mut self) {
+        let started_at = Instant::now();
         self.rows.clear();
         let filter = self.filter_query.to_ascii_lowercase();
         flatten_rows(
@@ -125,15 +137,9 @@ impl SessionBrowserState {
             &mut self.rows,
             true,
         );
-    }
-}
-
-fn expand_all_groups(node: &SessionNode, expanded_paths: &mut HashSet<String>) {
-    if !node.children.is_empty() {
-        expanded_paths.insert(node.path.display().to_string());
-        for child in &node.children {
-            expand_all_groups(child, expanded_paths);
-        }
+        self.metrics.row_count = self.rows.len();
+        self.metrics.rebuild_count += 1;
+        self.metrics.last_rebuild_ms = started_at.elapsed().as_secs_f32() * 1000.0;
     }
 }
 

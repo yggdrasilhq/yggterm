@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::process::{Command, Stdio};
 use std::time::SystemTime;
-use time::OffsetDateTime;
+use time::{OffsetDateTime, UtcOffset, macros::format_description};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,7 +132,7 @@ impl YggtermServer {
         let mut this = Self {
             sessions: BTreeMap::new(),
             active_session_path: None,
-            active_view_mode: WorkspaceViewMode::Terminal,
+            active_view_mode: WorkspaceViewMode::Rendered,
             backend,
             theme,
             ghostty_bridge_enabled,
@@ -162,7 +162,6 @@ impl YggtermServer {
                 Some(&first_session.session_id),
                 Some(&first_session.cwd),
             );
-            this.request_terminal_launch_for_active();
         }
 
         this
@@ -542,9 +541,7 @@ fn build_session(
         UiTheme::ZedDark => "dark",
         UiTheme::ZedLight => "light",
     };
-    let started_at = OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| String::from("unknown"));
+    let started_at = format_display_datetime(OffsetDateTime::now_utc());
     let backend_label = match backend {
         TerminalBackend::Ghostty => "Ghostty",
         TerminalBackend::Mock => "Mock",
@@ -786,9 +783,7 @@ fn build_live_session(
     theme: UiTheme,
     ghostty_bridge_enabled: bool,
 ) -> ManagedSessionView {
-    let started_at = OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| String::from("unknown"));
+    let started_at = format_display_datetime(OffsetDateTime::now_utc());
     let launch_command = match &target.prefix {
         Some(prefix) => format!(
             "ssh {} '{}' 'yggterm server attach {}'",
@@ -1142,9 +1137,7 @@ fn upsert_session_metadata(
 
 fn format_system_time(time: SystemTime) -> String {
     let datetime: OffsetDateTime = time.into();
-    datetime
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "unknown".to_string())
+    format_display_datetime(datetime)
 }
 
 fn parse_stored_transcript(path: &str, fallback_started_at: &str) -> Option<StoredTranscript> {
@@ -1166,7 +1159,7 @@ fn parse_stored_transcript(path: &str, fallback_started_at: &str) -> Option<Stor
                     started_at = payload
                         .get("timestamp")
                         .and_then(Value::as_str)
-                        .map(ToOwned::to_owned)
+                        .map(parse_and_format_timestamp)
                         .or(started_at);
                 }
             }
@@ -1201,7 +1194,7 @@ fn parse_stored_transcript(path: &str, fallback_started_at: &str) -> Option<Stor
                             .unwrap_or_else(|| fallback_started_at.to_string())
                     }),
                     tone: session_preview_tone(role),
-                    folded: blocks.len() >= 8,
+                    folded: false,
                     lines,
                 });
             }
@@ -1221,7 +1214,7 @@ fn parse_stored_transcript(path: &str, fallback_started_at: &str) -> Option<Stor
                     timestamp: extract_timestamp(&value)
                         .unwrap_or_else(|| fallback_started_at.to_string()),
                     tone: PreviewTone::User,
-                    folded: blocks.len() >= 8,
+                    folded: false,
                     lines: normalize_preview_text(text),
                 });
             }
@@ -1279,14 +1272,32 @@ fn extract_timestamp(value: &Value) -> Option<String> {
     value
         .get("timestamp")
         .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
+        .map(parse_and_format_timestamp)
         .or_else(|| {
             value
                 .get("payload")
                 .and_then(|payload| payload.get("timestamp"))
                 .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
+                .map(parse_and_format_timestamp)
         })
+}
+
+fn format_display_datetime(datetime: OffsetDateTime) -> String {
+    const DISPLAY_FORMAT: &[time::format_description::FormatItem<'static>] = format_description!(
+        "[month repr:short] [day], [year] [hour repr:12 padding:zero]:[minute] [period] UTC[offset_hour sign:mandatory][offset_minute]"
+    );
+    let ist_offset = UtcOffset::from_hms(5, 30, 0).unwrap_or(UtcOffset::UTC);
+
+    datetime
+        .to_offset(ist_offset)
+        .format(DISPLAY_FORMAT)
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn parse_and_format_timestamp(value: &str) -> String {
+    OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+        .map(format_display_datetime)
+        .unwrap_or_else(|_| value.to_string())
 }
 
 fn session_role_label(role: &str) -> &'static str {

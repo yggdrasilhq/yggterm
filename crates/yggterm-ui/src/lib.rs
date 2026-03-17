@@ -343,7 +343,7 @@ pub fn chat_preview_card(
                             .take(LINE_RENDER_LIMIT)
                             .map(|line| {
                                 Label::new(line.clone())
-                                    .size(LabelSize::Small)
+                                    .size(LabelSize::Default)
                                     .color(Color::Default)
                                     .into_any_element()
                             })

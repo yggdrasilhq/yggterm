@@ -292,6 +292,13 @@ struct DebugTelemetry {
     last_log_at: Option<Instant>,
     smoothed_fps: f32,
     last_render_ms: f32,
+    last_sidebar_build_ms: f32,
+    last_preview_filter_ms: f32,
+    last_preview_build_ms: f32,
+    browser_rows: usize,
+    browser_rebuild_ms: f32,
+    visible_preview_blocks: usize,
+    total_preview_blocks: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,6 +418,13 @@ impl GpuiShell {
                 last_log_at: None,
                 smoothed_fps: 0.0,
                 last_render_ms: 0.0,
+                last_sidebar_build_ms: 0.0,
+                last_preview_filter_ms: 0.0,
+                last_preview_build_ms: 0.0,
+                browser_rows: 0,
+                browser_rebuild_ms: 0.0,
+                visible_preview_blocks: 0,
+                total_preview_blocks: 0,
             },
             debug_logs: VecDeque::new(),
         }
@@ -481,16 +495,18 @@ impl GpuiShell {
             .is_none_or(|last_log_at| last_log_at.elapsed().as_millis() >= 800);
         if should_log {
             self.debug_telemetry.last_log_at = Some(Instant::now());
-            let preview_blocks = self
-                .active_session()
-                .map(|session| session.preview.blocks.len())
-                .unwrap_or(0);
             if self.debug_telemetry.last_render_ms > 16.7 {
                 self.push_debug_log(format!(
-                    "fps {:.1} render {:.2}ms preview_blocks={} mode={}",
+                    "fps {:.1} render {:.2}ms sidebar {:.2}ms preview_filter {:.2}ms preview_build {:.2}ms rows={} rebuild {:.2}ms preview={}/{} mode={}",
                     self.debug_telemetry.smoothed_fps,
                     self.debug_telemetry.last_render_ms,
-                    preview_blocks,
+                    self.debug_telemetry.last_sidebar_build_ms,
+                    self.debug_telemetry.last_preview_filter_ms,
+                    self.debug_telemetry.last_preview_build_ms,
+                    self.debug_telemetry.browser_rows,
+                    self.debug_telemetry.browser_rebuild_ms,
+                    self.debug_telemetry.visible_preview_blocks,
+                    self.debug_telemetry.total_preview_blocks,
                     match self.server.active_view_mode() {
                         WorkspaceViewMode::Terminal => "terminal",
                         WorkspaceViewMode::Rendered => "preview",
@@ -563,6 +579,19 @@ impl GpuiShell {
             match mode {
                 WorkspaceViewMode::Terminal => "terminal view",
                 WorkspaceViewMode::Rendered => "rendered view",
+            },
+            cx,
+        );
+    }
+
+    fn toggle_right_panel(&mut self, cx: &mut Context<Self>) {
+        self.right_panel_open = !self.right_panel_open;
+        self.save_ui_config();
+        self.set_last_action(
+            if self.right_panel_open {
+                "metadata panel opened"
+            } else {
+                "metadata panel closed"
             },
             cx,
         );
@@ -1028,11 +1057,12 @@ impl GpuiShell {
             .into_any_element()
     }
 
-    fn sidebar(&self, cx: &mut Context<Self>, colors: &theme::ThemeColors) -> AnyElement {
+    fn sidebar(&mut self, cx: &mut Context<Self>, colors: &theme::ThemeColors) -> AnyElement {
         if !self.sidebar_open {
             return div().into_any_element();
         }
 
+        let rows_started_at = Instant::now();
         let rows = self
             .browser
             .rows()
@@ -1040,6 +1070,13 @@ impl GpuiShell {
             .enumerate()
             .map(|(ix, row)| self.session_tree_row(ix, row, cx))
             .collect::<Vec<_>>();
+        if cfg!(debug_assertions) {
+            let browser_metrics = self.browser.metrics();
+            self.debug_telemetry.last_sidebar_build_ms =
+                rows_started_at.elapsed().as_secs_f32() * 1000.0;
+            self.debug_telemetry.browser_rows = browser_metrics.row_count;
+            self.debug_telemetry.browser_rebuild_ms = browser_metrics.last_rebuild_ms;
+        }
 
         div()
             .w(self.sidebar_width)
@@ -1081,7 +1118,7 @@ impl GpuiShell {
     }
 
     fn workspace(
-        &self,
+        &mut self,
         _window: &mut Window,
         cx: &mut Context<Self>,
         colors: &theme::ThemeColors,
@@ -1165,7 +1202,7 @@ impl GpuiShell {
             .into_any_element()
     }
 
-    fn viewport(&self, cx: &mut Context<Self>, colors: &theme::ThemeColors) -> AnyElement {
+    fn viewport(&mut self, cx: &mut Context<Self>, colors: &theme::ThemeColors) -> AnyElement {
         let selected_path = self
             .active_session()
             .map(|session| match session.source {
@@ -1176,6 +1213,107 @@ impl GpuiShell {
             .unwrap_or_else(|| "~/.yggterm/sessions".to_string());
         let active_session = self.active_session();
         let preview_query = self.preview_query().trim().to_string();
+        let mut visible_preview_blocks = 0usize;
+        let mut total_preview_blocks = 0usize;
+        let mut preview_filter_ms = 0.0f32;
+        let mut preview_build_ms = 0.0f32;
+
+        let viewport_children = match active_session {
+            Some(session) if self.server.active_view_mode() == WorkspaceViewMode::Terminal => vec![
+                yggterm_ui::terminal_surface_card(
+                    match session.source {
+                        SessionSource::Stored => "Server Terminal",
+                        SessionSource::LiveSsh => "Ghostty Launch Request",
+                    },
+                    &session.terminal_lines,
+                    Some(&session.status_line),
+                    colors,
+                ),
+                yggterm_ui::terminal_surface_card(
+                    "Ghostty Integration",
+                    &[
+                        if self.bootstrap.ghostty_bridge_enabled {
+                            if self.bootstrap.ghostty_embedded_surface_supported {
+                                "libghostty bridge is available and the embedded surface host is enabled on this platform."
+                            } else {
+                                "libghostty is linked in this build, but the current upstream embedded surface host is not available on this platform."
+                            }
+                        } else {
+                            "libghostty bridge is not linked in this build."
+                        },
+                        "The shell color scheme is synchronized to the active Zed light/dark theme.",
+                        &self.bootstrap.ghostty_bridge_detail,
+                    ],
+                    Some(self.active_mode_label()),
+                    colors,
+                ),
+            ],
+            Some(session) => {
+                total_preview_blocks = session.preview.blocks.len();
+                let preview_filter_started_at = Instant::now();
+                let (visible_blocks, hidden_blocks) =
+                    self.visible_preview_blocks(&session.preview.blocks, preview_query.as_str());
+                preview_filter_ms = preview_filter_started_at.elapsed().as_secs_f32() * 1000.0;
+                visible_preview_blocks = visible_blocks.len();
+                let preview_build_started_at = Instant::now();
+                let mut blocks = Vec::new();
+                blocks.push(yggterm_ui::preview_summary_card(
+                    &session.preview.summary,
+                    preview_query.as_str(),
+                    visible_blocks.len() + hidden_blocks,
+                    session.preview.blocks.len(),
+                    colors,
+                ));
+                if hidden_blocks > 0 {
+                    blocks.push(yggterm_ui::terminal_surface_card(
+                        "Preview Window",
+                        &[format!(
+                            "{} older conversation blocks are hidden to keep preview rendering responsive.",
+                            hidden_blocks
+                        )],
+                        Some("windowed"),
+                        colors,
+                    ));
+                }
+                blocks.extend(visible_blocks.into_iter().map(|(ix, block)| {
+                    self.session_preview_block_element(
+                        ix,
+                        block,
+                        preview_query.as_str(),
+                        cx,
+                        colors,
+                    )
+                }));
+                if blocks.len() == 1 {
+                    blocks.push(yggterm_ui::terminal_surface_card(
+                        "No Preview Matches",
+                        &[
+                            "The active search query does not match this session preview.",
+                            "Clear the search field to return to the full transcript.",
+                        ],
+                        Some("search"),
+                        colors,
+                    ));
+                }
+                preview_build_ms = preview_build_started_at.elapsed().as_secs_f32() * 1000.0;
+                blocks
+            }
+            None => vec![yggterm_ui::terminal_surface_card(
+                "No Session Selected",
+                &[
+                    "Select a saved session from the sidebar to open its rendered preview first.",
+                    &self.bootstrap.ghostty_bridge_detail,
+                ],
+                Some("idle"),
+                colors,
+            )],
+        };
+        if cfg!(debug_assertions) {
+            self.debug_telemetry.last_preview_filter_ms = preview_filter_ms;
+            self.debug_telemetry.last_preview_build_ms = preview_build_ms;
+            self.debug_telemetry.visible_preview_blocks = visible_preview_blocks;
+            self.debug_telemetry.total_preview_blocks = total_preview_blocks;
+        }
 
         div()
             .flex_1()
@@ -1272,9 +1410,11 @@ impl GpuiShell {
                                     )
                                     .style(ButtonStyle::Subtle)
                                     .size(ButtonSize::Compact)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.clear_browser_filter(window, cx);
-                                    })),
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| {
+                                            this.clear_browser_filter(window, cx);
+                                        },
+                                    )),
                                 )
                             })
                             .child(
@@ -1293,88 +1433,7 @@ impl GpuiShell {
                     .px_4()
                     .py_3()
                     .gap_3()
-                    .children(match active_session {
-                        Some(session) if self.server.active_view_mode() == WorkspaceViewMode::Terminal => vec![
-                            yggterm_ui::terminal_surface_card(
-                                match session.source {
-                                    SessionSource::Stored => "Server Terminal",
-                                    SessionSource::LiveSsh => "Ghostty Launch Request",
-                                },
-                                &session.terminal_lines,
-                                Some(&session.status_line),
-                                colors,
-                            ),
-                            yggterm_ui::terminal_surface_card(
-                                "Ghostty Integration",
-                                &[
-                                    if self.bootstrap.ghostty_bridge_enabled {
-                                        if self.bootstrap.ghostty_embedded_surface_supported {
-                                            "libghostty bridge is available and the embedded surface host is enabled on this platform."
-                                        } else {
-                                            "libghostty is linked in this build, but the current upstream embedded surface host is not available on this platform."
-                                        }
-                                    } else {
-                                        "libghostty bridge is not linked in this build."
-                                    },
-                                    "The shell color scheme is synchronized to the active Zed light/dark theme.",
-                                    &self.bootstrap.ghostty_bridge_detail,
-                                ],
-                                Some(self.active_mode_label()),
-                                colors,
-                            ),
-                        ],
-                        Some(session) => {
-                            let (visible_blocks, hidden_blocks) = self.visible_preview_blocks(
-                                &session.preview.blocks,
-                                preview_query.as_str(),
-                            );
-                            let mut blocks = Vec::new();
-                            blocks.push(yggterm_ui::preview_summary_card(
-                                &session.preview.summary,
-                                preview_query.as_str(),
-                                visible_blocks.len() + hidden_blocks,
-                                session.preview.blocks.len(),
-                                colors,
-                            ));
-                            if hidden_blocks > 0 {
-                                blocks.push(yggterm_ui::terminal_surface_card(
-                                    "Preview Window",
-                                    &[format!(
-                                        "{} older conversation blocks are hidden to keep preview rendering responsive.",
-                                        hidden_blocks
-                                    )],
-                                    Some("windowed"),
-                                    colors,
-                                ));
-                            }
-                            blocks.extend(
-                                visible_blocks.into_iter().map(|(ix, block)| {
-                                    self.session_preview_block_element(ix, block, preview_query.as_str(), cx, colors)
-                                }),
-                            );
-                            if blocks.len() == 1 {
-                                blocks.push(yggterm_ui::terminal_surface_card(
-                                    "No Preview Matches",
-                                    &[
-                                        "The active search query does not match this session preview.",
-                                        "Clear the search field to return to the full transcript.",
-                                    ],
-                                    Some("search"),
-                                    colors,
-                                ));
-                            }
-                            blocks
-                        }
-                        None => vec![yggterm_ui::terminal_surface_card(
-                            "No Session Selected",
-                            &[
-                                "Select a saved session from the sidebar to open its rendered preview first.",
-                                &self.bootstrap.ghostty_bridge_detail,
-                            ],
-                            Some("idle"),
-                            colors,
-                        )],
-                    }),
+                    .children(viewport_children),
             )
             .into_any_element()
     }
@@ -1598,26 +1657,17 @@ impl GpuiShell {
                     )
                 })
                 .child(
-                    Label::new(match self.server.active_view_mode() {
-                        WorkspaceViewMode::Terminal => "terminal",
-                        WorkspaceViewMode::Rendered => "rendered",
-                    })
-                    .size(LabelSize::Small)
-                    .color(Color::Default),
-                )
-                .child(
                     Label::new(self.last_action.clone())
                         .size(LabelSize::Small)
                         .color(Color::Default),
                 )
-                .child(self.chrome_icon(
-                    "status-remote",
-                    match self.server.backend() {
-                        TerminalBackend::Ghostty => IconName::TerminalGhost,
-                        TerminalBackend::Mock => IconName::Disconnected,
-                    },
-                    false,
-                ))
+                .child(
+                    self.chrome_icon("status-metadata", IconName::Info, self.right_panel_open)
+                        .tooltip(Tooltip::text("Toggle Session Metadata"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_right_panel(cx);
+                        })),
+                )
                 .into_any_element(),
             colors.status_bar_background,
             colors.border,
