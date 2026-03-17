@@ -529,6 +529,11 @@ impl GpuiShell {
         );
     }
 
+    fn request_terminal_launch(&mut self, cx: &mut Context<Self>) {
+        self.server.request_terminal_launch_for_active();
+        self.set_last_action("terminal launch requested", cx);
+    }
+
     fn preview_query(&self) -> &str {
         self.browser.filter_query()
     }
@@ -1317,6 +1322,19 @@ impl GpuiShell {
                                             .size(ButtonSize::Compact)
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.set_all_preview_blocks_folded(true, cx);
+                                            })),
+                                    )
+                                },
+                            )
+                            .when(
+                                self.server.active_view_mode() == WorkspaceViewMode::Terminal,
+                                |this| {
+                                    this.child(
+                                        Button::new("request-terminal-launch", "Request Ghostty")
+                                            .style(ButtonStyle::Subtle)
+                                            .size(ButtonSize::Compact)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.request_terminal_launch(cx);
                                             })),
                                     )
                                 },
