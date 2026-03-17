@@ -346,8 +346,8 @@ struct GpuiShell {
     ui_config: ShellUiConfig,
     focus_handle: FocusHandle,
     chrome_menu_handle: PopoverMenuHandle<ContextMenu>,
-    search_editor: Entity<Editor>,
-    palette_editor: Entity<Editor>,
+    search_editor: Option<Entity<Editor>>,
+    palette_editor: Option<Entity<Editor>>,
     sidebar_scroll_handle: UniformListScrollHandle,
     preview_list_state: ListState,
     browser: SessionBrowserState,
@@ -380,26 +380,8 @@ impl GpuiShell {
     ) -> Self {
         let browser = SessionBrowserState::new(bootstrap.browser_tree.clone());
         let focus_handle = cx.focus_handle();
-        let search_editor = cx.new(|cx| {
-            let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Search sessions…", window, cx);
-            editor
-        });
-        let palette_editor = cx.new(|cx| {
-            let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Search commands and themes…", window, cx);
-            editor
-        });
         let sidebar_scroll_handle = UniformListScrollHandle::new();
         let preview_list_state = ListState::new(0, ListAlignment::Top, px(640.));
-        cx.subscribe(&search_editor, |this, editor, event: &EditorEvent, cx| {
-            if let EditorEvent::BufferEdited { .. } = event {
-                let query = editor.read(cx).text(cx);
-                this.browser.set_filter_query(query);
-                cx.notify();
-            }
-        })
-        .detach();
         focus_handle.focus(window, cx);
         let server = YggtermServer::new(
             &bootstrap.browser_tree,
@@ -443,8 +425,8 @@ impl GpuiShell {
             ui_config: ui_config.clone(),
             focus_handle,
             chrome_menu_handle: PopoverMenuHandle::default(),
-            search_editor,
-            palette_editor,
+            search_editor: None,
+            palette_editor: None,
             sidebar_scroll_handle,
             preview_list_state,
             browser,
@@ -488,6 +470,64 @@ impl GpuiShell {
 
     fn active_session(&self) -> Option<&yggterm_core::ManagedSessionView> {
         self.server.active_session()
+    }
+
+    fn ensure_search_editor(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Editor> {
+        if let Some(editor) = &self.search_editor {
+            return editor.clone();
+        }
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Search sessions…", window, cx);
+            editor
+        });
+        editor.update(cx, |editor, cx| {
+            editor.set_text(self.browser.filter_query(), window, cx);
+        });
+        cx.subscribe(&editor, |this, editor, event: &EditorEvent, cx| {
+            if let EditorEvent::BufferEdited { .. } = event {
+                let query = editor.read(cx).text(cx);
+                this.browser.set_filter_query(query);
+                cx.notify();
+            }
+        })
+        .detach();
+        self.search_editor = Some(editor.clone());
+        editor
+    }
+
+    fn ensure_palette_editor(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Editor> {
+        if let Some(editor) = &self.palette_editor {
+            return editor.clone();
+        }
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Search commands and themes…", window, cx);
+            editor
+        });
+        self.palette_editor = Some(editor.clone());
+        editor
+    }
+
+    fn prune_transient_editors(&mut self, window: &Window, cx: &App) {
+        if self
+            .search_editor
+            .as_ref()
+            .is_some_and(|editor| !editor.read(cx).is_focused(window))
+        {
+            self.search_editor = None;
+        }
+        if !self.command_palette_open {
+            self.palette_editor = None;
+        }
     }
 
     fn selected_dock(&self) -> &DockEntry {
@@ -800,25 +840,30 @@ impl GpuiShell {
     }
 
     fn clear_browser_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.search_editor.update(cx, |editor, cx| {
-            editor.set_text("", window, cx);
-        });
+        if let Some(editor) = &self.search_editor {
+            editor.update(cx, |editor, cx| {
+                editor.set_text("", window, cx);
+            });
+        }
         self.set_browser_filter("", cx);
     }
 
     fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.search_editor
-            .update(cx, |editor, cx| window.focus(&editor.focus_handle(cx), cx));
+        let search_editor = self.ensure_search_editor(window, cx);
+        search_editor.update(cx, |editor, cx| window.focus(&editor.focus_handle(cx), cx));
         self.set_last_action("focus search", cx);
     }
 
     fn focus_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.palette_editor
-            .update(cx, |editor, cx| window.focus(&editor.focus_handle(cx), cx));
+        let palette_editor = self.ensure_palette_editor(window, cx);
+        palette_editor.update(cx, |editor, cx| window.focus(&editor.focus_handle(cx), cx));
     }
 
     fn palette_query(&self, cx: &App) -> String {
-        self.palette_editor.read(cx).text(cx)
+        self.palette_editor
+            .as_ref()
+            .map(|editor| editor.read(cx).text(cx))
+            .unwrap_or_default()
     }
 
     fn open_settings_window(&mut self, cx: &mut Context<Self>) {
@@ -830,7 +875,10 @@ impl GpuiShell {
     fn toggle_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.command_palette_open = !self.command_palette_open;
         if self.command_palette_open {
+            self.ensure_palette_editor(window, cx);
             self.focus_palette(window, cx);
+        } else {
+            self.palette_editor = None;
         }
         self.set_last_action(
             if self.command_palette_open {
@@ -845,6 +893,7 @@ impl GpuiShell {
     fn dismiss_command_palette(&mut self, cx: &mut Context<Self>) {
         if self.command_palette_open {
             self.command_palette_open = false;
+            self.palette_editor = None;
             self.set_last_action("command palette dismissed", cx);
         }
     }
@@ -1084,7 +1133,10 @@ impl GpuiShell {
     fn titlebar_search(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let settings = ThemeSettings::get_global(cx);
         let colors = cx.theme().colors();
-        let is_focused = self.search_editor.read(cx).is_focused(window);
+        let is_focused = self
+            .search_editor
+            .as_ref()
+            .is_some_and(|editor| editor.read(cx).is_focused(window));
         let query = self.browser.filter_query().to_string();
         let text_style = TextStyle {
             color: colors.text,
@@ -1129,30 +1181,36 @@ impl GpuiShell {
                     .size(IconSize::Small)
                     .color(Color::Muted),
             )
-            .child(div().flex_1().h_full().child(if is_focused {
-                EditorElement::new(&self.search_editor, editor_style).into_any_element()
-            } else {
+            .child(
                 div()
+                    .flex_1()
                     .h_full()
-                    .flex()
-                    .items_center()
-                    .child(
-                        Label::new(if query.is_empty() {
-                            "Search sessions…".to_string()
-                        } else {
-                            query
-                        })
-                        .size(LabelSize::Small)
-                        .color(
-                            if self.browser.filter_query().is_empty() {
-                                Color::Muted
-                            } else {
-                                Color::Default
-                            },
-                        ),
-                    )
-                    .into_any_element()
-            }))
+                    .child(match (is_focused, self.search_editor.as_ref()) {
+                        (true, Some(editor)) => {
+                            EditorElement::new(editor, editor_style).into_any_element()
+                        }
+                        _ => div()
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .child(
+                                Label::new(if query.is_empty() {
+                                    "Search sessions…".to_string()
+                                } else {
+                                    query
+                                })
+                                .size(LabelSize::Small)
+                                .color(
+                                    if self.browser.filter_query().is_empty() {
+                                        Color::Muted
+                                    } else {
+                                        Color::Default
+                                    },
+                                ),
+                            )
+                            .into_any_element(),
+                    }),
+            )
             .child(
                 IconButton::new(
                     "titlebar-search-clear",
@@ -1849,6 +1907,10 @@ impl GpuiShell {
     }
 
     fn command_palette_overlay(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let palette_editor = self
+            .palette_editor
+            .as_ref()
+            .expect("palette editor exists while command palette is open");
         let active_theme = cx.theme().name.to_string();
         let theme_names = available_theme_names(cx);
         let palette_query = self.palette_query(cx);
@@ -1858,7 +1920,7 @@ impl GpuiShell {
                 || candidate.to_lowercase().contains(&palette_query_lower)
         };
         let settings = ThemeSettings::get_global(cx);
-        let palette_focused = self.palette_editor.read(cx).is_focused(window);
+        let palette_focused = palette_editor.read(cx).is_focused(window);
         let palette_text_style = TextStyle {
             color: cx.theme().colors().text,
             font_family: settings.buffer_font.family.clone(),
@@ -1945,7 +2007,7 @@ impl GpuiShell {
                                                 .color(Color::Muted),
                                         )
                                         .child(div().flex_1().h_full().child(EditorElement::new(
-                                            &self.palette_editor,
+                                            palette_editor,
                                             palette_editor_style,
                                         )))
                                         .child(
@@ -1961,9 +2023,11 @@ impl GpuiShell {
                                             .tooltip(Tooltip::text("Clear Search"))
                                             .on_click(
                                                 cx.listener(|this, _, window, cx| {
-                                                    this.palette_editor.update(cx, |editor, cx| {
-                                                        editor.set_text("", window, cx);
-                                                    });
+                                                    if let Some(editor) = &this.palette_editor {
+                                                        editor.update(cx, |editor, cx| {
+                                                            editor.set_text("", window, cx);
+                                                        });
+                                                    }
                                                     this.focus_palette(window, cx);
                                                 }),
                                             ),
@@ -2169,6 +2233,7 @@ impl Render for GpuiShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let render_started_at = Instant::now();
         self.update_debug_telemetry();
+        self.prune_transient_editors(window, cx);
         let colors = cx.theme().colors().clone();
         self.server.sync_theme(match cx.theme().appearance {
             Appearance::Light => UiTheme::ZedLight,

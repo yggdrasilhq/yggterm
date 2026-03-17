@@ -1179,6 +1179,12 @@ fn parse_stored_transcript(path: &str, fallback_started_at: &str) -> Option<Stor
                 if lines.is_empty() {
                     continue;
                 }
+                if role == "assistant"
+                    && blocks.is_empty()
+                    && looks_like_session_metadata_block(&lines)
+                {
+                    continue;
+                }
 
                 match role {
                     "user" | "developer" => user_messages += 1,
@@ -1228,6 +1234,25 @@ fn parse_stored_transcript(path: &str, fallback_started_at: &str) -> Option<Stor
         assistant_messages,
         blocks,
     })
+}
+
+fn looks_like_session_metadata_block(lines: &[String]) -> bool {
+    let known_prefixes = [
+        "Session ",
+        "Storage ",
+        "Cwd ",
+        "Started ",
+        "Updated ",
+        "Messages ",
+        "Host ",
+        "Source ",
+        "Backend ",
+    ];
+    let matches = lines
+        .iter()
+        .filter(|line| known_prefixes.iter().any(|prefix| line.starts_with(prefix)))
+        .count();
+    matches >= 3
 }
 
 fn message_lines_from_payload(payload: &Value) -> Vec<String> {
