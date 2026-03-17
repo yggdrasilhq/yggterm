@@ -37,6 +37,7 @@ pub struct SessionPreviewBlock {
     pub role: &'static str,
     pub timestamp: String,
     pub tone: PreviewTone,
+    pub folded: bool,
     pub lines: Vec<String>,
 }
 
@@ -140,6 +141,19 @@ impl YggtermServer {
             .as_ref()
             .and_then(|path| self.sessions.get(path))
     }
+
+    pub fn toggle_preview_block(&mut self, block_ix: usize) {
+        let Some(path) = self.active_session_path.as_ref() else {
+            return;
+        };
+        let Some(session) = self.sessions.get_mut(path) else {
+            return;
+        };
+        let Some(block) = session.preview.blocks.get_mut(block_ix) else {
+            return;
+        };
+        block.folded = !block.folded;
+    }
 }
 
 fn first_session_path(node: &SessionNode) -> Option<String> {
@@ -205,6 +219,7 @@ fn build_session(path: &str, backend: TerminalBackend, theme: UiTheme) -> Manage
                 role: "USER",
                 timestamp: started_at.clone(),
                 tone: PreviewTone::User,
+                folded: false,
                 lines: vec![
                     format!("Attach {title} on {host_label} and restore the last multiplexed shell."),
                     format!("Open the persisted workspace rooted at {cwd}."),
@@ -214,6 +229,7 @@ fn build_session(path: &str, backend: TerminalBackend, theme: UiTheme) -> Manage
                 role: "ASSISTANT",
                 timestamp: "server:restore".to_string(),
                 tone: PreviewTone::Assistant,
+                folded: false,
                 lines: vec![
                     format!("{backend_label} backend reserved for the live terminal surface."),
                     "Rendered preview follows codex-session-tui structure: scan browser first, inspect transcript second.".to_string(),
@@ -224,6 +240,7 @@ fn build_session(path: &str, backend: TerminalBackend, theme: UiTheme) -> Manage
                 role: "USER",
                 timestamp: "session:notes".to_string(),
                 tone: PreviewTone::User,
+                folded: true,
                 lines: vec![
                     "Future rich rendering will show screenshots, search hits, command summaries, and clipboard transfers here.".to_string(),
                     "Switch back to Terminal in the titlebar when the Ghostty surface is active.".to_string(),
