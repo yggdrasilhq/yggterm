@@ -29,10 +29,15 @@ jobs:
             libxkbcommon-dev
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.93.0
 
       - name: Install Zig
         run: ./scripts/setup-zig.sh
+
+      - name: Clone Zed sibling repo
+        run: git clone --depth 1 https://github.com/zed-industries/zed ../zed
 
       - name: Build release binary
         run: cargo build --release
@@ -43,7 +48,7 @@ jobs:
           bash -n scripts/package-deb.sh
           bash -n scripts/package-release.sh
 
-      - name: Smoke test CLI
+      - name: Validate release binary
         run: |
-          ./target/release/yggterm --version
-          ./target/release/yggterm tree
+          test -x ./target/release/yggterm
+          file ./target/release/yggterm

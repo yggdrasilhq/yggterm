@@ -32,7 +32,9 @@ jobs:
             libxkbcommon-dev
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.93.0
 
       - name: Install Zig
         run: ./scripts/setup-zig.sh
