@@ -43,7 +43,7 @@ jobs:
         run: git clone --depth 1 https://github.com/zed-industries/zed ../zed
 
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --release -p yggterm --no-default-features
 
       - name: Check shell scripts
         run: |
