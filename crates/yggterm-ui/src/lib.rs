@@ -3,7 +3,7 @@ use gpui::{AnyElement, Hsla, Stateful, Window, div, px};
 use theme::ThemeColors;
 use ui::{
     ButtonSize, ButtonStyle, Color, Divider, IconButton, IconButtonShape, IconName, IconSize,
-    Label, LabelSize, ListItem, ListItemSpacing, Switch, ToggleState, h_flex, prelude::*, v_flex,
+    Label, LabelSize, Switch, ToggleState, h_flex, prelude::*, v_flex,
 };
 
 pub fn render_session_tree_text(root: &yggterm_core::SessionNode) -> anyhow::Result<String> {
@@ -236,19 +236,16 @@ pub fn terminal_surface_card<S: AsRef<str>>(
 }
 
 pub fn preview_summary_card(
-    summary: &[yggterm_core::SessionMetadataEntry],
     query: &str,
     matching_blocks: usize,
     total_blocks: usize,
-    colors: &ThemeColors,
+    _colors: &ThemeColors,
 ) -> AnyElement {
     v_flex()
         .gap_2()
-        .p_3()
-        .rounded_md()
-        .bg(colors.surface_background)
-        .border_1()
-        .border_color(colors.border_variant)
+        .px_1()
+        .pt_1()
+        .pb_2()
         .child(
             h_flex()
                 .items_center()
@@ -268,27 +265,6 @@ pub fn preview_summary_card(
             )
         })
         .child(Divider::horizontal().inset())
-        .children(
-            summary
-                .iter()
-                .map(|entry| {
-                    ListItem::new(format!("summary-{}", entry.label))
-                        .spacing(ListItemSpacing::Dense)
-                        .selectable(false)
-                        .start_slot(
-                            Label::new(entry.label)
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
-                        .child(
-                            Label::new(entry.value.clone())
-                                .size(LabelSize::Small)
-                                .color(Color::Default),
-                        )
-                        .into_any_element()
-                })
-                .collect::<Vec<_>>(),
-        )
         .into_any_element()
 }
 
