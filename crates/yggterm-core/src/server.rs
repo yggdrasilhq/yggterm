@@ -186,25 +186,16 @@ impl YggtermServer {
                     TerminalBackend::Ghostty => "Ghostty",
                     TerminalBackend::Mock => "Mock",
                 },
-                appearance
-                ,
+                appearance,
                 launch_status,
             );
         }
     }
 
     pub fn open_or_focus_session(&mut self, path: &str) {
-        let entry = self
-            .sessions
-            .entry(path.to_string())
-            .or_insert_with(|| {
-                build_session(
-                    path,
-                    self.backend,
-                    self.theme,
-                    self.ghostty_bridge_enabled,
-                )
-            });
+        let entry = self.sessions.entry(path.to_string()).or_insert_with(|| {
+            build_session(path, self.backend, self.theme, self.ghostty_bridge_enabled)
+        });
         entry.backend = self.backend;
         self.active_session_path = Some(path.to_string());
     }
@@ -668,12 +659,8 @@ fn describe_status_line(
         UiTheme::ZedDark => "dark",
         UiTheme::ZedLight => "light",
     };
-    let launch_status = describe_launch_phase(
-        source,
-        launch_phase,
-        remote_deploy_state,
-        bridge_available,
-    );
+    let launch_status =
+        describe_launch_phase(source, launch_phase, remote_deploy_state, bridge_available);
     format!("{backend_label} · {appearance} scheme requested · {launch_status}")
 }
 
@@ -746,7 +733,10 @@ fn build_live_terminal_lines(session: &ManagedSessionView) -> Vec<String> {
 
 fn session_preview_cwd(path: &str) -> String {
     let trimmed = path.trim_end_matches('/');
-    let parent = trimmed.rsplit_once('/').map(|(parent, _)| parent).unwrap_or(trimmed);
+    let parent = trimmed
+        .rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .unwrap_or(trimmed);
     if let Some(home) = dirs::home_dir() {
         let home = home.to_string_lossy().to_string();
         if parent == home {
