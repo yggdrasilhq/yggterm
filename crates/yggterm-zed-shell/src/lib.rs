@@ -637,15 +637,23 @@ impl GpuiShell {
             h_flex()
                 .w(px(520.))
                 .flex_none()
-                .gap_1()
                 .items_center()
                 .justify_start()
-                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(
-                    self.chrome_icon("toggle-nav", IconName::WorkspaceNavOpen, self.sidebar_open)
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            self.chrome_icon(
+                                "toggle-nav",
+                                IconName::WorkspaceNavOpen,
+                                self.sidebar_open,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
+                        )
+                        .child(self.chrome_menu(cx)),
                 )
-                .child(self.chrome_menu(cx))
                 .into_any_element(),
             h_flex()
                 .flex_1()
@@ -656,72 +664,80 @@ impl GpuiShell {
             h_flex()
                 .w(px(520.))
                 .flex_none()
-                .gap_1()
                 .items_center()
                 .justify_end()
-                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(
-                    Button::new("titlebar-restore-all", "Restore All")
-                        .style(ButtonStyle::Subtle)
-                        .size(ButtonSize::Compact)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.set_last_action("restore all", cx)
-                        })),
-                )
-                .child(
-                    Button::new("titlebar-paste-screenshot", "Paste Screenshot")
-                        .style(ButtonStyle::Subtle)
-                        .size(ButtonSize::Compact)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.set_last_action("paste screenshot", cx)
-                        })),
-                )
-                .child(
-                    Button::new(
-                        "view-mode-toggle",
-                        match self.server.active_view_mode() {
-                            WorkspaceViewMode::Terminal => "Terminal",
-                            WorkspaceViewMode::Rendered => "Rendered",
-                        },
-                    )
-                    .style(ButtonStyle::Subtle)
-                    .size(ButtonSize::Compact)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        let next_mode = match this.server.active_view_mode() {
-                            WorkspaceViewMode::Terminal => WorkspaceViewMode::Rendered,
-                            WorkspaceViewMode::Rendered => WorkspaceViewMode::Terminal,
-                        };
-                        this.set_view_mode(next_mode, cx);
-                    })),
-                )
-                .child(
-                    self.chrome_icon(
-                        "metadata-panel",
-                        IconName::Info,
-                        self.right_panel_open && self.selected_right_panel == RightPanel::Metadata,
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.toggle_right_panel(RightPanel::Metadata, cx)
-                    })),
-                )
-                .child(
-                    self.chrome_icon(
-                        "extensions-panel",
-                        IconName::Code,
-                        self.right_panel_open && self.selected_right_panel == RightPanel::Extensions,
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.toggle_right_panel(RightPanel::Extensions, cx)
-                    })),
-                )
-                .child(
-                    Label::new(self.active_theme_label(cx))
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-                .child(
-                    self.chrome_icon("window-settings", IconName::Settings, false)
-                        .on_click(cx.listener(|this, _, _, cx| this.open_settings_window(cx))),
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            Button::new("titlebar-restore-all", "Restore All")
+                                .style(ButtonStyle::Subtle)
+                                .size(ButtonSize::Compact)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_last_action("restore all", cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("titlebar-paste-screenshot", "Paste Screenshot")
+                                .style(ButtonStyle::Subtle)
+                                .size(ButtonSize::Compact)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_last_action("paste screenshot", cx)
+                                })),
+                        )
+                        .child(
+                            Button::new(
+                                "view-mode-toggle",
+                                match self.server.active_view_mode() {
+                                    WorkspaceViewMode::Terminal => "Terminal",
+                                    WorkspaceViewMode::Rendered => "Rendered",
+                                },
+                            )
+                            .style(ButtonStyle::Subtle)
+                            .size(ButtonSize::Compact)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let next_mode = match this.server.active_view_mode() {
+                                    WorkspaceViewMode::Terminal => WorkspaceViewMode::Rendered,
+                                    WorkspaceViewMode::Rendered => WorkspaceViewMode::Terminal,
+                                };
+                                this.set_view_mode(next_mode, cx);
+                            })),
+                        )
+                        .child(
+                            self.chrome_icon(
+                                "metadata-panel",
+                                IconName::Info,
+                                self.right_panel_open
+                                    && self.selected_right_panel == RightPanel::Metadata,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle_right_panel(RightPanel::Metadata, cx)
+                            })),
+                        )
+                        .child(
+                            self.chrome_icon(
+                                "extensions-panel",
+                                IconName::Code,
+                                self.right_panel_open
+                                    && self.selected_right_panel == RightPanel::Extensions,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle_right_panel(RightPanel::Extensions, cx)
+                            })),
+                        )
+                        .child(
+                            Label::new(self.active_theme_label(cx))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            self.chrome_icon("window-settings", IconName::Settings, false)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.open_settings_window(cx)
+                                })),
+                        ),
                 )
                 .into_any_element(),
         ]
