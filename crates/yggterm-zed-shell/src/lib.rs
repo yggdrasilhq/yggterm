@@ -1432,7 +1432,6 @@ impl GpuiShell {
                 let preview_build_started_at = Instant::now();
                 let mut blocks = Vec::with_capacity(3);
                 blocks.push(yggterm_ui::preview_summary_card(
-                    &session.preview.summary,
                     preview_query.as_str(),
                     self.preview_cache.visible_blocks.len(),
                     session.preview.blocks.len(),
