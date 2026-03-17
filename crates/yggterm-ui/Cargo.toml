@@ -3,7 +3,7 @@ name = "yggterm-ui"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-license.workspace = true
+license = "Apache-2.0"
 
 [dependencies]
 yggterm-core = { path = "../yggterm-core" }
