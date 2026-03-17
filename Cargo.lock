@@ -10232,6 +10232,7 @@ dependencies = [
  "tracing-subscriber",
  "yggterm-core",
  "yggterm-ghostty-bridge",
+ "yggterm-gtk-glue",
  "yggterm-zed-shell",
 ]
 
@@ -10255,6 +10256,10 @@ dependencies = [
  "anyhow",
  "thiserror 2.0.18",
 ]
+
+[[package]]
+name = "yggterm-gtk-glue"
+version = "0.1.4"
 
 [[package]]
 name = "yggterm-platform"

@@ -85,6 +85,7 @@ Build Ghostty runtime artifacts:
 Current upstream constraint:
 
 - On Linux, `libghostty` links and the Yggterm server can launch Ghostty for terminal mode, but Ghostty's current embedded surface host only exposes macOS/iOS platform views. The in-viewport terminal path therefore still falls back to an external Ghostty process on Linux until upstream surface hosting expands.
+- `crates/yggterm-gtk-glue` is the reserved Linux bypass layer for a GTK-hosted Ghostty path while upstream embedding remains unavailable there.
 
 Build the workspace:
 
