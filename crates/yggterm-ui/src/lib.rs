@@ -2,7 +2,7 @@ use gpui::Div;
 use gpui::{AnyElement, Hsla, Stateful, Window, div, px};
 use theme::ThemeColors;
 use ui::{
-    ButtonSize, ButtonStyle, Color, Divider, Icon, IconButton, IconButtonShape, IconName, IconSize,
+    ButtonSize, ButtonStyle, Color, Divider, IconButton, IconButtonShape, IconName, IconSize,
     Label, LabelSize, ListItem, ListItemSpacing, Switch, ToggleState, h_flex, prelude::*, v_flex,
 };
 
@@ -293,7 +293,7 @@ pub fn preview_summary_card(
 }
 
 pub fn chat_preview_card(
-    role: &str,
+    _role: &str,
     timestamp: &str,
     tone: ChatBubbleTone,
     folded: bool,
@@ -301,22 +301,13 @@ pub fn chat_preview_card(
     lines: &[String],
     colors: &ThemeColors,
 ) -> AnyElement {
-    let (bg, border, icon) = match tone {
+    let (bg, border) = match tone {
         ChatBubbleTone::User => (
             colors.text_accent.opacity(0.10),
             colors.text_accent.opacity(0.28),
-            IconName::Person,
         ),
-        ChatBubbleTone::Assistant => (
-            colors.element_background,
-            colors.border_variant,
-            IconName::BookCopy,
-        ),
-        ChatBubbleTone::Neutral => (
-            colors.surface_background,
-            colors.border_variant,
-            IconName::Info,
-        ),
+        ChatBubbleTone::Assistant => (colors.surface_background, colors.border_variant),
+        ChatBubbleTone::Neutral => (colors.surface_background, colors.border_variant),
     };
 
     div()
@@ -328,43 +319,17 @@ pub fn chat_preview_card(
         })
         .child(
             v_flex()
-                .w(px(720.))
+                .w(px(780.))
                 .max_w_full()
-                .gap_2()
+                .gap_3()
                 .p_3()
-                .rounded_md()
+                .rounded_lg()
                 .bg(bg)
                 .border_1()
                 .border_color(border)
-                .child(
-                    h_flex()
-                        .items_center()
-                        .justify_between()
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .items_center()
-                                .child(Icon::new(icon).size(IconSize::Small))
-                                .child(
-                                    Label::new(role.to_string())
-                                        .size(LabelSize::Small)
-                                        .color(Color::Default),
-                                )
-                                .child(
-                                    Label::new(timestamp.to_string())
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
-                                ),
-                        )
-                        .child(
-                            Label::new(if folded { "collapsed" } else { "expanded" })
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        ),
-                )
                 .when(!query.is_empty(), |this| {
                     this.child(
-                        Label::new(format!("query: {query}"))
+                        Label::new(format!("match: {query}"))
                             .size(LabelSize::Small)
                             .color(Color::Muted),
                     )
@@ -381,7 +346,24 @@ pub fn chat_preview_card(
                             })
                             .collect::<Vec<_>>(),
                     )
-                }),
+                })
+                .child(
+                    h_flex()
+                        .w_full()
+                        .justify_end()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            Label::new(if folded { "collapsed" } else { "" })
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new(timestamp.to_string())
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                ),
         )
         .into_any_element()
 }

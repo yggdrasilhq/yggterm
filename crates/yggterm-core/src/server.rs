@@ -2,6 +2,8 @@ use crate::{SessionNode, UiTheme};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
+use std::process::{Command, Stdio};
+use std::time::SystemTime;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -96,6 +98,8 @@ pub struct ManagedSessionView {
     pub rendered_sections: Vec<SessionRenderedSection>,
     pub preview: SessionPreview,
     pub metadata: Vec<SessionMetadataEntry>,
+    pub terminal_process_id: Option<u32>,
+    pub last_launch_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -307,11 +311,65 @@ impl YggtermServer {
 
         match session.source {
             SessionSource::Stored => {
-                session.launch_phase = if session.bridge_available {
-                    TerminalLaunchPhase::Running
-                } else {
-                    TerminalLaunchPhase::BridgePending
-                };
+                if session.terminal_process_id.is_none() {
+                    match spawn_local_ghostty(&session.launch_command) {
+                        Ok(pid) => {
+                            session.backend = TerminalBackend::Ghostty;
+                            session.terminal_process_id = Some(pid);
+                            session.last_launch_error = None;
+                            session.launch_phase = TerminalLaunchPhase::Running;
+                            session.terminal_lines = vec![
+                                format!("$ {}", session.launch_command),
+                                format!("ghostty pid {pid}"),
+                                "server launched the terminal in an external Ghostty window"
+                                    .to_string(),
+                                "the embedded libghostty surface is the next integration step"
+                                    .to_string(),
+                            ];
+                        }
+                        Err(error) => {
+                            session.backend = TerminalBackend::Mock;
+                            session.last_launch_error = Some(error.clone());
+                            session.launch_phase = TerminalLaunchPhase::BridgePending;
+                            session
+                                .terminal_lines
+                                .push(format!("ghostty launch error: {error}"));
+                        }
+                    }
+                }
+                upsert_session_metadata(
+                    &mut session.metadata,
+                    "Backend",
+                    match session.backend {
+                        TerminalBackend::Ghostty => "Ghostty".to_string(),
+                        TerminalBackend::Mock => "Mock".to_string(),
+                    },
+                );
+                upsert_session_metadata(
+                    &mut session.metadata,
+                    "Launch PID",
+                    session
+                        .terminal_process_id
+                        .map(|pid| pid.to_string())
+                        .unwrap_or_else(|| "not launched".to_string()),
+                );
+                upsert_session_metadata(
+                    &mut session.metadata,
+                    "Launch Error",
+                    session
+                        .last_launch_error
+                        .clone()
+                        .unwrap_or_else(|| "none".to_string()),
+                );
+                upsert_session_metadata(
+                    &mut session.metadata,
+                    "Status",
+                    if session.terminal_process_id.is_some() {
+                        "running".to_string()
+                    } else {
+                        "launch failed".to_string()
+                    },
+                );
                 session.status_line = describe_status_line(
                     session.backend,
                     self.theme,
@@ -333,6 +391,15 @@ impl YggtermServer {
                     TerminalLaunchPhase::BridgePending
                 };
                 session.terminal_lines = build_live_terminal_lines(session);
+                upsert_session_metadata(
+                    &mut session.metadata,
+                    "Status",
+                    if session.bridge_available {
+                        "remote ready".to_string()
+                    } else {
+                        "copying binary".to_string()
+                    },
+                );
                 session.status_line = describe_status_line(
                     session.backend,
                     self.theme,
@@ -358,6 +425,12 @@ struct StoredTranscript {
     user_messages: usize,
     assistant_messages: usize,
     blocks: Vec<SessionPreviewBlock>,
+}
+
+#[derive(Debug, Clone)]
+struct StoredFileSnapshot {
+    updated_at: Option<String>,
+    bytes: Option<u64>,
 }
 
 fn first_session_leaf(node: &SessionNode) -> Option<StoredLeaf> {
@@ -415,10 +488,19 @@ fn build_session(
         session_id
     );
     let transcript = parse_stored_transcript(path, &started_at);
+    let file_snapshot = stored_file_snapshot(path);
     let started_at = transcript
         .as_ref()
         .map(|transcript| transcript.started_at.clone())
         .unwrap_or(started_at);
+    let preview_block_count = transcript
+        .as_ref()
+        .map(|transcript| transcript.blocks.len())
+        .unwrap_or(0);
+    let message_count = transcript
+        .as_ref()
+        .map(|transcript| transcript.user_messages + transcript.assistant_messages)
+        .unwrap_or(0);
     let preview = SessionPreview {
         summary: vec![
             SessionMetadataEntry {
@@ -448,6 +530,13 @@ fn build_session(
                         )
                     })
                     .unwrap_or_else(|| "preview unavailable".to_string()),
+            },
+            SessionMetadataEntry {
+                label: "Updated",
+                value: file_snapshot
+                    .updated_at
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
             },
         ],
         blocks: transcript
@@ -512,8 +601,8 @@ fn build_session(
             format!("$ cd {cwd}"),
             format!("$ codex resume {session_id}"),
             format!("Ghostty terminal host: {backend_label}"),
-            "waiting for embedded terminal surface".to_string(),
-            "server will attach stdin/stdout here once libghostty is mounted".to_string(),
+            "yggterm server launches ghostty for terminal mode".to_string(),
+            "embedded libghostty remains the next integration step".to_string(),
         ],
         rendered_sections: vec![
             SessionRenderedSection {
@@ -539,6 +628,10 @@ fn build_session(
                 value: "stored".to_string(),
             },
             SessionMetadataEntry {
+                label: "Host",
+                value: host_label.clone(),
+            },
+            SessionMetadataEntry {
                 label: "Session",
                 value: session_id,
             },
@@ -551,8 +644,46 @@ fn build_session(
                 value: cwd,
             },
             SessionMetadataEntry {
+                label: "Started",
+                value: started_at,
+            },
+            SessionMetadataEntry {
+                label: "Updated",
+                value: file_snapshot
+                    .updated_at
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+            },
+            SessionMetadataEntry {
+                label: "Bytes",
+                value: file_snapshot
+                    .bytes
+                    .map(|bytes| bytes.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+            },
+            SessionMetadataEntry {
+                label: "Messages",
+                value: message_count.to_string(),
+            },
+            SessionMetadataEntry {
+                label: "Preview Blocks",
+                value: preview_block_count.to_string(),
+            },
+            SessionMetadataEntry {
                 label: "Backend",
                 value: backend_label.to_string(),
+            },
+            SessionMetadataEntry {
+                label: "Launch PID",
+                value: "not launched".to_string(),
+            },
+            SessionMetadataEntry {
+                label: "Launch Error",
+                value: "none".to_string(),
+            },
+            SessionMetadataEntry {
+                label: "Status",
+                value: "queued".to_string(),
             },
             SessionMetadataEntry {
                 label: "Bridge",
@@ -571,6 +702,8 @@ fn build_session(
                 value: launch_command,
             },
         ],
+        terminal_process_id: None,
+        last_launch_error: None,
     }
 }
 
@@ -679,6 +812,10 @@ fn build_live_session(
                 value: "live-ssh".to_string(),
             },
             SessionMetadataEntry {
+                label: "Host",
+                value: target.label.clone(),
+            },
+            SessionMetadataEntry {
                 label: "UUID",
                 value: uuid.to_string(),
             },
@@ -695,10 +832,24 @@ fn build_live_session(
                 value: "planned".to_string(),
             },
             SessionMetadataEntry {
+                label: "Launch PID",
+                value: "remote".to_string(),
+            },
+            SessionMetadataEntry {
+                label: "Launch Error",
+                value: "none".to_string(),
+            },
+            SessionMetadataEntry {
+                label: "Status",
+                value: "planned".to_string(),
+            },
+            SessionMetadataEntry {
                 label: "Launch",
                 value: launch_command,
             },
         ],
+        terminal_process_id: None,
+        last_launch_error: None,
     }
 }
 
@@ -788,6 +939,50 @@ fn build_live_terminal_lines(session: &ManagedSessionView) -> Vec<String> {
             }
         ),
     ]
+}
+
+fn stored_file_snapshot(path: &str) -> StoredFileSnapshot {
+    let metadata = fs::metadata(path).ok();
+    StoredFileSnapshot {
+        updated_at: metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok())
+            .map(format_system_time),
+        bytes: metadata.as_ref().map(|metadata| metadata.len()),
+    }
+}
+
+fn spawn_local_ghostty(launch_command: &str) -> Result<u32, String> {
+    let child = Command::new("ghostty")
+        .arg("-e")
+        .arg("bash")
+        .arg("-lc")
+        .arg(launch_command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("failed to spawn ghostty: {error}"))?;
+    Ok(child.id())
+}
+
+fn upsert_session_metadata(
+    metadata: &mut Vec<SessionMetadataEntry>,
+    label: &'static str,
+    value: String,
+) {
+    if let Some(entry) = metadata.iter_mut().find(|entry| entry.label == label) {
+        entry.value = value;
+    } else {
+        metadata.push(SessionMetadataEntry { label, value });
+    }
+}
+
+fn format_system_time(time: SystemTime) -> String {
+    let datetime: OffsetDateTime = time.into();
+    datetime
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "unknown".to_string())
 }
 
 fn parse_stored_transcript(path: &str, fallback_started_at: &str) -> Option<StoredTranscript> {
