@@ -497,6 +497,11 @@ impl GpuiShell {
         );
     }
 
+    fn toggle_preview_block(&mut self, block_ix: usize, cx: &mut Context<Self>) {
+        self.server.toggle_preview_block(block_ix);
+        self.set_last_action(format!("preview block {}", block_ix + 1), cx);
+    }
+
     fn set_browser_filter(&mut self, query: impl Into<String>, cx: &mut Context<Self>) {
         let query = query.into();
         self.browser.set_filter_query(query.clone());
@@ -1226,7 +1231,10 @@ impl GpuiShell {
                                     .preview
                                     .blocks
                                     .iter()
-                                    .map(|block| session_preview_block(block.role, &block.timestamp, &block.lines, block.tone, colors)),
+                                    .enumerate()
+                                    .map(|(ix, block)| {
+                                        self.session_preview_block_element(ix, block, cx, colors)
+                                    }),
                             );
                             blocks
                         }
@@ -1517,6 +1525,62 @@ impl GpuiShell {
             })
             .toggle_state(selected)
             .style(ButtonStyle::Transparent)
+    }
+
+    fn session_preview_block_element(
+        &self,
+        block_ix: usize,
+        block: &yggterm_core::SessionPreviewBlock,
+        cx: &mut Context<Self>,
+        colors: &theme::ThemeColors,
+    ) -> AnyElement {
+        let border = match block.tone {
+            PreviewTone::User => colors.text_accent.opacity(0.32),
+            PreviewTone::Assistant => colors.border_variant,
+        };
+        let bg = match block.tone {
+            PreviewTone::User => colors.text_accent.opacity(0.08),
+            PreviewTone::Assistant => colors.surface_background,
+        };
+
+        v_flex()
+            .gap_2()
+            .p_3()
+            .rounded_md()
+            .bg(bg)
+            .border_1()
+            .border_color(border)
+            .child(
+                Button::new(
+                    format!("preview-block-{block_ix}"),
+                    format!(
+                        "{}  {}  {}",
+                        if block.folded { "▶" } else { "▼" },
+                        block.role,
+                        block.timestamp
+                    ),
+                )
+                .style(ButtonStyle::Transparent)
+                .full_width()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_preview_block(block_ix, cx);
+                })),
+            )
+            .when(!block.folded, |this| {
+                this.children(
+                    block
+                        .lines
+                        .iter()
+                        .map(|line| {
+                            Label::new(line.clone())
+                                .size(LabelSize::Small)
+                                .color(Color::Default)
+                                .into_any_element()
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .into_any_element()
     }
 
     fn command_palette_overlay(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -2306,61 +2370,6 @@ fn session_preview_summary(
             summary
                 .iter()
                 .map(|entry| metadata_row(entry.label, entry.value.clone()))
-                .collect::<Vec<_>>(),
-        )
-        .into_any_element()
-}
-
-fn session_preview_block<S: AsRef<str>>(
-    role: &str,
-    timestamp: &str,
-    lines: &[S],
-    tone: PreviewTone,
-    colors: &theme::ThemeColors,
-) -> AnyElement {
-    let border = match tone {
-        PreviewTone::User => colors.text_accent.opacity(0.32),
-        PreviewTone::Assistant => colors.border_variant,
-    };
-    let bg = match tone {
-        PreviewTone::User => colors.text_accent.opacity(0.08),
-        PreviewTone::Assistant => colors.surface_background,
-    };
-
-    v_flex()
-        .gap_2()
-        .p_3()
-        .rounded_md()
-        .bg(bg)
-        .border_1()
-        .border_color(border)
-        .child(
-            h_flex()
-                .items_center()
-                .justify_between()
-                .child(
-                    Label::new(role.to_string())
-                        .size(LabelSize::Small)
-                        .color(match tone {
-                            PreviewTone::User => Color::Accent,
-                            PreviewTone::Assistant => Color::Default,
-                        }),
-                )
-                .child(
-                    Label::new(timestamp.to_string())
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                ),
-        )
-        .children(
-            lines
-                .iter()
-                .map(|line| {
-                    Label::new(line.as_ref().to_string())
-                        .size(LabelSize::Small)
-                        .color(Color::Default)
-                        .into_any_element()
-                })
                 .collect::<Vec<_>>(),
         )
         .into_any_element()
