@@ -1,5 +1,6 @@
 use crate::{SessionNode, UiTheme};
 use std::collections::BTreeMap;
+use time::OffsetDateTime;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceViewMode {
@@ -25,6 +26,26 @@ pub struct SessionRenderedSection {
     pub lines: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewTone {
+    User,
+    Assistant,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionPreviewBlock {
+    pub role: &'static str,
+    pub timestamp: String,
+    pub tone: PreviewTone,
+    pub lines: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionPreview {
+    pub summary: Vec<SessionMetadataEntry>,
+    pub blocks: Vec<SessionPreviewBlock>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ManagedSessionView {
     pub session_path: String,
@@ -34,6 +55,7 @@ pub struct ManagedSessionView {
     pub status_line: String,
     pub terminal_lines: Vec<String>,
     pub rendered_sections: Vec<SessionRenderedSection>,
+    pub preview: SessionPreview,
     pub metadata: Vec<SessionMetadataEntry>,
 }
 
@@ -151,9 +173,63 @@ fn build_session(path: &str, backend: TerminalBackend, theme: UiTheme) -> Manage
         UiTheme::ZedDark => "dark",
         UiTheme::ZedLight => "light",
     };
+    let started_at = OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| String::from("unknown"));
     let backend_label = match backend {
         TerminalBackend::Ghostty => "Ghostty",
         TerminalBackend::Mock => "Mock",
+    };
+    let cwd = session_preview_cwd(path);
+    let preview = SessionPreview {
+        summary: vec![
+            SessionMetadataEntry {
+                label: "Session",
+                value: title.clone(),
+            },
+            SessionMetadataEntry {
+                label: "Path",
+                value: path.to_string(),
+            },
+            SessionMetadataEntry {
+                label: "Cwd",
+                value: cwd.clone(),
+            },
+            SessionMetadataEntry {
+                label: "Started",
+                value: started_at.clone(),
+            },
+        ],
+        blocks: vec![
+            SessionPreviewBlock {
+                role: "USER",
+                timestamp: started_at.clone(),
+                tone: PreviewTone::User,
+                lines: vec![
+                    format!("Attach {title} on {host_label} and restore the last multiplexed shell."),
+                    format!("Open the persisted workspace rooted at {cwd}."),
+                ],
+            },
+            SessionPreviewBlock {
+                role: "ASSISTANT",
+                timestamp: "server:restore".to_string(),
+                tone: PreviewTone::Assistant,
+                lines: vec![
+                    format!("{backend_label} backend reserved for the live terminal surface."),
+                    "Rendered preview follows codex-session-tui structure: scan browser first, inspect transcript second.".to_string(),
+                    "The Yggterm server stays authoritative for restore, attach, and remote orchestration.".to_string(),
+                ],
+            },
+            SessionPreviewBlock {
+                role: "USER",
+                timestamp: "session:notes".to_string(),
+                tone: PreviewTone::User,
+                lines: vec![
+                    "Future rich rendering will show screenshots, search hits, command summaries, and clipboard transfers here.".to_string(),
+                    "Switch back to Terminal in the titlebar when the Ghostty surface is active.".to_string(),
+                ],
+            },
+        ],
     };
 
     ManagedSessionView {
@@ -188,6 +264,7 @@ fn build_session(path: &str, backend: TerminalBackend, theme: UiTheme) -> Manage
                 ],
             },
         ],
+        preview,
         metadata: vec![
             SessionMetadataEntry {
                 label: "Host",
@@ -200,6 +277,10 @@ fn build_session(path: &str, backend: TerminalBackend, theme: UiTheme) -> Manage
             SessionMetadataEntry {
                 label: "Storage",
                 value: "~/.yggterm".to_string(),
+            },
+            SessionMetadataEntry {
+                label: "Cwd",
+                value: cwd,
             },
             SessionMetadataEntry {
                 label: "Backend",
@@ -215,4 +296,20 @@ fn build_session(path: &str, backend: TerminalBackend, theme: UiTheme) -> Manage
             },
         ],
     }
+}
+
+fn session_preview_cwd(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    let parent = trimmed.rsplit_once('/').map(|(parent, _)| parent).unwrap_or(trimmed);
+    if let Some(home) = dirs::home_dir() {
+        let home = home.to_string_lossy().to_string();
+        if parent == home {
+            return String::from("~");
+        }
+        let with_slash = format!("{home}/");
+        if let Some(rest) = parent.strip_prefix(&with_slash) {
+            return format!("~/{rest}");
+        }
+    }
+    parent.to_string()
 }
