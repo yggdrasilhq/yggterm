@@ -3,16 +3,17 @@ use assets::Assets;
 use editor::{Editor, EditorElement, EditorStyle};
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, Decorations, Entity, FocusHandle,
-    Focusable, Global, HitboxBehavior, Hsla, KeyBinding, MouseButton, MouseDownEvent,
-    MouseMoveEvent, Pixels, Point, ResizeEdge, SharedString, Size, StatefulInteractiveElement,
-    TextStyle, Tiling, Window, WindowBounds, WindowDecorations, WindowOptions, actions, canvas,
-    div, point, prelude::*, px, relative, size, transparent_black,
+    Focusable, Global, HitboxBehavior, Hsla, KeyBinding, ListAlignment, ListSizingBehavior,
+    ListState, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, ResizeEdge,
+    SharedString, Size, StatefulInteractiveElement, TextStyle, Tiling, UniformListScrollHandle,
+    Window, WindowBounds, WindowDecorations, WindowOptions, actions, canvas, div, list, point,
+    prelude::*, px, relative, size, transparent_black, uniform_list,
 };
 use gpui_platform::application;
 use serde::{Deserialize, Serialize};
 use settings::Settings;
 use std::collections::VecDeque;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::path::PathBuf;
 use std::time::Instant;
 use theme::{ActiveTheme, Appearance, ThemeRegistry, ThemeSelection, ThemeSettings};
@@ -27,6 +28,7 @@ use workspace::CloseWindow;
 use yggterm_core::{
     BrowserRow, BrowserRowKind, PreviewTone, SessionBrowserState, SessionMetadataEntry,
     SessionNode, SessionSource, TerminalBackend, UiTheme, WorkspaceViewMode, YggtermServer,
+    resolve_yggterm_home,
 };
 
 actions!(
@@ -280,6 +282,15 @@ fn open_settings_window_global(cx: &mut App) {
     );
 }
 
+fn debug_log_path() -> Option<PathBuf> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    resolve_yggterm_home()
+        .ok()
+        .map(|home| home.join("debug-ui.log"))
+}
+
 #[derive(Debug, Clone)]
 struct DockEntry {
     title: &'static str,
@@ -299,6 +310,15 @@ struct DebugTelemetry {
     browser_rebuild_ms: f32,
     visible_preview_blocks: usize,
     total_preview_blocks: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PreviewRenderCache {
+    session_path: Option<String>,
+    query: String,
+    visible_block_indices: Vec<usize>,
+    hidden_blocks: usize,
+    total_blocks: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,8 +348,11 @@ struct GpuiShell {
     chrome_menu_handle: PopoverMenuHandle<ContextMenu>,
     search_editor: Entity<Editor>,
     palette_editor: Entity<Editor>,
+    sidebar_scroll_handle: UniformListScrollHandle,
+    preview_list_state: ListState,
     browser: SessionBrowserState,
     server: YggtermServer,
+    preview_cache: PreviewRenderCache,
     dock_entries: Vec<DockEntry>,
     selected_dock_ix: usize,
     sidebar_open: bool,
@@ -345,6 +368,7 @@ struct GpuiShell {
     last_action: String,
     debug_telemetry: DebugTelemetry,
     debug_logs: VecDeque<String>,
+    debug_log_path: Option<PathBuf>,
 }
 
 impl GpuiShell {
@@ -368,6 +392,8 @@ impl GpuiShell {
             editor.set_placeholder_text("Search commands and themes…", window, cx);
             editor
         });
+        let sidebar_scroll_handle = UniformListScrollHandle::new();
+        let preview_list_state = ListState::new(0, ListAlignment::Top, px(640.));
         focus_handle.focus(window, cx);
         let server = YggtermServer::new(
             &bootstrap.browser_tree,
@@ -375,6 +401,21 @@ impl GpuiShell {
             bootstrap.ghostty_bridge_enabled,
             bootstrap.theme,
         );
+        let debug_log_path = debug_log_path();
+        if cfg!(debug_assertions) {
+            if let Some(path) = &debug_log_path {
+                if let Some(parent) = path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let launch_banner = format!(
+                    "{}  shell launch\n",
+                    OffsetDateTime::now_utc()
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap_or_else(|_| "unknown".to_string())
+                );
+                let _ = fs::write(path, launch_banner);
+            }
+        }
 
         let dock_entries = vec![
             DockEntry {
@@ -398,8 +439,11 @@ impl GpuiShell {
             chrome_menu_handle: PopoverMenuHandle::default(),
             search_editor,
             palette_editor,
+            sidebar_scroll_handle,
+            preview_list_state,
             browser,
             server,
+            preview_cache: PreviewRenderCache::default(),
             dock_entries,
             selected_dock_ix: 0,
             sidebar_open: true,
@@ -427,6 +471,7 @@ impl GpuiShell {
                 total_preview_blocks: 0,
             },
             debug_logs: VecDeque::new(),
+            debug_log_path,
         }
     }
 
@@ -463,6 +508,20 @@ impl GpuiShell {
         while self.debug_logs.len() > 48 {
             self.debug_logs.pop_back();
         }
+        if let Some(path) = &self.debug_log_path {
+            let line = self
+                .debug_logs
+                .front()
+                .cloned()
+                .unwrap_or_else(|| format!("{timestamp}  log"));
+            let _ = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .and_then(|mut file| {
+                    std::io::Write::write_all(&mut file, format!("{line}\n").as_bytes())
+                });
+        }
     }
 
     fn update_debug_telemetry(&mut self) {
@@ -495,24 +554,27 @@ impl GpuiShell {
             .is_none_or(|last_log_at| last_log_at.elapsed().as_millis() >= 800);
         if should_log {
             self.debug_telemetry.last_log_at = Some(Instant::now());
-            if self.debug_telemetry.last_render_ms > 16.7 {
-                self.push_debug_log(format!(
-                    "fps {:.1} render {:.2}ms sidebar {:.2}ms preview_filter {:.2}ms preview_build {:.2}ms rows={} rebuild {:.2}ms preview={}/{} mode={}",
-                    self.debug_telemetry.smoothed_fps,
-                    self.debug_telemetry.last_render_ms,
-                    self.debug_telemetry.last_sidebar_build_ms,
-                    self.debug_telemetry.last_preview_filter_ms,
-                    self.debug_telemetry.last_preview_build_ms,
-                    self.debug_telemetry.browser_rows,
-                    self.debug_telemetry.browser_rebuild_ms,
-                    self.debug_telemetry.visible_preview_blocks,
-                    self.debug_telemetry.total_preview_blocks,
-                    match self.server.active_view_mode() {
-                        WorkspaceViewMode::Terminal => "terminal",
-                        WorkspaceViewMode::Rendered => "preview",
-                    }
-                ));
-            }
+            let severity = if self.debug_telemetry.last_render_ms > 16.7 {
+                "slow"
+            } else {
+                "frame"
+            };
+            self.push_debug_log(format!(
+                "{severity} fps {:.1} render {:.2}ms sidebar {:.2}ms preview_filter {:.2}ms preview_build {:.2}ms rows={} rebuild {:.2}ms preview={}/{} mode={}",
+                self.debug_telemetry.smoothed_fps,
+                self.debug_telemetry.last_render_ms,
+                self.debug_telemetry.last_sidebar_build_ms,
+                self.debug_telemetry.last_preview_filter_ms,
+                self.debug_telemetry.last_preview_build_ms,
+                self.debug_telemetry.browser_rows,
+                self.debug_telemetry.browser_rebuild_ms,
+                self.debug_telemetry.visible_preview_blocks,
+                self.debug_telemetry.total_preview_blocks,
+                match self.server.active_view_mode() {
+                    WorkspaceViewMode::Terminal => "terminal",
+                    WorkspaceViewMode::Rendered => "preview",
+                }
+            ));
         }
     }
 
@@ -667,23 +729,54 @@ impl GpuiShell {
                 .any(|line| line.to_ascii_lowercase().contains(&query))
     }
 
-    fn visible_preview_blocks<'a>(
-        &self,
-        blocks: &'a [yggterm_core::SessionPreviewBlock],
-        query: &str,
-    ) -> (Vec<(usize, &'a yggterm_core::SessionPreviewBlock)>, usize) {
-        let matching = blocks
-            .iter()
-            .enumerate()
-            .filter(|(_, block)| self.preview_block_matches(block, query))
-            .collect::<Vec<_>>();
-        let hidden = matching.len().saturating_sub(Self::PREVIEW_RENDER_LIMIT);
-        let visible = if hidden > 0 {
-            matching.into_iter().skip(hidden).collect()
-        } else {
-            matching
+    fn ensure_preview_cache(&mut self) -> f32 {
+        let query = self.preview_query().trim().to_string();
+        let active_session = self.active_session().cloned();
+        let session_path = active_session
+            .as_ref()
+            .map(|session| session.session_path.clone());
+        let total_blocks = active_session
+            .as_ref()
+            .map(|session| session.preview.blocks.len())
+            .unwrap_or(0);
+        let cache_is_current = self.preview_cache.session_path == session_path
+            && self.preview_cache.query == query
+            && self.preview_cache.total_blocks == total_blocks;
+        if cache_is_current {
+            return 0.0;
+        }
+
+        let started_at = Instant::now();
+        let mut visible_block_indices = Vec::new();
+        let mut hidden_blocks = 0usize;
+        if let Some(session) = active_session.as_ref() {
+            let mut matching = session
+                .preview
+                .blocks
+                .iter()
+                .enumerate()
+                .filter_map(|(ix, block)| {
+                    self.preview_block_matches(block, query.as_str())
+                        .then_some(ix)
+                })
+                .collect::<Vec<_>>();
+            hidden_blocks = matching.len().saturating_sub(Self::PREVIEW_RENDER_LIMIT);
+            if hidden_blocks > 0 {
+                matching.drain(0..hidden_blocks);
+            }
+            visible_block_indices = matching;
+        }
+
+        self.preview_cache = PreviewRenderCache {
+            session_path,
+            query,
+            visible_block_indices,
+            hidden_blocks,
+            total_blocks,
         };
-        (visible, hidden)
+        self.preview_list_state
+            .reset(self.preview_cache.visible_block_indices.len());
+        started_at.elapsed().as_secs_f32() * 1000.0
     }
 
     fn set_browser_filter(&mut self, query: impl Into<String>, cx: &mut Context<Self>) {
@@ -1063,13 +1156,7 @@ impl GpuiShell {
         }
 
         let rows_started_at = Instant::now();
-        let rows = self
-            .browser
-            .rows()
-            .iter()
-            .enumerate()
-            .map(|(ix, row)| self.session_tree_row(ix, row, cx))
-            .collect::<Vec<_>>();
+        let row_count = self.browser.rows().len();
         if cfg!(debug_assertions) {
             let browser_metrics = self.browser.metrics();
             self.debug_telemetry.last_sidebar_build_ms =
@@ -1105,14 +1192,25 @@ impl GpuiShell {
             )
             .child(Divider::horizontal())
             .child(
-                v_flex()
-                    .flex_1()
-                    .id("session-tree-scroll")
-                    .overflow_y_scroll()
-                    .px_1()
-                    .py_1()
-                    .gap(px(2.))
-                    .children(rows),
+                div().flex_1().px_1().py_1().child(
+                    uniform_list(
+                        "session-tree-scroll",
+                        row_count,
+                        cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
+                            range
+                                .filter_map(|ix| {
+                                    this.browser
+                                        .rows()
+                                        .get(ix)
+                                        .cloned()
+                                        .map(|row| this.session_tree_row(ix, &row, cx))
+                                })
+                                .collect::<Vec<_>>()
+                        }),
+                    )
+                    .track_scroll(&self.sidebar_scroll_handle)
+                    .h_full(),
+                ),
             )
             .into_any_element()
     }
@@ -1211,14 +1309,14 @@ impl GpuiShell {
             })
             .or_else(|| self.selected_row().map(|row| row.full_path.clone()))
             .unwrap_or_else(|| "~/.yggterm/sessions".to_string());
-        let active_session = self.active_session();
         let preview_query = self.preview_query().trim().to_string();
         let mut visible_preview_blocks = 0usize;
         let mut total_preview_blocks = 0usize;
-        let mut preview_filter_ms = 0.0f32;
+        let preview_filter_ms = self.ensure_preview_cache();
         let mut preview_build_ms = 0.0f32;
+        let active_session = self.active_session().cloned();
 
-        let viewport_children = match active_session {
+        let viewport_children = match active_session.as_ref() {
             Some(session) if self.server.active_view_mode() == WorkspaceViewMode::Terminal => vec![
                 yggterm_ui::terminal_surface_card(
                     match session.source {
@@ -1250,41 +1348,29 @@ impl GpuiShell {
             ],
             Some(session) => {
                 total_preview_blocks = session.preview.blocks.len();
-                let preview_filter_started_at = Instant::now();
-                let (visible_blocks, hidden_blocks) =
-                    self.visible_preview_blocks(&session.preview.blocks, preview_query.as_str());
-                preview_filter_ms = preview_filter_started_at.elapsed().as_secs_f32() * 1000.0;
-                visible_preview_blocks = visible_blocks.len();
+                visible_preview_blocks = self.preview_cache.visible_block_indices.len();
                 let preview_build_started_at = Instant::now();
-                let mut blocks = Vec::new();
+                let mut blocks = Vec::with_capacity(3);
                 blocks.push(yggterm_ui::preview_summary_card(
                     &session.preview.summary,
                     preview_query.as_str(),
-                    visible_blocks.len() + hidden_blocks,
+                    self.preview_cache.visible_block_indices.len()
+                        + self.preview_cache.hidden_blocks,
                     session.preview.blocks.len(),
                     colors,
                 ));
-                if hidden_blocks > 0 {
+                if self.preview_cache.hidden_blocks > 0 {
                     blocks.push(yggterm_ui::terminal_surface_card(
                         "Preview Window",
                         &[format!(
                             "{} older conversation blocks are hidden to keep preview rendering responsive.",
-                            hidden_blocks
+                            self.preview_cache.hidden_blocks
                         )],
                         Some("windowed"),
                         colors,
                     ));
                 }
-                blocks.extend(visible_blocks.into_iter().map(|(ix, block)| {
-                    self.session_preview_block_element(
-                        ix,
-                        block,
-                        preview_query.as_str(),
-                        cx,
-                        colors,
-                    )
-                }));
-                if blocks.len() == 1 {
+                if self.preview_cache.visible_block_indices.is_empty() {
                     blocks.push(yggterm_ui::terminal_surface_card(
                         "No Preview Matches",
                         &[
@@ -1294,6 +1380,45 @@ impl GpuiShell {
                         Some("search"),
                         colors,
                     ));
+                } else {
+                    blocks.push(
+                        div()
+                            .flex_1()
+                            .min_h(px(320.))
+                            .child(
+                                list(
+                                    self.preview_list_state.clone(),
+                                    cx.processor(|this, ix: usize, _window, cx| {
+                                        let colors = cx.theme().colors().clone();
+                                        let Some(session) = this.active_session().cloned() else {
+                                            return div().into_any_element();
+                                        };
+                                        let Some(block_ix) = this
+                                            .preview_cache
+                                            .visible_block_indices
+                                            .get(ix)
+                                            .copied()
+                                        else {
+                                            return div().into_any_element();
+                                        };
+                                        let Some(block) = session.preview.blocks.get(block_ix)
+                                        else {
+                                            return div().into_any_element();
+                                        };
+                                        this.session_preview_block_element(
+                                            block_ix,
+                                            block,
+                                            this.preview_cache.query.as_str(),
+                                            cx,
+                                            &colors,
+                                        )
+                                    }),
+                                )
+                                .with_sizing_behavior(ListSizingBehavior::Auto)
+                                .h_full(),
+                            )
+                            .into_any_element(),
+                    );
                 }
                 preview_build_ms = preview_build_started_at.elapsed().as_secs_f32() * 1000.0;
                 blocks
@@ -1429,7 +1554,6 @@ impl GpuiShell {
                 v_flex()
                     .flex_1()
                     .id("viewport-scroll")
-                    .overflow_y_scroll()
                     .px_4()
                     .py_3()
                     .gap_3()
@@ -2201,11 +2325,13 @@ fn yggterm_client_side_decorations(
                             cx.notify(view.entity_id());
                         });
                     }
-                    window.refresh();
                 })
-                .on_hover(|hovered, window, _| {
+                .on_hover(|hovered, window, cx| {
                     if !*hovered {
-                        window.refresh();
+                        cx.set_global(GlobalResizeEdge(None));
+                        let _ = window.window_handle().update(cx, |view, _, cx| {
+                            cx.notify(view.entity_id());
+                        });
                     }
                 })
                 .on_mouse_down(MouseButton::Left, move |e, window, _| {
@@ -2275,9 +2401,8 @@ fn yggterm_client_side_decorations(
                             }])
                         }),
                 })
-                .on_mouse_move(|_, window, cx| {
+                .on_mouse_move(|_, _, cx| {
                     cx.stop_propagation();
-                    window.refresh();
                 })
                 .size_full()
                 .child(element),
