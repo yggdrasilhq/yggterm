@@ -1,8 +1,9 @@
 use gpui::Div;
 use gpui::{AnyElement, Hsla, Stateful, Window, div, px};
+use theme::ThemeColors;
 use ui::{
-    ButtonSize, ButtonStyle, Color, IconButton, IconButtonShape, IconName, IconSize, h_flex,
-    prelude::*,
+    ButtonSize, ButtonStyle, Color, Divider, Icon, IconButton, IconButtonShape, IconName, IconSize,
+    Label, LabelSize, ListItem, ListItemSpacing, h_flex, prelude::*, v_flex,
 };
 
 pub fn render_session_tree_text(root: &yggterm_core::SessionNode) -> anyhow::Result<String> {
@@ -21,9 +22,17 @@ fn render_node(node: &yggterm_core::SessionNode, depth: usize, out: &mut String)
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChatBubbleTone {
+    Neutral,
+    User,
+    Assistant,
+}
+
 pub fn titlebar_frame(
     left: AnyElement,
     center: AnyElement,
+    right: AnyElement,
     window: &mut Window,
     background: Hsla,
     border: Hsla,
@@ -31,7 +40,7 @@ pub fn titlebar_frame(
     h_flex()
         .id("yggterm-titlebar")
         .w_full()
-        .h(px(40.))
+        .h(px(42.))
         .items_center()
         .justify_between()
         .bg(background)
@@ -65,7 +74,9 @@ pub fn titlebar_frame(
                 .flex()
                 .items_center()
                 .justify_end()
+                .gap_1()
                 .px_2()
+                .child(right)
                 .child(window_controls(window)),
         )
 }
@@ -124,19 +135,203 @@ fn window_controls(window: &mut Window) -> AnyElement {
         .into_any_element()
 }
 
+pub fn titlebar_icon_button(id: &'static str, icon: IconName) -> IconButton {
+    IconButton::new(id, icon)
+        .shape(IconButtonShape::Square)
+        .size(ButtonSize::Large)
+        .icon_size(IconSize::Medium)
+        .icon_color(Color::Muted)
+        .style(ButtonStyle::Transparent)
+}
+
 fn window_control(
     id: &'static str,
     icon: IconName,
     on_click: impl Fn(&mut Window) + 'static,
 ) -> impl IntoElement {
-    IconButton::new(id, icon)
-        .shape(IconButtonShape::Square)
-        .size(ButtonSize::Medium)
-        .icon_size(IconSize::Small)
-        .icon_color(Color::Muted)
-        .style(ButtonStyle::Transparent)
-        .on_click(move |_, window, cx| {
-            cx.stop_propagation();
-            on_click(window);
+    titlebar_icon_button(id, icon).on_click(move |_, window, cx| {
+        cx.stop_propagation();
+        on_click(window);
+    })
+}
+
+pub fn terminal_surface_card<S: AsRef<str>>(
+    title: &'static str,
+    lines: &[S],
+    badge: Option<&str>,
+    colors: &ThemeColors,
+) -> AnyElement {
+    let badge = badge.unwrap_or("session").to_string();
+    v_flex()
+        .gap_2()
+        .p_3()
+        .rounded_md()
+        .bg(colors.surface_background)
+        .border_1()
+        .border_color(colors.border_variant)
+        .child(
+            h_flex()
+                .items_center()
+                .justify_between()
+                .child(Label::new(title).size(LabelSize::Small))
+                .child(Label::new(badge).size(LabelSize::Small).color(Color::Muted)),
+        )
+        .children(
+            lines
+                .iter()
+                .enumerate()
+                .map(|(ix, line)| {
+                    let line = line.as_ref();
+                    Label::new(format!("{:02}  {line}", ix + 1))
+                        .size(LabelSize::Small)
+                        .color(if line.starts_with('$') {
+                            Color::Accent
+                        } else {
+                            Color::Default
+                        })
+                        .into_any_element()
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_any_element()
+}
+
+pub fn preview_summary_card(
+    summary: &[yggterm_core::SessionMetadataEntry],
+    query: &str,
+    matching_blocks: usize,
+    total_blocks: usize,
+    colors: &ThemeColors,
+) -> AnyElement {
+    v_flex()
+        .gap_2()
+        .p_3()
+        .rounded_md()
+        .bg(colors.surface_background)
+        .border_1()
+        .border_color(colors.border_variant)
+        .child(
+            h_flex()
+                .items_center()
+                .justify_between()
+                .child(Label::new("Conversation").size(LabelSize::Small))
+                .child(
+                    Label::new(format!("{matching_blocks}/{total_blocks} blocks"))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                ),
+        )
+        .when(!query.is_empty(), |this| {
+            this.child(
+                Label::new(format!("Filtered by \"{query}\""))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
         })
+        .child(Divider::horizontal().inset())
+        .children(
+            summary
+                .iter()
+                .map(|entry| {
+                    ListItem::new(format!("summary-{}", entry.label))
+                        .spacing(ListItemSpacing::Dense)
+                        .selectable(false)
+                        .start_slot(
+                            Label::new(entry.label)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new(entry.value.clone())
+                                .size(LabelSize::Small)
+                                .color(Color::Default),
+                        )
+                        .into_any_element()
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_any_element()
+}
+
+pub fn chat_preview_card(
+    role: &str,
+    timestamp: &str,
+    tone: ChatBubbleTone,
+    folded: bool,
+    query: &str,
+    lines: &[String],
+    colors: &ThemeColors,
+) -> AnyElement {
+    let (bg, border, icon) = match tone {
+        ChatBubbleTone::User => (
+            colors.text_accent.opacity(0.10),
+            colors.text_accent.opacity(0.28),
+            IconName::Person,
+        ),
+        ChatBubbleTone::Assistant => (
+            colors.element_background,
+            colors.border_variant,
+            IconName::BookCopy,
+        ),
+        ChatBubbleTone::Neutral => (
+            colors.surface_background,
+            colors.border_variant,
+            IconName::Info,
+        ),
+    };
+
+    v_flex()
+        .gap_2()
+        .p_3()
+        .rounded_md()
+        .bg(bg)
+        .border_1()
+        .border_color(border)
+        .child(
+            h_flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(Icon::new(icon).size(IconSize::Small))
+                        .child(
+                            Label::new(role.to_string())
+                                .size(LabelSize::Small)
+                                .color(Color::Default),
+                        )
+                        .child(
+                            Label::new(timestamp.to_string())
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
+                )
+                .child(
+                    Label::new(if folded { "collapsed" } else { "expanded" })
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                ),
+        )
+        .when(!query.is_empty(), |this| {
+            this.child(
+                Label::new(format!("query: {query}"))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+        })
+        .when(!folded, |this| {
+            this.children(
+                lines
+                    .iter()
+                    .map(|line| {
+                        Label::new(line.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Default)
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .into_any_element()
 }
