@@ -15,7 +15,7 @@ fn main() -> Result<()> {
     let ghostty_bridge = yggterm_ghostty_bridge::bridge_status();
     let gtk_glue_detail = yggterm_gtk_glue::detail();
 
-    yggterm_zed_shell::launch_gpui_shell(yggterm_zed_shell::ShellBootstrap {
+    yggterm_ui::launch_shell(yggterm_ui::ShellBootstrap {
         tree,
         browser_tree,
         theme: settings.theme,

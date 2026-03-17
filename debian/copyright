@@ -2,14 +2,6 @@ Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: yggterm
 Source: local
 
-Files: apps/yggterm/* apps/yggterm/**
- crates/yggterm-zed-shell/* crates/yggterm-zed-shell/**
-Copyright: 2026 Avikalpa Kundu
-License: GPL-3+
- Licensed under the GNU General Public License, version 3 or later.
- On Debian systems, the full text of GPL-3 can be found in
- /usr/share/common-licenses/GPL-3
-
 Files: *.md
  AGENTS.md
 Copyright: 2026 Avikalpa Kundu
