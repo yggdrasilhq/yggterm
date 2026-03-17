@@ -26,7 +26,8 @@ use ui::{
 use workspace::CloseWindow;
 use yggterm_core::{
     BrowserRow, BrowserRowKind, PreviewTone, SessionMetadataEntry, SessionNode,
-    SessionBrowserState, TerminalBackend, UiTheme, WorkspaceViewMode, YggtermServer,
+    SessionBrowserState, SessionSource, TerminalBackend, UiTheme, WorkspaceViewMode,
+    YggtermServer,
 };
 
 actions!(
@@ -502,6 +503,20 @@ impl GpuiShell {
         self.set_last_action(format!("preview block {}", block_ix + 1), cx);
     }
 
+    fn connect_ssh_target(&mut self, target_ix: usize, cx: &mut Context<Self>) {
+        if let Some(session_key) = self.server.connect_ssh_target(target_ix) {
+            self.set_last_action(format!("ssh session {}", session_key.trim_start_matches("live::")), cx);
+        }
+    }
+
+    fn focus_live_session(&mut self, session_key: &str, cx: &mut Context<Self>) {
+        self.server.focus_live_session(session_key);
+        self.set_last_action(
+            format!("live {}", session_key.trim_start_matches("live::")),
+            cx,
+        );
+    }
+
     fn set_all_preview_blocks_folded(&mut self, folded: bool, cx: &mut Context<Self>) {
         self.server.set_all_preview_blocks_folded(folded);
         self.set_last_action(
@@ -914,6 +929,8 @@ impl GpuiShell {
             return div().into_any_element();
         }
 
+        let ssh_targets = self.server.ssh_targets().to_vec();
+        let live_sessions = self.server.live_sessions();
         let rows = self
             .browser
             .rows()
@@ -1064,6 +1081,76 @@ impl GpuiShell {
                         .size(LabelSize::Small)
                         .color(Color::Muted),
                     )
+                    .child(Divider::horizontal().inset())
+                    .child(
+                        ListSubHeader::new("Connect SSH")
+                            .left_icon(Some(IconName::Server))
+                            .end_slot(
+                                Label::new(ssh_targets.len().to_string())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .into_any_element(),
+                            ),
+                    )
+                    .children(
+                        ssh_targets
+                            .into_iter()
+                            .enumerate()
+                            .map(|(ix, target)| {
+                                ListItem::new(format!("ssh-target-{ix}"))
+                                    .spacing(ListItemSpacing::Dense)
+                                    .start_slot(Icon::new(IconName::ArrowUpRight).size(IconSize::Small))
+                                    .child(Label::new(target.label).size(LabelSize::Small))
+                                    .end_slot(
+                                        Label::new(
+                                            target
+                                                .prefix
+                                                .clone()
+                                                .unwrap_or_else(|| String::from("plain ssh")),
+                                        )
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                    )
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.connect_ssh_target(ix, cx);
+                                    }))
+                                    .into_any_element()
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .child(Divider::horizontal().inset())
+                    .child(
+                        ListSubHeader::new("Live Sessions")
+                            .left_icon(Some(IconName::ToolTerminal))
+                            .end_slot(
+                                Label::new(live_sessions.len().to_string())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .into_any_element(),
+                            ),
+                    )
+                    .children(
+                        live_sessions
+                            .into_iter()
+                            .map(|session| {
+                                let session_key = format!("live::{}", session.id);
+                                let session_id = session.id.clone();
+                                ListItem::new(format!("live-session-{}", session.id))
+                                    .spacing(ListItemSpacing::Dense)
+                                    .start_slot(Icon::new(IconName::TerminalGhost).size(IconSize::Small))
+                                    .child(Label::new(session_id).size(LabelSize::Small))
+                                    .end_slot(
+                                        Label::new(session.host_label)
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    )
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.focus_live_session(&session_key, cx);
+                                    }))
+                                    .into_any_element()
+                            })
+                            .collect::<Vec<_>>(),
+                    )
                     .into_any_element(),
             )
             .into_any_element()
@@ -1163,7 +1250,10 @@ impl GpuiShell {
     fn viewport(&self, cx: &mut Context<Self>, colors: &theme::ThemeColors) -> AnyElement {
         let selected_path = self
             .active_session()
-            .map(|session| session.session_path.clone())
+            .map(|session| match session.source {
+                SessionSource::Stored => session.session_path.clone(),
+                SessionSource::LiveSsh => format!("{} · {}", session.id, session.host_label),
+            })
             .or_else(|| self.selected_row().map(|row| row.full_path.clone()))
             .unwrap_or_else(|| "~/.yggterm/sessions".to_string());
         let active_session = self.active_session();
@@ -1275,7 +1365,15 @@ impl GpuiShell {
                     .gap_3()
                     .children(match active_session {
                         Some(session) if self.server.active_view_mode() == WorkspaceViewMode::Terminal => vec![
-                            session_block("Server Terminal", &session.terminal_lines, Some(&session.status_line), colors),
+                            session_block(
+                                match session.source {
+                                    SessionSource::Stored => "Server Terminal",
+                                    SessionSource::LiveSsh => "Ghostty Launch Request",
+                                },
+                                &session.terminal_lines,
+                                Some(&session.status_line),
+                                colors,
+                            ),
                             session_block(
                                 "Ghostty Integration",
                                 &[
@@ -1285,7 +1383,7 @@ impl GpuiShell {
                                         "libghostty bridge is not linked in this build."
                                     },
                                     "The shell color scheme is synchronized to the active Zed light/dark theme.",
-                                    "The server remains the authority for attach/focus/restore decisions.",
+                                    "The Yggterm server owns terminal launch requests and would hand live sessions to Ghostty surfaces here.",
                                 ],
                                 Some(self.active_mode_label()),
                                 colors,
