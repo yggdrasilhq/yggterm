@@ -99,7 +99,9 @@ pub struct ManagedSessionView {
     pub preview: SessionPreview,
     pub metadata: Vec<SessionMetadataEntry>,
     pub terminal_process_id: Option<u32>,
+    pub terminal_window_id: Option<String>,
     pub last_launch_error: Option<String>,
+    pub last_window_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -320,7 +322,9 @@ impl YggtermServer {
                         Ok(pid) => {
                             session.backend = TerminalBackend::Ghostty;
                             session.terminal_process_id = Some(pid);
+                            session.terminal_window_id = None;
                             session.last_launch_error = None;
+                            session.last_window_error = None;
                             session.launch_phase = TerminalLaunchPhase::Running;
                             session.terminal_lines = vec![
                                 format!("$ {}", session.launch_command),
@@ -329,6 +333,7 @@ impl YggtermServer {
                                     .to_string(),
                                 embedded_surface_note(session.bridge_available),
                             ];
+                            let _ = sync_external_window(session);
                         }
                         Err(error) => {
                             session.backend = TerminalBackend::Mock;
@@ -361,6 +366,22 @@ impl YggtermServer {
                     "Launch Error",
                     session
                         .last_launch_error
+                        .clone()
+                        .unwrap_or_else(|| "none".to_string()),
+                );
+                upsert_session_metadata(
+                    &mut session.metadata,
+                    "Ghostty Window",
+                    session
+                        .terminal_window_id
+                        .clone()
+                        .unwrap_or_else(|| "not resolved".to_string()),
+                );
+                upsert_session_metadata(
+                    &mut session.metadata,
+                    "Window Error",
+                    session
+                        .last_window_error
                         .clone()
                         .unwrap_or_else(|| "none".to_string()),
                 );
@@ -411,6 +432,52 @@ impl YggtermServer {
                     session.remote_deploy_state,
                     session.bridge_available,
                 );
+            }
+        }
+    }
+
+    pub fn sync_external_terminal_window_for_active(&mut self) -> String {
+        let Some(path) = self.active_session_path.as_ref() else {
+            return "no active session".to_string();
+        };
+        let Some(session) = self.sessions.get_mut(path) else {
+            return "no active session".to_string();
+        };
+        match sync_external_window(session) {
+            Ok(window_id) => format!("ghostty window resolved: {window_id}"),
+            Err(error) => error,
+        }
+    }
+
+    pub fn raise_external_terminal_window_for_active(&mut self) -> String {
+        let Some(path) = self.active_session_path.as_ref() else {
+            return "no active session".to_string();
+        };
+        let Some(session) = self.sessions.get_mut(path) else {
+            return "no active session".to_string();
+        };
+
+        if session.terminal_window_id.is_none() {
+            let _ = sync_external_window(session);
+        }
+
+        let Some(window_id) = session.terminal_window_id.clone() else {
+            return session
+                .last_window_error
+                .clone()
+                .unwrap_or_else(|| "ghostty window not resolved".to_string());
+        };
+
+        match raise_x11_window(&window_id) {
+            Ok(()) => {
+                session.last_window_error = None;
+                upsert_session_metadata(&mut session.metadata, "Window Error", "none".to_string());
+                format!("ghostty window raised: {window_id}")
+            }
+            Err(error) => {
+                session.last_window_error = Some(error.clone());
+                upsert_session_metadata(&mut session.metadata, "Window Error", error.clone());
+                error
             }
         }
     }
@@ -706,7 +773,9 @@ fn build_session(
             },
         ],
         terminal_process_id: None,
+        terminal_window_id: None,
         last_launch_error: None,
+        last_window_error: None,
     }
 }
 
@@ -852,7 +921,9 @@ fn build_live_session(
             },
         ],
         terminal_process_id: None,
+        terminal_window_id: None,
         last_launch_error: None,
+        last_window_error: None,
     }
 }
 
@@ -967,6 +1038,94 @@ fn spawn_local_ghostty(launch_command: &str) -> Result<u32, String> {
         .spawn()
         .map_err(|error| format!("failed to spawn ghostty: {error}"))?;
     Ok(child.id())
+}
+
+fn sync_external_window(session: &mut ManagedSessionView) -> Result<String, String> {
+    let Some(pid) = session.terminal_process_id else {
+        let error = "ghostty pid not available".to_string();
+        session.last_window_error = Some(error.clone());
+        upsert_session_metadata(
+            &mut session.metadata,
+            "Ghostty Window",
+            "not resolved".to_string(),
+        );
+        upsert_session_metadata(&mut session.metadata, "Window Error", error.clone());
+        return Err(error);
+    };
+
+    match resolve_x11_window_for_pid(pid) {
+        Ok(window_id) => {
+            session.terminal_window_id = Some(window_id.clone());
+            session.last_window_error = None;
+            upsert_session_metadata(&mut session.metadata, "Ghostty Window", window_id.clone());
+            upsert_session_metadata(&mut session.metadata, "Window Error", "none".to_string());
+            if !session
+                .terminal_lines
+                .iter()
+                .any(|line| line.contains("x11 window"))
+            {
+                session
+                    .terminal_lines
+                    .push(format!("x11 window {window_id}"));
+            }
+            Ok(window_id)
+        }
+        Err(error) => {
+            session.terminal_window_id = None;
+            session.last_window_error = Some(error.clone());
+            upsert_session_metadata(
+                &mut session.metadata,
+                "Ghostty Window",
+                "not resolved".to_string(),
+            );
+            upsert_session_metadata(&mut session.metadata, "Window Error", error.clone());
+            Err(error)
+        }
+    }
+}
+
+fn resolve_x11_window_for_pid(pid: u32) -> Result<String, String> {
+    let output = Command::new("xdotool")
+        .arg("search")
+        .arg("--pid")
+        .arg(pid.to_string())
+        .output()
+        .map_err(|error| format!("failed to run xdotool search: {error}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("ghostty window for pid {pid} not found yet")
+        } else {
+            format!("ghostty window lookup failed: {stderr}")
+        });
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.trim().to_string())
+        .ok_or_else(|| format!("ghostty window for pid {pid} not found yet"))
+}
+
+fn raise_x11_window(window_id: &str) -> Result<(), String> {
+    let output = Command::new("xdotool")
+        .arg("windowactivate")
+        .arg("--sync")
+        .arg(window_id)
+        .output()
+        .map_err(|error| format!("failed to run xdotool windowactivate: {error}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if stderr.is_empty() {
+            format!("failed to raise ghostty window {window_id}")
+        } else {
+            format!("failed to raise ghostty window {window_id}: {stderr}")
+        })
+    }
 }
 
 fn upsert_session_metadata(
