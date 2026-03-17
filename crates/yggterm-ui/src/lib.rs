@@ -277,77 +277,91 @@ pub fn chat_preview_card(
     lines: &[String],
     colors: &ThemeColors,
 ) -> AnyElement {
-    const LINE_RENDER_LIMIT: usize = 8;
-    let (bg, border) = match tone {
+    let (bg, border, footer_color) = match tone {
         ChatBubbleTone::User => (
-            colors.text_accent.opacity(0.10),
-            colors.text_accent.opacity(0.28),
+            colors.text_accent.opacity(0.12),
+            colors.text_accent.opacity(0.26),
+            Color::Accent,
         ),
-        ChatBubbleTone::Assistant => (colors.surface_background, colors.border_variant),
-        ChatBubbleTone::Neutral => (colors.surface_background, colors.border_variant),
+        ChatBubbleTone::Assistant => (
+            colors.surface_background,
+            colors.border_variant,
+            Color::Muted,
+        ),
+        ChatBubbleTone::Neutral => (
+            colors.surface_background,
+            colors.border_variant,
+            Color::Muted,
+        ),
     };
 
     div()
         .w_full()
         .flex()
+        .py_1()
         .justify_start()
         .when(matches!(tone, ChatBubbleTone::User), |this| {
             this.justify_end()
         })
         .child(
             v_flex()
-                .w(px(780.))
-                .max_w_full()
-                .gap_3()
-                .p_3()
-                .rounded_lg()
+                .w_full()
+                .max_w(px(match tone {
+                    ChatBubbleTone::User => 760.,
+                    ChatBubbleTone::Assistant | ChatBubbleTone::Neutral => 860.,
+                }))
+                .gap_2()
+                .px_4()
+                .py_3()
+                .rounded_xl()
                 .bg(bg)
                 .border_1()
                 .border_color(border)
                 .when(!query.is_empty(), |this| {
                     this.child(
-                        Label::new(format!("match: {query}"))
-                            .size(LabelSize::Small)
+                        Label::new(format!("Matched by \"{query}\""))
+                            .size(LabelSize::XSmall)
                             .color(Color::Muted),
                     )
                 })
                 .when(!folded, |this| {
-                    let hidden_line_count = lines.len().saturating_sub(LINE_RENDER_LIMIT);
                     this.children(
                         lines
                             .iter()
-                            .take(LINE_RENDER_LIMIT)
                             .map(|line| {
                                 Label::new(line.clone())
                                     .size(LabelSize::Default)
+                                    .line_height_style(ui::LineHeightStyle::UiLabel)
                                     .color(Color::Default)
                                     .into_any_element()
                             })
                             .collect::<Vec<_>>(),
                     )
-                    .when(hidden_line_count > 0, |this| {
-                        this.child(
-                            Label::new(format!("… {} more lines", hidden_line_count))
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
-                    })
+                })
+                .when(folded, |this| {
+                    this.child(
+                        Label::new("Collapsed")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
                 })
                 .child(
                     h_flex()
                         .w_full()
                         .justify_end()
-                        .gap_2()
+                        .gap_1()
                         .items_center()
-                        .child(
-                            Label::new(if folded { "collapsed" } else { "" })
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
+                        .when(folded, |this| {
+                            this.child(
+                                Label::new("collapsed")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                        })
                         .child(
                             Label::new(timestamp.to_string())
                                 .size(LabelSize::XSmall)
-                                .color(Color::Muted),
+                                .color(footer_color),
                         ),
                 ),
         )
