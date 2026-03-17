@@ -11,7 +11,10 @@ fn main() {
 
     let header = ghostty_dir.join("include").join("ghostty.h");
     if header.exists() {
-        println!("cargo:rustc-env=YGGTERM_GHOSTTY_HEADER={}", header.display());
+        println!(
+            "cargo:rustc-env=YGGTERM_GHOSTTY_HEADER={}",
+            header.display()
+        );
     }
 
     if let Some(lib_dir) = env::var_os("GHOSTTY_LIB_DIR") {
