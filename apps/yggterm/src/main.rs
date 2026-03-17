@@ -1,36 +1,10 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
 use eframe::egui;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command as ProcessCommand, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use yggterm_core::{AppSettings, SessionNode, SessionStore, UiTheme};
-
-#[derive(Debug, Parser)]
-#[command(name = "yggterm", version, about = "Yggdrasil Terminal")]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Command>,
-}
-
-#[derive(Debug, Subcommand)]
-enum Command {
-    /// Initialize local state directories (~/.yggterm by default)
-    Init,
-    /// Create a nested session folder path (example: team/backend/api)
-    MkSession { path: String },
-    /// Print session tree
-    Tree,
-    /// Print environment and integration readiness
-    Doctor,
-    /// Print Zed upstream integration plan markers
-    ZedPlan,
-    /// Launch the GPUI shell prototype
-    Gui,
-    /// Launch the older eframe scaffold
-    GuiScaffold,
-}
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -39,99 +13,8 @@ fn main() -> Result<()> {
         .without_time()
         .init();
 
-    let cli = Cli::parse();
     let store = SessionStore::open_or_init()?;
-
-    match cli.command.unwrap_or(Command::Tree) {
-        Command::Init => {
-            println!("Initialized YGGTERM_HOME at {}", store.home_dir().display());
-            println!("Sessions root at {}", store.sessions_root().display());
-            println!("Settings file at {}", store.settings_path().display());
-        }
-        Command::MkSession { path } => {
-            let created = store.create_session_path(&path)?;
-            println!("Created session path: {}", created.display());
-        }
-        Command::Tree => {
-            let platform = yggterm_platform::host_platform();
-            let _ = yggterm_ghostty_bridge::initialize_bridge();
-            let tree = store.load_tree()?;
-            println!("Host platform: {:?}", platform);
-            print!("{}", yggterm_ui::render_session_tree_text(&tree)?);
-        }
-        Command::Doctor => {
-            let platform = yggterm_platform::host_platform();
-            let env = yggterm_ghostty_bridge::GhosttyEnvironment::discover();
-            let bridge = yggterm_ghostty_bridge::bridge_status();
-            println!("Host platform: {:?}", platform);
-            println!("YGGTERM_HOME: {}", store.home_dir().display());
-            println!(
-                "Ghostty header discovered: {}",
-                env.header_path.unwrap_or_else(|| "not found".to_string())
-            );
-            println!(
-                "Ghostty library discovered: {}",
-                env.lib_dir.unwrap_or_else(|| "not found".to_string())
-            );
-            println!(
-                "Ghostty bridge init status: {}",
-                if bridge.ffi_enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-            );
-            println!(
-                "Ghostty embedded surface host: {}",
-                if bridge.embedded_surface_available() {
-                    "available"
-                } else {
-                    "unavailable"
-                }
-            );
-            println!("Bridge detail: {}", bridge.detail);
-            if !bridge.ffi_enabled {
-                println!(
-                    "Hint: use packaged .deb build (ghostty-ffi) or build with --features ghostty-ffi"
-                );
-            }
-        }
-        Command::ZedPlan => {
-            let plan = yggterm_zed_shell::shell_plan();
-            println!("Use workspace::Item: {}", plan.uses_upstream_workspace_item);
-            println!(
-                "Use project_panel tree: {}",
-                plan.uses_upstream_project_panel
-            );
-            println!(
-                "Use terminal_view items: {}",
-                plan.uses_upstream_terminal_view
-            );
-            println!(
-                "Center viewport replaced by terminals: {}",
-                plan.center_viewport_replaced_by_terminals
-            );
-            println!(
-                "GPUI shell scaffold present: {}",
-                plan.uses_gpui_shell_scaffold
-            );
-            println!(
-                "Virtual session tree present: {}",
-                plan.uses_virtual_session_tree
-            );
-            println!(
-                "Ghostty bridge status integrated: {}",
-                plan.integrates_ghostty_bridge_status
-            );
-            for marker in yggterm_zed_shell::upstream_type_markers() {
-                println!("Marker: {marker}");
-            }
-        }
-        Command::Gui => launch_gpui_gui(store)?,
-        Command::GuiScaffold => launch_gui(store)?,
-    }
-
-    Ok(())
+    launch_gpui_gui(store)
 }
 
 fn launch_gpui_gui(store: SessionStore) -> Result<()> {
