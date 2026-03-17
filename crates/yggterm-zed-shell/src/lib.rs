@@ -1,11 +1,12 @@
 use anyhow::Result;
 use assets::Assets;
+use editor::{Editor, EditorElement, EditorStyle};
 use gpui::{
-    AnyElement, App, Bounds, Context, CursorStyle, Decorations, Entity, FocusHandle, Global,
+    AnyElement, App, Bounds, Context, CursorStyle, Decorations, Entity, FocusHandle, Focusable, Global,
     HitboxBehavior, Hsla, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point,
-    ResizeEdge, SharedString, Size, Tiling, Window, WindowBounds, WindowDecorations,
+    ResizeEdge, SharedString, Size, TextStyle, Tiling, Window, WindowBounds, WindowDecorations,
     WindowOptions, actions, canvas, div, point, prelude::*, px, size, transparent_black,
-    StatefulInteractiveElement,
+    StatefulInteractiveElement, relative,
 };
 use gpui_platform::application;
 use platform_title_bar::PlatformTitleBar;
@@ -18,7 +19,7 @@ use theme::{
 };
 use ui::{
     Button, ButtonCommon, ButtonSize, ButtonStyle, Clickable, Color, ContextMenu, Disclosure,
-    Divider, FixedWidth, Icon, IconButton, IconButtonShape, IconName, IconSize, Label,
+    Disableable, Divider, FixedWidth, Icon, IconButton, IconButtonShape, IconName, IconSize, Label,
     LabelCommon, LabelSize, ListHeader, ListItem, ListItemSpacing, ListSubHeader, PopoverMenu,
     PopoverMenuHandle, StyledExt, Toggleable, Tooltip, h_flex, v_flex,
 };
@@ -32,12 +33,8 @@ actions!(
     yggterm_shell,
     [
         CloseCommandPalette,
+        FocusSearch,
         OpenCommandPalette,
-        SetFilterAll,
-        SetFilterCodex,
-        SetFilterLocal,
-        SetFilterProd,
-        SetFilterRemote,
         SwitchToRenderedView,
         SwitchToTerminalView,
         ToggleSidebar,
@@ -94,6 +91,7 @@ pub fn launch_gpui_shell(bootstrap: ShellBootstrap) -> Result<()> {
             .expect("failed to load bundled Zed fonts");
         cx.bind_keys([
             KeyBinding::new("ctrl-shift-p", OpenCommandPalette, None),
+            KeyBinding::new("ctrl-l", FocusSearch, None),
             KeyBinding::new("escape", CloseCommandPalette, None),
         ]);
         apply_initial_theme(&ui_config, bootstrap.theme, cx);
@@ -313,7 +311,8 @@ struct GpuiShell {
     focus_handle: FocusHandle,
     titlebar: Entity<PlatformTitleBar>,
     chrome_menu_handle: PopoverMenuHandle<ContextMenu>,
-    search_menu_handle: PopoverMenuHandle<ContextMenu>,
+    search_editor: Entity<Editor>,
+    palette_editor: Entity<Editor>,
     browser: SessionBrowserState,
     server: YggtermServer,
     dock_entries: Vec<DockEntry>,
@@ -340,6 +339,16 @@ impl GpuiShell {
         let browser = SessionBrowserState::new(bootstrap.tree.clone());
         let focus_handle = cx.focus_handle();
         let titlebar = cx.new(|cx| PlatformTitleBar::new("yggterm-platform-titlebar", cx));
+        let search_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Search sessions…", window, cx);
+            editor
+        });
+        let palette_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Search commands and themes…", window, cx);
+            editor
+        });
         focus_handle.focus(window, cx);
         let server = YggtermServer::new(
             &bootstrap.tree,
@@ -369,7 +378,8 @@ impl GpuiShell {
             focus_handle,
             titlebar,
             chrome_menu_handle: PopoverMenuHandle::default(),
-            search_menu_handle: PopoverMenuHandle::default(),
+            search_editor,
+            palette_editor,
             browser,
             server,
             dock_entries,
@@ -499,14 +509,46 @@ impl GpuiShell {
         );
     }
 
+    fn clear_browser_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_editor.update(cx, |editor, cx| {
+            editor.set_text("", window, cx);
+        });
+        self.set_browser_filter("", cx);
+    }
+
+    fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_editor
+            .update(cx, |editor, cx| window.focus(&editor.focus_handle(cx), cx));
+        self.set_last_action("focus search", cx);
+    }
+
+    fn sync_browser_filter_from_editor(&mut self, cx: &App) {
+        let query = self.search_editor.read(cx).text(cx);
+        if query != self.browser.filter_query() {
+            self.browser.set_filter_query(query);
+        }
+    }
+
+    fn focus_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.palette_editor
+            .update(cx, |editor, cx| window.focus(&editor.focus_handle(cx), cx));
+    }
+
+    fn palette_query(&self, cx: &App) -> String {
+        self.palette_editor.read(cx).text(cx)
+    }
+
     fn open_settings_window(&mut self, cx: &mut Context<Self>) {
         self.command_palette_open = false;
         self.set_last_action("settings window", cx);
         cx.defer(open_settings_window_global);
     }
 
-    fn toggle_command_palette(&mut self, cx: &mut Context<Self>) {
+    fn toggle_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.command_palette_open = !self.command_palette_open;
+        if self.command_palette_open {
+            self.focus_palette(window, cx);
+        }
         self.set_last_action(
             if self.command_palette_open {
                 "command palette"
@@ -589,7 +631,7 @@ impl GpuiShell {
         cx.theme().name.clone()
     }
 
-    fn titlebar_children(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn titlebar_children(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let selected = self
             .active_session()
             .map(|session| session.title.as_str())
@@ -613,7 +655,7 @@ impl GpuiShell {
             h_flex()
                 .gap_3()
                 .items_center()
-                .child(self.titlebar_search(cx))
+                .child(self.titlebar_search(window, cx))
                 .child(Label::new(format!("pi@dev: ~/gh/yggterm  ·  {selected}")).size(LabelSize::Small).color(Color::Muted))
                 .into_any_element(),
             h_flex()
@@ -687,8 +729,8 @@ impl GpuiShell {
         ]
     }
 
-    fn window_chrome(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let children = self.titlebar_children(cx);
+    fn window_chrome(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let children = self.titlebar_children(window, cx);
         self.titlebar.update(cx, |titlebar, cx| {
             titlebar.set_workspace_sidebar_open(self.sidebar_open, cx);
             titlebar.set_children(children);
@@ -740,48 +782,79 @@ impl GpuiShell {
             })
     }
 
-    fn titlebar_search(&self, _cx: &mut Context<Self>) -> PopoverMenu<ContextMenu> {
-        let filter_label = if self.browser.filter_query().is_empty() {
-            "Search sessions".to_string()
-        } else {
-            self.browser.filter_query().to_string()
+    fn titlebar_search(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let settings = ThemeSettings::get_global(cx);
+        let colors = cx.theme().colors();
+        let is_focused = self.search_editor.read(cx).is_focused(window);
+        let text_style = TextStyle {
+            color: colors.text,
+            font_family: settings.buffer_font.family.clone(),
+            font_features: settings.buffer_font.features.clone(),
+            font_fallbacks: settings.buffer_font.fallbacks.clone(),
+            font_size: ui::rems(0.875).into(),
+            font_weight: settings.buffer_font.weight,
+            ..TextStyle::default()
+        };
+        let editor_style = EditorStyle {
+            background: colors.toolbar_background,
+            local_player: cx.theme().players().local(),
+            text: text_style,
+            syntax: cx.theme().syntax().clone(),
+            ..EditorStyle::default()
         };
 
-        PopoverMenu::new("yggterm-titlebar-search")
-            .with_handle(self.search_menu_handle.clone())
-            .anchor(gpui::Corner::BottomLeft)
-            .trigger_with_tooltip(
-                Button::new("titlebar-search-button", filter_label)
-                    .icon(IconName::MagnifyingGlass)
-                    .style(ButtonStyle::Subtle)
-                    .size(ButtonSize::Compact)
-                    .truncate(true)
-                    .color(if self.browser.filter_query().is_empty() {
-                        Color::Muted
-                    } else {
-                        Color::Default
-                    }),
-                Tooltip::text("Session Filter"),
+        h_flex()
+            .w(px(380.))
+            .h(px(32.))
+            .items_center()
+            .gap_2()
+            .px_2()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.focus_search(window, cx);
+                    cx.stop_propagation();
+                }),
             )
-            .menu(move |window, cx| {
-                Some(ContextMenu::build(window, cx, |menu, _, _| {
-                    menu.entry("Clear Filter", None, |window, cx| {
-                        window.dispatch_action(Box::new(SetFilterAll), cx)
-                    })
-                    .entry("Filter: remote", None, |window, cx| {
-                        window.dispatch_action(Box::new(SetFilterRemote), cx)
-                    })
-                    .entry("Filter: prod", None, |window, cx| {
-                        window.dispatch_action(Box::new(SetFilterProd), cx)
-                    })
-                    .entry("Filter: codex", None, |window, cx| {
-                        window.dispatch_action(Box::new(SetFilterCodex), cx)
-                    })
-                    .entry("Filter: local", None, |window, cx| {
-                        window.dispatch_action(Box::new(SetFilterLocal), cx)
-                    })
-                }))
+            .rounded_md()
+            .border_1()
+            .border_color(if is_focused {
+                colors.border_focused
+            } else {
+                colors.border_variant
             })
+            .bg(colors.toolbar_background)
+            .child(
+                Icon::new(IconName::MagnifyingGlass)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .h_full()
+                    .child(EditorElement::new(&self.search_editor, editor_style)),
+            )
+            .child(
+                IconButton::new(
+                    "titlebar-search-clear",
+                    if self.browser.filter_query().is_empty() {
+                        IconName::ListFilter
+                    } else {
+                        IconName::Close
+                    },
+                )
+                .shape(IconButtonShape::Square)
+                .icon_size(IconSize::XSmall)
+                .icon_color(Color::Muted)
+                .style(ButtonStyle::Transparent)
+                .disabled(self.browser.filter_query().is_empty())
+                .tooltip(Tooltip::text("Clear Search"))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.clear_browser_filter(window, cx)
+                })),
+            )
+            .into_any_element()
     }
 
     fn sidebar(&self, cx: &mut Context<Self>, colors: &theme::ThemeColors) -> AnyElement {
@@ -873,8 +946,8 @@ impl GpuiShell {
                             .icon(IconName::MagnifyingGlass)
                             .style(ButtonStyle::Subtle)
                             .full_width()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.set_last_action("session filter menu", cx)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.focus_search(window, cx)
                             })),
                     )
                     .child(
@@ -1421,9 +1494,33 @@ impl GpuiShell {
             .style(ButtonStyle::Transparent)
     }
 
-    fn command_palette_overlay(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn command_palette_overlay(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let active_theme = cx.theme().name.to_string();
         let theme_names = available_theme_names(cx);
+        let palette_query = self.palette_query(cx);
+        let palette_query_lower = palette_query.to_lowercase();
+        let query_matches = |candidate: &str| {
+            palette_query_lower.is_empty() || candidate.to_lowercase().contains(&palette_query_lower)
+        };
+        let settings = ThemeSettings::get_global(cx);
+        let palette_focused = self.palette_editor.read(cx).is_focused(window);
+        let palette_text_style = TextStyle {
+            color: cx.theme().colors().text,
+            font_family: settings.buffer_font.family.clone(),
+            font_features: settings.buffer_font.features.clone(),
+            font_fallbacks: settings.buffer_font.fallbacks.clone(),
+            font_size: ui::rems(0.875).into(),
+            font_weight: settings.buffer_font.weight,
+            line_height: relative(1.3),
+            ..TextStyle::default()
+        };
+        let palette_editor_style = EditorStyle {
+            background: cx.theme().colors().elevated_surface_background,
+            local_player: cx.theme().players().local(),
+            text: palette_text_style,
+            syntax: cx.theme().syntax().clone(),
+            ..EditorStyle::default()
+        };
         let wash = match cx.theme().appearance {
             Appearance::Light => Hsla {
                 h: 0.,
@@ -1473,15 +1570,52 @@ impl GpuiShell {
                                     .gap_2()
                                     .border_b_1()
                                     .border_color(cx.theme().colors().border_variant)
-                                    .child(
-                                        Icon::new(IconName::MagnifyingGlass)
-                                            .size(IconSize::Small)
-                                            .color(Color::Muted),
-                                    )
-                                    .child(
-                                        Label::new("Command Palette")
-                                            .size(LabelSize::Default)
-                                            .color(Color::Default),
+                                    .child(h_flex()
+                                        .flex_1()
+                                        .h(px(32.))
+                                        .items_center()
+                                        .gap_2()
+                                        .px_2()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(if palette_focused {
+                                            cx.theme().colors().border_focused
+                                        } else {
+                                            cx.theme().colors().border_variant
+                                        })
+                                        .bg(cx.theme().colors().elevated_surface_background)
+                                        .child(
+                                            Icon::new(IconName::MagnifyingGlass)
+                                                .size(IconSize::Small)
+                                                .color(Color::Muted),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .h_full()
+                                                .child(EditorElement::new(
+                                                    &self.palette_editor,
+                                                    palette_editor_style,
+                                                )),
+                                        )
+                                        .child(
+                                            IconButton::new(
+                                                "palette-search-clear",
+                                                IconName::Close,
+                                            )
+                                            .shape(IconButtonShape::Square)
+                                            .icon_size(IconSize::XSmall)
+                                            .icon_color(Color::Muted)
+                                            .style(ButtonStyle::Transparent)
+                                            .disabled(palette_query.is_empty())
+                                            .tooltip(Tooltip::text("Clear Search"))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.palette_editor.update(cx, |editor, cx| {
+                                                    editor.set_text("", window, cx);
+                                                });
+                                                this.focus_palette(window, cx);
+                                            })),
+                                        ),
                                     )
                                     .child(div().flex_1())
                                     .child(
@@ -1503,26 +1637,72 @@ impl GpuiShell {
                                         ListSubHeader::new("Actions")
                                             .left_icon(Some(IconName::Settings)),
                                     )
-                                    .child(
-                                        Button::new("palette-settings", "Open Settings")
+                                    .when(query_matches("Open Settings"), |this| {
+                                        this.child(
+                                            Button::new("palette-settings", "Open Settings")
+                                                .style(ButtonStyle::Subtle)
+                                                .full_width()
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.open_settings_window(cx);
+                                                })),
+                                        )
+                                    })
+                                    .when(query_matches("Toggle Default Light Dark Theme"), |this| {
+                                        this.child(
+                                            Button::new(
+                                                "palette-toggle-theme-mode",
+                                                "Toggle Default Light/Dark Theme",
+                                            )
                                             .style(ButtonStyle::Subtle)
                                             .full_width()
                                             .on_click(cx.listener(|this, _, _, cx| {
-                                                this.open_settings_window(cx);
+                                                toggle_theme_mode_and_save(cx);
+                                                this.dismiss_command_palette(cx);
                                             })),
-                                    )
-                                    .child(
-                                        Button::new(
-                                            "palette-toggle-theme-mode",
-                                            "Toggle Default Light/Dark Theme",
                                         )
-                                        .style(ButtonStyle::Subtle)
-                                        .full_width()
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            toggle_theme_mode_and_save(cx);
-                                            this.dismiss_command_palette(cx);
-                                        })),
-                                    )
+                                    })
+                                    .when(query_matches("Switch to Terminal View"), |this| {
+                                        this.child(
+                                            Button::new(
+                                                "palette-terminal-view",
+                                                "Switch to Terminal View",
+                                            )
+                                            .style(ButtonStyle::Subtle)
+                                            .full_width()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.set_view_mode(WorkspaceViewMode::Terminal, cx);
+                                                this.dismiss_command_palette(cx);
+                                            })),
+                                        )
+                                    })
+                                    .when(query_matches("Switch to Rendered View"), |this| {
+                                        this.child(
+                                            Button::new(
+                                                "palette-rendered-view",
+                                                "Switch to Rendered View",
+                                            )
+                                            .style(ButtonStyle::Subtle)
+                                            .full_width()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.set_view_mode(WorkspaceViewMode::Rendered, cx);
+                                                this.dismiss_command_palette(cx);
+                                            })),
+                                        )
+                                    })
+                                    .when(query_matches("Focus Session Search"), |this| {
+                                        this.child(
+                                            Button::new(
+                                                "palette-focus-search",
+                                                "Focus Session Search",
+                                            )
+                                            .style(ButtonStyle::Subtle)
+                                            .full_width()
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.dismiss_command_palette(cx);
+                                                this.focus_search(window, cx);
+                                            })),
+                                        )
+                                    })
                                     .child(Divider::horizontal())
                                     .child(
                                         ListSubHeader::new("Bundled Zed Themes")
@@ -1531,6 +1711,7 @@ impl GpuiShell {
                                     .children(
                                         theme_names
                                             .into_iter()
+                                            .filter(|theme_name| query_matches(theme_name))
                                             .map(|theme_name| {
                                                 let is_active = theme_name == cx.theme().name.to_string();
                                                 Button::new(
@@ -1617,23 +1798,11 @@ impl Render for GpuiShell {
         yggterm_client_side_decorations(
             div()
                 .track_focus(&self.focus_handle)
-                .on_action(cx.listener(|this, _: &OpenCommandPalette, _, cx| {
-                    this.toggle_command_palette(cx);
+                .on_action(cx.listener(|this, _: &OpenCommandPalette, window, cx| {
+                    this.toggle_command_palette(window, cx);
                 }))
-                .on_action(cx.listener(|this, _: &SetFilterAll, _, cx| {
-                    this.set_browser_filter("", cx);
-                }))
-                .on_action(cx.listener(|this, _: &SetFilterRemote, _, cx| {
-                    this.set_browser_filter("remote", cx);
-                }))
-                .on_action(cx.listener(|this, _: &SetFilterProd, _, cx| {
-                    this.set_browser_filter("prod", cx);
-                }))
-                .on_action(cx.listener(|this, _: &SetFilterCodex, _, cx| {
-                    this.set_browser_filter("codex", cx);
-                }))
-                .on_action(cx.listener(|this, _: &SetFilterLocal, _, cx| {
-                    this.set_browser_filter("local", cx);
+                .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
+                    this.focus_search(window, cx);
                 }))
                 .on_action(cx.listener(|this, _: &SwitchToTerminalView, _, cx| {
                     this.set_view_mode(WorkspaceViewMode::Terminal, cx);
@@ -1656,6 +1825,10 @@ impl Render for GpuiShell {
                 .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
                     this.end_panel_drag(cx);
                 }))
+                .map(|this| {
+                    self.sync_browser_filter_from_editor(cx);
+                    this
+                })
                 .size_full()
                 .flex()
                 .flex_col()
@@ -1675,7 +1848,7 @@ impl Render for GpuiShell {
                         .child(self.workspace(window, cx, &colors)),
                 )
                 .when(self.command_palette_open, |this| {
-                    this.child(self.command_palette_overlay(cx))
+                    this.child(self.command_palette_overlay(window, cx))
                 }),
             window,
             cx,
