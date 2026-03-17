@@ -13,7 +13,7 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 ## Engineering constraints
 
 - Primary implementation language: **Rust**.
-- When building against the local `../zed` GPUI stack, expect a newer Rust toolchain requirement than the temporary scaffold. In this environment Rust `1.93.0` is currently the working choice.
+- When building against the local `../zed` GPUI stack, use the repository-pinned Rust `1.94.0` toolchain.
 - Ghostty interoperability may require **Zig** and `libghostty` integration work.
 - Prefer explicit modular boundaries:
   - `core` (domain state and tree model)
