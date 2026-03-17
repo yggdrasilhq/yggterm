@@ -339,6 +339,8 @@ struct GpuiShell {
 }
 
 impl GpuiShell {
+    const PREVIEW_RENDER_LIMIT: usize = 20;
+
     fn new(
         bootstrap: ShellBootstrap,
         ui_config: ShellUiConfig,
@@ -481,16 +483,18 @@ impl GpuiShell {
                 .active_session()
                 .map(|session| session.preview.blocks.len())
                 .unwrap_or(0);
-            self.push_debug_log(format!(
-                "fps {:.1} render {:.2}ms preview_blocks={} mode={}",
-                self.debug_telemetry.smoothed_fps,
-                self.debug_telemetry.last_render_ms,
-                preview_blocks,
-                match self.server.active_view_mode() {
-                    WorkspaceViewMode::Terminal => "terminal",
-                    WorkspaceViewMode::Rendered => "preview",
-                }
-            ));
+            if self.debug_telemetry.last_render_ms > 16.7 {
+                self.push_debug_log(format!(
+                    "fps {:.1} render {:.2}ms preview_blocks={} mode={}",
+                    self.debug_telemetry.smoothed_fps,
+                    self.debug_telemetry.last_render_ms,
+                    preview_blocks,
+                    match self.server.active_view_mode() {
+                        WorkspaceViewMode::Terminal => "terminal",
+                        WorkspaceViewMode::Rendered => "preview",
+                    }
+                ));
+            }
         }
     }
 
@@ -620,6 +624,25 @@ impl GpuiShell {
                 .lines
                 .iter()
                 .any(|line| line.to_ascii_lowercase().contains(&query))
+    }
+
+    fn visible_preview_blocks<'a>(
+        &self,
+        blocks: &'a [yggterm_core::SessionPreviewBlock],
+        query: &str,
+    ) -> (Vec<(usize, &'a yggterm_core::SessionPreviewBlock)>, usize) {
+        let matching = blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| self.preview_block_matches(block, query))
+            .collect::<Vec<_>>();
+        let hidden = matching.len().saturating_sub(Self::PREVIEW_RENDER_LIMIT);
+        let visible = if hidden > 0 {
+            matching.into_iter().skip(hidden).collect()
+        } else {
+            matching
+        };
+        (visible, hidden)
     }
 
     fn set_browser_filter(&mut self, query: impl Into<String>, cx: &mut Context<Self>) {
@@ -1269,25 +1292,31 @@ impl GpuiShell {
                             ),
                         ],
                         Some(session) => {
-                            let matching_blocks = session
-                                .preview
-                                .blocks
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, block)| {
-                                    self.preview_block_matches(block, preview_query.as_str())
-                                })
-                                .collect::<Vec<_>>();
+                            let (visible_blocks, hidden_blocks) = self.visible_preview_blocks(
+                                &session.preview.blocks,
+                                preview_query.as_str(),
+                            );
                             let mut blocks = Vec::new();
                             blocks.push(yggterm_ui::preview_summary_card(
                                 &session.preview.summary,
                                 preview_query.as_str(),
-                                matching_blocks.len(),
+                                visible_blocks.len() + hidden_blocks,
                                 session.preview.blocks.len(),
                                 colors,
                             ));
+                            if hidden_blocks > 0 {
+                                blocks.push(yggterm_ui::terminal_surface_card(
+                                    "Preview Window",
+                                    &[format!(
+                                        "{} older conversation blocks are hidden to keep preview rendering responsive.",
+                                        hidden_blocks
+                                    )],
+                                    Some("windowed"),
+                                    colors,
+                                ));
+                            }
                             blocks.extend(
-                                matching_blocks.into_iter().map(|(ix, block)| {
+                                visible_blocks.into_iter().map(|(ix, block)| {
                                     self.session_preview_block_element(ix, block, preview_query.as_str(), cx, colors)
                                 }),
                             );
