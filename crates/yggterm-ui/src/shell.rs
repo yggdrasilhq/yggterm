@@ -1,0 +1,598 @@
+use anyhow::Result;
+use gpui::{
+    AnyElement, App, AppContext, Bounds, Context, InteractiveElement, IntoElement, ParentElement, Render,
+    SharedString, StatefulInteractiveElement, Styled, UniformListScrollHandle, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions, div, px, size,
+    uniform_list,
+};
+use gpui_platform::application;
+use yggterm_core::{
+    BrowserRow, BrowserRowKind, ManagedSessionView, PreviewTone, SessionBrowserState,
+    SessionMetadataEntry, SessionNode, UiTheme, WorkspaceViewMode, YggtermServer,
+};
+
+use crate::{
+    ChatBubbleTone, TitlebarIcon, ToggleState, UiPalette, chat_preview_card, preview_summary_card,
+    statusbar_frame, terminal_surface_card, titlebar_frame, titlebar_icon_button,
+    titlebar_mode_toggle,
+};
+
+#[derive(Debug, Clone)]
+pub struct ShellBootstrap {
+    pub tree: SessionNode,
+    pub browser_tree: SessionNode,
+    pub theme: UiTheme,
+    pub ghostty_bridge_enabled: bool,
+    pub ghostty_embedded_surface_supported: bool,
+    pub ghostty_bridge_detail: String,
+    pub prefer_ghostty_backend: bool,
+}
+
+pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
+    application().run(move |cx: &mut App| {
+        let bounds = Bounds::centered(None, size(px(1460.), px(920.)), cx);
+        let shell = bootstrap.clone();
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_background: WindowBackgroundAppearance::Opaque,
+                window_decorations: Some(WindowDecorations::Server),
+                window_min_size: Some(size(px(1024.), px(720.))),
+                app_id: Some("dev.yggterm".into()),
+                ..Default::default()
+            },
+            move |_window, cx| cx.new(|cx| GpuiShell::new(shell.clone(), cx)),
+        )
+        .expect("failed to open yggterm shell");
+    });
+
+    Ok(())
+}
+
+struct GpuiShell {
+    bootstrap: ShellBootstrap,
+    browser: SessionBrowserState,
+    server: YggtermServer,
+    sidebar_open: bool,
+    right_panel_open: bool,
+    sidebar_scroll_handle: UniformListScrollHandle,
+    last_action: String,
+}
+
+impl GpuiShell {
+    fn new(bootstrap: ShellBootstrap, _cx: &mut Context<Self>) -> Self {
+        Self {
+            browser: SessionBrowserState::new(bootstrap.browser_tree.clone()),
+            server: YggtermServer::new(
+                &bootstrap.browser_tree,
+                bootstrap.prefer_ghostty_backend,
+                bootstrap.ghostty_bridge_enabled,
+                bootstrap.theme,
+            ),
+            bootstrap,
+            sidebar_open: true,
+            right_panel_open: true,
+            sidebar_scroll_handle: UniformListScrollHandle::new(),
+            last_action: "ready".to_string(),
+        }
+    }
+
+    fn palette(&self) -> UiPalette {
+        match self.bootstrap.theme {
+            UiTheme::ZedDark => UiPalette::dark(),
+            UiTheme::ZedLight => UiPalette::light(),
+        }
+    }
+
+    fn active_session(&self) -> Option<&ManagedSessionView> {
+        self.server.active_session()
+    }
+
+    fn selected_row(&self) -> Option<&BrowserRow> {
+        self.browser.selected_row()
+    }
+
+    fn total_leaf_sessions(&self) -> usize {
+        self.browser.total_sessions()
+    }
+
+    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_open = !self.sidebar_open;
+        self.last_action = if self.sidebar_open {
+            "sidebar opened"
+        } else {
+            "sidebar hidden"
+        }
+        .to_string();
+        cx.notify();
+    }
+
+    fn toggle_right_panel(&mut self, cx: &mut Context<Self>) {
+        self.right_panel_open = !self.right_panel_open;
+        self.last_action = if self.right_panel_open {
+            "metadata opened"
+        } else {
+            "metadata hidden"
+        }
+        .to_string();
+        cx.notify();
+    }
+
+    fn set_view_mode(&mut self, mode: WorkspaceViewMode, cx: &mut Context<Self>) {
+        self.server.set_view_mode(mode);
+        if mode == WorkspaceViewMode::Terminal {
+            self.server.request_terminal_launch_for_active();
+        }
+        self.last_action = match mode {
+            WorkspaceViewMode::Rendered => "preview mode",
+            WorkspaceViewMode::Terminal => "terminal mode",
+        }
+        .to_string();
+        cx.notify();
+    }
+
+    fn connect_ssh_target(&mut self, target_ix: usize, cx: &mut Context<Self>) {
+        if let Some(key) = self.server.connect_ssh_target(target_ix) {
+            self.last_action = format!("ssh session {key}");
+            cx.notify();
+        }
+    }
+
+    fn select_row(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(row) = self.browser.rows().get(ix).cloned() else {
+            return;
+        };
+
+        match row.kind {
+            BrowserRowKind::Group => {
+                self.browser.toggle_group(&row.full_path);
+                self.last_action = format!("toggled {}", row.label);
+            }
+            BrowserRowKind::Session => {
+                self.browser.select_path(row.full_path.clone());
+                self.server.open_or_focus_session(
+                    &row.full_path,
+                    row.session_id.as_deref(),
+                    row.session_cwd.as_deref(),
+                );
+                self.server.set_view_mode(WorkspaceViewMode::Rendered);
+                self.last_action = format!("selected {}", row.label);
+            }
+        }
+        cx.notify();
+    }
+
+    fn toggle_preview_block(&mut self, block_ix: usize, cx: &mut Context<Self>) {
+        self.server.toggle_preview_block(block_ix);
+        cx.notify();
+    }
+
+    fn search_placeholder(&self, palette: &UiPalette) -> AnyElement {
+        div()
+            .w(px(360.))
+            .h(px(30.))
+            .flex()
+            .items_center()
+            .px_3()
+            .rounded_md()
+            .bg(palette.element_background)
+            .border_1()
+            .border_color(palette.border_variant)
+            .text_sm()
+            .text_color(palette.text_muted)
+            .child("Search sessions…")
+            .into_any_element()
+    }
+
+    fn titlebar(&self, _window: &mut Window, cx: &mut Context<Self>, palette: &UiPalette) -> AnyElement {
+        let left = div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .items_center()
+            .child(titlebar_mode_toggle(
+                "preview-toggle",
+                "Preview",
+                self.server.active_view_mode() == WorkspaceViewMode::Rendered,
+                cx.listener(|this, state, _, cx| {
+                    this.set_view_mode(
+                        if *state == ToggleState::Selected {
+                            WorkspaceViewMode::Rendered
+                        } else {
+                            WorkspaceViewMode::Terminal
+                        },
+                        cx,
+                    )
+                }),
+                palette,
+            ))
+            .child(
+                titlebar_icon_button("toggle-sidebar", TitlebarIcon::Sidebar, palette)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
+            )
+            .into_any_element();
+
+        let right = div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .items_center()
+            .child(
+                titlebar_icon_button("connect-ssh", TitlebarIcon::ConnectSsh, palette)
+                    .on_click(cx.listener(|this, _, _, cx| this.connect_ssh_target(0, cx))),
+            )
+            .child(
+                titlebar_icon_button("toggle-meta", TitlebarIcon::Info, palette)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_right_panel(cx))),
+            )
+            .into_any_element();
+
+        titlebar_frame(
+            left,
+            self.search_placeholder(palette),
+            right,
+            palette.window_background,
+            palette.border,
+        )
+        .into_any_element()
+    }
+
+    fn sidebar(&self, cx: &mut Context<Self>, palette: &UiPalette) -> AnyElement {
+        if !self.sidebar_open {
+            return div().into_any_element();
+        }
+
+        let row_count = self.browser.rows().len();
+        div()
+            .w(px(248.))
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(palette.window_background)
+            .border_r_1()
+            .border_color(palette.border)
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(palette.border_variant)
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(palette.text_muted)
+                            .child(format!("Codex Sessions {}", self.total_leaf_sessions())),
+                    ),
+            )
+            .child(
+                uniform_list("shell-sidebar-rows", row_count, cx.processor(
+                    |this, range: std::ops::Range<usize>, _, cx| {
+                        let palette = this.palette();
+                        range
+                            .map(|ix| this.sidebar_row(ix, cx, &palette))
+                            .collect::<Vec<_>>()
+                    },
+                ))
+                .track_scroll(&self.sidebar_scroll_handle)
+                .h_full(),
+            )
+            .into_any_element()
+    }
+
+    fn sidebar_row(&self, ix: usize, cx: &mut Context<Self>, palette: &UiPalette) -> AnyElement {
+        let Some(row) = self.browser.rows().get(ix).cloned() else {
+            return div().into_any_element();
+        };
+        let is_selected = self
+            .browser
+            .selected_path()
+            .is_some_and(|path| path == row.full_path);
+
+        let glyph = match row.kind {
+            BrowserRowKind::Group => {
+                if row.expanded {
+                    "▾"
+                } else {
+                    "▸"
+                }
+            }
+            BrowserRowKind::Session => "•",
+        };
+
+        let detail: SharedString = if row.kind == BrowserRowKind::Session {
+            row.session_id
+                .as_deref()
+                .map(short_tail)
+                .unwrap_or_default()
+        } else {
+            row.descendant_sessions.to_string().into()
+        };
+
+        div()
+            .id(("sidebar-row", ix))
+            .w_full()
+            .h(px(30.))
+            .flex()
+            .items_center()
+            .justify_between()
+            .px_2()
+            .pl(px(12. + row.depth as f32 * 14.))
+            .bg(if is_selected {
+                palette.text_accent.opacity(0.14)
+            } else {
+                palette.window_background
+            })
+            .text_sm()
+            .text_color(palette.text)
+            .on_click(cx.listener(move |this, _, _, cx| this.select_row(ix, cx)))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .items_center()
+                    .child(div().text_color(palette.text_muted).child(glyph))
+                    .child(div().text_ellipsis().child(row.label)),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(palette.text_muted)
+                    .child(detail),
+            )
+            .into_any_element()
+    }
+
+    fn viewport(&self, cx: &mut Context<Self>, palette: &UiPalette) -> AnyElement {
+        let selected_path = self
+            .active_session()
+            .map(|session| session.session_path.clone())
+            .or_else(|| self.selected_row().map(|row| row.full_path.clone()))
+            .unwrap_or_else(|| "~/.yggterm/sessions".to_string());
+
+        let body = match self.active_session() {
+            Some(session) if self.server.active_view_mode() == WorkspaceViewMode::Terminal => {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(terminal_surface_card(
+                        "Server Terminal",
+                        &session.terminal_lines,
+                        Some(&session.status_line),
+                        palette,
+                    ))
+                    .child(terminal_surface_card(
+                        "Ghostty Integration",
+                        &[
+                            if self.bootstrap.ghostty_bridge_enabled {
+                                if self.bootstrap.ghostty_embedded_surface_supported {
+                                    "libghostty bridge is available and the embedded surface host is enabled on this platform."
+                                } else {
+                                    "libghostty is linked in this build, but the current upstream embedded surface host is not available on this platform."
+                                }
+                            } else {
+                                "libghostty bridge is not linked in this build."
+                            },
+                            &self.bootstrap.ghostty_bridge_detail,
+                        ],
+                        Some("terminal"),
+                        palette,
+                    ))
+                    .into_any_element()
+            }
+            Some(session) => {
+                let blocks = session
+                    .preview
+                    .blocks
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, block)| self.preview_block(ix, block, cx, palette))
+                    .collect::<Vec<_>>();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(preview_summary_card("", blocks.len(), blocks.len(), palette))
+                    .children(blocks)
+                    .into_any_element()
+            }
+            None => div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(terminal_surface_card(
+                    "No Session Selected",
+                    &["Select a session from the sidebar to render its preview."],
+                    Some("idle"),
+                    palette,
+                ))
+                .into_any_element(),
+        };
+
+        div()
+            .flex_1()
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(palette.surface_background)
+            .child(
+                div()
+                    .w_full()
+                    .h(px(34.))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(palette.border_variant)
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(palette.text_muted)
+                            .child(selected_path),
+                    ),
+            )
+            .child(div().flex_1().overflow_hidden().p_3().child(body))
+            .into_any_element()
+    }
+
+    fn preview_block(
+        &self,
+        block_ix: usize,
+        block: &yggterm_core::SessionPreviewBlock,
+        cx: &mut Context<Self>,
+        palette: &UiPalette,
+    ) -> AnyElement {
+        div()
+            .id(("preview-block", block_ix))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_preview_block(block_ix, cx)))
+            .child(chat_preview_card(
+                block.role,
+                &block.timestamp,
+                match block.tone {
+                    PreviewTone::User => ChatBubbleTone::User,
+                    PreviewTone::Assistant => ChatBubbleTone::Assistant,
+                },
+                block.folded,
+                "",
+                &block.lines,
+                palette,
+            ))
+            .into_any_element()
+    }
+
+    fn inspector(&self, palette: &UiPalette) -> AnyElement {
+        if !self.right_panel_open {
+            return div().into_any_element();
+        }
+
+        let metadata = self
+            .active_session()
+            .map(|session| session.metadata.clone())
+            .unwrap_or_default();
+
+        div()
+            .w(px(280.))
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(palette.window_background)
+            .border_l_1()
+            .border_color(palette.border)
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(palette.border_variant)
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(palette.text_muted)
+                            .child("Session Metadata"),
+                    ),
+            )
+            .children(metadata.into_iter().map(|entry| metadata_row(entry, palette)))
+            .into_any_element()
+    }
+
+    fn statusbar(&self, cx: &mut Context<Self>, palette: &UiPalette) -> AnyElement {
+        statusbar_frame(
+            div()
+                .flex()
+                .flex_row()
+                .gap_3()
+                .items_center()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(palette.text)
+                        .child(format!("{} codex sessions", self.total_leaf_sessions())),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(palette.text)
+                        .child(format!(
+                            "selected {}",
+                            self.active_session()
+                                .map(|session| session.title.as_str())
+                                .unwrap_or("none")
+                        )),
+                )
+                .into_any_element(),
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .items_center()
+                .child(div().text_sm().text_color(palette.text).child(self.last_action.clone()))
+                .child(
+                    titlebar_icon_button("status-meta", TitlebarIcon::Info, palette)
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_right_panel(cx))),
+                )
+                .into_any_element(),
+            palette.window_background,
+            palette.border,
+        )
+        .into_any_element()
+    }
+}
+
+impl Render for GpuiShell {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = self.palette();
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(palette.window_background)
+            .child(self.titlebar(window, cx, &palette))
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_row()
+                    .child(self.sidebar(cx, &palette))
+                    .child(self.viewport(cx, &palette))
+                    .child(self.inspector(&palette)),
+            )
+            .child(self.statusbar(cx, &palette))
+    }
+}
+
+fn metadata_row(entry: SessionMetadataEntry, palette: &UiPalette) -> AnyElement {
+    div()
+        .px_3()
+        .py_2()
+        .border_b_1()
+        .border_color(palette.border_variant.opacity(0.65))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(palette.text_muted)
+                        .child(entry.label),
+                )
+                .child(div().text_sm().text_color(palette.text).child(entry.value)),
+        )
+        .into_any_element()
+}
+
+fn short_tail(session_id: &str) -> SharedString {
+    let tail = session_id
+        .chars()
+        .rev()
+        .take(8)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    tail.into()
+}
