@@ -1,6 +1,6 @@
 use anyhow::Result;
 use assets::Assets;
-use editor::{Editor, EditorElement, EditorStyle};
+use editor::{Editor, EditorElement, EditorEvent, EditorStyle};
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, Decorations, Entity, FocusHandle,
     Focusable, Global, HitboxBehavior, Hsla, KeyBinding, ListAlignment, ListSizingBehavior,
@@ -302,6 +302,7 @@ struct DebugTelemetry {
     last_frame_at: Option<Instant>,
     last_log_at: Option<Instant>,
     smoothed_fps: f32,
+    last_frame_gap_ms: f32,
     last_render_ms: f32,
     last_sidebar_build_ms: f32,
     last_preview_filter_ms: f32,
@@ -394,6 +395,14 @@ impl GpuiShell {
         });
         let sidebar_scroll_handle = UniformListScrollHandle::new();
         let preview_list_state = ListState::new(0, ListAlignment::Top, px(640.));
+        cx.subscribe(&search_editor, |this, editor, event: &EditorEvent, cx| {
+            if let EditorEvent::BufferEdited { .. } = event {
+                let query = editor.read(cx).text(cx);
+                this.browser.set_filter_query(query);
+                cx.notify();
+            }
+        })
+        .detach();
         focus_handle.focus(window, cx);
         let server = YggtermServer::new(
             &bootstrap.browser_tree,
@@ -461,6 +470,7 @@ impl GpuiShell {
                 last_frame_at: None,
                 last_log_at: None,
                 smoothed_fps: 0.0,
+                last_frame_gap_ms: 0.0,
                 last_render_ms: 0.0,
                 last_sidebar_build_ms: 0.0,
                 last_preview_filter_ms: 0.0,
@@ -531,13 +541,19 @@ impl GpuiShell {
         let now = Instant::now();
         if let Some(last_frame_at) = self.debug_telemetry.last_frame_at {
             let frame_ms = now.duration_since(last_frame_at).as_secs_f32() * 1000.0;
+            self.debug_telemetry.last_frame_gap_ms = frame_ms;
             if frame_ms > 0.0 {
-                let fps = 1000.0 / frame_ms;
-                self.debug_telemetry.smoothed_fps = if self.debug_telemetry.smoothed_fps == 0.0 {
-                    fps
+                if frame_ms > 250.0 {
+                    self.debug_telemetry.smoothed_fps = 0.0;
                 } else {
-                    self.debug_telemetry.smoothed_fps * 0.85 + fps * 0.15
-                };
+                    let fps = 1000.0 / frame_ms;
+                    self.debug_telemetry.smoothed_fps = if self.debug_telemetry.smoothed_fps == 0.0
+                    {
+                        fps
+                    } else {
+                        self.debug_telemetry.smoothed_fps * 0.85 + fps * 0.15
+                    };
+                }
             }
         }
         self.debug_telemetry.last_frame_at = Some(now);
@@ -560,8 +576,9 @@ impl GpuiShell {
                 "frame"
             };
             self.push_debug_log(format!(
-                "{severity} fps {:.1} render {:.2}ms sidebar {:.2}ms preview_filter {:.2}ms preview_build {:.2}ms rows={} rebuild {:.2}ms preview={}/{} mode={}",
+                "{severity} fps {:.1} gap {:.1}ms render {:.2}ms sidebar {:.2}ms preview_filter {:.2}ms preview_build {:.2}ms rows={} rebuild {:.2}ms preview={}/{} mode={}",
                 self.debug_telemetry.smoothed_fps,
+                self.debug_telemetry.last_frame_gap_ms,
                 self.debug_telemetry.last_render_ms,
                 self.debug_telemetry.last_sidebar_build_ms,
                 self.debug_telemetry.last_preview_filter_ms,
@@ -805,13 +822,6 @@ impl GpuiShell {
         self.set_last_action("focus search", cx);
     }
 
-    fn sync_browser_filter_from_editor(&mut self, cx: &App) {
-        let query = self.search_editor.read(cx).text(cx);
-        if query != self.browser.filter_query() {
-            self.browser.set_filter_query(query);
-        }
-    }
-
     fn focus_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_editor
             .update(cx, |editor, cx| window.focus(&editor.focus_handle(cx), cx));
@@ -960,10 +970,14 @@ impl GpuiShell {
             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .when(cfg!(debug_assertions), |this| {
                 this.child(
-                    Label::new(format!(
-                        "{:.1} fps  {:.2} ms",
-                        self.debug_telemetry.smoothed_fps, self.debug_telemetry.last_render_ms,
-                    ))
+                    Label::new(if self.debug_telemetry.smoothed_fps > 0.0 {
+                        format!(
+                            "{:.1} fps  {:.2} ms",
+                            self.debug_telemetry.smoothed_fps, self.debug_telemetry.last_render_ms,
+                        )
+                    } else {
+                        format!("idle  {:.2} ms", self.debug_telemetry.last_render_ms)
+                    })
                     .size(LabelSize::Small)
                     .color(Color::Muted),
                 )
@@ -2207,10 +2221,6 @@ impl Render for GpuiShell {
                         this.end_panel_drag(cx);
                     }),
                 )
-                .map(|this| {
-                    self.sync_browser_filter_from_editor(cx);
-                    this
-                })
                 .size_full()
                 .flex()
                 .flex_col()
