@@ -1085,6 +1085,7 @@ impl GpuiShell {
         let settings = ThemeSettings::get_global(cx);
         let colors = cx.theme().colors();
         let is_focused = self.search_editor.read(cx).is_focused(window);
+        let query = self.browser.filter_query().to_string();
         let text_style = TextStyle {
             color: colors.text,
             font_family: settings.buffer_font.family.clone(),
@@ -1128,12 +1129,30 @@ impl GpuiShell {
                     .size(IconSize::Small)
                     .color(Color::Muted),
             )
-            .child(
+            .child(div().flex_1().h_full().child(if is_focused {
+                EditorElement::new(&self.search_editor, editor_style).into_any_element()
+            } else {
                 div()
-                    .flex_1()
                     .h_full()
-                    .child(EditorElement::new(&self.search_editor, editor_style)),
-            )
+                    .flex()
+                    .items_center()
+                    .child(
+                        Label::new(if query.is_empty() {
+                            "Search sessions…".to_string()
+                        } else {
+                            query
+                        })
+                        .size(LabelSize::Small)
+                        .color(
+                            if self.browser.filter_query().is_empty() {
+                                Color::Muted
+                            } else {
+                                Color::Default
+                            },
+                        ),
+                    )
+                    .into_any_element()
+            }))
             .child(
                 IconButton::new(
                     "titlebar-search-clear",
