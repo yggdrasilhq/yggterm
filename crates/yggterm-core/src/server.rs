@@ -54,6 +54,22 @@ pub enum SessionSource {
     LiveSsh,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalLaunchPhase {
+    Queued,
+    BridgePending,
+    RemoteBootstrap,
+    Running,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteDeployState {
+    NotRequired,
+    Planned,
+    CopyingBinary,
+    Ready,
+}
+
 #[derive(Debug, Clone)]
 pub struct SshConnectTarget {
     pub label: String,
@@ -69,6 +85,9 @@ pub struct ManagedSessionView {
     pub host_label: String,
     pub source: SessionSource,
     pub backend: TerminalBackend,
+    pub bridge_available: bool,
+    pub launch_phase: TerminalLaunchPhase,
+    pub remote_deploy_state: RemoteDeployState,
     pub launch_command: String,
     pub status_line: String,
     pub terminal_lines: Vec<String>,
@@ -84,6 +103,7 @@ pub struct YggtermServer {
     active_view_mode: WorkspaceViewMode,
     backend: TerminalBackend,
     theme: UiTheme,
+    ghostty_bridge_enabled: bool,
     ssh_targets: Vec<SshConnectTarget>,
     live_session_order: Vec<String>,
 }
@@ -107,6 +127,7 @@ impl YggtermServer {
             active_view_mode: WorkspaceViewMode::Terminal,
             backend,
             theme,
+            ghostty_bridge_enabled,
             ssh_targets: vec![
                 SshConnectTarget {
                     label: "prod-app-01".to_string(),
@@ -153,13 +174,21 @@ impl YggtermServer {
                 UiTheme::ZedDark => "dark",
                 UiTheme::ZedLight => "light",
             };
+            let launch_status = describe_launch_phase(
+                session.source,
+                session.launch_phase,
+                session.remote_deploy_state,
+                session.bridge_available,
+            );
             session.status_line = format!(
-                "{} host active · {} scheme requested",
+                "{} · {} scheme requested · {}",
                 match session.backend {
                     TerminalBackend::Ghostty => "Ghostty",
                     TerminalBackend::Mock => "Mock",
                 },
                 appearance
+                ,
+                launch_status,
             );
         }
     }
@@ -168,7 +197,14 @@ impl YggtermServer {
         let entry = self
             .sessions
             .entry(path.to_string())
-            .or_insert_with(|| build_session(path, self.backend, self.theme));
+            .or_insert_with(|| {
+                build_session(
+                    path,
+                    self.backend,
+                    self.theme,
+                    self.ghostty_bridge_enabled,
+                )
+            });
         entry.backend = self.backend;
         self.active_session_path = Some(path.to_string());
     }
@@ -194,6 +230,7 @@ impl YggtermServer {
         if self.sessions.contains_key(key) {
             self.active_session_path = Some(key.to_string());
             self.active_view_mode = WorkspaceViewMode::Terminal;
+            self.request_terminal_launch_for_active();
         }
     }
 
@@ -201,11 +238,18 @@ impl YggtermServer {
         let target = self.ssh_targets.get(target_ix)?.clone();
         let uuid = Uuid::new_v4().to_string();
         let key = format!("live::{uuid}");
-        let session = build_live_session(&uuid, &target, self.backend, self.theme);
+        let session = build_live_session(
+            &uuid,
+            &target,
+            self.backend,
+            self.theme,
+            self.ghostty_bridge_enabled,
+        );
         self.sessions.insert(key.clone(), session);
         self.live_session_order.insert(0, key.clone());
         self.active_session_path = Some(key.clone());
         self.active_view_mode = WorkspaceViewMode::Terminal;
+        self.request_terminal_launch_for_active();
         Some(key)
     }
 
@@ -233,6 +277,54 @@ impl YggtermServer {
             block.folded = folded;
         }
     }
+
+    pub fn request_terminal_launch_for_active(&mut self) {
+        let Some(path) = self.active_session_path.as_ref() else {
+            return;
+        };
+        let Some(session) = self.sessions.get_mut(path) else {
+            return;
+        };
+
+        match session.source {
+            SessionSource::Stored => {
+                session.launch_phase = if session.bridge_available {
+                    TerminalLaunchPhase::Running
+                } else {
+                    TerminalLaunchPhase::BridgePending
+                };
+                session.status_line = describe_status_line(
+                    session.backend,
+                    self.theme,
+                    session.source,
+                    session.launch_phase,
+                    session.remote_deploy_state,
+                    session.bridge_available,
+                );
+            }
+            SessionSource::LiveSsh => {
+                session.remote_deploy_state = if session.bridge_available {
+                    RemoteDeployState::Ready
+                } else {
+                    RemoteDeployState::CopyingBinary
+                };
+                session.launch_phase = if session.bridge_available {
+                    TerminalLaunchPhase::Running
+                } else {
+                    TerminalLaunchPhase::BridgePending
+                };
+                session.terminal_lines = build_live_terminal_lines(session);
+                session.status_line = describe_status_line(
+                    session.backend,
+                    self.theme,
+                    session.source,
+                    session.launch_phase,
+                    session.remote_deploy_state,
+                    session.bridge_available,
+                );
+            }
+        }
+    }
 }
 
 fn first_session_path(node: &SessionNode) -> Option<String> {
@@ -249,7 +341,12 @@ fn first_session_path(node: &SessionNode) -> Option<String> {
     None
 }
 
-fn build_session(path: &str, backend: TerminalBackend, theme: UiTheme) -> ManagedSessionView {
+fn build_session(
+    path: &str,
+    backend: TerminalBackend,
+    theme: UiTheme,
+    ghostty_bridge_enabled: bool,
+) -> ManagedSessionView {
     let title = path.rsplit('/').next().unwrap_or(path).to_string();
     let host_label = if path.contains("/prod/") {
         "prod-app-01"
@@ -335,8 +432,26 @@ fn build_session(path: &str, backend: TerminalBackend, theme: UiTheme) -> Manage
         host_label: host_label.clone(),
         source: SessionSource::Stored,
         backend,
+        bridge_available: ghostty_bridge_enabled,
+        launch_phase: if ghostty_bridge_enabled {
+            TerminalLaunchPhase::Queued
+        } else {
+            TerminalLaunchPhase::BridgePending
+        },
+        remote_deploy_state: RemoteDeployState::NotRequired,
         launch_command: format!("yggterm server attach {title}"),
-        status_line: format!("{backend_label} host active · {appearance} scheme requested"),
+        status_line: describe_status_line(
+            backend,
+            theme,
+            SessionSource::Stored,
+            if ghostty_bridge_enabled {
+                TerminalLaunchPhase::Queued
+            } else {
+                TerminalLaunchPhase::BridgePending
+            },
+            RemoteDeployState::NotRequired,
+            ghostty_bridge_enabled,
+        ),
         terminal_lines: vec![
             format!("$ attach {title}"),
             format!("Connected to {host_label}"),
@@ -390,6 +505,14 @@ fn build_session(path: &str, backend: TerminalBackend, theme: UiTheme) -> Manage
                 value: backend_label.to_string(),
             },
             SessionMetadataEntry {
+                label: "Bridge",
+                value: if ghostty_bridge_enabled {
+                    "available".to_string()
+                } else {
+                    "not linked".to_string()
+                },
+            },
+            SessionMetadataEntry {
                 label: "Theme",
                 value: appearance.to_string(),
             },
@@ -406,15 +529,8 @@ fn build_live_session(
     target: &SshConnectTarget,
     backend: TerminalBackend,
     theme: UiTheme,
+    ghostty_bridge_enabled: bool,
 ) -> ManagedSessionView {
-    let appearance = match theme {
-        UiTheme::ZedDark => "dark",
-        UiTheme::ZedLight => "light",
-    };
-    let backend_label = match backend {
-        TerminalBackend::Ghostty => "Ghostty",
-        TerminalBackend::Mock => "Mock",
-    };
     let started_at = OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| String::from("unknown"));
@@ -433,18 +549,28 @@ fn build_live_session(
         host_label: target.label.clone(),
         source: SessionSource::LiveSsh,
         backend,
+        bridge_available: ghostty_bridge_enabled,
+        launch_phase: TerminalLaunchPhase::RemoteBootstrap,
+        remote_deploy_state: RemoteDeployState::Planned,
         launch_command: launch_command.clone(),
-        status_line: format!("{backend_label} launch requested · {appearance} scheme requested"),
+        status_line: describe_status_line(
+            backend,
+            theme,
+            SessionSource::LiveSsh,
+            TerminalLaunchPhase::RemoteBootstrap,
+            RemoteDeployState::Planned,
+            ghostty_bridge_enabled,
+        ),
         terminal_lines: vec![
             format!("$ {launch_command}"),
-            format!("Launching live SSH session {uuid}"),
+            format!("Queue live SSH session {uuid}"),
             format!("Target: {}", target.ssh_target),
             format!(
                 "Prefix: {}",
                 target.prefix.clone().unwrap_or_else(|| "none".to_string())
             ),
-            "Bridge: request Ghostty surface in the main viewport".to_string(),
-            "Binary transfer: planned for remote bootstrap path".to_string(),
+            "Remote bootstrap: copy yggterm binary if missing".to_string(),
+            "Ghostty bridge: request main viewport surface".to_string(),
         ],
         rendered_sections: vec![],
         preview: SessionPreview {
@@ -464,6 +590,14 @@ fn build_live_session(
                 SessionMetadataEntry {
                     label: "Started",
                     value: started_at.clone(),
+                },
+                SessionMetadataEntry {
+                    label: "Bridge",
+                    value: if ghostty_bridge_enabled {
+                        "available".to_string()
+                    } else {
+                        "not linked".to_string()
+                    },
                 },
             ],
             blocks: vec![
@@ -507,11 +641,107 @@ fn build_live_session(
                 value: target.prefix.clone().unwrap_or_else(|| "none".to_string()),
             },
             SessionMetadataEntry {
+                label: "Deploy",
+                value: "planned".to_string(),
+            },
+            SessionMetadataEntry {
                 label: "Launch",
                 value: launch_command,
             },
         ],
     }
+}
+
+fn describe_status_line(
+    backend: TerminalBackend,
+    theme: UiTheme,
+    source: SessionSource,
+    launch_phase: TerminalLaunchPhase,
+    remote_deploy_state: RemoteDeployState,
+    bridge_available: bool,
+) -> String {
+    let backend_label = match backend {
+        TerminalBackend::Ghostty => "Ghostty",
+        TerminalBackend::Mock => "Mock",
+    };
+    let appearance = match theme {
+        UiTheme::ZedDark => "dark",
+        UiTheme::ZedLight => "light",
+    };
+    let launch_status = describe_launch_phase(
+        source,
+        launch_phase,
+        remote_deploy_state,
+        bridge_available,
+    );
+    format!("{backend_label} · {appearance} scheme requested · {launch_status}")
+}
+
+fn describe_launch_phase(
+    source: SessionSource,
+    launch_phase: TerminalLaunchPhase,
+    remote_deploy_state: RemoteDeployState,
+    bridge_available: bool,
+) -> String {
+    let bridge = if bridge_available {
+        "bridge ready"
+    } else {
+        "bridge missing"
+    };
+    match (source, launch_phase, remote_deploy_state) {
+        (SessionSource::Stored, TerminalLaunchPhase::Queued, _) => {
+            format!("stored attach queued · {bridge}")
+        }
+        (SessionSource::Stored, TerminalLaunchPhase::BridgePending, _) => {
+            format!("stored attach pending bridge · {bridge}")
+        }
+        (SessionSource::Stored, TerminalLaunchPhase::Running, _) => {
+            format!("stored terminal requested · {bridge}")
+        }
+        (SessionSource::LiveSsh, _, RemoteDeployState::Planned) => {
+            format!("remote bootstrap planned · {bridge}")
+        }
+        (SessionSource::LiveSsh, _, RemoteDeployState::CopyingBinary) => {
+            format!("copying yggterm binary · {bridge}")
+        }
+        (SessionSource::LiveSsh, TerminalLaunchPhase::Running, RemoteDeployState::Ready) => {
+            format!("ghostty session requested · {bridge}")
+        }
+        (SessionSource::LiveSsh, TerminalLaunchPhase::BridgePending, _) => {
+            format!("waiting for ghostty bridge · {bridge}")
+        }
+        _ => format!("launch queued · {bridge}"),
+    }
+}
+
+fn build_live_terminal_lines(session: &ManagedSessionView) -> Vec<String> {
+    let deploy = match session.remote_deploy_state {
+        RemoteDeployState::NotRequired => "not required",
+        RemoteDeployState::Planned => "planned",
+        RemoteDeployState::CopyingBinary => "copying binary",
+        RemoteDeployState::Ready => "ready",
+    };
+    let launch = match session.launch_phase {
+        TerminalLaunchPhase::Queued => "queued",
+        TerminalLaunchPhase::BridgePending => "bridge pending",
+        TerminalLaunchPhase::RemoteBootstrap => "remote bootstrap",
+        TerminalLaunchPhase::Running => "running",
+    };
+    vec![
+        format!("$ {}", session.launch_command),
+        format!("Launching live SSH session {}", session.id),
+        format!("Target: {}", session.host_label),
+        format!("Deploy state: {deploy}"),
+        format!("Launch phase: {launch}"),
+        format!(
+            "Ghostty bridge: {}",
+            if session.bridge_available {
+                "available"
+            } else {
+                "not linked in this build"
+            }
+        ),
+    ]
 }
 
 fn session_preview_cwd(path: &str) -> String {
