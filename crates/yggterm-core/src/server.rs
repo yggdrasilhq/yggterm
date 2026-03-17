@@ -1,6 +1,7 @@
 use crate::{SessionNode, UiTheme};
 use std::collections::BTreeMap;
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceViewMode {
@@ -47,12 +48,28 @@ pub struct SessionPreview {
     pub blocks: Vec<SessionPreviewBlock>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionSource {
+    Stored,
+    LiveSsh,
+}
+
+#[derive(Debug, Clone)]
+pub struct SshConnectTarget {
+    pub label: String,
+    pub ssh_target: String,
+    pub prefix: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ManagedSessionView {
+    pub id: String,
     pub session_path: String,
     pub title: String,
     pub host_label: String,
+    pub source: SessionSource,
     pub backend: TerminalBackend,
+    pub launch_command: String,
     pub status_line: String,
     pub terminal_lines: Vec<String>,
     pub rendered_sections: Vec<SessionRenderedSection>,
@@ -67,6 +84,8 @@ pub struct YggtermServer {
     active_view_mode: WorkspaceViewMode,
     backend: TerminalBackend,
     theme: UiTheme,
+    ssh_targets: Vec<SshConnectTarget>,
+    live_session_order: Vec<String>,
 }
 
 impl YggtermServer {
@@ -88,6 +107,24 @@ impl YggtermServer {
             active_view_mode: WorkspaceViewMode::Terminal,
             backend,
             theme,
+            ssh_targets: vec![
+                SshConnectTarget {
+                    label: "prod-app-01".to_string(),
+                    ssh_target: "prod-app-01".to_string(),
+                    prefix: Some("sudo machinectl shell prod".to_string()),
+                },
+                SshConnectTarget {
+                    label: "design-01".to_string(),
+                    ssh_target: "design-01".to_string(),
+                    prefix: None,
+                },
+                SshConnectTarget {
+                    label: "ghostty-admin".to_string(),
+                    ssh_target: "ghostty-admin".to_string(),
+                    prefix: Some("tmux new-session -A -s yggterm".to_string()),
+                },
+            ],
+            live_session_order: Vec::new(),
         };
 
         if let Some(first_session) = first_session_path(tree) {
@@ -140,6 +177,36 @@ impl YggtermServer {
         self.active_session_path
             .as_ref()
             .and_then(|path| self.sessions.get(path))
+    }
+
+    pub fn ssh_targets(&self) -> &[SshConnectTarget] {
+        &self.ssh_targets
+    }
+
+    pub fn live_sessions(&self) -> Vec<ManagedSessionView> {
+        self.live_session_order
+            .iter()
+            .filter_map(|key| self.sessions.get(key).cloned())
+            .collect()
+    }
+
+    pub fn focus_live_session(&mut self, key: &str) {
+        if self.sessions.contains_key(key) {
+            self.active_session_path = Some(key.to_string());
+            self.active_view_mode = WorkspaceViewMode::Terminal;
+        }
+    }
+
+    pub fn connect_ssh_target(&mut self, target_ix: usize) -> Option<String> {
+        let target = self.ssh_targets.get(target_ix)?.clone();
+        let uuid = Uuid::new_v4().to_string();
+        let key = format!("live::{uuid}");
+        let session = build_live_session(&uuid, &target, self.backend, self.theme);
+        self.sessions.insert(key.clone(), session);
+        self.live_session_order.insert(0, key.clone());
+        self.active_session_path = Some(key.clone());
+        self.active_view_mode = WorkspaceViewMode::Terminal;
+        Some(key)
     }
 
     pub fn toggle_preview_block(&mut self, block_ix: usize) {
@@ -262,10 +329,13 @@ fn build_session(path: &str, backend: TerminalBackend, theme: UiTheme) -> Manage
     };
 
     ManagedSessionView {
+        id: format!("stored:{title}"),
         session_path: path.to_string(),
         title: title.clone(),
         host_label: host_label.clone(),
+        source: SessionSource::Stored,
         backend,
+        launch_command: format!("yggterm server attach {title}"),
         status_line: format!("{backend_label} host active · {appearance} scheme requested"),
         terminal_lines: vec![
             format!("$ attach {title}"),
@@ -296,6 +366,10 @@ fn build_session(path: &str, backend: TerminalBackend, theme: UiTheme) -> Manage
         preview,
         metadata: vec![
             SessionMetadataEntry {
+                label: "Source",
+                value: "stored".to_string(),
+            },
+            SessionMetadataEntry {
                 label: "Host",
                 value: host_label,
             },
@@ -322,6 +396,119 @@ fn build_session(path: &str, backend: TerminalBackend, theme: UiTheme) -> Manage
             SessionMetadataEntry {
                 label: "Restore",
                 value: "last_session".to_string(),
+            },
+        ],
+    }
+}
+
+fn build_live_session(
+    uuid: &str,
+    target: &SshConnectTarget,
+    backend: TerminalBackend,
+    theme: UiTheme,
+) -> ManagedSessionView {
+    let appearance = match theme {
+        UiTheme::ZedDark => "dark",
+        UiTheme::ZedLight => "light",
+    };
+    let backend_label = match backend {
+        TerminalBackend::Ghostty => "Ghostty",
+        TerminalBackend::Mock => "Mock",
+    };
+    let started_at = OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| String::from("unknown"));
+    let launch_command = match &target.prefix {
+        Some(prefix) => format!(
+            "ssh {} '{}' 'yggterm server attach {}'",
+            target.ssh_target, prefix, uuid
+        ),
+        None => format!("ssh {} 'yggterm server attach {}'", target.ssh_target, uuid),
+    };
+
+    ManagedSessionView {
+        id: uuid.to_string(),
+        session_path: format!("ssh://{}/{}", target.ssh_target, uuid),
+        title: uuid.to_string(),
+        host_label: target.label.clone(),
+        source: SessionSource::LiveSsh,
+        backend,
+        launch_command: launch_command.clone(),
+        status_line: format!("{backend_label} launch requested · {appearance} scheme requested"),
+        terminal_lines: vec![
+            format!("$ {launch_command}"),
+            format!("Launching live SSH session {uuid}"),
+            format!("Target: {}", target.ssh_target),
+            format!(
+                "Prefix: {}",
+                target.prefix.clone().unwrap_or_else(|| "none".to_string())
+            ),
+            "Bridge: request Ghostty surface in the main viewport".to_string(),
+            "Binary transfer: planned for remote bootstrap path".to_string(),
+        ],
+        rendered_sections: vec![],
+        preview: SessionPreview {
+            summary: vec![
+                SessionMetadataEntry {
+                    label: "UUID",
+                    value: uuid.to_string(),
+                },
+                SessionMetadataEntry {
+                    label: "Target",
+                    value: target.ssh_target.clone(),
+                },
+                SessionMetadataEntry {
+                    label: "Prefix",
+                    value: target.prefix.clone().unwrap_or_else(|| "none".to_string()),
+                },
+                SessionMetadataEntry {
+                    label: "Started",
+                    value: started_at.clone(),
+                },
+            ],
+            blocks: vec![
+                SessionPreviewBlock {
+                    role: "USER",
+                    timestamp: started_at.clone(),
+                    tone: PreviewTone::User,
+                    folded: false,
+                    lines: vec![
+                        format!("Open live terminal {uuid} through the Yggterm server."),
+                        "This session should land in the main viewport as a Ghostty-backed terminal.".to_string(),
+                    ],
+                },
+                SessionPreviewBlock {
+                    role: "ASSISTANT",
+                    timestamp: "server:launch".to_string(),
+                    tone: PreviewTone::Assistant,
+                    folded: false,
+                    lines: vec![
+                        format!("Launch command prepared: {launch_command}"),
+                        "Remote bootstrap will eventually ship the yggterm binary before attach.".to_string(),
+                    ],
+                },
+            ],
+        },
+        metadata: vec![
+            SessionMetadataEntry {
+                label: "Source",
+                value: "live-ssh".to_string(),
+            },
+            SessionMetadataEntry {
+                label: "UUID",
+                value: uuid.to_string(),
+            },
+            SessionMetadataEntry {
+                label: "Target",
+                value: target.ssh_target.clone(),
+            },
+            SessionMetadataEntry {
+                label: "Prefix",
+                value: target.prefix.clone().unwrap_or_else(|| "none".to_string()),
+            },
+            SessionMetadataEntry {
+                label: "Launch",
+                value: launch_command,
             },
         ],
     }

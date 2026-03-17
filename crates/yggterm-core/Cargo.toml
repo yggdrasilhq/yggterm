@@ -12,3 +12,4 @@ serde_json.workspace = true
 thiserror.workspace = true
 dirs.workspace = true
 time.workspace = true
+uuid = { version = "1", features = ["v4"] }
