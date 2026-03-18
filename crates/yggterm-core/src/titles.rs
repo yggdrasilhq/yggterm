@@ -9,7 +9,6 @@ use std::time::Duration;
 use time::OffsetDateTime;
 
 const TITLE_DB_FILENAME: &str = "session-titles.db";
-const MAX_GENERATIONS_PER_LOAD: usize = 4;
 
 pub struct SessionTitleStore {
     conn: Connection,
@@ -17,8 +16,6 @@ pub struct SessionTitleStore {
 
 pub struct SessionTitleResolver {
     store: SessionTitleStore,
-    settings: AppSettings,
-    remaining_budget: usize,
 }
 
 impl SessionTitleStore {
@@ -77,16 +74,19 @@ impl SessionTitleStore {
 }
 
 impl SessionTitleResolver {
-    pub fn new(home: &Path, settings: &AppSettings) -> Result<Self> {
+    pub fn new(home: &Path) -> Result<Self> {
         Ok(Self {
             store: SessionTitleStore::open(home)?,
-            settings: settings.clone(),
-            remaining_budget: MAX_GENERATIONS_PER_LOAD,
         })
     }
 
-    pub fn resolve_for_session(
-        &mut self,
+    pub fn resolve_for_session(&self, session_id: &str) -> Result<Option<String>> {
+        self.store.get_title(session_id)
+    }
+
+    pub fn generate_for_session(
+        &self,
+        settings: &AppSettings,
         session_id: &str,
         cwd: &str,
         file_path: &Path,
@@ -95,7 +95,7 @@ impl SessionTitleResolver {
             return Ok(Some(title));
         }
 
-        if self.remaining_budget == 0 || !self.settings_ready() {
+        if !settings_ready(settings) {
             return Ok(None);
         }
 
@@ -104,7 +104,7 @@ impl SessionTitleResolver {
             return Ok(None);
         }
 
-        let title = request_litellm_title(&self.settings, &context)?;
+        let title = request_litellm_title(settings, &context)?;
         let Some(title) = sanitize_generated_title(&title) else {
             return Ok(None);
         };
@@ -113,18 +113,17 @@ impl SessionTitleResolver {
             session_id,
             cwd,
             &title,
-            &self.settings.interface_llm_model,
+            &settings.interface_llm_model,
             "litellm",
         )?;
-        self.remaining_budget = self.remaining_budget.saturating_sub(1);
         Ok(Some(title))
     }
+}
 
-    fn settings_ready(&self) -> bool {
-        !self.settings.litellm_endpoint.trim().is_empty()
-            && !self.settings.litellm_api_key.trim().is_empty()
-            && !self.settings.interface_llm_model.trim().is_empty()
-    }
+pub fn settings_ready(settings: &AppSettings) -> bool {
+    !settings.litellm_endpoint.trim().is_empty()
+        && !settings.litellm_api_key.trim().is_empty()
+        && !settings.interface_llm_model.trim().is_empty()
 }
 
 fn extract_tail_context(path: &Path) -> Result<String> {
