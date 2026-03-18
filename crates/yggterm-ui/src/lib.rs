@@ -98,7 +98,7 @@ pub fn titlebar_frame(
     row()
         .id("yggterm-titlebar")
         .w_full()
-        .h(px(46.))
+        .h(px(50.))
         .items_center()
         .justify_between()
         .bg(background)
@@ -106,13 +106,13 @@ pub fn titlebar_frame(
         .border_color(border)
         .child(
             div()
-                .w(px(360.))
+                .w(px(340.))
                 .flex_none()
                 .h_full()
                 .flex()
                 .items_center()
                 .justify_start()
-                .px_2()
+                .px_2p5()
                 .child(left),
         )
         .child(
@@ -122,18 +122,19 @@ pub fn titlebar_frame(
                 .flex()
                 .items_center()
                 .justify_center()
+                .px_2()
                 .child(center),
         )
         .child(
             div()
-                .w(px(360.))
+                .w(px(340.))
                 .flex_none()
                 .h_full()
                 .flex()
                 .items_center()
                 .justify_end()
-                .gap_1()
-                .px_2()
+                .gap_1p5()
+                .px_2p5()
                 .child(right),
         )
 }
@@ -396,10 +397,10 @@ pub fn metadata_section_card(
     palette: &UiPalette,
 ) -> AnyElement {
     column()
-        .gap_2()
-        .p_3()
+        .gap_1p5()
+        .p_2p5()
         .rounded_lg()
-        .bg(palette.surface_background)
+        .bg(palette.surface_background.opacity(0.82))
         .border_1()
         .border_color(palette.border_variant)
         .child(

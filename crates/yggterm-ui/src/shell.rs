@@ -342,7 +342,7 @@ impl GpuiShell {
 
         div()
             .id("search-bar")
-            .w(px(380.))
+            .w(px(360.))
             .h(px(30.))
             .flex()
             .items_center()
@@ -425,7 +425,7 @@ impl GpuiShell {
         let left = div()
             .flex()
             .flex_row()
-            .gap_2()
+            .gap_1p5()
             .items_center()
             .child(
                 div()
@@ -458,7 +458,8 @@ impl GpuiShell {
                     .flex()
                     .flex_col()
                     .gap_0p5()
-                    .max_w(px(220.))
+                    .px_1()
+                    .max_w(px(190.))
                     .child(
                         div()
                             .text_sm()
@@ -482,7 +483,7 @@ impl GpuiShell {
             div()
                 .flex()
                 .flex_row()
-                .gap_2()
+                .gap_1p5()
                 .items_center()
                 .child(
                     toolbar_chip_button(
@@ -1072,7 +1073,7 @@ impl GpuiShell {
         };
 
         div()
-            .w(px(272.))
+            .w(px(256.))
             .h_full()
             .flex()
             .flex_col()
@@ -1082,13 +1083,13 @@ impl GpuiShell {
             .child(
                 div()
                     .px_3()
-                    .py_2()
+                    .py_1p5()
                     .border_b_1()
                     .border_color(palette.border_variant)
                     .child(
                         div()
-                            .text_sm()
-                            .text_color(palette.text)
+                            .text_xs()
+                            .text_color(palette.text_muted)
                             .child("Session Metadata"),
                     ),
             )
@@ -1098,10 +1099,10 @@ impl GpuiShell {
                     .flex_1()
                     .overflow_y_scroll()
                     .scrollbar_width(px(10.))
-                    .p_3()
+                    .p_2p5()
                     .flex()
                     .flex_col()
-                    .gap_3()
+                    .gap_2()
                     .children(inspector_body),
             )
             .into_any_element()
@@ -1180,7 +1181,7 @@ fn metadata_stat(label: &str, value: &str, palette: &UiPalette) -> AnyElement {
     div()
         .flex()
         .flex_col()
-        .gap_1()
+        .gap_0p5()
         .child(
             div()
                 .text_xs()
