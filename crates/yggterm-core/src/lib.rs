@@ -44,7 +44,7 @@ pub enum UiTheme {
     ZedLight,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AppSettings {
     pub theme: UiTheme,
     pub show_tree: bool,
@@ -53,6 +53,9 @@ pub struct AppSettings {
     pub terminal_font_size: f32,
     pub ui_font_size: f32,
     pub prefer_ghostty_backend: bool,
+    pub litellm_endpoint: String,
+    pub litellm_api_key: String,
+    pub interface_llm_model: String,
 }
 
 impl Default for AppSettings {
@@ -65,6 +68,9 @@ impl Default for AppSettings {
             terminal_font_size: 13.0,
             ui_font_size: 14.0,
             prefer_ghostty_backend: true,
+            litellm_endpoint: String::new(),
+            litellm_api_key: String::new(),
+            interface_llm_model: String::new(),
         }
     }
 }
@@ -114,11 +120,7 @@ impl SessionStore {
 
     pub fn save_settings(&self, settings: &AppSettings) -> Result<()> {
         let path = self.settings_path();
-        let data =
-            serde_json::to_string_pretty(settings).context("failed to serialize settings")?;
-        fs::write(&path, data)
-            .with_context(|| format!("failed to write settings file {}", path.display()))?;
-        Ok(())
+        save_settings_file(&path, settings)
     }
 
     pub fn create_session_path(&self, relative: &str) -> Result<PathBuf> {
@@ -137,6 +139,13 @@ impl SessionStore {
         let codex_root = resolve_codex_sessions_root()?;
         build_codex_browser_tree(&codex_root)
     }
+}
+
+pub fn save_settings_file(path: &Path, settings: &AppSettings) -> Result<()> {
+    let data = serde_json::to_string_pretty(settings).context("failed to serialize settings")?;
+    fs::write(path, data)
+        .with_context(|| format!("failed to write settings file {}", path.display()))?;
+    Ok(())
 }
 
 pub fn resolve_yggterm_home() -> Result<PathBuf> {
