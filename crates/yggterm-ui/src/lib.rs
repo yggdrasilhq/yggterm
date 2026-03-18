@@ -98,7 +98,7 @@ pub fn titlebar_frame(
     row()
         .id("yggterm-titlebar")
         .w_full()
-        .h(px(44.))
+        .h(px(40.))
         .items_center()
         .justify_between()
         .bg(background)
@@ -110,13 +110,13 @@ pub fn titlebar_frame(
         })
         .child(
             div()
-                .w(px(340.))
+                .w(px(228.))
                 .flex_none()
                 .h_full()
                 .flex()
                 .items_center()
                 .justify_start()
-                .px_2p5()
+                .px_2()
                 .child(left),
         )
         .child(
@@ -126,19 +126,19 @@ pub fn titlebar_frame(
                 .flex()
                 .items_center()
                 .justify_center()
-                .px_2()
+                .px_1p5()
                 .child(center),
         )
         .child(
             div()
-                .w(px(340.))
+                .w(px(228.))
                 .flex_none()
                 .h_full()
                 .flex()
                 .items_center()
                 .justify_end()
-                .gap_1p5()
-                .px_2p5()
+                .gap_1()
+                .px_2()
                 .child(right),
         )
 }
@@ -152,10 +152,10 @@ pub fn statusbar_frame(
     row()
         .id("yggterm-statusbar")
         .w_full()
-        .h(px(30.))
+        .h(px(26.))
         .items_center()
         .justify_between()
-        .px_2()
+        .px_2p5()
         .bg(background)
         .border_t_1()
         .border_color(border)
@@ -246,25 +246,25 @@ pub fn toolbar_chip_button(
 ) -> Stateful<Div> {
     div()
         .id(id)
-        .h(px(28.))
+        .h(px(26.))
         .flex()
         .flex_row()
         .items_center()
         .justify_center()
-        .px_3()
-        .rounded_lg()
+        .px_2p5()
+        .rounded_md()
         .bg(if selected {
-            palette.text_accent.opacity(0.14)
+            palette.text_accent.opacity(0.12)
         } else {
             palette.element_background
         })
         .border_1()
         .border_color(if selected {
-            palette.border_focused
+            palette.border_focused.opacity(0.92)
         } else {
-            palette.border_variant
+            palette.border_variant.opacity(0.9)
         })
-        .text_sm()
+        .text_xs()
         .text_color(if selected {
             palette.text
         } else {
@@ -284,10 +284,10 @@ pub fn titlebar_mode_toggle(
     palette: &UiPalette,
 ) -> AnyElement {
     row()
-        .gap_2()
+        .gap_1p5()
         .items_center()
-        .px_2()
-        .py_1()
+        .px_1p5()
+        .py_0p5()
         .rounded_full()
         .bg(palette.element_background)
         .border_1()
@@ -298,7 +298,7 @@ pub fn titlebar_mode_toggle(
         })
         .child(
             div()
-                .text_sm()
+                .text_xs()
                 .text_color(palette.text_muted)
                 .child(label.to_string()),
         )
@@ -366,11 +366,11 @@ pub fn terminal_surface_card<S: AsRef<str>>(
     let badge = badge.unwrap_or("session").to_string();
     column()
         .gap_2()
-        .p_3()
-        .rounded_md()
+        .p_3p5()
+        .rounded_lg()
         .bg(palette.surface_background)
         .border_1()
-        .border_color(palette.border_variant)
+        .border_color(palette.border_variant.opacity(0.94))
         .child(
             row()
                 .w_full()
@@ -397,6 +397,7 @@ pub fn terminal_surface_card<S: AsRef<str>>(
                         } else {
                             palette.text
                         })
+                        .line_height(relative(1.35))
                         .child(format!("{:02}  {line}", ix + 1))
                         .into_any_element()
                 })
@@ -414,13 +415,13 @@ pub fn preview_summary_card(
     palette: &UiPalette,
 ) -> AnyElement {
     column()
-        .w(px(320.))
-        .gap_2()
-        .p_3()
+        .w(px(308.))
+        .gap_1p5()
+        .p_2p5()
         .rounded_lg()
         .bg(palette.surface_background)
         .border_1()
-        .border_color(palette.border_variant)
+        .border_color(palette.border_variant.opacity(0.94))
         .child(
             row()
                 .items_center()
@@ -466,11 +467,11 @@ pub fn metadata_section_card(
 ) -> AnyElement {
     column()
         .gap_1p5()
-        .p_2p5()
+        .p_2()
         .rounded_lg()
-        .bg(palette.surface_background.opacity(0.82))
+        .bg(palette.surface_background.opacity(0.88))
         .border_1()
-        .border_color(palette.border_variant)
+        .border_color(palette.border_variant.opacity(0.92))
         .child(
             div()
                 .text_xs()
@@ -526,12 +527,12 @@ pub fn chat_preview_card(
             column()
                 .w_full()
                 .max_w(px(match tone {
-                    ChatBubbleTone::User => 720.,
-                    ChatBubbleTone::Assistant | ChatBubbleTone::Neutral => 880.,
+                    ChatBubbleTone::User => 700.,
+                    ChatBubbleTone::Assistant | ChatBubbleTone::Neutral => 840.,
                 }))
-                .gap_3()
-                .px_4()
-                .py_3p5()
+                .gap_2p5()
+                .px_3p5()
+                .py_3()
                 .rounded_xl()
                 .bg(bg)
                 .border_1()
@@ -638,9 +639,9 @@ fn render_preview_segments(
         segments.push(
             column()
                 .gap_1()
-                .px_3()
+                .px_2p5()
                 .py_2()
-                .rounded_lg()
+                .rounded_md()
                 .bg(match tone {
                     ChatBubbleTone::User => palette.text_accent.opacity(0.10),
                     ChatBubbleTone::Assistant | ChatBubbleTone::Neutral => {
@@ -735,8 +736,8 @@ fn icon_glyph(icon: TitlebarIcon) -> &'static str {
 
 fn toggle_pill(enabled: bool, palette: &UiPalette) -> Div {
     row()
-        .w(px(34.))
-        .h(px(20.))
+        .w(px(30.))
+        .h(px(17.))
         .rounded_full()
         .items_center()
         .justify_start()
@@ -748,7 +749,7 @@ fn toggle_pill(enabled: bool, palette: &UiPalette) -> Div {
         })
         .child(
             div()
-                .size(px(14.))
+                .size(px(11.))
                 .rounded_full()
                 .bg(if enabled {
                     palette.text_accent
@@ -768,7 +769,7 @@ fn chrome_button(
 ) -> Stateful<Div> {
     div()
         .id(id)
-        .size(px(26.))
+        .size(px(24.))
         .flex()
         .items_center()
         .justify_center()
@@ -776,7 +777,7 @@ fn chrome_button(
         .bg(background)
         .border_1()
         .border_color(border)
-        .text_xs()
+        .text_sm()
         .text_color(text_color)
         .on_mouse_down(MouseButton::Left, |_, _, cx: &mut App| {
             cx.stop_propagation();
