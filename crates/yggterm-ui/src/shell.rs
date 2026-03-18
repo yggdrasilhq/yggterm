@@ -239,12 +239,13 @@ fn app() -> Element {
     let main_snapshot = snapshot.clone();
     let metadata_snapshot = snapshot.clone();
     let maximized = window().is_maximized();
+    let shell_radius = if maximized { 0 } else { 11 };
 
     rsx! {
         div {
             style: "position: fixed; inset: 0; background: transparent; overflow: hidden;",
             div {
-                style: shell_style(snapshot.palette),
+                style: shell_style(snapshot.palette, shell_radius),
                 Titlebar {
                     snapshot: titlebar_snapshot,
                     hovered: hovered,
@@ -452,23 +453,23 @@ fn Sidebar(
     rsx! {
         div {
             style: format!(
-                "width:258px; min-width:258px; max-width:258px; display:flex; flex-direction:column; \
+                "width:292px; min-width:292px; max-width:292px; display:flex; flex-direction:column; \
                  background:{}; overflow:hidden;",
                 snapshot.palette.sidebar
             ),
             div {
-                style: "padding:14px 14px 10px 14px;",
+                style: "padding:15px 16px 8px 16px;",
                 div {
-                    style: format!("font-size:11px; color:{}; margin-bottom:6px;", snapshot.palette.muted),
+                    style: format!("font-size:10px; letter-spacing:0.02em; color:{}; margin-bottom:5px;", snapshot.palette.muted),
                     "Codex Sessions"
                 }
                         div {
-                            style: format!("font-size:12px; font-weight:600; color:{};", snapshot.palette.text),
+                            style: format!("font-size:11px; font-weight:600; color:{};", snapshot.palette.text),
                             {format!("{} stored · {} visible", snapshot.total_leaf_sessions, snapshot.rows.len())}
                         }
             }
             div {
-                style: "flex:1; min-height:0; overflow:auto; padding:8px 10px;",
+                style: "flex:1; min-height:0; overflow:auto; padding:6px 12px 8px 12px;",
                 for row in snapshot.rows.iter().cloned() {
                     SidebarRow {
                         row: row.clone(),
@@ -480,16 +481,16 @@ fn Sidebar(
             }
             div {
                 style: format!(
-                    "padding:12px 10px 12px 10px; display:flex; flex-direction:column; gap:10px;",
+                    "padding:10px 12px 12px 12px; display:flex; flex-direction:column; gap:9px;",
                 ),
                 if !snapshot.ssh_targets.is_empty() {
                     div {
                         div {
-                            style: format!("font-size:11px; color:{}; margin-bottom:6px;", snapshot.palette.muted),
+                            style: format!("font-size:10px; letter-spacing:0.02em; color:{}; margin-bottom:5px;", snapshot.palette.muted),
                             "Connect SSH"
                         }
                         div {
-                            style: "display:flex; flex-direction:column; gap:6px;",
+                            style: "display:flex; flex-direction:column; gap:5px;",
                             for (ix , target) in snapshot.ssh_targets.iter().cloned().enumerate() {
                                 {
                                     let target_detail = if let Some(prefix) = target.prefix.as_ref() {
@@ -504,11 +505,11 @@ fn Sidebar(
                                             div {
                                                 style: "display:flex; flex-direction:column; align-items:flex-start; min-width:0;",
                                                 span {
-                                                    style: format!("font-size:12px; font-weight:600; color:{};", snapshot.palette.text),
+                                                    style: format!("font-size:11px; font-weight:600; color:{};", snapshot.palette.text),
                                                     "{target.label}"
                                                 }
                                                 span {
-                                                    style: format!("font-size:11px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", snapshot.palette.muted),
+                                                    style: format!("font-size:10px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", snapshot.palette.muted),
                                                     "{target_detail}"
                                                 }
                                             }
@@ -522,11 +523,11 @@ fn Sidebar(
                 if !snapshot.live_sessions.is_empty() {
                     div {
                         div {
-                            style: format!("font-size:11px; color:{}; margin-bottom:6px;", snapshot.palette.muted),
+                            style: format!("font-size:10px; letter-spacing:0.02em; color:{}; margin-bottom:5px;", snapshot.palette.muted),
                             "Live Sessions"
                         }
                         div {
-                            style: "display:flex; flex-direction:column; gap:6px;",
+                            style: "display:flex; flex-direction:column; gap:5px;",
                             for session in snapshot.live_sessions.iter().cloned() {
                                 button {
                                     style: sidebar_action_style(snapshot.palette),
@@ -534,11 +535,11 @@ fn Sidebar(
                                     div {
                                         style: "display:flex; flex-direction:column; align-items:flex-start; min-width:0;",
                                         span {
-                                            style: format!("font-size:12px; font-weight:600; color:{};", snapshot.palette.text),
+                                            style: format!("font-size:11px; font-weight:600; color:{};", snapshot.palette.text),
                                             "{session.title}"
                                         }
                                         span {
-                                            style: format!("font-size:11px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", snapshot.palette.muted),
+                                            style: format!("font-size:10px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", snapshot.palette.muted),
                                             "{session.status_line}"
                                         }
                                     }
@@ -564,7 +565,7 @@ fn SidebarRow(
         BrowserRowKind::Group => "▸",
         BrowserRowKind::Session => "•",
     };
-    let indent = row.depth * 14 + 10;
+    let indent = row.depth * 12 + 12;
     let background = if selected {
         palette.accent_soft
     } else if row.kind == BrowserRowKind::Group && row.depth == 0 {
@@ -576,8 +577,8 @@ fn SidebarRow(
     rsx! {
         button {
             style: format!(
-                "width:100%; display:flex; flex-direction:column; align-items:stretch; gap:3px; \
-                 border:none; border-radius:12px; background:{}; padding:8px 10px 8px {}px; margin-bottom:4px;",
+                "width:100%; display:flex; flex-direction:column; align-items:stretch; gap:2px; \
+                 border:none; border-radius:12px; background:{}; padding:6px 9px 6px {}px; margin-bottom:2px;",
                 background, indent
             ),
             onclick: move |evt| on_select.call(evt),
@@ -586,12 +587,12 @@ fn SidebarRow(
                 div {
                     style: "display:flex; align-items:center; gap:8px; min-width:0;",
                     span {
-                        style: format!("font-size:11px; color:{};", palette.muted),
+                        style: format!("font-size:10px; color:{};", palette.muted),
                         "{disclosure}"
                     }
                     span {
                         style: format!(
-                            "font-size:12px; color:{}; font-weight:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                            "font-size:11px; color:{}; font-weight:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
                             if selected { palette.text } else if row.kind == BrowserRowKind::Group && row.depth > 0 { palette.muted } else { palette.text },
                             if row.kind == BrowserRowKind::Group && row.depth == 0 { 600 } else { 500 }
                         ),
@@ -600,12 +601,12 @@ fn SidebarRow(
                 }
                 if row.kind == BrowserRowKind::Group {
                     span {
-                        style: format!("font-size:11px; color:{};", palette.muted),
+                        style: format!("font-size:10px; color:{};", palette.muted),
                         "{row.descendant_sessions}"
                     }
                 } else if !row.host_label.is_empty() {
                     span {
-                        style: format!("font-size:11px; color:{};", palette.muted),
+                        style: format!("font-size:10px; color:{};", palette.muted),
                         "{row.host_label}"
                     }
                 }
@@ -613,7 +614,7 @@ fn SidebarRow(
             if !row.detail_label.is_empty() {
                 div {
                     style: format!(
-                        "font-size:11px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                        "font-size:10px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
                         palette.muted
                     ),
                     "{row.detail_label}"
@@ -724,7 +725,7 @@ fn MainSurface(
             ),
             div {
                 style: format!(
-                    "flex:1; overflow:auto; padding:24px; background:{}; border-radius:22px; box-shadow:{};",
+                    "flex:1; overflow:auto; padding:24px; background:{}; border-radius:11px; box-shadow:{};",
                     snapshot.palette.panel, snapshot.palette.panel_shadow
                 ),
                 {body}
@@ -899,19 +900,19 @@ fn MetadataRail(snapshot: RenderSnapshot) -> Element {
     rsx! {
         div {
             style: format!(
-                "width:236px; min-width:236px; max-width:236px; display:flex; flex-direction:column; \
+                "width:224px; min-width:224px; max-width:224px; display:flex; flex-direction:column; \
                  background:{}; overflow:hidden;",
                 snapshot.palette.sidebar
             ),
             div {
                 style: format!(
-                    "padding:14px 16px 12px 16px; font-size:12px; font-weight:700; color:{};",
+                    "padding:15px 16px 10px 16px; font-size:11px; font-weight:700; color:{};",
                     snapshot.palette.text
                 ),
                 "Session Metadata"
             }
             div {
-                style: "flex:1; overflow:auto; padding:12px 16px; display:flex; flex-direction:column; gap:16px;",
+                style: "flex:1; overflow:auto; padding:10px 16px 14px 16px; display:flex; flex-direction:column; gap:14px;",
                 if let Some(session) = session {
                     MetadataGroup {
                         title: "Overview".to_string(),
@@ -947,21 +948,21 @@ fn MetadataGroup(
     rsx! {
         div {
             style: format!(
-                "display:flex; flex-direction:column; gap:8px; padding-bottom:10px;",
+                "display:flex; flex-direction:column; gap:7px; padding-bottom:8px;",
             ),
             div {
-                style: format!("font-size:11px; font-weight:700; color:{};", palette.muted),
+                style: format!("font-size:10px; font-weight:700; letter-spacing:0.02em; color:{};", palette.muted),
                 "{title}"
             }
             for entry in entries.into_iter() {
                 div {
-                    style: "display:flex; flex-direction:column; gap:3px;",
+                    style: "display:flex; flex-direction:column; gap:2px;",
                     span {
-                        style: format!("font-size:11px; color:{};", palette.muted),
+                        style: format!("font-size:10px; color:{};", palette.muted),
                         "{entry.label}"
                     }
                     span {
-                        style: format!("font-size:12px; color:{}; white-space:pre-wrap;", palette.text),
+                        style: format!("font-size:11px; color:{}; white-space:pre-wrap; line-height:1.35;", palette.text),
                         "{entry.value}"
                     }
                 }
@@ -1011,12 +1012,12 @@ fn palette(theme: UiTheme) -> Palette {
     }
 }
 
-fn shell_style(palette: Palette) -> String {
+fn shell_style(palette: Palette, radius: u8) -> String {
     format!(
         "position:fixed; inset:0; display:flex; flex-direction:column; overflow:hidden; \
-         border-radius:11px; background-color:{}; background-image:{}; box-shadow:{}; backdrop-filter: blur(30px) saturate(165%); \
-         -webkit-backdrop-filter: blur(30px) saturate(165%);",
-        palette.shell, palette.gradient, palette.shadow
+         border-radius:{}px; background-color:{}; background-image:{}; box-shadow:{}; backdrop-filter: blur(30px) saturate(165%); \
+         -webkit-backdrop-filter: blur(30px) saturate(165%); font-family:{};",
+        radius, palette.shell, palette.gradient, palette.shadow, interface_font_family()
     )
 }
 
@@ -1048,7 +1049,7 @@ fn chip_style(palette: Palette, selected: bool) -> String {
 
 fn sidebar_action_style(palette: Palette) -> String {
     format!(
-        "width:100%; border:none; border-radius:12px; background:{}; padding:9px 10px; text-align:left;",
+        "width:100%; border:none; border-radius:12px; background:{}; padding:8px 10px; text-align:left;",
         palette.sidebar_hover
     )
 }
@@ -1082,4 +1083,19 @@ fn metadata_value(session: &ManagedSessionView, label: &str) -> String {
         .find(|entry| entry.label == label)
         .map(|entry| entry.value.clone())
         .unwrap_or_default()
+}
+
+#[cfg(target_os = "linux")]
+fn interface_font_family() -> &'static str {
+    "\"Inter Variable\", \"Inter\", system-ui, sans-serif"
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn interface_font_family() -> &'static str {
+    "system-ui, sans-serif"
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn interface_font_family() -> &'static str {
+    "system-ui, sans-serif"
 }
