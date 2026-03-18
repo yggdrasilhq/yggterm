@@ -579,7 +579,11 @@ impl GpuiShell {
         } else {
             row.detail_label.clone()
         };
+        let is_top_group = row.kind == BrowserRowKind::Group && row.depth == 0;
+        let has_detail = !detail.is_empty();
         let label_color = if is_selected {
+            palette.text
+        } else if is_top_group {
             palette.text
         } else if row.kind == BrowserRowKind::Session {
             palette.text
@@ -623,22 +627,77 @@ impl GpuiShell {
             _ => None,
         };
 
+        let label = if is_top_group {
+            div()
+                .text_base()
+                .text_color(label_color)
+                .line_clamp(1)
+                .text_ellipsis()
+                .child(row.label.clone())
+        } else {
+            div()
+                .text_sm()
+                .text_color(label_color)
+                .line_clamp(1)
+                .text_ellipsis()
+                .child(row.label.clone())
+        };
+        let mut body = div().flex().flex_col().gap_1().flex_1().child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_1p5()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_1p5()
+                        .items_center()
+                        .child(
+                            div()
+                                .w(px(12.))
+                                .text_color(disclosure_color)
+                                .child(disclosure),
+                        )
+                        .child(label),
+                )
+                .children(right_badge),
+        );
+        if has_detail {
+            body = body.child(
+                div()
+                    .pl(px(14.))
+                    .text_xs()
+                    .text_color(if is_selected {
+                        palette.text_muted.opacity(0.9)
+                    } else {
+                        palette.text_muted
+                    })
+                    .line_clamp(1)
+                    .text_ellipsis()
+                    .child(detail),
+            );
+        }
+
         div()
             .id(("sidebar-row", ix))
             .w_full()
-            .min_h(px(38.))
+            .min_h(px(if has_detail { 38. } else { 30. }))
             .flex()
             .flex_row()
             .items_start()
             .justify_between()
             .px_2()
-            .py_1p5()
-            .pl(px(10. + row.depth as f32 * 10.))
+            .py(px(if has_detail { 6. } else { 4. }))
+            .pl(px(10. + row.depth as f32 * 8.))
             .bg(if is_selected {
-                palette.text_accent.opacity(0.16)
+                palette.text_accent.opacity(0.18)
             } else {
                 palette.window_background
             })
+            .rounded_md()
             .border_l_2()
             .border_color(if is_selected {
                 palette.border_focused
@@ -646,56 +705,7 @@ impl GpuiShell {
                 palette.window_background
             })
             .on_click(cx.listener(move |this, _, _, cx| this.select_row(ix, cx)))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .flex_1()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap_1p5()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .gap_1p5()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .w(px(12.))
-                                            .text_color(disclosure_color)
-                                            .child(disclosure),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(label_color)
-                                            .line_clamp(1)
-                                            .text_ellipsis()
-                                            .child(row.label),
-                                    ),
-                            )
-                            .children(right_badge),
-                    )
-                    .child(
-                        div()
-                            .pl(px(14.))
-                            .text_xs()
-                            .text_color(if is_selected {
-                                palette.text_muted.opacity(0.9)
-                            } else {
-                                palette.text_muted
-                            })
-                            .line_clamp(1)
-                            .text_ellipsis()
-                            .child(detail),
-                    ),
-            )
+            .child(body)
             .into_any_element()
     }
 
