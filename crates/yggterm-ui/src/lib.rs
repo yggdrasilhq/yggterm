@@ -98,7 +98,7 @@ pub fn titlebar_frame(
     row()
         .id("yggterm-titlebar")
         .w_full()
-        .h(px(50.))
+        .h(px(44.))
         .items_center()
         .justify_between()
         .bg(background)
@@ -164,27 +164,64 @@ pub fn statusbar_frame(
 }
 
 pub fn window_controls(window: &mut Window) -> AnyElement {
-    row()
+    let supported = window.window_controls();
+    let controls = row()
         .id("yggterm-window-controls")
         .gap_1()
         .items_center()
         .on_mouse_down(MouseButton::Left, |_, _, cx: &mut App| {
             cx.stop_propagation()
-        })
-        .child(window_control("minimize", "−", move |window| {
-            window.minimize_window();
-        }))
-        .child(window_control(
-            "maximize-or-restore",
-            if window.is_maximized() { "❐" } else { "□" },
-            move |window| {
-                window.zoom_window();
+        });
+
+    #[cfg(target_os = "macos")]
+    let controls = controls
+        .child(traffic_light(
+            "close",
+            hsla(0.01, 0.78, 0.58, 1.0),
+            |window| {
+                window.remove_window();
             },
         ))
+        .when(supported.minimize, |row| {
+            row.child(traffic_light(
+                "minimize",
+                hsla(0.13, 0.94, 0.63, 1.0),
+                |window| {
+                    window.minimize_window();
+                },
+            ))
+        })
+        .when(supported.maximize, |row| {
+            row.child(traffic_light(
+                "maximize-or-restore",
+                hsla(0.36, 0.65, 0.49, 1.0),
+                |window| {
+                    window.zoom_window();
+                },
+            ))
+        });
+
+    #[cfg(not(target_os = "macos"))]
+    let controls = controls
+        .when(supported.minimize, |row| {
+            row.child(window_control("minimize", "−", move |window| {
+                window.minimize_window();
+            }))
+        })
+        .when(supported.maximize, |row| {
+            row.child(window_control(
+                "maximize-or-restore",
+                if window.is_maximized() { "❐" } else { "□" },
+                move |window| {
+                    window.zoom_window();
+                },
+            ))
+        })
         .child(window_control("close", "×", move |window| {
             window.remove_window();
-        }))
-        .into_any_element()
+        }));
+
+    controls.into_any_element()
 }
 
 pub fn titlebar_icon_button(
@@ -297,6 +334,27 @@ fn window_control(
         cx.stop_propagation();
         on_click(window);
     })
+}
+
+fn traffic_light(
+    id: &'static str,
+    background: Hsla,
+    on_click: impl Fn(&mut Window) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .size(px(12.))
+        .rounded_full()
+        .bg(background)
+        .border_1()
+        .border_color(background.opacity(0.75))
+        .on_mouse_down(MouseButton::Left, |_, _, cx: &mut App| {
+            cx.stop_propagation();
+        })
+        .on_click(move |_, window, cx| {
+            cx.stop_propagation();
+            on_click(window);
+        })
 }
 
 pub fn terminal_surface_card<S: AsRef<str>>(
@@ -710,15 +768,15 @@ fn chrome_button(
 ) -> Stateful<Div> {
     div()
         .id(id)
-        .size(px(30.))
+        .size(px(26.))
         .flex()
         .items_center()
         .justify_center()
-        .rounded_lg()
+        .rounded_md()
         .bg(background)
         .border_1()
         .border_color(border)
-        .text_sm()
+        .text_xs()
         .text_color(text_color)
         .on_mouse_down(MouseButton::Left, |_, _, cx: &mut App| {
             cx.stop_propagation();
