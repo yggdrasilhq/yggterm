@@ -1,6 +1,6 @@
 use crate::SessionNode;
 use dirs::home_dir;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
 
@@ -154,11 +154,13 @@ impl SessionBrowserState {
         let started_at = Instant::now();
         self.rows.clear();
         let filter = self.filter_query.to_ascii_lowercase();
+        let short_ids = unique_session_short_ids(&self.root);
         flatten_rows(
             &self.root,
             0,
             &filter,
             &self.expanded_paths,
+            &short_ids,
             &mut self.rows,
             true,
         );
@@ -210,6 +212,7 @@ fn flatten_rows(
     depth: usize,
     filter: &str,
     expanded_paths: &HashSet<String>,
+    short_ids: &HashMap<String, String>,
     rows: &mut Vec<BrowserRow>,
     include_root: bool,
 ) -> bool {
@@ -232,7 +235,7 @@ fn flatten_rows(
             } else {
                 BrowserRowKind::Group
             },
-            label: format_row_label(node, depth, descendant_sessions, is_session),
+            label: format_row_label(node, short_ids, &full_path, is_session),
             detail_label: detail_label_for_row(node, &full_path, is_session),
             full_path: full_path.clone(),
             depth,
@@ -246,7 +249,15 @@ fn flatten_rows(
 
     if !is_session && expanded {
         for child in &node.children {
-            flatten_rows(child, depth + 1, filter, expanded_paths, rows, true);
+            flatten_rows(
+                child,
+                depth + 1,
+                filter,
+                expanded_paths,
+                short_ids,
+                rows,
+                true,
+            );
         }
     }
 
@@ -255,12 +266,16 @@ fn flatten_rows(
 
 fn format_row_label(
     node: &SessionNode,
-    _depth: usize,
-    _descendant_sessions: usize,
+    short_ids: &HashMap<String, String>,
+    full_path: &str,
     is_session: bool,
 ) -> String {
     if is_session {
-        node.name.clone()
+        short_ids
+            .get(full_path)
+            .cloned()
+            .or_else(|| node.session_id.as_deref().map(|id| session_id_suffix(id, 7)))
+            .unwrap_or_else(|| node.name.clone())
     } else {
         node.name.clone()
     }
@@ -268,13 +283,10 @@ fn format_row_label(
 
 fn detail_label_for_row(node: &SessionNode, full_path: &str, is_session: bool) -> String {
     if is_session {
-        match (node.cwd.as_deref(), node.session_id.as_deref()) {
-            (Some(cwd), Some(session_id)) => {
-                format!("{} · {}", browser_display_path(cwd), session_id)
-            }
-            (Some(cwd), None) => browser_display_path(cwd),
-            _ => browser_display_path(full_path),
-        }
+        node.cwd
+            .as_deref()
+            .map(browser_display_path)
+            .unwrap_or_else(|| browser_display_path(full_path))
     } else {
         if full_path.starts_with("live::") {
             "remote runtime".to_string()
@@ -353,4 +365,46 @@ fn browser_display_path(path: &str) -> String {
     }
 
     normalized
+}
+
+fn unique_session_short_ids(root: &SessionNode) -> HashMap<String, String> {
+    let mut sessions = Vec::<(String, String)>::new();
+    collect_session_ids(root, &mut sessions);
+
+    let mut out = HashMap::new();
+    for (path, session_id) in &sessions {
+        let id_len = session_id.chars().count();
+        let mut width = 7usize.min(id_len).max(1);
+        while width < id_len {
+            let suffix = session_id_suffix(session_id, width);
+            let collision = sessions.iter().any(|(other_path, other_id)| {
+                other_path != path && session_id_suffix(other_id, width) == suffix
+            });
+            if !collision {
+                break;
+            }
+            width += 1;
+        }
+        out.insert(path.clone(), session_id_suffix(session_id, width));
+    }
+    out
+}
+
+fn collect_session_ids(node: &SessionNode, out: &mut Vec<(String, String)>) {
+    if node.children.is_empty() {
+        if let Some(session_id) = node.session_id.as_ref() {
+            out.push((node.path.display().to_string(), session_id.clone()));
+        }
+        return;
+    }
+
+    for child in &node.children {
+        collect_session_ids(child, out);
+    }
+}
+
+fn session_id_suffix(id: &str, width: usize) -> String {
+    let chars = id.chars().collect::<Vec<_>>();
+    let start = chars.len().saturating_sub(width);
+    chars[start..].iter().collect::<String>()
 }
