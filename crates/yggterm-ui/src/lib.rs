@@ -304,6 +304,7 @@ pub fn terminal_surface_card<S: AsRef<str>>(
         .border_color(palette.border_variant)
         .child(
             row()
+                .w_full()
                 .items_center()
                 .justify_between()
                 .child(
@@ -343,6 +344,7 @@ pub fn preview_summary_card(
     palette: &UiPalette,
 ) -> AnyElement {
     column()
+        .w(px(320.))
         .gap_2()
         .p_3()
         .rounded_lg()

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use gpui::{
-    AnyElement, App, AppContext, Bounds, Context, InteractiveElement, IntoElement, ParentElement,
-    Render, StatefulInteractiveElement, Styled, UniformListScrollHandle, Window,
+    AnyElement, App, AppContext, Bounds, Context, FocusHandle, InteractiveElement, IntoElement,
+    ParentElement, Render, StatefulInteractiveElement, Styled, UniformListScrollHandle, Window,
     WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions, div, px, size,
     uniform_list,
 };
@@ -56,12 +56,15 @@ struct GpuiShell {
     sidebar_open: bool,
     right_panel_open: bool,
     sidebar_scroll_handle: UniformListScrollHandle,
+    search_focus: FocusHandle,
+    search_query: String,
     last_action: String,
 }
 
 impl GpuiShell {
-    fn new(bootstrap: ShellBootstrap, _cx: &mut Context<Self>) -> Self {
-        Self {
+    fn new(bootstrap: ShellBootstrap, cx: &mut Context<Self>) -> Self {
+        let search_focus = cx.focus_handle();
+        let this = Self {
             browser: SessionBrowserState::new(bootstrap.browser_tree.clone()),
             server: YggtermServer::new(
                 &bootstrap.browser_tree,
@@ -73,8 +76,58 @@ impl GpuiShell {
             sidebar_open: true,
             right_panel_open: true,
             sidebar_scroll_handle: UniformListScrollHandle::new(),
+            search_focus,
+            search_query: String::new(),
             last_action: "ready".to_string(),
-        }
+        };
+
+        cx.observe_keystrokes(|this, event, window, cx| {
+            if !this.search_focus.is_focused(window) {
+                return;
+            }
+
+            let key = event.keystroke.key.as_str();
+            match key {
+                "backspace" => {
+                    this.search_query.pop();
+                    this.apply_search(cx);
+                }
+                "escape" => {
+                    if !this.search_query.is_empty() {
+                        this.search_query.clear();
+                        this.apply_search(cx);
+                    }
+                }
+                "enter" => {
+                    if let Some(ix) = this
+                        .browser
+                        .rows()
+                        .iter()
+                        .position(|row| row.kind == BrowserRowKind::Session)
+                    {
+                        this.select_row(ix, cx);
+                    }
+                }
+                _ => {
+                    if event.keystroke.modifiers.control
+                        || event.keystroke.modifiers.platform
+                        || event.keystroke.modifiers.alt
+                    {
+                        return;
+                    }
+
+                    if let Some(text) = event.keystroke.key_char.as_ref() {
+                        if !text.chars().any(|ch| ch.is_control()) {
+                            this.search_query.push_str(text);
+                            this.apply_search(cx);
+                        }
+                    }
+                }
+            }
+        })
+        .detach();
+
+        this
     }
 
     fn palette(&self) -> UiPalette {
@@ -94,6 +147,30 @@ impl GpuiShell {
 
     fn total_leaf_sessions(&self) -> usize {
         self.browser.total_sessions()
+    }
+
+    fn apply_search(&mut self, cx: &mut Context<Self>) {
+        self.browser.set_filter_query(self.search_query.clone());
+        self.last_action = if self.search_query.is_empty() {
+            "search cleared".to_string()
+        } else {
+            format!("filtered {}", self.search_query)
+        };
+        cx.notify();
+    }
+
+    fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.search_focus, cx);
+        self.last_action = "search focused".to_string();
+        cx.notify();
+    }
+
+    fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_query.clear();
+        self.browser.set_filter_query("");
+        window.focus(&self.search_focus, cx);
+        self.last_action = "search cleared".to_string();
+        cx.notify();
     }
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -189,8 +266,28 @@ impl GpuiShell {
         cx.notify();
     }
 
-    fn search_placeholder(&self, palette: &UiPalette) -> AnyElement {
+    fn search_bar(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        palette: &UiPalette,
+    ) -> AnyElement {
+        let mut right_status = div().flex().flex_row().gap_2().items_center();
+        if !self.search_query.is_empty() {
+            right_status = right_status.child(
+                toolbar_chip_button("clear-search", "Clear", false, palette)
+                    .on_click(cx.listener(|this, _, window, cx| this.clear_search(window, cx))),
+            );
+        }
+        let right_status = right_status.child(
+            div()
+                .text_xs()
+                .text_color(palette.text_muted)
+                .child(format!("{} rows", self.browser.rows().len())),
+        );
+
         div()
+            .id("search-bar")
             .w(px(380.))
             .h(px(30.))
             .flex()
@@ -200,22 +297,45 @@ impl GpuiShell {
             .rounded_lg()
             .bg(palette.element_background)
             .border_1()
-            .border_color(palette.border_variant)
+            .border_color(if self.search_focus.is_focused(window) {
+                palette.border_focused
+            } else {
+                palette.border_variant
+            })
             .text_sm()
             .text_color(palette.text_muted)
-            .child("Search sessions…")
+            .focusable()
+            .track_focus(&self.search_focus)
+            .on_click(cx.listener(|this, _, window, cx| this.focus_search(window, cx)))
             .child(
                 div()
-                    .text_xs()
-                    .text_color(palette.text_muted)
-                    .child(format!("{} sessions", self.total_leaf_sessions())),
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .items_center()
+                    .child(div().text_color(palette.text_muted).child("⌕"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(if self.search_query.is_empty() {
+                                palette.text_muted
+                            } else {
+                                palette.text
+                            })
+                            .child(if self.search_query.is_empty() {
+                                "Search sessions…".to_string()
+                            } else {
+                                self.search_query.clone()
+                            }),
+                    ),
             )
+            .child(right_status)
             .into_any_element()
     }
 
     fn titlebar(
         &self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
         palette: &UiPalette,
     ) -> AnyElement {
@@ -269,7 +389,7 @@ impl GpuiShell {
 
         titlebar_frame(
             left,
-            self.search_placeholder(palette),
+            self.search_bar(window, cx, palette),
             right,
             palette.window_background,
             palette.border,
@@ -311,7 +431,8 @@ impl GpuiShell {
                             .text_xs()
                             .text_color(palette.text_muted)
                             .child(format!(
-                                "{} stored sessions{}",
+                                "{} stored · {} visible{}",
+                                self.browser.total_session_count(),
                                 self.total_leaf_sessions(),
                                 self.active_session()
                                     .map(|session| format!(" · viewing {}", session.title))
@@ -319,7 +440,34 @@ impl GpuiShell {
                             )),
                     ),
             )
-            .child(
+            .child(if row_count == 0 {
+                div()
+                    .flex_1()
+                    .flex()
+                    .justify_center()
+                    .items_center()
+                    .px_4()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(palette.text)
+                                    .child("No matching sessions"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(palette.text_muted)
+                                    .child("Adjust the search query or clear the filter."),
+                            ),
+                    )
+                    .into_any_element()
+            } else {
                 uniform_list(
                     "shell-sidebar-rows",
                     row_count,
@@ -331,8 +479,9 @@ impl GpuiShell {
                     }),
                 )
                 .track_scroll(&self.sidebar_scroll_handle)
-                .h_full(),
-            )
+                .h_full()
+                .into_any_element()
+            })
             .into_any_element()
     }
 
@@ -386,6 +535,12 @@ impl GpuiShell {
             } else {
                 palette.window_background
             })
+            .border_l_2()
+            .border_color(if is_selected {
+                palette.border_focused
+            } else {
+                palette.window_background
+            })
             .on_click(cx.listener(move |this, _, _, cx| this.select_row(ix, cx)))
             .child(
                 div()
@@ -403,7 +558,11 @@ impl GpuiShell {
                             .child(
                                 div()
                                     .text_sm()
-                                    .text_color(palette.text)
+                                    .text_color(if row.kind == BrowserRowKind::Session {
+                                        palette.text
+                                    } else {
+                                        palette.text_muted
+                                    })
                                     .text_ellipsis()
                                     .child(row.label),
                             ),
