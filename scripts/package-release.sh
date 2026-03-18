@@ -7,11 +7,18 @@ BIN_PATH="${ROOT_DIR}/target/release/yggterm"
 TARGET_LABEL="${1:-linux-x86_64}"
 RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.94.0}"
 CARGO_CMD=(cargo "+${RUSTUP_TOOLCHAIN}")
+GHOSTTY_PREFIX="${ROOT_DIR}/.yggterm-state/ghostty-prefix"
+GHOSTTY_LIB_DIR="${GHOSTTY_PREFIX}/lib"
+GHOSTTY_DIR="${ROOT_DIR}/../ghostty"
 
 mkdir -p "$DIST_DIR"
 
+if [[ ! -f "${GHOSTTY_LIB_DIR}/libghostty.so" ]]; then
+  "${ROOT_DIR}/scripts/build-ghostty-lib.sh"
+fi
+
 pushd "$ROOT_DIR" >/dev/null
-"${CARGO_CMD[@]}" build --release
+GHOSTTY_DIR="${GHOSTTY_DIR}" GHOSTTY_LIB_DIR="${GHOSTTY_LIB_DIR}" "${CARGO_CMD[@]}" build --release
 popd >/dev/null
 
 cp "$BIN_PATH" "$DIST_DIR/yggterm-${TARGET_LABEL}"

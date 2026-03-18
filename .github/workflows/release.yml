@@ -51,6 +51,9 @@ jobs:
       - name: Clone Zed sibling repo
         run: git clone --depth 1 https://github.com/zed-industries/zed ../zed
 
+      - name: Build Ghostty runtime artifacts
+        run: ./scripts/build-ghostty-lib.sh
+
       - name: Package release artifacts
         run: ./scripts/package-release.sh linux-x86_64
 
