@@ -16,6 +16,7 @@ pub struct BrowserRow {
     pub full_path: String,
     pub label: String,
     pub detail_label: String,
+    pub session_title: Option<String>,
     pub depth: usize,
     pub host_label: String,
     pub descendant_sessions: usize,
@@ -237,6 +238,11 @@ fn flatten_rows(
             },
             label: format_row_label(node, short_ids, &full_path, is_session),
             detail_label: detail_label_for_row(node, &full_path, is_session),
+            session_title: if is_session {
+                node.title.clone()
+            } else {
+                None
+            },
             full_path: full_path.clone(),
             depth,
             host_label: host_label_for_row(node, depth),
@@ -271,11 +277,13 @@ fn format_row_label(
     is_session: bool,
 ) -> String {
     if is_session {
-        short_ids
-            .get(full_path)
-            .cloned()
-            .or_else(|| node.session_id.as_deref().map(|id| session_id_suffix(id, 7)))
-            .unwrap_or_else(|| node.name.clone())
+        node.title.clone().unwrap_or_else(|| {
+            short_ids
+                .get(full_path)
+                .cloned()
+                .or_else(|| node.session_id.as_deref().map(|id| session_id_suffix(id, 7)))
+                .unwrap_or_else(|| node.name.clone())
+        })
     } else {
         node.name.clone()
     }
@@ -283,10 +291,25 @@ fn format_row_label(
 
 fn detail_label_for_row(node: &SessionNode, full_path: &str, is_session: bool) -> String {
     if is_session {
-        node.cwd
+        let path_label = node
+            .cwd
             .as_deref()
             .map(browser_display_path)
-            .unwrap_or_else(|| browser_display_path(full_path))
+            .unwrap_or_else(|| browser_display_path(full_path));
+        if node.title.is_some() {
+            let short_id = node
+                .session_id
+                .as_deref()
+                .map(|id| session_id_suffix(id, 7))
+                .unwrap_or_default();
+            if short_id.is_empty() {
+                path_label
+            } else {
+                format!("{short_id} · {path_label}")
+            }
+        } else {
+            path_label
+        }
     } else {
         if full_path.starts_with("live::") {
             "remote runtime".to_string()
