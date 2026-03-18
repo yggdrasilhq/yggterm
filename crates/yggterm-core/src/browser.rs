@@ -111,6 +111,10 @@ impl SessionBrowserState {
             .count()
     }
 
+    pub fn total_session_count(&self) -> usize {
+        count_leaf_sessions(&self.root)
+    }
+
     fn ensure_selection(&mut self) {
         let selected_missing = self
             .selected_path
@@ -175,7 +179,7 @@ fn flatten_rows(
     if !is_session && descendant_sessions == 0 {
         return false;
     }
-    let expanded = is_session || expanded_paths.contains(&full_path);
+    let expanded = is_session || !filter.is_empty() || expanded_paths.contains(&full_path);
 
     if include_root {
         rows.push(BrowserRow {
