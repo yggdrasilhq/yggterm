@@ -468,8 +468,18 @@ impl GpuiShell {
         }
 
         let row_count = self.browser.rows().len();
+        let summary = self
+            .active_session()
+            .map(|session| format!("viewing {}", session.title))
+            .unwrap_or_else(|| {
+                format!(
+                    "{} stored · {} visible",
+                    self.browser.total_session_count(),
+                    self.total_leaf_sessions()
+                )
+            });
         div()
-            .w(px(224.))
+            .w(px(216.))
             .h_full()
             .flex()
             .flex_col()
@@ -495,14 +505,7 @@ impl GpuiShell {
                         div()
                             .text_xs()
                             .text_color(palette.text_muted)
-                            .child(format!(
-                                "{} stored · {} visible{}",
-                                self.browser.total_session_count(),
-                                self.total_leaf_sessions(),
-                                self.active_session()
-                                    .map(|session| format!(" · viewing {}", session.title))
-                                    .unwrap_or_default()
-                            )),
+                            .child(summary),
                     ),
             )
             .child(if row_count == 0 {
@@ -559,44 +562,80 @@ impl GpuiShell {
             .selected_path()
             .is_some_and(|path| path == row.full_path);
 
-        let glyph = match row.kind {
-            BrowserRowKind::Group => {
-                if row.expanded {
-                    "▾"
+        let disclosure = match row.kind {
+            BrowserRowKind::Group if row.expanded => "▾",
+            BrowserRowKind::Group => "▸",
+            BrowserRowKind::Session => {
+                if is_selected {
+                    "●"
                 } else {
-                    "▸"
+                    "○"
                 }
             }
-            BrowserRowKind::Session => "•",
         };
 
         let detail = if row.kind == BrowserRowKind::Session {
             row.detail_label.clone()
         } else {
-            format!(
-                "{} sessions{}",
-                row.descendant_sessions,
-                if row.detail_label.is_empty() {
-                    String::new()
-                } else {
-                    format!(" · {}", row.detail_label)
-                }
-            )
+            row.detail_label.clone()
+        };
+        let label_color = if is_selected {
+            palette.text
+        } else if row.kind == BrowserRowKind::Session {
+            palette.text
+        } else {
+            palette.text_muted
+        };
+        let disclosure_color = if is_selected {
+            palette.text_accent
+        } else {
+            palette.text_muted
+        };
+        let right_badge = match row.kind {
+            BrowserRowKind::Group => Some(
+                div()
+                    .px_1p5()
+                    .py_0p5()
+                    .rounded_md()
+                    .bg(if is_selected {
+                        palette.text_accent.opacity(0.16)
+                    } else {
+                        palette.element_background
+                    })
+                    .text_xs()
+                    .text_color(if is_selected {
+                        palette.text_accent
+                    } else {
+                        palette.text_muted
+                    })
+                    .child(row.descendant_sessions.to_string()),
+            ),
+            BrowserRowKind::Session if !row.host_label.is_empty() => Some(
+                div()
+                    .px_1p5()
+                    .py_0p5()
+                    .rounded_md()
+                    .bg(palette.element_background)
+                    .text_xs()
+                    .text_color(palette.text_muted)
+                    .child(row.host_label.clone()),
+            ),
+            _ => None,
         };
 
         div()
             .id(("sidebar-row", ix))
             .w_full()
-            .min_h(px(42.))
+            .min_h(px(38.))
             .flex()
             .flex_row()
             .items_start()
             .justify_between()
             .px_2()
-            .py_2()
-            .pl(px(12. + row.depth as f32 * 14.))
+            .py_1p5()
+            .pl(px(10. + row.depth as f32 * 10.))
             .bg(if is_selected {
-                palette.text_accent.opacity(0.14)
+                palette.text_accent.opacity(0.16)
             } else {
                 palette.window_background
             })
@@ -617,27 +656,41 @@ impl GpuiShell {
                         div()
                             .flex()
                             .flex_row()
-                            .gap_2()
+                            .gap_1p5()
                             .items_center()
-                            .child(div().text_color(palette.text_muted).child(glyph))
+                            .justify_between()
                             .child(
                                 div()
-                                    .text_sm()
-                                    .text_color(if row.kind == BrowserRowKind::Session {
-                                        palette.text
-                                    } else {
-                                        palette.text_muted
-                                    })
-                                    .line_clamp(1)
-                                    .text_ellipsis()
-                                    .child(row.label),
-                            ),
+                                    .flex()
+                                    .flex_row()
+                                    .gap_1p5()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .w(px(12.))
+                                            .text_color(disclosure_color)
+                                            .child(disclosure),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(label_color)
+                                            .line_clamp(1)
+                                            .text_ellipsis()
+                                            .child(row.label),
+                                    ),
+                            )
+                            .children(right_badge),
                     )
                     .child(
                         div()
-                            .pl(px(18.))
+                            .pl(px(14.))
                             .text_xs()
-                            .text_color(palette.text_muted)
+                            .text_color(if is_selected {
+                                palette.text_muted.opacity(0.9)
+                            } else {
+                                palette.text_muted
+                            })
                             .line_clamp(1)
                             .text_ellipsis()
                             .child(detail),
