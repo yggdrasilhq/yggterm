@@ -973,36 +973,36 @@ fn MetadataGroup(
 fn palette(theme: UiTheme) -> Palette {
     match theme {
         UiTheme::ZedLight => Palette {
-            shell: "rgba(245,248,249,0.72)",
+            shell: "rgba(244,248,250,0.92)",
             titlebar: "transparent",
             sidebar: "transparent",
             sidebar_hover: "rgba(134,186,202,0.14)",
             panel: "#ffffff",
-            panel_alt: "rgba(255,255,255,0.48)",
+            panel_alt: "rgba(255,255,255,0.68)",
             border: "#dfe5ea",
             text: "#24303a",
             muted: "#6f7c86",
             accent: "#2f7cf6",
             accent_soft: "rgba(114,190,215,0.18)",
-            gradient: "linear-gradient(180deg, rgba(236,245,249,0.78) 0%, rgba(234,245,239,0.74) 48%, rgba(238,240,244,0.78) 100%)",
+            gradient: "linear-gradient(180deg, rgba(232,243,248,0.94) 0%, rgba(232,244,238,0.90) 48%, rgba(237,240,244,0.94) 100%)",
             close_hover: "#e81123",
             control_hover: "rgba(36,48,58,0.10)",
             shadow: "0 24px 52px rgba(72,102,118,0.16)",
             panel_shadow: "0 18px 44px rgba(69,108,136,0.18)",
         },
         UiTheme::ZedDark => Palette {
-            shell: "rgba(37,44,50,0.78)",
+            shell: "rgba(39,46,52,0.92)",
             titlebar: "transparent",
             sidebar: "transparent",
             sidebar_hover: "rgba(131,198,205,0.14)",
             panel: "#f8fafc",
-            panel_alt: "rgba(255,255,255,0.08)",
+            panel_alt: "rgba(255,255,255,0.14)",
             border: "#3b4755",
             text: "#dce6ee",
             muted: "#9fb0bd",
             accent: "#73b9ff",
             accent_soft: "rgba(115,185,255,0.14)",
-            gradient: "linear-gradient(180deg, rgba(70,97,108,0.76) 0%, rgba(77,104,96,0.74) 52%, rgba(57,64,72,0.84) 100%)",
+            gradient: "linear-gradient(180deg, rgba(68,95,106,0.92) 0%, rgba(75,102,94,0.88) 52%, rgba(58,65,73,0.94) 100%)",
             close_hover: "#e81123",
             control_hover: "rgba(255,255,255,0.08)",
             shadow: "0 26px 72px rgba(0,0,0,0.34)",
@@ -1014,9 +1014,9 @@ fn palette(theme: UiTheme) -> Palette {
 fn shell_style(palette: Palette) -> String {
     format!(
         "position:fixed; inset:0; display:flex; flex-direction:column; overflow:hidden; \
-         border-radius:11px; background:{}; box-shadow:{}; backdrop-filter: blur(26px) saturate(155%); \
-         -webkit-backdrop-filter: blur(26px) saturate(155%);",
-        palette.gradient, palette.shadow
+         border-radius:11px; background-color:{}; background-image:{}; box-shadow:{}; backdrop-filter: blur(30px) saturate(165%); \
+         -webkit-backdrop-filter: blur(30px) saturate(165%);",
+        palette.shell, palette.gradient, palette.shadow
     )
 }
 
