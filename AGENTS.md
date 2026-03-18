@@ -36,12 +36,12 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 
 - Upstream-first integration: prefer using existing interfaces from `../zed` and `../ghostty` instead of reimplementing behavior.
 - Minimize forks: keep Yggterm-specific code as adapter layers around upstream crates/APIs so upstream pulls stay low-friction.
-- Prefer direct consumption of Zed crates like `ui`, `theme`, `settings`, `workspace`, and panel/titlebar helpers before recreating similar local UI code.
+- Prefer direct consumption of GPUI and upstream Ghostty interfaces, but keep Yggterm-owned shell chrome and session UI in local crates where that reduces licensing and maintenance friction.
 - Reuse GPUI, `workspace::Item`, `workspace::SerializableItem`, `workspace::Panel`, `Pane`, and `PaneGroup` patterns wherever they fit the terminal workspace model.
 - Reuse `project_panel` tree behavior for sidebar interaction, but map nodes to terminal session metadata instead of files.
 - Replace editor-centric open flows with terminal-centric behavior: selecting a tree node should open, restore, or focus Ghostty sessions rather than text buffers.
 - The central viewport should host Ghostty-backed terminal views in place of file editors.
-- Until Ghostty surfaces are embedded, keep mock tab bodies and sidebar data inside Zed-derived chrome rather than inventing new UI systems.
+- Until Ghostty surfaces are embedded, keep mock terminal bodies and sidebar data inside the Yggterm-owned GPUI shell rather than building throwaway alternate frontends.
 - Session state is local-first under `~/.yggterm`, but the tree model is metadata-first rather than a direct filesystem mirror.
 - Use `~/gh/codex-session-tui` and the local `../zed` checkout as reference material when refining shell shape, chrome, and interaction patterns.
 - Use the running X11 session and screenshots of a live Zed window when validating visual changes to the scaffold.

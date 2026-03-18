@@ -6718,7 +6718,7 @@ dependencies = [
 
 [[package]]
 name = "yggterm"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "tracing",
@@ -6731,7 +6731,7 @@ dependencies = [
 
 [[package]]
 name = "yggterm-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -6744,7 +6744,7 @@ dependencies = [
 
 [[package]]
 name = "yggterm-ghostty-bridge"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "thiserror 2.0.18",
@@ -6752,15 +6752,15 @@ dependencies = [
 
 [[package]]
 name = "yggterm-gtk-glue"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "yggterm-platform"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "yggterm-ui"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "gpui",

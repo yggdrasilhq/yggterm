@@ -20,12 +20,12 @@ This repository is still scaffolding.
 
 - Rust workspace structure is in place.
 - Ghostty bridge packaging and runtime probing exist.
-- A temporary desktop shell exists for fast iteration on layout and interaction.
-- The current shell is useful for shape and workflow experiments, but it is not the final GPUI implementation yet.
+- A GPUI desktop shell exists for fast iteration on layout and interaction.
+- The current shell lives in `crates/yggterm-ui` and is the active product surface.
 - `yggterm` now opens the GPUI shell prototype directly.
 - The old CLI subcommands and the `eframe` scaffold path have been removed.
-- The GPUI shell should prefer direct reuse of Zed crates such as `ui`, `theme`, and `settings` over local visual reimplementation.
-- Mock sidebars, tabs, docks, and bodies are acceptable only as placeholders inside Zed-derived chrome while Ghostty embedding is still pending.
+- The shell chrome is now owned locally in `yggterm-ui`, while GPUI and adjacent Zed checkout code remain the runtime/UI reference stack.
+- Mock sidebars, preview panes, and docks are acceptable only as placeholders while Ghostty embedding and the server runtime are still pending.
 
 When working in this repo, optimize for getting the application closer to "Zed chrome + Ghostty sessions + virtual session tree", not for deepening temporary scaffolding choices.
 
@@ -35,9 +35,9 @@ Yggterm should inherit the parts of Zed that already work well for a dense works
 
 - title bar and window chrome proportions
 - left-sidebar rhythm and hierarchy
-- pane and tab vocabulary
+- pane vocabulary
 - focus routing and panel behavior
-- theme and settings behavior
+- theme behavior
 
 The key change is that the center of the app is Ghostty sessions and session groups instead of editors and projects.
 
@@ -130,9 +130,9 @@ Build the FFI bundle archive:
 
 ## Repository layout
 
-- `apps/yggterm`: CLI entrypoint and current desktop scaffold
+- `apps/yggterm`: CLI entrypoint and desktop launcher
 - `crates/yggterm-core`: session model and settings persistence
-- `crates/yggterm-ui`: shared UI helpers
+- `crates/yggterm-ui`: GPUI shell, titlebar, statusbar, and view rendering
 - `crates/yggterm-platform`: platform detection
 - `crates/yggterm-ghostty-bridge`: Ghostty runtime bridge
 - `scripts/`: packaging, installer, and toolchain helpers
