@@ -1,12 +1,12 @@
 # yggterm
 
-Yggdrasil Terminal (`yggterm`) is a Rust-first terminal workspace that aims to combine Ghostty terminal semantics with a GPUI shell shaped like Zed.
+Yggdrasil Terminal (`yggterm`) is a Rust-first terminal workspace that aims to combine Ghostty terminal semantics with a Dioxus desktop shell shaped like Zed.
 
 The product target is not "an editor with terminals". It is a remote-first terminal application with a strong sidebar, persistent session metadata, and room for many long-lived shells across different machines.
 
 ## Product direction
 
-- GPUI is the intended app shell and Zed is the primary visual and structural reference.
+- Dioxus desktop is the active app shell and Zed remains the primary visual and structural reference.
 - Ghostty is the terminal engine contract.
 - The left sidebar is a vertical tree of virtual folders and sessions.
 - Sidebar nodes represent session metadata, not a direct mirror of the local filesystem.
@@ -20,11 +20,11 @@ This repository is still scaffolding.
 
 - Rust workspace structure is in place.
 - Ghostty bridge packaging and runtime probing exist.
-- A GPUI desktop shell exists for fast iteration on layout and interaction.
+- A Dioxus desktop shell exists for fast iteration on layout and interaction.
 - The current shell lives in `crates/yggterm-ui` and is the active product surface.
-- `yggterm` now opens the GPUI shell prototype directly.
+- `yggterm` now opens the Dioxus shell directly.
 - The old CLI subcommands and the `eframe` scaffold path have been removed.
-- The shell chrome is now owned locally in `yggterm-ui`, while GPUI and adjacent Zed checkout code remain the runtime/UI reference stack.
+- The shell chrome is now owned locally in `yggterm-ui`, while the adjacent Zed checkout remains the visual reference stack.
 - Mock sidebars, preview panes, and docks are acceptable only as placeholders while Ghostty embedding and the server runtime are still pending.
 
 When working in this repo, optimize for getting the application closer to "Zed chrome + Ghostty sessions + virtual session tree", not for deepening temporary scaffolding choices.
@@ -66,7 +66,7 @@ yggterm
 Requirements:
 
 - Rust stable
-- Rust `1.94.0` is the current pinned toolchain for the local GPUI/Zed dependency stack.
+- Rust `1.94.0` is the current pinned toolchain for the local desktop dependency stack.
 - Zig stable
 - adjacent checkouts of `../ghostty` and `../zed` for integration work
 
@@ -132,7 +132,7 @@ Build the FFI bundle archive:
 
 - `apps/yggterm`: CLI entrypoint and desktop launcher
 - `crates/yggterm-core`: session model and settings persistence
-- `crates/yggterm-ui`: GPUI shell, titlebar, statusbar, and view rendering
+- `crates/yggterm-ui`: Dioxus desktop shell, titlebar, statusbar, and view rendering
 - `crates/yggterm-platform`: platform detection
 - `crates/yggterm-ghostty-bridge`: Ghostty runtime bridge
 - `scripts/`: packaging, installer, and toolchain helpers

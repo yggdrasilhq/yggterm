@@ -1,28 +1,13 @@
 use anyhow::Result;
-use gpui::prelude::FluentBuilder;
-use gpui::{
-    AnyElement, App, AppContext, Bounds, Context, CursorStyle, Decorations, FocusHandle,
-    HitboxBehavior, InteractiveElement, IntoElement, KeyBinding, MouseButton, ParentElement,
-    Pixels, Render, ResizeEdge, ScrollStrategy, Size, StatefulInteractiveElement, Styled,
-    UniformListScrollHandle, Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations,
-    WindowOptions, actions, canvas, div, point, px, size, transparent_black, uniform_list,
-};
-use gpui_platform::application;
+use dioxus::desktop::{Config, LogicalSize, WindowBuilder, window};
+use dioxus::prelude::*;
+use once_cell::sync::OnceCell;
 use yggterm_core::{
     BrowserRow, BrowserRowKind, ManagedSessionView, PreviewTone, SessionBrowserState, SessionNode,
-    UiTheme, WorkspaceViewMode, YggtermServer,
+    SshConnectTarget, UiTheme, WorkspaceViewMode, YggtermServer,
 };
 
-use crate::{
-    ChatBubbleTone, TitlebarIcon, UiPalette, chat_preview_card, metadata_section_card,
-    preview_summary_card, statusbar_frame, terminal_surface_card, titlebar_frame,
-    titlebar_icon_button, toolbar_chip_button, window_controls,
-};
-
-actions!(
-    search_input,
-    [SearchPrev, SearchNext, SearchAccept, SearchClear]
-);
+static BOOTSTRAP: OnceCell<ShellBootstrap> = OnceCell::new();
 
 #[derive(Debug, Clone)]
 pub struct ShellBootstrap {
@@ -35,49 +20,62 @@ pub struct ShellBootstrap {
     pub prefer_ghostty_backend: bool,
 }
 
-pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
-    application().run(move |cx: &mut App| {
-        cx.bind_keys([
-            KeyBinding::new("up", SearchPrev, Some("SearchInput")),
-            KeyBinding::new("down", SearchNext, Some("SearchInput")),
-            KeyBinding::new("enter", SearchAccept, Some("SearchInput")),
-            KeyBinding::new("escape", SearchClear, Some("SearchInput")),
-        ]);
-        let bounds = Bounds::centered(None, size(px(1460.), px(920.)), cx);
-        let shell = bootstrap.clone();
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_background: WindowBackgroundAppearance::Transparent,
-                window_decorations: Some(WindowDecorations::Client),
-                window_min_size: Some(size(px(1024.), px(720.))),
-                app_id: Some("dev.yggterm".into()),
-                ..Default::default()
-            },
-            move |_window, cx| cx.new(|cx| GpuiShell::new(shell.clone(), cx)),
-        )
-        .expect("failed to open yggterm shell");
-    });
-
-    Ok(())
-}
-
-struct GpuiShell {
+#[derive(Clone)]
+struct ShellState {
     bootstrap: ShellBootstrap,
     browser: SessionBrowserState,
     server: YggtermServer,
+    search_query: String,
     sidebar_open: bool,
     right_panel_open: bool,
-    sidebar_scroll_handle: UniformListScrollHandle,
-    search_focus: FocusHandle,
-    search_query: String,
     last_action: String,
 }
 
-impl GpuiShell {
-    fn new(bootstrap: ShellBootstrap, cx: &mut Context<Self>) -> Self {
-        let search_focus = cx.focus_handle();
-        let this = Self {
+#[derive(Clone, PartialEq)]
+struct RenderSnapshot {
+    palette: Palette,
+    search_query: String,
+    sidebar_open: bool,
+    right_panel_open: bool,
+    rows: Vec<BrowserRow>,
+    selected_path: Option<String>,
+    active_session: Option<ManagedSessionView>,
+    active_view_mode: WorkspaceViewMode,
+    ssh_targets: Vec<SshConnectTarget>,
+    live_sessions: Vec<ManagedSessionView>,
+    total_leaf_sessions: usize,
+    last_action: String,
+    ghostty_embedded_surface_supported: bool,
+    ghostty_bridge_detail: String,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct Palette {
+    shell: &'static str,
+    titlebar: &'static str,
+    sidebar: &'static str,
+    panel: &'static str,
+    panel_alt: &'static str,
+    border: &'static str,
+    text: &'static str,
+    muted: &'static str,
+    accent: &'static str,
+    accent_soft: &'static str,
+    close_hover: &'static str,
+    control_hover: &'static str,
+    shadow: &'static str,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HoveredControl {
+    Minimize,
+    Maximize,
+    Close,
+}
+
+impl ShellState {
+    fn new(bootstrap: ShellBootstrap) -> Self {
+        Self {
             browser: SessionBrowserState::new(bootstrap.browser_tree.clone()),
             server: YggtermServer::new(
                 &bootstrap.browser_tree,
@@ -86,1165 +84,1025 @@ impl GpuiShell {
                 bootstrap.theme,
             ),
             bootstrap,
+            search_query: String::new(),
             sidebar_open: true,
             right_panel_open: true,
-            sidebar_scroll_handle: UniformListScrollHandle::new(),
-            search_focus,
-            search_query: String::new(),
             last_action: "ready".to_string(),
-        };
-
-        cx.observe_keystrokes(|this, event, window, cx| {
-            if !this.search_focus.is_focused(window) {
-                return;
-            }
-
-            let key = event.keystroke.key.as_str();
-            match key {
-                "backspace" => {
-                    this.search_query.pop();
-                    this.apply_search(cx);
-                }
-                "escape" => {
-                    if !this.search_query.is_empty() {
-                        this.search_query.clear();
-                        this.apply_search(cx);
-                    }
-                }
-                "enter" => {
-                    if let Some(ix) = this.browser.selected_session_index().or_else(|| {
-                        this.browser
-                            .rows()
-                            .iter()
-                            .position(|row| row.kind == BrowserRowKind::Session)
-                    }) {
-                        this.select_row(ix, cx);
-                    }
-                }
-                "up" => {
-                    this.move_search_selection(-1, cx);
-                }
-                "down" => {
-                    this.move_search_selection(1, cx);
-                }
-                _ => {
-                    if event.keystroke.modifiers.control
-                        || event.keystroke.modifiers.platform
-                        || event.keystroke.modifiers.alt
-                    {
-                        return;
-                    }
-
-                    if let Some(text) = event.keystroke.key_char.as_ref() {
-                        if !text.chars().any(|ch| ch.is_control()) {
-                            this.search_query.push_str(text);
-                            this.apply_search(cx);
-                        }
-                    }
-                }
-            }
-        })
-        .detach();
-
-        this
-    }
-
-    fn palette(&self) -> UiPalette {
-        match self.bootstrap.theme {
-            UiTheme::ZedDark => UiPalette::dark(),
-            UiTheme::ZedLight => UiPalette::light(),
         }
     }
 
-    fn active_session(&self) -> Option<&ManagedSessionView> {
-        self.server.active_session()
+    fn snapshot(&self) -> RenderSnapshot {
+        RenderSnapshot {
+            palette: palette(self.bootstrap.theme),
+            search_query: self.search_query.clone(),
+            sidebar_open: self.sidebar_open,
+            right_panel_open: self.right_panel_open,
+            rows: self.browser.rows().to_vec(),
+            selected_path: self.browser.selected_path().map(ToOwned::to_owned),
+            active_session: self.server.active_session().cloned(),
+            active_view_mode: self.server.active_view_mode(),
+            ssh_targets: self.server.ssh_targets().to_vec(),
+            live_sessions: self.server.live_sessions(),
+            total_leaf_sessions: self.browser.total_sessions(),
+            last_action: self.last_action.clone(),
+            ghostty_embedded_surface_supported: self.bootstrap.ghostty_embedded_surface_supported,
+            ghostty_bridge_detail: self.bootstrap.ghostty_bridge_detail.clone(),
+        }
     }
 
-    fn selected_row(&self) -> Option<&BrowserRow> {
-        self.browser.selected_row()
-    }
-
-    fn metadata_value<'a>(&self, session: &'a ManagedSessionView, label: &str) -> &'a str {
-        session
-            .metadata
-            .iter()
-            .find(|entry| entry.label == label)
-            .map(|entry| entry.value.as_str())
-            .unwrap_or("")
-    }
-
-    fn total_leaf_sessions(&self) -> usize {
-        self.browser.total_sessions()
-    }
-
-    fn apply_search(&mut self, cx: &mut Context<Self>) {
+    fn set_search(&mut self, query: String) {
+        self.search_query = query;
         self.browser.set_filter_query(self.search_query.clone());
         self.last_action = if self.search_query.is_empty() {
             "search cleared".to_string()
         } else {
             format!("filtered {}", self.search_query)
         };
-        cx.notify();
     }
 
-    fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        window.focus(&self.search_focus, cx);
-        self.last_action = "search focused".to_string();
-        cx.notify();
-    }
-
-    fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.search_query.clear();
-        self.browser.set_filter_query("");
-        window.focus(&self.search_focus, cx);
-        self.last_action = "search cleared".to_string();
-        cx.notify();
-    }
-
-    fn move_search_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let selected_ix = if delta < 0 {
-            self.browser.select_previous_session()
-        } else {
-            self.browser.select_next_session()
-        };
-
-        if let Some(ix) = selected_ix {
-            self.sidebar_scroll_handle
-                .scroll_to_item(ix, ScrollStrategy::Nearest);
-            if let Some(row) = self.browser.rows().get(ix) {
-                self.last_action = format!("selected {}", row.label);
-            }
-            cx.notify();
-        }
-    }
-
-    fn accept_search_selection(&mut self, cx: &mut Context<Self>) {
-        if let Some(ix) = self.browser.selected_session_index().or_else(|| {
-            self.browser
-                .rows()
-                .iter()
-                .position(|row| row.kind == BrowserRowKind::Session)
-        }) {
-            self.select_row(ix, cx);
-        }
-    }
-
-    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+    fn toggle_sidebar(&mut self) {
         self.sidebar_open = !self.sidebar_open;
         self.last_action = if self.sidebar_open {
-            "sidebar opened"
+            "sidebar opened".to_string()
         } else {
-            "sidebar hidden"
-        }
-        .to_string();
-        cx.notify();
+            "sidebar hidden".to_string()
+        };
     }
 
-    fn toggle_right_panel(&mut self, cx: &mut Context<Self>) {
+    fn toggle_right_panel(&mut self) {
         self.right_panel_open = !self.right_panel_open;
         self.last_action = if self.right_panel_open {
-            "metadata opened"
+            "metadata opened".to_string()
         } else {
-            "metadata hidden"
-        }
-        .to_string();
-        cx.notify();
-    }
-
-    fn set_view_mode(&mut self, mode: WorkspaceViewMode, cx: &mut Context<Self>) {
-        self.server.set_view_mode(mode);
-        if mode == WorkspaceViewMode::Terminal {
-            self.server.request_terminal_launch_for_active();
-        }
-        self.last_action = match mode {
-            WorkspaceViewMode::Rendered => "preview mode",
-            WorkspaceViewMode::Terminal => "terminal mode",
-        }
-        .to_string();
-        cx.notify();
-    }
-
-    fn select_row(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let Some(row) = self.browser.rows().get(ix).cloned() else {
-            return;
+            "metadata hidden".to_string()
         };
+    }
 
+    fn set_view_mode(&mut self, mode: WorkspaceViewMode) {
+        self.server.set_view_mode(mode);
+        self.last_action = match mode {
+            WorkspaceViewMode::Rendered => "preview mode".to_string(),
+            WorkspaceViewMode::Terminal => "terminal mode".to_string(),
+        };
+    }
+
+    fn select_row(&mut self, row: &BrowserRow) {
+        self.browser.select_path(row.full_path.clone());
         match row.kind {
             BrowserRowKind::Group => {
                 self.browser.toggle_group(&row.full_path);
                 self.last_action = format!("toggled {}", row.label);
             }
             BrowserRowKind::Session => {
-                self.browser.select_path(row.full_path.clone());
                 self.server.open_or_focus_session(
                     &row.full_path,
                     row.session_id.as_deref(),
                     row.session_cwd.as_deref(),
                 );
                 self.server.set_view_mode(WorkspaceViewMode::Rendered);
-                self.last_action = format!("selected {}", row.label);
+                self.last_action = format!("opened {}", row.label);
             }
         }
-        cx.notify();
     }
 
-    fn toggle_preview_block(&mut self, block_ix: usize, cx: &mut Context<Self>) {
+    fn connect_ssh_target(&mut self, target_ix: usize) {
+        if let Some(key) = self.server.connect_ssh_target(target_ix) {
+            self.last_action = format!("connected {key}");
+        }
+    }
+
+    fn focus_live_session(&mut self, key: &str) {
+        self.server.focus_live_session(key);
+        self.last_action = format!("focused {key}");
+    }
+
+    fn toggle_preview_block(&mut self, block_ix: usize) {
         self.server.toggle_preview_block(block_ix);
-        cx.notify();
+        self.last_action = format!("preview block {}", block_ix + 1);
     }
 
-    fn expand_preview_blocks(&mut self, cx: &mut Context<Self>) {
+    fn expand_preview_blocks(&mut self) {
         self.server.set_all_preview_blocks_folded(false);
         self.last_action = "expanded preview".to_string();
-        cx.notify();
     }
 
-    fn collapse_preview_blocks(&mut self, cx: &mut Context<Self>) {
+    fn collapse_preview_blocks(&mut self) {
         self.server.set_all_preview_blocks_folded(true);
         self.last_action = "collapsed preview".to_string();
-        cx.notify();
     }
 
-    fn resolve_ghostty_window(&mut self, cx: &mut Context<Self>) {
+    fn request_terminal_launch(&mut self) {
+        self.server.request_terminal_launch_for_active();
+        self.server.set_view_mode(WorkspaceViewMode::Terminal);
+        self.last_action = "requested ghostty".to_string();
+    }
+
+    fn resolve_ghostty_window(&mut self) {
         self.last_action = self.server.sync_external_terminal_window_for_active();
-        cx.notify();
     }
 
-    fn focus_ghostty_window(&mut self, cx: &mut Context<Self>) {
+    fn focus_ghostty_window(&mut self) {
         self.last_action = self.server.raise_external_terminal_window_for_active();
-        cx.notify();
-    }
-
-    fn search_bar(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-        palette: &UiPalette,
-    ) -> AnyElement {
-        let mut right_status = div().flex().flex_row().gap_2().items_center();
-        if !self.search_query.is_empty() {
-            right_status = right_status.child(
-                toolbar_chip_button("clear-search", "Clear", false, palette)
-                    .on_click(cx.listener(|this, _, window, cx| this.clear_search(window, cx))),
-            );
-        }
-        let right_status = right_status.child(
-            div()
-                .text_xs()
-                .text_color(palette.text_muted)
-                .child(format!("{} rows", self.browser.rows().len())),
-        );
-
-        div()
-            .id("search-bar")
-            .w(px(344.))
-            .h(px(27.))
-            .flex()
-            .items_center()
-            .justify_between()
-            .px_2()
-            .rounded_lg()
-            .bg(palette.element_background)
-            .border_1()
-            .border_color(if self.search_focus.is_focused(window) {
-                palette.border_focused
-            } else {
-                palette.border_variant
-            })
-            .text_sm()
-            .text_color(palette.text_muted)
-            .focusable()
-            .key_context("SearchInput")
-            .track_focus(&self.search_focus)
-            .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                cx.stop_propagation();
-            })
-            .on_action(
-                cx.listener(|this, _: &SearchPrev, _, cx| this.move_search_selection(-1, cx)),
-            )
-            .on_action(cx.listener(|this, _: &SearchNext, _, cx| this.move_search_selection(1, cx)))
-            .on_action(
-                cx.listener(|this, _: &SearchAccept, _, cx| this.accept_search_selection(cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &SearchClear, window, cx| this.clear_search(window, cx)),
-            )
-            .on_click(cx.listener(|this, _, window, cx| this.focus_search(window, cx)))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_2()
-                    .items_center()
-                    .child(div().text_color(palette.text_muted).child("⌕"))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(if self.search_query.is_empty() {
-                                palette.text_muted
-                            } else {
-                                palette.text
-                            })
-                            .child(if self.search_query.is_empty() {
-                                "Search sessions…".to_string()
-                            } else {
-                                self.search_query.clone()
-                            }),
-                    ),
-            )
-            .child(right_status)
-            .into_any_element()
-    }
-
-    fn titlebar(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-        palette: &UiPalette,
-    ) -> AnyElement {
-        let left = div()
-            .flex()
-            .flex_row()
-            .gap_1()
-            .items_center()
-            .when(cfg!(target_os = "macos"), |div| {
-                div.child(window_controls(window, palette))
-            })
-            .child(
-                titlebar_icon_button("toggle-sidebar", TitlebarIcon::Sidebar, palette)
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
-            )
-            .into_any_element();
-
-        let right =
-            div()
-                .flex()
-                .flex_row()
-                .gap_1p5()
-                .items_center()
-                .child(
-                    toolbar_chip_button(
-                        "view-preview",
-                        "Preview",
-                        self.server.active_view_mode() == WorkspaceViewMode::Rendered,
-                        palette,
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.set_view_mode(WorkspaceViewMode::Rendered, cx)
-                    })),
-                )
-                .child(
-                    toolbar_chip_button(
-                        "view-terminal",
-                        "Terminal",
-                        self.server.active_view_mode() == WorkspaceViewMode::Terminal,
-                        palette,
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.set_view_mode(WorkspaceViewMode::Terminal, cx)
-                    })),
-                )
-                .child(
-                    titlebar_icon_button("toggle-meta", TitlebarIcon::Info, palette)
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_right_panel(cx))),
-                )
-                .when(!cfg!(target_os = "macos"), |div| {
-                    div.child(window_controls(window, palette))
-                })
-                .into_any_element();
-
-        titlebar_frame(
-            left,
-            self.search_bar(window, cx, palette),
-            right,
-            palette.window_background,
-            palette.border_variant.opacity(0.92),
-        )
-        .into_any_element()
-    }
-
-    fn sidebar(&self, cx: &mut Context<Self>, palette: &UiPalette) -> AnyElement {
-        if !self.sidebar_open {
-            return div().into_any_element();
-        }
-
-        let row_count = self.browser.rows().len();
-        let selected_row = self.selected_row().cloned();
-        let header_title = selected_row
-            .as_ref()
-            .map(|row| row.label.clone())
-            .unwrap_or_else(|| "Codex Sessions".to_string());
-        let header_detail = selected_row
-            .as_ref()
-            .and_then(|row| {
-                if row.detail_label.is_empty() {
-                    None
-                } else {
-                    Some(row.detail_label.clone())
-                }
-            })
-            .unwrap_or_else(|| {
-                format!(
-                    "{} stored · {} visible",
-                    self.browser.total_session_count(),
-                    self.total_leaf_sessions()
-                )
-            });
-        let filter_active = !self.search_query.is_empty();
-        let filter_summary = if filter_active {
-            format!("{} matches for “{}”", row_count, self.search_query)
-        } else {
-            format!("{} visible rows", row_count)
-        };
-        div()
-            .w(px(196.))
-            .h_full()
-            .flex()
-            .flex_col()
-            .bg(palette.window_background)
-            .border_r_1()
-            .border_color(palette.border_variant.opacity(0.84))
-            .child(
-                div()
-                    .px_3()
-                    .py_1p5()
-                    .border_b_1()
-                    .border_color(palette.border_variant.opacity(0.84))
-                    .flex()
-                    .flex_col()
-                    .gap_0p5()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(palette.text_muted)
-                            .child("Codex Sessions"),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(palette.text)
-                            .line_clamp(1)
-                            .text_ellipsis()
-                            .child(header_title),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(palette.text_muted)
-                            .line_clamp(1)
-                            .text_ellipsis()
-                            .child(header_detail),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap_1p5()
-                            .items_center()
-                            .child(
-                                div()
-                                    .px_1p5()
-                                    .py(px(3.))
-                                    .rounded_md()
-                                    .bg(if filter_active {
-                                        palette.text_accent.opacity(0.14)
-                                    } else {
-                                        palette.element_background
-                                    })
-                                    .text_xs()
-                                    .text_color(if filter_active {
-                                        palette.text_accent
-                                    } else {
-                                        palette.text_muted
-                                    })
-                                    .child(if filter_active { "filtered" } else { "tree" }),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(palette.text_muted)
-                                    .line_clamp(1)
-                                    .text_ellipsis()
-                                    .child(filter_summary),
-                            ),
-                    ),
-            )
-            .child(if row_count == 0 {
-                div()
-                    .flex_1()
-                    .flex()
-                    .justify_center()
-                    .items_center()
-                    .px_4()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .items_center()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(palette.text)
-                                    .child("No matching sessions"),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(palette.text_muted)
-                                    .child("Adjust the search query or clear the filter."),
-                            ),
-                    )
-                    .into_any_element()
-            } else {
-                uniform_list(
-                    "shell-sidebar-rows",
-                    row_count,
-                    cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
-                        let palette = this.palette();
-                        range
-                            .map(|ix| this.sidebar_row(ix, cx, &palette))
-                            .collect::<Vec<_>>()
-                    }),
-                )
-                .track_scroll(&self.sidebar_scroll_handle)
-                .h_full()
-                .into_any_element()
-            })
-            .into_any_element()
-    }
-
-    fn sidebar_row(&self, ix: usize, cx: &mut Context<Self>, palette: &UiPalette) -> AnyElement {
-        let Some(row) = self.browser.rows().get(ix).cloned() else {
-            return div().into_any_element();
-        };
-        let is_selected = self
-            .browser
-            .selected_path()
-            .is_some_and(|path| path == row.full_path);
-
-        let disclosure = match row.kind {
-            BrowserRowKind::Group if row.expanded => "▾",
-            BrowserRowKind::Group => "▸",
-            BrowserRowKind::Session => {
-                if is_selected {
-                    "●"
-                } else {
-                    "○"
-                }
-            }
-        };
-
-        let detail = if row.kind == BrowserRowKind::Session {
-            row.detail_label.clone()
-        } else {
-            row.detail_label.clone()
-        };
-        let is_top_group = row.kind == BrowserRowKind::Group && row.depth == 0;
-        let has_detail = !detail.is_empty();
-        let label_color = if is_selected {
-            palette.text
-        } else if is_top_group {
-            palette.text
-        } else if row.kind == BrowserRowKind::Session {
-            palette.text
-        } else {
-            palette.text_muted
-        };
-        let disclosure_color = if is_selected {
-            palette.text_accent
-        } else {
-            palette.text_muted
-        };
-        let guide_color = if is_selected {
-            palette.border_focused.opacity(0.38)
-        } else {
-            palette.border_variant
-        };
-        let right_badge = match row.kind {
-            BrowserRowKind::Group => Some(
-                div()
-                    .px_1p5()
-                    .py_0p5()
-                    .rounded_md()
-                    .bg(if is_selected {
-                        palette.text_accent.opacity(0.16)
-                    } else {
-                        palette.element_background
-                    })
-                    .text_xs()
-                    .text_color(if is_selected {
-                        palette.text_accent
-                    } else {
-                        palette.text_muted
-                    })
-                    .child(row.descendant_sessions.to_string()),
-            ),
-            BrowserRowKind::Session if !row.host_label.is_empty() => Some(
-                div()
-                    .px_1p5()
-                    .py_0p5()
-                    .rounded_md()
-                    .bg(palette.element_background)
-                    .text_xs()
-                    .text_color(palette.text_muted)
-                    .child(row.host_label.clone()),
-            ),
-            _ => None,
-        };
-        let guides = (0..row.depth)
-            .map(|_guide_ix| {
-                div()
-                    .w(px(6.))
-                    .text_xs()
-                    .text_color(guide_color)
-                    .child("│")
-                    .into_any_element()
-            })
-            .collect::<Vec<_>>();
-
-        let label = if is_top_group {
-            div()
-                .text_base()
-                .text_color(label_color)
-                .line_clamp(1)
-                .text_ellipsis()
-                .child(row.label.clone())
-        } else {
-            div()
-                .text_sm()
-                .text_color(label_color)
-                .line_clamp(1)
-                .text_ellipsis()
-                .child(row.label.clone())
-        };
-        let mut body = div().flex().flex_col().gap_1().flex_1().child(
-            div()
-                .flex()
-                .flex_row()
-                .gap_1p5()
-                .items_center()
-                .justify_between()
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .gap_1p5()
-                        .items_center()
-                        .children(guides)
-                        .child(
-                            div()
-                                .w(px(12.))
-                                .text_color(disclosure_color)
-                                .child(disclosure),
-                        )
-                        .child(label),
-                )
-                .children(right_badge),
-        );
-        if has_detail {
-            body = body.child(
-                div()
-                    .pl(px(14.))
-                    .pl(px(12.))
-                    .text_xs()
-                    .text_color(if is_selected {
-                        palette.text_muted.opacity(0.9)
-                    } else {
-                        palette.text_muted
-                    })
-                    .line_clamp(1)
-                    .text_ellipsis()
-                    .child(detail),
-            );
-        }
-
-        div()
-            .id(("sidebar-row", ix))
-            .w_full()
-            .min_h(px(if has_detail { 34. } else { 27. }))
-            .flex()
-            .flex_row()
-            .items_start()
-            .justify_between()
-            .px_1()
-            .py(px(if has_detail { 5. } else { 3. }))
-            .bg(if is_selected {
-                palette.text_accent.opacity(0.14)
-            } else if is_top_group {
-                palette.element_background.opacity(0.32)
-            } else {
-                palette.window_background
-            })
-            .rounded_md()
-            .border_l_2()
-            .border_color(if is_selected {
-                palette.border_focused.opacity(0.86)
-            } else {
-                transparent_black()
-            })
-            .on_click(cx.listener(move |this, _, _, cx| this.select_row(ix, cx)))
-            .child(body)
-            .into_any_element()
-    }
-
-    fn viewport(&self, cx: &mut Context<Self>, palette: &UiPalette) -> AnyElement {
-        let body = match self.active_session() {
-            Some(session) if self.server.active_view_mode() == WorkspaceViewMode::Terminal => {
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap_2()
-                            .child(
-                                toolbar_chip_button("focus-ghostty", "Focus Ghostty", false, palette)
-                                    .on_click(cx.listener(|this, _, _, cx| this.focus_ghostty_window(cx))),
-                            )
-                            .child(
-                                toolbar_chip_button("resolve-window", "Resolve Window", false, palette)
-                                    .on_click(cx.listener(|this, _, _, cx| this.resolve_ghostty_window(cx))),
-                            ),
-                    )
-                    .child(terminal_surface_card(
-                        "Server Terminal",
-                        &session.terminal_lines,
-                        Some(&session.status_line),
-                        palette,
-                    ))
-                    .child(terminal_surface_card(
-                        "Ghostty Integration",
-                        &[
-                            if self.bootstrap.ghostty_bridge_enabled {
-                                if self.bootstrap.ghostty_embedded_surface_supported {
-                                    "libghostty bridge is available and the embedded surface host is enabled on this platform."
-                                } else {
-                                    "libghostty is linked in this build, but the current upstream embedded surface host is not available on this platform."
-                                }
-                            } else {
-                                "libghostty bridge is not linked in this build."
-                            },
-                            &self.bootstrap.ghostty_bridge_detail,
-                        ],
-                        Some("terminal"),
-                        palette,
-                    ))
-                    .into_any_element()
-            }
-            Some(session) => {
-                let subtitle = format!(
-                    "{} · {} · {}",
-                    self.metadata_value(session, "Host"),
-                    self.metadata_value(session, "Started"),
-                    self.metadata_value(session, "Messages")
-                );
-                let blocks = session
-                    .preview
-                    .blocks
-                    .iter()
-                    .enumerate()
-                    .map(|(ix, block)| {
-                        let grouped_with_previous = ix > 0
-                            && session
-                                .preview
-                                .blocks
-                                .get(ix - 1)
-                                .is_some_and(|prev| prev.tone == block.tone);
-                        self.preview_block(ix, block, grouped_with_previous, cx, palette)
-                    })
-                    .collect::<Vec<_>>();
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .justify_between()
-                            .gap_3()
-                            .child(preview_summary_card(
-                                &session.title,
-                                &subtitle,
-                                "",
-                                blocks.len(),
-                                blocks.len(),
-                                palette,
-                            ))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .gap_2()
-                                    .child(
-                                        toolbar_chip_button("expand-preview", "Expand All", false, palette)
-                                            .on_click(cx.listener(|this, _, _, cx| this.expand_preview_blocks(cx))),
-                                    )
-                                    .child(
-                                        toolbar_chip_button("collapse-preview", "Collapse All", false, palette)
-                                            .on_click(cx.listener(|this, _, _, cx| this.collapse_preview_blocks(cx))),
-                                    ),
-                            ),
-                    )
-                    .children(blocks)
-                    .into_any_element()
-            }
-            None => div()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(terminal_surface_card(
-                    "No Session Selected",
-                    &["Select a session from the sidebar to render its preview."],
-                    Some("idle"),
-                    palette,
-                ))
-                .into_any_element(),
-        };
-
-        div()
-            .flex_1()
-            .h_full()
-            .flex()
-            .flex_col()
-            .bg(palette.surface_background)
-            .child(
-                div()
-                    .id("viewport-scroll")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .scrollbar_width(px(10.))
-                    .child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .justify_center()
-                            .p_2()
-                            .child(div().w_full().max_w(px(920.)).child(body)),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn preview_block(
-        &self,
-        block_ix: usize,
-        block: &yggterm_core::SessionPreviewBlock,
-        grouped_with_previous: bool,
-        cx: &mut Context<Self>,
-        palette: &UiPalette,
-    ) -> AnyElement {
-        div()
-            .id(("preview-block", block_ix))
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| this.toggle_preview_block(block_ix, cx)))
-            .child(chat_preview_card(
-                block.role,
-                &block.timestamp,
-                match block.tone {
-                    PreviewTone::User => ChatBubbleTone::User,
-                    PreviewTone::Assistant => ChatBubbleTone::Assistant,
-                },
-                grouped_with_previous,
-                block.folded,
-                "",
-                &block.lines,
-                palette,
-            ))
-            .into_any_element()
-    }
-
-    fn inspector(&self, palette: &UiPalette) -> AnyElement {
-        if !self.right_panel_open {
-            return div().into_any_element();
-        }
-
-        let inspector_body = if let Some(session) = self.active_session() {
-            let overview_rows = vec![
-                metadata_stat("Session", &session.title, palette),
-                metadata_stat("Source", self.metadata_value(session, "Source"), palette),
-                metadata_stat("Host", self.metadata_value(session, "Host"), palette),
-            ];
-            let timeline_rows = vec![
-                metadata_stat("Started", self.metadata_value(session, "Started"), palette),
-                metadata_stat("Updated", self.metadata_value(session, "Updated"), palette),
-                metadata_stat(
-                    "Messages",
-                    self.metadata_value(session, "Messages"),
-                    palette,
-                ),
-                metadata_stat(
-                    "Preview",
-                    self.metadata_value(session, "Preview Blocks"),
-                    palette,
-                ),
-            ];
-            let runtime_rows = vec![
-                metadata_stat("Backend", self.metadata_value(session, "Backend"), palette),
-                metadata_stat("Status", self.metadata_value(session, "Status"), palette),
-                metadata_stat("Bridge", self.metadata_value(session, "Bridge"), palette),
-                metadata_stat("PID", self.metadata_value(session, "Launch PID"), palette),
-            ];
-            let location_rows = vec![
-                metadata_stat("Cwd", self.metadata_value(session, "Cwd"), palette),
-                metadata_stat("Storage", self.metadata_value(session, "Storage"), palette),
-                metadata_stat("Restore", self.metadata_value(session, "Restore"), palette),
-            ];
-
-            vec![
-                metadata_section_card("Overview", overview_rows, palette),
-                metadata_section_card("Timeline", timeline_rows, palette),
-                metadata_section_card("Runtime", runtime_rows, palette),
-                metadata_section_card("Location", location_rows, palette),
-            ]
-        } else {
-            vec![metadata_section_card(
-                "Session Metadata",
-                vec![metadata_stat("State", "No session selected", palette)],
-                palette,
-            )]
-        };
-
-        div()
-            .w(px(224.))
-            .h_full()
-            .flex()
-            .flex_col()
-            .bg(palette.window_background)
-            .border_l_1()
-            .border_color(palette.border_variant.opacity(0.84))
-            .child(
-                div()
-                    .px_3()
-                    .py_1()
-                    .border_b_1()
-                    .border_color(palette.border_variant.opacity(0.84))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(palette.text_muted)
-                            .child("Session Metadata"),
-                    ),
-            )
-            .child(
-                div()
-                    .id("inspector-scroll")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .scrollbar_width(px(10.))
-                    .p_2()
-                    .flex()
-                    .flex_col()
-                    .gap_1p5()
-                    .children(inspector_body),
-            )
-            .into_any_element()
-    }
-
-    fn statusbar(&self, cx: &mut Context<Self>, palette: &UiPalette) -> AnyElement {
-        statusbar_frame(
-            div()
-                .flex()
-                .flex_row()
-                .gap_3()
-                .items_center()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(palette.text)
-                        .child(format!("{} codex sessions", self.total_leaf_sessions())),
-                )
-                .child(div().text_xs().text_color(palette.text).child(format!(
-                            "{} view · {}",
-                            match self.server.active_view_mode() {
-                                WorkspaceViewMode::Rendered => "preview",
-                                WorkspaceViewMode::Terminal => "terminal",
-                            },
-                            self.active_session()
-                                .map(|session| session.title.as_str())
-                                .unwrap_or("none")
-                        )))
-                .into_any_element(),
-            div()
-                .flex()
-                .flex_row()
-                .gap_2()
-                .items_center()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(palette.text_muted)
-                        .child(self.last_action.clone()),
-                )
-                .child(
-                    titlebar_icon_button("status-meta", TitlebarIcon::Info, palette)
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_right_panel(cx))),
-                )
-                .into_any_element(),
-            palette.window_background,
-            palette.border_variant.opacity(0.92),
-        )
-        .into_any_element()
     }
 }
 
-impl Render for GpuiShell {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let palette = self.palette();
-        let decorations = window.window_decorations();
-        let frame_inset = px(6.);
-        let border_size = px(1.);
-        let frame_border = palette.border.opacity(0.64);
-        let frame_radius = px(9.);
+pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
+    let _ = BOOTSTRAP.set(bootstrap);
 
-        window.set_client_inset(px(0.));
+    dioxus::LaunchBuilder::desktop()
+        .with_cfg(
+            Config::new().with_window(
+                WindowBuilder::new()
+                    .with_title("yggterm")
+                    .with_transparent(true)
+                    .with_decorations(false)
+                    .with_resizable(true)
+                    .with_inner_size(LogicalSize::new(1460.0, 920.0))
+                    .with_min_inner_size(LogicalSize::new(1024.0, 720.0)),
+            ),
+        )
+        .launch(app);
 
-        let content = div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(palette.window_background)
-            .border_1()
-            .border_color(frame_border)
-            .cursor(CursorStyle::Arrow)
-            .when(matches!(decorations, Decorations::Client { .. }), |div| {
-                div.rounded_tl(frame_radius)
-                    .rounded_tr(frame_radius)
-                    .rounded_bl(frame_radius)
-                    .rounded_br(frame_radius)
-                    .overflow_hidden()
-            })
-            .on_mouse_move(|_, _, cx| {
-                cx.stop_propagation();
-            })
-            .child(self.titlebar(window, cx, &palette))
-            .child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .flex_row()
-                    .child(self.sidebar(cx, &palette))
-                    .child(self.viewport(cx, &palette))
-                    .child(self.inspector(&palette)),
-            )
-            .child(self.statusbar(cx, &palette));
+    Ok(())
+}
 
-        div()
-            .size_full()
-            .bg(transparent_black())
-            .when(matches!(decorations, Decorations::Client { .. }), |div| {
-                div.rounded_tl(frame_radius)
-                    .rounded_tr(frame_radius)
-                    .rounded_bl(frame_radius)
-                    .rounded_br(frame_radius)
-                    .overflow_hidden()
-            })
-            .map(|div| match decorations {
-                Decorations::Server => div.child(content),
-                Decorations::Client { tiling, .. } => div
-                    .child(
-                        canvas(
-                            |_bounds, window, _cx| {
-                                window.insert_hitbox(
-                                    Bounds::new(
-                                        point(px(0.), px(0.)),
-                                        window.window_bounds().get_bounds().size,
-                                    ),
-                                    HitboxBehavior::Normal,
-                                )
-                            },
-                            move |_bounds, hitbox, window, _cx| {
-                                let mouse = window.mouse_position();
-                                let size = window.window_bounds().get_bounds().size;
-                                let Some(edge) = resize_edge(mouse, frame_inset, size) else {
-                                    return;
-                                };
-                                window.set_cursor_style(
-                                    match edge {
-                                        ResizeEdge::Top | ResizeEdge::Bottom => {
-                                            CursorStyle::ResizeUpDown
-                                        }
-                                        ResizeEdge::Left | ResizeEdge::Right => {
-                                            CursorStyle::ResizeLeftRight
-                                        }
-                                        ResizeEdge::TopLeft | ResizeEdge::BottomRight => {
-                                            CursorStyle::ResizeUpLeftDownRight
-                                        }
-                                        ResizeEdge::TopRight | ResizeEdge::BottomLeft => {
-                                            CursorStyle::ResizeUpRightDownLeft
-                                        }
-                                    },
-                                    &hitbox,
-                                );
-                            },
-                        )
-                        .size_full()
-                        .absolute(),
-                    )
-                    .on_mouse_move(|_, window, _cx| {
-                        window.refresh();
-                    })
-                    .on_mouse_down(MouseButton::Left, move |e, window, cx| {
-                        let size = window.window_bounds().get_bounds().size;
-                        if let Some(edge) = resize_edge(e.position, frame_inset, size) {
-                            cx.stop_propagation();
-                            window.start_window_resize(edge);
+fn app() -> Element {
+    let bootstrap = BOOTSTRAP.get().expect("shell bootstrap not initialized").clone();
+    let mut state = use_signal(|| ShellState::new(bootstrap));
+    let mut hovered = use_signal(|| None::<HoveredControl>);
+    let snapshot = state.read().snapshot();
+    let titlebar_snapshot = snapshot.clone();
+    let sidebar_snapshot = snapshot.clone();
+    let main_snapshot = snapshot.clone();
+    let metadata_snapshot = snapshot.clone();
+    let status_snapshot = snapshot.clone();
+    let maximized = window().is_maximized();
+
+    rsx! {
+        div {
+            style: "position: fixed; inset: 0; background: transparent; overflow: hidden;",
+            div {
+                style: shell_style(snapshot.palette),
+                Titlebar {
+                    snapshot: titlebar_snapshot,
+                    hovered: hovered,
+                    on_toggle_sidebar: move || state.with_mut(|shell| shell.toggle_sidebar()),
+                    on_search: move |value: String| state.with_mut(|shell| shell.set_search(value)),
+                    on_hover_control: move |control: Option<HoveredControl>| hovered.set(control),
+                    maximized: maximized,
+                }
+                div {
+                    style: "display: flex; flex: 1; min-height: 0; overflow: hidden;",
+                    if sidebar_snapshot.sidebar_open {
+                        Sidebar {
+                            snapshot: sidebar_snapshot,
+                            on_select_row: move |row: BrowserRow| state.with_mut(|shell| shell.select_row(&row)),
+                            on_connect_ssh: move |ix: usize| state.with_mut(|shell| shell.connect_ssh_target(ix)),
+                            on_focus_live: move |id: String| state.with_mut(|shell| shell.focus_live_session(&id)),
                         }
-                    })
-                    .child(content.map(|div| {
-                        div.when(!tiling.top, |div| div.border_t(border_size))
-                            .when(!tiling.bottom, |div| div.border_b(border_size))
-                            .when(!tiling.left, |div| div.border_l(border_size))
-                            .when(!tiling.right, |div| div.border_r(border_size))
-                    })),
-            })
+                    }
+                    MainSurface {
+                        snapshot: main_snapshot,
+                        on_expand_preview: move || state.with_mut(|shell| shell.expand_preview_blocks()),
+                        on_collapse_preview: move || state.with_mut(|shell| shell.collapse_preview_blocks()),
+                        on_toggle_preview_block: move |ix: usize| state.with_mut(|shell| shell.toggle_preview_block(ix)),
+                        on_request_terminal: move || state.with_mut(|shell| shell.request_terminal_launch()),
+                        on_focus_ghostty: move || state.with_mut(|shell| shell.focus_ghostty_window()),
+                        on_resolve_ghostty: move || state.with_mut(|shell| shell.resolve_ghostty_window()),
+                    }
+                    if metadata_snapshot.right_panel_open {
+                        MetadataRail { snapshot: metadata_snapshot }
+                    }
+                }
+                Statusbar {
+                    snapshot: status_snapshot,
+                    on_set_view_mode: move |mode: WorkspaceViewMode| state.with_mut(|shell| shell.set_view_mode(mode)),
+                    on_toggle_meta: move || state.with_mut(|shell| shell.toggle_right_panel()),
+                }
+            }
+        }
     }
 }
 
-fn resize_edge(pos: gpui::Point<Pixels>, inset: Pixels, size: Size<Pixels>) -> Option<ResizeEdge> {
-    let edge = if pos.y < inset && pos.x < inset {
-        ResizeEdge::TopLeft
-    } else if pos.y < inset && pos.x > size.width - inset {
-        ResizeEdge::TopRight
-    } else if pos.y < inset {
-        ResizeEdge::Top
-    } else if pos.y > size.height - inset && pos.x < inset {
-        ResizeEdge::BottomLeft
-    } else if pos.y > size.height - inset && pos.x > size.width - inset {
-        ResizeEdge::BottomRight
-    } else if pos.y > size.height - inset {
-        ResizeEdge::Bottom
-    } else if pos.x < inset {
-        ResizeEdge::Left
-    } else if pos.x > size.width - inset {
-        ResizeEdge::Right
-    } else {
-        return None;
-    };
-    Some(edge)
+#[component]
+fn Titlebar(
+    snapshot: RenderSnapshot,
+    hovered: Signal<Option<HoveredControl>>,
+    on_toggle_sidebar: EventHandler<()>,
+    on_search: EventHandler<String>,
+    on_hover_control: EventHandler<Option<HoveredControl>>,
+    maximized: bool,
+) -> Element {
+    let current_title = snapshot
+        .active_session
+        .as_ref()
+        .map(|session| session.title.clone())
+        .unwrap_or_else(|| "Codex Sessions".to_string());
+    let current_detail = snapshot
+        .active_session
+        .as_ref()
+        .map(|session| session.session_path.clone())
+        .unwrap_or_else(|| "Select a session or connect over SSH.".to_string());
+
+    rsx! {
+        div {
+            style: format!(
+                "display:flex; align-items:center; justify-content:space-between; height:42px; \
+                 padding:0 10px; border-bottom:1px solid {}; background:{};",
+                snapshot.palette.border, snapshot.palette.titlebar
+            ),
+            onmousedown: move |_| window().drag(),
+            div {
+                style: "display:flex; align-items:center; gap:10px; width:240px; min-width:240px;",
+                button {
+                    style: icon_button_style(snapshot.palette),
+                    onmousedown: |evt| evt.stop_propagation(),
+                    onclick: move |_| on_toggle_sidebar.call(()),
+                    "☰"
+                }
+                div {
+                    style: "display:flex; flex-direction:column; min-width:0;",
+                    div {
+                        style: format!(
+                            "font-size:12px; font-weight:600; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                            snapshot.palette.text
+                        ),
+                        "{current_title}"
+                    }
+                    div {
+                        style: format!(
+                            "font-size:11px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                            snapshot.palette.muted
+                        ),
+                        "{current_detail}"
+                    }
+                }
+            }
+            div {
+                style: "flex:1; display:flex; justify-content:center; padding:0 12px;",
+                input {
+                    r#type: "text",
+                    value: "{snapshot.search_query}",
+                    placeholder: "Search sessions…",
+                    style: search_style(snapshot.palette),
+                    onmousedown: |evt| evt.stop_propagation(),
+                    oninput: move |evt| on_search.call(evt.value()),
+                }
+            }
+            div {
+                style: "display:flex; align-items:stretch; justify-content:flex-end; width:240px; min-width:240px;",
+                WindowControls {
+                    palette: snapshot.palette,
+                    hovered: hovered(),
+                    on_hover_control: on_hover_control,
+                    maximized: maximized,
+                }
+            }
+        }
+    }
 }
 
-fn metadata_stat(label: &str, value: &str, palette: &UiPalette) -> AnyElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap_0p5()
-        .child(
-            div()
-                .text_xs()
-                .text_color(palette.text_muted)
-                .child(label.to_string()),
-        )
-        .child(
-            div()
-                .text_sm()
-                .text_color(palette.text)
-                .whitespace_normal()
-                .child(value.to_string()),
-        )
-        .into_any_element()
+#[component]
+fn WindowControls(
+    palette: Palette,
+    hovered: Option<HoveredControl>,
+    on_hover_control: EventHandler<Option<HoveredControl>>,
+    maximized: bool,
+) -> Element {
+    rsx! {
+        div {
+            style: "display:flex; align-items:stretch; gap:0;",
+            WindowControl {
+                glyph: "—",
+                hovered: hovered == Some(HoveredControl::Minimize),
+                hover_tone: HoveredControl::Minimize,
+                palette,
+                on_hover_control,
+                on_press: move |_| window().set_minimized(true),
+            }
+            WindowControl {
+                glyph: { if maximized { "❐" } else { "▢" } },
+                hovered: hovered == Some(HoveredControl::Maximize),
+                hover_tone: HoveredControl::Maximize,
+                palette,
+                on_hover_control,
+                on_press: move |_| window().toggle_maximized(),
+            }
+            WindowControl {
+                glyph: "✕",
+                hovered: hovered == Some(HoveredControl::Close),
+                hover_tone: HoveredControl::Close,
+                palette,
+                on_hover_control,
+                on_press: move |_| window().close(),
+            }
+        }
+    }
+}
+
+#[component]
+fn WindowControl(
+    glyph: &'static str,
+    hovered: bool,
+    hover_tone: HoveredControl,
+    palette: Palette,
+    on_hover_control: EventHandler<Option<HoveredControl>>,
+    on_press: EventHandler<MouseEvent>,
+) -> Element {
+    let is_close = hover_tone == HoveredControl::Close;
+    let background = if hovered {
+        if is_close {
+            palette.close_hover
+        } else {
+            palette.control_hover
+        }
+    } else {
+        "transparent"
+    };
+    let color = if hovered && is_close {
+        "#ffffff"
+    } else {
+        palette.text
+    };
+
+    rsx! {
+        button {
+            style: format!(
+                "width:34px; height:30px; border:none; border-radius:0; background:{}; color:{}; \
+                 display:flex; align-items:center; justify-content:center; font-size:13px; font-weight:600;",
+                background, color
+            ),
+            onmousedown: |evt| evt.stop_propagation(),
+            onmouseenter: move |_| on_hover_control.call(Some(hover_tone)),
+            onmouseleave: move |_| on_hover_control.call(None),
+            onclick: move |evt| on_press.call(evt),
+            "{glyph}"
+        }
+    }
+}
+
+#[component]
+fn Sidebar(
+    snapshot: RenderSnapshot,
+    on_select_row: EventHandler<BrowserRow>,
+    on_connect_ssh: EventHandler<usize>,
+    on_focus_live: EventHandler<String>,
+) -> Element {
+    rsx! {
+        div {
+            style: format!(
+                "width:210px; min-width:210px; max-width:210px; display:flex; flex-direction:column; \
+                 background:{}; border-right:1px solid {}; overflow:hidden;",
+                snapshot.palette.sidebar, snapshot.palette.border
+            ),
+            div {
+                style: format!(
+                    "padding:12px 12px 10px 12px; border-bottom:1px solid {};",
+                    snapshot.palette.border
+                ),
+                div {
+                    style: format!("font-size:11px; color:{}; margin-bottom:6px;", snapshot.palette.muted),
+                    "Codex Sessions"
+                }
+                        div {
+                            style: format!("font-size:12px; font-weight:600; color:{};", snapshot.palette.text),
+                            {format!("{} stored · {} visible", snapshot.total_leaf_sessions, snapshot.rows.len())}
+                        }
+            }
+            div {
+                style: "flex:1; min-height:0; overflow:auto; padding:8px;",
+                for row in snapshot.rows.iter().cloned() {
+                    SidebarRow {
+                        row: row.clone(),
+                        selected: snapshot.selected_path.as_deref() == Some(row.full_path.as_str()),
+                        palette: snapshot.palette,
+                        on_select: move |_| on_select_row.call(row.clone()),
+                    }
+                }
+            }
+            div {
+                style: format!(
+                    "border-top:1px solid {}; padding:10px 8px 12px 8px; display:flex; flex-direction:column; gap:10px;",
+                    snapshot.palette.border
+                ),
+                if !snapshot.ssh_targets.is_empty() {
+                    div {
+                        div {
+                            style: format!("font-size:11px; color:{}; margin-bottom:6px;", snapshot.palette.muted),
+                            "Connect SSH"
+                        }
+                        div {
+                            style: "display:flex; flex-direction:column; gap:6px;",
+                            for (ix , target) in snapshot.ssh_targets.iter().cloned().enumerate() {
+                                {
+                                    let target_detail = if let Some(prefix) = target.prefix.as_ref() {
+                                        format!("{} · {}", target.ssh_target, prefix)
+                                    } else {
+                                        target.ssh_target.clone()
+                                    };
+                                    rsx! {
+                                        button {
+                                            style: sidebar_action_style(snapshot.palette),
+                                            onclick: move |_| on_connect_ssh.call(ix),
+                                            div {
+                                                style: "display:flex; flex-direction:column; align-items:flex-start; min-width:0;",
+                                                span {
+                                                    style: format!("font-size:12px; font-weight:600; color:{};", snapshot.palette.text),
+                                                    "{target.label}"
+                                                }
+                                                span {
+                                                    style: format!("font-size:11px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", snapshot.palette.muted),
+                                                    "{target_detail}"
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if !snapshot.live_sessions.is_empty() {
+                    div {
+                        div {
+                            style: format!("font-size:11px; color:{}; margin-bottom:6px;", snapshot.palette.muted),
+                            "Live Sessions"
+                        }
+                        div {
+                            style: "display:flex; flex-direction:column; gap:6px;",
+                            for session in snapshot.live_sessions.iter().cloned() {
+                                button {
+                                    style: sidebar_action_style(snapshot.palette),
+                                    onclick: move |_| on_focus_live.call(session.session_path.clone()),
+                                    div {
+                                        style: "display:flex; flex-direction:column; align-items:flex-start; min-width:0;",
+                                        span {
+                                            style: format!("font-size:12px; font-weight:600; color:{};", snapshot.palette.text),
+                                            "{session.title}"
+                                        }
+                                        span {
+                                            style: format!("font-size:11px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", snapshot.palette.muted),
+                                            "{session.status_line}"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn SidebarRow(
+    row: BrowserRow,
+    selected: bool,
+    palette: Palette,
+    on_select: EventHandler<MouseEvent>,
+) -> Element {
+    let disclosure = match row.kind {
+        BrowserRowKind::Group if row.expanded => "▾",
+        BrowserRowKind::Group => "▸",
+        BrowserRowKind::Session => "•",
+    };
+    let indent = row.depth * 14 + 10;
+    let background = if selected {
+        palette.accent_soft
+    } else if row.kind == BrowserRowKind::Group && row.depth == 0 {
+        palette.panel_alt
+    } else {
+        "transparent"
+    };
+    let border = if selected {
+        format!("2px solid {}", palette.accent)
+    } else {
+        "2px solid transparent".to_string()
+    };
+
+    rsx! {
+        button {
+            style: format!(
+                "width:100%; display:flex; flex-direction:column; align-items:stretch; gap:3px; \
+                 border:none; border-left:{}; border-radius:8px; background:{}; padding:7px 8px 7px {}px; margin-bottom:4px;",
+                border, background, indent
+            ),
+            onclick: move |evt| on_select.call(evt),
+            div {
+                style: "display:flex; align-items:center; justify-content:space-between; gap:8px;",
+                div {
+                    style: "display:flex; align-items:center; gap:8px; min-width:0;",
+                    span {
+                        style: format!("font-size:11px; color:{};", palette.muted),
+                        "{disclosure}"
+                    }
+                    span {
+                        style: format!(
+                            "font-size:12px; color:{}; font-weight:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                            if selected { palette.text } else if row.kind == BrowserRowKind::Group && row.depth > 0 { palette.muted } else { palette.text },
+                            if row.kind == BrowserRowKind::Group && row.depth == 0 { 600 } else { 500 }
+                        ),
+                        "{row.label}"
+                    }
+                }
+                if row.kind == BrowserRowKind::Group {
+                    span {
+                        style: format!("font-size:11px; color:{};", palette.muted),
+                        "{row.descendant_sessions}"
+                    }
+                } else if !row.host_label.is_empty() {
+                    span {
+                        style: format!("font-size:11px; color:{};", palette.muted),
+                        "{row.host_label}"
+                    }
+                }
+            }
+            if !row.detail_label.is_empty() {
+                div {
+                    style: format!(
+                        "font-size:11px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                        palette.muted
+                    ),
+                    "{row.detail_label}"
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn MainSurface(
+    snapshot: RenderSnapshot,
+    on_expand_preview: EventHandler<()>,
+    on_collapse_preview: EventHandler<()>,
+    on_toggle_preview_block: EventHandler<usize>,
+    on_request_terminal: EventHandler<()>,
+    on_focus_ghostty: EventHandler<()>,
+    on_resolve_ghostty: EventHandler<()>,
+) -> Element {
+    let body = if let Some(session) = snapshot.active_session.clone() {
+        match snapshot.active_view_mode {
+            WorkspaceViewMode::Rendered => rsx! {
+                div {
+                    style: "display:flex; flex-direction:column; gap:16px; min-width:0;",
+                    div {
+                        style: "display:flex; align-items:flex-start; justify-content:space-between; gap:16px;",
+                        PreviewSummary { session: session.clone(), palette: snapshot.palette }
+                        div {
+                            style: "display:flex; gap:8px;",
+                            button {
+                                style: chip_style(snapshot.palette, false),
+                                onclick: move |_| on_expand_preview.call(()),
+                                "Expand All"
+                            }
+                            button {
+                                style: chip_style(snapshot.palette, false),
+                                onclick: move |_| on_collapse_preview.call(()),
+                                "Collapse All"
+                            }
+                        }
+                    }
+                    div {
+                        style: "display:flex; flex-direction:column; gap:14px;",
+                        for (ix, block) in session.preview.blocks.iter().cloned().enumerate() {
+                            PreviewBlock {
+                                block_ix: ix,
+                                block: block.clone(),
+                                palette: snapshot.palette,
+                                on_toggle: move |_| on_toggle_preview_block.call(ix),
+                            }
+                        }
+                    }
+                }
+            },
+            WorkspaceViewMode::Terminal => rsx! {
+                div {
+                    style: "display:flex; flex-direction:column; gap:16px; min-width:0;",
+                    div {
+                        style: "display:flex; gap:8px; justify-content:flex-end;",
+                        button {
+                            style: chip_style(snapshot.palette, false),
+                            onclick: move |_| on_request_terminal.call(()),
+                            "Request Ghostty"
+                        }
+                        button {
+                            style: chip_style(snapshot.palette, false),
+                            onclick: move |_| on_focus_ghostty.call(()),
+                            "Focus Ghostty"
+                        }
+                        button {
+                            style: chip_style(snapshot.palette, false),
+                            onclick: move |_| on_resolve_ghostty.call(()),
+                            "Resolve Window"
+                        }
+                    }
+                    TerminalCard {
+                        title: "Server Terminal".to_string(),
+                        subtitle: session.status_line.clone(),
+                        lines: session.terminal_lines.clone(),
+                        palette: snapshot.palette,
+                    }
+                    TerminalCard {
+                        title: "Ghostty Integration".to_string(),
+                        subtitle: if snapshot.ghostty_embedded_surface_supported {
+                            "embedded surface available".to_string()
+                        } else {
+                            "external window path".to_string()
+                        },
+                        lines: vec![
+                            snapshot.ghostty_bridge_detail.clone(),
+                            "Yggterm server opens and tracks session-owned Ghostty launches here.".to_string(),
+                        ],
+                        palette: snapshot.palette,
+                    }
+                }
+            },
+        }
+    } else {
+        rsx! {
+            EmptyState { palette: snapshot.palette }
+        }
+    };
+
+    rsx! {
+        div {
+            style: format!(
+                "flex:1; min-width:0; min-height:0; display:flex; flex-direction:column; background:{};",
+                snapshot.palette.panel
+            ),
+            div {
+                style: "flex:1; overflow:auto; padding:18px;",
+                {body}
+            }
+        }
+    }
+}
+
+#[component]
+fn PreviewSummary(session: ManagedSessionView, palette: Palette) -> Element {
+    let started = metadata_value(&session, "Started");
+    let messages = metadata_value(&session, "Messages");
+
+    rsx! {
+        div {
+            style: format!(
+                "display:flex; flex-direction:column; gap:6px; min-width:280px; max-width:360px; \
+                 background:{}; border:1px solid {}; border-radius:12px; padding:14px 16px;",
+                palette.panel_alt, palette.border
+            ),
+            div {
+                style: format!("font-size:13px; font-weight:700; color:{};", palette.text),
+                "{session.title}"
+            }
+            div {
+                style: format!("font-size:11px; color:{};", palette.muted),
+                "{session.host_label} · {started}"
+            }
+            div {
+                style: format!("font-size:11px; color:{};", palette.muted),
+                "{messages} · {session.preview.blocks.len()} blocks"
+            }
+        }
+    }
+}
+
+#[component]
+fn PreviewBlock(
+    block_ix: usize,
+    block: yggterm_core::SessionPreviewBlock,
+    palette: Palette,
+    on_toggle: EventHandler<MouseEvent>,
+) -> Element {
+    let background = match block.tone {
+        PreviewTone::User => palette.accent_soft,
+        PreviewTone::Assistant => palette.panel_alt,
+    };
+    let badge = match block.tone {
+        PreviewTone::User => palette.accent,
+        PreviewTone::Assistant => palette.muted,
+    };
+
+    rsx! {
+        button {
+            style: format!(
+                "width:100%; border:none; text-align:left; background:{}; border-radius:14px; \
+                 padding:14px 16px; box-shadow: inset 0 0 0 1px {};",
+                background, palette.border
+            ),
+            onclick: move |evt| on_toggle.call(evt),
+            div {
+                style: "display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:10px;",
+                div {
+                    style: "display:flex; align-items:center; gap:8px;",
+                    span {
+                        style: format!(
+                            "display:inline-flex; align-items:center; justify-content:center; min-width:54px; height:22px; \
+                             border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:700;",
+                            if block.tone == PreviewTone::User { "rgba(37,99,235,0.14)" } else { "rgba(108,114,127,0.12)" },
+                            badge
+                        ),
+                        "{block.role}"
+                    }
+                    span {
+                        style: format!("font-size:11px; color:{};", palette.muted),
+                        "{block.timestamp}"
+                    }
+                }
+                span {
+                    style: format!("font-size:11px; color:{};", palette.muted),
+                    {if block.folded { format!("Expand {}", block_ix + 1) } else { format!("Collapse {}", block_ix + 1) }}
+                }
+            }
+            if block.folded {
+                div {
+                    style: format!("font-size:12px; color:{};", palette.muted),
+                    "{block.lines.len()} lines hidden"
+                }
+            } else {
+                div {
+                    style: format!("display:flex; flex-direction:column; gap:7px; color:{};", palette.text),
+                    for line in block.lines.iter() {
+                        div {
+                            style: "font-size:13px; line-height:1.45; white-space:pre-wrap;",
+                            "{line}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn TerminalCard(title: String, subtitle: String, lines: Vec<String>, palette: Palette) -> Element {
+    rsx! {
+        div {
+            style: format!(
+                "display:flex; flex-direction:column; gap:12px; background:{}; border:1px solid {}; \
+                 border-radius:12px; padding:14px 16px;",
+                palette.panel_alt, palette.border
+            ),
+            div {
+                style: "display:flex; align-items:center; justify-content:space-between; gap:12px;",
+                div {
+                    style: format!("font-size:13px; font-weight:700; color:{};", palette.text),
+                    "{title}"
+                }
+                div {
+                    style: format!("font-size:11px; color:{};", palette.muted),
+                    "{subtitle}"
+                }
+            }
+            div {
+                style: format!(
+                    "display:flex; flex-direction:column; gap:8px; padding:12px; background:{}; \
+                     border-radius:10px; box-shadow: inset 0 0 0 1px {};",
+                    palette.panel, palette.border
+                ),
+                for (ix, line) in lines.iter().enumerate() {
+                    div {
+                        style: format!(
+                            "font-size:12px; line-height:1.45; color:{}; white-space:pre-wrap;",
+                            if line.starts_with('$') { palette.accent } else { palette.text }
+                        ),
+                        "{ix + 1:02}  {line}"
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn EmptyState(palette: Palette) -> Element {
+    rsx! {
+        div {
+            style: "display:flex; align-items:center; justify-content:center; height:100%;",
+            div {
+                style: format!(
+                    "display:flex; flex-direction:column; align-items:center; gap:8px; background:{}; \
+                     border:1px solid {}; border-radius:14px; padding:20px 24px;",
+                    palette.panel_alt, palette.border
+                ),
+                div {
+                    style: format!("font-size:14px; font-weight:700; color:{};", palette.text),
+                    "No Session Selected"
+                }
+                div {
+                    style: format!("font-size:12px; color:{};", palette.muted),
+                    "Choose a stored Codex session or connect over SSH from the sidebar."
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn MetadataRail(snapshot: RenderSnapshot) -> Element {
+    let session = snapshot.active_session;
+
+    rsx! {
+        div {
+            style: format!(
+                "width:240px; min-width:240px; max-width:240px; display:flex; flex-direction:column; \
+                 background:{}; border-left:1px solid {}; overflow:hidden;",
+                snapshot.palette.sidebar, snapshot.palette.border
+            ),
+            div {
+                style: format!(
+                    "padding:12px 14px; border-bottom:1px solid {}; font-size:12px; font-weight:700; color:{};",
+                    snapshot.palette.border, snapshot.palette.text
+                ),
+                "Session Metadata"
+            }
+            div {
+                style: "flex:1; overflow:auto; padding:12px 14px; display:flex; flex-direction:column; gap:14px;",
+                if let Some(session) = session {
+                    MetadataGroup {
+                        title: "Overview".to_string(),
+                        entries: session.metadata.iter().take(6).cloned().collect(),
+                        palette: snapshot.palette,
+                    }
+                    MetadataGroup {
+                        title: "Runtime".to_string(),
+                        entries: session.metadata.iter().skip(6).cloned().collect(),
+                        palette: snapshot.palette,
+                    }
+                } else {
+                    MetadataGroup {
+                        title: "Overview".to_string(),
+                        entries: vec![yggterm_core::SessionMetadataEntry {
+                            label: "State",
+                            value: "No session selected".to_string(),
+                        }],
+                        palette: snapshot.palette,
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn MetadataGroup(
+    title: String,
+    entries: Vec<yggterm_core::SessionMetadataEntry>,
+    palette: Palette,
+) -> Element {
+    rsx! {
+        div {
+            style: format!(
+                "display:flex; flex-direction:column; gap:8px; padding-bottom:10px; border-bottom:1px solid {};",
+                palette.border
+            ),
+            div {
+                style: format!("font-size:11px; font-weight:700; color:{};", palette.muted),
+                "{title}"
+            }
+            for entry in entries.into_iter() {
+                div {
+                    style: "display:flex; flex-direction:column; gap:3px;",
+                    span {
+                        style: format!("font-size:11px; color:{};", palette.muted),
+                        "{entry.label}"
+                    }
+                    span {
+                        style: format!("font-size:12px; color:{}; white-space:pre-wrap;", palette.text),
+                        "{entry.value}"
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn Statusbar(
+    snapshot: RenderSnapshot,
+    on_set_view_mode: EventHandler<WorkspaceViewMode>,
+    on_toggle_meta: EventHandler<()>,
+) -> Element {
+    rsx! {
+        div {
+            style: format!(
+                "display:flex; align-items:center; justify-content:space-between; gap:16px; height:28px; \
+                 padding:0 12px; border-top:1px solid {}; background:{};",
+                snapshot.palette.border, snapshot.palette.titlebar
+            ),
+            div {
+                style: "display:flex; align-items:center; gap:12px; min-width:0;",
+                span {
+                    style: format!("font-size:11px; color:{};", snapshot.palette.text),
+                    "{snapshot.total_leaf_sessions} codex sessions"
+                }
+                span {
+                    style: format!("font-size:11px; color:{};", snapshot.palette.muted),
+                    "{snapshot.last_action}"
+                }
+            }
+            div {
+                style: "display:flex; align-items:center; gap:8px;",
+                button {
+                    style: chip_style(snapshot.palette, snapshot.active_view_mode == WorkspaceViewMode::Rendered),
+                    onclick: move |_| on_set_view_mode.call(WorkspaceViewMode::Rendered),
+                    "Preview"
+                }
+                button {
+                    style: chip_style(snapshot.palette, snapshot.active_view_mode == WorkspaceViewMode::Terminal),
+                    onclick: move |_| on_set_view_mode.call(WorkspaceViewMode::Terminal),
+                    "Terminal"
+                }
+                button {
+                    style: chip_style(snapshot.palette, snapshot.right_panel_open),
+                    onclick: move |_| on_toggle_meta.call(()),
+                    if snapshot.right_panel_open { "Hide Metadata" } else { "Show Metadata" }
+                }
+            }
+        }
+    }
+}
+
+fn palette(theme: UiTheme) -> Palette {
+    match theme {
+        UiTheme::ZedLight => Palette {
+            shell: "rgba(248,248,250,0.92)",
+            titlebar: "#f3f3f5",
+            sidebar: "#f7f7f8",
+            panel: "#ffffff",
+            panel_alt: "#f3f4f6",
+            border: "#d9dbe3",
+            text: "#111318",
+            muted: "#6b7280",
+            accent: "#2563eb",
+            accent_soft: "rgba(37,99,235,0.10)",
+            close_hover: "#e81123",
+            control_hover: "rgba(17,19,24,0.08)",
+            shadow: "0 18px 50px rgba(15,23,42,0.16)",
+        },
+        UiTheme::ZedDark => Palette {
+            shell: "rgba(25,28,34,0.92)",
+            titlebar: "#1d2128",
+            sidebar: "#1a1e25",
+            panel: "#1f242d",
+            panel_alt: "#252b35",
+            border: "#333b47",
+            text: "#e5e7eb",
+            muted: "#98a2b3",
+            accent: "#60a5fa",
+            accent_soft: "rgba(96,165,250,0.14)",
+            close_hover: "#e81123",
+            control_hover: "rgba(255,255,255,0.08)",
+            shadow: "0 20px 60px rgba(0,0,0,0.42)",
+        },
+    }
+}
+
+fn shell_style(palette: Palette) -> String {
+    format!(
+        "position:fixed; inset:0; display:flex; flex-direction:column; overflow:hidden; \
+         border-radius:11px; background:{}; box-shadow:{}; border:1px solid {}; backdrop-filter: blur(14px);",
+        palette.shell, palette.shadow, palette.border
+    )
+}
+
+fn search_style(palette: Palette) -> String {
+    format!(
+        "width:min(520px, 100%); height:28px; padding:0 12px; border-radius:999px; \
+         border:1px solid {}; background:{}; color:{}; outline:none; font-size:12px;",
+        palette.border, palette.panel, palette.text
+    )
+}
+
+fn icon_button_style(palette: Palette) -> String {
+    format!(
+        "width:26px; height:26px; border:none; border-radius:8px; background:{}; color:{}; font-size:13px;",
+        palette.panel_alt, palette.muted
+    )
+}
+
+fn chip_style(palette: Palette, selected: bool) -> String {
+    format!(
+        "height:24px; padding:0 10px; border-radius:999px; border:1px solid {}; background:{}; \
+         color:{}; font-size:11px; font-weight:600;",
+        if selected { palette.accent } else { palette.border },
+        if selected { palette.accent_soft } else { palette.panel_alt },
+        if selected { palette.text } else { palette.muted }
+    )
+}
+
+fn sidebar_action_style(palette: Palette) -> String {
+    format!(
+        "width:100%; border:none; border-radius:10px; background:{}; padding:8px 10px; text-align:left;",
+        palette.panel_alt
+    )
+}
+
+fn metadata_value(session: &ManagedSessionView, label: &str) -> String {
+    session
+        .metadata
+        .iter()
+        .find(|entry| entry.label == label)
+        .map(|entry| entry.value.clone())
+        .unwrap_or_default()
 }
