@@ -255,16 +255,14 @@ fn flatten_rows(
 
 fn format_row_label(
     node: &SessionNode,
-    depth: usize,
-    descendant_sessions: usize,
+    _depth: usize,
+    _descendant_sessions: usize,
     is_session: bool,
 ) -> String {
     if is_session {
         node.name.clone()
-    } else if depth == 0 {
-        node.name.clone()
     } else {
-        format!("{} ({descendant_sessions})", node.name)
+        node.name.clone()
     }
 }
 
