@@ -54,6 +54,7 @@ struct Palette {
     shell: &'static str,
     titlebar: &'static str,
     sidebar: &'static str,
+    sidebar_hover: &'static str,
     panel: &'static str,
     panel_alt: &'static str,
     border: &'static str,
@@ -61,9 +62,11 @@ struct Palette {
     muted: &'static str,
     accent: &'static str,
     accent_soft: &'static str,
+    gradient: &'static str,
     close_hover: &'static str,
     control_hover: &'static str,
     shadow: &'static str,
+    panel_shadow: &'static str,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -235,7 +238,6 @@ fn app() -> Element {
     let sidebar_snapshot = snapshot.clone();
     let main_snapshot = snapshot.clone();
     let metadata_snapshot = snapshot.clone();
-    let status_snapshot = snapshot.clone();
     let maximized = window().is_maximized();
 
     rsx! {
@@ -249,6 +251,8 @@ fn app() -> Element {
                     on_toggle_sidebar: move || state.with_mut(|shell| shell.toggle_sidebar()),
                     on_search: move |value: String| state.with_mut(|shell| shell.set_search(value)),
                     on_hover_control: move |control: Option<HoveredControl>| hovered.set(control),
+                    on_set_view_mode: move |mode: WorkspaceViewMode| state.with_mut(|shell| shell.set_view_mode(mode)),
+                    on_toggle_meta: move || state.with_mut(|shell| shell.toggle_right_panel()),
                     maximized: maximized,
                 }
                 div {
@@ -274,11 +278,6 @@ fn app() -> Element {
                         MetadataRail { snapshot: metadata_snapshot }
                     }
                 }
-                Statusbar {
-                    snapshot: status_snapshot,
-                    on_set_view_mode: move |mode: WorkspaceViewMode| state.with_mut(|shell| shell.set_view_mode(mode)),
-                    on_toggle_meta: move || state.with_mut(|shell| shell.toggle_right_panel()),
-                }
             }
         }
     }
@@ -291,29 +290,20 @@ fn Titlebar(
     on_toggle_sidebar: EventHandler<()>,
     on_search: EventHandler<String>,
     on_hover_control: EventHandler<Option<HoveredControl>>,
+    on_set_view_mode: EventHandler<WorkspaceViewMode>,
+    on_toggle_meta: EventHandler<()>,
     maximized: bool,
 ) -> Element {
-    let current_title = snapshot
-        .active_session
-        .as_ref()
-        .map(|session| session.title.clone())
-        .unwrap_or_else(|| "Codex Sessions".to_string());
-    let current_detail = snapshot
-        .active_session
-        .as_ref()
-        .map(|session| session.session_path.clone())
-        .unwrap_or_else(|| "Select a session or connect over SSH.".to_string());
-
     rsx! {
         div {
             style: format!(
                 "display:flex; align-items:center; justify-content:space-between; height:42px; \
-                 padding:0 10px; border-bottom:1px solid {}; background:{};",
-                snapshot.palette.border, snapshot.palette.titlebar
+                 padding:0 10px; background:{};",
+                snapshot.palette.titlebar
             ),
             onmousedown: move |_| window().drag(),
             div {
-                style: "display:flex; align-items:center; gap:10px; width:240px; min-width:240px;",
+                style: "display:flex; align-items:center; gap:12px; width:260px; min-width:260px;",
                 button {
                     style: icon_button_style(snapshot.palette),
                     onmousedown: |evt| evt.stop_propagation(),
@@ -321,20 +311,23 @@ fn Titlebar(
                     "☰"
                 }
                 div {
-                    style: "display:flex; flex-direction:column; min-width:0;",
-                    div {
-                        style: format!(
-                            "font-size:12px; font-weight:600; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
-                            snapshot.palette.text
+                    style: toggle_slider_style(snapshot.palette),
+                    onmousedown: |evt| evt.stop_propagation(),
+                    button {
+                        style: toggle_slider_end_style(
+                            snapshot.palette,
+                            snapshot.active_view_mode == WorkspaceViewMode::Rendered
                         ),
-                        "{current_title}"
+                        onclick: move |_| on_set_view_mode.call(WorkspaceViewMode::Rendered),
+                        "Preview"
                     }
-                    div {
-                        style: format!(
-                            "font-size:11px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
-                            snapshot.palette.muted
+                    button {
+                        style: toggle_slider_end_style(
+                            snapshot.palette,
+                            snapshot.active_view_mode == WorkspaceViewMode::Terminal
                         ),
-                        "{current_detail}"
+                        onclick: move |_| on_set_view_mode.call(WorkspaceViewMode::Terminal),
+                        "Terminal"
                     }
                 }
             }
@@ -350,7 +343,13 @@ fn Titlebar(
                 }
             }
             div {
-                style: "display:flex; align-items:stretch; justify-content:flex-end; width:240px; min-width:240px;",
+                style: "display:flex; align-items:center; justify-content:flex-end; gap:10px; width:260px; min-width:260px;",
+                button {
+                    style: metadata_toggle_style(snapshot.palette, snapshot.right_panel_open),
+                    onmousedown: |evt| evt.stop_propagation(),
+                    onclick: move |_| on_toggle_meta.call(()),
+                    if snapshot.right_panel_open { "Metadata" } else { "Inspect" }
+                }
                 WindowControls {
                     palette: snapshot.palette,
                     hovered: hovered(),
@@ -369,6 +368,8 @@ fn WindowControls(
     on_hover_control: EventHandler<Option<HoveredControl>>,
     maximized: bool,
 ) -> Element {
+    let maximize_glyph = if maximized { "❐" } else { "▢" };
+
     rsx! {
         div {
             style: "display:flex; align-items:stretch; gap:0;",
@@ -381,7 +382,7 @@ fn WindowControls(
                 on_press: move |_| window().set_minimized(true),
             }
             WindowControl {
-                glyph: { if maximized { "❐" } else { "▢" } },
+                glyph: maximize_glyph,
                 hovered: hovered == Some(HoveredControl::Maximize),
                 hover_tone: HoveredControl::Maximize,
                 palette,
@@ -452,14 +453,11 @@ fn Sidebar(
         div {
             style: format!(
                 "width:210px; min-width:210px; max-width:210px; display:flex; flex-direction:column; \
-                 background:{}; border-right:1px solid {}; overflow:hidden;",
-                snapshot.palette.sidebar, snapshot.palette.border
+                 background:{}; overflow:hidden;",
+                snapshot.palette.sidebar
             ),
             div {
-                style: format!(
-                    "padding:12px 12px 10px 12px; border-bottom:1px solid {};",
-                    snapshot.palette.border
-                ),
+                style: "padding:12px 12px 10px 12px;",
                 div {
                     style: format!("font-size:11px; color:{}; margin-bottom:6px;", snapshot.palette.muted),
                     "Codex Sessions"
@@ -482,8 +480,7 @@ fn Sidebar(
             }
             div {
                 style: format!(
-                    "border-top:1px solid {}; padding:10px 8px 12px 8px; display:flex; flex-direction:column; gap:10px;",
-                    snapshot.palette.border
+                    "padding:10px 8px 12px 8px; display:flex; flex-direction:column; gap:10px;",
                 ),
                 if !snapshot.ssh_targets.is_empty() {
                     div {
@@ -575,18 +572,13 @@ fn SidebarRow(
     } else {
         "transparent"
     };
-    let border = if selected {
-        format!("2px solid {}", palette.accent)
-    } else {
-        "2px solid transparent".to_string()
-    };
 
     rsx! {
         button {
             style: format!(
                 "width:100%; display:flex; flex-direction:column; align-items:stretch; gap:3px; \
-                 border:none; border-left:{}; border-radius:8px; background:{}; padding:7px 8px 7px {}px; margin-bottom:4px;",
-                border, background, indent
+                 border:none; border-radius:10px; background:{}; padding:7px 8px 7px {}px; margin-bottom:4px;",
+                background, indent
             ),
             onclick: move |evt| on_select.call(evt),
             div {
@@ -728,11 +720,13 @@ fn MainSurface(
     rsx! {
         div {
             style: format!(
-                "flex:1; min-width:0; min-height:0; display:flex; flex-direction:column; background:{};",
-                snapshot.palette.panel
+                "flex:1; min-width:0; min-height:0; display:flex; flex-direction:column; background:transparent; padding:14px 14px 18px 0;",
             ),
             div {
-                style: "flex:1; overflow:auto; padding:18px;",
+                style: format!(
+                    "flex:1; overflow:auto; padding:22px; background:{}; border-radius:18px; box-shadow:{};",
+                    snapshot.palette.panel, snapshot.palette.panel_shadow
+                ),
                 {body}
             }
         }
@@ -906,13 +900,13 @@ fn MetadataRail(snapshot: RenderSnapshot) -> Element {
         div {
             style: format!(
                 "width:240px; min-width:240px; max-width:240px; display:flex; flex-direction:column; \
-                 background:{}; border-left:1px solid {}; overflow:hidden;",
-                snapshot.palette.sidebar, snapshot.palette.border
+                 background:{}; overflow:hidden;",
+                snapshot.palette.sidebar
             ),
             div {
                 style: format!(
-                    "padding:12px 14px; border-bottom:1px solid {}; font-size:12px; font-weight:700; color:{};",
-                    snapshot.palette.border, snapshot.palette.text
+                    "padding:12px 14px; font-size:12px; font-weight:700; color:{};",
+                    snapshot.palette.text
                 ),
                 "Session Metadata"
             }
@@ -977,83 +971,43 @@ fn MetadataGroup(
     }
 }
 
-#[component]
-fn Statusbar(
-    snapshot: RenderSnapshot,
-    on_set_view_mode: EventHandler<WorkspaceViewMode>,
-    on_toggle_meta: EventHandler<()>,
-) -> Element {
-    rsx! {
-        div {
-            style: format!(
-                "display:flex; align-items:center; justify-content:space-between; gap:16px; height:28px; \
-                 padding:0 12px; border-top:1px solid {}; background:{};",
-                snapshot.palette.border, snapshot.palette.titlebar
-            ),
-            div {
-                style: "display:flex; align-items:center; gap:12px; min-width:0;",
-                span {
-                    style: format!("font-size:11px; color:{};", snapshot.palette.text),
-                    "{snapshot.total_leaf_sessions} codex sessions"
-                }
-                span {
-                    style: format!("font-size:11px; color:{};", snapshot.palette.muted),
-                    "{snapshot.last_action}"
-                }
-            }
-            div {
-                style: "display:flex; align-items:center; gap:8px;",
-                button {
-                    style: chip_style(snapshot.palette, snapshot.active_view_mode == WorkspaceViewMode::Rendered),
-                    onclick: move |_| on_set_view_mode.call(WorkspaceViewMode::Rendered),
-                    "Preview"
-                }
-                button {
-                    style: chip_style(snapshot.palette, snapshot.active_view_mode == WorkspaceViewMode::Terminal),
-                    onclick: move |_| on_set_view_mode.call(WorkspaceViewMode::Terminal),
-                    "Terminal"
-                }
-                button {
-                    style: chip_style(snapshot.palette, snapshot.right_panel_open),
-                    onclick: move |_| on_toggle_meta.call(()),
-                    if snapshot.right_panel_open { "Hide Metadata" } else { "Show Metadata" }
-                }
-            }
-        }
-    }
-}
-
 fn palette(theme: UiTheme) -> Palette {
     match theme {
         UiTheme::ZedLight => Palette {
-            shell: "rgba(248,248,250,0.92)",
-            titlebar: "#f3f3f5",
-            sidebar: "#f7f7f8",
+            shell: "rgba(243,247,246,0.92)",
+            titlebar: "transparent",
+            sidebar: "transparent",
+            sidebar_hover: "rgba(110,166,191,0.10)",
             panel: "#ffffff",
-            panel_alt: "#f3f4f6",
-            border: "#d9dbe3",
-            text: "#111318",
-            muted: "#6b7280",
-            accent: "#2563eb",
-            accent_soft: "rgba(37,99,235,0.10)",
+            panel_alt: "rgba(255,255,255,0.52)",
+            border: "#d8dee5",
+            text: "#24303a",
+            muted: "#6f7c86",
+            accent: "#2f7cf6",
+            accent_soft: "rgba(64,163,215,0.14)",
+            gradient: "linear-gradient(180deg, rgba(223,240,247,0.92) 0%, rgba(231,243,238,0.96) 52%, rgba(238,240,242,0.92) 100%)",
             close_hover: "#e81123",
-            control_hover: "rgba(17,19,24,0.08)",
-            shadow: "0 18px 50px rgba(15,23,42,0.16)",
+            control_hover: "rgba(36,48,58,0.08)",
+            shadow: "0 18px 42px rgba(44,74,94,0.10)",
+            panel_shadow: "0 14px 34px rgba(66,103,131,0.12)",
         },
         UiTheme::ZedDark => Palette {
-            shell: "rgba(25,28,34,0.92)",
-            titlebar: "#1d2128",
-            sidebar: "#1a1e25",
-            panel: "#1f242d",
-            panel_alt: "#252b35",
-            border: "#333b47",
-            text: "#e5e7eb",
-            muted: "#98a2b3",
-            accent: "#60a5fa",
-            accent_soft: "rgba(96,165,250,0.14)",
+            shell: "rgba(33,39,46,0.92)",
+            titlebar: "transparent",
+            sidebar: "transparent",
+            sidebar_hover: "rgba(122,190,204,0.12)",
+            panel: "#f8fafc",
+            panel_alt: "rgba(255,255,255,0.06)",
+            border: "#3b4755",
+            text: "#dce6ee",
+            muted: "#9fb0bd",
+            accent: "#73b9ff",
+            accent_soft: "rgba(115,185,255,0.12)",
+            gradient: "linear-gradient(180deg, rgba(48,74,90,0.88) 0%, rgba(58,92,85,0.84) 56%, rgba(55,61,68,0.90) 100%)",
             close_hover: "#e81123",
             control_hover: "rgba(255,255,255,0.08)",
-            shadow: "0 20px 60px rgba(0,0,0,0.42)",
+            shadow: "0 20px 60px rgba(0,0,0,0.34)",
+            panel_shadow: "0 18px 40px rgba(0,0,0,0.18)",
         },
     }
 }
@@ -1061,23 +1015,24 @@ fn palette(theme: UiTheme) -> Palette {
 fn shell_style(palette: Palette) -> String {
     format!(
         "position:fixed; inset:0; display:flex; flex-direction:column; overflow:hidden; \
-         border-radius:11px; background:{}; box-shadow:{}; border:1px solid {}; backdrop-filter: blur(14px);",
-        palette.shell, palette.shadow, palette.border
+         border-radius:11px; background:{}; box-shadow:{}; backdrop-filter: blur(16px);",
+        palette.gradient, palette.shadow
     )
 }
 
 fn search_style(palette: Palette) -> String {
     format!(
-        "width:min(520px, 100%); height:28px; padding:0 12px; border-radius:999px; \
-         border:1px solid {}; background:{}; color:{}; outline:none; font-size:12px;",
-        palette.border, palette.panel, palette.text
+        "width:min(520px, 100%); height:30px; padding:0 12px; border-radius:9px; \
+         border:none; background:rgba(255,255,255,0.74); color:{}; outline:none; font-size:12px; \
+         box-shadow: inset 0 0 0 1px rgba(255,255,255,0.22);",
+        palette.text
     )
 }
 
 fn icon_button_style(palette: Palette) -> String {
     format!(
-        "width:26px; height:26px; border:none; border-radius:8px; background:{}; color:{}; font-size:13px;",
-        palette.panel_alt, palette.muted
+        "width:28px; height:28px; border:none; border-radius:8px; background:transparent; color:{}; font-size:13px;",
+        palette.muted
     )
 }
 
@@ -1094,7 +1049,29 @@ fn chip_style(palette: Palette, selected: bool) -> String {
 fn sidebar_action_style(palette: Palette) -> String {
     format!(
         "width:100%; border:none; border-radius:10px; background:{}; padding:8px 10px; text-align:left;",
-        palette.panel_alt
+        palette.sidebar_hover
+    )
+}
+
+fn toggle_slider_style(_palette: Palette) -> String {
+    format!(
+        "display:flex; align-items:center; gap:4px; padding:3px; border:none; border-radius:999px; background:rgba(255,255,255,0.38);"
+    )
+}
+
+fn toggle_slider_end_style(palette: Palette, selected: bool) -> String {
+    format!(
+        "height:26px; min-width:82px; padding:0 12px; border:none; border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:700;",
+        if selected { palette.panel } else { "transparent" },
+        if selected { palette.text } else { palette.muted }
+    )
+}
+
+fn metadata_toggle_style(palette: Palette, selected: bool) -> String {
+    format!(
+        "height:28px; padding:0 12px; border:none; border-radius:10px; background:{}; color:{}; font-size:11px; font-weight:700;",
+        if selected { "rgba(255,255,255,0.52)" } else { "transparent" },
+        if selected { palette.text } else { palette.muted }
     )
 }
 
