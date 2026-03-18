@@ -1167,12 +1167,8 @@ impl Render for GpuiShell {
         let decorations = window.window_decorations();
         let frame_inset = px(6.);
         let border_size = px(1.);
-        let rounding = px(10.);
 
-        match decorations {
-            Decorations::Client { .. } => window.set_client_inset(frame_inset),
-            Decorations::Server => window.set_client_inset(px(0.)),
-        }
+        window.set_client_inset(px(0.));
 
         let content = div()
             .size_full()
@@ -1251,35 +1247,11 @@ impl Render for GpuiShell {
                             window.start_window_resize(edge);
                         }
                     })
-                    .when(!(tiling.top || tiling.right), |div| {
-                        div.rounded_tr(rounding)
-                    })
-                    .when(!(tiling.top || tiling.left), |div| div.rounded_tl(rounding))
-                    .when(!(tiling.bottom || tiling.right), |div| {
-                        div.rounded_br(rounding)
-                    })
-                    .when(!(tiling.bottom || tiling.left), |div| {
-                        div.rounded_bl(rounding)
-                    })
-                    .when(!tiling.top, |div| div.pt(frame_inset))
-                    .when(!tiling.bottom, |div| div.pb(frame_inset))
-                    .when(!tiling.left, |div| div.pl(frame_inset))
-                    .when(!tiling.right, |div| div.pr(frame_inset))
                     .child(content.map(|div| {
-                        div.when(!(tiling.top || tiling.right), |div| {
-                            div.rounded_tr(rounding)
-                        })
-                        .when(!(tiling.top || tiling.left), |div| div.rounded_tl(rounding))
-                        .when(!(tiling.bottom || tiling.right), |div| {
-                            div.rounded_br(rounding)
-                        })
-                        .when(!(tiling.bottom || tiling.left), |div| {
-                            div.rounded_bl(rounding)
-                        })
-                        .when(!tiling.top, |div| div.border_t(border_size))
-                        .when(!tiling.bottom, |div| div.border_b(border_size))
-                        .when(!tiling.left, |div| div.border_l(border_size))
-                        .when(!tiling.right, |div| div.border_r(border_size))
+                        div.when(!tiling.top, |div| div.border_t(border_size))
+                            .when(!tiling.bottom, |div| div.border_b(border_size))
+                            .when(!tiling.left, |div| div.border_l(border_size))
+                            .when(!tiling.right, |div| div.border_r(border_size))
                     })),
             })
     }
