@@ -404,6 +404,24 @@ impl GpuiShell {
         cx: &mut Context<Self>,
         palette: &UiPalette,
     ) -> AnyElement {
+        let session_title = self
+            .active_session()
+            .map(|session| session.title.clone())
+            .or_else(|| self.selected_row().map(|row| row.label.clone()))
+            .unwrap_or_else(|| "Codex Sessions".to_string());
+        let session_context = self
+            .active_session()
+            .map(|session| self.metadata_value(session, "Cwd").to_string())
+            .or_else(|| {
+                self.selected_row().and_then(|row| {
+                    if row.detail_label.is_empty() {
+                        None
+                    } else {
+                        Some(row.detail_label.clone())
+                    }
+                })
+            })
+            .unwrap_or_else(|| "~/.codex/sessions".to_string());
         let left = div()
             .flex()
             .flex_row()
@@ -435,22 +453,68 @@ impl GpuiShell {
                 titlebar_icon_button("toggle-sidebar", TitlebarIcon::Sidebar, palette)
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
             )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .max_w(px(220.))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(palette.text)
+                            .line_clamp(1)
+                            .text_ellipsis()
+                            .child(session_title),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(palette.text_muted)
+                            .line_clamp(1)
+                            .text_ellipsis()
+                            .child(session_context),
+                    ),
+            )
             .into_any_element();
 
-        let right = div()
-            .flex()
-            .flex_row()
-            .gap_2()
-            .items_center()
-            .child(
-                toolbar_chip_button("connect-ssh", "SSH", false, palette)
-                    .on_click(cx.listener(|this, _, _, cx| this.connect_ssh_target(0, cx))),
-            )
-            .child(
-                titlebar_icon_button("toggle-meta", TitlebarIcon::Info, palette)
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_right_panel(cx))),
-            )
-            .into_any_element();
+        let right =
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .items_center()
+                .child(
+                    toolbar_chip_button(
+                        "view-preview",
+                        "Preview",
+                        self.server.active_view_mode() == WorkspaceViewMode::Rendered,
+                        palette,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_view_mode(WorkspaceViewMode::Rendered, cx)
+                    })),
+                )
+                .child(
+                    toolbar_chip_button(
+                        "view-terminal",
+                        "Terminal",
+                        self.server.active_view_mode() == WorkspaceViewMode::Terminal,
+                        palette,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_view_mode(WorkspaceViewMode::Terminal, cx)
+                    })),
+                )
+                .child(
+                    toolbar_chip_button("connect-ssh", "SSH", false, palette)
+                        .on_click(cx.listener(|this, _, _, cx| this.connect_ssh_target(0, cx))),
+                )
+                .child(
+                    titlebar_icon_button("toggle-meta", TitlebarIcon::Info, palette)
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_right_panel(cx))),
+                )
+                .into_any_element();
 
         titlebar_frame(
             left,
@@ -787,12 +851,6 @@ impl GpuiShell {
     }
 
     fn viewport(&self, cx: &mut Context<Self>, palette: &UiPalette) -> AnyElement {
-        let selected_path = self
-            .active_session()
-            .map(|session| session.session_path.clone())
-            .or_else(|| self.selected_row().map(|row| row.full_path.clone()))
-            .unwrap_or_else(|| "~/.yggterm/sessions".to_string());
-
         let body = match self.active_session() {
             Some(session) if self.server.active_view_mode() == WorkspaceViewMode::Terminal => {
                 div()
@@ -916,77 +974,6 @@ impl GpuiShell {
             .flex()
             .flex_col()
             .bg(palette.surface_background)
-            .child(
-                div()
-                    .w_full()
-                    .min_h(px(42.))
-                    .px_3()
-                    .py_2()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .border_b_1()
-                    .border_color(palette.border_variant)
-                    .bg(palette.window_background)
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_0p5()
-                            .child(
-                                div().text_sm().text_color(palette.text).child(
-                                    self.active_session()
-                                        .map(|session| session.title.clone())
-                                        .unwrap_or_else(|| "No session selected".to_string()),
-                                ),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(palette.text_muted)
-                                    .line_clamp(1)
-                                    .child(
-                                        self.active_session()
-                                            .map(|session| {
-                                                self.metadata_value(session, "Cwd").to_string()
-                                            })
-                                            .unwrap_or(selected_path.clone()),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap_2()
-                            .child(
-                                toolbar_chip_button(
-                                    "view-preview",
-                                    "Preview",
-                                    self.server.active_view_mode() == WorkspaceViewMode::Rendered,
-                                    palette,
-                                )
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.set_view_mode(WorkspaceViewMode::Rendered, cx)
-                                    },
-                                )),
-                            )
-                            .child(
-                                toolbar_chip_button(
-                                    "view-terminal",
-                                    "Terminal",
-                                    self.server.active_view_mode() == WorkspaceViewMode::Terminal,
-                                    palette,
-                                )
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.set_view_mode(WorkspaceViewMode::Terminal, cx)
-                                    },
-                                )),
-                            ),
-                    ),
-            )
             .child(
                 div()
                     .id("viewport-scroll")
