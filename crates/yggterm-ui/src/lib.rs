@@ -104,6 +104,10 @@ pub fn titlebar_frame(
         .bg(background)
         .border_b_1()
         .border_color(border)
+        .on_mouse_down(MouseButton::Left, |_, window, cx: &mut App| {
+            cx.stop_propagation();
+            window.start_window_move();
+        })
         .child(
             div()
                 .w(px(340.))
@@ -229,6 +233,9 @@ pub fn toolbar_chip_button(
         } else {
             palette.text_muted
         })
+        .on_mouse_down(MouseButton::Left, |_, _, cx: &mut App| {
+            cx.stop_propagation();
+        })
         .child(label.into())
 }
 
@@ -260,6 +267,9 @@ pub fn titlebar_mode_toggle(
         )
         .child(toggle_pill(enabled, palette))
         .id(id)
+        .on_mouse_down(MouseButton::Left, |_, _, cx: &mut App| {
+            cx.stop_propagation();
+        })
         .on_click(move |_, window, cx| {
             let next = if enabled {
                 ToggleState::Unselected
@@ -710,5 +720,8 @@ fn chrome_button(
         .border_color(border)
         .text_sm()
         .text_color(text_color)
+        .on_mouse_down(MouseButton::Left, |_, _, cx: &mut App| {
+            cx.stop_propagation();
+        })
         .child(glyph)
 }
