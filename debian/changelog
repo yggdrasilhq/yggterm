@@ -1,3 +1,11 @@
+yggterm (0.1.5-1) unstable; urgency=medium
+
+  * Drop the stale yggterm-zed-shell crate from the active release path.
+  * Make yggterm-ui the owned GPUI shell crate for chrome and workspace rendering.
+  * Keep release workflow, packaging, and licensing aligned with the Apache-only crate layout.
+
+ -- Yggdrasil HQ <opensource@yggdrasilhq.invalid>  Wed, 18 Mar 2026 00:00:00 +0000
+
 yggterm (0.1.4-1) unstable; urgency=medium
 
   * Stabilize the Zed-style shell frame and command palette overlay.
