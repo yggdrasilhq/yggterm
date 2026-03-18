@@ -163,7 +163,7 @@ pub fn statusbar_frame(
         .child(right)
 }
 
-pub fn window_controls(window: &mut Window) -> AnyElement {
+pub fn window_controls(window: &mut Window, palette: &UiPalette) -> AnyElement {
     let supported = window.window_controls();
     let controls = row()
         .id("yggterm-window-controls")
@@ -204,22 +204,39 @@ pub fn window_controls(window: &mut Window) -> AnyElement {
     #[cfg(not(target_os = "macos"))]
     let controls = controls
         .when(supported.minimize, |row| {
-            row.child(window_control("minimize", "−", move |window| {
-                window.minimize_window();
-            }))
+            row.child(window_control(
+                "minimize",
+                "—",
+                palette.text,
+                palette.surface_background.opacity(0.92),
+                palette.border_variant.opacity(0.9),
+                move |window| {
+                    window.minimize_window();
+                },
+            ))
         })
         .when(supported.maximize, |row| {
             row.child(window_control(
                 "maximize-or-restore",
-                if window.is_maximized() { "❐" } else { "□" },
+                if window.is_maximized() { "❐" } else { "▢" },
+                palette.text,
+                palette.surface_background.opacity(0.92),
+                palette.border_variant.opacity(0.9),
                 move |window| {
                     window.zoom_window();
                 },
             ))
         })
-        .child(window_control("close", "×", move |window| {
-            window.remove_window();
-        }));
+        .child(window_control(
+            "close",
+            "✕",
+            hsla(0.01, 0.68, 0.46, 1.0),
+            hsla(0.01, 0.68, 0.46, 0.08),
+            hsla(0.01, 0.68, 0.46, 0.18),
+            move |window| {
+                window.remove_window();
+            },
+        ));
 
     controls.into_any_element()
 }
@@ -321,14 +338,17 @@ pub fn titlebar_mode_toggle(
 fn window_control(
     id: &'static str,
     glyph: &'static str,
+    text_color: Hsla,
+    background: Hsla,
+    border: Hsla,
     on_click: impl Fn(&mut Window) + 'static,
 ) -> impl IntoElement {
     chrome_button(
         id,
         glyph,
-        hsla(0., 0., 0.7, 1.0),
-        hsla(0., 0., 0.0, 0.0),
-        hsla(0., 0., 0.0, 0.0),
+        text_color,
+        background,
+        border,
     )
     .on_click(move |_, window, cx| {
         cx.stop_propagation();
@@ -336,6 +356,7 @@ fn window_control(
     })
 }
 
+#[cfg(target_os = "macos")]
 fn traffic_light(
     id: &'static str,
     background: Hsla,
@@ -365,7 +386,7 @@ pub fn terminal_surface_card<S: AsRef<str>>(
 ) -> AnyElement {
     let badge = badge.unwrap_or("session").to_string();
     column()
-        .gap_2()
+        .gap_1p5()
         .p_3p5()
         .rounded_lg()
         .bg(palette.surface_background)
@@ -516,7 +537,7 @@ pub fn chat_preview_card(
         .pt(if grouped_with_previous {
             px(2.)
         } else {
-            px(12.)
+            px(10.)
         })
         .pb(px(2.))
         .justify_start()
@@ -645,13 +666,15 @@ fn render_preview_segments(
                 .bg(match tone {
                     ChatBubbleTone::User => palette.text_accent.opacity(0.10),
                     ChatBubbleTone::Assistant | ChatBubbleTone::Neutral => {
-                        palette.window_background.opacity(0.55)
+                        palette.window_background.opacity(0.48)
                     }
                 })
                 .border_1()
                 .border_color(match tone {
                     ChatBubbleTone::User => palette.text_accent.opacity(0.24),
-                    ChatBubbleTone::Assistant | ChatBubbleTone::Neutral => palette.border_variant,
+                    ChatBubbleTone::Assistant | ChatBubbleTone::Neutral => {
+                        palette.border_variant.opacity(0.82)
+                    }
                 })
                 .children(
                     chunk
@@ -769,7 +792,7 @@ fn chrome_button(
 ) -> Stateful<Div> {
     div()
         .id(id)
-        .size(px(24.))
+        .size(px(23.))
         .flex()
         .items_center()
         .justify_center()
@@ -777,7 +800,7 @@ fn chrome_button(
         .bg(background)
         .border_1()
         .border_color(border)
-        .text_sm()
+        .text_xs()
         .text_color(text_color)
         .on_mouse_down(MouseButton::Left, |_, _, cx: &mut App| {
             cx.stop_propagation();
