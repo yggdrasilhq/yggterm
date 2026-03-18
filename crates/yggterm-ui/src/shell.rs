@@ -1,9 +1,9 @@
 use anyhow::Result;
 use gpui::{
     AnyElement, App, AppContext, Bounds, Context, FocusHandle, InteractiveElement, IntoElement,
-    KeyBinding, ParentElement, Render, ScrollStrategy, StatefulInteractiveElement, Styled,
-    UniformListScrollHandle, Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations,
-    WindowOptions, actions, div, px, size, uniform_list,
+    KeyBinding, MouseButton, ParentElement, Render, ScrollStrategy, StatefulInteractiveElement,
+    Styled, UniformListScrollHandle, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowDecorations, WindowOptions, actions, div, px, size, uniform_list,
 };
 use gpui_platform::application;
 use yggterm_core::{
@@ -14,7 +14,7 @@ use yggterm_core::{
 use crate::{
     ChatBubbleTone, TitlebarIcon, ToggleState, UiPalette, chat_preview_card, metadata_section_card,
     preview_summary_card, statusbar_frame, terminal_surface_card, titlebar_frame,
-    titlebar_icon_button, titlebar_mode_toggle, toolbar_chip_button,
+    titlebar_icon_button, titlebar_mode_toggle, toolbar_chip_button, window_controls,
 };
 
 actions!(
@@ -47,7 +47,7 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_background: WindowBackgroundAppearance::Opaque,
-                window_decorations: Some(WindowDecorations::Server),
+                window_decorations: Some(WindowDecorations::Client),
                 window_min_size: Some(size(px(1024.), px(720.))),
                 app_id: Some("dev.yggterm".into()),
                 ..Default::default()
@@ -361,6 +361,9 @@ impl GpuiShell {
             .focusable()
             .key_context("SearchInput")
             .track_focus(&self.search_focus)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
             .on_action(
                 cx.listener(|this, _: &SearchPrev, _, cx| this.move_search_selection(-1, cx)),
             )
@@ -515,6 +518,7 @@ impl GpuiShell {
                     titlebar_icon_button("toggle-meta", TitlebarIcon::Info, palette)
                         .on_click(cx.listener(|this, _, _, cx| this.toggle_right_panel(cx))),
                 )
+                .child(window_controls(window))
                 .into_any_element();
 
         titlebar_frame(
