@@ -338,6 +338,7 @@ pub fn terminal_surface_card<S: AsRef<str>>(
 
 pub fn preview_summary_card(
     title: &str,
+    subtitle: &str,
     query: &str,
     matching_blocks: usize,
     total_blocks: usize,
@@ -369,6 +370,15 @@ pub fn preview_summary_card(
                         .child(format!("{matching_blocks}/{total_blocks} blocks")),
                 ),
         )
+        .when(!subtitle.is_empty(), |this| {
+            this.child(
+                div()
+                    .text_xs()
+                    .text_color(palette.text_muted)
+                    .line_clamp(1)
+                    .child(subtitle.to_string()),
+            )
+        })
         .when(!query.is_empty(), |this| {
             this.child(
                 div()
@@ -377,6 +387,28 @@ pub fn preview_summary_card(
                     .child(format!("Filtered by \"{query}\"")),
             )
         })
+        .into_any_element()
+}
+
+pub fn metadata_section_card(
+    title: &str,
+    rows: Vec<AnyElement>,
+    palette: &UiPalette,
+) -> AnyElement {
+    column()
+        .gap_2()
+        .p_3()
+        .rounded_lg()
+        .bg(palette.surface_background)
+        .border_1()
+        .border_color(palette.border_variant)
+        .child(
+            div()
+                .text_xs()
+                .text_color(palette.text_muted)
+                .child(title.to_string()),
+        )
+        .children(rows)
         .into_any_element()
 }
 

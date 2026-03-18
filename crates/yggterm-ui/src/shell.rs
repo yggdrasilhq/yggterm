@@ -7,14 +7,14 @@ use gpui::{
 };
 use gpui_platform::application;
 use yggterm_core::{
-    BrowserRow, BrowserRowKind, ManagedSessionView, PreviewTone, SessionBrowserState,
-    SessionMetadataEntry, SessionNode, UiTheme, WorkspaceViewMode, YggtermServer,
+    BrowserRow, BrowserRowKind, ManagedSessionView, PreviewTone, SessionBrowserState, SessionNode,
+    UiTheme, WorkspaceViewMode, YggtermServer,
 };
 
 use crate::{
-    ChatBubbleTone, TitlebarIcon, ToggleState, UiPalette, chat_preview_card, preview_summary_card,
-    statusbar_frame, terminal_surface_card, titlebar_frame, titlebar_icon_button,
-    titlebar_mode_toggle, toolbar_chip_button,
+    ChatBubbleTone, TitlebarIcon, ToggleState, UiPalette, chat_preview_card, metadata_section_card,
+    preview_summary_card, statusbar_frame, terminal_surface_card, titlebar_frame,
+    titlebar_icon_button, titlebar_mode_toggle, toolbar_chip_button,
 };
 
 actions!(
@@ -160,6 +160,15 @@ impl GpuiShell {
 
     fn selected_row(&self) -> Option<&BrowserRow> {
         self.browser.selected_row()
+    }
+
+    fn metadata_value<'a>(&self, session: &'a ManagedSessionView, label: &str) -> &'a str {
+        session
+            .metadata
+            .iter()
+            .find(|entry| entry.label == label)
+            .map(|entry| entry.value.as_str())
+            .unwrap_or("")
     }
 
     fn total_leaf_sessions(&self) -> usize {
@@ -690,6 +699,12 @@ impl GpuiShell {
                     .into_any_element()
             }
             Some(session) => {
+                let subtitle = format!(
+                    "{} · {} · {}",
+                    self.metadata_value(session, "Host"),
+                    self.metadata_value(session, "Started"),
+                    self.metadata_value(session, "Messages")
+                );
                 let blocks = session
                     .preview
                     .blocks
@@ -716,7 +731,14 @@ impl GpuiShell {
                             .items_center()
                             .justify_between()
                             .gap_3()
-                            .child(preview_summary_card("Conversation", "", blocks.len(), blocks.len(), palette))
+                            .child(preview_summary_card(
+                                &session.title,
+                                &subtitle,
+                                "",
+                                blocks.len(),
+                                blocks.len(),
+                                palette,
+                            ))
                             .child(
                                 div()
                                     .flex()
@@ -757,8 +779,9 @@ impl GpuiShell {
             .child(
                 div()
                     .w_full()
-                    .h(px(34.))
+                    .min_h(px(42.))
                     .px_3()
+                    .py_2()
                     .flex()
                     .items_center()
                     .justify_between()
@@ -767,9 +790,29 @@ impl GpuiShell {
                     .bg(palette.window_background)
                     .child(
                         div()
-                            .text_sm()
-                            .text_color(palette.text_muted)
-                            .child(selected_path),
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(
+                                div().text_sm().text_color(palette.text).child(
+                                    self.active_session()
+                                        .map(|session| session.title.clone())
+                                        .unwrap_or_else(|| "No session selected".to_string()),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(palette.text_muted)
+                                    .line_clamp(1)
+                                    .child(
+                                        self.active_session()
+                                            .map(|session| {
+                                                self.metadata_value(session, "Cwd").to_string()
+                                            })
+                                            .unwrap_or(selected_path.clone()),
+                                    ),
+                            ),
                     )
                     .child(
                         div()
@@ -855,13 +898,54 @@ impl GpuiShell {
             return div().into_any_element();
         }
 
-        let metadata = self
-            .active_session()
-            .map(|session| session.metadata.clone())
-            .unwrap_or_default();
+        let inspector_body = if let Some(session) = self.active_session() {
+            let overview_rows = vec![
+                metadata_stat("Session", &session.title, palette),
+                metadata_stat("Source", self.metadata_value(session, "Source"), palette),
+                metadata_stat("Host", self.metadata_value(session, "Host"), palette),
+            ];
+            let timeline_rows = vec![
+                metadata_stat("Started", self.metadata_value(session, "Started"), palette),
+                metadata_stat("Updated", self.metadata_value(session, "Updated"), palette),
+                metadata_stat(
+                    "Messages",
+                    self.metadata_value(session, "Messages"),
+                    palette,
+                ),
+                metadata_stat(
+                    "Preview",
+                    self.metadata_value(session, "Preview Blocks"),
+                    palette,
+                ),
+            ];
+            let runtime_rows = vec![
+                metadata_stat("Backend", self.metadata_value(session, "Backend"), palette),
+                metadata_stat("Status", self.metadata_value(session, "Status"), palette),
+                metadata_stat("Bridge", self.metadata_value(session, "Bridge"), palette),
+                metadata_stat("PID", self.metadata_value(session, "Launch PID"), palette),
+            ];
+            let location_rows = vec![
+                metadata_stat("Cwd", self.metadata_value(session, "Cwd"), palette),
+                metadata_stat("Storage", self.metadata_value(session, "Storage"), palette),
+                metadata_stat("Restore", self.metadata_value(session, "Restore"), palette),
+            ];
+
+            vec![
+                metadata_section_card("Overview", overview_rows, palette),
+                metadata_section_card("Timeline", timeline_rows, palette),
+                metadata_section_card("Runtime", runtime_rows, palette),
+                metadata_section_card("Location", location_rows, palette),
+            ]
+        } else {
+            vec![metadata_section_card(
+                "Session Metadata",
+                vec![metadata_stat("State", "No session selected", palette)],
+                palette,
+            )]
+        };
 
         div()
-            .w(px(280.))
+            .w(px(272.))
             .h_full()
             .flex()
             .flex_col()
@@ -877,7 +961,7 @@ impl GpuiShell {
                     .child(
                         div()
                             .text_sm()
-                            .text_color(palette.text_muted)
+                            .text_color(palette.text)
                             .child("Session Metadata"),
                     ),
             )
@@ -887,11 +971,11 @@ impl GpuiShell {
                     .flex_1()
                     .overflow_y_scroll()
                     .scrollbar_width(px(10.))
-                    .children(
-                        metadata
-                            .into_iter()
-                            .map(|entry| metadata_row(entry, palette)),
-                    ),
+                    .p_3()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .children(inspector_body),
             )
             .into_any_element()
     }
@@ -965,30 +1049,23 @@ impl Render for GpuiShell {
     }
 }
 
-fn metadata_row(entry: SessionMetadataEntry, palette: &UiPalette) -> AnyElement {
+fn metadata_stat(label: &str, value: &str, palette: &UiPalette) -> AnyElement {
     div()
-        .px_3()
-        .py_2p5()
-        .border_b_1()
-        .border_color(palette.border_variant.opacity(0.65))
+        .flex()
+        .flex_col()
+        .gap_1()
         .child(
             div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(palette.text_muted)
-                        .child(entry.label),
-                )
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(palette.text)
-                        .whitespace_normal()
-                        .child(entry.value),
-                ),
+                .text_xs()
+                .text_color(palette.text_muted)
+                .child(label.to_string()),
+        )
+        .child(
+            div()
+                .text_sm()
+                .text_color(palette.text)
+                .whitespace_normal()
+                .child(value.to_string()),
         )
         .into_any_element()
 }
