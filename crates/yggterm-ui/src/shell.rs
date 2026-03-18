@@ -5,7 +5,8 @@ use once_cell::sync::OnceCell;
 use std::path::PathBuf;
 use yggterm_core::{
     AppSettings, BrowserRow, BrowserRowKind, ManagedSessionView, PreviewTone, SessionBrowserState,
-    SessionNode, SshConnectTarget, UiTheme, WorkspaceViewMode, YggtermServer, save_settings_file,
+    SessionNode, SessionStore, SshConnectTarget, UiTheme, WorkspaceViewMode, YggtermServer,
+    save_settings_file,
 };
 
 static BOOTSTRAP: OnceCell<ShellBootstrap> = OnceCell::new();
@@ -268,6 +269,41 @@ impl ShellState {
         self.last_action = "updated interface llm".to_string();
     }
 
+    fn generate_session_titles(&mut self) {
+        if self.settings.litellm_endpoint.trim().is_empty()
+            || self.settings.litellm_api_key.trim().is_empty()
+            || self.settings.interface_llm_model.trim().is_empty()
+        {
+            self.last_action = "configure LiteLLM settings first".to_string();
+            return;
+        }
+
+        let selected_path = self.browser.selected_path().map(str::to_string);
+        let filter_query = self.search_query.clone();
+
+        match SessionStore::open_or_init().and_then(|store| {
+            let generated = store.generate_missing_codex_titles(&self.settings, 8)?;
+            let browser_tree = store.load_codex_tree(&self.settings)?;
+            Ok((generated, browser_tree))
+        }) {
+            Ok((generated, browser_tree)) => {
+                self.browser = SessionBrowserState::new(browser_tree);
+                self.browser.set_filter_query(filter_query);
+                if let Some(path) = selected_path {
+                    self.browser.select_path(path);
+                }
+                self.last_action = if generated == 0 {
+                    "titles already cached".to_string()
+                } else {
+                    format!("generated {generated} titles")
+                };
+            }
+            Err(error) => {
+                self.last_action = format!("title generation failed: {error}");
+            }
+        }
+    }
+
     fn persist_settings(&self) {
         let _ = save_settings_file(&self.bootstrap.settings_path, &self.settings);
     }
@@ -346,6 +382,7 @@ fn app() -> Element {
                             on_endpoint_change: move |value: String| state.with_mut(|shell| shell.update_litellm_endpoint(value)),
                             on_api_key_change: move |value: String| state.with_mut(|shell| shell.update_litellm_api_key(value)),
                             on_model_change: move |value: String| state.with_mut(|shell| shell.update_interface_llm_model(value)),
+                            on_generate_titles: move |_| state.with_mut(|shell| shell.generate_session_titles()),
                         }
                     }
                 }
@@ -990,6 +1027,7 @@ fn RightRail(
     on_endpoint_change: EventHandler<String>,
     on_api_key_change: EventHandler<String>,
     on_model_change: EventHandler<String>,
+    on_generate_titles: EventHandler<MouseEvent>,
 ) -> Element {
     rsx! {
         div {
@@ -1008,6 +1046,7 @@ fn RightRail(
                     on_endpoint_change,
                     on_api_key_change,
                     on_model_change,
+                    on_generate_titles,
                 }
             }
         }
@@ -1059,6 +1098,7 @@ fn SettingsRailBody(
     on_endpoint_change: EventHandler<String>,
     on_api_key_change: EventHandler<String>,
     on_model_change: EventHandler<String>,
+    on_generate_titles: EventHandler<MouseEvent>,
 ) -> Element {
     rsx! {
         div {
@@ -1094,9 +1134,18 @@ fn SettingsRailBody(
                 palette: snapshot.palette,
                 on_change: on_model_change,
             }
+            button {
+                style: format!(
+                    "height:32px; border:none; border-radius:10px; background:{}; color:{}; \
+                     font-size:11px; font-weight:700; text-align:center;",
+                    snapshot.palette.accent_soft, snapshot.palette.text
+                ),
+                onclick: move |evt| on_generate_titles.call(evt),
+                "Generate Session Titles"
+            }
             div {
                 style: format!("font-size:11px; line-height:1.5; color:{};", snapshot.palette.muted),
-                "Future session-title generation will use this configuration to summarize recent terminal or Codex context into friendlier names under ~/.yggterm."
+                "Yggterm caches generated titles under ~/.yggterm/session-titles.db and only refreshes them when you ask for it here."
             }
         }
     }

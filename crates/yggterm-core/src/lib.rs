@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use titles::SessionTitleResolver;
+use titles::{SessionTitleResolver, settings_ready as litellm_settings_ready};
 
 pub use browser::{BrowserMetrics, BrowserRow, BrowserRowKind, SessionBrowserState};
 pub use server::{
@@ -141,6 +141,31 @@ impl SessionStore {
     pub fn load_codex_tree(&self, settings: &AppSettings) -> Result<SessionNode> {
         let codex_root = resolve_codex_sessions_root()?;
         build_codex_browser_tree(&self.home, &codex_root, settings)
+    }
+
+    pub fn generate_missing_codex_titles(
+        &self,
+        settings: &AppSettings,
+        budget: usize,
+    ) -> Result<usize> {
+        if budget == 0 || !litellm_settings_ready(settings) {
+            return Ok(0);
+        }
+
+        let codex_root = resolve_codex_sessions_root()?;
+        if !codex_root.exists() {
+            return Ok(0);
+        }
+
+        let resolver = SessionTitleResolver::new(&self.home)?;
+        let mut remaining_budget = budget;
+        generate_missing_codex_titles_recursive(
+            &resolver,
+            settings,
+            &codex_root,
+            &mut remaining_budget,
+        )?;
+        Ok(budget.saturating_sub(remaining_budget))
     }
 }
 
@@ -326,6 +351,12 @@ struct CodexSessionSummary {
 }
 
 #[derive(Debug, Clone)]
+struct CodexSessionIdentity {
+    session_id: String,
+    cwd: String,
+}
+
+#[derive(Debug, Clone)]
 struct CodexProjectBucket {
     cwd: String,
     sessions: Vec<CodexSessionSummary>,
@@ -342,11 +373,11 @@ struct CodexBrowserTreeNode {
 fn build_codex_browser_tree(
     home: &Path,
     codex_root: &Path,
-    settings: &AppSettings,
+    _settings: &AppSettings,
 ) -> Result<SessionNode> {
-    let mut title_resolver = SessionTitleResolver::new(home, settings).ok();
+    let title_resolver = SessionTitleResolver::new(home).ok();
     let sessions = if codex_root.exists() {
-        scan_codex_sessions(codex_root, &mut title_resolver)?
+        scan_codex_sessions(codex_root, title_resolver.as_ref())?
     } else {
         Vec::new()
     };
@@ -384,7 +415,7 @@ fn build_codex_browser_tree(
 
 fn scan_codex_sessions(
     root: &Path,
-    title_resolver: &mut Option<SessionTitleResolver>,
+    title_resolver: Option<&SessionTitleResolver>,
 ) -> Result<Vec<CodexSessionSummary>> {
     let mut sessions = Vec::new();
     for entry in
@@ -406,8 +437,22 @@ fn scan_codex_sessions(
 
 fn read_codex_session_summary(
     path: &Path,
-    title_resolver: &mut Option<SessionTitleResolver>,
+    title_resolver: Option<&SessionTitleResolver>,
 ) -> Result<Option<CodexSessionSummary>> {
+    let Some(identity) = read_codex_session_identity(path)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(CodexSessionSummary {
+        file_path: path.to_path_buf(),
+        generated_title: title_resolver
+            .and_then(|resolver| resolver.resolve_for_session(&identity.session_id).ok().flatten()),
+        session_id: identity.session_id,
+        cwd: identity.cwd,
+    }))
+}
+
+fn read_codex_session_identity(path: &Path) -> Result<Option<CodexSessionIdentity>> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read codex session {}", path.display()))?;
 
@@ -440,19 +485,56 @@ fn read_codex_session_summary(
         return Ok(None);
     };
 
-    Ok(Some(CodexSessionSummary {
-        file_path: path.to_path_buf(),
-        generated_title: title_resolver
-            .as_mut()
-            .and_then(|resolver| {
-                resolver
-                    .resolve_for_session(session_id.as_deref().unwrap_or(&fallback_id), &cwd, path)
-                    .ok()
-                    .flatten()
-            }),
+    Ok(Some(CodexSessionIdentity {
         session_id: session_id.unwrap_or(fallback_id),
         cwd,
     }))
+}
+
+fn generate_missing_codex_titles_recursive(
+    resolver: &SessionTitleResolver,
+    settings: &AppSettings,
+    root: &Path,
+    remaining_budget: &mut usize,
+) -> Result<()> {
+    if *remaining_budget == 0 {
+        return Ok(());
+    }
+
+    for entry in
+        fs::read_dir(root).with_context(|| format!("failed to read dir {}", root.display()))?
+    {
+        if *remaining_budget == 0 {
+            break;
+        }
+
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            generate_missing_codex_titles_recursive(resolver, settings, &path, remaining_budget)?;
+            continue;
+        }
+
+        if !is_codex_session_file(&path) {
+            continue;
+        }
+
+        let Some(identity) = read_codex_session_identity(&path)? else {
+            continue;
+        };
+        if resolver.resolve_for_session(&identity.session_id)?.is_some() {
+            continue;
+        }
+        if resolver
+            .generate_for_session(settings, &identity.session_id, &identity.cwd, &path)?
+            .is_some()
+        {
+            *remaining_budget = remaining_budget.saturating_sub(1);
+        }
+    }
+
+    Ok(())
 }
 
 fn find_string_field(value: &Value, keys: &[&str]) -> Option<String> {
