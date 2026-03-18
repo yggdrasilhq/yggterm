@@ -36,6 +36,9 @@ struct ShellState {
     right_panel_mode: RightPanelMode,
     last_action: String,
     maximized: bool,
+    notifications: Vec<ToastNotification>,
+    next_notification_id: u64,
+    context_menu_row: Option<BrowserRow>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -44,6 +47,23 @@ enum RightPanelMode {
     Metadata,
     Settings,
     Connect,
+    Notifications,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NotificationTone {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+#[derive(Clone, PartialEq)]
+struct ToastNotification {
+    id: u64,
+    tone: NotificationTone,
+    title: String,
+    message: String,
 }
 
 #[derive(Clone, PartialEq)]
@@ -64,6 +84,8 @@ struct RenderSnapshot {
     ghostty_bridge_detail: String,
     settings: AppSettings,
     maximized: bool,
+    notifications: Vec<ToastNotification>,
+    context_menu_row: Option<BrowserRow>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -116,6 +138,9 @@ impl ShellState {
             right_panel_mode,
             last_action: "ready".to_string(),
             maximized: false,
+            notifications: Vec::new(),
+            next_notification_id: 1,
+            context_menu_row: None,
         }
     }
 
@@ -137,6 +162,8 @@ impl ShellState {
             ghostty_bridge_detail: self.bootstrap.ghostty_bridge_detail.clone(),
             settings: self.settings.clone(),
             maximized: self.maximized,
+            notifications: self.notifications.clone(),
+            context_menu_row: self.context_menu_row.clone(),
         }
     }
 
@@ -172,6 +199,7 @@ impl ShellState {
             RightPanelMode::Hidden => "right panel hidden".to_string(),
             RightPanelMode::Settings => "settings opened".to_string(),
             RightPanelMode::Connect => "ssh connect opened".to_string(),
+            RightPanelMode::Notifications => "notifications opened".to_string(),
         };
     }
 
@@ -188,6 +216,7 @@ impl ShellState {
             RightPanelMode::Hidden => "right panel hidden".to_string(),
             RightPanelMode::Metadata => "metadata opened".to_string(),
             RightPanelMode::Connect => "ssh connect opened".to_string(),
+            RightPanelMode::Notifications => "notifications opened".to_string(),
         };
     }
 
@@ -204,6 +233,22 @@ impl ShellState {
             RightPanelMode::Hidden => "right panel hidden".to_string(),
             RightPanelMode::Metadata => "metadata opened".to_string(),
             RightPanelMode::Settings => "settings opened".to_string(),
+            RightPanelMode::Notifications => "notifications opened".to_string(),
+        };
+    }
+
+    fn toggle_notifications_panel(&mut self) {
+        self.right_panel_mode = if self.right_panel_mode == RightPanelMode::Notifications {
+            RightPanelMode::Hidden
+        } else {
+            RightPanelMode::Notifications
+        };
+        self.last_action = match self.right_panel_mode {
+            RightPanelMode::Notifications => "notifications opened".to_string(),
+            RightPanelMode::Hidden => "right panel hidden".to_string(),
+            RightPanelMode::Metadata => "metadata opened".to_string(),
+            RightPanelMode::Settings => "settings opened".to_string(),
+            RightPanelMode::Connect => "ssh connect opened".to_string(),
         };
     }
 
@@ -223,6 +268,7 @@ impl ShellState {
                 self.last_action = format!("toggled {}", row.label);
             }
             BrowserRowKind::Session => {
+                self.context_menu_row = None;
                 self.server.open_or_focus_session(
                     &row.full_path,
                     row.session_id.as_deref(),
@@ -231,6 +277,9 @@ impl ShellState {
                 );
                 self.server.set_view_mode(WorkspaceViewMode::Rendered);
                 self.last_action = format!("opened {}", row.label);
+                if row.session_title.is_none() {
+                    self.generate_title_for_row(row, false);
+                }
             }
         }
     }
@@ -238,6 +287,11 @@ impl ShellState {
     fn connect_ssh_target(&mut self, target_ix: usize) {
         if let Some(key) = self.server.connect_ssh_target(target_ix) {
             self.last_action = format!("connected {key}");
+            self.push_notification(
+                NotificationTone::Success,
+                "SSH Session Started",
+                format!("Opened live session {key}."),
+            );
         }
     }
 
@@ -311,12 +365,33 @@ impl ShellState {
         self.maximized = !self.maximized;
     }
 
+    fn open_context_menu(&mut self, row: BrowserRow) {
+        self.context_menu_row = Some(row);
+    }
+
+    fn close_context_menu(&mut self) {
+        self.context_menu_row = None;
+    }
+
+    fn clear_notification(&mut self, id: u64) {
+        self.notifications.retain(|notification| notification.id != id);
+    }
+
+    fn clear_notifications(&mut self) {
+        self.notifications.clear();
+    }
+
     fn generate_session_titles(&mut self) {
         if self.settings.litellm_endpoint.trim().is_empty()
             || self.settings.litellm_api_key.trim().is_empty()
             || self.settings.interface_llm_model.trim().is_empty()
         {
             self.last_action = "configure LiteLLM settings first".to_string();
+            self.push_notification(
+                NotificationTone::Warning,
+                "LiteLLM Not Configured",
+                "Fill the endpoint, API key, and interface model before generating titles.",
+            );
             return;
         }
 
@@ -339,15 +414,111 @@ impl ShellState {
                 } else {
                     format!("generated {generated} titles")
                 };
+                self.push_notification(
+                    NotificationTone::Success,
+                    "Session Titles Updated",
+                    if generated == 0 {
+                        "All visible titles were already cached.".to_string()
+                    } else {
+                        format!("Generated {generated} new session titles.")
+                    },
+                );
             }
             Err(error) => {
                 self.last_action = format!("title generation failed: {error}");
+                self.push_notification(
+                    NotificationTone::Error,
+                    "Title Generation Failed",
+                    error.to_string(),
+                );
+            }
+        }
+    }
+
+    fn regenerate_title_for_row(&mut self, row: &BrowserRow) {
+        self.generate_title_for_row(row, true);
+        self.context_menu_row = None;
+    }
+
+    fn generate_title_for_row(&mut self, row: &BrowserRow, force: bool) {
+        if row.kind != BrowserRowKind::Session {
+            return;
+        }
+        if self.settings.litellm_endpoint.trim().is_empty()
+            || self.settings.litellm_api_key.trim().is_empty()
+            || self.settings.interface_llm_model.trim().is_empty()
+        {
+            self.push_notification(
+                NotificationTone::Warning,
+                "LiteLLM Not Configured",
+                "Open settings and configure LiteLLM before generating chat titles.",
+            );
+            return;
+        }
+
+        match SessionStore::open_or_init().and_then(|store| {
+            let title = store.generate_title_for_session_path(&self.settings, &row.full_path, force)?;
+            let browser_tree = store.load_codex_tree(&self.settings)?;
+            Ok((title, browser_tree))
+        }) {
+            Ok((Some(title), browser_tree)) => {
+                let selected_path = self.browser.selected_path().map(str::to_string);
+                let filter_query = self.search_query.clone();
+                self.browser = SessionBrowserState::new(browser_tree);
+                self.browser.set_filter_query(filter_query);
+                if let Some(path) = selected_path.or_else(|| Some(row.full_path.clone())) {
+                    self.browser.select_path(path);
+                }
+                self.server.open_or_focus_session(
+                    &row.full_path,
+                    row.session_id.as_deref(),
+                    row.session_cwd.as_deref(),
+                    Some(&title),
+                );
+                self.push_notification(
+                    NotificationTone::Success,
+                    if force { "Title Regenerated" } else { "Title Generated" },
+                    format!("Session is now titled “{title}”."),
+                );
+            }
+            Ok((None, _)) => {
+                self.push_notification(
+                    NotificationTone::Info,
+                    "No Title Generated",
+                    "This session did not produce enough context to title yet.",
+                );
+            }
+            Err(error) => {
+                self.push_notification(
+                    NotificationTone::Error,
+                    "Title Generation Failed",
+                    error.to_string(),
+                );
             }
         }
     }
 
     fn persist_settings(&self) {
         let _ = save_settings_file(&self.bootstrap.settings_path, &self.settings);
+    }
+
+    fn push_notification(
+        &mut self,
+        tone: NotificationTone,
+        title: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        self.notifications.push(ToastNotification {
+            id: self.next_notification_id,
+            tone,
+            title: title.into(),
+            message: message.into(),
+        });
+        self.next_notification_id += 1;
+        if self.notifications.len() > 1000 {
+            let overflow = self.notifications.len() - 1000;
+            self.notifications.drain(0..overflow);
+        }
     }
 }
 
@@ -398,6 +569,7 @@ fn app() -> Element {
                     on_toggle_meta: move || state.with_mut(|shell| shell.toggle_metadata_panel()),
                     on_toggle_settings: move || state.with_mut(|shell| shell.toggle_settings_panel()),
                     on_toggle_connect: move || state.with_mut(|shell| shell.toggle_connect_panel()),
+                    on_toggle_notifications: move || state.with_mut(|shell| shell.toggle_notifications_panel()),
                     on_toggle_maximized: move || state.with_mut(|shell| shell.toggle_maximized()),
                     maximized: maximized,
                 }
@@ -406,8 +578,7 @@ fn app() -> Element {
                     Sidebar {
                         snapshot: sidebar_snapshot,
                         on_select_row: move |row: BrowserRow| state.with_mut(|shell| shell.select_row(&row)),
-                        on_connect_ssh: move |ix: usize| state.with_mut(|shell| shell.connect_ssh_target(ix)),
-                        on_focus_live: move |id: String| state.with_mut(|shell| shell.focus_live_session(&id)),
+                        on_open_context_menu: move |row: BrowserRow| state.with_mut(|shell| shell.open_context_menu(row)),
                     }
                     MainSurface {
                         snapshot: main_snapshot,
@@ -428,6 +599,23 @@ fn app() -> Element {
                         on_adjust_main_zoom: move |delta: i32| state.with_mut(|shell| shell.adjust_main_zoom(delta)),
                         on_connect_ssh: move |ix: usize| state.with_mut(|shell| shell.connect_ssh_target(ix)),
                         on_focus_live: move |id: String| state.with_mut(|shell| shell.focus_live_session(&id)),
+                        on_clear_notification: move |id: u64| state.with_mut(|shell| shell.clear_notification(id)),
+                        on_clear_notifications: move |_| state.with_mut(|shell| shell.clear_notifications()),
+                    }
+                }
+                if let Some(row) = snapshot.context_menu_row.clone() {
+                    ContextMenuOverlay {
+                        row: row.clone(),
+                        palette: snapshot.palette,
+                        on_close: move |_| state.with_mut(|shell| shell.close_context_menu()),
+                        on_regenerate: move |_| state.with_mut(|shell| shell.regenerate_title_for_row(&row)),
+                    }
+                }
+                if !snapshot.notifications.is_empty() {
+                    ToastViewport {
+                        notifications: snapshot.notifications.clone(),
+                        palette: snapshot.palette,
+                        on_clear_notification: move |id: u64| state.with_mut(|shell| shell.clear_notification(id)),
                     }
                 }
             }
@@ -446,6 +634,7 @@ fn Titlebar(
     on_toggle_meta: EventHandler<()>,
     on_toggle_settings: EventHandler<()>,
     on_toggle_connect: EventHandler<()>,
+    on_toggle_notifications: EventHandler<()>,
     on_toggle_maximized: EventHandler<()>,
     maximized: bool,
 ) -> Element {
@@ -527,7 +716,17 @@ fn Titlebar(
                 button {
                     style: utility_icon_style(
                         snapshot.palette,
-                        snapshot.right_panel_mode == RightPanelMode::Settings
+                        snapshot.right_panel_mode == RightPanelMode::Notifications
+                    ),
+                    onmousedown: |evt| evt.stop_propagation(),
+                    onclick: move |_| on_toggle_notifications.call(()),
+                    BellIcon {}
+                }
+                button {
+                    style: utility_icon_style_sized(
+                        snapshot.palette,
+                        snapshot.right_panel_mode == RightPanelMode::Settings,
+                        15
                     ),
                     onmousedown: |evt| evt.stop_propagation(),
                     onclick: move |_| on_toggle_settings.call(()),
@@ -645,8 +844,7 @@ fn WindowControl(
 fn Sidebar(
     snapshot: RenderSnapshot,
     on_select_row: EventHandler<BrowserRow>,
-    on_connect_ssh: EventHandler<usize>,
-    on_focus_live: EventHandler<String>,
+    on_open_context_menu: EventHandler<BrowserRow>,
 ) -> Element {
     let width = if snapshot.sidebar_open { SIDE_RAIL_WIDTH } else { 0 };
     let opacity = if snapshot.sidebar_open { "1" } else { "0" };
@@ -664,11 +862,18 @@ fn Sidebar(
             div {
                 style: "flex:1; min-height:0; overflow:auto; padding:14px 12px 12px 12px;",
                 for row in snapshot.rows.iter().cloned() {
-                    SidebarRow {
-                        row: row.clone(),
-                        selected: snapshot.selected_path.as_deref() == Some(row.full_path.as_str()),
-                        palette: snapshot.palette,
-                        on_select: move |_| on_select_row.call(row.clone()),
+                    {
+                        let select_row = row.clone();
+                        let context_row = row.clone();
+                        rsx! {
+                            SidebarRow {
+                                row: row.clone(),
+                                selected: snapshot.selected_path.as_deref() == Some(row.full_path.as_str()),
+                                palette: snapshot.palette,
+                                on_select: move |_| on_select_row.call(select_row.clone()),
+                                on_open_context_menu: move |_| on_open_context_menu.call(context_row.clone()),
+                            }
+                        }
                     }
                 }
             }
@@ -682,6 +887,7 @@ fn SidebarRow(
     selected: bool,
     palette: Palette,
     on_select: EventHandler<MouseEvent>,
+    on_open_context_menu: EventHandler<MouseEvent>,
 ) -> Element {
     let indent = row.depth * 12 + 12;
     let background = if selected {
@@ -716,6 +922,10 @@ fn SidebarRow(
                 background, indent
             ),
             onclick: move |evt| on_select.call(evt),
+            oncontextmenu: move |evt| {
+                evt.prevent_default();
+                on_open_context_menu.call(evt);
+            },
             div {
                 style: "display:flex; align-items:center; justify-content:space-between; gap:8px;",
                 div {
@@ -842,6 +1052,31 @@ fn TreeIcon(row: BrowserRow) -> Element {
                     stroke_width: "1.0",
                     stroke_opacity: "0.42",
                 }
+            }
+        }
+    }
+}
+
+#[component]
+fn BellIcon() -> Element {
+    rsx! {
+        svg {
+            width: "15",
+            height: "15",
+            view_box: "0 0 16 16",
+            fill: "none",
+            xmlns: "http://www.w3.org/2000/svg",
+            path {
+                d: "M8 2.4C6.18 2.4 4.95 3.73 4.95 5.56V6.42C4.95 7.11 4.67 7.95 4.31 8.53L3.45 9.96C3.1 10.55 3.39 11.2 4.03 11.2H11.97C12.61 11.2 12.9 10.55 12.55 9.96L11.69 8.53C11.33 7.95 11.05 7.11 11.05 6.42V5.56C11.05 3.73 9.82 2.4 8 2.4Z",
+                stroke: "currentColor",
+                stroke_width: "1.15",
+                stroke_linejoin: "round",
+            }
+            path {
+                d: "M6.65 12.55C6.9 13.24 7.39 13.58 8 13.58C8.61 13.58 9.1 13.24 9.35 12.55",
+                stroke: "currentColor",
+                stroke_width: "1.15",
+                stroke_linecap: "round",
             }
         }
     }
@@ -1128,6 +1363,8 @@ fn RightRail(
     on_adjust_main_zoom: EventHandler<i32>,
     on_connect_ssh: EventHandler<usize>,
     on_focus_live: EventHandler<String>,
+    on_clear_notification: EventHandler<u64>,
+    on_clear_notifications: EventHandler<MouseEvent>,
 ) -> Element {
     let visible = snapshot.right_panel_mode != RightPanelMode::Hidden;
     let width = if visible { SIDE_RAIL_WIDTH } else { 0 };
@@ -1162,6 +1399,12 @@ fn RightRail(
                     snapshot: snapshot.clone(),
                     on_connect_ssh,
                     on_focus_live,
+                }
+            } else if snapshot.right_panel_mode == RightPanelMode::Notifications {
+                NotificationsRailBody {
+                    snapshot: snapshot.clone(),
+                    on_clear_notification,
+                    on_clear_notifications,
                 }
             }
         }
@@ -1283,6 +1526,48 @@ fn SettingsRailBody(
 }
 
 #[component]
+fn NotificationsRailBody(
+    snapshot: RenderSnapshot,
+    on_clear_notification: EventHandler<u64>,
+    on_clear_notifications: EventHandler<MouseEvent>,
+) -> Element {
+    rsx! {
+        div {
+            style: format!(
+                "padding:16px 16px 10px 16px; font-size:12px; font-weight:700; letter-spacing:0.01em; color:{};",
+                snapshot.palette.text
+            ),
+            "Notifications"
+        }
+        div {
+            style: "padding:0 16px 8px 16px; display:flex; justify-content:flex-end;",
+            button {
+                style: chip_style(snapshot.palette, false),
+                onclick: move |evt| on_clear_notifications.call(evt),
+                "Clear All"
+            }
+        }
+        div {
+            style: "flex:1; overflow:auto; padding:10px 16px 14px 16px; display:flex; flex-direction:column; gap:10px;",
+            if snapshot.notifications.is_empty() {
+                div {
+                    style: format!("font-size:12px; line-height:1.5; color:{};", snapshot.palette.muted),
+                    "No notifications yet."
+                }
+            } else {
+                for notification in snapshot.notifications.iter().cloned().rev() {
+                    NotificationCard {
+                        notification: notification.clone(),
+                        palette: snapshot.palette,
+                        on_clear: move |_| on_clear_notification.call(notification.id),
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
 fn ConnectRailBody(
     snapshot: RenderSnapshot,
     on_connect_ssh: EventHandler<usize>,
@@ -1352,6 +1637,103 @@ fn ConnectRailBody(
                                 }
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn NotificationCard(
+    notification: ToastNotification,
+    palette: Palette,
+    on_clear: EventHandler<MouseEvent>,
+) -> Element {
+    let (tone_bg, tone_fg) = notification_tone_colors(notification.tone, palette);
+    rsx! {
+        div {
+            style: format!(
+                "display:flex; flex-direction:column; gap:7px; padding:12px 12px 11px 12px; border-radius:12px; \
+                 background:{}; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.24);",
+                tone_bg
+            ),
+            div {
+                style: "display:flex; align-items:center; justify-content:space-between; gap:8px;",
+                div {
+                    style: format!("font-size:12px; font-weight:700; color:{};", tone_fg),
+                    "{notification.title}"
+                }
+                button {
+                    style: format!(
+                        "width:22px; height:22px; border:none; border-radius:8px; background:rgba(255,255,255,0.30); color:{}; font-size:12px; font-weight:700;",
+                        tone_fg
+                    ),
+                    onclick: move |evt| on_clear.call(evt),
+                    "×"
+                }
+            }
+            div {
+                style: format!("font-size:11px; line-height:1.45; color:{};", palette.text),
+                "{notification.message}"
+            }
+        }
+    }
+}
+
+#[component]
+fn ContextMenuOverlay(
+    row: BrowserRow,
+    palette: Palette,
+    on_close: EventHandler<MouseEvent>,
+    on_regenerate: EventHandler<MouseEvent>,
+) -> Element {
+    rsx! {
+        div {
+            style: "position:fixed; inset:0; z-index:90; background:transparent;",
+            onclick: move |evt| on_close.call(evt),
+            div {
+                style: format!(
+                    "position:absolute; top:60px; left:18px; min-width:180px; padding:8px; border-radius:14px; \
+                     background:rgba(255,255,255,0.96); box-shadow: 0 18px 44px rgba(69,108,136,0.18);"
+                ),
+                onmousedown: |evt| evt.stop_propagation(),
+                onclick: |evt| evt.stop_propagation(),
+                div {
+                    style: format!("padding:4px 8px 8px 8px; font-size:11px; font-weight:700; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.muted),
+                    "{row.label}"
+                }
+                button {
+                    style: format!(
+                        "width:100%; height:30px; border:none; border-radius:10px; background:{}; color:{}; \
+                         font-size:12px; font-weight:600; text-align:left; padding:0 10px;",
+                        palette.accent_soft, palette.text
+                    ),
+                    onclick: move |evt| on_regenerate.call(evt),
+                    "Regenerate Title"
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn ToastViewport(
+    notifications: Vec<ToastNotification>,
+    palette: Palette,
+    on_clear_notification: EventHandler<u64>,
+) -> Element {
+    let items = notifications.into_iter().rev().take(4).collect::<Vec<_>>();
+    rsx! {
+        div {
+            style: "position:fixed; top:56px; right:18px; z-index:80; display:flex; flex-direction:column; gap:10px; width:300px; pointer-events:none;",
+            for notification in items {
+                div {
+                    style: "pointer-events:auto;",
+                    NotificationCard {
+                        notification: notification.clone(),
+                        palette,
+                        on_clear: move |_| on_clear_notification.call(notification.id),
                     }
                 }
             }
@@ -1522,10 +1904,15 @@ fn icon_button_style(palette: Palette) -> String {
 }
 
 fn utility_icon_style(palette: Palette, selected: bool) -> String {
+    utility_icon_style_sized(palette, selected, 13)
+}
+
+fn utility_icon_style_sized(palette: Palette, selected: bool, font_size_px: u8) -> String {
     format!(
-        "width:28px; height:28px; border:none; border-radius:10px; background:{}; color:{}; font-size:13px; font-weight:700;",
+        "width:28px; height:28px; border:none; border-radius:10px; background:{}; color:{}; font-size:{}px; font-weight:700;",
         if selected { "rgba(255,255,255,0.46)" } else { "transparent" },
-        if selected { palette.text } else { palette.muted }
+        if selected { palette.text } else { palette.muted },
+        font_size_px
     )
 }
 
@@ -1550,7 +1937,8 @@ fn chip_style(palette: Palette, selected: bool) -> String {
 
 fn sidebar_action_style(palette: Palette) -> String {
     format!(
-        "width:100%; border:none; border-radius:12px; background:{}; padding:8px 10px; text-align:left;",
+        "width:100%; border:none; border-radius:12px; background:{}; padding:8px 10px; text-align:left; \
+         text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased;",
         palette.sidebar_hover
     )
 }
@@ -1575,6 +1963,15 @@ fn settings_input_style(palette: Palette) -> String {
          color:{}; outline:none; font-size:11px; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.34);",
         palette.text
     )
+}
+
+fn notification_tone_colors(tone: NotificationTone, palette: Palette) -> (&'static str, &'static str) {
+    match tone {
+        NotificationTone::Info => ("rgba(114,190,215,0.18)", palette.accent),
+        NotificationTone::Success => ("rgba(110,201,141,0.18)", "#227a45"),
+        NotificationTone::Warning => ("rgba(242,198,89,0.22)", "#8e6513"),
+        NotificationTone::Error => ("rgba(226,86,86,0.18)", "#b12e2e"),
+    }
 }
 
 fn zoom_button_style(palette: Palette) -> String {
