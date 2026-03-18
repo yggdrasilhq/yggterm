@@ -99,6 +99,12 @@ Run locally:
 cargo +1.94.0 run
 ```
 
+Run via npm:
+
+```bash
+npx -y yggterm
+```
+
 ## Release artifacts
 
 Release packaging is generated from this repository and written to `dist/`.
