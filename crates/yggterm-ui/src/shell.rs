@@ -643,11 +643,6 @@ fn SidebarRow(
     palette: Palette,
     on_select: EventHandler<MouseEvent>,
 ) -> Element {
-    let disclosure = match row.kind {
-        BrowserRowKind::Group if row.expanded => "▾",
-        BrowserRowKind::Group => "▸",
-        BrowserRowKind::Session => "",
-    };
     let indent = row.depth * 12 + 12;
     let background = if selected {
         palette.accent_soft
@@ -659,9 +654,9 @@ fn SidebarRow(
     let icon = if row.kind == BrowserRowKind::Session {
         ">_"
     } else if row.depth == 0 {
-        "🖥"
+        if row.expanded { "▥" } else { "▤" }
     } else {
-        "📁"
+        if row.expanded { "⊟" } else { "⊞" }
     };
 
     rsx! {
@@ -677,14 +672,14 @@ fn SidebarRow(
                 div {
                     style: "display:flex; align-items:center; gap:8px; min-width:0;",
                     span {
-                        style: format!("font-size:10px; color:{};", palette.muted),
+                        style: format!(
+                            "display:inline-flex; align-items:center; justify-content:center; min-width:18px; \
+                             font-size:{}; line-height:1; color:{}; font-weight:{};",
+                            if row.kind == BrowserRowKind::Session { "12px" } else { "13px" },
+                            if selected { palette.text } else { palette.muted },
+                            if row.kind == BrowserRowKind::Session { 700 } else { 600 }
+                        ),
                         "{icon}"
-                    }
-                    if !disclosure.is_empty() {
-                        span {
-                            style: format!("font-size:10px; color:{};", palette.muted),
-                            "{disclosure}"
-                        }
                     }
                     span {
                         style: format!(
@@ -1000,8 +995,10 @@ fn RightRail(
         div {
             style: format!(
                 "width:236px; min-width:236px; max-width:236px; display:flex; flex-direction:column; \
-                 background:{}; overflow:hidden;",
-                snapshot.palette.sidebar
+                 background:rgba(255,255,255,0.18); overflow:hidden; border-radius:12px 0 0 12px; \
+                 backdrop-filter: blur(18px) saturate(145%); -webkit-backdrop-filter: blur(18px) saturate(145%); \
+                 box-shadow: inset 1px 0 0 rgba(255,255,255,0.20); text-rendering:optimizeLegibility; \
+                 -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
             ),
             if snapshot.right_panel_mode == RightPanelMode::Metadata {
                 MetadataRailBody { snapshot: snapshot.clone() }
@@ -1024,7 +1021,7 @@ fn MetadataRailBody(snapshot: RenderSnapshot) -> Element {
     rsx! {
         div {
             style: format!(
-                "padding:15px 16px 10px 16px; font-size:11px; font-weight:700; color:{};",
+                "padding:16px 16px 10px 16px; font-size:11px; font-weight:700; letter-spacing:0.01em; color:{};",
                 snapshot.palette.text
             ),
             "Session Metadata"
@@ -1066,7 +1063,7 @@ fn SettingsRailBody(
     rsx! {
         div {
             style: format!(
-                "padding:15px 16px 10px 16px; font-size:11px; font-weight:700; color:{};",
+                "padding:16px 16px 10px 16px; font-size:11px; font-weight:700; letter-spacing:0.01em; color:{};",
                 snapshot.palette.text
             ),
             "Interface Settings"
@@ -1098,7 +1095,7 @@ fn SettingsRailBody(
                 on_change: on_model_change,
             }
             div {
-                style: format!("font-size:10px; line-height:1.45; color:{};", snapshot.palette.muted),
+                style: format!("font-size:11px; line-height:1.5; color:{};", snapshot.palette.muted),
                 "Future session-title generation will use this configuration to summarize recent terminal or Codex context into friendlier names under ~/.yggterm."
             }
         }
@@ -1116,7 +1113,7 @@ fn SettingsField(
 ) -> Element {
     rsx! {
         div {
-            style: "display:flex; flex-direction:column; gap:5px;",
+            style: "display:flex; flex-direction:column; gap:6px;",
             div {
                 style: format!("font-size:10px; font-weight:700; letter-spacing:0.02em; color:{};", palette.muted),
                 "{label}"
@@ -1140,22 +1137,20 @@ fn MetadataGroup(
 ) -> Element {
     rsx! {
         div {
-            style: format!(
-                "display:flex; flex-direction:column; gap:7px; padding-bottom:8px;",
-            ),
+            style: "display:flex; flex-direction:column; gap:8px; padding-bottom:10px;",
             div {
                 style: format!("font-size:10px; font-weight:700; letter-spacing:0.02em; color:{};", palette.muted),
                 "{title}"
             }
             for entry in entries.into_iter() {
                 div {
-                    style: "display:flex; flex-direction:column; gap:2px;",
+                    style: "display:flex; flex-direction:column; gap:3px;",
                     span {
                         style: format!("font-size:10px; color:{};", palette.muted),
                         "{entry.label}"
                     }
                     span {
-                        style: format!("font-size:11px; color:{}; white-space:pre-wrap; line-height:1.35;", palette.text),
+                        style: format!("font-size:11px; color:{}; white-space:pre-wrap; line-height:1.45;", palette.text),
                         "{entry.value}"
                     }
                 }
