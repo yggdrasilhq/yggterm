@@ -432,6 +432,9 @@ impl GpuiShell {
             .flex_row()
             .gap_1p5()
             .items_center()
+            .when(cfg!(target_os = "macos"), |div| {
+                div.child(window_controls(window))
+            })
             .child(
                 div()
                     .text_sm()
@@ -520,7 +523,9 @@ impl GpuiShell {
                     titlebar_icon_button("toggle-meta", TitlebarIcon::Info, palette)
                         .on_click(cx.listener(|this, _, _, cx| this.toggle_right_panel(cx))),
                 )
-                .child(window_controls(window))
+                .when(!cfg!(target_os = "macos"), |div| {
+                    div.child(window_controls(window))
+                })
                 .into_any_element();
 
         titlebar_frame(
@@ -1177,6 +1182,15 @@ impl Render for GpuiShell {
             .bg(palette.window_background)
             .border_1()
             .border_color(palette.border)
+            .cursor(CursorStyle::Arrow)
+            .when(matches!(decorations, Decorations::Client { .. }), |div| {
+                let radius = px(4.);
+                div.rounded_tl(radius)
+                    .rounded_tr(radius)
+                    .rounded_bl(radius)
+                    .rounded_br(radius)
+                    .overflow_hidden()
+            })
             .on_mouse_move(|_, _, cx| {
                 cx.stop_propagation();
             })
