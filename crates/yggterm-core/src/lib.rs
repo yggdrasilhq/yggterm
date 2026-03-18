@@ -167,6 +167,34 @@ impl SessionStore {
         )?;
         Ok(budget.saturating_sub(remaining_budget))
     }
+
+    pub fn generate_title_for_session_path(
+        &self,
+        settings: &AppSettings,
+        session_path: &str,
+        force: bool,
+    ) -> Result<Option<String>> {
+        if !litellm_settings_ready(settings) {
+            return Ok(None);
+        }
+
+        let path = PathBuf::from(session_path);
+        if !path.exists() || !is_codex_session_file(&path) {
+            return Ok(None);
+        }
+
+        let Some(identity) = read_codex_session_identity(&path)? else {
+            return Ok(None);
+        };
+        let resolver = SessionTitleResolver::new(&self.home)?;
+        resolver.generate_for_session(
+            settings,
+            &identity.session_id,
+            &identity.cwd,
+            &path,
+            force,
+        )
+    }
 }
 
 pub fn save_settings_file(path: &Path, settings: &AppSettings) -> Result<()> {
@@ -527,7 +555,7 @@ fn generate_missing_codex_titles_recursive(
             continue;
         }
         if resolver
-            .generate_for_session(settings, &identity.session_id, &identity.cwd, &path)?
+            .generate_for_session(settings, &identity.session_id, &identity.cwd, &path, false)?
             .is_some()
         {
             *remaining_budget = remaining_budget.saturating_sub(1);

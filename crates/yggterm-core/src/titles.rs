@@ -71,6 +71,14 @@ impl SessionTitleStore {
         )?;
         Ok(())
     }
+
+    pub fn delete_title(&self, session_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM session_titles WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        Ok(())
+    }
 }
 
 impl SessionTitleResolver {
@@ -90,7 +98,16 @@ impl SessionTitleResolver {
         session_id: &str,
         cwd: &str,
         file_path: &Path,
+        force: bool,
     ) -> Result<Option<String>> {
+        if !force {
+            if let Some(title) = self.store.get_title(session_id)? {
+                return Ok(Some(title));
+            }
+        } else {
+            let _ = self.store.delete_title(session_id);
+        }
+
         if let Some(title) = self.store.get_title(session_id)? {
             return Ok(Some(title));
         }
