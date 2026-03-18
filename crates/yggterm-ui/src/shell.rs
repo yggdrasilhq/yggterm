@@ -1,9 +1,11 @@
 use anyhow::Result;
+use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, App, AppContext, Bounds, Context, FocusHandle, InteractiveElement, IntoElement,
-    KeyBinding, MouseButton, ParentElement, Render, ScrollStrategy, StatefulInteractiveElement,
-    Styled, UniformListScrollHandle, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowDecorations, WindowOptions, actions, div, px, size, uniform_list,
+    AnyElement, App, AppContext, Bounds, Context, CursorStyle, Decorations, FocusHandle,
+    HitboxBehavior, InteractiveElement, IntoElement, KeyBinding, MouseButton, ParentElement,
+    Pixels, Render, ResizeEdge, ScrollStrategy, Size, StatefulInteractiveElement, Styled,
+    UniformListScrollHandle, Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations,
+    WindowOptions, actions, canvas, div, point, px, size, transparent_black, uniform_list,
 };
 use gpui_platform::application;
 use yggterm_core::{
@@ -1162,11 +1164,26 @@ impl GpuiShell {
 impl Render for GpuiShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = self.palette();
-        div()
+        let decorations = window.window_decorations();
+        let frame_inset = px(6.);
+        let border_size = px(1.);
+        let rounding = px(10.);
+
+        match decorations {
+            Decorations::Client { .. } => window.set_client_inset(frame_inset),
+            Decorations::Server => window.set_client_inset(px(0.)),
+        }
+
+        let content = div()
             .size_full()
             .flex()
             .flex_col()
             .bg(palette.window_background)
+            .border_1()
+            .border_color(palette.border)
+            .on_mouse_move(|_, _, cx| {
+                cx.stop_propagation();
+            })
             .child(self.titlebar(window, cx, &palette))
             .child(
                 div()
@@ -1177,8 +1194,118 @@ impl Render for GpuiShell {
                     .child(self.viewport(cx, &palette))
                     .child(self.inspector(&palette)),
             )
-            .child(self.statusbar(cx, &palette))
+            .child(self.statusbar(cx, &palette));
+
+        div()
+            .size_full()
+            .bg(transparent_black())
+            .map(|div| match decorations {
+                Decorations::Server => div.child(content),
+                Decorations::Client { tiling, .. } => div
+                    .child(
+                        canvas(
+                            |_bounds, window, _cx| {
+                                window.insert_hitbox(
+                                    Bounds::new(
+                                        point(px(0.), px(0.)),
+                                        window.window_bounds().get_bounds().size,
+                                    ),
+                                    HitboxBehavior::Normal,
+                                )
+                            },
+                            move |_bounds, hitbox, window, _cx| {
+                                let mouse = window.mouse_position();
+                                let size = window.window_bounds().get_bounds().size;
+                                let Some(edge) = resize_edge(mouse, frame_inset, size) else {
+                                    return;
+                                };
+                                window.set_cursor_style(
+                                    match edge {
+                                        ResizeEdge::Top | ResizeEdge::Bottom => {
+                                            CursorStyle::ResizeUpDown
+                                        }
+                                        ResizeEdge::Left | ResizeEdge::Right => {
+                                            CursorStyle::ResizeLeftRight
+                                        }
+                                        ResizeEdge::TopLeft | ResizeEdge::BottomRight => {
+                                            CursorStyle::ResizeUpLeftDownRight
+                                        }
+                                        ResizeEdge::TopRight | ResizeEdge::BottomLeft => {
+                                            CursorStyle::ResizeUpRightDownLeft
+                                        }
+                                    },
+                                    &hitbox,
+                                );
+                            },
+                        )
+                        .size_full()
+                        .absolute(),
+                    )
+                    .on_mouse_move(|_, window, _cx| {
+                        window.refresh();
+                    })
+                    .on_mouse_down(MouseButton::Left, move |e, window, cx| {
+                        let size = window.window_bounds().get_bounds().size;
+                        if let Some(edge) = resize_edge(e.position, frame_inset, size) {
+                            cx.stop_propagation();
+                            window.start_window_resize(edge);
+                        }
+                    })
+                    .when(!(tiling.top || tiling.right), |div| {
+                        div.rounded_tr(rounding)
+                    })
+                    .when(!(tiling.top || tiling.left), |div| div.rounded_tl(rounding))
+                    .when(!(tiling.bottom || tiling.right), |div| {
+                        div.rounded_br(rounding)
+                    })
+                    .when(!(tiling.bottom || tiling.left), |div| {
+                        div.rounded_bl(rounding)
+                    })
+                    .when(!tiling.top, |div| div.pt(frame_inset))
+                    .when(!tiling.bottom, |div| div.pb(frame_inset))
+                    .when(!tiling.left, |div| div.pl(frame_inset))
+                    .when(!tiling.right, |div| div.pr(frame_inset))
+                    .child(content.map(|div| {
+                        div.when(!(tiling.top || tiling.right), |div| {
+                            div.rounded_tr(rounding)
+                        })
+                        .when(!(tiling.top || tiling.left), |div| div.rounded_tl(rounding))
+                        .when(!(tiling.bottom || tiling.right), |div| {
+                            div.rounded_br(rounding)
+                        })
+                        .when(!(tiling.bottom || tiling.left), |div| {
+                            div.rounded_bl(rounding)
+                        })
+                        .when(!tiling.top, |div| div.border_t(border_size))
+                        .when(!tiling.bottom, |div| div.border_b(border_size))
+                        .when(!tiling.left, |div| div.border_l(border_size))
+                        .when(!tiling.right, |div| div.border_r(border_size))
+                    })),
+            })
     }
+}
+
+fn resize_edge(pos: gpui::Point<Pixels>, inset: Pixels, size: Size<Pixels>) -> Option<ResizeEdge> {
+    let edge = if pos.y < inset && pos.x < inset {
+        ResizeEdge::TopLeft
+    } else if pos.y < inset && pos.x > size.width - inset {
+        ResizeEdge::TopRight
+    } else if pos.y < inset {
+        ResizeEdge::Top
+    } else if pos.y > size.height - inset && pos.x < inset {
+        ResizeEdge::BottomLeft
+    } else if pos.y > size.height - inset && pos.x > size.width - inset {
+        ResizeEdge::BottomRight
+    } else if pos.y > size.height - inset {
+        ResizeEdge::Bottom
+    } else if pos.x < inset {
+        ResizeEdge::Left
+    } else if pos.x > size.width - inset {
+        ResizeEdge::Right
+    } else {
+        return None;
+    };
+    Some(edge)
 }
 
 fn metadata_stat(label: &str, value: &str, palette: &UiPalette) -> AnyElement {
