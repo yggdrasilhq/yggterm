@@ -10,7 +10,7 @@ pub enum BrowserRowKind {
     Session,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowserRow {
     pub kind: BrowserRowKind,
     pub full_path: String,
