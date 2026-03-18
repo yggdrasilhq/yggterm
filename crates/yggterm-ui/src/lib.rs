@@ -207,9 +207,9 @@ pub fn window_controls(window: &mut Window, palette: &UiPalette) -> AnyElement {
             row.child(window_control(
                 "minimize",
                 "—",
-                palette.text,
-                palette.surface_background.opacity(0.92),
-                palette.border_variant.opacity(0.9),
+                palette.text.opacity(0.92),
+                palette.element_background.opacity(0.98),
+                palette.border_variant.opacity(0.98),
                 move |window| {
                     window.minimize_window();
                 },
@@ -219,9 +219,9 @@ pub fn window_controls(window: &mut Window, palette: &UiPalette) -> AnyElement {
             row.child(window_control(
                 "maximize-or-restore",
                 if window.is_maximized() { "❐" } else { "▢" },
-                palette.text,
-                palette.surface_background.opacity(0.92),
-                palette.border_variant.opacity(0.9),
+                palette.text.opacity(0.92),
+                palette.element_background.opacity(0.98),
+                palette.border_variant.opacity(0.98),
                 move |window| {
                     window.zoom_window();
                 },
@@ -230,9 +230,9 @@ pub fn window_controls(window: &mut Window, palette: &UiPalette) -> AnyElement {
         .child(window_control(
             "close",
             "✕",
-            hsla(0.01, 0.68, 0.46, 1.0),
-            hsla(0.01, 0.68, 0.46, 0.08),
-            hsla(0.01, 0.68, 0.46, 0.18),
+            hsla(0.01, 0.72, 0.40, 1.0),
+            hsla(0.01, 0.72, 0.40, 0.14),
+            hsla(0.01, 0.72, 0.40, 0.30),
             move |window| {
                 window.remove_window();
             },
@@ -792,15 +792,16 @@ fn chrome_button(
 ) -> Stateful<Div> {
     div()
         .id(id)
-        .size(px(23.))
+        .w(px(26.))
+        .h(px(22.))
         .flex()
         .items_center()
         .justify_center()
-        .rounded_md()
+        .rounded_sm()
         .bg(background)
         .border_1()
         .border_color(border)
-        .text_xs()
+        .text_base()
         .text_color(text_color)
         .on_mouse_down(MouseButton::Left, |_, _, cx: &mut App| {
             cx.stop_propagation();

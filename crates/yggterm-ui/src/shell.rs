@@ -420,7 +420,7 @@ impl GpuiShell {
             div()
                 .flex()
                 .flex_row()
-                .gap_1()
+                .gap_1p5()
                 .items_center()
                 .child(
                     toolbar_chip_button(
@@ -1099,6 +1099,7 @@ impl Render for GpuiShell {
         let frame_inset = px(6.);
         let border_size = px(1.);
         let frame_border = palette.border.opacity(0.64);
+        let frame_radius = px(9.);
 
         window.set_client_inset(px(0.));
 
@@ -1111,11 +1112,10 @@ impl Render for GpuiShell {
             .border_color(frame_border)
             .cursor(CursorStyle::Arrow)
             .when(matches!(decorations, Decorations::Client { .. }), |div| {
-                let radius = px(7.);
-                div.rounded_tl(radius)
-                    .rounded_tr(radius)
-                    .rounded_bl(radius)
-                    .rounded_br(radius)
+                div.rounded_tl(frame_radius)
+                    .rounded_tr(frame_radius)
+                    .rounded_bl(frame_radius)
+                    .rounded_br(frame_radius)
                     .overflow_hidden()
             })
             .on_mouse_move(|_, _, cx| {
@@ -1136,6 +1136,13 @@ impl Render for GpuiShell {
         div()
             .size_full()
             .bg(transparent_black())
+            .when(matches!(decorations, Decorations::Client { .. }), |div| {
+                div.rounded_tl(frame_radius)
+                    .rounded_tr(frame_radius)
+                    .rounded_bl(frame_radius)
+                    .rounded_br(frame_radius)
+                    .overflow_hidden()
+            })
             .map(|div| match decorations {
                 Decorations::Server => div.child(content),
                 Decorations::Client { tiling, .. } => div
