@@ -19,13 +19,13 @@ pub enum TerminalBackend {
     Mock,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionMetadataEntry {
     pub label: &'static str,
     pub value: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRenderedSection {
     pub title: &'static str,
     pub lines: Vec<String>,
@@ -37,7 +37,7 @@ pub enum PreviewTone {
     Assistant,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionPreviewBlock {
     pub role: &'static str,
     pub timestamp: String,
@@ -46,7 +46,7 @@ pub struct SessionPreviewBlock {
     pub lines: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionPreview {
     pub summary: Vec<SessionMetadataEntry>,
     pub blocks: Vec<SessionPreviewBlock>,
@@ -74,14 +74,14 @@ pub enum RemoteDeployState {
     Ready,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshConnectTarget {
     pub label: String,
     pub ssh_target: String,
     pub prefix: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedSessionView {
     pub id: String,
     pub session_path: String,
