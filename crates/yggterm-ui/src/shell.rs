@@ -35,6 +35,7 @@ struct ShellState {
     sidebar_open: bool,
     right_panel_mode: RightPanelMode,
     last_action: String,
+    maximized: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -42,6 +43,7 @@ enum RightPanelMode {
     Hidden,
     Metadata,
     Settings,
+    Connect,
 }
 
 #[derive(Clone, PartialEq)]
@@ -61,6 +63,7 @@ struct RenderSnapshot {
     ghostty_embedded_surface_supported: bool,
     ghostty_bridge_detail: String,
     settings: AppSettings,
+    maximized: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -112,6 +115,7 @@ impl ShellState {
             sidebar_open: true,
             right_panel_mode,
             last_action: "ready".to_string(),
+            maximized: false,
         }
     }
 
@@ -132,6 +136,7 @@ impl ShellState {
             ghostty_embedded_surface_supported: self.bootstrap.ghostty_embedded_surface_supported,
             ghostty_bridge_detail: self.bootstrap.ghostty_bridge_detail.clone(),
             settings: self.settings.clone(),
+            maximized: self.maximized,
         }
     }
 
@@ -166,6 +171,7 @@ impl ShellState {
             RightPanelMode::Metadata => "metadata opened".to_string(),
             RightPanelMode::Hidden => "right panel hidden".to_string(),
             RightPanelMode::Settings => "settings opened".to_string(),
+            RightPanelMode::Connect => "ssh connect opened".to_string(),
         };
     }
 
@@ -181,6 +187,23 @@ impl ShellState {
             RightPanelMode::Settings => "settings opened".to_string(),
             RightPanelMode::Hidden => "right panel hidden".to_string(),
             RightPanelMode::Metadata => "metadata opened".to_string(),
+            RightPanelMode::Connect => "ssh connect opened".to_string(),
+        };
+    }
+
+    fn toggle_connect_panel(&mut self) {
+        self.right_panel_mode = if self.right_panel_mode == RightPanelMode::Connect {
+            RightPanelMode::Hidden
+        } else {
+            RightPanelMode::Connect
+        };
+        self.settings.show_settings = false;
+        self.persist_settings();
+        self.last_action = match self.right_panel_mode {
+            RightPanelMode::Connect => "ssh connect opened".to_string(),
+            RightPanelMode::Hidden => "right panel hidden".to_string(),
+            RightPanelMode::Metadata => "metadata opened".to_string(),
+            RightPanelMode::Settings => "settings opened".to_string(),
         };
     }
 
@@ -270,6 +293,24 @@ impl ShellState {
         self.last_action = "updated interface llm".to_string();
     }
 
+    fn adjust_ui_zoom(&mut self, delta_steps: i32) {
+        self.settings.ui_font_size = clamp_zoom_value(self.settings.ui_font_size + delta_steps as f32);
+        self.persist_settings();
+        self.last_action = format!("interface zoom {}%", zoom_percent(self.settings.ui_font_size, 14.0));
+    }
+
+    fn adjust_main_zoom(&mut self, delta_steps: i32) {
+        self.settings.terminal_font_size =
+            clamp_zoom_value_main(self.settings.terminal_font_size + delta_steps as f32);
+        self.persist_settings();
+        self.last_action = format!("main zoom {}%", zoom_percent(self.settings.terminal_font_size, 13.0));
+    }
+
+    fn toggle_maximized(&mut self) {
+        window().toggle_maximized();
+        self.maximized = !self.maximized;
+    }
+
     fn generate_session_titles(&mut self) {
         if self.settings.litellm_endpoint.trim().is_empty()
             || self.settings.litellm_api_key.trim().is_empty()
@@ -339,7 +380,7 @@ fn app() -> Element {
     let sidebar_snapshot = snapshot.clone();
     let main_snapshot = snapshot.clone();
     let metadata_snapshot = snapshot.clone();
-    let maximized = window().is_maximized();
+    let maximized = snapshot.maximized;
     let shell_radius = if maximized { 0 } else { 11 };
 
     rsx! {
@@ -356,17 +397,17 @@ fn app() -> Element {
                     on_set_view_mode: move |mode: WorkspaceViewMode| state.with_mut(|shell| shell.set_view_mode(mode)),
                     on_toggle_meta: move || state.with_mut(|shell| shell.toggle_metadata_panel()),
                     on_toggle_settings: move || state.with_mut(|shell| shell.toggle_settings_panel()),
+                    on_toggle_connect: move || state.with_mut(|shell| shell.toggle_connect_panel()),
+                    on_toggle_maximized: move || state.with_mut(|shell| shell.toggle_maximized()),
                     maximized: maximized,
                 }
                 div {
                     style: "display: flex; flex: 1; min-height: 0; overflow: hidden;",
-                    if sidebar_snapshot.sidebar_open {
-                        Sidebar {
-                            snapshot: sidebar_snapshot,
-                            on_select_row: move |row: BrowserRow| state.with_mut(|shell| shell.select_row(&row)),
-                            on_connect_ssh: move |ix: usize| state.with_mut(|shell| shell.connect_ssh_target(ix)),
-                            on_focus_live: move |id: String| state.with_mut(|shell| shell.focus_live_session(&id)),
-                        }
+                    Sidebar {
+                        snapshot: sidebar_snapshot,
+                        on_select_row: move |row: BrowserRow| state.with_mut(|shell| shell.select_row(&row)),
+                        on_connect_ssh: move |ix: usize| state.with_mut(|shell| shell.connect_ssh_target(ix)),
+                        on_focus_live: move |id: String| state.with_mut(|shell| shell.focus_live_session(&id)),
                     }
                     MainSurface {
                         snapshot: main_snapshot,
@@ -377,14 +418,16 @@ fn app() -> Element {
                         on_focus_ghostty: move || state.with_mut(|shell| shell.focus_ghostty_window()),
                         on_resolve_ghostty: move || state.with_mut(|shell| shell.resolve_ghostty_window()),
                     }
-                    if metadata_snapshot.right_panel_mode != RightPanelMode::Hidden {
-                        RightRail {
-                            snapshot: metadata_snapshot,
-                            on_endpoint_change: move |value: String| state.with_mut(|shell| shell.update_litellm_endpoint(value)),
-                            on_api_key_change: move |value: String| state.with_mut(|shell| shell.update_litellm_api_key(value)),
-                            on_model_change: move |value: String| state.with_mut(|shell| shell.update_interface_llm_model(value)),
-                            on_generate_titles: move |_| state.with_mut(|shell| shell.generate_session_titles()),
-                        }
+                    RightRail {
+                        snapshot: metadata_snapshot,
+                        on_endpoint_change: move |value: String| state.with_mut(|shell| shell.update_litellm_endpoint(value)),
+                        on_api_key_change: move |value: String| state.with_mut(|shell| shell.update_litellm_api_key(value)),
+                        on_model_change: move |value: String| state.with_mut(|shell| shell.update_interface_llm_model(value)),
+                        on_generate_titles: move |_| state.with_mut(|shell| shell.generate_session_titles()),
+                        on_adjust_ui_zoom: move |delta: i32| state.with_mut(|shell| shell.adjust_ui_zoom(delta)),
+                        on_adjust_main_zoom: move |delta: i32| state.with_mut(|shell| shell.adjust_main_zoom(delta)),
+                        on_connect_ssh: move |ix: usize| state.with_mut(|shell| shell.connect_ssh_target(ix)),
+                        on_focus_live: move |id: String| state.with_mut(|shell| shell.focus_live_session(&id)),
                     }
                 }
             }
@@ -402,16 +445,20 @@ fn Titlebar(
     on_set_view_mode: EventHandler<WorkspaceViewMode>,
     on_toggle_meta: EventHandler<()>,
     on_toggle_settings: EventHandler<()>,
+    on_toggle_connect: EventHandler<()>,
+    on_toggle_maximized: EventHandler<()>,
     maximized: bool,
 ) -> Element {
     rsx! {
         div {
             style: format!(
                 "display:flex; align-items:center; justify-content:space-between; height:44px; \
-                 padding:0 12px; background:{};",
-                snapshot.palette.titlebar
+                 padding:0 12px; background:{}; zoom:{}%;",
+                snapshot.palette.titlebar,
+                zoom_percent_f32(snapshot.settings.ui_font_size, 14.0)
             ),
             onmousedown: move |_| window().drag(),
+            ondoubleclick: move |_| on_toggle_maximized.call(()),
             div {
                 style: "display:flex; align-items:center; gap:12px; width:300px; min-width:300px;",
                 button {
@@ -472,10 +519,20 @@ fn Titlebar(
                     onclick: move |_| on_toggle_settings.call(()),
                     "⚙"
                 }
+                button {
+                    style: connect_button_style(
+                        snapshot.palette,
+                        snapshot.right_panel_mode == RightPanelMode::Connect
+                    ),
+                    onmousedown: |evt| evt.stop_propagation(),
+                    onclick: move |_| on_toggle_connect.call(()),
+                    "Connect SSH"
+                }
                 WindowControls {
                     palette: snapshot.palette,
                     hovered: hovered(),
                     on_hover_control: on_hover_control,
+                    on_toggle_maximized: on_toggle_maximized,
                     maximized: maximized,
                 }
             }
@@ -488,6 +545,7 @@ fn WindowControls(
     palette: Palette,
     hovered: Option<HoveredControl>,
     on_hover_control: EventHandler<Option<HoveredControl>>,
+    on_toggle_maximized: EventHandler<()>,
     maximized: bool,
 ) -> Element {
     let maximize_glyph = if maximized { "❐" } else { "▢" };
@@ -509,7 +567,7 @@ fn WindowControls(
                 hover_tone: HoveredControl::Maximize,
                 palette,
                 on_hover_control,
-                on_press: move |_| window().toggle_maximized(),
+                on_press: move |_| on_toggle_maximized.call(()),
             }
             WindowControl {
                 glyph: "✕",
@@ -571,102 +629,27 @@ fn Sidebar(
     on_connect_ssh: EventHandler<usize>,
     on_focus_live: EventHandler<String>,
 ) -> Element {
+    let width = if snapshot.sidebar_open { SIDE_RAIL_WIDTH } else { 0 };
+    let opacity = if snapshot.sidebar_open { "1" } else { "0" };
+    let translate = if snapshot.sidebar_open { "translateX(0)" } else { "translateX(-14px)" };
     rsx! {
         div {
             style: format!(
                 "width:{}px; min-width:{}px; max-width:{}px; display:flex; flex-direction:column; \
-                 background:{}; overflow:hidden;",
-                SIDE_RAIL_WIDTH, SIDE_RAIL_WIDTH, SIDE_RAIL_WIDTH, snapshot.palette.sidebar
+                 background:{}; overflow:hidden; transition: width 180ms ease, opacity 180ms ease, transform 180ms ease; \
+                 opacity:{}; transform:{}; pointer-events:{}; zoom:{}%;",
+                width, width, width, snapshot.palette.sidebar, opacity, translate,
+                if snapshot.sidebar_open { "auto" } else { "none" },
+                zoom_percent_f32(snapshot.settings.ui_font_size, 14.0)
             ),
             div {
-                style: "padding:15px 16px 8px 16px;",
-                div {
-                    style: format!("font-size:10px; letter-spacing:0.02em; color:{}; margin-bottom:5px;", snapshot.palette.muted),
-                    "Codex Sessions"
-                }
-                        div {
-                            style: format!("font-size:11px; font-weight:600; color:{};", snapshot.palette.text),
-                            {format!("{} stored · {} visible", snapshot.total_leaf_sessions, snapshot.rows.len())}
-                        }
-            }
-            div {
-                style: "flex:1; min-height:0; overflow:auto; padding:6px 12px 8px 12px;",
+                style: "flex:1; min-height:0; overflow:auto; padding:14px 12px 12px 12px;",
                 for row in snapshot.rows.iter().cloned() {
                     SidebarRow {
                         row: row.clone(),
                         selected: snapshot.selected_path.as_deref() == Some(row.full_path.as_str()),
                         palette: snapshot.palette,
                         on_select: move |_| on_select_row.call(row.clone()),
-                    }
-                }
-            }
-            div {
-                style: format!(
-                    "padding:10px 12px 12px 12px; display:flex; flex-direction:column; gap:9px;",
-                ),
-                if !snapshot.ssh_targets.is_empty() {
-                    div {
-                        div {
-                            style: format!("font-size:10px; letter-spacing:0.02em; color:{}; margin-bottom:5px;", snapshot.palette.muted),
-                            "Connect SSH"
-                        }
-                        div {
-                            style: "display:flex; flex-direction:column; gap:5px;",
-                            for (ix , target) in snapshot.ssh_targets.iter().cloned().enumerate() {
-                                {
-                                    let target_detail = if let Some(prefix) = target.prefix.as_ref() {
-                                        format!("{} · {}", target.ssh_target, prefix)
-                                    } else {
-                                        target.ssh_target.clone()
-                                    };
-                                    rsx! {
-                                        button {
-                                            style: sidebar_action_style(snapshot.palette),
-                                            onclick: move |_| on_connect_ssh.call(ix),
-                                            div {
-                                                style: "display:flex; flex-direction:column; align-items:flex-start; min-width:0;",
-                                                span {
-                                                    style: format!("font-size:11px; font-weight:600; color:{};", snapshot.palette.text),
-                                                    "{target.label}"
-                                                }
-                                                span {
-                                                    style: format!("font-size:10px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", snapshot.palette.muted),
-                                                    "{target_detail}"
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                if !snapshot.live_sessions.is_empty() {
-                    div {
-                        div {
-                            style: format!("font-size:10px; letter-spacing:0.02em; color:{}; margin-bottom:5px;", snapshot.palette.muted),
-                            "Live Sessions"
-                        }
-                        div {
-                            style: "display:flex; flex-direction:column; gap:5px;",
-                            for session in snapshot.live_sessions.iter().cloned() {
-                                button {
-                                    style: sidebar_action_style(snapshot.palette),
-                                    onclick: move |_| on_focus_live.call(session.session_path.clone()),
-                                    div {
-                                        style: "display:flex; flex-direction:column; align-items:flex-start; min-width:0;",
-                                        span {
-                                            style: format!("font-size:11px; font-weight:600; color:{};", snapshot.palette.text),
-                                            "{session.title}"
-                                        }
-                                        span {
-                                            style: format!("font-size:10px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", snapshot.palette.muted),
-                                            "{session.status_line}"
-                                        }
-                                    }
-                                }
-                            }
-                        }
                     }
                 }
             }
@@ -720,7 +703,7 @@ fn SidebarRow(
                     style: "display:flex; align-items:center; gap:8px; min-width:0;",
                     div {
                         style: format!(
-                            "display:inline-flex; align-items:center; justify-content:center; width:18px; min-width:18px; height:18px; color:{};",
+                            "display:inline-flex; align-items:center; justify-content:center; width:19px; min-width:19px; height:19px; color:{};",
                             icon_color
                         ),
                         TreeIcon { row: row.clone() }
@@ -739,14 +722,9 @@ fn SidebarRow(
                         style: format!("font-size:10px; color:{};", palette.muted),
                         "{row.descendant_sessions}"
                     }
-                } else if !row.host_label.is_empty() {
-                    span {
-                        style: format!("font-size:10px; color:{};", palette.muted),
-                        "{row.host_label}"
-                    }
                 }
             }
-            if !row.detail_label.is_empty() {
+            if row.kind == BrowserRowKind::Group && !row.detail_label.is_empty() {
                 div {
                     style: format!(
                         "font-size:10px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
@@ -763,31 +741,9 @@ fn SidebarRow(
 fn TreeIcon(row: BrowserRow) -> Element {
     if row.kind == BrowserRowKind::Session {
         return rsx! {
-            svg {
-                width: "16",
-                height: "16",
-                view_box: "0 0 16 16",
-                fill: "none",
-                xmlns: "http://www.w3.org/2000/svg",
-                path {
-                    d: "M2.75 4.25H13.25V11.75H2.75V4.25Z",
-                    stroke: "currentColor",
-                    stroke_width: "1.15",
-                    stroke_linejoin: "round",
-                }
-                path {
-                    d: "M4.5 6.2L6.4 8L4.5 9.8",
-                    stroke: "currentColor",
-                    stroke_width: "1.15",
-                    stroke_linecap: "round",
-                    stroke_linejoin: "round",
-                }
-                path {
-                    d: "M7.8 9.95H10.85",
-                    stroke: "currentColor",
-                    stroke_width: "1.15",
-                    stroke_linecap: "round",
-                }
+            span {
+                style: "display:inline-flex; align-items:center; justify-content:center; font-size:13px; font-weight:700; line-height:1;",
+                ">_"
             }
         };
     }
@@ -795,8 +751,8 @@ fn TreeIcon(row: BrowserRow) -> Element {
     if row.depth == 0 {
         return rsx! {
             svg {
-                width: "17",
-                height: "17",
+                width: "18",
+                height: "18",
                 view_box: "0 0 18 18",
                 fill: "none",
                 xmlns: "http://www.w3.org/2000/svg",
@@ -821,58 +777,51 @@ fn TreeIcon(row: BrowserRow) -> Element {
                     stroke_width: "1.15",
                     stroke_linecap: "round",
                 }
-                if row.expanded {
-                    path {
-                        d: "M13.9 6.6L15.35 8.05L13.9 9.5",
-                        stroke: "currentColor",
-                        stroke_width: "1.15",
-                        stroke_linecap: "round",
-                        stroke_linejoin: "round",
-                    }
-                } else {
-                    path {
-                        d: "M13.35 6.85L15.25 6.85",
-                        stroke: "currentColor",
-                        stroke_width: "1.15",
-                        stroke_linecap: "round",
-                    }
-                }
             }
         };
     }
 
-    rsx! {
-        svg {
-            width: "17",
-            height: "17",
-            view_box: "0 0 18 18",
-            fill: "none",
-            xmlns: "http://www.w3.org/2000/svg",
-            path {
-                d: "M2.75 5.25C2.75 4.83579 3.08579 4.5 3.5 4.5H6.65L8 5.85H14.5C14.9142 5.85 15.25 6.18579 15.25 6.6V12.5C15.25 12.9142 14.9142 13.25 14.5 13.25H3.5C3.08579 13.25 2.75 12.9142 2.75 12.5V5.25Z",
-                stroke: "currentColor",
-                stroke_width: "1.15",
-                stroke_linejoin: "round",
+    if row.expanded {
+        rsx! {
+            svg {
+                width: "18",
+                height: "18",
+                view_box: "0 0 16 16",
+                fill: "none",
+                xmlns: "http://www.w3.org/2000/svg",
+                path {
+                    d: "M1.9 5.2C1.9 4.59249 2.39249 4.1 3 4.1H6.35L7.6 5.35H13C13.6075 5.35 14.1 5.84249 14.1 6.45V11.8C14.1 12.4075 13.6075 12.9 13 12.9H3C2.39249 12.9 1.9 12.4075 1.9 11.8V5.2Z",
+                    fill: "currentColor",
+                    fill_opacity: "0.84",
+                    stroke_linejoin: "round",
+                }
+                path {
+                    d: "M2.4 6.25H14.05",
+                    stroke: "currentColor",
+                    stroke_width: "0.95",
+                    stroke_opacity: "0.18",
+                }
             }
-            if row.expanded {
+        }
+    } else {
+        rsx! {
+            svg {
+                width: "18",
+                height: "18",
+                view_box: "0 0 18 18",
+                fill: "none",
+                xmlns: "http://www.w3.org/2000/svg",
                 path {
-                    d: "M6.4 8.2H11.6",
+                    d: "M2.1 5.45C2.1 4.78726 2.63726 4.25 3.3 4.25H6.65L7.95 5.55H14.05C14.7127 5.55 15.25 6.08726 15.25 6.75V12.05C15.25 12.7127 14.7127 13.25 14.05 13.25H3.3C2.63726 13.25 2.1 12.7127 2.1 12.05V5.45Z",
                     stroke: "currentColor",
                     stroke_width: "1.15",
-                    stroke_linecap: "round",
+                    stroke_linejoin: "round",
                 }
-            } else {
                 path {
-                    d: "M9 6.8V11.2",
+                    d: "M2.6 6.5H14.75",
                     stroke: "currentColor",
-                    stroke_width: "1.15",
-                    stroke_linecap: "round",
-                }
-                path {
-                    d: "M6.8 9H11.2",
-                    stroke: "currentColor",
-                    stroke_width: "1.15",
-                    stroke_linecap: "round",
+                    stroke_width: "1.0",
+                    stroke_opacity: "0.42",
                 }
             }
         }
@@ -980,8 +929,9 @@ fn MainSurface(
             ),
             div {
                 style: format!(
-                    "flex:1; overflow:auto; padding:24px; background:{}; border-radius:11px; box-shadow:{};",
-                    snapshot.palette.panel, snapshot.palette.panel_shadow
+                    "flex:1; overflow:auto; padding:24px; background:{}; border-radius:11px; box-shadow:{}; zoom:{}%;",
+                    snapshot.palette.panel, snapshot.palette.panel_shadow,
+                    zoom_percent_f32(snapshot.settings.terminal_font_size, 13.0)
                 ),
                 {body}
             }
@@ -1155,14 +1105,26 @@ fn RightRail(
     on_api_key_change: EventHandler<String>,
     on_model_change: EventHandler<String>,
     on_generate_titles: EventHandler<MouseEvent>,
+    on_adjust_ui_zoom: EventHandler<i32>,
+    on_adjust_main_zoom: EventHandler<i32>,
+    on_connect_ssh: EventHandler<usize>,
+    on_focus_live: EventHandler<String>,
 ) -> Element {
+    let visible = snapshot.right_panel_mode != RightPanelMode::Hidden;
+    let width = if visible { SIDE_RAIL_WIDTH } else { 0 };
+    let opacity = if visible { "1" } else { "0" };
+    let translate = if visible { "translateX(0)" } else { "translateX(14px)" };
     rsx! {
         div {
             style: format!(
                 "width:{}px; min-width:{}px; max-width:{}px; display:flex; flex-direction:column; \
                  background:transparent; overflow:hidden; text-rendering:optimizeLegibility; \
-                 -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
-                SIDE_RAIL_WIDTH, SIDE_RAIL_WIDTH, SIDE_RAIL_WIDTH
+                 -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale; \
+                 transition: width 180ms ease, opacity 180ms ease, transform 180ms ease; \
+                 opacity:{}; transform:{}; pointer-events:{}; zoom:{}%;",
+                width, width, width, opacity, translate,
+                if visible { "auto" } else { "none" },
+                zoom_percent_f32(snapshot.settings.ui_font_size, 14.0)
             ),
             if snapshot.right_panel_mode == RightPanelMode::Metadata {
                 MetadataRailBody { snapshot: snapshot.clone() }
@@ -1173,6 +1135,14 @@ fn RightRail(
                     on_api_key_change,
                     on_model_change,
                     on_generate_titles,
+                    on_adjust_ui_zoom,
+                    on_adjust_main_zoom,
+                }
+            } else if snapshot.right_panel_mode == RightPanelMode::Connect {
+                ConnectRailBody {
+                    snapshot: snapshot.clone(),
+                    on_connect_ssh,
+                    on_focus_live,
                 }
             }
         }
@@ -1186,13 +1156,13 @@ fn MetadataRailBody(snapshot: RenderSnapshot) -> Element {
     rsx! {
         div {
             style: format!(
-                "padding:16px 16px 10px 16px; font-size:11px; font-weight:700; letter-spacing:0.01em; color:{};",
+                "padding:16px 16px 10px 16px; font-size:12px; font-weight:700; letter-spacing:0.01em; color:{};",
                 snapshot.palette.text
             ),
             "Session Metadata"
         }
         div {
-            style: "flex:1; overflow:auto; padding:10px 16px 14px 16px; display:flex; flex-direction:column; gap:14px;",
+            style: "flex:1; overflow:auto; padding:10px 16px 14px 16px; display:flex; flex-direction:column; gap:16px;",
             if let Some(session) = session {
                 MetadataGroup {
                     title: "Overview".to_string(),
@@ -1225,11 +1195,13 @@ fn SettingsRailBody(
     on_api_key_change: EventHandler<String>,
     on_model_change: EventHandler<String>,
     on_generate_titles: EventHandler<MouseEvent>,
+    on_adjust_ui_zoom: EventHandler<i32>,
+    on_adjust_main_zoom: EventHandler<i32>,
 ) -> Element {
     rsx! {
         div {
             style: format!(
-                "padding:16px 16px 10px 16px; font-size:11px; font-weight:700; letter-spacing:0.01em; color:{};",
+                "padding:16px 16px 10px 16px; font-size:12px; font-weight:700; letter-spacing:0.01em; color:{};",
                 snapshot.palette.text
             ),
             "Interface Settings"
@@ -1260,6 +1232,20 @@ fn SettingsRailBody(
                 palette: snapshot.palette,
                 on_change: on_model_change,
             }
+            ZoomSettingRow {
+                label: "Interface Zoom".to_string(),
+                percent: zoom_percent(snapshot.settings.ui_font_size, 14.0),
+                palette: snapshot.palette,
+                on_decrease: move |_| on_adjust_ui_zoom.call(-1),
+                on_increase: move |_| on_adjust_ui_zoom.call(1),
+            }
+            ZoomSettingRow {
+                label: "Main Zoom".to_string(),
+                percent: zoom_percent(snapshot.settings.terminal_font_size, 13.0),
+                palette: snapshot.palette,
+                on_decrease: move |_| on_adjust_main_zoom.call(-1),
+                on_increase: move |_| on_adjust_main_zoom.call(1),
+            }
             button {
                 style: format!(
                     "height:32px; border:none; border-radius:10px; background:{}; color:{}; \
@@ -1278,6 +1264,83 @@ fn SettingsRailBody(
 }
 
 #[component]
+fn ConnectRailBody(
+    snapshot: RenderSnapshot,
+    on_connect_ssh: EventHandler<usize>,
+    on_focus_live: EventHandler<String>,
+) -> Element {
+    rsx! {
+        div {
+            style: format!(
+                "padding:16px 16px 10px 16px; font-size:12px; font-weight:700; letter-spacing:0.01em; color:{};",
+                snapshot.palette.text
+            ),
+            "Connect SSH"
+        }
+        div {
+            style: "flex:1; overflow:auto; padding:10px 16px 14px 16px; display:flex; flex-direction:column; gap:16px;",
+            if !snapshot.ssh_targets.is_empty() {
+                div {
+                    style: "display:flex; flex-direction:column; gap:8px;",
+                    for (ix, target) in snapshot.ssh_targets.iter().cloned().enumerate() {
+                        {
+                            let target_detail = if let Some(prefix) = target.prefix.as_ref() {
+                                format!("{} · {}", target.ssh_target, prefix)
+                            } else {
+                                target.ssh_target.clone()
+                            };
+                            rsx! {
+                                button {
+                                    style: sidebar_action_style(snapshot.palette),
+                                    onclick: move |_| on_connect_ssh.call(ix),
+                                    div {
+                                        style: "display:flex; flex-direction:column; align-items:flex-start; gap:3px; min-width:0;",
+                                        span {
+                                            style: format!("font-size:12px; font-weight:600; color:{};", snapshot.palette.text),
+                                            "{target.label}"
+                                        }
+                                        span {
+                                            style: format!("font-size:11px; line-height:1.35; color:{}; white-space:pre-wrap;", snapshot.palette.muted),
+                                            "{target_detail}"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !snapshot.live_sessions.is_empty() {
+                div {
+                    style: "display:flex; flex-direction:column; gap:8px;",
+                    div {
+                        style: format!("font-size:11px; font-weight:700; color:{};", snapshot.palette.muted),
+                        "Live Sessions"
+                    }
+                    for session in snapshot.live_sessions.iter().cloned() {
+                        button {
+                            style: sidebar_action_style(snapshot.palette),
+                            onclick: move |_| on_focus_live.call(session.session_path.clone()),
+                            div {
+                                style: "display:flex; flex-direction:column; align-items:flex-start; gap:3px; min-width:0;",
+                                span {
+                                    style: format!("font-size:12px; font-weight:600; color:{};", snapshot.palette.text),
+                                    "{session.title}"
+                                }
+                                span {
+                                    style: format!("font-size:11px; line-height:1.35; color:{}; white-space:pre-wrap;", snapshot.palette.muted),
+                                    "{session.status_line}"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
 fn SettingsField(
     label: String,
     value: String,
@@ -1290,7 +1353,7 @@ fn SettingsField(
         div {
             style: "display:flex; flex-direction:column; gap:6px;",
             div {
-                style: format!("font-size:10px; font-weight:700; letter-spacing:0.02em; color:{};", palette.muted),
+                style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", palette.muted),
                 "{label}"
             }
             input {
@@ -1299,6 +1362,45 @@ fn SettingsField(
                 placeholder: "{placeholder}",
                 style: settings_input_style(palette),
                 oninput: move |evt| on_change.call(evt.value()),
+            }
+        }
+    }
+}
+
+#[component]
+fn ZoomSettingRow(
+    label: String,
+    percent: i32,
+    palette: Palette,
+    on_decrease: EventHandler<MouseEvent>,
+    on_increase: EventHandler<MouseEvent>,
+) -> Element {
+    rsx! {
+        div {
+            style: "display:flex; flex-direction:column; gap:6px;",
+            div {
+                style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", palette.muted),
+                "{label}"
+            }
+            div {
+                style: format!(
+                    "display:flex; align-items:center; justify-content:space-between; height:32px; padding:0 6px; \
+                     border:none; border-radius:10px; background:rgba(255,255,255,0.58); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.34);"
+                ),
+                button {
+                    style: zoom_button_style(palette),
+                    onclick: move |evt| on_decrease.call(evt),
+                    "−"
+                }
+                span {
+                    style: format!("font-size:12px; font-weight:600; color:{};", palette.text),
+                    "{percent}"
+                }
+                button {
+                    style: zoom_button_style(palette),
+                    onclick: move |evt| on_increase.call(evt),
+                    "+"
+                }
             }
         }
     }
@@ -1314,18 +1416,18 @@ fn MetadataGroup(
         div {
             style: "display:flex; flex-direction:column; gap:8px; padding-bottom:10px;",
             div {
-                style: format!("font-size:10px; font-weight:700; letter-spacing:0.02em; color:{};", palette.muted),
+                style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", palette.muted),
                 "{title}"
             }
             for entry in entries.into_iter() {
                 div {
-                    style: "display:flex; flex-direction:column; gap:3px;",
+                    style: "display:flex; flex-direction:column; gap:4px;",
                     span {
-                        style: format!("font-size:10px; color:{};", palette.muted),
+                        style: format!("font-size:11px; font-weight:600; color:{};", palette.muted),
                         "{entry.label}"
                     }
                     span {
-                        style: format!("font-size:11px; color:{}; white-space:pre-wrap; line-height:1.45;", palette.text),
+                        style: format!("font-size:12px; font-weight:500; color:{}; white-space:pre-wrap; line-height:1.5;", palette.text),
                         "{entry.value}"
                     }
                 }
@@ -1408,6 +1510,15 @@ fn utility_icon_style(palette: Palette, selected: bool) -> String {
     )
 }
 
+fn connect_button_style(palette: Palette, selected: bool) -> String {
+    format!(
+        "height:28px; padding:0 11px; border:none; border-radius:10px; background:{}; color:{}; \
+         font-size:11px; font-weight:700; white-space:nowrap;",
+        if selected { "rgba(255,255,255,0.46)" } else { "transparent" },
+        if selected { palette.text } else { palette.muted }
+    )
+}
+
 fn chip_style(palette: Palette, selected: bool) -> String {
     format!(
         "height:24px; padding:0 10px; border-radius:999px; border:1px solid {}; background:{}; \
@@ -1445,6 +1556,30 @@ fn settings_input_style(palette: Palette) -> String {
          color:{}; outline:none; font-size:11px; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.34);",
         palette.text
     )
+}
+
+fn zoom_button_style(palette: Palette) -> String {
+    format!(
+        "width:22px; height:22px; border:none; border-radius:8px; background:rgba(255,255,255,0.36); \
+         color:{}; font-size:13px; font-weight:700; display:inline-flex; align-items:center; justify-content:center;",
+        palette.text
+    )
+}
+
+fn clamp_zoom_value(value: f32) -> f32 {
+    value.clamp(10.0, 20.0)
+}
+
+fn clamp_zoom_value_main(value: f32) -> f32 {
+    value.clamp(10.0, 20.0)
+}
+
+fn zoom_percent(value: f32, base: f32) -> i32 {
+    ((value / base) * 100.0).round() as i32
+}
+
+fn zoom_percent_f32(value: f32, base: f32) -> f32 {
+    (value / base) * 100.0
 }
 
 fn metadata_value(session: &ManagedSessionView, label: &str) -> String {
