@@ -595,6 +595,11 @@ impl GpuiShell {
         } else {
             palette.text_muted
         };
+        let guide_color = if is_selected {
+            palette.border_focused.opacity(0.38)
+        } else {
+            palette.border_variant
+        };
         let right_badge = match row.kind {
             BrowserRowKind::Group => Some(
                 div()
@@ -626,6 +631,16 @@ impl GpuiShell {
             ),
             _ => None,
         };
+        let guides = (0..row.depth)
+            .map(|_guide_ix| {
+                div()
+                    .w(px(6.))
+                    .text_xs()
+                    .text_color(guide_color)
+                    .child("│")
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
 
         let label = if is_top_group {
             div()
@@ -655,6 +670,7 @@ impl GpuiShell {
                         .flex_row()
                         .gap_1p5()
                         .items_center()
+                        .children(guides)
                         .child(
                             div()
                                 .w(px(12.))
@@ -691,9 +707,10 @@ impl GpuiShell {
             .justify_between()
             .px_2()
             .py(px(if has_detail { 6. } else { 4. }))
-            .pl(px(10. + row.depth as f32 * 8.))
             .bg(if is_selected {
                 palette.text_accent.opacity(0.18)
+            } else if is_top_group {
+                palette.element_background.opacity(0.42)
             } else {
                 palette.window_background
             })
