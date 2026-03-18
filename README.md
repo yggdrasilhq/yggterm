@@ -68,7 +68,8 @@ Requirements:
 - Rust stable
 - Rust `1.94.0` is the current pinned toolchain for the local desktop dependency stack.
 - Zig stable
-- adjacent checkouts of `../ghostty` and `../zed` for integration work
+- adjacent checkout of `../ghostty` for local Ghostty integration work
+- optional local checkout of `../zed` as a design/reference repo while refining shell shape
 
 Install Zig:
 
@@ -133,6 +134,22 @@ Build the FFI bundle archive:
 ```bash
 ./scripts/package-release-ffi.sh linux-x86_64
 ```
+
+## npm publishing
+
+The npm launcher package lives under [`npm/`](./npm) and is published by GitHub Actions from:
+
+- [npm-publish.yml](/home/pi/gh/yggterm/.github/workflows/npm-publish.yml)
+
+That workflow publishes on GitHub release publication and is designed for npm trusted publishing rather than a long-lived `NPM_TOKEN`.
+
+For npm trusted publisher setup on npmjs.com, use:
+
+- Organization or user: `yggdrasilhq`
+- Repository: `yggterm`
+- Workflow filename: `npm-publish.yml`
+
+Only the filename is entered on npmjs.com, not the full path.
 
 ## Repository layout
 

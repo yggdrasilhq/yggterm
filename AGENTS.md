@@ -7,7 +7,7 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 ## Local repository relationships
 
 - `../ghostty` contains Ghostty terminal code in Zig.
-- `../zed` contains Zed editor UI code in Rust.
+- `../zed` is an optional visual/reference checkout for shell design study.
 - This repo (`yggterm`) is the integration layer and product surface.
 
 ## Engineering constraints
@@ -42,7 +42,7 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 - The central viewport should host Ghostty-backed terminal views in place of file editors.
 - Until Ghostty surfaces are embedded, keep mock terminal bodies and sidebar data inside the Yggterm-owned Dioxus shell rather than building throwaway alternate frontends.
 - Session state is local-first under `~/.yggterm`, but the tree model is metadata-first rather than a direct filesystem mirror.
-- Use `~/gh/codex-session-tui` and the local `../zed` checkout as reference material when refining shell shape, chrome, and interaction patterns.
+- Use `~/gh/codex-session-tui` and, when helpful, the local `../zed` checkout as reference material when refining shell shape, chrome, and interaction patterns.
 - Use the running X11 session and screenshots of a live Zed window when validating visual changes to the scaffold.
 - Treat `libghostty` C APIs as the terminal engine contract (app/surface lifecycle, input, render/tick hooks).
 - Keep Rust-to-Ghostty interop thin and explicit via `ghostty-bridge`.
