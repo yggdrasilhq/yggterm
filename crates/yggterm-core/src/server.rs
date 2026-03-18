@@ -161,6 +161,7 @@ impl YggtermServer {
                 &first_session.path,
                 Some(&first_session.session_id),
                 Some(&first_session.cwd),
+                Some(&first_session.title),
             );
         }
 
@@ -212,12 +213,14 @@ impl YggtermServer {
         path: &str,
         session_id: Option<&str>,
         cwd: Option<&str>,
+        title_hint: Option<&str>,
     ) {
         let entry = self.sessions.entry(path.to_string()).or_insert_with(|| {
             build_session(
                 path,
                 session_id,
                 cwd,
+                title_hint,
                 self.backend,
                 self.theme,
                 self.ghostty_bridge_enabled,
@@ -233,6 +236,9 @@ impl YggtermServer {
                 label: "Cwd",
                 value: cwd.to_string(),
             });
+        }
+        if let Some(title_hint) = title_hint {
+            entry.title = title_hint.to_string();
         }
         self.active_session_path = Some(path.to_string());
     }
@@ -486,6 +492,7 @@ struct StoredLeaf {
     path: String,
     session_id: String,
     cwd: String,
+    title: String,
 }
 
 #[derive(Debug, Clone)]
@@ -512,6 +519,7 @@ fn first_session_leaf(node: &SessionNode) -> Option<StoredLeaf> {
                 .cwd
                 .clone()
                 .unwrap_or_else(|| session_preview_cwd(&node.path.display().to_string())),
+            title: node.title.clone().unwrap_or_else(|| node.name.clone()),
         });
     }
 
@@ -528,6 +536,7 @@ fn build_session(
     path: &str,
     session_id: Option<&str>,
     cwd: Option<&str>,
+    title_hint: Option<&str>,
     backend: TerminalBackend,
     theme: UiTheme,
     ghostty_bridge_enabled: bool,
@@ -535,7 +544,9 @@ fn build_session(
     let session_id = session_id
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| path.rsplit('/').next().unwrap_or(path).to_string());
-    let title = short_session_id(&session_id);
+    let title = title_hint
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| short_session_id(&session_id));
     let host_label = String::from("localhost");
 
     let appearance = match theme {
