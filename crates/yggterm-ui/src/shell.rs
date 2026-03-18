@@ -2,9 +2,10 @@ use anyhow::Result;
 use dioxus::desktop::{Config, LogicalSize, WindowBuilder, window};
 use dioxus::prelude::*;
 use once_cell::sync::OnceCell;
+use std::path::PathBuf;
 use yggterm_core::{
-    BrowserRow, BrowserRowKind, ManagedSessionView, PreviewTone, SessionBrowserState, SessionNode,
-    SshConnectTarget, UiTheme, WorkspaceViewMode, YggtermServer,
+    AppSettings, BrowserRow, BrowserRowKind, ManagedSessionView, PreviewTone, SessionBrowserState,
+    SessionNode, SshConnectTarget, UiTheme, WorkspaceViewMode, YggtermServer, save_settings_file,
 };
 
 static BOOTSTRAP: OnceCell<ShellBootstrap> = OnceCell::new();
@@ -13,6 +14,8 @@ static BOOTSTRAP: OnceCell<ShellBootstrap> = OnceCell::new();
 pub struct ShellBootstrap {
     pub tree: SessionNode,
     pub browser_tree: SessionNode,
+    pub settings: AppSettings,
+    pub settings_path: PathBuf,
     pub theme: UiTheme,
     pub ghostty_bridge_enabled: bool,
     pub ghostty_embedded_surface_supported: bool,
@@ -25,10 +28,18 @@ struct ShellState {
     bootstrap: ShellBootstrap,
     browser: SessionBrowserState,
     server: YggtermServer,
+    settings: AppSettings,
     search_query: String,
     sidebar_open: bool,
-    right_panel_open: bool,
+    right_panel_mode: RightPanelMode,
     last_action: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RightPanelMode {
+    Hidden,
+    Metadata,
+    Settings,
 }
 
 #[derive(Clone, PartialEq)]
@@ -36,7 +47,7 @@ struct RenderSnapshot {
     palette: Palette,
     search_query: String,
     sidebar_open: bool,
-    right_panel_open: bool,
+    right_panel_mode: RightPanelMode,
     rows: Vec<BrowserRow>,
     selected_path: Option<String>,
     active_session: Option<ManagedSessionView>,
@@ -47,6 +58,7 @@ struct RenderSnapshot {
     last_action: String,
     ghostty_embedded_surface_supported: bool,
     ghostty_bridge_detail: String,
+    settings: AppSettings,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -78,6 +90,12 @@ enum HoveredControl {
 
 impl ShellState {
     fn new(bootstrap: ShellBootstrap) -> Self {
+        let settings = bootstrap.settings.clone();
+        let right_panel_mode = if settings.show_settings {
+            RightPanelMode::Settings
+        } else {
+            RightPanelMode::Metadata
+        };
         Self {
             browser: SessionBrowserState::new(bootstrap.browser_tree.clone()),
             server: YggtermServer::new(
@@ -86,10 +104,11 @@ impl ShellState {
                 bootstrap.ghostty_bridge_enabled,
                 bootstrap.theme,
             ),
+            settings,
             bootstrap,
             search_query: String::new(),
             sidebar_open: true,
-            right_panel_open: true,
+            right_panel_mode,
             last_action: "ready".to_string(),
         }
     }
@@ -99,7 +118,7 @@ impl ShellState {
             palette: palette(self.bootstrap.theme),
             search_query: self.search_query.clone(),
             sidebar_open: self.sidebar_open,
-            right_panel_open: self.right_panel_open,
+            right_panel_mode: self.right_panel_mode,
             rows: self.browser.rows().to_vec(),
             selected_path: self.browser.selected_path().map(ToOwned::to_owned),
             active_session: self.server.active_session().cloned(),
@@ -110,6 +129,7 @@ impl ShellState {
             last_action: self.last_action.clone(),
             ghostty_embedded_surface_supported: self.bootstrap.ghostty_embedded_surface_supported,
             ghostty_bridge_detail: self.bootstrap.ghostty_bridge_detail.clone(),
+            settings: self.settings.clone(),
         }
     }
 
@@ -132,12 +152,33 @@ impl ShellState {
         };
     }
 
-    fn toggle_right_panel(&mut self) {
-        self.right_panel_open = !self.right_panel_open;
-        self.last_action = if self.right_panel_open {
-            "metadata opened".to_string()
+    fn toggle_metadata_panel(&mut self) {
+        self.right_panel_mode = if self.right_panel_mode == RightPanelMode::Metadata {
+            RightPanelMode::Hidden
         } else {
-            "metadata hidden".to_string()
+            RightPanelMode::Metadata
+        };
+        self.settings.show_settings = false;
+        self.persist_settings();
+        self.last_action = match self.right_panel_mode {
+            RightPanelMode::Metadata => "metadata opened".to_string(),
+            RightPanelMode::Hidden => "right panel hidden".to_string(),
+            RightPanelMode::Settings => "settings opened".to_string(),
+        };
+    }
+
+    fn toggle_settings_panel(&mut self) {
+        self.right_panel_mode = if self.right_panel_mode == RightPanelMode::Settings {
+            RightPanelMode::Hidden
+        } else {
+            RightPanelMode::Settings
+        };
+        self.settings.show_settings = self.right_panel_mode == RightPanelMode::Settings;
+        self.persist_settings();
+        self.last_action = match self.right_panel_mode {
+            RightPanelMode::Settings => "settings opened".to_string(),
+            RightPanelMode::Hidden => "right panel hidden".to_string(),
+            RightPanelMode::Metadata => "metadata opened".to_string(),
         };
     }
 
@@ -207,6 +248,28 @@ impl ShellState {
     fn focus_ghostty_window(&mut self) {
         self.last_action = self.server.raise_external_terminal_window_for_active();
     }
+
+    fn update_litellm_endpoint(&mut self, value: String) {
+        self.settings.litellm_endpoint = value;
+        self.persist_settings();
+        self.last_action = "updated LiteLLM endpoint".to_string();
+    }
+
+    fn update_litellm_api_key(&mut self, value: String) {
+        self.settings.litellm_api_key = value;
+        self.persist_settings();
+        self.last_action = "updated LiteLLM API key".to_string();
+    }
+
+    fn update_interface_llm_model(&mut self, value: String) {
+        self.settings.interface_llm_model = value;
+        self.persist_settings();
+        self.last_action = "updated interface llm".to_string();
+    }
+
+    fn persist_settings(&self) {
+        let _ = save_settings_file(&self.bootstrap.settings_path, &self.settings);
+    }
 }
 
 pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
@@ -253,7 +316,8 @@ fn app() -> Element {
                     on_search: move |value: String| state.with_mut(|shell| shell.set_search(value)),
                     on_hover_control: move |control: Option<HoveredControl>| hovered.set(control),
                     on_set_view_mode: move |mode: WorkspaceViewMode| state.with_mut(|shell| shell.set_view_mode(mode)),
-                    on_toggle_meta: move || state.with_mut(|shell| shell.toggle_right_panel()),
+                    on_toggle_meta: move || state.with_mut(|shell| shell.toggle_metadata_panel()),
+                    on_toggle_settings: move || state.with_mut(|shell| shell.toggle_settings_panel()),
                     maximized: maximized,
                 }
                 div {
@@ -275,8 +339,13 @@ fn app() -> Element {
                         on_focus_ghostty: move || state.with_mut(|shell| shell.focus_ghostty_window()),
                         on_resolve_ghostty: move || state.with_mut(|shell| shell.resolve_ghostty_window()),
                     }
-                    if metadata_snapshot.right_panel_open {
-                        MetadataRail { snapshot: metadata_snapshot }
+                    if metadata_snapshot.right_panel_mode != RightPanelMode::Hidden {
+                        RightRail {
+                            snapshot: metadata_snapshot,
+                            on_endpoint_change: move |value: String| state.with_mut(|shell| shell.update_litellm_endpoint(value)),
+                            on_api_key_change: move |value: String| state.with_mut(|shell| shell.update_litellm_api_key(value)),
+                            on_model_change: move |value: String| state.with_mut(|shell| shell.update_interface_llm_model(value)),
+                        }
                     }
                 }
             }
@@ -293,6 +362,7 @@ fn Titlebar(
     on_hover_control: EventHandler<Option<HoveredControl>>,
     on_set_view_mode: EventHandler<WorkspaceViewMode>,
     on_toggle_meta: EventHandler<()>,
+    on_toggle_settings: EventHandler<()>,
     maximized: bool,
 ) -> Element {
     rsx! {
@@ -346,10 +416,22 @@ fn Titlebar(
             div {
                 style: "display:flex; align-items:center; justify-content:flex-end; gap:10px; width:300px; min-width:300px;",
                 button {
-                    style: metadata_toggle_style(snapshot.palette, snapshot.right_panel_open),
+                    style: utility_icon_style(
+                        snapshot.palette,
+                        snapshot.right_panel_mode == RightPanelMode::Metadata
+                    ),
                     onmousedown: |evt| evt.stop_propagation(),
                     onclick: move |_| on_toggle_meta.call(()),
-                    if snapshot.right_panel_open { "Metadata" } else { "Inspect" }
+                    "ⓘ"
+                }
+                button {
+                    style: utility_icon_style(
+                        snapshot.palette,
+                        snapshot.right_panel_mode == RightPanelMode::Settings
+                    ),
+                    onmousedown: |evt| evt.stop_propagation(),
+                    onclick: move |_| on_toggle_settings.call(()),
+                    "⚙"
                 }
                 WindowControls {
                     palette: snapshot.palette,
@@ -563,7 +645,7 @@ fn SidebarRow(
     let disclosure = match row.kind {
         BrowserRowKind::Group if row.expanded => "▾",
         BrowserRowKind::Group => "▸",
-        BrowserRowKind::Session => "•",
+        BrowserRowKind::Session => "",
     };
     let indent = row.depth * 12 + 12;
     let background = if selected {
@@ -572,6 +654,13 @@ fn SidebarRow(
         palette.panel_alt
     } else {
         "transparent"
+    };
+    let icon = if row.kind == BrowserRowKind::Session {
+        ">_"
+    } else if row.depth == 0 {
+        "🖥"
+    } else {
+        "📁"
     };
 
     rsx! {
@@ -588,7 +677,13 @@ fn SidebarRow(
                     style: "display:flex; align-items:center; gap:8px; min-width:0;",
                     span {
                         style: format!("font-size:10px; color:{};", palette.muted),
-                        "{disclosure}"
+                        "{icon}"
+                    }
+                    if !disclosure.is_empty() {
+                        span {
+                            style: format!("font-size:10px; color:{};", palette.muted),
+                            "{disclosure}"
+                        }
                     }
                     span {
                         style: format!(
@@ -894,46 +989,143 @@ fn EmptyState(palette: Palette) -> Element {
 }
 
 #[component]
-fn MetadataRail(snapshot: RenderSnapshot) -> Element {
+fn RightRail(
+    snapshot: RenderSnapshot,
+    on_endpoint_change: EventHandler<String>,
+    on_api_key_change: EventHandler<String>,
+    on_model_change: EventHandler<String>,
+) -> Element {
+    rsx! {
+        div {
+            style: format!(
+                "width:236px; min-width:236px; max-width:236px; display:flex; flex-direction:column; \
+                 background:{}; overflow:hidden;",
+                snapshot.palette.sidebar
+            ),
+            if snapshot.right_panel_mode == RightPanelMode::Metadata {
+                MetadataRailBody { snapshot: snapshot.clone() }
+            } else if snapshot.right_panel_mode == RightPanelMode::Settings {
+                SettingsRailBody {
+                    snapshot: snapshot.clone(),
+                    on_endpoint_change,
+                    on_api_key_change,
+                    on_model_change,
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn MetadataRailBody(snapshot: RenderSnapshot) -> Element {
     let session = snapshot.active_session;
 
     rsx! {
         div {
             style: format!(
-                "width:224px; min-width:224px; max-width:224px; display:flex; flex-direction:column; \
-                 background:{}; overflow:hidden;",
-                snapshot.palette.sidebar
+                "padding:15px 16px 10px 16px; font-size:11px; font-weight:700; color:{};",
+                snapshot.palette.text
             ),
-            div {
-                style: format!(
-                    "padding:15px 16px 10px 16px; font-size:11px; font-weight:700; color:{};",
-                    snapshot.palette.text
-                ),
-                "Session Metadata"
+            "Session Metadata"
+        }
+        div {
+            style: "flex:1; overflow:auto; padding:10px 16px 14px 16px; display:flex; flex-direction:column; gap:14px;",
+            if let Some(session) = session {
+                MetadataGroup {
+                    title: "Overview".to_string(),
+                    entries: session.metadata.iter().take(6).cloned().collect(),
+                    palette: snapshot.palette,
+                }
+                MetadataGroup {
+                    title: "Runtime".to_string(),
+                    entries: session.metadata.iter().skip(6).cloned().collect(),
+                    palette: snapshot.palette,
+                }
+            } else {
+                MetadataGroup {
+                    title: "Overview".to_string(),
+                    entries: vec![yggterm_core::SessionMetadataEntry {
+                        label: "State",
+                        value: "No session selected".to_string(),
+                    }],
+                    palette: snapshot.palette,
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn SettingsRailBody(
+    snapshot: RenderSnapshot,
+    on_endpoint_change: EventHandler<String>,
+    on_api_key_change: EventHandler<String>,
+    on_model_change: EventHandler<String>,
+) -> Element {
+    rsx! {
+        div {
+            style: format!(
+                "padding:15px 16px 10px 16px; font-size:11px; font-weight:700; color:{};",
+                snapshot.palette.text
+            ),
+            "Interface Settings"
+        }
+        div {
+            style: "flex:1; overflow:auto; padding:10px 16px 14px 16px; display:flex; flex-direction:column; gap:14px;",
+            SettingsField {
+                label: "LiteLLM Endpoint".to_string(),
+                value: snapshot.settings.litellm_endpoint.clone(),
+                placeholder: "https://litellm.example/v1".to_string(),
+                secret: false,
+                palette: snapshot.palette,
+                on_change: on_endpoint_change,
+            }
+            SettingsField {
+                label: "API Key".to_string(),
+                value: snapshot.settings.litellm_api_key.clone(),
+                placeholder: "sk-...".to_string(),
+                secret: true,
+                palette: snapshot.palette,
+                on_change: on_api_key_change,
+            }
+            SettingsField {
+                label: "Interface LLM".to_string(),
+                value: snapshot.settings.interface_llm_model.clone(),
+                placeholder: "openai/gpt-5.4-mini".to_string(),
+                secret: false,
+                palette: snapshot.palette,
+                on_change: on_model_change,
             }
             div {
-                style: "flex:1; overflow:auto; padding:10px 16px 14px 16px; display:flex; flex-direction:column; gap:14px;",
-                if let Some(session) = session {
-                    MetadataGroup {
-                        title: "Overview".to_string(),
-                        entries: session.metadata.iter().take(6).cloned().collect(),
-                        palette: snapshot.palette,
-                    }
-                    MetadataGroup {
-                        title: "Runtime".to_string(),
-                        entries: session.metadata.iter().skip(6).cloned().collect(),
-                        palette: snapshot.palette,
-                    }
-                } else {
-                    MetadataGroup {
-                        title: "Overview".to_string(),
-                        entries: vec![yggterm_core::SessionMetadataEntry {
-                            label: "State",
-                            value: "No session selected".to_string(),
-                        }],
-                        palette: snapshot.palette,
-                    }
-                }
+                style: format!("font-size:10px; line-height:1.45; color:{};", snapshot.palette.muted),
+                "Future session-title generation will use this configuration to summarize recent terminal or Codex context into friendlier names under ~/.yggterm."
+            }
+        }
+    }
+}
+
+#[component]
+fn SettingsField(
+    label: String,
+    value: String,
+    placeholder: String,
+    secret: bool,
+    palette: Palette,
+    on_change: EventHandler<String>,
+) -> Element {
+    rsx! {
+        div {
+            style: "display:flex; flex-direction:column; gap:5px;",
+            div {
+                style: format!("font-size:10px; font-weight:700; letter-spacing:0.02em; color:{};", palette.muted),
+                "{label}"
+            }
+            input {
+                r#type: if secret { "password" } else { "text" },
+                value: "{value}",
+                placeholder: "{placeholder}",
+                style: settings_input_style(palette),
+                oninput: move |evt| on_change.call(evt.value()),
             }
         }
     }
@@ -1037,6 +1229,14 @@ fn icon_button_style(palette: Palette) -> String {
     )
 }
 
+fn utility_icon_style(palette: Palette, selected: bool) -> String {
+    format!(
+        "width:28px; height:28px; border:none; border-radius:10px; background:{}; color:{}; font-size:13px; font-weight:700;",
+        if selected { "rgba(255,255,255,0.46)" } else { "transparent" },
+        if selected { palette.text } else { palette.muted }
+    )
+}
+
 fn chip_style(palette: Palette, selected: bool) -> String {
     format!(
         "height:24px; padding:0 10px; border-radius:999px; border:1px solid {}; background:{}; \
@@ -1068,11 +1268,11 @@ fn toggle_slider_end_style(palette: Palette, selected: bool) -> String {
     )
 }
 
-fn metadata_toggle_style(palette: Palette, selected: bool) -> String {
+fn settings_input_style(palette: Palette) -> String {
     format!(
-        "height:28px; padding:0 12px; border:none; border-radius:10px; background:{}; color:{}; font-size:11px; font-weight:700;",
-        if selected { "rgba(255,255,255,0.46)" } else { "transparent" },
-        if selected { palette.text } else { palette.muted }
+        "height:30px; padding:0 10px; border:none; border-radius:8px; background:rgba(255,255,255,0.58); \
+         color:{}; outline:none; font-size:11px; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.34);",
+        palette.text
     )
 }
 
