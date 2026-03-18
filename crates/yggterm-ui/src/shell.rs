@@ -1,9 +1,9 @@
 use anyhow::Result;
 use gpui::{
     AnyElement, App, AppContext, Bounds, Context, FocusHandle, InteractiveElement, IntoElement,
-    ParentElement, Render, StatefulInteractiveElement, Styled, UniformListScrollHandle, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions, div, px, size,
-    uniform_list,
+    KeyBinding, ParentElement, Render, ScrollStrategy, StatefulInteractiveElement, Styled,
+    UniformListScrollHandle, Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations,
+    WindowOptions, actions, div, px, size, uniform_list,
 };
 use gpui_platform::application;
 use yggterm_core::{
@@ -16,6 +16,11 @@ use crate::{
     statusbar_frame, terminal_surface_card, titlebar_frame, titlebar_icon_button,
     titlebar_mode_toggle, toolbar_chip_button,
 };
+
+actions!(
+    search_input,
+    [SearchPrev, SearchNext, SearchAccept, SearchClear]
+);
 
 #[derive(Debug, Clone)]
 pub struct ShellBootstrap {
@@ -30,6 +35,12 @@ pub struct ShellBootstrap {
 
 pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
     application().run(move |cx: &mut App| {
+        cx.bind_keys([
+            KeyBinding::new("up", SearchPrev, Some("SearchInput")),
+            KeyBinding::new("down", SearchNext, Some("SearchInput")),
+            KeyBinding::new("enter", SearchAccept, Some("SearchInput")),
+            KeyBinding::new("escape", SearchClear, Some("SearchInput")),
+        ]);
         let bounds = Bounds::centered(None, size(px(1460.), px(920.)), cx);
         let shell = bootstrap.clone();
         cx.open_window(
@@ -99,14 +110,20 @@ impl GpuiShell {
                     }
                 }
                 "enter" => {
-                    if let Some(ix) = this
-                        .browser
-                        .rows()
-                        .iter()
-                        .position(|row| row.kind == BrowserRowKind::Session)
-                    {
+                    if let Some(ix) = this.browser.selected_session_index().or_else(|| {
+                        this.browser
+                            .rows()
+                            .iter()
+                            .position(|row| row.kind == BrowserRowKind::Session)
+                    }) {
                         this.select_row(ix, cx);
                     }
+                }
+                "up" => {
+                    this.move_search_selection(-1, cx);
+                }
+                "down" => {
+                    this.move_search_selection(1, cx);
                 }
                 _ => {
                     if event.keystroke.modifiers.control
@@ -171,6 +188,34 @@ impl GpuiShell {
         window.focus(&self.search_focus, cx);
         self.last_action = "search cleared".to_string();
         cx.notify();
+    }
+
+    fn move_search_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let selected_ix = if delta < 0 {
+            self.browser.select_previous_session()
+        } else {
+            self.browser.select_next_session()
+        };
+
+        if let Some(ix) = selected_ix {
+            self.sidebar_scroll_handle
+                .scroll_to_item(ix, ScrollStrategy::Nearest);
+            if let Some(row) = self.browser.rows().get(ix) {
+                self.last_action = format!("selected {}", row.label);
+            }
+            cx.notify();
+        }
+    }
+
+    fn accept_search_selection(&mut self, cx: &mut Context<Self>) {
+        if let Some(ix) = self.browser.selected_session_index().or_else(|| {
+            self.browser
+                .rows()
+                .iter()
+                .position(|row| row.kind == BrowserRowKind::Session)
+        }) {
+            self.select_row(ix, cx);
+        }
     }
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -305,7 +350,18 @@ impl GpuiShell {
             .text_sm()
             .text_color(palette.text_muted)
             .focusable()
+            .key_context("SearchInput")
             .track_focus(&self.search_focus)
+            .on_action(
+                cx.listener(|this, _: &SearchPrev, _, cx| this.move_search_selection(-1, cx)),
+            )
+            .on_action(cx.listener(|this, _: &SearchNext, _, cx| this.move_search_selection(1, cx)))
+            .on_action(
+                cx.listener(|this, _: &SearchAccept, _, cx| this.accept_search_selection(cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &SearchClear, window, cx| this.clear_search(window, cx)),
+            )
             .on_click(cx.listener(|this, _, window, cx| this.focus_search(window, cx)))
             .child(
                 div()
@@ -546,7 +602,7 @@ impl GpuiShell {
                 div()
                     .flex()
                     .flex_col()
-                    .gap_2()
+                    .gap_1()
                     .flex_1()
                     .child(
                         div()
@@ -563,6 +619,7 @@ impl GpuiShell {
                                     } else {
                                         palette.text_muted
                                     })
+                                    .line_clamp(1)
                                     .text_ellipsis()
                                     .child(row.label),
                             ),
@@ -572,6 +629,7 @@ impl GpuiShell {
                             .pl(px(18.))
                             .text_xs()
                             .text_color(palette.text_muted)
+                            .line_clamp(1)
                             .text_ellipsis()
                             .child(detail),
                     ),
