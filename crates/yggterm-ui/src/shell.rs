@@ -695,7 +695,15 @@ impl GpuiShell {
                     .blocks
                     .iter()
                     .enumerate()
-                    .map(|(ix, block)| self.preview_block(ix, block, cx, palette))
+                    .map(|(ix, block)| {
+                        let grouped_with_previous = ix > 0
+                            && session
+                                .preview
+                                .blocks
+                                .get(ix - 1)
+                                .is_some_and(|prev| prev.tone == block.tone);
+                        self.preview_block(ix, block, grouped_with_previous, cx, palette)
+                    })
                     .collect::<Vec<_>>();
                 div()
                     .flex()
@@ -818,6 +826,7 @@ impl GpuiShell {
         &self,
         block_ix: usize,
         block: &yggterm_core::SessionPreviewBlock,
+        grouped_with_previous: bool,
         cx: &mut Context<Self>,
         palette: &UiPalette,
     ) -> AnyElement {
@@ -832,6 +841,7 @@ impl GpuiShell {
                     PreviewTone::User => ChatBubbleTone::User,
                     PreviewTone::Assistant => ChatBubbleTone::Assistant,
                 },
+                grouped_with_previous,
                 block.folded,
                 "",
                 &block.lines,

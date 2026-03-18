@@ -2,7 +2,7 @@ use gpui::Div;
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton, Stateful,
-    StatefulInteractiveElement, Styled, Window, div, hsla, px,
+    StatefulInteractiveElement, Styled, Window, div, hsla, px, relative,
 };
 
 mod shell;
@@ -384,6 +384,7 @@ pub fn chat_preview_card(
     _role: &str,
     timestamp: &str,
     tone: ChatBubbleTone,
+    grouped_with_previous: bool,
     folded: bool,
     query: &str,
     lines: &[String],
@@ -410,7 +411,12 @@ pub fn chat_preview_card(
     div()
         .w_full()
         .flex()
-        .py_1p5()
+        .pt(if grouped_with_previous {
+            px(2.)
+        } else {
+            px(12.)
+        })
+        .pb(px(2.))
         .justify_start()
         .when(matches!(tone, ChatBubbleTone::User), |this| {
             this.justify_end()
@@ -422,13 +428,20 @@ pub fn chat_preview_card(
                     ChatBubbleTone::User => 720.,
                     ChatBubbleTone::Assistant | ChatBubbleTone::Neutral => 880.,
                 }))
-                .gap_2()
+                .gap_3()
                 .px_4()
                 .py_3p5()
                 .rounded_xl()
                 .bg(bg)
                 .border_1()
                 .border_color(border)
+                .when(!grouped_with_previous, |this| {
+                    this.child(div().h(px(3.)).w(px(36.)).rounded_full().bg(match tone {
+                        ChatBubbleTone::User => palette.text_accent.opacity(0.55),
+                        ChatBubbleTone::Assistant => palette.border_focused.opacity(0.35),
+                        ChatBubbleTone::Neutral => palette.border_variant,
+                    }))
+                })
                 .when(!query.is_empty(), |this| {
                     this.child(
                         div()
@@ -438,19 +451,7 @@ pub fn chat_preview_card(
                     )
                 })
                 .when(!folded, |this| {
-                    this.children(
-                        lines
-                            .iter()
-                            .map(|line| {
-                                div()
-                                    .text_base()
-                                    .text_color(palette.text)
-                                    .whitespace_normal()
-                                    .child(line.clone())
-                                    .into_any_element()
-                            })
-                            .collect::<Vec<_>>(),
-                    )
+                    this.children(render_preview_segments(lines, tone, palette))
                 })
                 .when(folded, |this| {
                     this.child(
@@ -491,6 +492,136 @@ fn row() -> Div {
 
 fn column() -> Div {
     div().flex().flex_col()
+}
+
+fn render_preview_segments(
+    lines: &[String],
+    tone: ChatBubbleTone,
+    palette: &UiPalette,
+) -> Vec<AnyElement> {
+    let mut segments = Vec::new();
+    let mut prose = Vec::<String>::new();
+    let mut code = Vec::<String>::new();
+
+    let flush_prose = |segments: &mut Vec<AnyElement>, prose: &mut Vec<String>| {
+        if prose.is_empty() {
+            return;
+        }
+        let chunk = std::mem::take(prose);
+        segments.push(
+            column()
+                .gap_2()
+                .children(
+                    chunk
+                        .into_iter()
+                        .map(|line| {
+                            div()
+                                .text_base()
+                                .line_height(relative(1.45))
+                                .text_color(palette.text)
+                                .whitespace_normal()
+                                .child(line)
+                                .into_any_element()
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .into_any_element(),
+        );
+    };
+
+    let flush_code = |segments: &mut Vec<AnyElement>, code: &mut Vec<String>| {
+        if code.is_empty() {
+            return;
+        }
+        let chunk = std::mem::take(code);
+        segments.push(
+            column()
+                .gap_1()
+                .px_3()
+                .py_2()
+                .rounded_lg()
+                .bg(match tone {
+                    ChatBubbleTone::User => palette.text_accent.opacity(0.10),
+                    ChatBubbleTone::Assistant | ChatBubbleTone::Neutral => {
+                        palette.window_background.opacity(0.55)
+                    }
+                })
+                .border_1()
+                .border_color(match tone {
+                    ChatBubbleTone::User => palette.text_accent.opacity(0.24),
+                    ChatBubbleTone::Assistant | ChatBubbleTone::Neutral => palette.border_variant,
+                })
+                .children(
+                    chunk
+                        .into_iter()
+                        .map(|line| {
+                            div()
+                                .text_sm()
+                                .line_height(relative(1.35))
+                                .text_color(palette.text)
+                                .whitespace_nowrap()
+                                .child(line)
+                                .into_any_element()
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .into_any_element(),
+        );
+    };
+
+    for line in lines {
+        if is_code_line(line) {
+            flush_prose(&mut segments, &mut prose);
+            code.push(line.clone());
+        } else {
+            flush_code(&mut segments, &mut code);
+            prose.push(line.clone());
+        }
+    }
+
+    flush_prose(&mut segments, &mut prose);
+    flush_code(&mut segments, &mut code);
+    segments
+}
+
+fn is_code_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if trimmed.starts_with("```")
+        || trimmed.starts_with("$ ")
+        || trimmed.starts_with("> ")
+        || trimmed.starts_with("fn ")
+        || trimmed.starts_with("pub ")
+        || trimmed.starts_with("impl ")
+        || trimmed.starts_with("use ")
+        || trimmed.starts_with("let ")
+        || trimmed.starts_with("const ")
+        || trimmed.starts_with("struct ")
+        || trimmed.starts_with("enum ")
+        || trimmed.starts_with("match ")
+        || trimmed.starts_with("if ")
+        || trimmed.starts_with("for ")
+        || trimmed.starts_with("while ")
+        || trimmed.starts_with("return ")
+        || trimmed.starts_with("cargo ")
+        || trimmed.starts_with("git ")
+        || trimmed.starts_with("cd ")
+        || trimmed.starts_with("ssh ")
+        || trimmed.starts_with('{')
+        || trimmed.starts_with('}')
+    {
+        return true;
+    }
+
+    trimmed.contains("::")
+        || trimmed.contains("->")
+        || trimmed.contains(" = ")
+        || trimmed.ends_with('{')
+        || trimmed.ends_with("};")
+        || trimmed.ends_with(")]")
 }
 
 fn icon_glyph(icon: TitlebarIcon) -> &'static str {
