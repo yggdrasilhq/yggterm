@@ -408,7 +408,7 @@ impl GpuiShell {
             .gap_1()
             .items_center()
             .when(cfg!(target_os = "macos"), |div| {
-                div.child(window_controls(window))
+                div.child(window_controls(window, palette))
             })
             .child(
                 titlebar_icon_button("toggle-sidebar", TitlebarIcon::Sidebar, palette)
@@ -449,7 +449,7 @@ impl GpuiShell {
                         .on_click(cx.listener(|this, _, _, cx| this.toggle_right_panel(cx))),
                 )
                 .when(!cfg!(target_os = "macos"), |div| {
-                    div.child(window_controls(window))
+                    div.child(window_controls(window, palette))
                 })
                 .into_any_element();
 
@@ -503,13 +503,13 @@ impl GpuiShell {
             .flex_col()
             .bg(palette.window_background)
             .border_r_1()
-            .border_color(palette.border_variant.opacity(0.92))
+            .border_color(palette.border_variant.opacity(0.84))
             .child(
                 div()
                     .px_3()
                     .py_1p5()
                     .border_b_1()
-                    .border_color(palette.border_variant.opacity(0.92))
+                    .border_color(palette.border_variant.opacity(0.84))
                     .flex()
                     .flex_col()
                     .gap_0p5()
@@ -544,7 +544,7 @@ impl GpuiShell {
                             .child(
                                 div()
                                     .px_1p5()
-                                    .py_0p5()
+                                    .py(px(3.))
                                     .rounded_md()
                                     .bg(if filter_active {
                                         palette.text_accent.opacity(0.14)
@@ -746,6 +746,7 @@ impl GpuiShell {
             body = body.child(
                 div()
                     .pl(px(14.))
+                    .pl(px(12.))
                     .text_xs()
                     .text_color(if is_selected {
                         palette.text_muted.opacity(0.9)
@@ -1015,13 +1016,13 @@ impl GpuiShell {
             .flex_col()
             .bg(palette.window_background)
             .border_l_1()
-            .border_color(palette.border_variant.opacity(0.92))
+            .border_color(palette.border_variant.opacity(0.84))
             .child(
                 div()
                     .px_3()
                     .py_1()
                     .border_b_1()
-                    .border_color(palette.border_variant.opacity(0.92))
+                    .border_color(palette.border_variant.opacity(0.84))
                     .child(
                         div()
                             .text_xs()
