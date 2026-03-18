@@ -457,7 +457,6 @@ fn Titlebar(
                 snapshot.palette.titlebar,
                 zoom_percent_f32(snapshot.settings.ui_font_size, 14.0)
             ),
-            onmousedown: move |_| window().drag(),
             ondoubleclick: move |_| on_toggle_maximized.call(()),
             div {
                 style: "display:flex; align-items:center; gap:12px; width:300px; min-width:300px;",
@@ -487,9 +486,19 @@ fn Titlebar(
                         "Terminal"
                     }
                 }
+                div {
+                    style: "flex:1; min-width:16px; height:100%;",
+                    onmousedown: move |_| window().drag(),
+                    ondoubleclick: move |_| on_toggle_maximized.call(()),
+                }
             }
             div {
-                style: "flex:1; display:flex; justify-content:center; padding:0 16px;",
+                style: "flex:1; display:flex; align-items:center; justify-content:center; gap:10px; padding:0 16px;",
+                div {
+                    style: "flex:1; min-width:12px; height:100%;",
+                    onmousedown: move |_| window().drag(),
+                    ondoubleclick: move |_| on_toggle_maximized.call(()),
+                }
                 input {
                     r#type: "text",
                     value: "{snapshot.search_query}",
@@ -498,17 +507,22 @@ fn Titlebar(
                     onmousedown: |evt| evt.stop_propagation(),
                     oninput: move |evt| on_search.call(evt.value()),
                 }
+                div {
+                    style: "flex:1; min-width:12px; height:100%;",
+                    onmousedown: move |_| window().drag(),
+                    ondoubleclick: move |_| on_toggle_maximized.call(()),
+                }
             }
             div {
-                style: "display:flex; align-items:center; justify-content:flex-end; gap:10px; width:300px; min-width:300px;",
+                style: "display:flex; align-items:center; justify-content:flex-end; gap:10px; width:340px; min-width:340px;",
                 button {
-                    style: utility_icon_style(
+                    style: connect_button_style(
                         snapshot.palette,
-                        snapshot.right_panel_mode == RightPanelMode::Metadata
+                        snapshot.right_panel_mode == RightPanelMode::Connect
                     ),
                     onmousedown: |evt| evt.stop_propagation(),
-                    onclick: move |_| on_toggle_meta.call(()),
-                    "ⓘ"
+                    onclick: move |_| on_toggle_connect.call(()),
+                    "Connect SSH"
                 }
                 button {
                     style: utility_icon_style(
@@ -520,13 +534,18 @@ fn Titlebar(
                     "⚙"
                 }
                 button {
-                    style: connect_button_style(
+                    style: utility_icon_style(
                         snapshot.palette,
-                        snapshot.right_panel_mode == RightPanelMode::Connect
+                        snapshot.right_panel_mode == RightPanelMode::Metadata
                     ),
                     onmousedown: |evt| evt.stop_propagation(),
-                    onclick: move |_| on_toggle_connect.call(()),
-                    "Connect SSH"
+                    onclick: move |_| on_toggle_meta.call(()),
+                    "ⓘ"
+                }
+                div {
+                    style: "flex:1; min-width:12px; height:100%;",
+                    onmousedown: move |_| window().drag(),
+                    ondoubleclick: move |_| on_toggle_maximized.call(()),
                 }
                 WindowControls {
                     palette: snapshot.palette,
