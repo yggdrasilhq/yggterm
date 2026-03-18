@@ -30,6 +30,7 @@ jobs:
             pkg-config \
             protobuf-compiler \
             ripgrep \
+            libfontconfig1-dev \
             libgl1-mesa-dev \
             libwayland-dev \
             libx11-dev \
