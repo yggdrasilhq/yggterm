@@ -276,10 +276,11 @@ fn detail_label_for_row(node: &SessionNode, full_path: &str, is_session: bool) -
             _ => browser_display_path(full_path),
         }
     } else {
-        node.cwd
-            .as_deref()
-            .map(browser_display_path)
-            .unwrap_or_else(|| browser_display_path(full_path))
+        if full_path.starts_with("live::") {
+            "remote runtime".to_string()
+        } else {
+            String::new()
+        }
     }
 }
 
