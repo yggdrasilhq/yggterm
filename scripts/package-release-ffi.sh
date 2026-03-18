@@ -11,9 +11,7 @@ RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.94.0}"
 CARGO_CMD=(cargo "+${RUSTUP_TOOLCHAIN}")
 
 if [[ ! -d "$LIB_DIR" ]]; then
-  echo "Ghostty lib dir not found: $LIB_DIR" >&2
-  echo "Run ./scripts/build-ghostty-lib.sh first." >&2
-  exit 1
+  "${ROOT_DIR}/scripts/build-ghostty-lib.sh"
 fi
 
 mkdir -p "$DIST_DIR"
