@@ -10,6 +10,7 @@ use yggterm_core::{
 };
 
 static BOOTSTRAP: OnceCell<ShellBootstrap> = OnceCell::new();
+const SIDE_RAIL_WIDTH: usize = 292;
 
 #[derive(Debug, Clone)]
 pub struct ShellBootstrap {
@@ -573,9 +574,9 @@ fn Sidebar(
     rsx! {
         div {
             style: format!(
-                "width:292px; min-width:292px; max-width:292px; display:flex; flex-direction:column; \
+                "width:{}px; min-width:{}px; max-width:{}px; display:flex; flex-direction:column; \
                  background:{}; overflow:hidden;",
-                snapshot.palette.sidebar
+                SIDE_RAIL_WIDTH, SIDE_RAIL_WIDTH, SIDE_RAIL_WIDTH, snapshot.palette.sidebar
             ),
             div {
                 style: "padding:15px 16px 8px 16px;",
@@ -688,12 +689,21 @@ fn SidebarRow(
     } else {
         "transparent"
     };
-    let icon = if row.kind == BrowserRowKind::Session {
-        ">_"
-    } else if row.depth == 0 {
-        if row.expanded { "▥" } else { "▤" }
+    let icon_color = if row.kind == BrowserRowKind::Group && row.depth == 0 && row.expanded {
+        palette.accent
+    } else if selected {
+        palette.text
     } else {
-        if row.expanded { "⊟" } else { "⊞" }
+        palette.muted
+    };
+    let label_color = if row.kind == BrowserRowKind::Group && row.depth == 0 && row.expanded {
+        palette.accent
+    } else if selected {
+        palette.text
+    } else if row.kind == BrowserRowKind::Group && row.depth > 0 {
+        palette.muted
+    } else {
+        palette.text
     };
 
     rsx! {
@@ -708,20 +718,17 @@ fn SidebarRow(
                 style: "display:flex; align-items:center; justify-content:space-between; gap:8px;",
                 div {
                     style: "display:flex; align-items:center; gap:8px; min-width:0;",
-                    span {
+                    div {
                         style: format!(
-                            "display:inline-flex; align-items:center; justify-content:center; min-width:18px; \
-                             font-size:{}; line-height:1; color:{}; font-weight:{};",
-                            if row.kind == BrowserRowKind::Session { "12px" } else { "13px" },
-                            if selected { palette.text } else { palette.muted },
-                            if row.kind == BrowserRowKind::Session { 700 } else { 600 }
+                            "display:inline-flex; align-items:center; justify-content:center; width:18px; min-width:18px; height:18px; color:{};",
+                            icon_color
                         ),
-                        "{icon}"
+                        TreeIcon { row: row.clone() }
                     }
                     span {
                         style: format!(
                             "font-size:11px; color:{}; font-weight:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
-                            if selected { palette.text } else if row.kind == BrowserRowKind::Group && row.depth > 0 { palette.muted } else { palette.text },
+                            label_color,
                             if row.kind == BrowserRowKind::Group && row.depth == 0 { 600 } else { 500 }
                         ),
                         "{row.label}"
@@ -746,6 +753,126 @@ fn SidebarRow(
                         palette.muted
                     ),
                     "{row.detail_label}"
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn TreeIcon(row: BrowserRow) -> Element {
+    if row.kind == BrowserRowKind::Session {
+        return rsx! {
+            svg {
+                width: "16",
+                height: "16",
+                view_box: "0 0 16 16",
+                fill: "none",
+                xmlns: "http://www.w3.org/2000/svg",
+                path {
+                    d: "M2.75 4.25H13.25V11.75H2.75V4.25Z",
+                    stroke: "currentColor",
+                    stroke_width: "1.15",
+                    stroke_linejoin: "round",
+                }
+                path {
+                    d: "M4.5 6.2L6.4 8L4.5 9.8",
+                    stroke: "currentColor",
+                    stroke_width: "1.15",
+                    stroke_linecap: "round",
+                    stroke_linejoin: "round",
+                }
+                path {
+                    d: "M7.8 9.95H10.85",
+                    stroke: "currentColor",
+                    stroke_width: "1.15",
+                    stroke_linecap: "round",
+                }
+            }
+        };
+    }
+
+    if row.depth == 0 {
+        return rsx! {
+            svg {
+                width: "17",
+                height: "17",
+                view_box: "0 0 18 18",
+                fill: "none",
+                xmlns: "http://www.w3.org/2000/svg",
+                rect {
+                    x: "2.75",
+                    y: "3.25",
+                    width: "12.5",
+                    height: "8.5",
+                    rx: "1.4",
+                    stroke: "currentColor",
+                    stroke_width: "1.15",
+                }
+                path {
+                    d: "M6.2 14.1H11.8",
+                    stroke: "currentColor",
+                    stroke_width: "1.15",
+                    stroke_linecap: "round",
+                }
+                path {
+                    d: "M9 11.95V14.05",
+                    stroke: "currentColor",
+                    stroke_width: "1.15",
+                    stroke_linecap: "round",
+                }
+                if row.expanded {
+                    path {
+                        d: "M13.9 6.6L15.35 8.05L13.9 9.5",
+                        stroke: "currentColor",
+                        stroke_width: "1.15",
+                        stroke_linecap: "round",
+                        stroke_linejoin: "round",
+                    }
+                } else {
+                    path {
+                        d: "M13.35 6.85L15.25 6.85",
+                        stroke: "currentColor",
+                        stroke_width: "1.15",
+                        stroke_linecap: "round",
+                    }
+                }
+            }
+        };
+    }
+
+    rsx! {
+        svg {
+            width: "17",
+            height: "17",
+            view_box: "0 0 18 18",
+            fill: "none",
+            xmlns: "http://www.w3.org/2000/svg",
+            path {
+                d: "M2.75 5.25C2.75 4.83579 3.08579 4.5 3.5 4.5H6.65L8 5.85H14.5C14.9142 5.85 15.25 6.18579 15.25 6.6V12.5C15.25 12.9142 14.9142 13.25 14.5 13.25H3.5C3.08579 13.25 2.75 12.9142 2.75 12.5V5.25Z",
+                stroke: "currentColor",
+                stroke_width: "1.15",
+                stroke_linejoin: "round",
+            }
+            if row.expanded {
+                path {
+                    d: "M6.4 8.2H11.6",
+                    stroke: "currentColor",
+                    stroke_width: "1.15",
+                    stroke_linecap: "round",
+                }
+            } else {
+                path {
+                    d: "M9 6.8V11.2",
+                    stroke: "currentColor",
+                    stroke_width: "1.15",
+                    stroke_linecap: "round",
+                }
+                path {
+                    d: "M6.8 9H11.2",
+                    stroke: "currentColor",
+                    stroke_width: "1.15",
+                    stroke_linecap: "round",
                 }
             }
         }
@@ -1032,11 +1159,10 @@ fn RightRail(
     rsx! {
         div {
             style: format!(
-                "width:236px; min-width:236px; max-width:236px; display:flex; flex-direction:column; \
-                 background:rgba(255,255,255,0.18); overflow:hidden; border-radius:12px 0 0 12px; \
-                 backdrop-filter: blur(18px) saturate(145%); -webkit-backdrop-filter: blur(18px) saturate(145%); \
-                 box-shadow: inset 1px 0 0 rgba(255,255,255,0.20); text-rendering:optimizeLegibility; \
+                "width:{}px; min-width:{}px; max-width:{}px; display:flex; flex-direction:column; \
+                 background:transparent; overflow:hidden; text-rendering:optimizeLegibility; \
                  -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
+                SIDE_RAIL_WIDTH, SIDE_RAIL_WIDTH, SIDE_RAIL_WIDTH
             ),
             if snapshot.right_panel_mode == RightPanelMode::Metadata {
                 MetadataRailBody { snapshot: snapshot.clone() }
