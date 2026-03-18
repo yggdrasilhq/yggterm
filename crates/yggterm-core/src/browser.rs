@@ -115,6 +115,27 @@ impl SessionBrowserState {
         count_leaf_sessions(&self.root)
     }
 
+    pub fn selected_index(&self) -> Option<usize> {
+        let path = self.selected_path.as_deref()?;
+        self.rows.iter().position(|row| row.full_path == path)
+    }
+
+    pub fn selected_session_index(&self) -> Option<usize> {
+        self.selected_path.as_deref().and_then(|path| {
+            self.rows
+                .iter()
+                .position(|row| row.kind == BrowserRowKind::Session && row.full_path == path)
+        })
+    }
+
+    pub fn select_next_session(&mut self) -> Option<usize> {
+        self.select_session_relative(1)
+    }
+
+    pub fn select_previous_session(&mut self) -> Option<usize> {
+        self.select_session_relative(-1)
+    }
+
     fn ensure_selection(&mut self) {
         let selected_missing = self
             .selected_path
@@ -144,6 +165,29 @@ impl SessionBrowserState {
         self.metrics.row_count = self.rows.len();
         self.metrics.rebuild_count += 1;
         self.metrics.last_rebuild_ms = started_at.elapsed().as_secs_f32() * 1000.0;
+    }
+
+    fn select_session_relative(&mut self, delta: isize) -> Option<usize> {
+        let session_indexes = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, row)| (row.kind == BrowserRowKind::Session).then_some(ix))
+            .collect::<Vec<_>>();
+        if session_indexes.is_empty() {
+            return None;
+        }
+
+        let current_position = self
+            .selected_session_index()
+            .and_then(|selected_ix| session_indexes.iter().position(|ix| *ix == selected_ix))
+            .unwrap_or(0);
+
+        let len = session_indexes.len() as isize;
+        let next_position = (current_position as isize + delta).rem_euclid(len) as usize;
+        let next_ix = session_indexes[next_position];
+        self.selected_path = Some(self.rows[next_ix].full_path.clone());
+        Some(next_ix)
     }
 }
 
