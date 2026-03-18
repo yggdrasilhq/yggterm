@@ -106,7 +106,7 @@ pub fn titlebar_frame(
         .border_color(border)
         .child(
             div()
-                .w(px(248.))
+                .w(px(360.))
                 .flex_none()
                 .h_full()
                 .flex()
@@ -126,7 +126,7 @@ pub fn titlebar_frame(
         )
         .child(
             div()
-                .w(px(248.))
+                .w(px(360.))
                 .flex_none()
                 .h_full()
                 .flex()
