@@ -468,9 +468,20 @@ impl GpuiShell {
         }
 
         let row_count = self.browser.rows().len();
-        let summary = self
-            .active_session()
-            .map(|session| format!("viewing {}", session.title))
+        let selected_row = self.selected_row().cloned();
+        let header_title = selected_row
+            .as_ref()
+            .map(|row| row.label.clone())
+            .unwrap_or_else(|| "Codex Sessions".to_string());
+        let header_detail = selected_row
+            .as_ref()
+            .and_then(|row| {
+                if row.detail_label.is_empty() {
+                    None
+                } else {
+                    Some(row.detail_label.clone())
+                }
+            })
             .unwrap_or_else(|| {
                 format!(
                     "{} stored · {} visible",
@@ -478,6 +489,12 @@ impl GpuiShell {
                     self.total_leaf_sessions()
                 )
             });
+        let filter_active = !self.search_query.is_empty();
+        let filter_summary = if filter_active {
+            format!("{} matches for “{}”", row_count, self.search_query)
+        } else {
+            format!("{} visible rows", row_count)
+        };
         div()
             .w(px(216.))
             .h_full()
@@ -497,15 +514,58 @@ impl GpuiShell {
                     .gap_1()
                     .child(
                         div()
+                            .text_xs()
+                            .text_color(palette.text_muted)
+                            .child("Codex Sessions"),
+                    )
+                    .child(
+                        div()
                             .text_sm()
                             .text_color(palette.text)
-                            .child("Codex Sessions"),
+                            .line_clamp(1)
+                            .text_ellipsis()
+                            .child(header_title),
                     )
                     .child(
                         div()
                             .text_xs()
                             .text_color(palette.text_muted)
-                            .child(summary),
+                            .line_clamp(1)
+                            .text_ellipsis()
+                            .child(header_detail),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_1p5()
+                            .items_center()
+                            .child(
+                                div()
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded_md()
+                                    .bg(if filter_active {
+                                        palette.text_accent.opacity(0.16)
+                                    } else {
+                                        palette.element_background
+                                    })
+                                    .text_xs()
+                                    .text_color(if filter_active {
+                                        palette.text_accent
+                                    } else {
+                                        palette.text_muted
+                                    })
+                                    .child(if filter_active { "filtered" } else { "tree" }),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(palette.text_muted)
+                                    .line_clamp(1)
+                                    .text_ellipsis()
+                                    .child(filter_summary),
+                            ),
                     ),
             )
             .child(if row_count == 0 {
