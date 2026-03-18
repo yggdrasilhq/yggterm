@@ -297,13 +297,13 @@ fn Titlebar(
     rsx! {
         div {
             style: format!(
-                "display:flex; align-items:center; justify-content:space-between; height:42px; \
-                 padding:0 10px; background:{};",
+                "display:flex; align-items:center; justify-content:space-between; height:44px; \
+                 padding:0 12px; background:{};",
                 snapshot.palette.titlebar
             ),
             onmousedown: move |_| window().drag(),
             div {
-                style: "display:flex; align-items:center; gap:12px; width:260px; min-width:260px;",
+                style: "display:flex; align-items:center; gap:12px; width:300px; min-width:300px;",
                 button {
                     style: icon_button_style(snapshot.palette),
                     onmousedown: |evt| evt.stop_propagation(),
@@ -332,7 +332,7 @@ fn Titlebar(
                 }
             }
             div {
-                style: "flex:1; display:flex; justify-content:center; padding:0 12px;",
+                style: "flex:1; display:flex; justify-content:center; padding:0 16px;",
                 input {
                     r#type: "text",
                     value: "{snapshot.search_query}",
@@ -343,7 +343,7 @@ fn Titlebar(
                 }
             }
             div {
-                style: "display:flex; align-items:center; justify-content:flex-end; gap:10px; width:260px; min-width:260px;",
+                style: "display:flex; align-items:center; justify-content:flex-end; gap:10px; width:300px; min-width:300px;",
                 button {
                     style: metadata_toggle_style(snapshot.palette, snapshot.right_panel_open),
                     onmousedown: |evt| evt.stop_propagation(),
@@ -452,12 +452,12 @@ fn Sidebar(
     rsx! {
         div {
             style: format!(
-                "width:210px; min-width:210px; max-width:210px; display:flex; flex-direction:column; \
+                "width:258px; min-width:258px; max-width:258px; display:flex; flex-direction:column; \
                  background:{}; overflow:hidden;",
                 snapshot.palette.sidebar
             ),
             div {
-                style: "padding:12px 12px 10px 12px;",
+                style: "padding:14px 14px 10px 14px;",
                 div {
                     style: format!("font-size:11px; color:{}; margin-bottom:6px;", snapshot.palette.muted),
                     "Codex Sessions"
@@ -468,7 +468,7 @@ fn Sidebar(
                         }
             }
             div {
-                style: "flex:1; min-height:0; overflow:auto; padding:8px;",
+                style: "flex:1; min-height:0; overflow:auto; padding:8px 10px;",
                 for row in snapshot.rows.iter().cloned() {
                     SidebarRow {
                         row: row.clone(),
@@ -480,7 +480,7 @@ fn Sidebar(
             }
             div {
                 style: format!(
-                    "padding:10px 8px 12px 8px; display:flex; flex-direction:column; gap:10px;",
+                    "padding:12px 10px 12px 10px; display:flex; flex-direction:column; gap:10px;",
                 ),
                 if !snapshot.ssh_targets.is_empty() {
                     div {
@@ -577,7 +577,7 @@ fn SidebarRow(
         button {
             style: format!(
                 "width:100%; display:flex; flex-direction:column; align-items:stretch; gap:3px; \
-                 border:none; border-radius:10px; background:{}; padding:7px 8px 7px {}px; margin-bottom:4px;",
+                 border:none; border-radius:12px; background:{}; padding:8px 10px 8px {}px; margin-bottom:4px;",
                 background, indent
             ),
             onclick: move |evt| on_select.call(evt),
@@ -720,11 +720,11 @@ fn MainSurface(
     rsx! {
         div {
             style: format!(
-                "flex:1; min-width:0; min-height:0; display:flex; flex-direction:column; background:transparent; padding:14px 14px 18px 0;",
+                "flex:1; min-width:0; min-height:0; display:flex; flex-direction:column; background:transparent; padding:12px 12px 10px 0;",
             ),
             div {
                 style: format!(
-                    "flex:1; overflow:auto; padding:22px; background:{}; border-radius:18px; box-shadow:{};",
+                    "flex:1; overflow:auto; padding:24px; background:{}; border-radius:22px; box-shadow:{};",
                     snapshot.palette.panel, snapshot.palette.panel_shadow
                 ),
                 {body}
@@ -742,8 +742,8 @@ fn PreviewSummary(session: ManagedSessionView, palette: Palette) -> Element {
         div {
             style: format!(
                 "display:flex; flex-direction:column; gap:6px; min-width:280px; max-width:360px; \
-                 background:{}; border:1px solid {}; border-radius:12px; padding:14px 16px;",
-                palette.panel_alt, palette.border
+                 background:{}; border:none; border-radius:14px; padding:14px 16px; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.38);",
+                palette.panel_alt
             ),
             div {
                 style: format!("font-size:13px; font-weight:700; color:{};", palette.text),
@@ -781,8 +781,8 @@ fn PreviewBlock(
         button {
             style: format!(
                 "width:100%; border:none; text-align:left; background:{}; border-radius:14px; \
-                 padding:14px 16px; box-shadow: inset 0 0 0 1px {};",
-                background, palette.border
+                 padding:15px 16px; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.42);",
+                background
             ),
             onclick: move |evt| on_toggle.call(evt),
             div {
@@ -833,9 +833,9 @@ fn TerminalCard(title: String, subtitle: String, lines: Vec<String>, palette: Pa
     rsx! {
         div {
             style: format!(
-                "display:flex; flex-direction:column; gap:12px; background:{}; border:1px solid {}; \
-                 border-radius:12px; padding:14px 16px;",
-                palette.panel_alt, palette.border
+                "display:flex; flex-direction:column; gap:12px; background:{}; border:none; \
+                 border-radius:14px; padding:15px 16px; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.38);",
+                palette.panel_alt
             ),
             div {
                 style: "display:flex; align-items:center; justify-content:space-between; gap:12px;",
@@ -851,8 +851,8 @@ fn TerminalCard(title: String, subtitle: String, lines: Vec<String>, palette: Pa
             div {
                 style: format!(
                     "display:flex; flex-direction:column; gap:8px; padding:12px; background:{}; \
-                     border-radius:10px; box-shadow: inset 0 0 0 1px {};",
-                    palette.panel, palette.border
+                     border-radius:12px; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.62);",
+                    palette.panel
                 ),
                 for (ix, line) in lines.iter().enumerate() {
                     div {
@@ -876,8 +876,8 @@ fn EmptyState(palette: Palette) -> Element {
             div {
                 style: format!(
                     "display:flex; flex-direction:column; align-items:center; gap:8px; background:{}; \
-                     border:1px solid {}; border-radius:14px; padding:20px 24px;",
-                    palette.panel_alt, palette.border
+                     border:none; border-radius:16px; padding:22px 26px; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.42);",
+                    palette.panel_alt
                 ),
                 div {
                     style: format!("font-size:14px; font-weight:700; color:{};", palette.text),
@@ -899,19 +899,19 @@ fn MetadataRail(snapshot: RenderSnapshot) -> Element {
     rsx! {
         div {
             style: format!(
-                "width:240px; min-width:240px; max-width:240px; display:flex; flex-direction:column; \
+                "width:236px; min-width:236px; max-width:236px; display:flex; flex-direction:column; \
                  background:{}; overflow:hidden;",
                 snapshot.palette.sidebar
             ),
             div {
                 style: format!(
-                    "padding:12px 14px; font-size:12px; font-weight:700; color:{};",
+                    "padding:14px 16px 12px 16px; font-size:12px; font-weight:700; color:{};",
                     snapshot.palette.text
                 ),
                 "Session Metadata"
             }
             div {
-                style: "flex:1; overflow:auto; padding:12px 14px; display:flex; flex-direction:column; gap:14px;",
+                style: "flex:1; overflow:auto; padding:12px 16px; display:flex; flex-direction:column; gap:16px;",
                 if let Some(session) = session {
                     MetadataGroup {
                         title: "Overview".to_string(),
@@ -947,8 +947,7 @@ fn MetadataGroup(
     rsx! {
         div {
             style: format!(
-                "display:flex; flex-direction:column; gap:8px; padding-bottom:10px; border-bottom:1px solid {};",
-                palette.border
+                "display:flex; flex-direction:column; gap:8px; padding-bottom:10px;",
             ),
             div {
                 style: format!("font-size:11px; font-weight:700; color:{};", palette.muted),
@@ -974,40 +973,40 @@ fn MetadataGroup(
 fn palette(theme: UiTheme) -> Palette {
     match theme {
         UiTheme::ZedLight => Palette {
-            shell: "rgba(243,247,246,0.92)",
+            shell: "rgba(245,248,249,0.72)",
             titlebar: "transparent",
             sidebar: "transparent",
-            sidebar_hover: "rgba(110,166,191,0.10)",
+            sidebar_hover: "rgba(134,186,202,0.14)",
             panel: "#ffffff",
-            panel_alt: "rgba(255,255,255,0.52)",
-            border: "#d8dee5",
+            panel_alt: "rgba(255,255,255,0.48)",
+            border: "#dfe5ea",
             text: "#24303a",
             muted: "#6f7c86",
             accent: "#2f7cf6",
-            accent_soft: "rgba(64,163,215,0.14)",
-            gradient: "linear-gradient(180deg, rgba(223,240,247,0.92) 0%, rgba(231,243,238,0.96) 52%, rgba(238,240,242,0.92) 100%)",
+            accent_soft: "rgba(114,190,215,0.18)",
+            gradient: "linear-gradient(180deg, rgba(236,245,249,0.78) 0%, rgba(234,245,239,0.74) 48%, rgba(238,240,244,0.78) 100%)",
             close_hover: "#e81123",
-            control_hover: "rgba(36,48,58,0.08)",
-            shadow: "0 18px 42px rgba(44,74,94,0.10)",
-            panel_shadow: "0 14px 34px rgba(66,103,131,0.12)",
+            control_hover: "rgba(36,48,58,0.10)",
+            shadow: "0 24px 52px rgba(72,102,118,0.16)",
+            panel_shadow: "0 18px 44px rgba(69,108,136,0.18)",
         },
         UiTheme::ZedDark => Palette {
-            shell: "rgba(33,39,46,0.92)",
+            shell: "rgba(37,44,50,0.78)",
             titlebar: "transparent",
             sidebar: "transparent",
-            sidebar_hover: "rgba(122,190,204,0.12)",
+            sidebar_hover: "rgba(131,198,205,0.14)",
             panel: "#f8fafc",
-            panel_alt: "rgba(255,255,255,0.06)",
+            panel_alt: "rgba(255,255,255,0.08)",
             border: "#3b4755",
             text: "#dce6ee",
             muted: "#9fb0bd",
             accent: "#73b9ff",
-            accent_soft: "rgba(115,185,255,0.12)",
-            gradient: "linear-gradient(180deg, rgba(48,74,90,0.88) 0%, rgba(58,92,85,0.84) 56%, rgba(55,61,68,0.90) 100%)",
+            accent_soft: "rgba(115,185,255,0.14)",
+            gradient: "linear-gradient(180deg, rgba(70,97,108,0.76) 0%, rgba(77,104,96,0.74) 52%, rgba(57,64,72,0.84) 100%)",
             close_hover: "#e81123",
             control_hover: "rgba(255,255,255,0.08)",
-            shadow: "0 20px 60px rgba(0,0,0,0.34)",
-            panel_shadow: "0 18px 40px rgba(0,0,0,0.18)",
+            shadow: "0 26px 72px rgba(0,0,0,0.34)",
+            panel_shadow: "0 22px 52px rgba(0,0,0,0.22)",
         },
     }
 }
@@ -1015,16 +1014,17 @@ fn palette(theme: UiTheme) -> Palette {
 fn shell_style(palette: Palette) -> String {
     format!(
         "position:fixed; inset:0; display:flex; flex-direction:column; overflow:hidden; \
-         border-radius:11px; background:{}; box-shadow:{}; backdrop-filter: blur(16px);",
+         border-radius:11px; background:{}; box-shadow:{}; backdrop-filter: blur(26px) saturate(155%); \
+         -webkit-backdrop-filter: blur(26px) saturate(155%);",
         palette.gradient, palette.shadow
     )
 }
 
 fn search_style(palette: Palette) -> String {
     format!(
-        "width:min(520px, 100%); height:30px; padding:0 12px; border-radius:9px; \
-         border:none; background:rgba(255,255,255,0.74); color:{}; outline:none; font-size:12px; \
-         box-shadow: inset 0 0 0 1px rgba(255,255,255,0.22);",
+        "width:min(560px, 100%); height:32px; padding:0 12px; border-radius:8px; \
+         border:none; background:rgba(255,255,255,0.66); color:{}; outline:none; font-size:12px; \
+         box-shadow: inset 0 0 0 1px rgba(255,255,255,0.36);",
         palette.text
     )
 }
@@ -1040,22 +1040,22 @@ fn chip_style(palette: Palette, selected: bool) -> String {
     format!(
         "height:24px; padding:0 10px; border-radius:999px; border:1px solid {}; background:{}; \
          color:{}; font-size:11px; font-weight:600;",
-        if selected { palette.accent } else { palette.border },
-        if selected { palette.accent_soft } else { palette.panel_alt },
+        if selected { palette.accent } else { "rgba(255,255,255,0.10)" },
+        if selected { palette.accent_soft } else { "rgba(255,255,255,0.28)" },
         if selected { palette.text } else { palette.muted }
     )
 }
 
 fn sidebar_action_style(palette: Palette) -> String {
     format!(
-        "width:100%; border:none; border-radius:10px; background:{}; padding:8px 10px; text-align:left;",
+        "width:100%; border:none; border-radius:12px; background:{}; padding:9px 10px; text-align:left;",
         palette.sidebar_hover
     )
 }
 
 fn toggle_slider_style(_palette: Palette) -> String {
     format!(
-        "display:flex; align-items:center; gap:4px; padding:3px; border:none; border-radius:999px; background:rgba(255,255,255,0.38);"
+        "display:flex; align-items:center; gap:4px; padding:3px; border:none; border-radius:999px; background:rgba(255,255,255,0.34); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.28);"
     )
 }
 
@@ -1070,7 +1070,7 @@ fn toggle_slider_end_style(palette: Palette, selected: bool) -> String {
 fn metadata_toggle_style(palette: Palette, selected: bool) -> String {
     format!(
         "height:28px; padding:0 12px; border:none; border-radius:10px; background:{}; color:{}; font-size:11px; font-weight:700;",
-        if selected { "rgba(255,255,255,0.52)" } else { "transparent" },
+        if selected { "rgba(255,255,255,0.46)" } else { "transparent" },
         if selected { palette.text } else { palette.muted }
     )
 }
