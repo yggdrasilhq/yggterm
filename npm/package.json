@@ -1,0 +1,31 @@
+{
+  "name": "yggterm",
+  "version": "1.0.0",
+  "description": "Remote-first terminal workspace launcher for Yggdrasil Terminal",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yggdrasilhq/yggterm.git"
+  },
+  "homepage": "https://github.com/yggdrasilhq/yggterm#readme",
+  "bugs": {
+    "url": "https://github.com/yggdrasilhq/yggterm/issues"
+  },
+  "bin": {
+    "yggterm": "bin/yggterm.js"
+  },
+  "files": [
+    "bin",
+    "README.md"
+  ],
+  "keywords": [
+    "terminal",
+    "ssh",
+    "ghostty",
+    "dioxus",
+    "workspace"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}
