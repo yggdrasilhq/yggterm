@@ -202,6 +202,7 @@ impl ShellState {
                     &row.full_path,
                     row.session_id.as_deref(),
                     row.session_cwd.as_deref(),
+                    Some(row.label.as_str()),
                 );
                 self.server.set_view_mode(WorkspaceViewMode::Rendered);
                 self.last_action = format!("opened {}", row.label);

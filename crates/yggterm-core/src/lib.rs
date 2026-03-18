@@ -1,5 +1,6 @@
 mod browser;
 mod server;
+mod titles;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use titles::SessionTitleResolver;
 
 pub use browser::{BrowserMetrics, BrowserRow, BrowserRowKind, SessionBrowserState};
 pub use server::{
@@ -25,6 +27,7 @@ pub const SETTINGS_FILENAME: &str = "settings.json";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionNode {
     pub name: String,
+    pub title: Option<String>,
     pub path: PathBuf,
     pub children: Vec<SessionNode>,
     pub session_id: Option<String>,
@@ -135,9 +138,9 @@ impl SessionStore {
         walk_directory_tree(&self.sessions_root, false)
     }
 
-    pub fn load_codex_tree(&self) -> Result<SessionNode> {
+    pub fn load_codex_tree(&self, settings: &AppSettings) -> Result<SessionNode> {
         let codex_root = resolve_codex_sessions_root()?;
-        build_codex_browser_tree(&codex_root)
+        build_codex_browser_tree(&self.home, &codex_root, settings)
     }
 }
 
@@ -223,6 +226,7 @@ fn walk_directory_tree(path: &Path, include_codex_files: bool) -> Result<Session
         } else if include_codex_files && is_codex_session_file(&entry_path) {
             children.push(SessionNode {
                 name: codex_leaf_label(&entry_path),
+                title: None,
                 path: entry_path,
                 children: Vec::new(),
                 session_id: None,
@@ -234,6 +238,7 @@ fn walk_directory_tree(path: &Path, include_codex_files: bool) -> Result<Session
 
     Ok(SessionNode {
         name,
+        title: None,
         path: path.to_path_buf(),
         children,
         session_id: None,
@@ -317,6 +322,7 @@ struct CodexSessionSummary {
     file_path: PathBuf,
     session_id: String,
     cwd: String,
+    generated_title: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -333,9 +339,14 @@ struct CodexBrowserTreeNode {
     children: BTreeMap<String, CodexBrowserTreeNode>,
 }
 
-fn build_codex_browser_tree(codex_root: &Path) -> Result<SessionNode> {
+fn build_codex_browser_tree(
+    home: &Path,
+    codex_root: &Path,
+    settings: &AppSettings,
+) -> Result<SessionNode> {
+    let mut title_resolver = SessionTitleResolver::new(home, settings).ok();
     let sessions = if codex_root.exists() {
-        scan_codex_sessions(codex_root)?
+        scan_codex_sessions(codex_root, &mut title_resolver)?
     } else {
         Vec::new()
     };
@@ -371,7 +382,10 @@ fn build_codex_browser_tree(codex_root: &Path) -> Result<SessionNode> {
     Ok(codex_browser_tree_to_session_node(&root))
 }
 
-fn scan_codex_sessions(root: &Path) -> Result<Vec<CodexSessionSummary>> {
+fn scan_codex_sessions(
+    root: &Path,
+    title_resolver: &mut Option<SessionTitleResolver>,
+) -> Result<Vec<CodexSessionSummary>> {
     let mut sessions = Vec::new();
     for entry in
         fs::read_dir(root).with_context(|| format!("failed to read dir {}", root.display()))?
@@ -380,9 +394,9 @@ fn scan_codex_sessions(root: &Path) -> Result<Vec<CodexSessionSummary>> {
         let path = entry.path();
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            sessions.extend(scan_codex_sessions(&path)?);
+            sessions.extend(scan_codex_sessions(&path, title_resolver)?);
         } else if is_codex_session_file(&path) {
-            if let Some(summary) = read_codex_session_summary(&path)? {
+            if let Some(summary) = read_codex_session_summary(&path, title_resolver)? {
                 sessions.push(summary);
             }
         }
@@ -390,7 +404,10 @@ fn scan_codex_sessions(root: &Path) -> Result<Vec<CodexSessionSummary>> {
     Ok(sessions)
 }
 
-fn read_codex_session_summary(path: &Path) -> Result<Option<CodexSessionSummary>> {
+fn read_codex_session_summary(
+    path: &Path,
+    title_resolver: &mut Option<SessionTitleResolver>,
+) -> Result<Option<CodexSessionSummary>> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read codex session {}", path.display()))?;
 
@@ -425,6 +442,14 @@ fn read_codex_session_summary(path: &Path) -> Result<Option<CodexSessionSummary>
 
     Ok(Some(CodexSessionSummary {
         file_path: path.to_path_buf(),
+        generated_title: title_resolver
+            .as_mut()
+            .and_then(|resolver| {
+                resolver
+                    .resolve_for_session(session_id.as_deref().unwrap_or(&fallback_id), &cwd, path)
+                    .ok()
+                    .flatten()
+            }),
         session_id: session_id.unwrap_or(fallback_id),
         cwd,
     }))
@@ -556,6 +581,7 @@ fn codex_browser_tree_to_session_node(node: &CodexBrowserTreeNode) -> SessionNod
     if let Some(project) = &node.project {
         children.extend(project.sessions.iter().map(|session| SessionNode {
             name: short_session_id(&session.session_id),
+            title: session.generated_title.clone(),
             path: session.file_path.clone(),
             children: Vec::new(),
             session_id: Some(session.session_id.clone()),
@@ -572,6 +598,7 @@ fn codex_browser_tree_to_session_node(node: &CodexBrowserTreeNode) -> SessionNod
 
     SessionNode {
         name: node.name.clone(),
+        title: None,
         path: PathBuf::from(node.full_path.clone()),
         children,
         session_id: None,

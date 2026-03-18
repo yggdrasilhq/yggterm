@@ -10,8 +10,10 @@ fn main() -> Result<()> {
 
     let store = SessionStore::open_or_init()?;
     let tree = store.load_tree()?;
-    let browser_tree = store.load_codex_tree().unwrap_or_else(|_| tree.clone());
     let settings = store.load_settings().unwrap_or_default();
+    let browser_tree = store
+        .load_codex_tree(&settings)
+        .unwrap_or_else(|_| tree.clone());
     let settings_path = store.settings_path();
     let theme = settings.theme;
     let prefer_ghostty_backend = settings.prefer_ghostty_backend;
