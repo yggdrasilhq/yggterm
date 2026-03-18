@@ -14,9 +14,9 @@ use yggterm_core::{
 };
 
 use crate::{
-    ChatBubbleTone, TitlebarIcon, ToggleState, UiPalette, chat_preview_card, metadata_section_card,
+    ChatBubbleTone, TitlebarIcon, UiPalette, chat_preview_card, metadata_section_card,
     preview_summary_card, statusbar_frame, terminal_surface_card, titlebar_frame,
-    titlebar_icon_button, titlebar_mode_toggle, toolbar_chip_button, window_controls,
+    titlebar_icon_button, toolbar_chip_button, window_controls,
 };
 
 actions!(
@@ -48,7 +48,7 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_background: WindowBackgroundAppearance::Opaque,
+                window_background: WindowBackgroundAppearance::Transparent,
                 window_decorations: Some(WindowDecorations::Client),
                 window_min_size: Some(size(px(1024.), px(720.))),
                 app_id: Some("dev.yggterm".into()),
@@ -264,13 +264,6 @@ impl GpuiShell {
         cx.notify();
     }
 
-    fn connect_ssh_target(&mut self, target_ix: usize, cx: &mut Context<Self>) {
-        if let Some(key) = self.server.connect_ssh_target(target_ix) {
-            self.last_action = format!("ssh session {key}");
-            cx.notify();
-        }
-    }
-
     fn select_row(&mut self, ix: usize, cx: &mut Context<Self>) {
         let Some(row) = self.browser.rows().get(ix).cloned() else {
             return;
@@ -344,12 +337,12 @@ impl GpuiShell {
 
         div()
             .id("search-bar")
-            .w(px(360.))
-            .h(px(30.))
+            .w(px(344.))
+            .h(px(27.))
             .flex()
             .items_center()
             .justify_between()
-            .px_3()
+            .px_2()
             .rounded_lg()
             .bg(palette.element_background)
             .border_1()
@@ -409,81 +402,17 @@ impl GpuiShell {
         cx: &mut Context<Self>,
         palette: &UiPalette,
     ) -> AnyElement {
-        let session_title = self
-            .active_session()
-            .map(|session| session.title.clone())
-            .or_else(|| self.selected_row().map(|row| row.label.clone()))
-            .unwrap_or_else(|| "Codex Sessions".to_string());
-        let session_context = self
-            .active_session()
-            .map(|session| self.metadata_value(session, "Cwd").to_string())
-            .or_else(|| {
-                self.selected_row().and_then(|row| {
-                    if row.detail_label.is_empty() {
-                        None
-                    } else {
-                        Some(row.detail_label.clone())
-                    }
-                })
-            })
-            .unwrap_or_else(|| "~/.codex/sessions".to_string());
         let left = div()
             .flex()
             .flex_row()
-            .gap_1p5()
+            .gap_1()
             .items_center()
             .when(cfg!(target_os = "macos"), |div| {
                 div.child(window_controls(window))
             })
             .child(
-                div()
-                    .text_sm()
-                    .text_color(palette.text_muted)
-                    .child("yggterm"),
-            )
-            .child(titlebar_mode_toggle(
-                "preview-toggle",
-                "Preview",
-                self.server.active_view_mode() == WorkspaceViewMode::Rendered,
-                cx.listener(|this, state, _, cx| {
-                    this.set_view_mode(
-                        if *state == ToggleState::Selected {
-                            WorkspaceViewMode::Rendered
-                        } else {
-                            WorkspaceViewMode::Terminal
-                        },
-                        cx,
-                    )
-                }),
-                palette,
-            ))
-            .child(
                 titlebar_icon_button("toggle-sidebar", TitlebarIcon::Sidebar, palette)
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_0p5()
-                    .px_1()
-                    .max_w(px(190.))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(palette.text)
-                            .line_clamp(1)
-                            .text_ellipsis()
-                            .child(session_title),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(palette.text_muted)
-                            .line_clamp(1)
-                            .text_ellipsis()
-                            .child(session_context),
-                    ),
             )
             .into_any_element();
 
@@ -491,7 +420,7 @@ impl GpuiShell {
             div()
                 .flex()
                 .flex_row()
-                .gap_1p5()
+                .gap_1()
                 .items_center()
                 .child(
                     toolbar_chip_button(
@@ -516,10 +445,6 @@ impl GpuiShell {
                     })),
                 )
                 .child(
-                    toolbar_chip_button("connect-ssh", "SSH", false, palette)
-                        .on_click(cx.listener(|this, _, _, cx| this.connect_ssh_target(0, cx))),
-                )
-                .child(
                     titlebar_icon_button("toggle-meta", TitlebarIcon::Info, palette)
                         .on_click(cx.listener(|this, _, _, cx| this.toggle_right_panel(cx))),
                 )
@@ -533,7 +458,7 @@ impl GpuiShell {
             self.search_bar(window, cx, palette),
             right,
             palette.window_background,
-            palette.border,
+            palette.border_variant.opacity(0.92),
         )
         .into_any_element()
     }
@@ -572,22 +497,22 @@ impl GpuiShell {
             format!("{} visible rows", row_count)
         };
         div()
-            .w(px(216.))
+            .w(px(196.))
             .h_full()
             .flex()
             .flex_col()
             .bg(palette.window_background)
             .border_r_1()
-            .border_color(palette.border)
+            .border_color(palette.border_variant.opacity(0.92))
             .child(
                 div()
                     .px_3()
-                    .py_2p5()
+                    .py_1p5()
                     .border_b_1()
-                    .border_color(palette.border_variant)
+                    .border_color(palette.border_variant.opacity(0.92))
                     .flex()
                     .flex_col()
-                    .gap_1()
+                    .gap_0p5()
                     .child(
                         div()
                             .text_xs()
@@ -622,7 +547,7 @@ impl GpuiShell {
                                     .py_0p5()
                                     .rounded_md()
                                     .bg(if filter_active {
-                                        palette.text_accent.opacity(0.16)
+                                        palette.text_accent.opacity(0.14)
                                     } else {
                                         palette.element_background
                                     })
@@ -836,26 +761,26 @@ impl GpuiShell {
         div()
             .id(("sidebar-row", ix))
             .w_full()
-            .min_h(px(if has_detail { 38. } else { 30. }))
+            .min_h(px(if has_detail { 34. } else { 27. }))
             .flex()
             .flex_row()
             .items_start()
             .justify_between()
-            .px_2()
-            .py(px(if has_detail { 6. } else { 4. }))
+            .px_1()
+            .py(px(if has_detail { 5. } else { 3. }))
             .bg(if is_selected {
-                palette.text_accent.opacity(0.18)
+                palette.text_accent.opacity(0.14)
             } else if is_top_group {
-                palette.element_background.opacity(0.42)
+                palette.element_background.opacity(0.32)
             } else {
                 palette.window_background
             })
             .rounded_md()
             .border_l_2()
             .border_color(if is_selected {
-                palette.border_focused
+                palette.border_focused.opacity(0.86)
             } else {
-                palette.window_background
+                transparent_black()
             })
             .on_click(cx.listener(move |this, _, _, cx| this.select_row(ix, cx)))
             .child(body)
@@ -997,8 +922,8 @@ impl GpuiShell {
                             .w_full()
                             .flex()
                             .justify_center()
-                            .p_3()
-                            .child(div().w_full().max_w(px(980.)).child(body)),
+                            .p_2()
+                            .child(div().w_full().max_w(px(920.)).child(body)),
                     ),
             )
             .into_any_element()
@@ -1084,19 +1009,19 @@ impl GpuiShell {
         };
 
         div()
-            .w(px(256.))
+            .w(px(224.))
             .h_full()
             .flex()
             .flex_col()
             .bg(palette.window_background)
             .border_l_1()
-            .border_color(palette.border)
+            .border_color(palette.border_variant.opacity(0.92))
             .child(
                 div()
                     .px_3()
-                    .py_1p5()
+                    .py_1()
                     .border_b_1()
-                    .border_color(palette.border_variant)
+                    .border_color(palette.border_variant.opacity(0.92))
                     .child(
                         div()
                             .text_xs()
@@ -1110,10 +1035,10 @@ impl GpuiShell {
                     .flex_1()
                     .overflow_y_scroll()
                     .scrollbar_width(px(10.))
-                    .p_2p5()
+                    .p_2()
                     .flex()
                     .flex_col()
-                    .gap_2()
+                    .gap_1p5()
                     .children(inspector_body),
             )
             .into_any_element()
@@ -1128,11 +1053,11 @@ impl GpuiShell {
                 .items_center()
                 .child(
                     div()
-                        .text_sm()
+                        .text_xs()
                         .text_color(palette.text)
                         .child(format!("{} codex sessions", self.total_leaf_sessions())),
                 )
-                .child(div().text_sm().text_color(palette.text).child(format!(
+                .child(div().text_xs().text_color(palette.text).child(format!(
                             "{} view · {}",
                             match self.server.active_view_mode() {
                                 WorkspaceViewMode::Rendered => "preview",
@@ -1150,7 +1075,7 @@ impl GpuiShell {
                 .items_center()
                 .child(
                     div()
-                        .text_sm()
+                        .text_xs()
                         .text_color(palette.text_muted)
                         .child(self.last_action.clone()),
                 )
@@ -1160,7 +1085,7 @@ impl GpuiShell {
                 )
                 .into_any_element(),
             palette.window_background,
-            palette.border,
+            palette.border_variant.opacity(0.92),
         )
         .into_any_element()
     }
@@ -1172,6 +1097,7 @@ impl Render for GpuiShell {
         let decorations = window.window_decorations();
         let frame_inset = px(6.);
         let border_size = px(1.);
+        let frame_border = palette.border.opacity(0.64);
 
         window.set_client_inset(px(0.));
 
@@ -1181,10 +1107,10 @@ impl Render for GpuiShell {
             .flex_col()
             .bg(palette.window_background)
             .border_1()
-            .border_color(palette.border)
+            .border_color(frame_border)
             .cursor(CursorStyle::Arrow)
             .when(matches!(decorations, Decorations::Client { .. }), |div| {
-                let radius = px(4.);
+                let radius = px(7.);
                 div.rounded_tl(radius)
                     .rounded_tr(radius)
                     .rounded_bl(radius)
