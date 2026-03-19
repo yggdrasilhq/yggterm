@@ -5370,6 +5370,7 @@ dependencies = [
  "anyhow",
  "dioxus",
  "once_cell",
+ "tokio",
  "yggterm-core",
 ]
 
