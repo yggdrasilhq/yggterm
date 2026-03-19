@@ -1,3 +1,11 @@
+yggterm (1.0.1-1) unstable; urgency=medium
+
+  * Restore browser selection and expansion state across launches.
+  * Improve shell notifications and metadata rail legibility.
+  * Recover session titles from reasoning-only LiteLLM model responses.
+
+ -- Yggdrasil HQ <opensource@yggdrasilhq.invalid>  Thu, 19 Mar 2026 00:00:00 +0000
+
 yggterm (1.0.0-1) unstable; urgency=medium
 
   * Cut the first major release with the Dioxus desktop shell.
