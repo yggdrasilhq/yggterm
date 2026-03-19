@@ -234,14 +234,7 @@ fn request_litellm_title(settings: &AppSettings, context: &str) -> Result<String
         .context("LiteLLM returned an error status")?;
 
     let value: Value = response.json().context("failed to parse LiteLLM response")?;
-    let title = value
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("message"))
-        .and_then(|message| message.get("content"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
+    let title = extract_completion_text(&value)
         .context("LiteLLM response did not contain a title")?;
     Ok(title)
 }
@@ -274,19 +267,62 @@ fn sanitize_generated_title(raw: &str) -> Option<String> {
 
 fn message_lines_from_payload(payload: &Value) -> Vec<String> {
     let mut lines = Vec::new();
+    if let Some(text) = payload.get("content").and_then(Value::as_str) {
+        lines.extend(normalize_preview_text(text));
+    }
     if let Some(content_items) = payload.get("content").and_then(Value::as_array) {
         for item in content_items {
-            if let Some(text) = item
-                .get("text")
-                .or_else(|| item.get("input_text"))
-                .or_else(|| item.get("output_text"))
-                .and_then(Value::as_str)
-            {
+            if let Some(text) = extract_text_fragment(item) {
                 lines.extend(normalize_preview_text(text));
             }
         }
     }
     lines
+}
+
+fn extract_completion_text(value: &Value) -> Option<String> {
+    let choice = value.get("choices")?.as_array()?.first()?;
+    let message = choice.get("message");
+
+    message
+        .and_then(|message| message.get("content"))
+        .and_then(extract_text_fragment)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            message
+                .and_then(|message| message.get("content"))
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(extract_text_fragment)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .filter(|text| !text.trim().is_empty())
+        })
+        .or_else(|| {
+            message
+                .and_then(|message| message.get("refusal"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| {
+            choice
+                .get("text")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn extract_text_fragment(value: &Value) -> Option<&str> {
+    value
+        .as_str()
+        .or_else(|| value.get("text").and_then(Value::as_str))
+        .or_else(|| value.get("input_text").and_then(Value::as_str))
+        .or_else(|| value.get("output_text").and_then(Value::as_str))
+        .or_else(|| value.get("content").and_then(Value::as_str))
+        .or_else(|| value.get("value").and_then(Value::as_str))
 }
 
 fn normalize_preview_text(text: &str) -> Vec<String> {

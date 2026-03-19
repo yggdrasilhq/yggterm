@@ -509,15 +509,11 @@ fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force:
     }
 
     state.with_mut(|shell| {
-        shell.push_notification(
-            NotificationTone::Info,
-            if force {
-                "Regenerating Title"
-            } else {
-                "Generating Title"
-            },
-            format!("Requesting a title for {}.", row.label),
-        );
+        shell.last_action = if force {
+            format!("regenerating title for {}", row.label)
+        } else {
+            format!("generating title for {}", row.label)
+        };
     });
 
     spawn(async move {
@@ -567,9 +563,9 @@ fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force:
             }
             Ok(Ok((None, _))) => {
                 shell.push_notification(
-                    NotificationTone::Info,
+                    NotificationTone::Warning,
                     "No Title Generated",
-                    "This session did not produce enough context to title yet.",
+                    "The model did not return a usable short title for this session.",
                 );
             }
             Ok(Err(error)) => {
@@ -701,6 +697,7 @@ fn app() -> Element {
                     ToastViewport {
                         notifications: snapshot.notifications.clone(),
                         palette: snapshot.palette,
+                        right_inset: toast_right_inset(snapshot.right_panel_mode),
                         on_clear_notification: move |id: u64| state.with_mut(|shell| shell.clear_notification(id)),
                     }
                 }
@@ -2017,12 +2014,21 @@ fn ContextMenuOverlay(
 fn ToastViewport(
     notifications: Vec<ToastNotification>,
     palette: Palette,
+    right_inset: usize,
     on_clear_notification: EventHandler<u64>,
 ) -> Element {
-    let items = notifications.into_iter().rev().take(4).collect::<Vec<_>>();
+    let items = notifications
+        .into_iter()
+        .rev()
+        .filter(|notification| notification.tone != NotificationTone::Info)
+        .take(3)
+        .collect::<Vec<_>>();
     rsx! {
         div {
-            style: "position:fixed; top:56px; right:18px; z-index:80; display:flex; flex-direction:column; gap:10px; width:300px; pointer-events:none;",
+            style: format!(
+                "position:fixed; top:56px; right:{}px; z-index:80; display:flex; flex-direction:column; gap:10px; width:280px; pointer-events:none;",
+                right_inset
+            ),
             for notification in items {
                 div {
                     style: "pointer-events:auto;",
@@ -2034,6 +2040,14 @@ fn ToastViewport(
                 }
             }
         }
+    }
+}
+
+fn toast_right_inset(right_panel_mode: RightPanelMode) -> usize {
+    if right_panel_mode == RightPanelMode::Hidden {
+        18
+    } else {
+        SIDE_RAIL_WIDTH + 28
     }
 }
 
