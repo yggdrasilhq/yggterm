@@ -22,6 +22,7 @@ This repository is still scaffolding.
 - Ghostty bridge packaging and runtime probing exist.
 - A Dioxus desktop shell exists for fast iteration on layout and interaction.
 - The current shell lives in `crates/yggterm-ui` and is the active product surface.
+- Session orchestration now has a dedicated crate boundary in `crates/yggterm-server`.
 - `yggterm` now opens the Dioxus shell directly.
 - The old CLI subcommands and the `eframe` scaffold path have been removed.
 - The shell chrome is now owned locally in `yggterm-ui`, while the adjacent Zed checkout remains the visual reference stack.
@@ -169,6 +170,7 @@ Only the filename is entered on npmjs.com, not the full path.
 
 - `apps/yggterm`: CLI entrypoint and desktop launcher
 - `crates/yggterm-core`: session model and settings persistence
+- `crates/yggterm-server`: session orchestration, live SSH launch model, daemon/IPC state, and runtime host detection
 - `crates/yggterm-ui`: Dioxus desktop shell, titlebar, statusbar, and view rendering
 - `crates/yggterm-platform`: platform detection
 - `crates/yggterm-ghostty-bridge`: Ghostty runtime bridge
