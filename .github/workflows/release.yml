@@ -11,6 +11,73 @@ permissions:
 
 jobs:
   package:
+    name: Package ${{ matrix.label }}
+    runs-on: ${{ matrix.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            runs_on: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - label: macos-x86_64
+            runs_on: macos-13
+            target: x86_64-apple-darwin
+          - label: macos-aarch64
+            runs_on: macos-14
+            target: aarch64-apple-darwin
+          - label: windows-x86_64
+            runs_on: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install system packages
+        if: matrix.runs_on == 'ubuntu-24.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            curl \
+            fakeroot \
+            jq \
+            pkg-config \
+            protobuf-compiler \
+            ripgrep \
+            libfontconfig1-dev \
+            libgl1-mesa-dev \
+            libgtk-3-dev \
+            libsoup-3.0-dev \
+            libwebkit2gtk-4.1-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxdo-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+          targets: ${{ matrix.target }}
+
+      - name: Package portable release artifacts
+        shell: bash
+        run: ./scripts/package-platform-release.sh "${{ matrix.label }}" "${{ matrix.target }}"
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: yggterm-${{ matrix.label }}
+          path: |
+            dist/yggterm-${{ matrix.label }}*
+
+  package-linux-extras:
+    name: Package Linux extras
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
@@ -52,11 +119,8 @@ jobs:
       - name: Clone Ghostty sibling repo
         run: git clone --depth 1 https://github.com/ghostty-org/ghostty ../ghostty
 
-      - name: Build Ghostty runtime artifacts
-        run: ./scripts/build-ghostty-lib.sh
-
-      - name: Package release artifacts
-        run: ./scripts/package-release.sh linux-x86_64
+      - name: Package Debian artifact
+        run: ./scripts/package-deb.sh
 
       - name: Package FFI bundle
         run: ./scripts/package-release-ffi.sh linux-x86_64
@@ -64,19 +128,29 @@ jobs:
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: yggterm-release-artifacts
-          path: dist/*
-
-      - name: Publish GitHub release assets
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/yggterm-linux-x86_64
-            dist/yggterm-linux-x86_64.sha256
-            dist/yggterm-linux-x86_64.tar.gz
-            dist/yggterm-linux-x86_64.tar.gz.sha256
+          name: yggterm-linux-extras
+          path: |
             dist/yggterm-linux-x86_64-ghostty-ffi.tar.gz
             dist/yggterm-linux-x86_64-ghostty-ffi.tar.gz.sha256
             dist/yggterm_*.deb
             dist/yggterm_*.deb.sha256
+
+  publish-release:
+    name: Publish GitHub release assets
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - package
+      - package-linux-extras
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-artifacts/*
