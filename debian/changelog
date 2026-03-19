@@ -1,3 +1,11 @@
+yggterm (1.0.2-1) unstable; urgency=medium
+
+  * Publish portable release assets for Linux, macOS, and Windows.
+  * Add a platform-aware npm launcher for GitHub release downloads.
+  * Keep Linux-specific Ghostty FFI and Debian packaging as release extras.
+
+ -- Yggdrasil HQ <opensource@yggdrasilhq.invalid>  Thu, 19 Mar 2026 00:00:00 +0000
+
 yggterm (1.0.1-1) unstable; urgency=medium
 
   * Restore browser selection and expansion state across launches.

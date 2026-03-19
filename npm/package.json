@@ -1,6 +1,6 @@
 {
   "name": "yggterm",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Remote-first terminal workspace launcher for Yggdrasil Terminal",
   "license": "Apache-2.0",
   "repository": {

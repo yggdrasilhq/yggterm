@@ -106,11 +106,18 @@ Run via npm:
 npx -y yggterm
 ```
 
+The npm launcher currently supports:
+
+- Linux `x86_64`
+- macOS `x86_64`
+- macOS `aarch64`
+- Windows `x86_64`
+
 ## Release artifacts
 
 Release packaging is generated from this repository and written to `dist/`.
 
-Build all public release artifacts:
+Build the portable Linux release artifacts:
 
 ```bash
 ./scripts/package-release.sh linux-x86_64
@@ -122,6 +129,13 @@ This produces:
 - `yggterm-linux-x86_64.tar.gz`
 - `yggterm_<version>-<revision>_amd64.deb`
 - corresponding `.sha256` files
+
+Cross-platform release assets are produced by GitHub Actions on tag pushes:
+
+- `linux-x86_64`
+- `macos-x86_64`
+- `macos-aarch64`
+- `windows-x86_64`
 
 Build only the Debian package:
 

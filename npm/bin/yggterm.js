@@ -12,6 +12,18 @@ function targetLabel() {
     return "linux-x86_64";
   }
 
+  if (process.platform === "darwin" && process.arch === "x64") {
+    return "macos-x86_64";
+  }
+
+  if (process.platform === "darwin" && process.arch === "arm64") {
+    return "macos-aarch64";
+  }
+
+  if (process.platform === "win32" && process.arch === "x64") {
+    return "windows-x86_64";
+  }
+
   throw new Error(
     `unsupported platform for npm launcher: ${process.platform}-${process.arch}`
   );
@@ -26,7 +38,8 @@ function cacheRoot(version) {
 async function downloadBinary(version, destination) {
   const repo = process.env.YGGTERM_REPO || "yggdrasilhq/yggterm";
   const label = targetLabel();
-  const url = `https://github.com/${repo}/releases/download/v${version}/yggterm-${label}`;
+  const suffix = label.startsWith("windows-") ? ".exe" : "";
+  const url = `https://github.com/${repo}/releases/download/v${version}/yggterm-${label}${suffix}`;
   const response = await fetch(url, { redirect: "follow" });
 
   if (!response.ok) {
@@ -44,7 +57,8 @@ async function downloadBinary(version, destination) {
 async function ensureBinary() {
   const version = pkg.version;
   const label = targetLabel();
-  const location = path.join(cacheRoot(version), `yggterm-${label}`);
+  const suffix = label.startsWith("windows-") ? ".exe" : "";
+  const location = path.join(cacheRoot(version), `yggterm-${label}${suffix}`);
 
   if (!fs.existsSync(location)) {
     await downloadBinary(version, location);

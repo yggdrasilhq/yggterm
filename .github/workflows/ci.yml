@@ -51,7 +51,11 @@ jobs:
         run: |
           bash -n scripts/install.sh
           bash -n scripts/package-deb.sh
+          bash -n scripts/package-platform-release.sh
           bash -n scripts/package-release.sh
+
+      - name: Validate npm launcher
+        run: node --check npm/bin/yggterm.js
 
       - name: Validate release binary
         run: |
