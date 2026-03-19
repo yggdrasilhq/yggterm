@@ -4,7 +4,7 @@ use std::thread;
 use std::time::Duration;
 use yggterm_core::SessionStore;
 use yggterm_server::{
-    default_endpoint, detect_ghostty_host, ping, run_daemon, snapshot, status,
+    default_endpoint, detect_ghostty_host, ping, run_attach, run_daemon, snapshot, status,
 };
 
 fn main() -> Result<()> {
@@ -20,6 +20,9 @@ fn main() -> Result<()> {
         let endpoint = default_endpoint(store.home_dir());
         let host = detect_ghostty_host();
         return run_daemon(&endpoint, host);
+    }
+    if args.len() == 3 && args[0] == "server" && args[1] == "attach" {
+        return run_attach(&args[2]);
     }
 
     let tree = store.load_tree()?;
