@@ -55,6 +55,8 @@ struct ShellState {
     notifications: Vec<ToastNotification>,
     next_notification_id: u64,
     context_menu_row: Option<BrowserRow>,
+    preview_layout: PreviewLayoutMode,
+    server_busy: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -72,6 +74,12 @@ enum NotificationTone {
     Success,
     Warning,
     Error,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreviewLayoutMode {
+    Chat,
+    Graph,
 }
 
 #[derive(Clone, PartialEq)]
@@ -104,6 +112,8 @@ struct RenderSnapshot {
     always_on_top: bool,
     notifications: Vec<ToastNotification>,
     context_menu_row: Option<BrowserRow>,
+    preview_layout: PreviewLayoutMode,
+    server_busy: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -184,6 +194,8 @@ impl ShellState {
             notifications: Vec::new(),
             next_notification_id: 1,
             context_menu_row: None,
+            preview_layout: PreviewLayoutMode::Chat,
+            server_busy: false,
         };
         state.sync_browser_settings();
         state
@@ -211,6 +223,8 @@ impl ShellState {
             always_on_top: self.always_on_top,
             notifications: self.notifications.clone(),
             context_menu_row: self.context_menu_row.clone(),
+            preview_layout: self.preview_layout,
+            server_busy: self.server_busy,
         }
     }
 
@@ -300,6 +314,14 @@ impl ShellState {
         };
     }
 
+    fn set_preview_layout(&mut self, mode: PreviewLayoutMode) {
+        self.preview_layout = mode;
+        self.last_action = match mode {
+            PreviewLayoutMode::Chat => "chat view".to_string(),
+            PreviewLayoutMode::Graph => "graph view".to_string(),
+        };
+    }
+
     fn apply_daemon_snapshot_result(
         &mut self,
         result: Result<(ServerUiSnapshot, Option<String>)>,
@@ -307,11 +329,13 @@ impl ShellState {
         match result {
             Ok((snapshot, message)) => {
                 self.server.apply_snapshot(snapshot);
+                self.server_busy = false;
                 if let Some(message) = message {
                     self.last_action = message;
                 }
             }
             Err(error) => {
+                self.server_busy = false;
                 self.last_action = format!("server sync failed: {error}");
                 self.push_notification(
                     NotificationTone::Error,
@@ -320,13 +344,6 @@ impl ShellState {
                 );
             }
         }
-    }
-
-    fn set_view_mode(&mut self, mode: WorkspaceViewMode) {
-        self.apply_daemon_snapshot_result(daemon_set_view_mode(
-            &self.bootstrap.server_endpoint,
-            mode,
-        ));
     }
 
     fn select_row(&mut self, row: &BrowserRow) {
@@ -350,76 +367,6 @@ impl ShellState {
                 self.last_action = format!("opened {}", row.label);
             }
         }
-    }
-
-    fn connect_ssh_target(&mut self, target_ix: usize) {
-        match connect_ssh(&self.bootstrap.server_endpoint, target_ix) {
-            Ok((snapshot, message)) => {
-                self.server.apply_snapshot(snapshot);
-                self.last_action = message.unwrap_or_else(|| "ssh session started".to_string());
-                self.push_notification(
-                    NotificationTone::Success,
-                    "SSH Session Started",
-                    self.last_action.clone(),
-                );
-            }
-            Err(error) => {
-                self.last_action = format!("ssh connect failed: {error}");
-                self.push_notification(
-                    NotificationTone::Error,
-                    "SSH Session Failed",
-                    error.to_string(),
-                );
-            }
-        }
-    }
-
-    fn focus_live_session(&mut self, key: &str) {
-        self.apply_daemon_snapshot_result(focus_live(&self.bootstrap.server_endpoint, key));
-        self.last_action = format!("focused {key}");
-    }
-
-    fn toggle_preview_block(&mut self, block_ix: usize) {
-        self.apply_daemon_snapshot_result(daemon_toggle_preview_block(
-            &self.bootstrap.server_endpoint,
-            block_ix,
-        ));
-        self.last_action = format!("preview block {}", block_ix + 1);
-    }
-
-    fn expand_preview_blocks(&mut self) {
-        self.apply_daemon_snapshot_result(set_all_preview_blocks_folded(
-            &self.bootstrap.server_endpoint,
-            false,
-        ));
-        self.last_action = "expanded preview".to_string();
-    }
-
-    fn collapse_preview_blocks(&mut self) {
-        self.apply_daemon_snapshot_result(set_all_preview_blocks_folded(
-            &self.bootstrap.server_endpoint,
-            true,
-        ));
-        self.last_action = "collapsed preview".to_string();
-    }
-
-    fn request_terminal_launch(&mut self) {
-        self.apply_daemon_snapshot_result(request_terminal_launch(
-            &self.bootstrap.server_endpoint,
-        ));
-        self.last_action = "requested ghostty".to_string();
-    }
-
-    fn resolve_ghostty_window(&mut self) {
-        self.apply_daemon_snapshot_result(sync_external_window(
-            &self.bootstrap.server_endpoint,
-        ));
-    }
-
-    fn focus_ghostty_window(&mut self) {
-        self.apply_daemon_snapshot_result(raise_external_window(
-            &self.bootstrap.server_endpoint,
-        ));
     }
 
     fn update_litellm_endpoint(&mut self, value: String) {
@@ -684,6 +631,81 @@ fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force:
     });
 }
 
+fn spawn_server_snapshot_action<F>(
+    mut state: Signal<ShellState>,
+    pending_label: String,
+    request: F,
+) where
+    F: FnOnce(ServerEndpoint) -> Result<(ServerUiSnapshot, Option<String>)> + Send + 'static,
+{
+    let endpoint = state.read().bootstrap.server_endpoint.clone();
+    state.with_mut(|shell| {
+        shell.server_busy = true;
+        shell.last_action = pending_label.clone();
+    });
+
+    spawn(async move {
+        let outcome = task::spawn_blocking(move || request(endpoint)).await;
+        state.with_mut(|shell| match outcome {
+            Ok(result) => shell.apply_daemon_snapshot_result(result),
+            Err(error) => {
+                shell.server_busy = false;
+                shell.last_action = format!("server task failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "Server Task Failed",
+                    error.to_string(),
+                );
+            }
+        });
+    });
+}
+
+fn spawn_set_view_mode(mut state: Signal<ShellState>, mode: WorkspaceViewMode) {
+    state.with_mut(|shell| {
+        shell.server.set_view_mode(mode);
+        shell.server_busy = true;
+        shell.last_action = match mode {
+            WorkspaceViewMode::Rendered => "switching to preview".to_string(),
+            WorkspaceViewMode::Terminal => "switching to terminal".to_string(),
+        };
+    });
+    spawn_server_snapshot_action(
+        state,
+        "syncing view mode".to_string(),
+        move |endpoint| {
+            if mode == WorkspaceViewMode::Terminal {
+                request_terminal_launch(&endpoint)
+            } else {
+                daemon_set_view_mode(&endpoint, mode)
+            }
+        },
+    );
+}
+
+fn spawn_open_session_row(mut state: Signal<ShellState>, row: BrowserRow) {
+    state.with_mut(|shell| {
+        shell.browser.select_path(row.full_path.clone());
+        shell.context_menu_row = None;
+        shell.sync_browser_settings();
+        shell.server_busy = true;
+        shell.last_action = format!("opening {}", row.label);
+    });
+    spawn_server_snapshot_action(
+        state,
+        format!("opening {}", row.label),
+        move |endpoint| {
+            open_stored_session(
+                &endpoint,
+                &row.full_path,
+                row.session_id.as_deref(),
+                row.session_cwd.as_deref(),
+                Some(row.label.as_str()),
+            )
+        },
+    );
+}
+
 pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
     let _ = BOOTSTRAP.set(bootstrap);
 
@@ -733,7 +755,7 @@ fn app() -> Element {
                     on_toggle_sidebar: move || state.with_mut(|shell| shell.toggle_sidebar()),
                     on_search: move |value: String| state.with_mut(|shell| shell.set_search(value)),
                     on_hover_control: move |control: Option<HoveredControl>| hovered.set(control),
-                    on_set_view_mode: move |mode: WorkspaceViewMode| state.with_mut(|shell| shell.set_view_mode(mode)),
+                    on_set_view_mode: move |mode: WorkspaceViewMode| spawn_set_view_mode(state, mode),
                     on_toggle_meta: move || state.with_mut(|shell| shell.toggle_metadata_panel()),
                     on_toggle_settings: move || state.with_mut(|shell| shell.toggle_settings_panel()),
                     on_toggle_connect: move || state.with_mut(|shell| shell.toggle_connect_panel()),
@@ -748,7 +770,10 @@ fn app() -> Element {
                         snapshot: sidebar_snapshot,
                         on_select_row: move |row: BrowserRow| {
                             let should_generate = row.kind == BrowserRowKind::Session && row.session_title.is_none();
-                            state.with_mut(|shell| shell.select_row(&row));
+                            match row.kind {
+                                BrowserRowKind::Group => state.with_mut(|shell| shell.select_row(&row)),
+                                BrowserRowKind::Session => spawn_open_session_row(state, row.clone()),
+                            }
                             if should_generate {
                                 queue_title_generation(state, row.clone(), false);
                             }
@@ -757,12 +782,43 @@ fn app() -> Element {
                     }
                     MainSurface {
                         snapshot: main_snapshot,
-                        on_expand_preview: move || state.with_mut(|shell| shell.expand_preview_blocks()),
-                        on_collapse_preview: move || state.with_mut(|shell| shell.collapse_preview_blocks()),
-                        on_toggle_preview_block: move |ix: usize| state.with_mut(|shell| shell.toggle_preview_block(ix)),
-                        on_request_terminal: move || state.with_mut(|shell| shell.request_terminal_launch()),
-                        on_focus_ghostty: move || state.with_mut(|shell| shell.focus_ghostty_window()),
-                        on_resolve_ghostty: move || state.with_mut(|shell| shell.resolve_ghostty_window()),
+                        on_expand_preview: move || spawn_server_snapshot_action(
+                            state,
+                            "expanding preview".to_string(),
+                            |endpoint| set_all_preview_blocks_folded(&endpoint, false),
+                        ),
+                        on_collapse_preview: move || spawn_server_snapshot_action(
+                            state,
+                            "collapsing preview".to_string(),
+                            |endpoint| set_all_preview_blocks_folded(&endpoint, true),
+                        ),
+                        on_toggle_preview_block: move |ix: usize| {
+                            state.with_mut(|shell| {
+                                shell.server.toggle_preview_block(ix);
+                                shell.server_busy = true;
+                            });
+                            spawn_server_snapshot_action(
+                                state,
+                                format!("toggling preview block {}", ix + 1),
+                                move |endpoint| daemon_toggle_preview_block(&endpoint, ix),
+                            )
+                        },
+                        on_request_terminal: move || spawn_server_snapshot_action(
+                            state,
+                            "requesting terminal".to_string(),
+                            |endpoint| request_terminal_launch(&endpoint),
+                        ),
+                        on_focus_ghostty: move || spawn_server_snapshot_action(
+                            state,
+                            "focusing ghostty".to_string(),
+                            |endpoint| raise_external_window(&endpoint),
+                        ),
+                        on_resolve_ghostty: move || spawn_server_snapshot_action(
+                            state,
+                            "resolving ghostty".to_string(),
+                            |endpoint| sync_external_window(&endpoint),
+                        ),
+                        on_set_preview_layout: move |mode: PreviewLayoutMode| state.with_mut(|shell| shell.set_preview_layout(mode)),
                     }
                     RightRail {
                         snapshot: metadata_snapshot,
@@ -772,8 +828,16 @@ fn app() -> Element {
                         on_generate_titles: move |_| state.with_mut(|shell| shell.generate_session_titles()),
                         on_adjust_ui_zoom: move |delta: i32| state.with_mut(|shell| shell.adjust_ui_zoom(delta)),
                         on_adjust_main_zoom: move |delta: i32| state.with_mut(|shell| shell.adjust_main_zoom(delta)),
-                        on_connect_ssh: move |ix: usize| state.with_mut(|shell| shell.connect_ssh_target(ix)),
-                        on_focus_live: move |id: String| state.with_mut(|shell| shell.focus_live_session(&id)),
+                        on_connect_ssh: move |ix: usize| spawn_server_snapshot_action(
+                            state,
+                            "connecting ssh".to_string(),
+                            move |endpoint| connect_ssh(&endpoint, ix),
+                        ),
+                        on_focus_live: move |id: String| spawn_server_snapshot_action(
+                            state,
+                            format!("focusing {id}"),
+                            move |endpoint| focus_live(&endpoint, &id),
+                        ),
                         on_clear_notification: move |id: u64| state.with_mut(|shell| shell.clear_notification(id)),
                         on_clear_notifications: move |_| state.with_mut(|shell| shell.clear_notifications()),
                     }
@@ -1480,82 +1544,87 @@ fn MainSurface(
     on_request_terminal: EventHandler<()>,
     on_focus_ghostty: EventHandler<()>,
     on_resolve_ghostty: EventHandler<()>,
+    on_set_preview_layout: EventHandler<PreviewLayoutMode>,
 ) -> Element {
     let body = if let Some(session) = snapshot.active_session.clone() {
         match snapshot.active_view_mode {
             WorkspaceViewMode::Rendered => rsx! {
                 div {
-                    style: "display:flex; flex-direction:column; gap:18px; min-width:0; width:min(940px, 100%); margin:0 auto;",
+                    style: "display:flex; flex-direction:column; gap:18px; min-width:0; width:min(980px, 100%); margin:0 auto;",
                     div {
                         style: "display:flex; align-items:flex-start; justify-content:space-between; gap:16px; flex-wrap:wrap;",
                         PreviewSummary { session: session.clone(), palette: snapshot.palette }
-                        div {
-                            style: "display:flex; gap:8px; margin-left:auto;",
-                            button {
-                                style: chip_style(snapshot.palette, false),
-                                onclick: move |_| on_expand_preview.call(()),
-                                "Expand All"
-                            }
-                            button {
-                                style: chip_style(snapshot.palette, false),
-                                onclick: move |_| on_collapse_preview.call(()),
-                                "Collapse All"
-                            }
+                        PreviewToolbar {
+                            palette: snapshot.palette,
+                            preview_layout: snapshot.preview_layout,
+                            server_busy: snapshot.server_busy,
+                            on_expand_preview: move |_| on_expand_preview.call(()),
+                            on_collapse_preview: move |_| on_collapse_preview.call(()),
+                            on_set_preview_layout: move |mode| on_set_preview_layout.call(mode),
                         }
                     }
-                    div {
-                        style: "display:flex; flex-direction:column; gap:16px;",
-                        for (ix, block) in session.preview.blocks.iter().cloned().enumerate() {
-                            PreviewBlock {
-                                block_ix: ix,
-                                block: block.clone(),
-                                palette: snapshot.palette,
-                                on_toggle: move |_| on_toggle_preview_block.call(ix),
+                    if snapshot.preview_layout == PreviewLayoutMode::Chat {
+                        div {
+                            style: "display:flex; flex-direction:column; gap:18px;",
+                            for (ix, block) in session.preview.blocks.iter().cloned().enumerate() {
+                                PreviewBlock {
+                                    block_ix: ix,
+                                    block: block.clone(),
+                                    palette: snapshot.palette,
+                                    on_toggle: move |_| on_toggle_preview_block.call(ix),
+                                }
                             }
+                        }
+                    } else {
+                        PreviewGraph {
+                            session: session.clone(),
+                            palette: snapshot.palette,
                         }
                     }
                 }
             },
             WorkspaceViewMode::Terminal => rsx! {
                 div {
-                    style: "display:flex; flex-direction:column; gap:16px; min-width:0; width:min(940px, 100%); margin:0 auto;",
+                    style: "display:flex; flex-direction:column; gap:16px; min-width:0; width:min(980px, 100%); margin:0 auto;",
                     div {
-                        style: "display:flex; gap:8px; justify-content:flex-end;",
-                        button {
-                            style: chip_style(snapshot.palette, false),
+                        style: "display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap;",
+                        div {
+                            style: "display:flex; flex-direction:column; gap:6px;",
+                            div {
+                                style: format!("font-size:12px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:{};", snapshot.palette.muted),
+                                "Terminal Session"
+                            }
+                            div {
+                                style: format!("font-size:20px; font-weight:700; color:{};", snapshot.palette.text),
+                                "{session.title}"
+                            }
+                            div {
+                                style: format!("font-size:12px; color:{};", snapshot.palette.muted),
+                                "{session.status_line}"
+                            }
+                        }
+                        div {
+                            style: "display:flex; gap:8px; justify-content:flex-end;",
+                            button {
+                            style: chip_style(snapshot.palette, snapshot.server_busy),
                             onclick: move |_| on_request_terminal.call(()),
                             "Request Ghostty"
-                        }
-                        button {
-                            style: chip_style(snapshot.palette, false),
-                            onclick: move |_| on_focus_ghostty.call(()),
-                            "Focus Ghostty"
-                        }
-                        button {
-                            style: chip_style(snapshot.palette, false),
-                            onclick: move |_| on_resolve_ghostty.call(()),
-                            "Resolve Window"
+                            }
+                            button {
+                                style: chip_style(snapshot.palette, snapshot.server_busy),
+                                onclick: move |_| on_focus_ghostty.call(()),
+                                "Focus Ghostty"
+                            }
+                            button {
+                                style: chip_style(snapshot.palette, snapshot.server_busy),
+                                onclick: move |_| on_resolve_ghostty.call(()),
+                                "Resolve Window"
+                            }
                         }
                     }
-                    TerminalCard {
-                        title: "Server Terminal".to_string(),
-                        subtitle: session.status_line.clone(),
-                        lines: session.terminal_lines.clone(),
-                        palette: snapshot.palette,
-                    }
-                    TerminalCard {
-                        title: "Ghostty Integration".to_string(),
-                        subtitle: if snapshot.ghostty_embedded_surface_supported {
-                            "embedded surface available".to_string()
-                        } else {
-                            "external window path".to_string()
-                        },
-                        lines: vec![
-                            snapshot.ghostty_bridge_detail.clone(),
-                            snapshot.server_daemon_detail.clone(),
-                            "Yggterm server opens and tracks session-owned Ghostty launches here.".to_string(),
-                        ],
-                        palette: snapshot.palette,
+                    TerminalCanvas {
+                        session: session.clone(),
+                        snapshot: snapshot.clone(),
                     }
                 }
             },
@@ -1584,6 +1653,141 @@ fn MainSurface(
 }
 
 #[component]
+fn IconToggleButton(
+    active: bool,
+    icon: &'static str,
+    label: String,
+    palette: Palette,
+    onclick: EventHandler<MouseEvent>,
+) -> Element {
+    rsx! {
+        button {
+            title: "{label}",
+            style: format!(
+                "display:inline-flex; align-items:center; justify-content:center; width:34px; height:34px; \
+                 border:none; border-radius:12px; background:{}; color:{}; font-size:15px; font-weight:700; \
+                 box-shadow: inset 0 0 0 1px {};",
+                if active { "rgba(95, 168, 255, 0.18)" } else { "rgba(255,255,255,0.68)" },
+                if active { palette.accent } else { palette.muted },
+                if active { "rgba(95, 168, 255, 0.22)" } else { "rgba(255,255,255,0.6)" }
+            ),
+            onclick: move |evt| onclick.call(evt),
+            "{icon}"
+        }
+    }
+}
+
+#[component]
+fn PreviewToolbar(
+    palette: Palette,
+    preview_layout: PreviewLayoutMode,
+    server_busy: bool,
+    on_expand_preview: EventHandler<MouseEvent>,
+    on_collapse_preview: EventHandler<MouseEvent>,
+    on_set_preview_layout: EventHandler<PreviewLayoutMode>,
+) -> Element {
+    rsx! {
+        div {
+            style: "display:flex; flex-direction:column; gap:10px; margin-left:auto; min-width:250px;",
+            div {
+                style: "display:flex; align-items:center; justify-content:flex-end; gap:8px;",
+                IconToggleButton {
+                    active: preview_layout == PreviewLayoutMode::Chat,
+                    icon: "▤",
+                    label: "Chat View".to_string(),
+                    palette,
+                    onclick: move |_| on_set_preview_layout.call(PreviewLayoutMode::Chat),
+                }
+                IconToggleButton {
+                    active: preview_layout == PreviewLayoutMode::Graph,
+                    icon: "◎",
+                    label: "Graph View".to_string(),
+                    palette,
+                    onclick: move |_| on_set_preview_layout.call(PreviewLayoutMode::Graph),
+                }
+            }
+            div {
+                style: "display:flex; justify-content:flex-end; gap:8px;",
+                button {
+                    style: chip_style(palette, server_busy),
+                    onclick: move |evt| on_expand_preview.call(evt),
+                    "Expand All"
+                }
+                button {
+                    style: chip_style(palette, server_busy),
+                    onclick: move |evt| on_collapse_preview.call(evt),
+                    "Collapse All"
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn PreviewGraph(session: ManagedSessionView, palette: Palette) -> Element {
+    rsx! {
+        div {
+            style: "display:flex; flex-direction:column; gap:14px; padding:12px 0 4px 0;",
+            for (ix, block) in session.preview.blocks.iter().enumerate() {
+                div {
+                    style: "display:grid; grid-template-columns:56px 1fr; gap:18px; align-items:flex-start;",
+                    div {
+                        style: "display:flex; flex-direction:column; align-items:center; gap:8px;",
+                        div {
+                            style: format!(
+                                "width:38px; height:38px; border-radius:999px; display:flex; align-items:center; justify-content:center; \
+                                 background:{}; color:{}; font-size:14px; font-weight:700; box-shadow:0 8px 18px rgba(148,163,184,0.18);",
+                                if block.tone == PreviewTone::User { "rgba(73,138,255,0.16)" } else { "rgba(255,255,255,0.95)" },
+                                if block.tone == PreviewTone::User { palette.accent } else { palette.text }
+                            ),
+                            {if block.tone == PreviewTone::User { "U" } else { "A" }}
+                        }
+                        if ix + 1 != session.preview.blocks.len() {
+                            div {
+                                style: "width:2px; min-height:54px; border-radius:999px; background:linear-gradient(180deg, rgba(120,153,189,0.42) 0%, rgba(120,153,189,0.08) 100%);"
+                            }
+                        }
+                    }
+                    div {
+                        style: format!(
+                            "display:flex; flex-direction:column; gap:10px; padding:16px 18px; border-radius:18px; \
+                             background:{}; box-shadow:0 16px 28px rgba(148,163,184,0.08), inset 0 0 0 1px rgba(255,255,255,0.62);",
+                            if block.tone == PreviewTone::User { "rgba(232,244,255,0.96)" } else { "rgba(255,255,255,0.92)" }
+                        ),
+                        div {
+                            style: "display:flex; align-items:center; justify-content:space-between; gap:12px;",
+                            span {
+                                style: format!("font-size:12px; font-weight:700; color:{};", palette.text),
+                                "{block.role}"
+                            }
+                            span {
+                                style: format!("font-size:11px; color:{};", palette.muted),
+                                "{block.timestamp}"
+                            }
+                        }
+                        div {
+                            style: format!("display:flex; flex-direction:column; gap:8px; color:{};", palette.text),
+                            for line in block.lines.iter().take(3) {
+                                div {
+                                    style: "font-size:13px; line-height:1.55; white-space:pre-wrap;",
+                                    "{line}"
+                                }
+                            }
+                            if block.lines.len() > 3 {
+                                div {
+                                    style: format!("font-size:11px; color:{};", palette.muted),
+                                    "+ {block.lines.len() - 3} more lines"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
 fn PreviewSummary(session: ManagedSessionView, palette: Palette) -> Element {
     let started = metadata_value(&session, "Started");
     let messages = metadata_value(&session, "Messages");
@@ -1602,7 +1806,7 @@ fn PreviewSummary(session: ManagedSessionView, palette: Palette) -> Element {
                 "Session Preview"
             }
             div {
-                style: format!("font-size:20px; font-weight:700; color:{}; line-height:1.2;", palette.text),
+                style: format!("font-size:22px; font-weight:700; color:{}; line-height:1.18;", palette.text),
                 "{session.title}"
             }
             div {
@@ -1627,8 +1831,8 @@ fn PreviewBlock(
     on_toggle: EventHandler<MouseEvent>,
 ) -> Element {
     let background = match block.tone {
-        PreviewTone::User => "rgba(223, 240, 252, 0.94)",
-        PreviewTone::Assistant => "rgba(255, 255, 255, 0.84)",
+        PreviewTone::User => "rgba(230, 242, 255, 0.98)",
+        PreviewTone::Assistant => "rgba(255, 255, 255, 0.94)",
     };
     let badge = match block.tone {
         PreviewTone::User => palette.accent,
@@ -1643,7 +1847,7 @@ fn PreviewBlock(
         button {
             style: format!(
                 "width:100%; border:none; text-align:left; background:{}; border-radius:18px; \
-                 padding:18px 18px; box-shadow: inset 0 0 0 1px {}, 0 10px 28px rgba(148,163,184,0.08);",
+                 padding:20px 20px; box-shadow: inset 0 0 0 1px {}, 0 14px 28px rgba(148,163,184,0.08);",
                 background, outline
             ),
             onclick: move |evt| on_toggle.call(evt),
@@ -1655,7 +1859,7 @@ fn PreviewBlock(
                         style: format!(
                             "display:inline-flex; align-items:center; justify-content:center; min-width:54px; height:22px; \
                              border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:700;",
-                            if block.tone == PreviewTone::User { "rgba(37,99,235,0.14)" } else { "rgba(108,114,127,0.12)" },
+                            if block.tone == PreviewTone::User { "rgba(37,99,235,0.12)" } else { "rgba(108,114,127,0.10)" },
                             badge
                         ),
                         "{block.role}"
@@ -1677,12 +1881,84 @@ fn PreviewBlock(
                 }
             } else {
                 div {
-                    style: format!("display:flex; flex-direction:column; gap:7px; color:{};", palette.text),
+                    style: format!("display:flex; flex-direction:column; gap:9px; color:{};", palette.text),
                     for line in block.lines.iter() {
                         div {
-                            style: "font-size:13px; line-height:1.58; white-space:pre-wrap;",
+                            style: "font-size:13px; line-height:1.62; white-space:pre-wrap;",
                             "{line}"
                         }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn TerminalCanvas(session: ManagedSessionView, snapshot: RenderSnapshot) -> Element {
+    rsx! {
+        div {
+            style: "display:flex; flex-direction:column; gap:16px;",
+            div {
+                style: "display:flex; flex-direction:column; gap:12px; padding:18px 20px; border-radius:20px; background:linear-gradient(180deg, rgba(13,18,24,0.98) 0%, rgba(19,27,35,0.97) 100%); box-shadow:0 28px 48px rgba(10,17,26,0.26), inset 0 0 0 1px rgba(132,155,177,0.12);",
+                div {
+                    style: "display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;",
+                    div {
+                        style: "display:flex; align-items:center; gap:10px;",
+                        div { style: "width:11px; height:11px; border-radius:999px; background:#fb7185;" }
+                        div { style: "width:11px; height:11px; border-radius:999px; background:#fbbf24;" }
+                        div { style: "width:11px; height:11px; border-radius:999px; background:#4ade80;" }
+                        span {
+                            style: "margin-left:6px; font-size:12px; font-weight:700; color:rgba(226,232,240,0.92);",
+                            "{session.title}"
+                        }
+                    }
+                    span {
+                        style: "font-size:11px; color:rgba(148,163,184,0.92);",
+                        "{session.status_line}"
+                    }
+                }
+                div {
+                    style: "display:flex; flex-direction:column; gap:8px; font-family:'Iosevka Term','JetBrains Mono','Fira Code',monospace; color:#d6e2ef;",
+                    for (ix, line) in session.terminal_lines.iter().enumerate() {
+                        div {
+                            style: "display:grid; grid-template-columns:34px 1fr; gap:10px; align-items:start; font-size:13px; line-height:1.58;",
+                            span {
+                                style: "color:rgba(96,165,250,0.88); text-align:right;",
+                                {format!("{:02}", ix + 1)}
+                            }
+                            span {
+                                style: "white-space:pre-wrap;",
+                                "{line}"
+                            }
+                        }
+                    }
+                }
+            }
+            div {
+                style: "display:grid; grid-template-columns:1.1fr 0.9fr; gap:14px;",
+                div {
+                    style: "padding:16px 18px; border-radius:18px; background:rgba(251,253,255,0.92); box-shadow:0 16px 30px rgba(148,163,184,0.10), inset 0 0 0 1px rgba(255,255,255,0.72);",
+                    div {
+                        style: format!("font-size:12px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:{}; margin-bottom:8px;", snapshot.palette.muted),
+                        "Server Attach"
+                    }
+                    div {
+                        style: format!("display:flex; flex-direction:column; gap:8px; font-size:13px; line-height:1.58; color:{};", snapshot.palette.text),
+                        div { "{snapshot.server_daemon_detail}" }
+                        div { "The active session is already owned by the yggterm daemon and can be reopened via `yggterm server attach <uuid>` on remote hosts." }
+                    }
+                }
+                div {
+                    style: "padding:16px 18px; border-radius:18px; background:rgba(240,248,255,0.88); box-shadow:0 16px 30px rgba(148,163,184,0.10), inset 0 0 0 1px rgba(255,255,255,0.72);",
+                    div {
+                        style: format!("font-size:12px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:{}; margin-bottom:8px;", snapshot.palette.muted),
+                        "Ghostty Host"
+                    }
+                    div {
+                        style: format!("display:flex; flex-direction:column; gap:8px; font-size:13px; line-height:1.58; color:{};", snapshot.palette.text),
+                        div { "{snapshot.ghostty_bridge_detail}" }
+                        div { "Terminal mode is server-owned now; Linux uses the GTK host adapter while macOS keeps the libghostty embedded-host path reserved." }
                     }
                 }
             }
