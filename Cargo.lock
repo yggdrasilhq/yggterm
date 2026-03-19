@@ -5321,7 +5321,7 @@ checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
 
 [[package]]
 name = "yggterm"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "tracing",
@@ -5334,7 +5334,7 @@ dependencies = [
 
 [[package]]
 name = "yggterm-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "dirs",
@@ -5344,12 +5344,13 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "time",
+ "tracing",
  "uuid",
 ]
 
 [[package]]
 name = "yggterm-ghostty-bridge"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "thiserror 2.0.18",
@@ -5357,21 +5358,22 @@ dependencies = [
 
 [[package]]
 name = "yggterm-gtk-glue"
-version = "1.0.0"
+version = "1.0.1"
 
 [[package]]
 name = "yggterm-platform"
-version = "1.0.0"
+version = "1.0.1"
 
 [[package]]
 name = "yggterm-ui"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "dioxus",
  "once_cell",
  "tao",
  "tokio",
+ "tracing",
  "yggterm-core",
 ]
 
