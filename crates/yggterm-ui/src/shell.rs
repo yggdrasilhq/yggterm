@@ -3,6 +3,7 @@ use dioxus::desktop::{Config, LogicalSize, WindowBuilder, window};
 use dioxus::prelude::*;
 use once_cell::sync::OnceCell;
 use std::path::PathBuf;
+use tokio::task;
 use yggterm_core::{
     AppSettings, BrowserRow, BrowserRowKind, ManagedSessionView, PreviewTone, SessionBrowserState,
     SessionNode, SessionStore, SshConnectTarget, UiTheme, WorkspaceViewMode, YggtermServer,
@@ -285,9 +286,6 @@ impl ShellState {
                 );
                 self.server.set_view_mode(WorkspaceViewMode::Rendered);
                 self.last_action = format!("opened {}", row.label);
-                if row.session_title.is_none() {
-                    self.generate_title_for_row(row, false);
-                }
             }
         }
     }
@@ -443,67 +441,8 @@ impl ShellState {
         }
     }
 
-    fn regenerate_title_for_row(&mut self, row: &BrowserRow) {
-        self.generate_title_for_row(row, true);
+    fn regenerate_title_for_row(&mut self, _row: &BrowserRow) {
         self.context_menu_row = None;
-    }
-
-    fn generate_title_for_row(&mut self, row: &BrowserRow, force: bool) {
-        if row.kind != BrowserRowKind::Session {
-            return;
-        }
-        if self.settings.litellm_endpoint.trim().is_empty()
-            || self.settings.litellm_api_key.trim().is_empty()
-            || self.settings.interface_llm_model.trim().is_empty()
-        {
-            self.push_notification(
-                NotificationTone::Warning,
-                "LiteLLM Not Configured",
-                "Open settings and configure LiteLLM before generating chat titles.",
-            );
-            return;
-        }
-
-        match SessionStore::open_or_init().and_then(|store| {
-            let title = store.generate_title_for_session_path(&self.settings, &row.full_path, force)?;
-            let browser_tree = store.load_codex_tree(&self.settings)?;
-            Ok((title, browser_tree))
-        }) {
-            Ok((Some(title), browser_tree)) => {
-                let selected_path = self.browser.selected_path().map(str::to_string);
-                let filter_query = self.search_query.clone();
-                self.browser = SessionBrowserState::new(browser_tree);
-                self.browser.set_filter_query(filter_query);
-                if let Some(path) = selected_path.or_else(|| Some(row.full_path.clone())) {
-                    self.browser.select_path(path);
-                }
-                self.server.open_or_focus_session(
-                    &row.full_path,
-                    row.session_id.as_deref(),
-                    row.session_cwd.as_deref(),
-                    Some(&title),
-                );
-                self.push_notification(
-                    NotificationTone::Success,
-                    if force { "Title Regenerated" } else { "Title Generated" },
-                    format!("Session is now titled “{title}”."),
-                );
-            }
-            Ok((None, _)) => {
-                self.push_notification(
-                    NotificationTone::Info,
-                    "No Title Generated",
-                    "This session did not produce enough context to title yet.",
-                );
-            }
-            Err(error) => {
-                self.push_notification(
-                    NotificationTone::Error,
-                    "Title Generation Failed",
-                    error.to_string(),
-                );
-            }
-        }
     }
 
     fn persist_settings(&self) {
@@ -528,6 +467,110 @@ impl ShellState {
             self.notifications.drain(0..overflow);
         }
     }
+}
+
+fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force: bool) {
+    if row.kind != BrowserRowKind::Session {
+        return;
+    }
+
+    let settings = state.read().settings.clone();
+    if settings.litellm_endpoint.trim().is_empty()
+        || settings.litellm_api_key.trim().is_empty()
+        || settings.interface_llm_model.trim().is_empty()
+    {
+        state.with_mut(|shell| {
+            shell.push_notification(
+                NotificationTone::Warning,
+                "LiteLLM Not Configured",
+                "Open settings and configure LiteLLM before generating chat titles.",
+            );
+        });
+        return;
+    }
+
+    state.with_mut(|shell| {
+        shell.push_notification(
+            NotificationTone::Info,
+            if force {
+                "Regenerating Title"
+            } else {
+                "Generating Title"
+            },
+            format!("Requesting a title for {}.", row.label),
+        );
+    });
+
+    spawn(async move {
+        let row_for_task = row.clone();
+        let settings_for_task = settings.clone();
+        let outcome = task::spawn_blocking(move || -> Result<(Option<String>, yggterm_core::SessionNode)> {
+            let store = SessionStore::open_or_init()?;
+            let title = store.generate_title_for_session_path(
+                &settings_for_task,
+                &row_for_task.full_path,
+                force,
+            )?;
+            let browser_tree = store.load_codex_tree(&settings_for_task)?;
+            Ok((title, browser_tree))
+        })
+        .await;
+
+        state.with_mut(|shell| match outcome {
+            Ok(Ok((Some(title), browser_tree))) => {
+                let selected_path = shell.browser.selected_path().map(str::to_string);
+                let filter_query = shell.search_query.clone();
+                shell.browser = SessionBrowserState::new(browser_tree);
+                shell.browser.set_filter_query(filter_query);
+                if let Some(path) = selected_path.or_else(|| Some(row.full_path.clone())) {
+                    shell.browser.select_path(path);
+                }
+                shell.server.open_or_focus_session(
+                    &row.full_path,
+                    row.session_id.as_deref(),
+                    row.session_cwd.as_deref(),
+                    Some(&title),
+                );
+                shell.last_action = if force {
+                    "regenerated title".to_string()
+                } else {
+                    "generated title".to_string()
+                };
+                shell.push_notification(
+                    NotificationTone::Success,
+                    if force {
+                        "Title Regenerated"
+                    } else {
+                        "Title Generated"
+                    },
+                    format!("Session is now titled “{title}”."),
+                );
+            }
+            Ok(Ok((None, _))) => {
+                shell.push_notification(
+                    NotificationTone::Info,
+                    "No Title Generated",
+                    "This session did not produce enough context to title yet.",
+                );
+            }
+            Ok(Err(error)) => {
+                shell.last_action = format!("title generation failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "Title Generation Failed",
+                    error.to_string(),
+                );
+            }
+            Err(error) => {
+                shell.last_action = format!("title generation task failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "Title Task Failed",
+                    error.to_string(),
+                );
+            }
+        });
+    });
 }
 
 pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
@@ -585,7 +628,13 @@ fn app() -> Element {
                     style: "display: flex; flex: 1; min-height: 0; overflow: hidden;",
                     Sidebar {
                         snapshot: sidebar_snapshot,
-                        on_select_row: move |row: BrowserRow| state.with_mut(|shell| shell.select_row(&row)),
+                        on_select_row: move |row: BrowserRow| {
+                            let should_generate = row.kind == BrowserRowKind::Session && row.session_title.is_none();
+                            state.with_mut(|shell| shell.select_row(&row));
+                            if should_generate {
+                                queue_title_generation(state, row.clone(), false);
+                            }
+                        },
                         on_open_context_menu: move |row: BrowserRow| state.with_mut(|shell| shell.open_context_menu(row)),
                     }
                     MainSurface {
@@ -616,7 +665,10 @@ fn app() -> Element {
                         row: row.clone(),
                         palette: snapshot.palette,
                         on_close: move |_| state.with_mut(|shell| shell.close_context_menu()),
-                        on_regenerate: move |_| state.with_mut(|shell| shell.regenerate_title_for_row(&row)),
+                        on_regenerate: move |_| {
+                            state.with_mut(|shell| shell.regenerate_title_for_row(&row));
+                            queue_title_generation(state, row.clone(), true);
+                        },
                     }
                 }
                 if !snapshot.notifications.is_empty() {
@@ -734,7 +786,7 @@ fn Titlebar(
                     style: utility_icon_style_sized(
                         snapshot.palette,
                         snapshot.right_panel_mode == RightPanelMode::Settings,
-                        15
+                        16
                     ),
                     onmousedown: |evt| evt.stop_propagation(),
                     onclick: move |_| on_toggle_settings.call(()),
@@ -855,8 +907,8 @@ fn WindowControlGlyph(icon: WindowControlIcon) -> Element {
     match icon {
         WindowControlIcon::Minimize => rsx! {
             svg {
-                width: "10",
-                height: "10",
+                width: "11",
+                height: "11",
                 view_box: "0 0 10 10",
                 fill: "none",
                 xmlns: "http://www.w3.org/2000/svg",
@@ -870,8 +922,8 @@ fn WindowControlGlyph(icon: WindowControlIcon) -> Element {
         },
         WindowControlIcon::Maximize => rsx! {
             svg {
-                width: "10",
-                height: "10",
+                width: "11",
+                height: "11",
                 view_box: "0 0 10 10",
                 fill: "none",
                 xmlns: "http://www.w3.org/2000/svg",
@@ -887,8 +939,8 @@ fn WindowControlGlyph(icon: WindowControlIcon) -> Element {
         },
         WindowControlIcon::Restore => rsx! {
             svg {
-                width: "10",
-                height: "10",
+                width: "11",
+                height: "11",
                 view_box: "0 0 10 10",
                 fill: "none",
                 xmlns: "http://www.w3.org/2000/svg",
@@ -908,8 +960,8 @@ fn WindowControlGlyph(icon: WindowControlIcon) -> Element {
         },
         WindowControlIcon::Close => rsx! {
             svg {
-                width: "10",
-                height: "10",
+                width: "11",
+                height: "11",
                 view_box: "0 0 10 10",
                 fill: "none",
                 xmlns: "http://www.w3.org/2000/svg",
