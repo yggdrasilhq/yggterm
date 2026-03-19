@@ -161,7 +161,11 @@ impl ShellState {
         let mut server = YggtermServer::new(
                 &bootstrap.browser_tree,
                 bootstrap.prefer_ghostty_backend,
-                bootstrap.ghostty_bridge_enabled,
+                yggterm_server::GhosttyHostSupport::shadow(
+                    bootstrap.ghostty_bridge_detail.clone(),
+                    bootstrap.ghostty_embedded_surface_supported,
+                    bootstrap.ghostty_bridge_enabled,
+                ),
                 bootstrap.theme,
             );
         server.apply_snapshot(bootstrap.initial_server_snapshot.clone());
