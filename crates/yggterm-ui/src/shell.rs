@@ -13,7 +13,8 @@ use yggterm_core::{
 
 static BOOTSTRAP: OnceCell<ShellBootstrap> = OnceCell::new();
 const SIDE_RAIL_WIDTH: usize = 292;
-const RESIZE_HANDLE: usize = 8;
+const EDGE_RESIZE_HANDLE: usize = 5;
+const CORNER_RESIZE_HANDLE: usize = 10;
 
 #[derive(Debug, Clone)]
 pub struct ShellBootstrap {
@@ -609,7 +610,12 @@ fn app() -> Element {
 
     rsx! {
         div {
-            style: "position: fixed; inset: 0; background: transparent; overflow: hidden;",
+            style: format!(
+                "position: fixed; inset: 0; overflow: hidden; border-radius:{}px; \
+                 background-color:{}; background-image:{}; backdrop-filter: blur(30px) saturate(165%); \
+                 -webkit-backdrop-filter: blur(30px) saturate(165%);",
+                shell_radius, snapshot.palette.shell, snapshot.palette.gradient
+            ),
             div {
                 style: shell_style(snapshot.palette, shell_radius),
                 WindowResizeHandles {}
@@ -701,6 +707,7 @@ fn Titlebar(
     on_toggle_maximized: EventHandler<()>,
     maximized: bool,
 ) -> Element {
+    let mut drag_armed = use_signal(|| false);
     rsx! {
         div {
             style: format!(
@@ -709,7 +716,19 @@ fn Titlebar(
                 snapshot.palette.titlebar,
                 zoom_percent_f32(snapshot.settings.ui_font_size, 14.0)
             ),
-            ondoubleclick: move |_| on_toggle_maximized.call(()),
+            onmousedown: move |_| drag_armed.set(true),
+            onmouseup: move |_| drag_armed.set(false),
+            onmouseleave: move |_| drag_armed.set(false),
+            onmousemove: move |_| {
+                if drag_armed() {
+                    drag_armed.set(false);
+                    window().drag();
+                }
+            },
+            ondoubleclick: move |_| {
+                drag_armed.set(false);
+                on_toggle_maximized.call(());
+            },
             div {
                 style: "display:flex; align-items:center; gap:12px; width:340px; min-width:340px;",
                 button {
@@ -743,16 +762,20 @@ fn Titlebar(
                 }
                 div {
                     style: "flex:1; min-width:56px; height:100%;",
-                    onmousedown: move |_| window().drag(),
-                    ondoubleclick: move |_| on_toggle_maximized.call(()),
+                    ondoubleclick: move |_| {
+                        drag_armed.set(false);
+                        on_toggle_maximized.call(());
+                    },
                 }
             }
             div {
                 style: "flex:1; display:flex; align-items:center; justify-content:center; gap:10px; padding:0 16px;",
                 div {
                     style: "flex:1; min-width:84px; height:100%;",
-                    onmousedown: move |_| window().drag(),
-                    ondoubleclick: move |_| on_toggle_maximized.call(()),
+                    ondoubleclick: move |_| {
+                        drag_armed.set(false);
+                        on_toggle_maximized.call(());
+                    },
                 }
                 input {
                     r#type: "text",
@@ -765,8 +788,10 @@ fn Titlebar(
                 }
                 div {
                     style: "flex:1; min-width:84px; height:100%;",
-                    onmousedown: move |_| window().drag(),
-                    ondoubleclick: move |_| on_toggle_maximized.call(()),
+                    ondoubleclick: move |_| {
+                        drag_armed.set(false);
+                        on_toggle_maximized.call(());
+                    },
                 }
             }
             div {
@@ -795,7 +820,7 @@ fn Titlebar(
                     style: utility_icon_style_sized(
                         snapshot.palette,
                         snapshot.right_panel_mode == RightPanelMode::Settings,
-                        16
+                        17
                     ),
                     onmousedown: |evt| evt.stop_propagation(),
                     ondoubleclick: |evt| evt.stop_propagation(),
@@ -814,8 +839,10 @@ fn Titlebar(
                 }
                 div {
                     style: "flex:1; min-width:48px; height:100%;",
-                    onmousedown: move |_| window().drag(),
-                    ondoubleclick: move |_| on_toggle_maximized.call(()),
+                    ondoubleclick: move |_| {
+                        drag_armed.set(false);
+                        on_toggle_maximized.call(());
+                    },
                 }
                 WindowControls {
                     palette: snapshot.palette,
@@ -999,35 +1026,35 @@ fn WindowControlGlyph(icon: WindowControlIcon) -> Element {
 fn WindowResizeHandles() -> Element {
     rsx! {
         ResizeHandle {
-            style: format!("position:absolute; top:0; left:0; width:{}px; height:{}px; z-index:120; cursor:nwse-resize;", RESIZE_HANDLE, RESIZE_HANDLE),
+            style: format!("position:absolute; top:0; left:0; width:{}px; height:{}px; z-index:120; cursor:nwse-resize;", CORNER_RESIZE_HANDLE, CORNER_RESIZE_HANDLE),
             direction: ResizeDirection::NorthWest,
         }
         ResizeHandle {
-            style: format!("position:absolute; top:0; right:0; width:{}px; height:{}px; z-index:120; cursor:nesw-resize;", RESIZE_HANDLE, RESIZE_HANDLE),
+            style: format!("position:absolute; top:0; right:0; width:{}px; height:{}px; z-index:120; cursor:nesw-resize;", CORNER_RESIZE_HANDLE, CORNER_RESIZE_HANDLE),
             direction: ResizeDirection::NorthEast,
         }
         ResizeHandle {
-            style: format!("position:absolute; bottom:0; left:0; width:{}px; height:{}px; z-index:120; cursor:nesw-resize;", RESIZE_HANDLE, RESIZE_HANDLE),
+            style: format!("position:absolute; bottom:0; left:0; width:{}px; height:{}px; z-index:120; cursor:nesw-resize;", CORNER_RESIZE_HANDLE, CORNER_RESIZE_HANDLE),
             direction: ResizeDirection::SouthWest,
         }
         ResizeHandle {
-            style: format!("position:absolute; bottom:0; right:0; width:{}px; height:{}px; z-index:120; cursor:nwse-resize;", RESIZE_HANDLE, RESIZE_HANDLE),
+            style: format!("position:absolute; bottom:0; right:0; width:{}px; height:{}px; z-index:120; cursor:nwse-resize;", CORNER_RESIZE_HANDLE, CORNER_RESIZE_HANDLE),
             direction: ResizeDirection::SouthEast,
         }
         ResizeHandle {
-            style: format!("position:absolute; top:0; left:{}px; right:{}px; height:{}px; z-index:119; cursor:ns-resize;", RESIZE_HANDLE, RESIZE_HANDLE, RESIZE_HANDLE),
+            style: format!("position:absolute; top:0; left:{}px; right:{}px; height:{}px; z-index:119; cursor:ns-resize;", CORNER_RESIZE_HANDLE, CORNER_RESIZE_HANDLE, EDGE_RESIZE_HANDLE),
             direction: ResizeDirection::North,
         }
         ResizeHandle {
-            style: format!("position:absolute; bottom:0; left:{}px; right:{}px; height:{}px; z-index:119; cursor:ns-resize;", RESIZE_HANDLE, RESIZE_HANDLE, RESIZE_HANDLE),
+            style: format!("position:absolute; bottom:0; left:{}px; right:{}px; height:{}px; z-index:119; cursor:ns-resize;", CORNER_RESIZE_HANDLE, CORNER_RESIZE_HANDLE, EDGE_RESIZE_HANDLE),
             direction: ResizeDirection::South,
         }
         ResizeHandle {
-            style: format!("position:absolute; top:{}px; bottom:{}px; left:0; width:{}px; z-index:119; cursor:ew-resize;", RESIZE_HANDLE, RESIZE_HANDLE, RESIZE_HANDLE),
+            style: format!("position:absolute; top:{}px; bottom:{}px; left:0; width:{}px; z-index:119; cursor:ew-resize;", CORNER_RESIZE_HANDLE, CORNER_RESIZE_HANDLE, EDGE_RESIZE_HANDLE),
             direction: ResizeDirection::West,
         }
         ResizeHandle {
-            style: format!("position:absolute; top:{}px; bottom:{}px; right:0; width:{}px; z-index:119; cursor:ew-resize;", RESIZE_HANDLE, RESIZE_HANDLE, RESIZE_HANDLE),
+            style: format!("position:absolute; top:{}px; bottom:{}px; right:0; width:{}px; z-index:119; cursor:ew-resize;", CORNER_RESIZE_HANDLE, CORNER_RESIZE_HANDLE, EDGE_RESIZE_HANDLE),
             direction: ResizeDirection::East,
         }
     }
@@ -1060,7 +1087,7 @@ fn Sidebar(
         div {
             style: format!(
                 "width:{}px; min-width:{}px; max-width:{}px; display:flex; flex-direction:column; \
-                 background:{}; overflow:hidden; transition: width 180ms ease, opacity 180ms ease, transform 180ms ease; \
+                 background:{}; overflow:hidden; transition: opacity 180ms ease, transform 180ms ease; \
                  opacity:{}; transform:{}; pointer-events:{}; zoom:{}%;",
                 width, width, width, snapshot.palette.sidebar, opacity, translate,
                 if snapshot.sidebar_open { "auto" } else { "none" },
@@ -1583,7 +1610,7 @@ fn RightRail(
                 "width:{}px; min-width:{}px; max-width:{}px; display:flex; flex-direction:column; \
                  background:transparent; overflow:hidden; text-rendering:optimizeLegibility; \
                  -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale; \
-                 transition: width 180ms ease, opacity 180ms ease, transform 180ms ease; \
+                 transition: opacity 180ms ease, transform 180ms ease; \
                  opacity:{}; transform:{}; pointer-events:{}; zoom:{}%;",
                 width, width, width, opacity, translate,
                 if visible { "auto" } else { "none" },
@@ -2106,7 +2133,7 @@ fn search_style(palette: Palette) -> String {
 fn icon_button_style(palette: Palette) -> String {
     format!(
         "width:28px; height:28px; border:none; border-radius:8px; background:transparent; color:{}; font-size:13px; \
-         user-select:none; -webkit-user-select:none;",
+         user-select:none; -webkit-user-select:none; pointer-events:auto;",
         palette.muted
     )
 }
@@ -2117,20 +2144,19 @@ fn utility_icon_style(palette: Palette, selected: bool) -> String {
 
 fn utility_icon_style_sized(palette: Palette, selected: bool, font_size_px: u8) -> String {
     format!(
-        "width:28px; height:28px; border:none; border-radius:10px; background:{}; color:{}; font-size:{}px; font-weight:700; \
-         user-select:none; -webkit-user-select:none;",
-        if selected { "rgba(255,255,255,0.46)" } else { "transparent" },
-        if selected { palette.text } else { palette.muted },
-        font_size_px
+        "width:28px; height:28px; border:none; border-radius:10px; background:transparent; color:{}; font-size:{}px; font-weight:{}; \
+         user-select:none; -webkit-user-select:none; pointer-events:auto;",
+        if selected { palette.accent } else { palette.muted },
+        font_size_px,
+        if selected { 800 } else { 700 }
     )
 }
 
 fn connect_button_style(palette: Palette, selected: bool) -> String {
     format!(
-        "height:28px; padding:0 11px; border:none; border-radius:10px; background:{}; color:{}; \
-         font-size:11px; font-weight:700; white-space:nowrap; user-select:none; -webkit-user-select:none;",
-        if selected { "rgba(255,255,255,0.46)" } else { "transparent" },
-        if selected { palette.text } else { palette.muted }
+        "height:28px; padding:0 11px; border:none; border-radius:10px; background:transparent; color:{}; \
+         font-size:11px; font-weight:700; white-space:nowrap; user-select:none; -webkit-user-select:none; pointer-events:auto;",
+        if selected { palette.accent } else { palette.muted }
     )
 }
 
