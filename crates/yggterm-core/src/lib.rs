@@ -48,6 +48,7 @@ pub enum UiTheme {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct AppSettings {
     pub theme: UiTheme,
     pub show_tree: bool,
@@ -59,6 +60,8 @@ pub struct AppSettings {
     pub litellm_endpoint: String,
     pub litellm_api_key: String,
     pub interface_llm_model: String,
+    pub selected_browser_path: Option<String>,
+    pub expanded_browser_paths: Vec<String>,
 }
 
 impl Default for AppSettings {
@@ -74,6 +77,8 @@ impl Default for AppSettings {
             litellm_endpoint: String::new(),
             litellm_api_key: String::new(),
             interface_llm_model: String::new(),
+            selected_browser_path: None,
+            expanded_browser_paths: Vec::new(),
         }
     }
 }

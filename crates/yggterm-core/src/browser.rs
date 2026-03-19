@@ -79,6 +79,12 @@ impl SessionBrowserState {
         self.selected_path.as_deref()
     }
 
+    pub fn expanded_paths(&self) -> Vec<String> {
+        let mut paths = self.expanded_paths.iter().cloned().collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
     pub fn selected_row(&self) -> Option<&BrowserRow> {
         self.selected_path
             .as_deref()
@@ -95,6 +101,23 @@ impl SessionBrowserState {
         if self.rows.iter().any(|row| row.full_path == path) {
             self.selected_path = Some(path);
         }
+    }
+
+    pub fn restore_ui_state(
+        &mut self,
+        expanded_paths: &[String],
+        selected_path: Option<&str>,
+    ) {
+        self.expanded_paths = expanded_paths.iter().cloned().collect();
+        if !self.root.children.is_empty() {
+            self.expanded_paths
+                .insert(self.root.path.display().to_string());
+        }
+        self.rebuild_rows();
+        if let Some(path) = selected_path {
+            self.select_path(path.to_string());
+        }
+        self.ensure_selection();
     }
 
     pub fn toggle_group(&mut self, path: &str) {

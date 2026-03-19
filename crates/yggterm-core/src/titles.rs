@@ -7,6 +7,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 use time::OffsetDateTime;
+use tracing::{info, warn};
 
 const TITLE_DB_FILENAME: &str = "session-titles.db";
 
@@ -100,8 +101,10 @@ impl SessionTitleResolver {
         file_path: &Path,
         force: bool,
     ) -> Result<Option<String>> {
+        info!(session_id, force, file_path=%file_path.display(), "resolving session title");
         if !force {
             if let Some(title) = self.store.get_title(session_id)? {
+                info!(session_id, "using cached session title");
                 return Ok(Some(title));
             }
         } else {
@@ -113,16 +116,20 @@ impl SessionTitleResolver {
         }
 
         if !settings_ready(settings) {
+            warn!(session_id, "title settings are not configured");
             return Ok(None);
         }
 
         let context = extract_tail_context(file_path)?;
         if context.is_empty() {
+            warn!(session_id, file_path=%file_path.display(), "no transcript context extracted for title generation");
             return Ok(None);
         }
+        info!(session_id, context_chars=context.len(), "requesting title from litellm");
 
         let title = request_litellm_title(settings, &context)?;
         let Some(title) = sanitize_generated_title(&title) else {
+            warn!(session_id, "model response sanitized to empty title");
             return Ok(None);
         };
 

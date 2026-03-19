@@ -5,6 +5,7 @@ use once_cell::sync::OnceCell;
 use std::path::PathBuf;
 use tao::window::ResizeDirection;
 use tokio::task;
+use tracing::{info, warn};
 use yggterm_core::{
     AppSettings, BrowserRow, BrowserRowKind, ManagedSessionView, PreviewTone, SessionBrowserState,
     SessionNode, SessionStore, SshConnectTarget, UiTheme, WorkspaceViewMode, YggtermServer,
@@ -139,18 +140,38 @@ impl ShellState {
         } else {
             RightPanelMode::Metadata
         };
-        Self {
-            browser: SessionBrowserState::new(bootstrap.browser_tree.clone()),
-            server: YggtermServer::new(
+        let sidebar_open = settings.show_tree;
+        let mut browser = SessionBrowserState::new(bootstrap.browser_tree.clone());
+        browser.restore_ui_state(
+            &settings.expanded_browser_paths,
+            settings.selected_browser_path.as_deref(),
+        );
+
+        let mut server = YggtermServer::new(
                 &bootstrap.browser_tree,
                 bootstrap.prefer_ghostty_backend,
                 bootstrap.ghostty_bridge_enabled,
                 bootstrap.theme,
-            ),
+            );
+        if let Some(row) = browser.selected_row().cloned() {
+            if row.kind == BrowserRowKind::Session {
+                server.open_or_focus_session(
+                    &row.full_path,
+                    row.session_id.as_deref(),
+                    row.session_cwd.as_deref(),
+                    Some(row.label.as_str()),
+                );
+                server.set_view_mode(WorkspaceViewMode::Rendered);
+            }
+        }
+
+        let mut state = Self {
             settings,
             bootstrap,
+            browser,
+            server,
             search_query: String::new(),
-            sidebar_open: true,
+            sidebar_open,
             right_panel_mode,
             last_action: "ready".to_string(),
             maximized: false,
@@ -158,7 +179,9 @@ impl ShellState {
             notifications: Vec::new(),
             next_notification_id: 1,
             context_menu_row: None,
-        }
+        };
+        state.sync_browser_settings();
+        state
     }
 
     fn snapshot(&self) -> RenderSnapshot {
@@ -197,6 +220,7 @@ impl ShellState {
 
     fn toggle_sidebar(&mut self) {
         self.sidebar_open = !self.sidebar_open;
+        self.sync_browser_settings();
         self.last_action = if self.sidebar_open {
             "sidebar opened".to_string()
         } else {
@@ -283,6 +307,7 @@ impl ShellState {
         match row.kind {
             BrowserRowKind::Group => {
                 self.browser.toggle_group(&row.full_path);
+                self.sync_browser_settings();
                 self.last_action = format!("toggled {}", row.label);
             }
             BrowserRowKind::Session => {
@@ -294,6 +319,7 @@ impl ShellState {
                     Some(row.label.as_str()),
                 );
                 self.server.set_view_mode(WorkspaceViewMode::Rendered);
+                self.sync_browser_settings();
                 self.last_action = format!("opened {}", row.label);
             }
         }
@@ -468,6 +494,13 @@ impl ShellState {
         let _ = save_settings_file(&self.bootstrap.settings_path, &self.settings);
     }
 
+    fn sync_browser_settings(&mut self) {
+        self.settings.show_tree = self.sidebar_open;
+        self.settings.selected_browser_path = self.browser.selected_path().map(ToOwned::to_owned);
+        self.settings.expanded_browser_paths = self.browser.expanded_paths();
+        self.persist_settings();
+    }
+
     fn push_notification(
         &mut self,
         tone: NotificationTone,
@@ -515,11 +548,13 @@ fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force:
             format!("generating title for {}", row.label)
         };
     });
+    info!(session_path=%row.full_path, force, "queueing title generation");
 
     spawn(async move {
         let row_for_task = row.clone();
         let settings_for_task = settings.clone();
         let outcome = task::spawn_blocking(move || -> Result<(Option<String>, yggterm_core::SessionNode)> {
+            info!(session_path=%row_for_task.full_path, force, "running title generation task");
             let store = SessionStore::open_or_init()?;
             let title = store.generate_title_for_session_path(
                 &settings_for_task,
@@ -534,12 +569,16 @@ fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force:
         state.with_mut(|shell| match outcome {
             Ok(Ok((Some(title), browser_tree))) => {
                 let selected_path = shell.browser.selected_path().map(str::to_string);
+                let expanded_paths = shell.browser.expanded_paths();
                 let filter_query = shell.search_query.clone();
                 shell.browser = SessionBrowserState::new(browser_tree);
+                shell.browser.restore_ui_state(
+                    &expanded_paths,
+                    selected_path
+                        .as_deref()
+                        .or(Some(row.full_path.as_str())),
+                );
                 shell.browser.set_filter_query(filter_query);
-                if let Some(path) = selected_path.or_else(|| Some(row.full_path.clone())) {
-                    shell.browser.select_path(path);
-                }
                 shell.server.open_or_focus_session(
                     &row.full_path,
                     row.session_id.as_deref(),
@@ -551,6 +590,7 @@ fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force:
                 } else {
                     "generated title".to_string()
                 };
+                shell.sync_browser_settings();
                 shell.push_notification(
                     NotificationTone::Success,
                     if force {
@@ -562,6 +602,7 @@ fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force:
                 );
             }
             Ok(Ok((None, _))) => {
+                warn!(session_path=%row.full_path, "title generation produced no usable title");
                 shell.push_notification(
                     NotificationTone::Warning,
                     "No Title Generated",
@@ -570,6 +611,7 @@ fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force:
             }
             Ok(Err(error)) => {
                 shell.last_action = format!("title generation failed: {error}");
+                warn!(session_path=%row.full_path, error=%error, "title generation failed");
                 shell.push_notification(
                     NotificationTone::Error,
                     "Title Generation Failed",
@@ -578,6 +620,7 @@ fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force:
             }
             Err(error) => {
                 shell.last_action = format!("title generation task failed: {error}");
+                warn!(session_path=%row.full_path, error=%error, "title generation task join failed");
                 shell.push_notification(
                     NotificationTone::Error,
                     "Title Task Failed",
@@ -1711,13 +1754,15 @@ fn MetadataRailBody(snapshot: RenderSnapshot) -> Element {
     rsx! {
         div {
             style: format!(
-                "padding:16px 16px 10px 16px; font-size:12px; font-weight:700; letter-spacing:0.01em; color:{};",
+                "padding:16px 16px 10px 16px; font-size:12px; font-weight:700; letter-spacing:0.01em; color:{}; \
+                 text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
                 snapshot.palette.text
             ),
             "Session Metadata"
         }
         div {
-            style: "flex:1; overflow:auto; padding:10px 16px 14px 16px; display:flex; flex-direction:column; gap:16px;",
+            style: "flex:1; overflow:auto; padding:10px 16px 14px 16px; display:flex; flex-direction:column; gap:16px; \
+             text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
             if let Some(session) = session {
                 MetadataGroup {
                     title: "Overview".to_string(),
@@ -1756,13 +1801,15 @@ fn SettingsRailBody(
     rsx! {
         div {
             style: format!(
-                "padding:16px 16px 10px 16px; font-size:12px; font-weight:700; letter-spacing:0.01em; color:{};",
+                "padding:16px 16px 10px 16px; font-size:12px; font-weight:700; letter-spacing:0.01em; color:{}; \
+                 text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
                 snapshot.palette.text
             ),
             "Interface Settings"
         }
         div {
-            style: "flex:1; overflow:auto; padding:10px 16px 14px 16px; display:flex; flex-direction:column; gap:14px;",
+            style: "flex:1; overflow:auto; padding:10px 16px 14px 16px; display:flex; flex-direction:column; gap:14px; \
+             text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
             SettingsField {
                 label: "LiteLLM Endpoint".to_string(),
                 value: snapshot.settings.litellm_endpoint.clone(),
@@ -1943,23 +1990,36 @@ fn NotificationCard(
     palette: Palette,
     on_clear: EventHandler<MouseEvent>,
 ) -> Element {
-    let (tone_bg, tone_fg) = notification_tone_colors(notification.tone, palette);
+    let (tone_accent, tone_fg) = notification_tone_colors(notification.tone, palette);
     rsx! {
         div {
             style: format!(
-                "display:flex; flex-direction:column; gap:7px; padding:12px 12px 11px 12px; border-radius:12px; \
-                 background:{}; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.24);",
-                tone_bg
+                "display:flex; flex-direction:column; gap:7px; padding:12px 12px 11px 12px; border-radius:14px; \
+                 background:rgba(249,250,252,0.86); backdrop-filter: blur(28px) saturate(165%); \
+                 -webkit-backdrop-filter: blur(28px) saturate(165%); box-shadow: 0 18px 38px rgba(49,67,82,0.14), inset 0 0 0 1px rgba(255,255,255,0.72);",
             ),
             div {
                 style: "display:flex; align-items:center; justify-content:space-between; gap:8px;",
                 div {
-                    style: format!("font-size:12px; font-weight:700; color:{};", tone_fg),
-                    "{notification.title}"
+                    style: "display:flex; align-items:center; gap:8px; min-width:0;",
+                    div {
+                        style: format!(
+                            "width:8px; height:8px; border-radius:999px; background:{}; flex:none;",
+                            tone_accent
+                        ),
+                    }
+                    div {
+                        style: format!(
+                            "font-size:12px; font-weight:700; color:{}; text-rendering:optimizeLegibility; \
+                             -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
+                            tone_fg
+                        ),
+                        "{notification.title}"
+                    }
                 }
                 button {
                     style: format!(
-                        "width:22px; height:22px; border:none; border-radius:8px; background:rgba(255,255,255,0.30); color:{}; font-size:12px; font-weight:700;",
+                        "width:22px; height:22px; border:none; border-radius:8px; background:rgba(241,244,247,0.92); color:{}; font-size:12px; font-weight:700;",
                         tone_fg
                     ),
                     onclick: move |evt| on_clear.call(evt),
@@ -1967,7 +2027,11 @@ fn NotificationCard(
                 }
             }
             div {
-                style: format!("font-size:11px; line-height:1.45; color:{};", palette.text),
+                style: format!(
+                    "font-size:11px; line-height:1.45; color:{}; text-rendering:optimizeLegibility; \
+                     -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
+                    palette.text
+                ),
                 "{notification.message}"
             }
         }
@@ -2044,11 +2108,8 @@ fn ToastViewport(
 }
 
 fn toast_right_inset(right_panel_mode: RightPanelMode) -> usize {
-    if right_panel_mode == RightPanelMode::Hidden {
-        18
-    } else {
-        SIDE_RAIL_WIDTH + 28
-    }
+    let _ = right_panel_mode;
+    18
 }
 
 #[component]
@@ -2127,18 +2188,30 @@ fn MetadataGroup(
         div {
             style: "display:flex; flex-direction:column; gap:8px; padding-bottom:10px;",
             div {
-                style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", palette.muted),
+                style: format!(
+                    "font-size:11px; font-weight:700; letter-spacing:0.02em; color:{}; \
+                     text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
+                    palette.muted
+                ),
                 "{title}"
             }
             for entry in entries.into_iter() {
                 div {
                     style: "display:flex; flex-direction:column; gap:4px;",
                     span {
-                        style: format!("font-size:11px; font-weight:600; color:{};", palette.muted),
+                        style: format!(
+                            "font-size:11px; font-weight:600; color:{}; text-rendering:optimizeLegibility; \
+                             -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
+                            palette.muted
+                        ),
                         "{entry.label}"
                     }
                     span {
-                        style: format!("font-size:12px; font-weight:500; color:{}; white-space:pre-wrap; line-height:1.5;", palette.text),
+                        style: format!(
+                            "font-size:12px; font-weight:500; color:{}; white-space:pre-wrap; line-height:1.5; \
+                             text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
+                            palette.text
+                        ),
                         "{entry.value}"
                     }
                 }
@@ -2279,10 +2352,10 @@ fn settings_input_style(palette: Palette) -> String {
 
 fn notification_tone_colors(tone: NotificationTone, palette: Palette) -> (&'static str, &'static str) {
     match tone {
-        NotificationTone::Info => ("rgba(114,190,215,0.18)", palette.accent),
-        NotificationTone::Success => ("rgba(110,201,141,0.18)", "#227a45"),
-        NotificationTone::Warning => ("rgba(242,198,89,0.22)", "#8e6513"),
-        NotificationTone::Error => ("rgba(226,86,86,0.18)", "#b12e2e"),
+        NotificationTone::Info => (palette.accent, "#315066"),
+        NotificationTone::Success => ("#2f9e62", "#315066"),
+        NotificationTone::Warning => ("#d79b24", "#315066"),
+        NotificationTone::Error => ("#d95c5c", "#315066"),
     }
 }
 
