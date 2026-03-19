@@ -40,6 +40,7 @@ struct ShellState {
     right_panel_mode: RightPanelMode,
     last_action: String,
     maximized: bool,
+    always_on_top: bool,
     notifications: Vec<ToastNotification>,
     next_notification_id: u64,
     context_menu_row: Option<BrowserRow>,
@@ -88,6 +89,7 @@ struct RenderSnapshot {
     ghostty_bridge_detail: String,
     settings: AppSettings,
     maximized: bool,
+    always_on_top: bool,
     notifications: Vec<ToastNotification>,
     context_menu_row: Option<BrowserRow>,
 }
@@ -114,6 +116,7 @@ struct Palette {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HoveredControl {
+    AlwaysOnTop,
     Minimize,
     Maximize,
     Close,
@@ -121,6 +124,7 @@ enum HoveredControl {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WindowControlIcon {
+    AlwaysOnTop,
     Minimize,
     Maximize,
     Restore,
@@ -150,6 +154,7 @@ impl ShellState {
             right_panel_mode,
             last_action: "ready".to_string(),
             maximized: false,
+            always_on_top: false,
             notifications: Vec::new(),
             next_notification_id: 1,
             context_menu_row: None,
@@ -174,6 +179,7 @@ impl ShellState {
             ghostty_bridge_detail: self.bootstrap.ghostty_bridge_detail.clone(),
             settings: self.settings.clone(),
             maximized: self.maximized,
+            always_on_top: self.always_on_top,
             notifications: self.notifications.clone(),
             context_menu_row: self.context_menu_row.clone(),
         }
@@ -372,6 +378,16 @@ impl ShellState {
     fn toggle_maximized(&mut self) {
         window().toggle_maximized();
         self.maximized = !self.maximized;
+    }
+
+    fn toggle_always_on_top(&mut self) {
+        self.always_on_top = !self.always_on_top;
+        window().set_always_on_top(self.always_on_top);
+        self.last_action = if self.always_on_top {
+            "always on top enabled".to_string()
+        } else {
+            "always on top disabled".to_string()
+        };
     }
 
     fn open_context_menu(&mut self, row: BrowserRow) {
@@ -631,6 +647,7 @@ fn app() -> Element {
                     on_toggle_connect: move || state.with_mut(|shell| shell.toggle_connect_panel()),
                     on_toggle_notifications: move || state.with_mut(|shell| shell.toggle_notifications_panel()),
                     on_toggle_maximized: move || state.with_mut(|shell| shell.toggle_maximized()),
+                    on_toggle_always_on_top: move || state.with_mut(|shell| shell.toggle_always_on_top()),
                     maximized: maximized,
                 }
                 div {
@@ -705,6 +722,7 @@ fn Titlebar(
     on_toggle_connect: EventHandler<()>,
     on_toggle_notifications: EventHandler<()>,
     on_toggle_maximized: EventHandler<()>,
+    on_toggle_always_on_top: EventHandler<()>,
     maximized: bool,
 ) -> Element {
     let mut drag_armed = use_signal(|| false);
@@ -849,7 +867,9 @@ fn Titlebar(
                     hovered: hovered(),
                     on_hover_control: on_hover_control,
                     on_toggle_maximized: on_toggle_maximized,
+                    on_toggle_always_on_top: on_toggle_always_on_top,
                     maximized: maximized,
+                    always_on_top: snapshot.always_on_top,
                 }
             }
         }
@@ -862,14 +882,26 @@ fn WindowControls(
     hovered: Option<HoveredControl>,
     on_hover_control: EventHandler<Option<HoveredControl>>,
     on_toggle_maximized: EventHandler<()>,
+    on_toggle_always_on_top: EventHandler<()>,
     maximized: bool,
+    always_on_top: bool,
 ) -> Element {
     rsx! {
         div {
             style: "display:flex; align-items:stretch; gap:0;",
             WindowControl {
+                icon: WindowControlIcon::AlwaysOnTop,
+                hovered: hovered == Some(HoveredControl::AlwaysOnTop),
+                active: always_on_top,
+                hover_tone: HoveredControl::AlwaysOnTop,
+                palette,
+                on_hover_control,
+                on_press: move |_| on_toggle_always_on_top.call(()),
+            }
+            WindowControl {
                 icon: WindowControlIcon::Minimize,
                 hovered: hovered == Some(HoveredControl::Minimize),
+                active: false,
                 hover_tone: HoveredControl::Minimize,
                 palette,
                 on_hover_control,
@@ -882,6 +914,7 @@ fn WindowControls(
                     WindowControlIcon::Maximize
                 },
                 hovered: hovered == Some(HoveredControl::Maximize),
+                active: false,
                 hover_tone: HoveredControl::Maximize,
                 palette,
                 on_hover_control,
@@ -890,6 +923,7 @@ fn WindowControls(
             WindowControl {
                 icon: WindowControlIcon::Close,
                 hovered: hovered == Some(HoveredControl::Close),
+                active: false,
                 hover_tone: HoveredControl::Close,
                 palette,
                 on_hover_control,
@@ -903,6 +937,7 @@ fn WindowControls(
 fn WindowControl(
     icon: WindowControlIcon,
     hovered: bool,
+    active: bool,
     hover_tone: HoveredControl,
     palette: Palette,
     on_hover_control: EventHandler<Option<HoveredControl>>,
@@ -915,11 +950,15 @@ fn WindowControl(
         } else {
             palette.control_hover
         }
+    } else if active {
+        "transparent"
     } else {
         "transparent"
     };
     let color = if hovered && is_close {
         "#ffffff"
+    } else if active {
+        palette.accent
     } else {
         palette.text
     };
@@ -945,6 +984,29 @@ fn WindowControl(
 #[component]
 fn WindowControlGlyph(icon: WindowControlIcon) -> Element {
     match icon {
+        WindowControlIcon::AlwaysOnTop => rsx! {
+            svg {
+                width: "12",
+                height: "12",
+                view_box: "0 0 12 12",
+                fill: "none",
+                xmlns: "http://www.w3.org/2000/svg",
+                path {
+                    d: "M3.1 5.2L6 2.4L8.9 5.2",
+                    stroke: "currentColor",
+                    stroke_width: "1.2",
+                    stroke_linecap: "round",
+                    stroke_linejoin: "round",
+                }
+                path {
+                    d: "M3.1 9.2L6 6.4L8.9 9.2",
+                    stroke: "currentColor",
+                    stroke_width: "1.2",
+                    stroke_linecap: "round",
+                    stroke_linejoin: "round",
+                }
+            }
+        },
         WindowControlIcon::Minimize => rsx! {
             svg {
                 width: "11",
