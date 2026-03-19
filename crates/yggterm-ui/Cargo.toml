@@ -7,6 +7,7 @@ license = "Apache-2.0"
 
 [dependencies]
 yggterm-core = { path = "../yggterm-core" }
+yggterm-server = { path = "../yggterm-server" }
 anyhow.workspace = true
 dioxus = { version = "0.7.3", features = ["desktop"] }
 once_cell = "1"

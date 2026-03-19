@@ -1,0 +1,22 @@
+[package]
+name = "yggterm-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license = "Apache-2.0"
+
+[features]
+default = []
+ghostty-ffi = ["yggterm-ghostty-bridge/ghostty-ffi"]
+
+[dependencies]
+anyhow.workspace = true
+dirs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tracing.workspace = true
+uuid = { version = "1", features = ["v4"] }
+yggterm-core = { path = "../yggterm-core" }
+yggterm-ghostty-bridge = { path = "../yggterm-ghostty-bridge", default-features = false }
+yggterm-gtk-glue = { path = "../yggterm-gtk-glue" }

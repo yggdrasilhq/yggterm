@@ -1,4 +1,13 @@
-use crate::{SessionNode, UiTheme};
+mod daemon;
+mod host;
+
+pub use daemon::{
+    ServerEndpoint, ServerRequest, ServerResponse, ServerRuntimeStatus, default_endpoint, ping,
+    run_daemon, status,
+};
+pub use host::{GhosttyHostKind, GhosttyHostSupport, detect_ghostty_host};
+
+use yggterm_core::{SessionNode, UiTheme};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;

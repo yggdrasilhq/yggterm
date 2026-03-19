@@ -1,5 +1,4 @@
 mod browser;
-mod server;
 mod titles;
 
 use anyhow::{Context, Result};
@@ -12,11 +11,6 @@ use std::path::{Path, PathBuf};
 use titles::{SessionTitleResolver, settings_ready as litellm_settings_ready};
 
 pub use browser::{BrowserMetrics, BrowserRow, BrowserRowKind, SessionBrowserState};
-pub use server::{
-    ManagedSessionView, PreviewTone, RemoteDeployState, SessionMetadataEntry, SessionPreview,
-    SessionPreviewBlock, SessionRenderedSection, SessionSource, SshConnectTarget, TerminalBackend,
-    TerminalLaunchPhase, WorkspaceViewMode, YggtermServer,
-};
 
 pub const ENV_YGGTERM_HOME: &str = "YGGTERM_HOME";
 pub const DEFAULT_HOME_DIRNAME: &str = ".yggterm";

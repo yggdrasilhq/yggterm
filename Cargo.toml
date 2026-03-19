@@ -2,6 +2,7 @@
 members = [
   "apps/yggterm",
   "crates/yggterm-core",
+  "crates/yggterm-server",
   "crates/yggterm-ui",
   "crates/yggterm-gtk-glue",
   "crates/yggterm-platform",

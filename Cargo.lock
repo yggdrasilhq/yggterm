@@ -5327,8 +5327,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "yggterm-core",
- "yggterm-ghostty-bridge",
- "yggterm-gtk-glue",
+ "yggterm-server",
  "yggterm-ui",
 ]
 
@@ -5365,6 +5364,22 @@ name = "yggterm-platform"
 version = "1.0.3"
 
 [[package]]
+name = "yggterm-server"
+version = "1.0.3"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "serde",
+ "serde_json",
+ "time",
+ "tracing",
+ "uuid",
+ "yggterm-core",
+ "yggterm-ghostty-bridge",
+ "yggterm-gtk-glue",
+]
+
+[[package]]
 name = "yggterm-ui"
 version = "1.0.3"
 dependencies = [
@@ -5375,6 +5390,7 @@ dependencies = [
  "tokio",
  "tracing",
  "yggterm-core",
+ "yggterm-server",
 ]
 
 [[package]]
