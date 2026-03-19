@@ -23,6 +23,8 @@ This repository is still scaffolding.
 - A Dioxus desktop shell exists for fast iteration on layout and interaction.
 - The current shell lives in `crates/yggterm-ui` and is the active product surface.
 - Session orchestration now has a dedicated crate boundary in `crates/yggterm-server`.
+- `yggterm server daemon` now owns session restore/runtime state and persists it under `~/.yggterm/server-state.json`.
+- `yggterm server attach <uuid>` now creates reusable attach metadata under `~/.yggterm/runtime/attach/<uuid>/session.json` and falls back to `tmux` or the user shell.
 - `yggterm` now opens the Dioxus shell directly.
 - The old CLI subcommands and the `eframe` scaffold path have been removed.
 - The shell chrome is now owned locally in `yggterm-ui`, while the adjacent Zed checkout remains the visual reference stack.
@@ -86,7 +88,8 @@ Build Ghostty runtime artifacts:
 
 Current upstream constraint:
 
-- On Linux, `libghostty` links and the Yggterm server can launch Ghostty for terminal mode, but Ghostty's current embedded surface host only exposes macOS/iOS platform views. The in-viewport terminal path therefore still falls back to an external Ghostty process on Linux until upstream surface hosting expands.
+- On Linux, `libghostty` links and the Yggterm server now routes terminal launch through a Linux GTK host adapter, but Ghostty's current embedded surface host still only exposes macOS/iOS platform views. The in-viewport terminal path therefore still falls back to an external Ghostty process on Linux until upstream surface hosting expands.
+- On macOS, the same host adapter interface reserves the `libghostty` embedded host path so the server and UI can converge on one launch contract across platforms.
 - `crates/yggterm-gtk-glue` is the reserved Linux bypass layer for a GTK-hosted Ghostty path while upstream embedding remains unavailable there.
 
 Build the workspace:

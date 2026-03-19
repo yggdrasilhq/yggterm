@@ -88,7 +88,7 @@ impl DaemonRuntime {
         let mut server = YggtermServer::new(
             &tree,
             settings.prefer_ghostty_backend,
-            support.bridge_enabled,
+            support.clone(),
             settings.theme,
         );
         let state_path = store.home_dir().join("server-state.json");

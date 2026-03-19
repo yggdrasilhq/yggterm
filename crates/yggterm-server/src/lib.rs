@@ -1,6 +1,8 @@
+mod attach;
 mod daemon;
 mod host;
 
+pub use attach::{AttachMetadata, run_attach};
 pub use daemon::{
     ServerEndpoint, ServerRequest, ServerResponse, ServerRuntimeStatus, connect_ssh,
     default_endpoint, focus_live, open_stored_session, ping, raise_external_window, run_daemon,
@@ -14,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::SystemTime;
 use time::{OffsetDateTime, UtcOffset, macros::format_description};
 use uuid::Uuid;
@@ -211,7 +213,7 @@ pub struct YggtermServer {
     active_view_mode: WorkspaceViewMode,
     backend: TerminalBackend,
     theme: UiTheme,
-    ghostty_bridge_enabled: bool,
+    ghostty_host: GhosttyHostSupport,
     ssh_targets: Vec<SshConnectTarget>,
     live_session_order: Vec<String>,
 }
@@ -220,9 +222,10 @@ impl YggtermServer {
     pub fn new(
         tree: &SessionNode,
         prefer_ghostty_backend: bool,
-        ghostty_bridge_enabled: bool,
+        ghostty_host: GhosttyHostSupport,
         theme: UiTheme,
     ) -> Self {
+        let ghostty_bridge_enabled = ghostty_host.bridge_enabled;
         let backend = if prefer_ghostty_backend && ghostty_bridge_enabled {
             TerminalBackend::Ghostty
         } else {
@@ -235,7 +238,7 @@ impl YggtermServer {
             active_view_mode: WorkspaceViewMode::Rendered,
             backend,
             theme,
-            ghostty_bridge_enabled,
+            ghostty_host,
             ssh_targets: vec![
                 SshConnectTarget {
                     label: "prod-app-01".to_string(),
@@ -323,7 +326,7 @@ impl YggtermServer {
                 title_hint,
                 self.backend,
                 self.theme,
-                self.ghostty_bridge_enabled,
+                self.ghostty_host.bridge_enabled,
             )
         });
         entry.backend = self.backend;
@@ -521,22 +524,25 @@ impl YggtermServer {
         match session.source {
             SessionSource::Stored => {
                 if session.terminal_process_id.is_none() {
-                    match spawn_local_ghostty(&session.launch_command) {
-                        Ok(pid) => {
+                    match self.ghostty_host.launch_terminal(&session.launch_command) {
+                        Ok(outcome) => {
                             session.backend = TerminalBackend::Ghostty;
-                            session.terminal_process_id = Some(pid);
+                            session.terminal_process_id = outcome.process_id;
                             session.terminal_window_id = None;
                             session.last_launch_error = None;
                             session.last_window_error = None;
-                            session.launch_phase = TerminalLaunchPhase::Running;
-                            session.terminal_lines = vec![
-                                format!("$ {}", session.launch_command),
-                                format!("ghostty pid {pid}"),
-                                "server launched the terminal in an external Ghostty window"
-                                    .to_string(),
-                                embedded_surface_note(session.bridge_available),
-                            ];
-                            let _ = sync_external_window_id(session);
+                            session.launch_phase = if outcome.embedded_surface_reserved {
+                                TerminalLaunchPhase::BridgePending
+                            } else {
+                                TerminalLaunchPhase::Running
+                            };
+                            session.terminal_lines = outcome.lines;
+                            session
+                                .terminal_lines
+                                .push(self.ghostty_host.integration_note());
+                            if session.terminal_process_id.is_some() {
+                                let _ = sync_external_window_id(session);
+                            }
                         }
                         Err(error) => {
                             session.backend = TerminalBackend::Mock;
@@ -697,7 +703,7 @@ impl YggtermServer {
             target,
             self.backend,
             self.theme,
-            self.ghostty_bridge_enabled,
+            self.ghostty_host.bridge_enabled,
         );
         if let Some(title_override) = title_override {
             session.title = title_override;
@@ -1161,13 +1167,15 @@ fn build_live_session(
     ghostty_bridge_enabled: bool,
 ) -> ManagedSessionView {
     let started_at = format_display_datetime(OffsetDateTime::now_utc());
-    let launch_command = match &target.prefix {
-        Some(prefix) => format!(
-            "ssh {} '{}' 'yggterm server attach {}'",
-            target.ssh_target, prefix, uuid
-        ),
-        None => format!("ssh {} 'yggterm server attach {}'", target.ssh_target, uuid),
+    let remote_command = match &target.prefix {
+        Some(prefix) => format!("{prefix} && yggterm server attach {uuid}"),
+        None => format!("yggterm server attach {uuid}"),
     };
+    let launch_command = format!(
+        "ssh {} {}",
+        target.ssh_target,
+        shell_single_quote(&remote_command)
+    );
 
     ManagedSessionView {
         id: uuid.to_string(),
@@ -1400,20 +1408,6 @@ fn stored_file_snapshot(path: &str) -> StoredFileSnapshot {
     }
 }
 
-fn spawn_local_ghostty(launch_command: &str) -> Result<u32, String> {
-    let child = Command::new("ghostty")
-        .arg("-e")
-        .arg("bash")
-        .arg("-lc")
-        .arg(launch_command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| format!("failed to spawn ghostty: {error}"))?;
-    Ok(child.id())
-}
-
 fn sync_external_window_id(session: &mut ManagedSessionView) -> Result<String, String> {
     let Some(pid) = session.terminal_process_id else {
         let error = "ghostty pid not available".to_string();
@@ -1455,6 +1449,20 @@ fn sync_external_window_id(session: &mut ManagedSessionView) -> Result<String, S
             upsert_session_metadata(&mut session.metadata, "Window Error", error.clone());
             Err(error)
         }
+    }
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn embedded_surface_note(bridge_available: bool) -> String {
+    if !bridge_available {
+        "libghostty is not linked in this build, so terminal mode stays on the fallback host path."
+            .to_string()
+    } else {
+        "The active host adapter decides whether this session lands in an embedded surface or an external Ghostty window."
+            .to_string()
     }
 }
 
@@ -1680,18 +1688,6 @@ fn message_lines_from_payload(payload: &Value) -> Vec<String> {
     lines
 }
 
-fn embedded_surface_note(bridge_available: bool) -> String {
-    if !bridge_available {
-        return "libghostty is not linked in this build, so terminal mode stays on the external fallback path.".to_string();
-    }
-
-    if cfg!(target_os = "linux") {
-        "libghostty is linked, but Ghostty's current embedded surface host only exposes macOS/iOS views, so Linux still falls back to an external Ghostty window.".to_string()
-    } else {
-        "libghostty is linked and the embedded surface host remains the active integration target."
-            .to_string()
-    }
-}
 
 fn normalize_preview_text(text: &str) -> Vec<String> {
     text.lines()
