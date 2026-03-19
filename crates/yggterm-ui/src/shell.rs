@@ -3,6 +3,7 @@ use dioxus::desktop::{Config, LogicalSize, WindowBuilder, window};
 use dioxus::prelude::*;
 use once_cell::sync::OnceCell;
 use std::path::PathBuf;
+use tao::window::ResizeDirection;
 use tokio::task;
 use yggterm_core::{
     AppSettings, BrowserRow, BrowserRowKind, ManagedSessionView, PreviewTone, SessionBrowserState,
@@ -12,6 +13,7 @@ use yggterm_core::{
 
 static BOOTSTRAP: OnceCell<ShellBootstrap> = OnceCell::new();
 const SIDE_RAIL_WIDTH: usize = 292;
+const RESIZE_HANDLE: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct ShellBootstrap {
@@ -610,6 +612,7 @@ fn app() -> Element {
             style: "position: fixed; inset: 0; background: transparent; overflow: hidden;",
             div {
                 style: shell_style(snapshot.palette, shell_radius),
+                WindowResizeHandles {}
                 Titlebar {
                     snapshot: titlebar_snapshot,
                     hovered: hovered,
@@ -706,10 +709,9 @@ fn Titlebar(
                 snapshot.palette.titlebar,
                 zoom_percent_f32(snapshot.settings.ui_font_size, 14.0)
             ),
-            onmousedown: move |_| window().drag(),
             ondoubleclick: move |_| on_toggle_maximized.call(()),
             div {
-                style: "display:flex; align-items:center; gap:12px; width:300px; min-width:300px;",
+                style: "display:flex; align-items:center; gap:12px; width:340px; min-width:340px;",
                 button {
                     style: icon_button_style(snapshot.palette),
                     onmousedown: |evt| evt.stop_propagation(),
@@ -739,11 +741,19 @@ fn Titlebar(
                         "Terminal"
                     }
                 }
-                div { style: "flex:1; min-width:16px; height:100%;" }
+                div {
+                    style: "flex:1; min-width:56px; height:100%;",
+                    onmousedown: move |_| window().drag(),
+                    ondoubleclick: move |_| on_toggle_maximized.call(()),
+                }
             }
             div {
                 style: "flex:1; display:flex; align-items:center; justify-content:center; gap:10px; padding:0 16px;",
-                div { style: "flex:1; min-width:12px; height:100%;" }
+                div {
+                    style: "flex:1; min-width:84px; height:100%;",
+                    onmousedown: move |_| window().drag(),
+                    ondoubleclick: move |_| on_toggle_maximized.call(()),
+                }
                 input {
                     r#type: "text",
                     value: "{snapshot.search_query}",
@@ -753,10 +763,14 @@ fn Titlebar(
                     ondoubleclick: |evt| evt.stop_propagation(),
                     oninput: move |evt| on_search.call(evt.value()),
                 }
-                div { style: "flex:1; min-width:12px; height:100%;" }
+                div {
+                    style: "flex:1; min-width:84px; height:100%;",
+                    onmousedown: move |_| window().drag(),
+                    ondoubleclick: move |_| on_toggle_maximized.call(()),
+                }
             }
             div {
-                style: "display:flex; align-items:center; justify-content:flex-end; gap:10px; width:340px; min-width:340px;",
+                style: "display:flex; align-items:center; justify-content:flex-end; gap:10px; width:372px; min-width:372px;",
                 button {
                     style: connect_button_style(
                         snapshot.palette,
@@ -798,7 +812,11 @@ fn Titlebar(
                     onclick: move |_| on_toggle_meta.call(()),
                     "ⓘ"
                 }
-                div { style: "flex:1; min-width:12px; height:100%;" }
+                div {
+                    style: "flex:1; min-width:48px; height:100%;",
+                    onmousedown: move |_| window().drag(),
+                    ondoubleclick: move |_| on_toggle_maximized.call(()),
+                }
                 WindowControls {
                     palette: snapshot.palette,
                     hovered: hovered(),
@@ -974,6 +992,58 @@ fn WindowControlGlyph(icon: WindowControlIcon) -> Element {
                 }
             }
         },
+    }
+}
+
+#[component]
+fn WindowResizeHandles() -> Element {
+    rsx! {
+        ResizeHandle {
+            style: format!("position:absolute; top:0; left:0; width:{}px; height:{}px; z-index:120; cursor:nwse-resize;", RESIZE_HANDLE, RESIZE_HANDLE),
+            direction: ResizeDirection::NorthWest,
+        }
+        ResizeHandle {
+            style: format!("position:absolute; top:0; right:0; width:{}px; height:{}px; z-index:120; cursor:nesw-resize;", RESIZE_HANDLE, RESIZE_HANDLE),
+            direction: ResizeDirection::NorthEast,
+        }
+        ResizeHandle {
+            style: format!("position:absolute; bottom:0; left:0; width:{}px; height:{}px; z-index:120; cursor:nesw-resize;", RESIZE_HANDLE, RESIZE_HANDLE),
+            direction: ResizeDirection::SouthWest,
+        }
+        ResizeHandle {
+            style: format!("position:absolute; bottom:0; right:0; width:{}px; height:{}px; z-index:120; cursor:nwse-resize;", RESIZE_HANDLE, RESIZE_HANDLE),
+            direction: ResizeDirection::SouthEast,
+        }
+        ResizeHandle {
+            style: format!("position:absolute; top:0; left:{}px; right:{}px; height:{}px; z-index:119; cursor:ns-resize;", RESIZE_HANDLE, RESIZE_HANDLE, RESIZE_HANDLE),
+            direction: ResizeDirection::North,
+        }
+        ResizeHandle {
+            style: format!("position:absolute; bottom:0; left:{}px; right:{}px; height:{}px; z-index:119; cursor:ns-resize;", RESIZE_HANDLE, RESIZE_HANDLE, RESIZE_HANDLE),
+            direction: ResizeDirection::South,
+        }
+        ResizeHandle {
+            style: format!("position:absolute; top:{}px; bottom:{}px; left:0; width:{}px; z-index:119; cursor:ew-resize;", RESIZE_HANDLE, RESIZE_HANDLE, RESIZE_HANDLE),
+            direction: ResizeDirection::West,
+        }
+        ResizeHandle {
+            style: format!("position:absolute; top:{}px; bottom:{}px; right:0; width:{}px; z-index:119; cursor:ew-resize;", RESIZE_HANDLE, RESIZE_HANDLE, RESIZE_HANDLE),
+            direction: ResizeDirection::East,
+        }
+    }
+}
+
+#[component]
+fn ResizeHandle(style: String, direction: ResizeDirection) -> Element {
+    rsx! {
+        div {
+            style: "{style}",
+            onmousedown: move |evt| {
+                evt.stop_propagation();
+                let _ = window().drag_resize_window(direction);
+            },
+            ondoubleclick: |evt| evt.stop_propagation(),
+        }
     }
 }
 
