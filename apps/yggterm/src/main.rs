@@ -3,7 +3,9 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 use yggterm_core::SessionStore;
-use yggterm_server::{default_endpoint, detect_ghostty_host, ping, run_daemon, status};
+use yggterm_server::{
+    default_endpoint, detect_ghostty_host, ping, run_daemon, snapshot, status,
+};
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -32,12 +34,15 @@ fn main() -> Result<()> {
     let host = detect_ghostty_host();
     let server_daemon_detail = ensure_server_daemon(&endpoint)?;
     let server_runtime = status(&endpoint).ok();
+    let (initial_server_snapshot, _) = snapshot(&endpoint)?;
 
     yggterm_ui::launch_shell(yggterm_ui::ShellBootstrap {
         tree,
         browser_tree,
         settings,
         settings_path,
+        server_endpoint: endpoint,
+        initial_server_snapshot,
         theme,
         ghostty_bridge_enabled: host.bridge_enabled,
         ghostty_embedded_surface_supported: host.embedded_surface_supported,

@@ -2,12 +2,15 @@ mod daemon;
 mod host;
 
 pub use daemon::{
-    ServerEndpoint, ServerRequest, ServerResponse, ServerRuntimeStatus, default_endpoint, ping,
-    run_daemon, status,
+    ServerEndpoint, ServerRequest, ServerResponse, ServerRuntimeStatus, connect_ssh,
+    default_endpoint, focus_live, open_stored_session, ping, raise_external_window, run_daemon,
+    request_terminal_launch, set_all_preview_blocks_folded, set_view_mode, snapshot, status,
+    sync_external_window, sync_theme, toggle_preview_block,
 };
 pub use host::{GhosttyHostKind, GhosttyHostSupport, detect_ghostty_host};
 
 use yggterm_core::{SessionNode, UiTheme};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
@@ -16,13 +19,13 @@ use std::time::SystemTime;
 use time::{OffsetDateTime, UtcOffset, macros::format_description};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkspaceViewMode {
     Terminal,
     Rendered,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TerminalBackend {
     Ghostty,
     Mock,
@@ -40,7 +43,7 @@ pub struct SessionRenderedSection {
     pub lines: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PreviewTone {
     User,
     Assistant,
@@ -61,13 +64,13 @@ pub struct SessionPreview {
     pub blocks: Vec<SessionPreviewBlock>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionSource {
     Stored,
     LiveSsh,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TerminalLaunchPhase {
     Queued,
     BridgePending,
@@ -75,7 +78,7 @@ pub enum TerminalLaunchPhase {
     Running,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RemoteDeployState {
     NotRequired,
     Planned,
@@ -83,11 +86,97 @@ pub enum RemoteDeployState {
     Ready,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SshConnectTarget {
     pub label: String,
     pub ssh_target: String,
     pub prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotMetadataEntry {
+    pub label: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotRenderedSection {
+    pub title: String,
+    pub lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotPreviewBlock {
+    pub role: String,
+    pub timestamp: String,
+    pub tone: PreviewTone,
+    pub folded: bool,
+    pub lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotPreview {
+    pub summary: Vec<SnapshotMetadataEntry>,
+    pub blocks: Vec<SnapshotPreviewBlock>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotSessionView {
+    pub id: String,
+    pub session_path: String,
+    pub title: String,
+    pub host_label: String,
+    pub source: SessionSource,
+    pub backend: TerminalBackend,
+    pub bridge_available: bool,
+    pub launch_phase: TerminalLaunchPhase,
+    pub remote_deploy_state: RemoteDeployState,
+    pub launch_command: String,
+    pub status_line: String,
+    pub terminal_lines: Vec<String>,
+    pub rendered_sections: Vec<SnapshotRenderedSection>,
+    pub preview: SnapshotPreview,
+    pub metadata: Vec<SnapshotMetadataEntry>,
+    pub terminal_process_id: Option<u32>,
+    pub terminal_window_id: Option<String>,
+    pub last_launch_error: Option<String>,
+    pub last_window_error: Option<String>,
+    pub ssh_target: Option<String>,
+    pub ssh_prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerUiSnapshot {
+    pub active_session_path: Option<String>,
+    pub active_session: Option<SnapshotSessionView>,
+    pub active_view_mode: WorkspaceViewMode,
+    pub ssh_targets: Vec<SshConnectTarget>,
+    pub live_sessions: Vec<SnapshotSessionView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedStoredSession {
+    pub path: String,
+    pub session_id: Option<String>,
+    pub cwd: Option<String>,
+    pub title_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedLiveSession {
+    pub key: String,
+    pub id: String,
+    pub title: String,
+    pub ssh_target: String,
+    pub prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedDaemonState {
+    pub active_session_path: Option<String>,
+    pub active_view_mode: WorkspaceViewMode,
+    pub stored_sessions: Vec<PersistedStoredSession>,
+    pub live_sessions: Vec<PersistedLiveSession>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +200,8 @@ pub struct ManagedSessionView {
     pub terminal_window_id: Option<String>,
     pub last_launch_error: Option<String>,
     pub last_window_error: Option<String>,
+    pub ssh_target: Option<String>,
+    pub ssh_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -258,6 +349,10 @@ impl YggtermServer {
             .and_then(|path| self.sessions.get(path))
     }
 
+    pub fn active_session_path(&self) -> Option<&str> {
+        self.active_session_path.as_deref()
+    }
+
     pub fn ssh_targets(&self) -> &[SshConnectTarget] {
         &self.ssh_targets
     }
@@ -267,6 +362,102 @@ impl YggtermServer {
             .iter()
             .filter_map(|key| self.sessions.get(key).cloned())
             .collect()
+    }
+
+    pub fn snapshot(&self) -> ServerUiSnapshot {
+        ServerUiSnapshot {
+            active_session_path: self.active_session_path.clone(),
+            active_session: self.active_session().cloned().map(snapshot_session_view),
+            active_view_mode: self.active_view_mode,
+            ssh_targets: self.ssh_targets.clone(),
+            live_sessions: self
+                .live_session_order
+                .iter()
+                .filter_map(|key| self.sessions.get(key))
+                .cloned()
+                .map(snapshot_session_view)
+                .collect(),
+        }
+    }
+
+    pub fn apply_snapshot(&mut self, snapshot: ServerUiSnapshot) {
+        self.active_view_mode = snapshot.active_view_mode;
+        self.active_session_path = snapshot.active_session_path.clone();
+        self.ssh_targets = snapshot.ssh_targets;
+        self.live_session_order = snapshot
+            .live_sessions
+            .iter()
+            .map(|session| session.session_path.clone())
+            .collect();
+        self.sessions.clear();
+        if let Some(active) = snapshot.active_session {
+            let key = active.session_path.clone();
+            self.sessions.insert(key, managed_session_from_snapshot(active));
+        }
+        for live in snapshot.live_sessions {
+            let key = live.session_path.clone();
+            self.sessions.insert(key, managed_session_from_snapshot(live));
+        }
+    }
+
+    pub fn persisted_state(&self) -> PersistedDaemonState {
+        let stored_sessions = self
+            .sessions
+            .iter()
+            .filter_map(|(path, session)| {
+                (session.source == SessionSource::Stored).then(|| PersistedStoredSession {
+                    path: path.clone(),
+                    session_id: Some(session.id.clone()),
+                    cwd: session
+                        .metadata
+                        .iter()
+                        .find(|entry| entry.label == "Cwd")
+                        .map(|entry| entry.value.clone()),
+                    title_hint: Some(session.title.clone()),
+                })
+            })
+            .collect();
+        let live_sessions = self
+            .live_session_order
+            .iter()
+            .filter_map(|key| self.sessions.get(key).map(|session| (key, session)))
+            .filter_map(|(key, session)| {
+                session.ssh_target.as_ref().map(|ssh_target| PersistedLiveSession {
+                    key: key.clone(),
+                    id: session.id.clone(),
+                    title: session.title.clone(),
+                    ssh_target: ssh_target.clone(),
+                    prefix: session.ssh_prefix.clone(),
+                })
+            })
+            .collect();
+
+        PersistedDaemonState {
+            active_session_path: self.active_session_path.clone(),
+            active_view_mode: self.active_view_mode,
+            stored_sessions,
+            live_sessions,
+        }
+    }
+
+    pub fn restore_persisted_state(&mut self, state: PersistedDaemonState) {
+        for session in state.stored_sessions {
+            self.open_or_focus_session(
+                &session.path,
+                session.session_id.as_deref(),
+                session.cwd.as_deref(),
+                session.title_hint.as_deref(),
+            );
+        }
+        for live in state.live_sessions {
+            self.restore_live_session(live);
+        }
+        self.active_view_mode = state.active_view_mode;
+        if let Some(path) = state.active_session_path {
+            if self.sessions.contains_key(&path) {
+                self.active_session_path = Some(path);
+            }
+        }
     }
 
     pub fn focus_live_session(&mut self, key: &str) {
@@ -281,19 +472,17 @@ impl YggtermServer {
         let target = self.ssh_targets.get(target_ix)?.clone();
         let uuid = Uuid::new_v4().to_string();
         let key = format!("live::{uuid}");
-        let session = build_live_session(
-            &uuid,
-            &target,
-            self.backend,
-            self.theme,
-            self.ghostty_bridge_enabled,
-        );
-        self.sessions.insert(key.clone(), session);
-        self.live_session_order.insert(0, key.clone());
-        self.active_session_path = Some(key.clone());
-        self.active_view_mode = WorkspaceViewMode::Terminal;
-        self.request_terminal_launch_for_active();
+        self.insert_live_session(&key, &uuid, &target, Some(target.label.clone()));
         Some(key)
+    }
+
+    pub fn restore_live_session(&mut self, live: PersistedLiveSession) {
+        let target = SshConnectTarget {
+            label: live.title.clone(),
+            ssh_target: live.ssh_target,
+            prefix: live.prefix,
+        };
+        self.insert_live_session(&live.key, &live.id, &target, Some(live.title));
     }
 
     pub fn toggle_preview_block(&mut self, block_ix: usize) {
@@ -347,7 +536,7 @@ impl YggtermServer {
                                     .to_string(),
                                 embedded_surface_note(session.bridge_available),
                             ];
-                            let _ = sync_external_window(session);
+                            let _ = sync_external_window_id(session);
                         }
                         Err(error) => {
                             session.backend = TerminalBackend::Mock;
@@ -457,7 +646,7 @@ impl YggtermServer {
         let Some(session) = self.sessions.get_mut(path) else {
             return "no active session".to_string();
         };
-        match sync_external_window(session) {
+        match sync_external_window_id(session) {
             Ok(window_id) => format!("ghostty window resolved: {window_id}"),
             Err(error) => error,
         }
@@ -472,7 +661,7 @@ impl YggtermServer {
         };
 
         if session.terminal_window_id.is_none() {
-            let _ = sync_external_window(session);
+            let _ = sync_external_window_id(session);
         }
 
         let Some(window_id) = session.terminal_window_id.clone() else {
@@ -494,6 +683,158 @@ impl YggtermServer {
                 error
             }
         }
+    }
+
+    fn insert_live_session(
+        &mut self,
+        key: &str,
+        session_id: &str,
+        target: &SshConnectTarget,
+        title_override: Option<String>,
+    ) {
+        let mut session = build_live_session(
+            session_id,
+            target,
+            self.backend,
+            self.theme,
+            self.ghostty_bridge_enabled,
+        );
+        if let Some(title_override) = title_override {
+            session.title = title_override;
+        }
+        self.sessions.insert(key.to_string(), session);
+        self.live_session_order.retain(|existing| existing != key);
+        self.live_session_order.insert(0, key.to_string());
+        self.active_session_path = Some(key.to_string());
+        self.active_view_mode = WorkspaceViewMode::Terminal;
+        self.request_terminal_launch_for_active();
+    }
+}
+
+fn snapshot_metadata_entries(entries: &[SessionMetadataEntry]) -> Vec<SnapshotMetadataEntry> {
+    entries
+        .iter()
+        .map(|entry| SnapshotMetadataEntry {
+            label: entry.label.to_string(),
+            value: entry.value.clone(),
+        })
+        .collect()
+}
+
+fn snapshot_preview_block(block: SessionPreviewBlock) -> SnapshotPreviewBlock {
+    SnapshotPreviewBlock {
+        role: block.role.to_string(),
+        timestamp: block.timestamp,
+        tone: block.tone,
+        folded: block.folded,
+        lines: block.lines,
+    }
+}
+
+fn snapshot_session_view(session: ManagedSessionView) -> SnapshotSessionView {
+    SnapshotSessionView {
+        id: session.id,
+        session_path: session.session_path,
+        title: session.title,
+        host_label: session.host_label,
+        source: session.source,
+        backend: session.backend,
+        bridge_available: session.bridge_available,
+        launch_phase: session.launch_phase,
+        remote_deploy_state: session.remote_deploy_state,
+        launch_command: session.launch_command,
+        status_line: session.status_line,
+        terminal_lines: session.terminal_lines,
+        rendered_sections: session
+            .rendered_sections
+            .into_iter()
+            .map(|section| SnapshotRenderedSection {
+                title: section.title.to_string(),
+                lines: section.lines,
+            })
+            .collect(),
+        preview: SnapshotPreview {
+            summary: snapshot_metadata_entries(&session.preview.summary),
+            blocks: session
+                .preview
+                .blocks
+                .into_iter()
+                .map(snapshot_preview_block)
+                .collect(),
+        },
+        metadata: snapshot_metadata_entries(&session.metadata),
+        terminal_process_id: session.terminal_process_id,
+        terminal_window_id: session.terminal_window_id,
+        last_launch_error: session.last_launch_error,
+        last_window_error: session.last_window_error,
+        ssh_target: session.ssh_target,
+        ssh_prefix: session.ssh_prefix,
+    }
+}
+
+fn leak_label(value: String) -> &'static str {
+    Box::leak(value.into_boxed_str())
+}
+
+fn managed_session_from_snapshot(session: SnapshotSessionView) -> ManagedSessionView {
+    ManagedSessionView {
+        id: session.id,
+        session_path: session.session_path,
+        title: session.title,
+        host_label: session.host_label,
+        source: session.source,
+        backend: session.backend,
+        bridge_available: session.bridge_available,
+        launch_phase: session.launch_phase,
+        remote_deploy_state: session.remote_deploy_state,
+        launch_command: session.launch_command,
+        status_line: session.status_line,
+        terminal_lines: session.terminal_lines,
+        rendered_sections: session
+            .rendered_sections
+            .into_iter()
+            .map(|section| SessionRenderedSection {
+                title: leak_label(section.title),
+                lines: section.lines,
+            })
+            .collect(),
+        preview: SessionPreview {
+            summary: session
+                .preview
+                .summary
+                .into_iter()
+                .map(|entry| SessionMetadataEntry {
+                    label: leak_label(entry.label),
+                    value: entry.value,
+                })
+                .collect(),
+            blocks: session
+                .preview
+                .blocks
+                .into_iter()
+                .map(|block| SessionPreviewBlock {
+                    role: leak_label(block.role),
+                    timestamp: block.timestamp,
+                    tone: block.tone,
+                    folded: block.folded,
+                    lines: block.lines,
+                })
+                .collect(),
+        },
+        metadata: session
+            .metadata
+            .into_iter()
+            .map(|entry| SessionMetadataEntry {
+                label: leak_label(entry.label),
+                value: entry.value,
+            })
+            .collect(),
+        terminal_process_id: session.terminal_process_id,
+        terminal_window_id: session.terminal_window_id,
+        last_launch_error: session.last_launch_error,
+        last_window_error: session.last_window_error,
+        ssh_target: session.ssh_target,
+        ssh_prefix: session.ssh_prefix,
     }
 }
 
@@ -807,6 +1148,8 @@ fn build_session(
         terminal_window_id: None,
         last_launch_error: None,
         last_window_error: None,
+        ssh_target: None,
+        ssh_prefix: None,
     }
 }
 
@@ -953,6 +1296,8 @@ fn build_live_session(
         terminal_window_id: None,
         last_launch_error: None,
         last_window_error: None,
+        ssh_target: Some(target.ssh_target.clone()),
+        ssh_prefix: target.prefix.clone(),
     }
 }
 
@@ -1069,7 +1414,7 @@ fn spawn_local_ghostty(launch_command: &str) -> Result<u32, String> {
     Ok(child.id())
 }
 
-fn sync_external_window(session: &mut ManagedSessionView) -> Result<String, String> {
+fn sync_external_window_id(session: &mut ManagedSessionView) -> Result<String, String> {
     let Some(pid) = session.terminal_process_id else {
         let error = "ghostty pid not available".to_string();
         session.last_window_error = Some(error.clone());

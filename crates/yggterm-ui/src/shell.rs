@@ -11,8 +11,12 @@ use yggterm_core::{
     UiTheme, save_settings_file,
 };
 use yggterm_server::{
-    ManagedSessionView, PreviewTone, SessionMetadataEntry, SessionPreviewBlock, SshConnectTarget,
-    WorkspaceViewMode, YggtermServer,
+    ManagedSessionView, PreviewTone, ServerEndpoint, ServerUiSnapshot, SessionMetadataEntry,
+    SessionPreviewBlock, SshConnectTarget, WorkspaceViewMode, YggtermServer, connect_ssh,
+    focus_live, open_stored_session, raise_external_window, request_terminal_launch,
+    set_all_preview_blocks_folded, set_view_mode as daemon_set_view_mode,
+    sync_external_window,
+    toggle_preview_block as daemon_toggle_preview_block,
 };
 
 static BOOTSTRAP: OnceCell<ShellBootstrap> = OnceCell::new();
@@ -26,6 +30,8 @@ pub struct ShellBootstrap {
     pub browser_tree: SessionNode,
     pub settings: AppSettings,
     pub settings_path: PathBuf,
+    pub server_endpoint: ServerEndpoint,
+    pub initial_server_snapshot: ServerUiSnapshot,
     pub theme: UiTheme,
     pub ghostty_bridge_enabled: bool,
     pub ghostty_embedded_surface_supported: bool,
@@ -158,17 +164,7 @@ impl ShellState {
                 bootstrap.ghostty_bridge_enabled,
                 bootstrap.theme,
             );
-        if let Some(row) = browser.selected_row().cloned() {
-            if row.kind == BrowserRowKind::Session {
-                server.open_or_focus_session(
-                    &row.full_path,
-                    row.session_id.as_deref(),
-                    row.session_cwd.as_deref(),
-                    Some(row.label.as_str()),
-                );
-                server.set_view_mode(WorkspaceViewMode::Rendered);
-            }
-        }
+        server.apply_snapshot(bootstrap.initial_server_snapshot.clone());
 
         let mut state = Self {
             settings,
@@ -300,12 +296,33 @@ impl ShellState {
         };
     }
 
+    fn apply_daemon_snapshot_result(
+        &mut self,
+        result: Result<(ServerUiSnapshot, Option<String>)>,
+    ) {
+        match result {
+            Ok((snapshot, message)) => {
+                self.server.apply_snapshot(snapshot);
+                if let Some(message) = message {
+                    self.last_action = message;
+                }
+            }
+            Err(error) => {
+                self.last_action = format!("server sync failed: {error}");
+                self.push_notification(
+                    NotificationTone::Error,
+                    "Server Sync Failed",
+                    error.to_string(),
+                );
+            }
+        }
+    }
+
     fn set_view_mode(&mut self, mode: WorkspaceViewMode) {
-        self.server.set_view_mode(mode);
-        self.last_action = match mode {
-            WorkspaceViewMode::Rendered => "preview mode".to_string(),
-            WorkspaceViewMode::Terminal => "terminal mode".to_string(),
-        };
+        self.apply_daemon_snapshot_result(daemon_set_view_mode(
+            &self.bootstrap.server_endpoint,
+            mode,
+        ));
     }
 
     fn select_row(&mut self, row: &BrowserRow) {
@@ -318,13 +335,13 @@ impl ShellState {
             }
             BrowserRowKind::Session => {
                 self.context_menu_row = None;
-                self.server.open_or_focus_session(
+                self.apply_daemon_snapshot_result(open_stored_session(
+                    &self.bootstrap.server_endpoint,
                     &row.full_path,
                     row.session_id.as_deref(),
                     row.session_cwd.as_deref(),
                     Some(row.label.as_str()),
-                );
-                self.server.set_view_mode(WorkspaceViewMode::Rendered);
+                ));
                 self.sync_browser_settings();
                 self.last_action = format!("opened {}", row.label);
             }
@@ -332,48 +349,73 @@ impl ShellState {
     }
 
     fn connect_ssh_target(&mut self, target_ix: usize) {
-        if let Some(key) = self.server.connect_ssh_target(target_ix) {
-            self.last_action = format!("connected {key}");
-            self.push_notification(
-                NotificationTone::Success,
-                "SSH Session Started",
-                format!("Opened live session {key}."),
-            );
+        match connect_ssh(&self.bootstrap.server_endpoint, target_ix) {
+            Ok((snapshot, message)) => {
+                self.server.apply_snapshot(snapshot);
+                self.last_action = message.unwrap_or_else(|| "ssh session started".to_string());
+                self.push_notification(
+                    NotificationTone::Success,
+                    "SSH Session Started",
+                    self.last_action.clone(),
+                );
+            }
+            Err(error) => {
+                self.last_action = format!("ssh connect failed: {error}");
+                self.push_notification(
+                    NotificationTone::Error,
+                    "SSH Session Failed",
+                    error.to_string(),
+                );
+            }
         }
     }
 
     fn focus_live_session(&mut self, key: &str) {
-        self.server.focus_live_session(key);
+        self.apply_daemon_snapshot_result(focus_live(&self.bootstrap.server_endpoint, key));
         self.last_action = format!("focused {key}");
     }
 
     fn toggle_preview_block(&mut self, block_ix: usize) {
-        self.server.toggle_preview_block(block_ix);
+        self.apply_daemon_snapshot_result(daemon_toggle_preview_block(
+            &self.bootstrap.server_endpoint,
+            block_ix,
+        ));
         self.last_action = format!("preview block {}", block_ix + 1);
     }
 
     fn expand_preview_blocks(&mut self) {
-        self.server.set_all_preview_blocks_folded(false);
+        self.apply_daemon_snapshot_result(set_all_preview_blocks_folded(
+            &self.bootstrap.server_endpoint,
+            false,
+        ));
         self.last_action = "expanded preview".to_string();
     }
 
     fn collapse_preview_blocks(&mut self) {
-        self.server.set_all_preview_blocks_folded(true);
+        self.apply_daemon_snapshot_result(set_all_preview_blocks_folded(
+            &self.bootstrap.server_endpoint,
+            true,
+        ));
         self.last_action = "collapsed preview".to_string();
     }
 
     fn request_terminal_launch(&mut self) {
-        self.server.request_terminal_launch_for_active();
-        self.server.set_view_mode(WorkspaceViewMode::Terminal);
+        self.apply_daemon_snapshot_result(request_terminal_launch(
+            &self.bootstrap.server_endpoint,
+        ));
         self.last_action = "requested ghostty".to_string();
     }
 
     fn resolve_ghostty_window(&mut self) {
-        self.last_action = self.server.sync_external_terminal_window_for_active();
+        self.apply_daemon_snapshot_result(sync_external_window(
+            &self.bootstrap.server_endpoint,
+        ));
     }
 
     fn focus_ghostty_window(&mut self) {
-        self.last_action = self.server.raise_external_terminal_window_for_active();
+        self.apply_daemon_snapshot_result(raise_external_window(
+            &self.bootstrap.server_endpoint,
+        ));
     }
 
     fn update_litellm_endpoint(&mut self, value: String) {
@@ -585,12 +627,13 @@ fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force:
                         .or(Some(row.full_path.as_str())),
                 );
                 shell.browser.set_filter_query(filter_query);
-                shell.server.open_or_focus_session(
+                shell.apply_daemon_snapshot_result(open_stored_session(
+                    &shell.bootstrap.server_endpoint,
                     &row.full_path,
                     row.session_id.as_deref(),
                     row.session_cwd.as_deref(),
                     Some(&title),
-                );
+                ));
                 shell.last_action = if force {
                     "regenerated title".to_string()
                 } else {
