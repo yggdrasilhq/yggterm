@@ -218,7 +218,7 @@ fn request_litellm_title(settings: &AppSettings, context: &str) -> Result<String
     let body = serde_json::json!({
         "model": settings.interface_llm_model,
         "temperature": 0.2,
-        "max_tokens": 24,
+        "max_tokens": 64,
         "messages": [
             {
                 "role": "system",
@@ -242,6 +242,8 @@ fn request_litellm_title(settings: &AppSettings, context: &str) -> Result<String
 
     let value: Value = response.json().context("failed to parse LiteLLM response")?;
     let title = extract_completion_text(&value)
+        .or_else(|| extract_reasoning_title(&value))
+        .or_else(|| heuristic_title_from_context(context))
         .context("LiteLLM response did not contain a title")?;
     Ok(title)
 }
@@ -295,6 +297,7 @@ fn extract_completion_text(value: &Value) -> Option<String> {
         .and_then(|message| message.get("content"))
         .and_then(extract_text_fragment)
         .map(ToOwned::to_owned)
+        .filter(|text| !text.trim().is_empty())
         .or_else(|| {
             message
                 .and_then(|message| message.get("content"))
@@ -313,13 +316,165 @@ fn extract_completion_text(value: &Value) -> Option<String> {
                 .and_then(|message| message.get("refusal"))
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned)
+                .filter(|text| !text.trim().is_empty())
         })
         .or_else(|| {
             choice
                 .get("text")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned)
+                .filter(|text| !text.trim().is_empty())
         })
+}
+
+fn extract_reasoning_title(value: &Value) -> Option<String> {
+    let choice = value.get("choices")?.as_array()?.first()?;
+    let message = choice.get("message")?;
+    let reasoning = message
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .or_else(|| message.get("reasoning").and_then(Value::as_str))
+        .or_else(|| {
+            message
+                .get("reasoning_details")
+                .and_then(Value::as_array)
+                .and_then(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.get("text").and_then(Value::as_str))
+                        .find(|text| !text.trim().is_empty())
+                })
+        })?;
+
+    extract_quoted_candidate(reasoning)
+}
+
+fn extract_quoted_candidate(text: &str) -> Option<String> {
+    for quote in ['"', '\''] {
+        let mut start = None;
+        for (ix, ch) in text.char_indices() {
+            if ch == quote {
+                if let Some(open_ix) = start.take() {
+                    let candidate = text[open_ix + ch.len_utf8()..ix].trim();
+                    if let Some(title) = sanitize_generated_title(candidate) {
+                        if plausible_title(&title) {
+                            return Some(title);
+                        }
+                    }
+                } else {
+                    start = Some(ix);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn heuristic_title_from_context(context: &str) -> Option<String> {
+    let line = context
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| line.starts_with("USER: ") && !line.is_empty())
+        .or_else(|| {
+            context
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+        })?;
+    let normalized = line
+        .strip_prefix("USER: ")
+        .or_else(|| line.strip_prefix("ASSISTANT: "))
+        .or_else(|| line.strip_prefix("MSG: "))
+        .unwrap_or(line);
+
+    let lower = normalized.to_ascii_lowercase();
+    if lower.contains("shortcut") || lower.contains("shortcuts") {
+        if let Some(quoted) = extract_quoted_candidate(normalized) {
+            if quoted.split_whitespace().count() == 1 {
+                let title = format!("{} Shortcuts", title_case_word(&quoted));
+                if plausible_title(&title) {
+                    return Some(title);
+                }
+            }
+        }
+        if lower.contains("excel") {
+            return Some(String::from("Excel Shortcut Design"));
+        }
+        return Some(String::from("Shortcut Config Design"));
+    }
+
+    let words = normalized
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .filter(|word| word.len() > 2)
+        .filter(|word| {
+            !matches!(
+                word.to_ascii_lowercase().as_str(),
+                "the"
+                    | "and"
+                    | "for"
+                    | "with"
+                    | "this"
+                    | "that"
+                    | "from"
+                    | "into"
+                    | "have"
+                    | "will"
+                    | "would"
+                    | "should"
+                    | "could"
+                    | "about"
+                    | "there"
+                    | "their"
+                    | "what"
+                    | "when"
+                    | "where"
+                    | "which"
+                    | "your"
+                    | "want"
+                    | "like"
+                    | "just"
+                    | "session"
+            )
+        })
+        .take(5)
+        .map(title_case_word)
+        .collect::<Vec<_>>();
+
+    if words.len() < 2 {
+        return None;
+    }
+
+    let title = words.join(" ");
+    plausible_title(&title).then_some(title)
+}
+
+fn title_case_word(word: &str) -> String {
+    let mut chars = word.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    first.to_ascii_uppercase().to_string() + &chars.as_str().to_ascii_lowercase()
+}
+
+fn plausible_title(title: &str) -> bool {
+    let word_count = title.split_whitespace().count();
+    let lower = title.to_ascii_lowercase();
+    (2..=6).contains(&word_count)
+        && title.len() <= 72
+        && !title.chars().any(|ch| ch.is_ascii_digit())
+        && !matches!(
+            lower.as_str(),
+            "the user asks"
+                | "user wants"
+                | "we need"
+                | "need generate"
+                | "short ui title"
+                | "terminal codex session"
+                | "to words"
+        )
 }
 
 fn extract_text_fragment(value: &Value) -> Option<&str> {
