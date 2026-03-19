@@ -20,10 +20,6 @@ function targetLabel() {
     return "macos-aarch64";
   }
 
-  if (process.platform === "win32" && process.arch === "x64") {
-    return "windows-x86_64";
-  }
-
   throw new Error(
     `unsupported platform for npm launcher: ${process.platform}-${process.arch}`
   );
