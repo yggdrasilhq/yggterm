@@ -7,9 +7,12 @@ use tao::window::ResizeDirection;
 use tokio::task;
 use tracing::{info, warn};
 use yggterm_core::{
-    AppSettings, BrowserRow, BrowserRowKind, ManagedSessionView, PreviewTone, SessionBrowserState,
-    SessionNode, SessionStore, SshConnectTarget, UiTheme, WorkspaceViewMode, YggtermServer,
-    save_settings_file,
+    AppSettings, BrowserRow, BrowserRowKind, SessionBrowserState, SessionNode, SessionStore,
+    UiTheme, save_settings_file,
+};
+use yggterm_server::{
+    ManagedSessionView, PreviewTone, SessionMetadataEntry, SessionPreviewBlock, SshConnectTarget,
+    WorkspaceViewMode, YggtermServer,
 };
 
 static BOOTSTRAP: OnceCell<ShellBootstrap> = OnceCell::new();
@@ -27,6 +30,7 @@ pub struct ShellBootstrap {
     pub ghostty_bridge_enabled: bool,
     pub ghostty_embedded_surface_supported: bool,
     pub ghostty_bridge_detail: String,
+    pub server_daemon_detail: String,
     pub prefer_ghostty_backend: bool,
 }
 
@@ -88,6 +92,7 @@ struct RenderSnapshot {
     last_action: String,
     ghostty_embedded_surface_supported: bool,
     ghostty_bridge_detail: String,
+    server_daemon_detail: String,
     settings: AppSettings,
     maximized: bool,
     always_on_top: bool,
@@ -200,6 +205,7 @@ impl ShellState {
             last_action: self.last_action.clone(),
             ghostty_embedded_surface_supported: self.bootstrap.ghostty_embedded_surface_supported,
             ghostty_bridge_detail: self.bootstrap.ghostty_bridge_detail.clone(),
+            server_daemon_detail: self.bootstrap.server_daemon_detail.clone(),
             settings: self.settings.clone(),
             maximized: self.maximized,
             always_on_top: self.always_on_top,
@@ -1432,12 +1438,12 @@ fn MainSurface(
         match snapshot.active_view_mode {
             WorkspaceViewMode::Rendered => rsx! {
                 div {
-                    style: "display:flex; flex-direction:column; gap:16px; min-width:0;",
+                    style: "display:flex; flex-direction:column; gap:18px; min-width:0; width:min(940px, 100%); margin:0 auto;",
                     div {
-                        style: "display:flex; align-items:flex-start; justify-content:space-between; gap:16px;",
+                        style: "display:flex; align-items:flex-start; justify-content:space-between; gap:16px; flex-wrap:wrap;",
                         PreviewSummary { session: session.clone(), palette: snapshot.palette }
                         div {
-                            style: "display:flex; gap:8px;",
+                            style: "display:flex; gap:8px; margin-left:auto;",
                             button {
                                 style: chip_style(snapshot.palette, false),
                                 onclick: move |_| on_expand_preview.call(()),
@@ -1451,7 +1457,7 @@ fn MainSurface(
                         }
                     }
                     div {
-                        style: "display:flex; flex-direction:column; gap:14px;",
+                        style: "display:flex; flex-direction:column; gap:16px;",
                         for (ix, block) in session.preview.blocks.iter().cloned().enumerate() {
                             PreviewBlock {
                                 block_ix: ix,
@@ -1465,7 +1471,7 @@ fn MainSurface(
             },
             WorkspaceViewMode::Terminal => rsx! {
                 div {
-                    style: "display:flex; flex-direction:column; gap:16px; min-width:0;",
+                    style: "display:flex; flex-direction:column; gap:16px; min-width:0; width:min(940px, 100%); margin:0 auto;",
                     div {
                         style: "display:flex; gap:8px; justify-content:flex-end;",
                         button {
@@ -1499,6 +1505,7 @@ fn MainSurface(
                         },
                         lines: vec![
                             snapshot.ghostty_bridge_detail.clone(),
+                            snapshot.server_daemon_detail.clone(),
                             "Yggterm server opens and tracks session-owned Ghostty launches here.".to_string(),
                         ],
                         palette: snapshot.palette,
@@ -1533,25 +1540,33 @@ fn MainSurface(
 fn PreviewSummary(session: ManagedSessionView, palette: Palette) -> Element {
     let started = metadata_value(&session, "Started");
     let messages = metadata_value(&session, "Messages");
+    let preview_blocks = session.preview.blocks.len();
 
     rsx! {
         div {
             style: format!(
-                "display:flex; flex-direction:column; gap:6px; min-width:280px; max-width:360px; \
-                 background:{}; border:none; border-radius:14px; padding:14px 16px; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.38);",
-                palette.panel_alt
+                "display:flex; flex-direction:column; gap:8px; flex:1; min-width:280px; \
+                 background:linear-gradient(180deg, rgba(255,255,255,0.78) 0%, rgba(248,252,255,0.68) 100%); \
+                 border:none; border-radius:18px; padding:18px 20px; \
+                 box-shadow: inset 0 0 0 1px rgba(255,255,255,0.48);",
             ),
             div {
-                style: format!("font-size:13px; font-weight:700; color:{};", palette.text),
+                style: format!("font-size:11px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:{};", palette.muted),
+                "Session Preview"
+            }
+            div {
+                style: format!("font-size:20px; font-weight:700; color:{}; line-height:1.2;", palette.text),
                 "{session.title}"
             }
             div {
-                style: format!("font-size:11px; color:{};", palette.muted),
+                style: format!("font-size:12px; color:{};", palette.muted),
                 "{session.host_label} · {started}"
             }
             div {
-                style: format!("font-size:11px; color:{};", palette.muted),
-                "{messages} · {session.preview.blocks.len()} blocks"
+                style: "display:flex; flex-wrap:wrap; gap:8px;",
+                StatusPill { label: "Messages".to_string(), value: messages, palette }
+                StatusPill { label: "Blocks".to_string(), value: preview_blocks.to_string(), palette }
+                StatusPill { label: "Mode".to_string(), value: "Rendered".to_string(), palette }
             }
         }
     }
@@ -1560,29 +1575,33 @@ fn PreviewSummary(session: ManagedSessionView, palette: Palette) -> Element {
 #[component]
 fn PreviewBlock(
     block_ix: usize,
-    block: yggterm_core::SessionPreviewBlock,
+    block: SessionPreviewBlock,
     palette: Palette,
     on_toggle: EventHandler<MouseEvent>,
 ) -> Element {
     let background = match block.tone {
-        PreviewTone::User => palette.accent_soft,
-        PreviewTone::Assistant => palette.panel_alt,
+        PreviewTone::User => "rgba(223, 240, 252, 0.94)",
+        PreviewTone::Assistant => "rgba(255, 255, 255, 0.84)",
     };
     let badge = match block.tone {
         PreviewTone::User => palette.accent,
         PreviewTone::Assistant => palette.muted,
     };
+    let outline = match block.tone {
+        PreviewTone::User => "rgba(66, 153, 225, 0.18)",
+        PreviewTone::Assistant => "rgba(148, 163, 184, 0.18)",
+    };
 
     rsx! {
         button {
             style: format!(
-                "width:100%; border:none; text-align:left; background:{}; border-radius:14px; \
-                 padding:15px 16px; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.42);",
-                background
+                "width:100%; border:none; text-align:left; background:{}; border-radius:18px; \
+                 padding:18px 18px; box-shadow: inset 0 0 0 1px {}, 0 10px 28px rgba(148,163,184,0.08);",
+                background, outline
             ),
             onclick: move |evt| on_toggle.call(evt),
             div {
-                style: "display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:10px;",
+                style: "display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px;",
                 div {
                     style: "display:flex; align-items:center; gap:8px;",
                     span {
@@ -1614,11 +1633,31 @@ fn PreviewBlock(
                     style: format!("display:flex; flex-direction:column; gap:7px; color:{};", palette.text),
                     for line in block.lines.iter() {
                         div {
-                            style: "font-size:13px; line-height:1.45; white-space:pre-wrap;",
+                            style: "font-size:13px; line-height:1.58; white-space:pre-wrap;",
                             "{line}"
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+#[component]
+fn StatusPill(label: String, value: String, palette: Palette) -> Element {
+    rsx! {
+        div {
+            style: format!(
+                "display:inline-flex; align-items:center; gap:6px; padding:6px 10px; border-radius:999px; \
+                 background:rgba(255,255,255,0.62); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.46);"
+            ),
+            span {
+                style: format!("font-size:11px; font-weight:700; color:{};", palette.muted),
+                "{label}"
+            }
+            span {
+                style: format!("font-size:11px; font-weight:700; color:{};", palette.text),
+                "{value}"
             }
         }
     }
@@ -1777,7 +1816,7 @@ fn MetadataRailBody(snapshot: RenderSnapshot) -> Element {
             } else {
                 MetadataGroup {
                     title: "Overview".to_string(),
-                    entries: vec![yggterm_core::SessionMetadataEntry {
+                    entries: vec![SessionMetadataEntry {
                         label: "State",
                         value: "No session selected".to_string(),
                     }],
@@ -2181,7 +2220,7 @@ fn ZoomSettingRow(
 #[component]
 fn MetadataGroup(
     title: String,
-    entries: Vec<yggterm_core::SessionMetadataEntry>,
+    entries: Vec<SessionMetadataEntry>,
     palette: Palette,
 ) -> Element {
     rsx! {
