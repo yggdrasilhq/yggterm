@@ -702,16 +702,18 @@ fn Titlebar(
         div {
             style: format!(
                 "display:flex; align-items:center; justify-content:space-between; height:44px; \
-                 padding:0 12px; background:{}; zoom:{}%;",
+                 padding:0 12px; background:{}; zoom:{}%; user-select:none; -webkit-user-select:none;",
                 snapshot.palette.titlebar,
                 zoom_percent_f32(snapshot.settings.ui_font_size, 14.0)
             ),
+            onmousedown: move |_| window().drag(),
             ondoubleclick: move |_| on_toggle_maximized.call(()),
             div {
                 style: "display:flex; align-items:center; gap:12px; width:300px; min-width:300px;",
                 button {
                     style: icon_button_style(snapshot.palette),
                     onmousedown: |evt| evt.stop_propagation(),
+                    ondoubleclick: |evt| evt.stop_propagation(),
                     onclick: move |_| on_toggle_sidebar.call(()),
                     "☰"
                 }
@@ -723,6 +725,7 @@ fn Titlebar(
                             snapshot.palette,
                             snapshot.active_view_mode == WorkspaceViewMode::Rendered
                         ),
+                        ondoubleclick: |evt| evt.stop_propagation(),
                         onclick: move |_| on_set_view_mode.call(WorkspaceViewMode::Rendered),
                         "Preview"
                     }
@@ -731,36 +734,26 @@ fn Titlebar(
                             snapshot.palette,
                             snapshot.active_view_mode == WorkspaceViewMode::Terminal
                         ),
+                        ondoubleclick: |evt| evt.stop_propagation(),
                         onclick: move |_| on_set_view_mode.call(WorkspaceViewMode::Terminal),
                         "Terminal"
                     }
                 }
-                div {
-                    style: "flex:1; min-width:16px; height:100%;",
-                    onmousedown: move |_| window().drag(),
-                    ondoubleclick: move |_| on_toggle_maximized.call(()),
-                }
+                div { style: "flex:1; min-width:16px; height:100%;" }
             }
             div {
                 style: "flex:1; display:flex; align-items:center; justify-content:center; gap:10px; padding:0 16px;",
-                div {
-                    style: "flex:1; min-width:12px; height:100%;",
-                    onmousedown: move |_| window().drag(),
-                    ondoubleclick: move |_| on_toggle_maximized.call(()),
-                }
+                div { style: "flex:1; min-width:12px; height:100%;" }
                 input {
                     r#type: "text",
                     value: "{snapshot.search_query}",
                     placeholder: "Search sessions…",
                     style: search_style(snapshot.palette),
                     onmousedown: |evt| evt.stop_propagation(),
+                    ondoubleclick: |evt| evt.stop_propagation(),
                     oninput: move |evt| on_search.call(evt.value()),
                 }
-                div {
-                    style: "flex:1; min-width:12px; height:100%;",
-                    onmousedown: move |_| window().drag(),
-                    ondoubleclick: move |_| on_toggle_maximized.call(()),
-                }
+                div { style: "flex:1; min-width:12px; height:100%;" }
             }
             div {
                 style: "display:flex; align-items:center; justify-content:flex-end; gap:10px; width:340px; min-width:340px;",
@@ -770,6 +763,7 @@ fn Titlebar(
                         snapshot.right_panel_mode == RightPanelMode::Connect
                     ),
                     onmousedown: |evt| evt.stop_propagation(),
+                    ondoubleclick: |evt| evt.stop_propagation(),
                     onclick: move |_| on_toggle_connect.call(()),
                     "Connect SSH"
                 }
@@ -779,6 +773,7 @@ fn Titlebar(
                         snapshot.right_panel_mode == RightPanelMode::Notifications
                     ),
                     onmousedown: |evt| evt.stop_propagation(),
+                    ondoubleclick: |evt| evt.stop_propagation(),
                     onclick: move |_| on_toggle_notifications.call(()),
                     BellIcon {}
                 }
@@ -789,6 +784,7 @@ fn Titlebar(
                         16
                     ),
                     onmousedown: |evt| evt.stop_propagation(),
+                    ondoubleclick: |evt| evt.stop_propagation(),
                     onclick: move |_| on_toggle_settings.call(()),
                     "⚙"
                 }
@@ -798,14 +794,11 @@ fn Titlebar(
                         snapshot.right_panel_mode == RightPanelMode::Metadata
                     ),
                     onmousedown: |evt| evt.stop_propagation(),
+                    ondoubleclick: |evt| evt.stop_propagation(),
                     onclick: move |_| on_toggle_meta.call(()),
                     "ⓘ"
                 }
-                div {
-                    style: "flex:1; min-width:12px; height:100%;",
-                    onmousedown: move |_| window().drag(),
-                    ondoubleclick: move |_| on_toggle_maximized.call(()),
-                }
+                div { style: "flex:1; min-width:12px; height:100%;" }
                 WindowControls {
                     palette: snapshot.palette,
                     hovered: hovered(),
@@ -890,10 +883,12 @@ fn WindowControl(
         button {
             style: format!(
                 "width:34px; height:30px; border:none; border-radius:0; background:{}; color:{}; \
-                 display:flex; align-items:center; justify-content:center; font-size:13px; font-weight:600;",
+                 display:flex; align-items:center; justify-content:center; font-size:13px; font-weight:600; \
+                 user-select:none; -webkit-user-select:none;",
                 background, color
             ),
             onmousedown: |evt| evt.stop_propagation(),
+            ondoubleclick: |evt| evt.stop_propagation(),
             onmouseenter: move |_| on_hover_control.call(Some(hover_tone)),
             onmouseleave: move |_| on_hover_control.call(None),
             onclick: move |evt| on_press.call(evt),
@@ -2033,14 +2028,15 @@ fn search_style(palette: Palette) -> String {
     format!(
         "width:min(560px, 100%); height:32px; padding:0 12px; border-radius:8px; \
          border:none; background:rgba(255,255,255,0.66); color:{}; outline:none; font-size:12px; \
-         box-shadow: inset 0 0 0 1px rgba(255,255,255,0.36);",
+         box-shadow: inset 0 0 0 1px rgba(255,255,255,0.36); user-select:text; -webkit-user-select:text;",
         palette.text
     )
 }
 
 fn icon_button_style(palette: Palette) -> String {
     format!(
-        "width:28px; height:28px; border:none; border-radius:8px; background:transparent; color:{}; font-size:13px;",
+        "width:28px; height:28px; border:none; border-radius:8px; background:transparent; color:{}; font-size:13px; \
+         user-select:none; -webkit-user-select:none;",
         palette.muted
     )
 }
@@ -2051,7 +2047,8 @@ fn utility_icon_style(palette: Palette, selected: bool) -> String {
 
 fn utility_icon_style_sized(palette: Palette, selected: bool, font_size_px: u8) -> String {
     format!(
-        "width:28px; height:28px; border:none; border-radius:10px; background:{}; color:{}; font-size:{}px; font-weight:700;",
+        "width:28px; height:28px; border:none; border-radius:10px; background:{}; color:{}; font-size:{}px; font-weight:700; \
+         user-select:none; -webkit-user-select:none;",
         if selected { "rgba(255,255,255,0.46)" } else { "transparent" },
         if selected { palette.text } else { palette.muted },
         font_size_px
@@ -2061,7 +2058,7 @@ fn utility_icon_style_sized(palette: Palette, selected: bool, font_size_px: u8) 
 fn connect_button_style(palette: Palette, selected: bool) -> String {
     format!(
         "height:28px; padding:0 11px; border:none; border-radius:10px; background:{}; color:{}; \
-         font-size:11px; font-weight:700; white-space:nowrap;",
+         font-size:11px; font-weight:700; white-space:nowrap; user-select:none; -webkit-user-select:none;",
         if selected { "rgba(255,255,255,0.46)" } else { "transparent" },
         if selected { palette.text } else { palette.muted }
     )
@@ -2087,13 +2084,14 @@ fn sidebar_action_style(palette: Palette) -> String {
 
 fn toggle_slider_style(_palette: Palette) -> String {
     format!(
-        "display:flex; align-items:center; gap:4px; padding:3px; border:none; border-radius:999px; background:rgba(255,255,255,0.34); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.28);"
+        "display:flex; align-items:center; gap:4px; padding:3px; border:none; border-radius:999px; background:rgba(255,255,255,0.34); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.28); user-select:none; -webkit-user-select:none;"
     )
 }
 
 fn toggle_slider_end_style(palette: Palette, selected: bool) -> String {
     format!(
-        "height:26px; min-width:82px; padding:0 12px; border:none; border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:700;",
+        "height:26px; min-width:82px; padding:0 12px; border:none; border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:700; \
+         user-select:none; -webkit-user-select:none;",
         if selected { palette.panel } else { "transparent" },
         if selected { palette.text } else { palette.muted }
     )
