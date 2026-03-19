@@ -115,6 +115,14 @@ enum HoveredControl {
     Close,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WindowControlIcon {
+    Minimize,
+    Maximize,
+    Restore,
+    Close,
+}
+
 impl ShellState {
     fn new(bootstrap: ShellBootstrap) -> Self {
         let settings = bootstrap.settings.clone();
@@ -766,13 +774,11 @@ fn WindowControls(
     on_toggle_maximized: EventHandler<()>,
     maximized: bool,
 ) -> Element {
-    let maximize_glyph = if maximized { "❐" } else { "▢" };
-
     rsx! {
         div {
             style: "display:flex; align-items:stretch; gap:0;",
             WindowControl {
-                glyph: "—",
+                icon: WindowControlIcon::Minimize,
                 hovered: hovered == Some(HoveredControl::Minimize),
                 hover_tone: HoveredControl::Minimize,
                 palette,
@@ -780,7 +786,11 @@ fn WindowControls(
                 on_press: move |_| window().set_minimized(true),
             }
             WindowControl {
-                glyph: maximize_glyph,
+                icon: if maximized {
+                    WindowControlIcon::Restore
+                } else {
+                    WindowControlIcon::Maximize
+                },
                 hovered: hovered == Some(HoveredControl::Maximize),
                 hover_tone: HoveredControl::Maximize,
                 palette,
@@ -788,7 +798,7 @@ fn WindowControls(
                 on_press: move |_| on_toggle_maximized.call(()),
             }
             WindowControl {
-                glyph: "✕",
+                icon: WindowControlIcon::Close,
                 hovered: hovered == Some(HoveredControl::Close),
                 hover_tone: HoveredControl::Close,
                 palette,
@@ -801,7 +811,7 @@ fn WindowControls(
 
 #[component]
 fn WindowControl(
-    glyph: &'static str,
+    icon: WindowControlIcon,
     hovered: bool,
     hover_tone: HoveredControl,
     palette: Palette,
@@ -835,8 +845,88 @@ fn WindowControl(
             onmouseenter: move |_| on_hover_control.call(Some(hover_tone)),
             onmouseleave: move |_| on_hover_control.call(None),
             onclick: move |evt| on_press.call(evt),
-            "{glyph}"
+            WindowControlGlyph { icon: icon }
         }
+    }
+}
+
+#[component]
+fn WindowControlGlyph(icon: WindowControlIcon) -> Element {
+    match icon {
+        WindowControlIcon::Minimize => rsx! {
+            svg {
+                width: "10",
+                height: "10",
+                view_box: "0 0 10 10",
+                fill: "none",
+                xmlns: "http://www.w3.org/2000/svg",
+                path {
+                    d: "M2 5.5H8",
+                    stroke: "currentColor",
+                    stroke_width: "1.1",
+                    stroke_linecap: "round",
+                }
+            }
+        },
+        WindowControlIcon::Maximize => rsx! {
+            svg {
+                width: "10",
+                height: "10",
+                view_box: "0 0 10 10",
+                fill: "none",
+                xmlns: "http://www.w3.org/2000/svg",
+                rect {
+                    x: "2.1",
+                    y: "2.1",
+                    width: "5.8",
+                    height: "5.8",
+                    stroke: "currentColor",
+                    stroke_width: "1.1",
+                }
+            }
+        },
+        WindowControlIcon::Restore => rsx! {
+            svg {
+                width: "10",
+                height: "10",
+                view_box: "0 0 10 10",
+                fill: "none",
+                xmlns: "http://www.w3.org/2000/svg",
+                path {
+                    d: "M3.2 2.1H7.7V6.6",
+                    stroke: "currentColor",
+                    stroke_width: "1.1",
+                    stroke_linejoin: "round",
+                }
+                path {
+                    d: "M2.3 3.4H6.8V7.9H2.3V3.4Z",
+                    stroke: "currentColor",
+                    stroke_width: "1.1",
+                    stroke_linejoin: "round",
+                }
+            }
+        },
+        WindowControlIcon::Close => rsx! {
+            svg {
+                width: "10",
+                height: "10",
+                view_box: "0 0 10 10",
+                fill: "none",
+                xmlns: "http://www.w3.org/2000/svg",
+                path {
+                    d: "M2.6 2.6L7.4 7.4",
+                    stroke: "currentColor",
+                    stroke_width: "1.1",
+                    stroke_linecap: "round",
+                }
+                path {
+                    d: "M7.4 2.6L2.6 7.4",
+                    stroke: "currentColor",
+                    stroke_width: "1.1",
+                    stroke_linecap: "round",
+                }
+            }
+        },
     }
 }
 
