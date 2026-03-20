@@ -265,17 +265,28 @@ impl ShellState {
     }
 
     fn snapshot(&self) -> RenderSnapshot {
+        let live_sessions = self.server.live_sessions();
+        let rows = merged_sidebar_rows(self.browser.rows(), &live_sessions);
+        let selected_path = if let Some(active) = self.server.active_session() {
+            if active.source == yggterm_server::SessionSource::LiveSsh {
+                Some(active.session_path.clone())
+            } else {
+                self.browser.selected_path().map(ToOwned::to_owned)
+            }
+        } else {
+            self.browser.selected_path().map(ToOwned::to_owned)
+        };
         RenderSnapshot {
             palette: palette(self.bootstrap.theme),
             search_query: self.search_query.clone(),
             sidebar_open: self.sidebar_open,
             right_panel_mode: self.right_panel_mode,
-            rows: self.browser.rows().to_vec(),
-            selected_path: self.browser.selected_path().map(ToOwned::to_owned),
+            rows,
+            selected_path,
             active_session: self.server.active_session().cloned(),
             active_view_mode: self.server.active_view_mode(),
             ssh_targets: self.server.ssh_targets().to_vec(),
-            live_sessions: self.server.live_sessions(),
+            live_sessions,
             total_leaf_sessions: self.browser.total_sessions(),
             last_action: self.last_action.clone(),
             ghostty_embedded_surface_supported: self.bootstrap.ghostty_embedded_surface_supported,
@@ -889,6 +900,63 @@ fn agent_profile_kind(profile: AgentSessionProfile) -> SessionKind {
     }
 }
 
+fn is_live_sidebar_row(row: &BrowserRow) -> bool {
+    row.full_path.starts_with("ssh://")
+        || row.full_path.starts_with("local://")
+        || row.full_path.starts_with("codex://")
+        || row.full_path.starts_with("codex-litellm://")
+}
+
+fn merged_sidebar_rows(
+    stored_rows: &[BrowserRow],
+    live_sessions: &[ManagedSessionView],
+) -> Vec<BrowserRow> {
+    if live_sessions.is_empty() {
+        return stored_rows.to_vec();
+    }
+
+    let mut rows = Vec::with_capacity(stored_rows.len() + live_sessions.len() + 1);
+    rows.push(BrowserRow {
+        kind: BrowserRowKind::Group,
+        full_path: "__live_sessions__".to_string(),
+        label: "live".to_string(),
+        detail_label: String::new(),
+        session_title: None,
+        depth: 0,
+        host_label: String::new(),
+        descendant_sessions: live_sessions.len(),
+        expanded: true,
+        session_id: None,
+        session_cwd: None,
+    });
+    for session in live_sessions {
+        let label = if session.title.trim().is_empty() {
+            session.id.clone()
+        } else {
+            session.title.clone()
+        };
+        rows.push(BrowserRow {
+            kind: BrowserRowKind::Session,
+            full_path: session.session_path.clone(),
+            label,
+            detail_label: session.status_line.clone(),
+            session_title: Some(session.title.clone()),
+            depth: 1,
+            host_label: "live".to_string(),
+            descendant_sessions: 1,
+            expanded: true,
+            session_id: Some(session.id.clone()),
+            session_cwd: session
+                .metadata
+                .iter()
+                .find(|entry| entry.label == "Cwd")
+                .map(|entry| entry.value.clone()),
+        });
+    }
+    rows.extend_from_slice(stored_rows);
+    rows
+}
+
 fn queue_session_note_creation(mut state: Signal<ShellState>, row: BrowserRow) {
     if row.kind != BrowserRowKind::Session {
         return;
@@ -958,6 +1026,136 @@ fn queue_session_note_creation(mut state: Signal<ShellState>, row: BrowserRow) {
     });
 }
 
+fn queue_new_document(mut state: Signal<ShellState>) {
+    state.with_mut(|shell| {
+        shell.server_busy = true;
+        shell.last_action = "creating document".to_string();
+    });
+
+    let selected_row = state.read().browser.selected_row().cloned();
+    let active_session = state.read().server.active_session().cloned();
+    let settings = state.read().settings.clone();
+
+    spawn(async move {
+        let outcome = task::spawn_blocking(move || -> Result<(yggterm_core::WorkspaceDocument, yggterm_core::SessionNode)> {
+            let store = SessionStore::open_or_init()?;
+            let virtual_path = new_document_virtual_path(selected_row.as_ref(), active_session.as_ref());
+            let document = store.save_document(
+                &virtual_path,
+                Some("Untitled note"),
+                "# Untitled note\n\nStart writing here.\n",
+            )?;
+            let browser_tree = store.load_codex_tree(&settings)?;
+            Ok((document, browser_tree))
+        })
+        .await;
+
+        state.with_mut(|shell| match outcome {
+            Ok(Ok((document, browser_tree))) => {
+                let expanded_paths = shell.browser.expanded_paths();
+                shell.browser = SessionBrowserState::new(browser_tree);
+                shell.browser.restore_ui_state(&expanded_paths, Some(&document.virtual_path));
+                shell.browser.select_path(document.virtual_path.clone());
+                shell.sync_browser_settings();
+                shell.apply_daemon_snapshot_result(open_stored_session(
+                    &shell.bootstrap.server_endpoint,
+                    SessionKind::Document,
+                    &document.virtual_path,
+                    Some(&document.id),
+                    Some(&document.virtual_path),
+                    Some(&document.title),
+                ));
+                shell.last_action = format!("created {}", document.title);
+                shell.push_notification(
+                    NotificationTone::Success,
+                    "Document Created",
+                    format!("Opened {}.", document.title),
+                );
+            }
+            Ok(Err(error)) => {
+                shell.server_busy = false;
+                shell.last_action = format!("document creation failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "Document Creation Failed",
+                    error.to_string(),
+                );
+            }
+            Err(error) => {
+                shell.server_busy = false;
+                shell.last_action = format!("document task failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "Document Task Failed",
+                    error.to_string(),
+                );
+            }
+        });
+    });
+}
+
+fn queue_document_save(mut state: Signal<ShellState>, virtual_path: String, title: String, body: String) {
+    state.with_mut(|shell| {
+        shell.server_busy = true;
+        shell.last_action = format!("saving {}", title);
+    });
+
+    let settings = state.read().settings.clone();
+    spawn(async move {
+        let outcome = task::spawn_blocking(move || -> Result<(yggterm_core::WorkspaceDocument, yggterm_core::SessionNode)> {
+            let store = SessionStore::open_or_init()?;
+            let document = store.save_document(&virtual_path, Some(&title), &body)?;
+            let browser_tree = store.load_codex_tree(&settings)?;
+            Ok((document, browser_tree))
+        })
+        .await;
+
+        state.with_mut(|shell| match outcome {
+            Ok(Ok((document, browser_tree))) => {
+                let expanded_paths = shell.browser.expanded_paths();
+                let filter_query = shell.search_query.clone();
+                shell.browser = SessionBrowserState::new(browser_tree);
+                shell.browser.restore_ui_state(&expanded_paths, Some(&document.virtual_path));
+                shell.browser.set_filter_query(filter_query);
+                shell.browser.select_path(document.virtual_path.clone());
+                shell.sync_browser_settings();
+                shell.apply_daemon_snapshot_result(open_stored_session(
+                    &shell.bootstrap.server_endpoint,
+                    SessionKind::Document,
+                    &document.virtual_path,
+                    Some(&document.id),
+                    Some(&document.virtual_path),
+                    Some(&document.title),
+                ));
+                shell.last_action = format!("saved {}", document.title);
+                shell.push_notification(
+                    NotificationTone::Success,
+                    "Document Saved",
+                    format!("Updated {}.", document.title),
+                );
+            }
+            Ok(Err(error)) => {
+                shell.server_busy = false;
+                shell.last_action = format!("document save failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "Document Save Failed",
+                    error.to_string(),
+                );
+            }
+            Err(error) => {
+                shell.server_busy = false;
+                shell.last_action = format!("document task failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "Document Task Failed",
+                    error.to_string(),
+                );
+            }
+        });
+    });
+}
+
 fn session_note_virtual_path(row: &BrowserRow) -> String {
     let base = row
         .session_cwd
@@ -988,6 +1186,48 @@ fn session_note_template(row: &BrowserRow) -> String {
         title = row.label,
         location = location,
     )
+}
+
+fn new_document_virtual_path(selected_row: Option<&BrowserRow>, active_session: Option<&ManagedSessionView>) -> String {
+    let base = selected_row
+        .and_then(document_parent_base)
+        .or_else(|| active_session.and_then(active_session_document_base))
+        .unwrap_or_else(|| "/documents".to_string());
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    format!("{}/notes/untitled-{}", base.trim_end_matches('/'), stamp)
+}
+
+fn document_parent_base(row: &BrowserRow) -> Option<String> {
+    match row.kind {
+        BrowserRowKind::Session => row.session_cwd.clone(),
+        BrowserRowKind::Document => parent_virtual_path(&row.full_path),
+        BrowserRowKind::Group => Some(row.full_path.clone()),
+    }
+}
+
+fn active_session_document_base(session: &ManagedSessionView) -> Option<String> {
+    if session.kind == SessionKind::Document {
+        parent_virtual_path(&session.session_path)
+    } else {
+        session
+            .metadata
+            .iter()
+            .find(|entry| entry.label == "Cwd")
+            .map(|entry| entry.value.clone())
+    }
+}
+
+fn parent_virtual_path(path: &str) -> Option<String> {
+    let normalized = path.trim_end_matches('/');
+    let parent = normalized.rsplit_once('/')?.0;
+    if parent.is_empty() {
+        Some("/documents".to_string())
+    } else {
+        Some(parent.to_string())
+    }
 }
 
 #[derive(Clone)]
@@ -1333,6 +1573,14 @@ fn app() -> Element {
                     Sidebar {
                         snapshot: sidebar_snapshot,
                         on_select_row: move |row: BrowserRow| {
+                            if is_live_sidebar_row(&row) {
+                                spawn_server_snapshot_action(
+                                    state,
+                                    format!("focusing {}", row.label),
+                                    move |endpoint| focus_live(&endpoint, &row.full_path),
+                                );
+                                return;
+                            }
                             let should_generate = row.kind == BrowserRowKind::Session && row.session_title.is_none();
                             match row.kind {
                                 BrowserRowKind::Group => state.with_mut(|shell| shell.select_row(&row)),
@@ -1368,6 +1616,9 @@ fn app() -> Element {
                             )
                         },
                         on_set_preview_layout: move |mode: PreviewLayoutMode| state.with_mut(|shell| shell.set_preview_layout(mode)),
+                        on_save_document: move |(path, title, body): (String, String, String)| {
+                            queue_document_save(state, path, title, body)
+                        },
                     }
                     RightRail {
                         snapshot: metadata_snapshot,
@@ -1377,6 +1628,7 @@ fn app() -> Element {
                         on_set_agent_profile: move |profile: AgentSessionProfile| {
                             state.with_mut(|shell| shell.update_default_agent_profile(profile))
                         },
+                        on_create_document: move |_| queue_new_document(state),
                         on_generate_titles: move |_| state.with_mut(|shell| shell.generate_session_titles()),
                         on_adjust_ui_zoom: move |delta: i32| state.with_mut(|shell| shell.adjust_ui_zoom(delta)),
                         on_adjust_main_zoom: move |delta: i32| state.with_mut(|shell| shell.adjust_main_zoom(delta)),
@@ -2119,44 +2371,59 @@ fn MainSurface(
     on_collapse_preview: EventHandler<()>,
     on_toggle_preview_block: EventHandler<usize>,
     on_set_preview_layout: EventHandler<PreviewLayoutMode>,
+    on_save_document: EventHandler<(String, String, String)>,
 ) -> Element {
     let body = if let Some(session) = snapshot.active_session.clone() {
         match snapshot.active_view_mode {
-            WorkspaceViewMode::Rendered => rsx! {
-                div {
-                    style: "display:flex; flex-direction:column; gap:18px; min-width:0; width:min(980px, 100%); margin:0 auto;",
-                    div {
-                        style: "display:flex; align-items:flex-start; justify-content:space-between; gap:16px; flex-wrap:wrap;",
-                        PreviewSummary { session: session.clone(), palette: snapshot.palette }
-                        PreviewToolbar {
+            WorkspaceViewMode::Rendered => {
+                if session.kind == SessionKind::Document {
+                    rsx! {
+                        DocumentEditor {
+                            key: "{session.session_path}",
+                            session: session.clone(),
                             palette: snapshot.palette,
-                            preview_layout: snapshot.preview_layout,
                             server_busy: snapshot.server_busy,
-                            on_expand_preview: move |_| on_expand_preview.call(()),
-                            on_collapse_preview: move |_| on_collapse_preview.call(()),
-                            on_set_preview_layout: move |mode| on_set_preview_layout.call(mode),
+                            on_save: on_save_document,
                         }
                     }
-                    if snapshot.preview_layout == PreviewLayoutMode::Chat {
+                } else {
+                    rsx! {
                         div {
-                            style: "display:flex; flex-direction:column; gap:18px;",
-                            for (ix, block) in session.preview.blocks.iter().cloned().enumerate() {
-                                PreviewBlock {
-                                    block_ix: ix,
-                                    block: block.clone(),
+                            style: "display:flex; flex-direction:column; gap:18px; min-width:0; width:min(980px, 100%); margin:0 auto;",
+                            div {
+                                style: "display:flex; align-items:flex-start; justify-content:space-between; gap:16px; flex-wrap:wrap;",
+                                PreviewSummary { session: session.clone(), palette: snapshot.palette }
+                                PreviewToolbar {
                                     palette: snapshot.palette,
-                                    on_toggle: move |_| on_toggle_preview_block.call(ix),
+                                    preview_layout: snapshot.preview_layout,
+                                    server_busy: snapshot.server_busy,
+                                    on_expand_preview: move |_| on_expand_preview.call(()),
+                                    on_collapse_preview: move |_| on_collapse_preview.call(()),
+                                    on_set_preview_layout: move |mode| on_set_preview_layout.call(mode),
+                                }
+                            }
+                            if snapshot.preview_layout == PreviewLayoutMode::Chat {
+                                div {
+                                    style: "display:flex; flex-direction:column; gap:18px;",
+                                    for (ix, block) in session.preview.blocks.iter().cloned().enumerate() {
+                                        PreviewBlock {
+                                            block_ix: ix,
+                                            block: block.clone(),
+                                            palette: snapshot.palette,
+                                            on_toggle: move |_| on_toggle_preview_block.call(ix),
+                                        }
+                                    }
+                                }
+                            } else {
+                                PreviewGraph {
+                                    session: session.clone(),
+                                    palette: snapshot.palette,
                                 }
                             }
                         }
-                    } else {
-                        PreviewGraph {
-                            session: session.clone(),
-                            palette: snapshot.palette,
-                        }
                     }
                 }
-            },
+            }
             WorkspaceViewMode::Terminal => rsx! {
                 div {
                     style: "display:flex; flex-direction:column; min-width:0; min-height:0; width:100%; height:100%;",
@@ -2259,6 +2526,73 @@ fn PreviewToolbar(
                     onclick: move |evt| on_collapse_preview.call(evt),
                     "Collapse All"
                 }
+            }
+        }
+    }
+}
+
+#[component]
+fn DocumentEditor(
+    session: ManagedSessionView,
+    palette: Palette,
+    server_busy: bool,
+    on_save: EventHandler<(String, String, String)>,
+) -> Element {
+    let mut title = use_signal(|| session.title.clone());
+    let initial_body = session
+        .rendered_sections
+        .first()
+        .map(|section| section.lines.join("\n"))
+        .or_else(|| {
+            session
+                .preview
+                .blocks
+                .first()
+                .map(|block| block.lines.join("\n"))
+        })
+        .unwrap_or_default();
+    let mut body = use_signal(|| initial_body);
+    let storage_path = session.session_path.clone();
+
+    rsx! {
+        div {
+            style: "display:flex; flex-direction:column; gap:18px; min-width:0; width:min(980px, 100%); height:100%; margin:0 auto;",
+            div {
+                style: "display:flex; align-items:center; justify-content:space-between; gap:14px; flex-wrap:wrap;",
+                div {
+                    style: "display:flex; flex-direction:column; gap:6px; min-width:0;",
+                    input {
+                        r#type: "text",
+                        value: "{title}",
+                        placeholder: "Document title",
+                        style: format!(
+                            "height:40px; min-width:min(440px, 100%); padding:0 14px; border:none; border-radius:10px; \
+                             background:rgba(255,255,255,0.76); color:{}; font-size:18px; font-weight:700; outline:none; \
+                             box-shadow: inset 0 0 0 1px rgba(170,190,212,0.18);",
+                            palette.text
+                        ),
+                        oninput: move |evt| title.set(evt.value()),
+                    }
+                    div {
+                        style: format!("font-size:11px; color:{};", palette.muted),
+                        "{storage_path}"
+                    }
+                }
+                button {
+                    style: chip_style(palette, server_busy),
+                    onclick: move |_| on_save.call((storage_path.clone(), title(), body())),
+                    "Save"
+                }
+            }
+            textarea {
+                value: "{body}",
+                style: format!(
+                    "flex:1; min-height:560px; width:100%; resize:none; padding:18px 20px; border:none; border-radius:14px; \
+                     background:rgba(255,255,255,0.72); color:{}; outline:none; font-size:14px; line-height:1.7; \
+                     box-shadow: inset 0 0 0 1px rgba(170,190,212,0.16); font-family:{};",
+                    palette.text, interface_font_family()
+                ),
+                oninput: move |evt| body.set(evt.value()),
             }
         }
     }
@@ -2757,6 +3091,7 @@ fn RightRail(
     on_api_key_change: EventHandler<String>,
     on_model_change: EventHandler<String>,
     on_set_agent_profile: EventHandler<AgentSessionProfile>,
+    on_create_document: EventHandler<MouseEvent>,
     on_generate_titles: EventHandler<MouseEvent>,
     on_adjust_ui_zoom: EventHandler<i32>,
     on_adjust_main_zoom: EventHandler<i32>,
@@ -2791,6 +3126,7 @@ fn RightRail(
                     on_api_key_change,
                     on_model_change,
                     on_set_agent_profile,
+                    on_create_document,
                     on_generate_titles,
                     on_adjust_ui_zoom,
                     on_adjust_main_zoom,
@@ -2861,6 +3197,7 @@ fn SettingsRailBody(
     on_api_key_change: EventHandler<String>,
     on_model_change: EventHandler<String>,
     on_set_agent_profile: EventHandler<AgentSessionProfile>,
+    on_create_document: EventHandler<MouseEvent>,
     on_generate_titles: EventHandler<MouseEvent>,
     on_adjust_ui_zoom: EventHandler<i32>,
     on_adjust_main_zoom: EventHandler<i32>,
@@ -2906,6 +3243,15 @@ fn SettingsRailBody(
                 palette: snapshot.palette,
                 selected: snapshot.settings.default_agent_profile,
                 on_select: on_set_agent_profile,
+            }
+            button {
+                style: format!(
+                    "height:32px; border:none; border-radius:10px; background:{}; color:{}; \
+                     font-size:11px; font-weight:700; text-align:center;",
+                    snapshot.palette.panel_alt, snapshot.palette.text
+                ),
+                onclick: move |evt| on_create_document.call(evt),
+                "New Document"
             }
             ZoomSettingRow {
                 label: "Interface Zoom".to_string(),
