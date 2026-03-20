@@ -137,7 +137,9 @@ pub fn sync_docked_ghostty_window(
         resolve_x11_window(pid, token)?
     };
 
-    run_xdotool(["windowmap", &window_id])?;
+    let parent_window = resolve_current_app_window()?;
+    run_xdotool(["windowreparent", &window_id, &parent_window])?;
+    unmap_sibling_windows(pid, &window_id)?;
     run_xdotool([
         "windowsize",
         "--sync",
@@ -152,17 +154,19 @@ pub fn sync_docked_ghostty_window(
         &rect.x.to_string(),
         &rect.y.to_string(),
     ])?;
+    run_xdotool(["windowmap", &window_id])?;
     focus_docked_ghostty_window(&window_id)?;
 
     Ok(DockedGhosttyWindow { window_id })
 }
 
-pub fn hide_docked_ghostty_window(window_id: &str) -> Result<()> {
+pub fn hide_docked_ghostty_window(pid: Option<u32>, window_id: &str) -> Result<()> {
     let status = controlled_ghostty_status();
     if !status.available {
         bail!(status.detail);
     }
-    run_xdotool(["windowunmap", window_id])
+    run_xdotool(["windowunmap", window_id])?;
+    unmap_sibling_windows(pid, window_id)
 }
 
 pub fn focus_docked_ghostty_window(window_id: &str) -> Result<()> {
@@ -171,16 +175,17 @@ pub fn focus_docked_ghostty_window(window_id: &str) -> Result<()> {
         bail!(status.detail);
     }
     run_xdotool(["windowraise", window_id])?;
-    run_xdotool(["windowactivate", "--sync", window_id])
+    if run_xdotool(["windowactivate", "--sync", window_id]).is_ok() {
+        return Ok(());
+    }
+    run_xdotool(["windowfocus", window_id])
+}
+
+fn resolve_current_app_window() -> Result<String> {
+    xdotool_search(["search", "--onlyvisible", "--pid", &std::process::id().to_string()])
 }
 
 fn resolve_x11_window(pid: Option<u32>, token: Option<&str>) -> Result<String> {
-    if let Some(pid) = pid {
-        if let Ok(window_id) = xdotool_search(["search", "--pid", &pid.to_string()]) {
-            return Ok(window_id);
-        }
-    }
-
     if let Some(token) = token.filter(|value| !value.trim().is_empty()) {
         if let Ok(window_id) = xdotool_search(["search", "--class", token]) {
             return Ok(window_id);
@@ -190,7 +195,60 @@ fn resolve_x11_window(pid: Option<u32>, token: Option<&str>) -> Result<String> {
         }
     }
 
+    if let Some(pid) = pid {
+        if let Ok(window_id) = xdotool_search(["search", "--pid", &pid.to_string()]) {
+            return Ok(window_id);
+        }
+    }
+
     bail!("ghostty window not found yet")
+}
+
+fn resolve_x11_windows_for_pid(pid: u32) -> Result<Vec<String>> {
+    let output = Command::new("xdotool")
+        .args(["search", "--pid", &pid.to_string()])
+        .output()
+        .context("failed to run xdotool search")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!(if stderr.is_empty() {
+            "xdotool search returned no window".to_string()
+        } else {
+            stderr
+        });
+    }
+
+    let windows = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .collect::<Vec<_>>();
+    if windows.is_empty() {
+        bail!("xdotool search returned no window id");
+    }
+    Ok(windows)
+}
+
+fn unmap_sibling_windows(pid: Option<u32>, keep_window_id: &str) -> Result<()> {
+    let Some(pid) = pid else {
+        return Ok(());
+    };
+    let Ok(window_ids) = resolve_x11_windows_for_pid(pid) else {
+        return Ok(());
+    };
+    for window_id in window_ids {
+        if window_id != keep_window_id {
+            let _ = run_xdotool(["windowunmap", &window_id]);
+        }
+    }
+    Ok(())
 }
 
 fn xdotool_search<const N: usize>(args: [&str; N]) -> Result<String> {

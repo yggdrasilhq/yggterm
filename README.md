@@ -88,7 +88,7 @@ Build Ghostty runtime artifacts:
 
 Current upstream constraint:
 
-- On Linux, `libghostty` links and Yggterm now launches an undecorated controlled Ghostty host window that docks into the terminal viewport under X11. This is a managed docking adapter, not a true upstream embedded surface API, so it remains a bridge strategy until Ghostty exposes a real Linux embeddable host.
+- On Linux, `libghostty` links and Yggterm now launches an undecorated controlled Ghostty host window that is reparented into the terminal viewport under X11. This is an X11 child-host bridge, not a true upstream embedded surface API, so it remains a stopgap until Ghostty exposes a real Linux embeddable host.
 - On macOS, the same host adapter interface now reserves an explicit embedded-surface identity through `yggterm-ghostty-bridge`, so the daemon, UI, and future native host can converge on one launch contract across platforms.
 - Windows packaging is currently disabled until the terminal host path is properly resolved there.
 - `crates/yggterm-gtk-glue` is the reserved Linux bypass layer for a GTK-hosted Ghostty path while upstream embedding remains unavailable there.
