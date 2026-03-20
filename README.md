@@ -1,13 +1,14 @@
 # yggterm
 
-Yggdrasil Terminal (`yggterm`) is a Rust-first terminal workspace that aims to combine Ghostty terminal semantics with a Dioxus desktop shell shaped like Zed.
+Yggdrasil Terminal (`yggterm`) is a Rust-first terminal workspace that combines a Dioxus desktop shell shaped like Zed with a server-owned PTY runtime and an embedded xterm.js terminal surface.
 
 The product target is not "an editor with terminals". It is a remote-first terminal application with a strong sidebar, persistent session metadata, and room for many long-lived shells across different machines.
 
 ## Product direction
 
 - Dioxus desktop is the active app shell and Zed remains the primary visual and structural reference.
-- Ghostty is the terminal engine contract.
+- xterm.js is the active embedded terminal surface.
+- Yggterm's daemon owns PTYs, restore state, and session attachment.
 - The left sidebar is a vertical tree of virtual folders and sessions.
 - Sidebar nodes represent session metadata, not a direct mirror of the local filesystem.
 - Session entries may point at Codex workflows, SSH targets, local shells, and other terminal contexts.
@@ -19,7 +20,7 @@ The product target is not "an editor with terminals". It is a remote-first termi
 This repository is still scaffolding.
 
 - Rust workspace structure is in place.
-- Ghostty bridge packaging and runtime probing exist.
+- xterm.js is embedded directly inside the main viewport for terminal mode.
 - A Dioxus desktop shell exists for fast iteration on layout and interaction.
 - The current shell lives in `crates/yggterm-ui` and is the active product surface.
 - Session orchestration now has a dedicated crate boundary in `crates/yggterm-server`.
@@ -28,7 +29,7 @@ This repository is still scaffolding.
 - `yggterm` now opens the Dioxus shell directly.
 - The old CLI subcommands and the `eframe` scaffold path have been removed.
 - The shell chrome is now owned locally in `yggterm-ui`, while the adjacent Zed checkout remains the visual reference stack.
-- Mock sidebars, preview panes, and docks are acceptable only as placeholders while Ghostty embedding and the server runtime are still pending.
+- Ghostty bridge code still exists as optional legacy integration work, but it is no longer the active terminal path.
 
 When working in this repo, optimize for getting the application closer to "Zed chrome + Ghostty sessions + virtual session tree", not for deepening temporary scaffolding choices.
 
@@ -42,13 +43,13 @@ Yggterm should inherit the parts of Zed that already work well for a dense works
 - focus routing and panel behavior
 - theme behavior
 
-The key change is that the center of the app is Ghostty sessions and session groups instead of editors and projects.
+The key change is that the center of the app is terminal sessions and session groups instead of editors and projects.
 
 ## Session model
 
 `YGGTERM_HOME` defaults to `~/.yggterm`.
 
-Today, the scaffold persists session state under `~/.yggterm/sessions`, but that storage layout is only a stepping stone. The long-term model is metadata-first: the sidebar tree should be able to describe terminal sessions that map to SSH hosts, Codex workspaces, Ghostty sessions, restore groups, and other non-file concepts.
+Today, the scaffold persists session state under `~/.yggterm/sessions`, but that storage layout is only a stepping stone. The long-term model is metadata-first: the sidebar tree should be able to describe terminal sessions that map to SSH hosts, Codex workspaces, restore groups, and other non-file concepts.
 
 References to keep in mind while iterating:
 
@@ -71,27 +72,14 @@ Requirements:
 - Rust stable
 - Rust `1.94.0` is the current pinned toolchain for the local desktop dependency stack.
 - Zig stable
-- adjacent checkout of `../ghostty` for local Ghostty integration work
+- no Ghostty checkout is required for the active embedded terminal path
 - optional local checkout of `../zed` as a design/reference repo while refining shell shape
 
-Install Zig:
+Current runtime model:
 
-```bash
-./scripts/setup-zig.sh
-```
-
-Build Ghostty runtime artifacts:
-
-```bash
-./scripts/build-ghostty-lib.sh
-```
-
-Current upstream constraint:
-
-- On Linux, `libghostty` links and Yggterm now launches an undecorated controlled Ghostty host window that is reparented into the terminal viewport under X11. This is an X11 child-host bridge, not a true upstream embedded surface API, so it remains a stopgap until Ghostty exposes a real Linux embeddable host.
-- On macOS, the same host adapter interface now reserves an explicit embedded-surface identity through `yggterm-ghostty-bridge`, so the daemon, UI, and future native host can converge on one launch contract across platforms.
-- Windows packaging is currently disabled until the terminal host path is properly resolved there.
-- `crates/yggterm-gtk-glue` is the reserved Linux bypass layer for a GTK-hosted Ghostty path while upstream embedding remains unavailable there.
+- The active terminal path is `yggterm-server` PTYs plus an embedded xterm.js surface inside the Dioxus viewport.
+- Preview mode stays rendered in-process.
+- Ghostty crates remain in the repo only as optional legacy integration work and are no longer required for the default app build.
 
 Build the workspace:
 
@@ -141,6 +129,7 @@ Cross-platform release assets are produced by GitHub Actions on tag pushes:
 - `macos-x86_64`
 - `macos-aarch64`
 - `windows-x86_64`
+- `windows-x86_64`
 
 Build only the Debian package:
 
@@ -174,10 +163,10 @@ Only the filename is entered on npmjs.com, not the full path.
 
 - `apps/yggterm`: CLI entrypoint and desktop launcher
 - `crates/yggterm-core`: session model and settings persistence
-- `crates/yggterm-server`: session orchestration, live SSH launch model, daemon/IPC state, and runtime host detection
+- `crates/yggterm-server`: session orchestration, daemon/IPC state, PTY runtime, and terminal attachment
 - `crates/yggterm-ui`: Dioxus desktop shell, titlebar, statusbar, and view rendering
 - `crates/yggterm-platform`: platform detection
-- `crates/yggterm-ghostty-bridge`: Ghostty runtime bridge
+- `crates/yggterm-ghostty-bridge`: optional legacy Ghostty runtime bridge
 - `scripts/`: packaging, installer, and toolchain helpers
 - `debian/`: Debian package metadata
 
