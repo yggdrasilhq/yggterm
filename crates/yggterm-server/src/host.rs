@@ -1,11 +1,22 @@
 use std::process::{Command, Stdio};
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum GhosttyTerminalHostMode {
+    EmbeddedSurface,
+    ControlledDock,
+    ExternalWindow,
+    Unsupported,
+}
+
 #[derive(Debug, Clone)]
 pub struct GhosttyLaunchOutcome {
     pub process_id: Option<u32>,
     pub embedded_surface_reserved: bool,
     pub host_token: Option<String>,
+    pub host_mode: GhosttyTerminalHostMode,
+    pub embedded_surface_id: Option<String>,
+    pub embedded_surface_detail: Option<String>,
     pub lines: Vec<String>,
 }
 
@@ -62,16 +73,26 @@ impl GhosttyHostSupport {
 
     pub fn launch_terminal(&self, launch_command: &str) -> Result<GhosttyLaunchOutcome, String> {
         match self.kind {
-            GhosttyHostKind::MacosLibghostty => Ok(GhosttyLaunchOutcome {
-                process_id: None,
-                embedded_surface_reserved: true,
-                host_token: None,
-                lines: vec![
-                    format!("$ {}", launch_command),
-                    "libghostty embedded host reserved on macOS".to_string(),
-                    "The daemon will hand this session to the in-viewport macOS host path.".to_string(),
-                ],
-            }),
+            GhosttyHostKind::MacosLibghostty => {
+                let reservation = yggterm_ghostty_bridge::reserve_embedded_surface(None)
+                    .map_err(|error| error.to_string())?;
+                Ok(GhosttyLaunchOutcome {
+                    process_id: None,
+                    embedded_surface_reserved: true,
+                    host_token: None,
+                    host_mode: GhosttyTerminalHostMode::EmbeddedSurface,
+                    embedded_surface_id: Some(reservation.surface_id.clone()),
+                    embedded_surface_detail: Some(reservation.detail.clone()),
+                    lines: vec![
+                        format!("$ {}", launch_command),
+                        "libghostty embedded host reserved on macOS".to_string(),
+                        format!("embedded surface {}", reservation.surface_id),
+                        reservation.detail,
+                        "The daemon will hand this session to the in-viewport macOS host path."
+                            .to_string(),
+                    ],
+                })
+            }
             GhosttyHostKind::LinuxControlledDock => {
                 let token = format!("yggterm-{}", Uuid::new_v4().simple());
                 let launch = yggterm_platform::launch_controlled_ghostty(launch_command, &token)
@@ -80,6 +101,9 @@ impl GhosttyHostSupport {
                     process_id: Some(launch.process_id),
                     embedded_surface_reserved: false,
                     host_token: Some(token),
+                    host_mode: GhosttyTerminalHostMode::ControlledDock,
+                    embedded_surface_id: None,
+                    embedded_surface_detail: None,
                     lines: launch.lines,
                 })
             }
@@ -99,6 +123,9 @@ impl GhosttyHostSupport {
                     process_id: Some(child.id()),
                     embedded_surface_reserved: false,
                     host_token: None,
+                    host_mode: GhosttyTerminalHostMode::ExternalWindow,
+                    embedded_surface_id: None,
+                    embedded_surface_detail: None,
                     lines: vec![
                         format!("$ {}", launch_command),
                         format!("ghostty pid {}", child.id()),
@@ -107,6 +134,15 @@ impl GhosttyHostSupport {
                 })
             }
             GhosttyHostKind::Unsupported => Err(self.detail.clone()),
+        }
+    }
+
+    pub fn terminal_host_mode(&self) -> GhosttyTerminalHostMode {
+        match self.kind {
+            GhosttyHostKind::MacosLibghostty => GhosttyTerminalHostMode::EmbeddedSurface,
+            GhosttyHostKind::LinuxControlledDock => GhosttyTerminalHostMode::ControlledDock,
+            GhosttyHostKind::ExternalGhostty => GhosttyTerminalHostMode::ExternalWindow,
+            GhosttyHostKind::Unsupported => GhosttyTerminalHostMode::Unsupported,
         }
     }
 
