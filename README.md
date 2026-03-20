@@ -141,7 +141,7 @@ The npm launcher package lives under [`npm/`](./npm) and is published by GitHub 
 
 - [npm-publish.yml](/home/pi/gh/yggterm/.github/workflows/npm-publish.yml)
 
-That workflow publishes on GitHub release publication and is designed for npm trusted publishing rather than a long-lived `NPM_TOKEN`.
+That workflow publishes on version tag pushes and can also be run manually. It is designed for npm trusted publishing rather than a long-lived `NPM_TOKEN`.
 
 For npm trusted publisher setup on npmjs.com, use:
 
