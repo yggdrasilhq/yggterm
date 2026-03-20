@@ -6,3 +6,4 @@ authors.workspace = true
 license = "Apache-2.0"
 
 [dependencies]
+anyhow.workspace = true

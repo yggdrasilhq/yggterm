@@ -141,6 +141,7 @@ pub struct SnapshotSessionView {
     pub metadata: Vec<SnapshotMetadataEntry>,
     pub terminal_process_id: Option<u32>,
     pub terminal_window_id: Option<String>,
+    pub terminal_host_token: Option<String>,
     pub last_launch_error: Option<String>,
     pub last_window_error: Option<String>,
     pub ssh_target: Option<String>,
@@ -200,6 +201,7 @@ pub struct ManagedSessionView {
     pub metadata: Vec<SessionMetadataEntry>,
     pub terminal_process_id: Option<u32>,
     pub terminal_window_id: Option<String>,
+    pub terminal_host_token: Option<String>,
     pub last_launch_error: Option<String>,
     pub last_window_error: Option<String>,
     pub ssh_target: Option<String>,
@@ -529,6 +531,7 @@ impl YggtermServer {
                             session.backend = TerminalBackend::Ghostty;
                             session.terminal_process_id = outcome.process_id;
                             session.terminal_window_id = None;
+                            session.terminal_host_token = outcome.host_token;
                             session.last_launch_error = None;
                             session.last_window_error = None;
                             session.launch_phase = if outcome.embedded_surface_reserved {
@@ -585,6 +588,14 @@ impl YggtermServer {
                         .terminal_window_id
                         .clone()
                         .unwrap_or_else(|| "not resolved".to_string()),
+                );
+                upsert_session_metadata(
+                    &mut session.metadata,
+                    "Host Token",
+                    session
+                        .terminal_host_token
+                        .clone()
+                        .unwrap_or_else(|| "none".to_string()),
                 );
                 upsert_session_metadata(
                     &mut session.metadata,
@@ -771,6 +782,7 @@ fn snapshot_session_view(session: ManagedSessionView) -> SnapshotSessionView {
         metadata: snapshot_metadata_entries(&session.metadata),
         terminal_process_id: session.terminal_process_id,
         terminal_window_id: session.terminal_window_id,
+        terminal_host_token: session.terminal_host_token,
         last_launch_error: session.last_launch_error,
         last_window_error: session.last_window_error,
         ssh_target: session.ssh_target,
@@ -837,6 +849,7 @@ fn managed_session_from_snapshot(session: SnapshotSessionView) -> ManagedSession
             .collect(),
         terminal_process_id: session.terminal_process_id,
         terminal_window_id: session.terminal_window_id,
+        terminal_host_token: session.terminal_host_token,
         last_launch_error: session.last_launch_error,
         last_window_error: session.last_window_error,
         ssh_target: session.ssh_target,
@@ -1152,6 +1165,7 @@ fn build_session(
         metadata,
         terminal_process_id: None,
         terminal_window_id: None,
+        terminal_host_token: None,
         last_launch_error: None,
         last_window_error: None,
         ssh_target: None,
@@ -1302,6 +1316,7 @@ fn build_live_session(
         ],
         terminal_process_id: None,
         terminal_window_id: None,
+        terminal_host_token: None,
         last_launch_error: None,
         last_window_error: None,
         ssh_target: Some(target.ssh_target.clone()),

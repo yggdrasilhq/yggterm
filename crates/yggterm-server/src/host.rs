@@ -1,16 +1,18 @@
 use std::process::{Command, Stdio};
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct GhosttyLaunchOutcome {
     pub process_id: Option<u32>,
     pub embedded_surface_reserved: bool,
+    pub host_token: Option<String>,
     pub lines: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GhosttyHostKind {
     MacosLibghostty,
-    LinuxGtkGlue,
+    LinuxControlledDock,
     ExternalGhostty,
     Unsupported,
 }
@@ -27,7 +29,7 @@ impl GhosttyHostKind {
     pub fn as_str(self) -> &'static str {
         match self {
             GhosttyHostKind::MacosLibghostty => "macos-libghostty",
-            GhosttyHostKind::LinuxGtkGlue => "linux-gtk-glue",
+            GhosttyHostKind::LinuxControlledDock => "linux-controlled-dock",
             GhosttyHostKind::ExternalGhostty => "external-ghostty",
             GhosttyHostKind::Unsupported => "unsupported",
         }
@@ -43,7 +45,7 @@ impl GhosttyHostSupport {
         let kind = if cfg!(target_os = "macos") && embedded_surface_supported {
             GhosttyHostKind::MacosLibghostty
         } else if cfg!(target_os = "linux") {
-            GhosttyHostKind::LinuxGtkGlue
+            GhosttyHostKind::LinuxControlledDock
         } else if bridge_enabled {
             GhosttyHostKind::ExternalGhostty
         } else {
@@ -63,14 +65,27 @@ impl GhosttyHostSupport {
             GhosttyHostKind::MacosLibghostty => Ok(GhosttyLaunchOutcome {
                 process_id: None,
                 embedded_surface_reserved: true,
+                host_token: None,
                 lines: vec![
                     format!("$ {}", launch_command),
                     "libghostty embedded host reserved on macOS".to_string(),
                     "The daemon will hand this session to the in-viewport macOS host path.".to_string(),
                 ],
             }),
-            GhosttyHostKind::LinuxGtkGlue | GhosttyHostKind::ExternalGhostty => {
+            GhosttyHostKind::LinuxControlledDock => {
+                let token = format!("yggterm-{}", Uuid::new_v4().simple());
+                let launch = yggterm_platform::launch_controlled_ghostty(launch_command, &token)
+                    .map_err(|error| error.to_string())?;
+                Ok(GhosttyLaunchOutcome {
+                    process_id: Some(launch.process_id),
+                    embedded_surface_reserved: false,
+                    host_token: Some(token),
+                    lines: launch.lines,
+                })
+            }
+            GhosttyHostKind::ExternalGhostty => {
                 let child = Command::new("ghostty")
+                    .arg("--gtk-single-instance=false")
                     .arg("-e")
                     .arg("bash")
                     .arg("-lc")
@@ -83,15 +98,11 @@ impl GhosttyHostSupport {
                 Ok(GhosttyLaunchOutcome {
                     process_id: Some(child.id()),
                     embedded_surface_reserved: false,
+                    host_token: None,
                     lines: vec![
                         format!("$ {}", launch_command),
                         format!("ghostty pid {}", child.id()),
-                        match self.kind {
-                            GhosttyHostKind::LinuxGtkGlue => {
-                                "linux gtk host path launched an external Ghostty window".to_string()
-                            }
-                            _ => "external Ghostty host launched a terminal window".to_string(),
-                        },
+                        "external Ghostty host launched a terminal window".to_string(),
                     ],
                 })
             }
@@ -104,8 +115,8 @@ impl GhosttyHostSupport {
             GhosttyHostKind::MacosLibghostty => {
                 "macOS keeps the libghostty embedded host path as the primary integration target.".to_string()
             }
-            GhosttyHostKind::LinuxGtkGlue => {
-                "Linux uses the GTK host adapter today while upstream embedded Ghostty hosting remains macOS/iOS-first.".to_string()
+            GhosttyHostKind::LinuxControlledDock => {
+                "Linux uses a controlled X11 docking adapter today while upstream embedded Ghostty hosting remains macOS/iOS-first.".to_string()
             }
             GhosttyHostKind::ExternalGhostty => {
                 "This platform currently falls back to an external Ghostty process host.".to_string()
@@ -130,10 +141,17 @@ pub fn detect_ghostty_host() -> GhosttyHostSupport {
         }
     } else if cfg!(target_os = "linux")
         && gtk_glue == yggterm_gtk_glue::GtkGlueStatus::Available
+        && yggterm_platform::controlled_ghostty_status().available
     {
+        let platform = yggterm_platform::controlled_ghostty_status();
         GhosttyHostSupport {
-            kind: GhosttyHostKind::LinuxGtkGlue,
-            detail: format!("{} {}", bridge.detail, yggterm_gtk_glue::detail()),
+            kind: GhosttyHostKind::LinuxControlledDock,
+            detail: format!(
+                "{} {} {}",
+                bridge.detail,
+                yggterm_gtk_glue::detail(),
+                platform.detail
+            ),
             embedded_surface_supported: false,
             bridge_enabled,
         }

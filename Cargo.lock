@@ -5362,6 +5362,9 @@ version = "1.0.3"
 [[package]]
 name = "yggterm-platform"
 version = "1.0.3"
+dependencies = [
+ "anyhow",
+]
 
 [[package]]
 name = "yggterm-server"
@@ -5377,6 +5380,7 @@ dependencies = [
  "yggterm-core",
  "yggterm-ghostty-bridge",
  "yggterm-gtk-glue",
+ "yggterm-platform",
 ]
 
 [[package]]
@@ -5390,6 +5394,7 @@ dependencies = [
  "tokio",
  "tracing",
  "yggterm-core",
+ "yggterm-platform",
  "yggterm-server",
 ]
 
