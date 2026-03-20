@@ -1,11 +1,15 @@
 use anyhow::Result;
-use dioxus::desktop::{Config, LogicalSize, WindowBuilder, window};
+use dioxus::desktop::{
+    Config, LogicalSize, WindowBuilder, WindowEvent as DesktopWindowEvent, use_window,
+    use_wry_event_handler, window,
+};
 use dioxus::prelude::*;
 use once_cell::sync::OnceCell;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
+use tao::event::Event as TaoEvent;
 use tao::window::ResizeDirection;
 use tokio::task;
 use tracing::{info, warn};
@@ -13,10 +17,12 @@ use yggterm_core::{
     AppSettings, BrowserRow, BrowserRowKind, SessionBrowserState, SessionNode, SessionStore,
     UiTheme, save_settings_file,
 };
+use yggterm_platform::DockRect;
 use yggterm_server::{
     ManagedSessionView, PreviewTone, ServerEndpoint, ServerUiSnapshot, SessionMetadataEntry,
-    ServerRuntimeStatus, SessionPreviewBlock, SshConnectTarget, WorkspaceViewMode, YggtermServer, connect_ssh,
-    focus_live, open_stored_session, raise_external_window, request_terminal_launch,
+    ServerRuntimeStatus, SessionPreviewBlock, SshConnectTarget, TerminalBackend,
+    WorkspaceViewMode, YggtermServer, connect_ssh, focus_live, open_stored_session,
+    raise_external_window, request_terminal_launch,
     set_all_preview_blocks_folded, set_view_mode as daemon_set_view_mode, status,
     sync_external_window, snapshot as daemon_snapshot, ping,
     toggle_preview_block as daemon_toggle_preview_block,
@@ -62,6 +68,8 @@ struct ShellState {
     server_busy: bool,
     server_daemon_detail: String,
     needs_initial_server_sync: bool,
+    docked_window_id: Option<String>,
+    dock_sync_in_flight: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -206,6 +214,8 @@ impl ShellState {
             server_busy: needs_initial_server_sync,
             server_daemon_detail: String::new(),
             needs_initial_server_sync,
+            docked_window_id: None,
+            dock_sync_in_flight: false,
         };
         state.server_daemon_detail = state.bootstrap.server_daemon_detail.clone();
         state.sync_browser_settings();
@@ -796,6 +806,146 @@ fn spawn_open_session_row(mut state: Signal<ShellState>, row: BrowserRow) {
     );
 }
 
+#[derive(Clone)]
+struct GhosttyDockRequest {
+    pid: Option<u32>,
+    known_window_id: Option<String>,
+    host_token: Option<String>,
+    rect: DockRect,
+}
+
+fn spawn_dock_sync(mut state: Signal<ShellState>, request: GhosttyDockRequest) {
+    if state.read().dock_sync_in_flight {
+        return;
+    }
+
+    state.with_mut(|shell| shell.dock_sync_in_flight = true);
+    spawn(async move {
+        let outcome = task::spawn_blocking(move || {
+            yggterm_platform::sync_docked_ghostty_window(
+                request.pid,
+                request.known_window_id.as_deref(),
+                request.host_token.as_deref(),
+                request.rect,
+            )
+        })
+        .await;
+
+        state.with_mut(|shell| {
+            shell.dock_sync_in_flight = false;
+            match outcome {
+                Ok(Ok(window)) => {
+                    let first_dock =
+                        shell.docked_window_id.as_deref() != Some(window.window_id.as_str());
+                    shell.docked_window_id = Some(window.window_id.clone());
+                    if first_dock {
+                        shell.last_action = format!("ghostty docked {}", window.window_id);
+                    }
+                }
+                Ok(Err(error)) => {
+                    if !is_transient_dock_error(&error.to_string()) {
+                        shell.last_action = format!("ghostty dock failed: {error}");
+                    }
+                }
+                Err(error) => {
+                    shell.last_action = format!("ghostty dock task failed: {error}");
+                }
+            }
+        });
+    });
+}
+
+fn spawn_dock_hide(mut state: Signal<ShellState>, window_id: String) {
+    if state.read().dock_sync_in_flight {
+        return;
+    }
+
+    state.with_mut(|shell| shell.dock_sync_in_flight = true);
+    spawn(async move {
+        let outcome =
+            task::spawn_blocking(move || yggterm_platform::hide_docked_ghostty_window(&window_id))
+                .await;
+        state.with_mut(|shell| {
+            shell.dock_sync_in_flight = false;
+            shell.docked_window_id = None;
+            if let Ok(Err(error)) = outcome
+                && !is_transient_dock_error(&error.to_string())
+            {
+                shell.last_action = format!("ghostty hide failed: {error}");
+            }
+        });
+    });
+}
+
+fn is_transient_dock_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("not found yet")
+        || lower.contains("returned no window")
+        || lower.contains("no window id")
+        || lower.contains("not installed on path")
+}
+
+fn ghostty_dock_request(
+    desktop: &dioxus::desktop::DesktopContext,
+    snapshot: &RenderSnapshot,
+) -> Option<GhosttyDockRequest> {
+    if !cfg!(target_os = "linux") || snapshot.active_view_mode != WorkspaceViewMode::Terminal {
+        return None;
+    }
+
+    let session = snapshot.active_session.as_ref()?;
+    if session.backend != TerminalBackend::Ghostty {
+        return None;
+    }
+
+    let pid = session.terminal_process_id?;
+    let outer = desktop.outer_position().ok()?;
+    let inner = desktop.inner_size();
+    let scale = desktop.scale_factor();
+    let left_sidebar = if snapshot.sidebar_open {
+        SIDE_RAIL_WIDTH as f64
+    } else {
+        0.0
+    };
+    let right_sidebar = if snapshot.right_panel_mode != RightPanelMode::Hidden {
+        SIDE_RAIL_WIDTH as f64
+    } else {
+        0.0
+    };
+    let titlebar_height = 44.0;
+    let top_padding = 12.0;
+    let right_padding = 12.0;
+    let bottom_padding = 10.0;
+    let frame_inset = 1.0;
+
+    let x = outer.x + ((left_sidebar + frame_inset) * scale).round() as i32;
+    let y = outer.y + ((titlebar_height + top_padding + frame_inset) * scale).round() as i32;
+    let width = inner.width.saturating_sub(
+        ((left_sidebar + right_sidebar + right_padding + frame_inset * 2.0) * scale).round()
+            as u32,
+    );
+    let height = inner.height.saturating_sub(
+        ((titlebar_height + top_padding + bottom_padding + frame_inset * 2.0) * scale).round()
+            as u32,
+    );
+
+    if width < 240 || height < 180 {
+        return None;
+    }
+
+    Some(GhosttyDockRequest {
+        pid: Some(pid),
+        known_window_id: session.terminal_window_id.clone(),
+        host_token: session.terminal_host_token.clone(),
+        rect: DockRect {
+            x,
+            y,
+            width,
+            height,
+        },
+    })
+}
+
 pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
     let _ = BOOTSTRAP.set(bootstrap);
 
@@ -819,8 +969,23 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
 fn app() -> Element {
     let bootstrap = BOOTSTRAP.get().expect("shell bootstrap not initialized").clone();
     let mut state = use_signal(|| ShellState::new(bootstrap));
+    let desktop = use_window();
     let mut hovered = use_signal(|| None::<HoveredControl>);
     let mut startup_sync_started = use_signal(|| false);
+    let mut window_epoch = use_signal(|| 0_u64);
+    use_wry_event_handler(move |event, _| {
+        if let TaoEvent::WindowEvent { event, .. } = event {
+            match event {
+                DesktopWindowEvent::Moved(_)
+                | DesktopWindowEvent::Resized(_)
+                | DesktopWindowEvent::Focused(_)
+                | DesktopWindowEvent::ScaleFactorChanged { .. } => {
+                    window_epoch.with_mut(|epoch| *epoch += 1);
+                }
+                _ => {}
+            }
+        }
+    });
     use_effect(move || {
         let should_start = {
             let shell = state.read();
@@ -829,6 +994,15 @@ fn app() -> Element {
         if should_start {
             startup_sync_started.set(true);
             spawn_initial_server_sync(state);
+        }
+    });
+    use_effect(move || {
+        let _ = *window_epoch.read();
+        let snapshot = state.read().snapshot();
+        if let Some(request) = ghostty_dock_request(&desktop, &snapshot) {
+            spawn_dock_sync(state, request);
+        } else if let Some(window_id) = state.read().docked_window_id.clone() {
+            spawn_dock_hide(state, window_id);
         }
     });
     let snapshot = state.read().snapshot();
@@ -2059,7 +2233,7 @@ fn TerminalCanvas(session: ManagedSessionView, snapshot: RenderSnapshot) -> Elem
                     div {
                         style: format!("display:flex; flex-direction:column; gap:8px; font-size:13px; line-height:1.58; color:{};", snapshot.palette.text),
                         div { "{snapshot.ghostty_bridge_detail}" }
-                        div { "Terminal mode is server-owned now; Linux uses the GTK host adapter while macOS keeps the libghostty embedded-host path reserved." }
+                        div { "Terminal mode is server-owned now; Linux uses the controlled Ghostty dock adapter while macOS keeps the libghostty embedded-host path reserved." }
                     }
                 }
             }
