@@ -1,6 +1,6 @@
 {
   "name": "yggterm",
-  "version": "1.0.3",
+  "version": "2.0.0",
   "description": "Remote-first terminal workspace launcher for Yggdrasil Terminal",
   "license": "Apache-2.0",
   "repository": {
@@ -21,7 +21,7 @@
   "keywords": [
     "terminal",
     "ssh",
-    "ghostty",
+    "xterm.js",
     "dioxus",
     "workspace"
   ],

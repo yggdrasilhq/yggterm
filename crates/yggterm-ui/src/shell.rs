@@ -3,8 +3,10 @@ use dioxus::desktop::{
     Config, LogicalSize, WindowBuilder, WindowEvent as DesktopWindowEvent, use_window,
     use_wry_event_handler, window,
 };
+use dioxus::document;
 use dioxus::prelude::*;
 use once_cell::sync::OnceCell;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -12,6 +14,7 @@ use std::time::Duration;
 use tao::event::Event as TaoEvent;
 use tao::window::ResizeDirection;
 use tokio::task;
+use tokio::time::sleep;
 use tracing::{info, warn};
 use yggterm_core::{
     AppSettings, BrowserRow, BrowserRowKind, SessionBrowserState, SessionNode, SessionStore,
@@ -21,11 +24,11 @@ use yggterm_platform::DockRect;
 use yggterm_server::{
     ManagedSessionView, PreviewTone, ServerEndpoint, ServerUiSnapshot, SessionMetadataEntry,
     ServerRuntimeStatus, SessionPreviewBlock, SshConnectTarget, TerminalBackend,
-    GhosttyTerminalHostMode,
-    WorkspaceViewMode, YggtermServer, connect_ssh, focus_live, open_stored_session,
-    raise_external_window, request_terminal_launch,
+    GhosttyTerminalHostMode, WorkspaceViewMode, YggtermServer, connect_ssh, focus_live,
+    open_stored_session, request_terminal_launch,
     set_all_preview_blocks_folded, set_view_mode as daemon_set_view_mode, status,
-    sync_external_window, snapshot as daemon_snapshot, ping,
+    snapshot as daemon_snapshot, ping, terminal_ensure, terminal_read, terminal_resize,
+    terminal_write,
     toggle_preview_block as daemon_toggle_preview_block,
 };
 
@@ -33,6 +36,9 @@ static BOOTSTRAP: OnceCell<ShellBootstrap> = OnceCell::new();
 const SIDE_RAIL_WIDTH: usize = 292;
 const EDGE_RESIZE_HANDLE: usize = 5;
 const CORNER_RESIZE_HANDLE: usize = 10;
+const XTERM_CSS: &str = include_str!("../../../assets/xterm/xterm.css");
+const XTERM_JS: &str = include_str!("../../../assets/xterm/xterm.js");
+const XTERM_FIT_JS: &str = include_str!("../../../assets/xterm/addon-fit.js");
 
 #[derive(Debug, Clone)]
 pub struct ShellBootstrap {
@@ -173,6 +179,29 @@ enum WindowControlIcon {
     Maximize,
     Restore,
     Close,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum TerminalJsCommand {
+    Reset {
+        title: String,
+        background: String,
+        foreground: String,
+        cursor: String,
+        font_size: f32,
+    },
+    Write {
+        data: String,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum TerminalJsEvent {
+    Ready,
+    Input { data: String },
+    Resize { cols: u16, rows: u16 },
 }
 
 impl ShellState {
@@ -1011,33 +1040,6 @@ fn ghostty_dock_request(
     })
 }
 
-fn focus_docked_host(mut state: Signal<ShellState>) {
-    let window_id = state
-        .read()
-        .docked_window_id
-        .clone()
-        .or_else(|| state.read().server.active_session().and_then(|session| session.terminal_window_id.clone()));
-
-    let Some(window_id) = window_id else {
-        spawn_server_snapshot_action(
-            state,
-            "focusing ghostty".to_string(),
-            |endpoint| raise_external_window(&endpoint),
-        );
-        return;
-    };
-
-    spawn(async move {
-        let focused =
-            task::spawn_blocking(move || yggterm_platform::focus_docked_ghostty_window(&window_id)).await;
-        state.with_mut(|shell| match focused {
-            Ok(Ok(())) => shell.last_action = "ghostty focused".to_string(),
-            Ok(Err(error)) => shell.last_action = format!("ghostty focus failed: {error}"),
-            Err(error) => shell.last_action = format!("ghostty focus task failed: {error}"),
-        });
-    });
-}
-
 pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
     let _ = BOOTSTRAP.set(bootstrap);
 
@@ -1150,6 +1152,15 @@ fn app() -> Element {
     let shell_radius = if maximized { 0 } else { 11 };
 
     rsx! {
+        document::Style {
+            "{XTERM_CSS}"
+        }
+        document::Script {
+            "{XTERM_JS}"
+        }
+        document::Script {
+            "{XTERM_FIT_JS}"
+        }
         div {
             style: format!(
                 "position: fixed; inset: 0; overflow: hidden; border-radius:{}px; \
@@ -1218,12 +1229,6 @@ fn app() -> Element {
                             state,
                             "requesting terminal".to_string(),
                             |endpoint| request_terminal_launch(&endpoint),
-                        ),
-                        on_focus_ghostty: move || focus_docked_host(state),
-                        on_resolve_ghostty: move || spawn_server_snapshot_action(
-                            state,
-                            "resolving ghostty".to_string(),
-                            |endpoint| sync_external_window(&endpoint),
                         ),
                         on_set_preview_layout: move |mode: PreviewLayoutMode| state.with_mut(|shell| shell.set_preview_layout(mode)),
                     }
@@ -1949,8 +1954,6 @@ fn MainSurface(
     on_collapse_preview: EventHandler<()>,
     on_toggle_preview_block: EventHandler<usize>,
     on_request_terminal: EventHandler<()>,
-    on_focus_ghostty: EventHandler<()>,
-    on_resolve_ghostty: EventHandler<()>,
     on_set_preview_layout: EventHandler<PreviewLayoutMode>,
 ) -> Element {
     let body = if let Some(session) = snapshot.active_session.clone() {
@@ -2013,26 +2016,16 @@ fn MainSurface(
                         div {
                             style: "display:flex; gap:8px; justify-content:flex-end;",
                             button {
-                            style: chip_style(snapshot.palette, snapshot.server_busy),
-                            onclick: move |_| on_request_terminal.call(()),
-                            "Request Ghostty"
-                            }
-                            button {
                                 style: chip_style(snapshot.palette, snapshot.server_busy),
-                                onclick: move |_| on_focus_ghostty.call(()),
-                                "Focus Ghostty"
-                            }
-                            button {
-                                style: chip_style(snapshot.palette, snapshot.server_busy),
-                                onclick: move |_| on_resolve_ghostty.call(()),
-                                "Resolve Window"
+                                onclick: move |_| on_request_terminal.call(()),
+                                "Reconnect Terminal"
                             }
                         }
                     }
                     TerminalCanvas {
+                        key: "{session.session_path}",
                         session: session.clone(),
                         snapshot: snapshot.clone(),
-                        on_focus_host: move |_| on_focus_ghostty.call(()),
                     }
                 }
             },
@@ -2306,29 +2299,84 @@ fn PreviewBlock(
 fn TerminalCanvas(
     session: ManagedSessionView,
     snapshot: RenderSnapshot,
-    on_focus_host: EventHandler<MouseEvent>,
 ) -> Element {
-    let host_badge = match session.terminal_host_mode {
-        GhosttyTerminalHostMode::EmbeddedSurface => "Embedded Host",
-        GhosttyTerminalHostMode::ControlledDock => "Docked Host",
-        GhosttyTerminalHostMode::ExternalWindow => "External Host",
-        GhosttyTerminalHostMode::Unsupported => "Mock Host",
-    };
-    let host_note = match session.terminal_host_mode {
-        GhosttyTerminalHostMode::EmbeddedSurface => session
-            .embedded_surface_detail
-            .clone()
-            .unwrap_or_else(|| "The macOS libghostty host slot is reserved for this session.".to_string()),
-        GhosttyTerminalHostMode::ControlledDock => "Linux controlled docking keeps a dedicated Ghostty window aligned to this viewport.".to_string(),
-        GhosttyTerminalHostMode::ExternalWindow => "This platform still uses an external Ghostty window for the active terminal session.".to_string(),
-        GhosttyTerminalHostMode::Unsupported => "Ghostty hosting is not active for this session in the current build.".to_string(),
-    };
+    let endpoint = BOOTSTRAP
+        .get()
+        .expect("shell bootstrap initialized")
+        .server_endpoint
+        .clone();
+    let session_path = session.session_path.clone();
+    let host_id = terminal_host_id(&session_path);
+    let terminal_title = session.title.clone();
+    let future_host_id = host_id.clone();
+    let theme = terminal_theme(snapshot.palette, snapshot.settings.terminal_font_size);
+    use_future(move || {
+        let endpoint = endpoint.clone();
+        let session_path = session_path.clone();
+        let host_id = future_host_id.clone();
+        let title = terminal_title.clone();
+        let theme = theme.clone();
+        async move {
+            if let Err(error) = terminal_ensure(&endpoint, &session_path) {
+                warn!(session=%session_path, error=%error, "failed to ensure terminal");
+                return;
+            }
+            let mut eval = document::eval(&terminal_eval_script(&host_id));
+            let _ = eval.send(TerminalJsCommand::Reset {
+                title,
+                background: theme.background.clone(),
+                foreground: theme.foreground.clone(),
+                cursor: theme.cursor.clone(),
+                font_size: theme.font_size,
+            });
+            let mut cursor = 0u64;
+            loop {
+                tokio::select! {
+                    event = eval.recv::<TerminalJsEvent>() => {
+                        match event {
+                            Ok(TerminalJsEvent::Ready) => {
+                                if let Ok((next_cursor, chunks)) = terminal_read(&endpoint, &session_path, 0) {
+                                    cursor = next_cursor;
+                                    for chunk in chunks {
+                                        let _ = eval.send(TerminalJsCommand::Write { data: chunk.data });
+                                    }
+                                }
+                            }
+                            Ok(TerminalJsEvent::Input { data }) => {
+                                let _ = terminal_write(&endpoint, &session_path, &data);
+                            }
+                            Ok(TerminalJsEvent::Resize { cols, rows }) => {
+                                let _ = terminal_resize(&endpoint, &session_path, cols, rows);
+                            }
+                            Err(error) => {
+                                warn!(session=%session_path, error=%error, "terminal eval bridge closed");
+                                break;
+                            }
+                        }
+                    }
+                    _ = sleep(Duration::from_millis(60)) => {
+                        match terminal_read(&endpoint, &session_path, cursor) {
+                            Ok((next_cursor, chunks)) => {
+                                cursor = next_cursor;
+                                for chunk in chunks {
+                                    let _ = eval.send(TerminalJsCommand::Write { data: chunk.data });
+                                }
+                            }
+                            Err(error) => {
+                                warn!(session=%session_path, error=%error, "terminal read failed");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
     rsx! {
         div {
             style: "display:flex; flex-direction:column; gap:16px;",
             div {
                 style: "display:flex; flex-direction:column; gap:12px; padding:18px 20px; border-radius:20px; background:linear-gradient(180deg, rgba(13,18,24,0.98) 0%, rgba(19,27,35,0.97) 100%); box-shadow:0 28px 48px rgba(10,17,26,0.26), inset 0 0 0 1px rgba(132,155,177,0.12);",
-                onclick: move |evt| on_focus_host.call(evt),
                 div {
                     style: "display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;",
                     div {
@@ -2353,34 +2401,16 @@ fn TerminalCanvas(
                             "display:inline-flex; align-items:center; justify-content:center; min-width:108px; height:24px; padding:0 10px; border-radius:999px; background:rgba(125,211,252,0.12); color:{}; font-size:11px; font-weight:700;",
                             snapshot.palette.accent
                         ),
-                        "{host_badge}"
-                    }
-                    if let Some(surface_id) = session.embedded_surface_id.clone() {
-                        span {
-                            style: "font-size:11px; color:rgba(148,163,184,0.92);",
-                            "surface {surface_id}"
-                        }
+                        "Embedded PTY"
                     }
                 }
                 div {
                     style: "padding:12px 14px; border-radius:14px; background:rgba(255,255,255,0.06); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.08); font-size:13px; line-height:1.55; color:#d6e2ef;",
-                    "{host_note}"
+                    "The active session is attached to a yggterm-owned PTY and rendered inline through xterm.js."
                 }
                 div {
-                    style: "display:flex; flex-direction:column; gap:8px; font-family:'Iosevka Term','JetBrains Mono','Fira Code',monospace; color:#d6e2ef;",
-                    for (ix, line) in session.terminal_lines.iter().enumerate() {
-                        div {
-                            style: "display:grid; grid-template-columns:34px 1fr; gap:10px; align-items:start; font-size:13px; line-height:1.58;",
-                            span {
-                                style: "color:rgba(96,165,250,0.88); text-align:right;",
-                                {format!("{:02}", ix + 1)}
-                            }
-                            span {
-                                style: "white-space:pre-wrap;",
-                                "{line}"
-                            }
-                        }
-                    }
+                    id: "{host_id}",
+                    style: "min-height:520px; border-radius:16px; overflow:hidden; background:#0b1220; box-shadow:inset 0 0 0 1px rgba(255,255,255,0.08);"
                 }
             }
             div {
@@ -2401,17 +2431,121 @@ fn TerminalCanvas(
                     style: "padding:16px 18px; border-radius:18px; background:rgba(240,248,255,0.88); box-shadow:0 16px 30px rgba(148,163,184,0.10), inset 0 0 0 1px rgba(255,255,255,0.72);",
                     div {
                         style: format!("font-size:12px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:{}; margin-bottom:8px;", snapshot.palette.muted),
-                        "Ghostty Host"
+                        "Embedded Terminal"
                     }
                     div {
                         style: format!("display:flex; flex-direction:column; gap:8px; font-size:13px; line-height:1.58; color:{};", snapshot.palette.text),
-                        div { "{snapshot.ghostty_bridge_detail}" }
-                        div { "Terminal mode is server-owned now; Linux uses the controlled Ghostty dock adapter while macOS keeps the libghostty embedded-host path reserved." }
+                        div { "xterm.js is embedded directly in the Dioxus viewport." }
+                        div { "Ghostty is no longer required for the active terminal path, which makes Wayland and Windows support much simpler." }
                     }
                 }
             }
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct TerminalTheme {
+    background: String,
+    foreground: String,
+    cursor: String,
+    font_size: f32,
+}
+
+fn terminal_theme(palette: Palette, font_size: f32) -> TerminalTheme {
+    TerminalTheme {
+        background: "#0b1220".to_string(),
+        foreground: "#d6e2ef".to_string(),
+        cursor: palette.accent.to_string(),
+        font_size: font_size.max(11.0),
+    }
+}
+
+fn terminal_host_id(session_path: &str) -> String {
+    let mut id = String::from("yggterm-terminal-");
+    for ch in session_path.chars() {
+        if ch.is_ascii_alphanumeric() {
+            id.push(ch.to_ascii_lowercase());
+        } else {
+            id.push('-');
+        }
+    }
+    id
+}
+
+fn terminal_eval_script(host_id: &str) -> String {
+    format!(
+        r#"
+        const hostId = {host_id:?};
+        const host = document.getElementById(hostId);
+        if (!host) {{
+            dioxus.send({{ kind: "ready" }});
+            return;
+        }}
+        if (!window.Terminal || !window.FitAddon || !window.FitAddon.FitAddon) {{
+            host.innerHTML = '<div style="padding:18px;color:#fca5a5;font:13px system-ui;">xterm.js assets failed to load.</div>';
+            dioxus.send({{ kind: "ready" }});
+            while (true) {{
+                await dioxus.recv();
+            }}
+        }}
+        if (window.__yggtermXtermCleanup) {{
+            try {{
+                window.__yggtermXtermCleanup();
+            }} catch (_error) {{}}
+        }}
+        host.innerHTML = "";
+        const term = new window.Terminal({{
+            allowTransparency: true,
+            convertEol: true,
+            cursorBlink: true,
+            fontFamily: "'Iosevka Term', 'JetBrains Mono', 'Fira Code', monospace",
+            scrollback: 5000,
+        }});
+        const fitAddon = new window.FitAddon.FitAddon();
+        term.loadAddon(fitAddon);
+        term.open(host);
+        const emitResize = () => {{
+            try {{
+                fitAddon.fit();
+                dioxus.send({{ kind: "resize", cols: term.cols, rows: term.rows }});
+            }} catch (_error) {{}}
+        }};
+        const resizeObserver = new ResizeObserver(() => emitResize());
+        resizeObserver.observe(host);
+        term.onData((data) => dioxus.send({{ kind: "input", data }}));
+        window.__yggtermXtermCleanup = () => {{
+            try {{
+                resizeObserver.disconnect();
+            }} catch (_error) {{}}
+            try {{
+                term.dispose();
+            }} catch (_error) {{}}
+            host.innerHTML = "";
+        }};
+        emitResize();
+        dioxus.send({{ kind: "ready" }});
+        while (true) {{
+            const message = await dioxus.recv();
+            if (!message) {{
+                continue;
+            }}
+            if (message.kind === "reset") {{
+                term.options.fontSize = message.font_size;
+                term.options.theme = {{
+                    background: message.background,
+                    foreground: message.foreground,
+                    cursor: message.cursor,
+                    selectionBackground: "rgba(107,165,255,0.22)",
+                }};
+                term.clear();
+                term.reset();
+            }} else if (message.kind === "write") {{
+                term.write(message.data);
+            }}
+        }}
+        "#
+    )
 }
 
 #[component]

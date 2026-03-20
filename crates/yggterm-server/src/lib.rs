@@ -1,24 +1,27 @@
 mod attach;
 mod daemon;
 mod host;
+mod terminal;
 
 pub use attach::{AttachMetadata, run_attach};
 pub use daemon::{
-    ServerEndpoint, ServerRequest, ServerResponse, ServerRuntimeStatus, connect_ssh,
+    ServerEndpoint, ServerRequest, ServerResponse, ServerRuntimeStatus, TerminalStreamChunk,
+    connect_ssh,
     default_endpoint, focus_live, open_stored_session, ping, raise_external_window, run_daemon,
     request_terminal_launch, set_all_preview_blocks_folded, set_view_mode, snapshot, status,
-    sync_external_window, sync_theme, toggle_preview_block,
+    sync_external_window, sync_theme, terminal_ensure, terminal_read, terminal_resize,
+    terminal_write, toggle_preview_block,
 };
 pub use host::{
     GhosttyHostKind, GhosttyHostSupport, GhosttyTerminalHostMode, detect_ghostty_host,
 };
+pub use terminal::{TerminalChunk, TerminalManager, TerminalReadResult};
 
 use yggterm_core::{SessionNode, TranscriptRole, UiTheme, read_codex_transcript_messages};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
-use std::process::Command;
 use std::time::SystemTime;
 use time::{OffsetDateTime, UtcOffset, macros::format_description};
 use uuid::Uuid;
@@ -31,6 +34,7 @@ pub enum WorkspaceViewMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TerminalBackend {
+    Xterm,
     Ghostty,
     Mock,
 }
@@ -235,12 +239,8 @@ impl YggtermServer {
         ghostty_host: GhosttyHostSupport,
         theme: UiTheme,
     ) -> Self {
-        let ghostty_bridge_enabled = ghostty_host.bridge_enabled;
-        let backend = if prefer_ghostty_backend && ghostty_bridge_enabled {
-            TerminalBackend::Ghostty
-        } else {
-            TerminalBackend::Mock
-        };
+        let _ = prefer_ghostty_backend;
+        let backend = TerminalBackend::Xterm;
 
         let mut this = Self {
             sessions: BTreeMap::new(),
@@ -312,6 +312,7 @@ impl YggtermServer {
             session.status_line = format!(
                 "{} · {} scheme requested · {}",
                 match session.backend {
+                    TerminalBackend::Xterm => "xterm.js",
                     TerminalBackend::Ghostty => "Ghostty",
                     TerminalBackend::Mock => "Mock",
                 },
@@ -364,6 +365,22 @@ impl YggtermServer {
 
     pub fn active_session_path(&self) -> Option<&str> {
         self.active_session_path.as_deref()
+    }
+
+    pub fn request_terminal_launch_for_path(&mut self, path: &str) {
+        self.active_session_path = Some(path.to_string());
+        self.request_terminal_launch_for_active();
+    }
+
+    pub fn terminal_spec(&self, path: &str) -> Option<(String, Option<String>)> {
+        self.sessions.get(path).map(|session| {
+            let cwd = session
+                .metadata
+                .iter()
+                .find(|entry| entry.label == "Cwd")
+                .map(|entry| entry.value.clone());
+            (session.launch_command.clone(), cwd)
+        })
     }
 
     pub fn ssh_targets(&self) -> &[SshConnectTarget] {
@@ -533,45 +550,26 @@ impl YggtermServer {
 
         match session.source {
             SessionSource::Stored => {
-                if session.terminal_process_id.is_none() {
-                    match self.ghostty_host.launch_terminal(&session.launch_command) {
-                        Ok(outcome) => {
-                            session.backend = TerminalBackend::Ghostty;
-                            session.terminal_process_id = outcome.process_id;
-                            session.terminal_window_id = None;
-                            session.terminal_host_token = outcome.host_token;
-                            session.terminal_host_mode = outcome.host_mode;
-                            session.embedded_surface_id = outcome.embedded_surface_id;
-                            session.embedded_surface_detail = outcome.embedded_surface_detail;
-                            session.last_launch_error = None;
-                            session.last_window_error = None;
-                            session.launch_phase = if outcome.embedded_surface_reserved {
-                                TerminalLaunchPhase::BridgePending
-                            } else {
-                                TerminalLaunchPhase::Running
-                            };
-                            session.terminal_lines = outcome.lines;
-                            session
-                                .terminal_lines
-                                .push(self.ghostty_host.integration_note());
-                            if session.terminal_process_id.is_some() {
-                                let _ = sync_external_window_id(session);
-                            }
-                        }
-                        Err(error) => {
-                            session.backend = TerminalBackend::Mock;
-                            session.last_launch_error = Some(error.clone());
-                            session.launch_phase = TerminalLaunchPhase::BridgePending;
-                            session
-                                .terminal_lines
-                                .push(format!("ghostty launch error: {error}"));
-                        }
-                    }
-                }
+                session.backend = TerminalBackend::Xterm;
+                session.terminal_process_id = None;
+                session.terminal_window_id = None;
+                session.terminal_host_token = None;
+                session.terminal_host_mode = GhosttyTerminalHostMode::Unsupported;
+                session.embedded_surface_id = None;
+                session.embedded_surface_detail = None;
+                session.last_launch_error = None;
+                session.last_window_error = None;
+                session.launch_phase = TerminalLaunchPhase::Running;
+                session.terminal_lines = vec![
+                    "xterm.js terminal attached to the yggterm daemon PTY.".to_string(),
+                    format!("$ {}", session.launch_command),
+                    "Preview mode stays rendered in-process while terminal mode streams the PTY directly in the main viewport.".to_string(),
+                ];
                 upsert_session_metadata(
                     &mut session.metadata,
                     "Backend",
                     match session.backend {
+                        TerminalBackend::Xterm => "xterm.js".to_string(),
                         TerminalBackend::Ghostty => "Ghostty".to_string(),
                         TerminalBackend::Mock => "Mock".to_string(),
                     },
@@ -579,72 +577,47 @@ impl YggtermServer {
                 upsert_session_metadata(
                     &mut session.metadata,
                     "Launch PID",
-                    session
-                        .terminal_process_id
-                        .map(|pid| pid.to_string())
-                        .unwrap_or_else(|| "not launched".to_string()),
+                    "daemon pty".to_string(),
                 );
                 upsert_session_metadata(
                     &mut session.metadata,
                     "Launch Error",
-                    session
-                        .last_launch_error
-                        .clone()
-                        .unwrap_or_else(|| "none".to_string()),
+                    "none".to_string(),
                 );
                 upsert_session_metadata(
                     &mut session.metadata,
                     "Ghostty Window",
-                    session
-                        .terminal_window_id
-                        .clone()
-                        .unwrap_or_else(|| "not resolved".to_string()),
+                    "not used".to_string(),
                 );
                 upsert_session_metadata(
                     &mut session.metadata,
                     "Host Mode",
-                    describe_terminal_host_mode(session.terminal_host_mode).to_string(),
+                    "embedded xterm.js".to_string(),
                 );
                 upsert_session_metadata(
                     &mut session.metadata,
                     "Host Token",
-                    session
-                        .terminal_host_token
-                        .clone()
-                        .unwrap_or_else(|| "none".to_string()),
+                    "daemon".to_string(),
                 );
                 upsert_session_metadata(
                     &mut session.metadata,
                     "Embedded Surface",
-                    session
-                        .embedded_surface_id
-                        .clone()
-                        .unwrap_or_else(|| "none".to_string()),
+                    "webview".to_string(),
                 );
                 upsert_session_metadata(
                     &mut session.metadata,
                     "Embedded Host",
-                    session
-                        .embedded_surface_detail
-                        .clone()
-                        .unwrap_or_else(|| "none".to_string()),
+                    "xterm.js".to_string(),
                 );
                 upsert_session_metadata(
                     &mut session.metadata,
                     "Window Error",
-                    session
-                        .last_window_error
-                        .clone()
-                        .unwrap_or_else(|| "none".to_string()),
+                    "none".to_string(),
                 );
                 upsert_session_metadata(
                     &mut session.metadata,
                     "Status",
-                    if session.terminal_process_id.is_some() {
-                        "running".to_string()
-                    } else {
-                        "launch failed".to_string()
-                    },
+                    "running".to_string(),
                 );
                 session.status_line = describe_status_line(
                     session.backend,
@@ -656,25 +629,14 @@ impl YggtermServer {
                 );
             }
             SessionSource::LiveSsh => {
-                session.remote_deploy_state = if session.bridge_available {
-                    RemoteDeployState::Ready
-                } else {
-                    RemoteDeployState::CopyingBinary
-                };
-                session.launch_phase = if session.bridge_available {
-                    TerminalLaunchPhase::Running
-                } else {
-                    TerminalLaunchPhase::BridgePending
-                };
+                session.backend = TerminalBackend::Xterm;
+                session.remote_deploy_state = RemoteDeployState::Ready;
+                session.launch_phase = TerminalLaunchPhase::Running;
                 session.terminal_lines = build_live_terminal_lines(session);
                 upsert_session_metadata(
                     &mut session.metadata,
                     "Status",
-                    if session.bridge_available {
-                        "remote ready".to_string()
-                    } else {
-                        "copying binary".to_string()
-                    },
+                    "remote ready".to_string(),
                 );
                 session.status_line = describe_status_line(
                     session.backend,
@@ -689,49 +651,11 @@ impl YggtermServer {
     }
 
     pub fn sync_external_terminal_window_for_active(&mut self) -> String {
-        let Some(path) = self.active_session_path.as_ref() else {
-            return "no active session".to_string();
-        };
-        let Some(session) = self.sessions.get_mut(path) else {
-            return "no active session".to_string();
-        };
-        match sync_external_window_id(session) {
-            Ok(window_id) => format!("ghostty window resolved: {window_id}"),
-            Err(error) => error,
-        }
+        "external ghostty window support is inactive in the xterm.js terminal path".to_string()
     }
 
     pub fn raise_external_terminal_window_for_active(&mut self) -> String {
-        let Some(path) = self.active_session_path.as_ref() else {
-            return "no active session".to_string();
-        };
-        let Some(session) = self.sessions.get_mut(path) else {
-            return "no active session".to_string();
-        };
-
-        if session.terminal_window_id.is_none() {
-            let _ = sync_external_window_id(session);
-        }
-
-        let Some(window_id) = session.terminal_window_id.clone() else {
-            return session
-                .last_window_error
-                .clone()
-                .unwrap_or_else(|| "ghostty window not resolved".to_string());
-        };
-
-        match raise_x11_window(&window_id) {
-            Ok(()) => {
-                session.last_window_error = None;
-                upsert_session_metadata(&mut session.metadata, "Window Error", "none".to_string());
-                format!("ghostty window raised: {window_id}")
-            }
-            Err(error) => {
-                session.last_window_error = Some(error.clone());
-                upsert_session_metadata(&mut session.metadata, "Window Error", error.clone());
-                error
-            }
-        }
+        "external ghostty window support is inactive in the xterm.js terminal path".to_string()
     }
 
     fn insert_live_session(
@@ -962,6 +886,7 @@ fn build_session(
     };
     let started_at = format_display_datetime(OffsetDateTime::now_utc());
     let backend_label = match backend {
+        TerminalBackend::Xterm => "xterm.js",
         TerminalBackend::Ghostty => "Ghostty",
         TerminalBackend::Mock => "Mock",
     };
@@ -1127,11 +1052,7 @@ fn build_session(
         },
         SessionMetadataEntry {
             label: "Bridge",
-            value: if ghostty_bridge_enabled {
-                "available".to_string()
-            } else {
-                "not linked".to_string()
-            },
+            value: "daemon pty".to_string(),
         },
         SessionMetadataEntry {
             label: "Theme",
@@ -1155,35 +1076,24 @@ fn build_session(
         host_label: host_label.clone(),
         source: SessionSource::Stored,
         backend,
-        bridge_available: ghostty_bridge_enabled,
-        launch_phase: if ghostty_bridge_enabled {
-            TerminalLaunchPhase::Queued
-        } else {
-            TerminalLaunchPhase::BridgePending
-        },
+        bridge_available: true,
+        launch_phase: TerminalLaunchPhase::Queued,
         remote_deploy_state: RemoteDeployState::NotRequired,
         launch_command: launch_command.clone(),
         status_line: describe_status_line(
             backend,
             theme,
             SessionSource::Stored,
-            if ghostty_bridge_enabled {
-                TerminalLaunchPhase::Queued
-            } else {
-                TerminalLaunchPhase::BridgePending
-            },
+            TerminalLaunchPhase::Queued,
             RemoteDeployState::NotRequired,
-            ghostty_bridge_enabled,
+            true,
         ),
         terminal_lines: vec![
             format!("$ cd {cwd}"),
             format!("$ codex resume {session_id}"),
-            format!("Ghostty terminal host: {backend_label}"),
-            "yggterm server launches ghostty for terminal mode".to_string(),
-            format!(
-                "Host strategy: {}",
-                describe_terminal_host_mode(ghostty_host_mode(backend, ghostty_bridge_enabled))
-            ),
+            format!("Terminal host: {backend_label}"),
+            "yggterm server launches an in-process PTY for terminal mode".to_string(),
+            "xterm.js renders the active PTY directly in the main viewport.".to_string(),
             embedded_surface_note(ghostty_bridge_enabled),
         ],
         rendered_sections: vec![
@@ -1191,7 +1101,7 @@ fn build_session(
                 title: "Rendered Session",
                 lines: vec![
                     "Preview mode renders the stored Codex transcript as a chat surface.".to_string(),
-                    "Turn Preview off in the titlebar to hand the main viewport back to Ghostty.".to_string(),
+                    "Turn Preview off in the titlebar to hand the main viewport back to the embedded terminal.".to_string(),
                     "The terminal/server session stays authoritative underneath.".to_string(),
                 ],
             },
@@ -1264,11 +1174,7 @@ fn build_live_session(
                 target.prefix.clone().unwrap_or_else(|| "none".to_string())
             ),
             "Remote bootstrap: copy yggterm binary if missing".to_string(),
-            "Ghostty bridge: request main viewport surface".to_string(),
-            format!(
-                "Host strategy: {}",
-                describe_terminal_host_mode(ghostty_host_mode(backend, ghostty_bridge_enabled))
-            ),
+            "Daemon PTY: request main viewport terminal stream".to_string(),
         ],
         rendered_sections: vec![],
         preview: SessionPreview {
@@ -1306,7 +1212,7 @@ fn build_live_session(
                     folded: false,
                     lines: vec![
                         format!("Open live terminal {uuid} through the Yggterm server."),
-                        "This session should land in the main viewport as a Ghostty-backed terminal.".to_string(),
+                        "This session should land in the main viewport as an embedded xterm.js terminal.".to_string(),
                     ],
                 },
                 SessionPreviewBlock {
@@ -1385,6 +1291,7 @@ fn describe_status_line(
     bridge_available: bool,
 ) -> String {
     let backend_label = match backend {
+        TerminalBackend::Xterm => "xterm.js",
         TerminalBackend::Ghostty => "Ghostty",
         TerminalBackend::Mock => "Mock",
     };
@@ -1403,34 +1310,34 @@ fn describe_launch_phase(
     remote_deploy_state: RemoteDeployState,
     bridge_available: bool,
 ) -> String {
-    let bridge = if bridge_available {
-        "bridge ready"
+    let runtime = if bridge_available {
+        "daemon ready"
     } else {
-        "bridge missing"
+        "runtime degraded"
     };
     match (source, launch_phase, remote_deploy_state) {
         (SessionSource::Stored, TerminalLaunchPhase::Queued, _) => {
-            format!("stored attach queued · {bridge}")
+            format!("stored attach queued · {runtime}")
         }
         (SessionSource::Stored, TerminalLaunchPhase::BridgePending, _) => {
-            format!("stored attach pending bridge · {bridge}")
+            format!("stored attach pending terminal host · {runtime}")
         }
         (SessionSource::Stored, TerminalLaunchPhase::Running, _) => {
-            format!("stored terminal requested · {bridge}")
+            format!("embedded terminal attached · {runtime}")
         }
         (SessionSource::LiveSsh, _, RemoteDeployState::Planned) => {
-            format!("remote bootstrap planned · {bridge}")
+            format!("remote bootstrap planned · {runtime}")
         }
         (SessionSource::LiveSsh, _, RemoteDeployState::CopyingBinary) => {
-            format!("copying yggterm binary · {bridge}")
+            format!("copying yggterm binary · {runtime}")
         }
         (SessionSource::LiveSsh, TerminalLaunchPhase::Running, RemoteDeployState::Ready) => {
-            format!("ghostty session requested · {bridge}")
+            format!("remote terminal attached · {runtime}")
         }
         (SessionSource::LiveSsh, TerminalLaunchPhase::BridgePending, _) => {
-            format!("waiting for ghostty bridge · {bridge}")
+            format!("waiting for terminal host · {runtime}")
         }
-        _ => format!("launch queued · {bridge}"),
+        _ => format!("launch queued · {runtime}"),
     }
 }
 
@@ -1453,14 +1360,7 @@ fn build_live_terminal_lines(session: &ManagedSessionView) -> Vec<String> {
         format!("Target: {}", session.host_label),
         format!("Deploy state: {deploy}"),
         format!("Launch phase: {launch}"),
-        format!(
-            "Ghostty bridge: {}",
-            if session.bridge_available {
-                "available"
-            } else {
-                "not linked in this build"
-            }
-        ),
+        "Terminal surface: embedded xterm.js".to_string(),
     ]
 }
 
@@ -1475,60 +1375,16 @@ fn stored_file_snapshot(path: &str) -> StoredFileSnapshot {
     }
 }
 
-fn sync_external_window_id(session: &mut ManagedSessionView) -> Result<String, String> {
-    let Some(pid) = session.terminal_process_id else {
-        let error = "ghostty pid not available".to_string();
-        session.last_window_error = Some(error.clone());
-        upsert_session_metadata(
-            &mut session.metadata,
-            "Ghostty Window",
-            "not resolved".to_string(),
-        );
-        upsert_session_metadata(&mut session.metadata, "Window Error", error.clone());
-        return Err(error);
-    };
-
-    match resolve_x11_window_for_pid(pid) {
-        Ok(window_id) => {
-            session.terminal_window_id = Some(window_id.clone());
-            session.last_window_error = None;
-            upsert_session_metadata(&mut session.metadata, "Ghostty Window", window_id.clone());
-            upsert_session_metadata(&mut session.metadata, "Window Error", "none".to_string());
-            if !session
-                .terminal_lines
-                .iter()
-                .any(|line| line.contains("x11 window"))
-            {
-                session
-                    .terminal_lines
-                    .push(format!("x11 window {window_id}"));
-            }
-            Ok(window_id)
-        }
-        Err(error) => {
-            session.terminal_window_id = None;
-            session.last_window_error = Some(error.clone());
-            upsert_session_metadata(
-                &mut session.metadata,
-                "Ghostty Window",
-                "not resolved".to_string(),
-            );
-            upsert_session_metadata(&mut session.metadata, "Window Error", error.clone());
-            Err(error)
-        }
-    }
-}
-
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn embedded_surface_note(bridge_available: bool) -> String {
     if !bridge_available {
-        "libghostty is not linked in this build, so terminal mode stays on the fallback host path."
+        "The active terminal path is now PTY + xterm.js, so no external host bridge is required."
             .to_string()
     } else {
-        "The active host adapter decides whether this session lands in an embedded surface or an external Ghostty window."
+        "Ghostty integration is optional now; the active viewport uses xterm.js for embedded terminals."
             .to_string()
     }
 }
@@ -1545,59 +1401,6 @@ fn ghostty_host_mode(
         GhosttyTerminalHostMode::ControlledDock
     } else {
         GhosttyTerminalHostMode::ExternalWindow
-    }
-}
-
-fn describe_terminal_host_mode(mode: GhosttyTerminalHostMode) -> &'static str {
-    match mode {
-        GhosttyTerminalHostMode::EmbeddedSurface => "embedded surface",
-        GhosttyTerminalHostMode::ControlledDock => "controlled dock",
-        GhosttyTerminalHostMode::ExternalWindow => "external window",
-        GhosttyTerminalHostMode::Unsupported => "unsupported",
-    }
-}
-
-fn resolve_x11_window_for_pid(pid: u32) -> Result<String, String> {
-    let output = Command::new("xdotool")
-        .arg("search")
-        .arg("--pid")
-        .arg(pid.to_string())
-        .output()
-        .map_err(|error| format!("failed to run xdotool search: {error}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if stderr.is_empty() {
-            format!("ghostty window for pid {pid} not found yet")
-        } else {
-            format!("ghostty window lookup failed: {stderr}")
-        });
-    }
-
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .map(|line| line.trim().to_string())
-        .ok_or_else(|| format!("ghostty window for pid {pid} not found yet"))
-}
-
-fn raise_x11_window(window_id: &str) -> Result<(), String> {
-    let output = Command::new("xdotool")
-        .arg("windowactivate")
-        .arg("--sync")
-        .arg(window_id)
-        .output()
-        .map_err(|error| format!("failed to run xdotool windowactivate: {error}"))?;
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Err(if stderr.is_empty() {
-            format!("failed to raise ghostty window {window_id}")
-        } else {
-            format!("failed to raise ghostty window {window_id}: {stderr}")
-        })
     }
 }
 

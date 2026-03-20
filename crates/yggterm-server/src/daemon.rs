@@ -1,5 +1,6 @@
 use crate::{
-    GhosttyHostSupport, PersistedDaemonState, ServerUiSnapshot, WorkspaceViewMode, YggtermServer,
+    GhosttyHostSupport, PersistedDaemonState, ServerUiSnapshot, TerminalManager,
+    WorkspaceViewMode, YggtermServer,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,12 @@ pub struct ServerRuntimeStatus {
     pub host_detail: String,
     pub embedded_surface_supported: bool,
     pub bridge_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalStreamChunk {
+    pub seq: u64,
+    pub data: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +60,22 @@ pub enum ServerRequest {
         folded: bool,
     },
     RequestTerminalLaunch,
+    TerminalEnsure {
+        path: String,
+    },
+    TerminalRead {
+        path: String,
+        cursor: u64,
+    },
+    TerminalWrite {
+        path: String,
+        data: String,
+    },
+    TerminalResize {
+        path: String,
+        cols: u16,
+        rows: u16,
+    },
     SyncExternalWindow,
     RaiseExternalWindow,
     SyncTheme {
@@ -69,6 +92,13 @@ pub enum ServerResponse {
         snapshot: ServerUiSnapshot,
         message: Option<String>,
     },
+    TerminalStream {
+        cursor: u64,
+        chunks: Vec<TerminalStreamChunk>,
+    },
+    Ack {
+        message: Option<String>,
+    },
     Error { message: String },
 }
 
@@ -76,6 +106,7 @@ struct DaemonRuntime {
     support: GhosttyHostSupport,
     state_path: PathBuf,
     server: YggtermServer,
+    terminals: TerminalManager,
 }
 
 impl DaemonRuntime {
@@ -99,6 +130,7 @@ impl DaemonRuntime {
             support,
             state_path,
             server,
+            terminals: TerminalManager::new(),
         })
     }
 
@@ -116,6 +148,23 @@ impl DaemonRuntime {
             snapshot: self.server.snapshot(),
             message,
         }
+    }
+
+    fn ensure_terminal_for_path(&mut self, path: &str) -> Result<()> {
+        self.server.request_terminal_launch_for_path(path);
+        let Some((launch_command, cwd)) = self.server.terminal_spec(path) else {
+            bail!("no terminal spec for session: {path}");
+        };
+        self.terminals
+            .ensure_session(path, &launch_command, cwd.as_deref())?;
+        Ok(())
+    }
+
+    fn ensure_terminal_for_active(&mut self) -> Result<()> {
+        let Some(path) = self.server.active_session_path().map(ToOwned::to_owned) else {
+            bail!("no active session");
+        };
+        self.ensure_terminal_for_path(&path)
     }
 
     fn persist(&self) -> Result<()> {
@@ -163,6 +212,9 @@ impl DaemonRuntime {
             }
             ServerRequest::SetViewMode { mode } => {
                 self.server.set_view_mode(mode);
+                if mode == WorkspaceViewMode::Terminal {
+                    self.ensure_terminal_for_active()?;
+                }
                 self.persist()?;
                 self.snapshot_response(Some(match mode {
                     WorkspaceViewMode::Rendered => "preview mode".to_string(),
@@ -184,10 +236,38 @@ impl DaemonRuntime {
                 }))
             }
             ServerRequest::RequestTerminalLaunch => {
-                self.server.request_terminal_launch_for_active();
+                self.ensure_terminal_for_active()?;
                 self.server.set_view_mode(WorkspaceViewMode::Terminal);
                 self.persist()?;
-                self.snapshot_response(Some("requested ghostty".to_string()))
+                self.snapshot_response(Some("requested terminal".to_string()))
+            }
+            ServerRequest::TerminalEnsure { path } => {
+                self.ensure_terminal_for_path(&path)?;
+                ServerResponse::Ack {
+                    message: Some("terminal ready".to_string()),
+                }
+            }
+            ServerRequest::TerminalRead { path, cursor } => {
+                let stream = self.terminals.read(&path, cursor)?;
+                ServerResponse::TerminalStream {
+                    cursor: stream.cursor,
+                    chunks: stream
+                        .chunks
+                        .into_iter()
+                        .map(|chunk| TerminalStreamChunk {
+                            seq: chunk.seq,
+                            data: chunk.data,
+                        })
+                        .collect(),
+                }
+            }
+            ServerRequest::TerminalWrite { path, data } => {
+                self.terminals.write(&path, &data)?;
+                ServerResponse::Ack { message: None }
+            }
+            ServerRequest::TerminalResize { path, cols, rows } => {
+                self.terminals.resize(&path, cols, rows)?;
+                ServerResponse::Ack { message: None }
             }
             ServerRequest::SyncExternalWindow => {
                 let message = self.server.sync_external_terminal_window_for_active();
@@ -313,6 +393,59 @@ pub fn request_terminal_launch(endpoint: &ServerEndpoint) -> Result<(ServerUiSna
     expect_snapshot(send_request(endpoint, &ServerRequest::RequestTerminalLaunch)?)
 }
 
+pub fn terminal_ensure(endpoint: &ServerEndpoint, path: &str) -> Result<Option<String>> {
+    expect_ack(send_request(
+        endpoint,
+        &ServerRequest::TerminalEnsure {
+            path: path.to_string(),
+        },
+    )?)
+}
+
+pub fn terminal_read(
+    endpoint: &ServerEndpoint,
+    path: &str,
+    cursor: u64,
+) -> Result<(u64, Vec<TerminalStreamChunk>)> {
+    match send_request(
+        endpoint,
+        &ServerRequest::TerminalRead {
+            path: path.to_string(),
+            cursor,
+        },
+    )? {
+        ServerResponse::TerminalStream { cursor, chunks } => Ok((cursor, chunks)),
+        ServerResponse::Error { message } => bail!(message),
+        other => bail!("unexpected terminal stream response: {:?}", other),
+    }
+}
+
+pub fn terminal_write(endpoint: &ServerEndpoint, path: &str, data: &str) -> Result<Option<String>> {
+    expect_ack(send_request(
+        endpoint,
+        &ServerRequest::TerminalWrite {
+            path: path.to_string(),
+            data: data.to_string(),
+        },
+    )?)
+}
+
+pub fn terminal_resize(
+    endpoint: &ServerEndpoint,
+    path: &str,
+    cols: u16,
+    rows: u16,
+) -> Result<Option<String>> {
+    expect_ack(send_request(
+        endpoint,
+        &ServerRequest::TerminalResize {
+            path: path.to_string(),
+            cols,
+            rows,
+        },
+    )?)
+}
+
 pub fn sync_external_window(endpoint: &ServerEndpoint) -> Result<(ServerUiSnapshot, Option<String>)> {
     expect_snapshot(send_request(endpoint, &ServerRequest::SyncExternalWindow)?)
 }
@@ -391,6 +524,14 @@ fn expect_snapshot(response: ServerResponse) -> Result<(ServerUiSnapshot, Option
         ServerResponse::Snapshot { snapshot, message } => Ok((snapshot, message)),
         ServerResponse::Error { message } => bail!(message),
         other => bail!("unexpected snapshot response: {:?}", other),
+    }
+}
+
+fn expect_ack(response: ServerResponse) -> Result<Option<String>> {
+    match response {
+        ServerResponse::Ack { message } => Ok(message),
+        ServerResponse::Error { message } => bail!(message),
+        other => bail!("unexpected ack response: {:?}", other),
     }
 }
 

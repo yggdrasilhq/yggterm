@@ -2,11 +2,11 @@
 
 ## Mission
 
-Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first terminal workspace with a Dioxus desktop shell shaped like Zed and a Ghostty-backed terminal core.
+Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first terminal workspace with a Dioxus desktop shell shaped like Zed, a daemon-owned PTY core, and an embedded xterm.js terminal surface.
 
 ## Local repository relationships
 
-- `../ghostty` contains Ghostty terminal code in Zig.
+- `../ghostty` contains legacy Ghostty integration code in Zig.
 - `../zed` is an optional visual/reference checkout for shell design study.
 - This repo (`yggterm`) is the integration layer and product surface.
 
@@ -14,11 +14,11 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 
 - Primary implementation language: **Rust**.
 - Use the repository-pinned Rust `1.94.0` toolchain for the local desktop stack.
-- Ghostty interoperability may require **Zig** and `libghostty` integration work.
+- Ghostty interoperability may still require **Zig** for legacy bridge work, but it is not required for the default terminal path.
 - Prefer explicit modular boundaries:
   - `core` (domain state and tree model)
   - `ui` (rendering and interaction)
-  - `ghostty-bridge` (FFI boundary)
+  - `ghostty-bridge` (legacy FFI boundary)
   - `platform` (OS-specific bindings)
 
 ## Product direction
@@ -29,24 +29,23 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 - Example sidebar entries should feel like `remote/prod/codex-session-tui`, `machines/pi/ghostty-admin`, or other metadata-derived paths, not just on-disk folders.
 - Fast startup and interactive responsiveness.
 - Cross-platform support (Linux/macOS/Windows where feasible).
-- Keep terminal semantics delegated to Ghostty where possible.
+- Keep terminal semantics owned by the Yggterm daemon plus xterm.js unless the Ghostty tradeoff is revisited explicitly.
 - Yggterm should feel remote-first: multiple machines, SSH-heavy workflows, and restoring many live terminal contexts is a core use case.
 
 ## Design philosophy
 
-- Upstream-first integration: prefer using existing interfaces from `../ghostty` and proven layout patterns from `../zed` instead of reimplementing behavior blindly.
+- Upstream-first integration: prefer proven layout patterns from `../zed` and a thin adapter boundary around terminal/runtime dependencies instead of reimplementing behavior blindly.
 - Minimize forks: keep Yggterm-specific code as adapter layers around upstream crates/APIs so upstream pulls stay low-friction.
 - Keep Yggterm-owned shell chrome and session UI in local crates so the desktop frontend stays maintainable and Apache-licensed.
 - Reuse upstream Zed layout ideas and `codex-session-tui` browser behavior, but do not couple the active shell to GPUI crates again unless that tradeoff is revisited explicitly.
-- Replace editor-centric open flows with terminal-centric behavior: selecting a tree node should open, restore, or focus Ghostty sessions rather than text buffers.
-- The central viewport should host Ghostty-backed terminal views in place of file editors.
-- Until Ghostty surfaces are embedded, keep mock terminal bodies and sidebar data inside the Yggterm-owned Dioxus shell rather than building throwaway alternate frontends.
+- Replace editor-centric open flows with terminal-centric behavior: selecting a tree node should open, restore, or focus Yggterm PTY sessions rather than text buffers.
+- The central viewport should host embedded xterm.js terminal views in place of file editors.
+- Keep the active desktop shell centered on real server-owned terminals rather than reviving temporary mock terminal bodies.
 - Session state is local-first under `~/.yggterm`, but the tree model is metadata-first rather than a direct filesystem mirror.
 - Use `~/gh/codex-session-tui` and, when helpful, the local `../zed` checkout as reference material when refining shell shape, chrome, and interaction patterns.
 - Use the running X11 session and screenshots of a live Zed window when validating visual changes to the scaffold.
-- Treat `libghostty` C APIs as the terminal engine contract (app/surface lifecycle, input, render/tick hooks).
-- Keep Rust-to-Ghostty interop thin and explicit via `ghostty-bridge`.
-- On Linux today, `libghostty` links but the upstream embedded surface host remains macOS/iOS-only, so external Ghostty process fallback is still the expected terminal path until upstream support changes.
+- Treat the yggterm daemon PTY API as the active terminal engine contract for the app.
+- Keep any Rust-to-Ghostty interop thin and explicit via `ghostty-bridge`, but do not route the default terminal path through it.
 - Rust is the primary language for product code.
 - Zig is required for Ghostty integration work; prefer stable Zig releases (including official stable tarballs) for reproducible builds.
 - Quality-of-life features such as full session restore, clipboard and screenshot paste into remote sessions, and durable session metadata are first-class product goals.
@@ -54,7 +53,7 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 ## Agent workflow expectations
 
 - Treat this as an integration-heavy systems project.
-- When adding code, include clear ownership boundaries between Rust app logic and Ghostty FFI.
+- When adding code, include clear ownership boundaries between Rust app logic, PTY runtime, and any optional Ghostty FFI.
 - Prefer incremental, testable changes.
 - Document integration assumptions in `README.md` or module-level docs.
 - The active shell is Dioxus-based. Keep steering it toward a polished Zed-shaped terminal workspace rather than rebuilding parallel frontend experiments.

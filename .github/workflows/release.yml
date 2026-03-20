@@ -26,6 +26,9 @@ jobs:
           - label: macos-aarch64
             runs_on: macos-14
             target: aarch64-apple-darwin
+          - label: windows-x86_64
+            runs_on: windows-2022
+            target: x86_64-pc-windows-msvc
     steps:
       - name: Checkout
         uses: actions/checkout@v4

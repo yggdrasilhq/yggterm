@@ -10,7 +10,7 @@ name = "yggterm"
 path = "src/main.rs"
 
 [features]
-default = ["ghostty-ffi"]
+default = []
 ghostty-ffi = ["yggterm-server/ghostty-ffi"]
 
 [dependencies]
