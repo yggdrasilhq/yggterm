@@ -21,6 +21,7 @@ use yggterm_platform::DockRect;
 use yggterm_server::{
     ManagedSessionView, PreviewTone, ServerEndpoint, ServerUiSnapshot, SessionMetadataEntry,
     ServerRuntimeStatus, SessionPreviewBlock, SshConnectTarget, TerminalBackend,
+    GhosttyTerminalHostMode,
     WorkspaceViewMode, YggtermServer, connect_ssh, focus_live, open_stored_session,
     raise_external_window, request_terminal_launch,
     set_all_preview_blocks_folded, set_view_mode as daemon_set_view_mode, status,
@@ -955,6 +956,9 @@ fn ghostty_dock_request(
 
     let session = snapshot.active_session.as_ref()?;
     if session.backend != TerminalBackend::Ghostty {
+        return None;
+    }
+    if session.terminal_host_mode != GhosttyTerminalHostMode::ControlledDock {
         return None;
     }
 
@@ -2296,6 +2300,21 @@ fn TerminalCanvas(
     snapshot: RenderSnapshot,
     on_focus_host: EventHandler<MouseEvent>,
 ) -> Element {
+    let host_badge = match session.terminal_host_mode {
+        GhosttyTerminalHostMode::EmbeddedSurface => "Embedded Host",
+        GhosttyTerminalHostMode::ControlledDock => "Docked Host",
+        GhosttyTerminalHostMode::ExternalWindow => "External Host",
+        GhosttyTerminalHostMode::Unsupported => "Mock Host",
+    };
+    let host_note = match session.terminal_host_mode {
+        GhosttyTerminalHostMode::EmbeddedSurface => session
+            .embedded_surface_detail
+            .clone()
+            .unwrap_or_else(|| "The macOS libghostty host slot is reserved for this session.".to_string()),
+        GhosttyTerminalHostMode::ControlledDock => "Linux controlled docking keeps a dedicated Ghostty window aligned to this viewport.".to_string(),
+        GhosttyTerminalHostMode::ExternalWindow => "This platform still uses an external Ghostty window for the active terminal session.".to_string(),
+        GhosttyTerminalHostMode::Unsupported => "Ghostty hosting is not active for this session in the current build.".to_string(),
+    };
     rsx! {
         div {
             style: "display:flex; flex-direction:column; gap:16px;",
@@ -2318,6 +2337,26 @@ fn TerminalCanvas(
                         style: "font-size:11px; color:rgba(148,163,184,0.92);",
                         "{session.status_line}"
                     }
+                }
+                div {
+                    style: "display:flex; align-items:center; gap:10px; flex-wrap:wrap;",
+                    span {
+                        style: format!(
+                            "display:inline-flex; align-items:center; justify-content:center; min-width:108px; height:24px; padding:0 10px; border-radius:999px; background:rgba(125,211,252,0.12); color:{}; font-size:11px; font-weight:700;",
+                            snapshot.palette.accent
+                        ),
+                        "{host_badge}"
+                    }
+                    if let Some(surface_id) = session.embedded_surface_id.clone() {
+                        span {
+                            style: "font-size:11px; color:rgba(148,163,184,0.92);",
+                            "surface {surface_id}"
+                        }
+                    }
+                }
+                div {
+                    style: "padding:12px 14px; border-radius:14px; background:rgba(255,255,255,0.06); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.08); font-size:13px; line-height:1.55; color:#d6e2ef;",
+                    "{host_note}"
                 }
                 div {
                     style: "display:flex; flex-direction:column; gap:8px; font-family:'Iosevka Term','JetBrains Mono','Fira Code',monospace; color:#d6e2ef;",

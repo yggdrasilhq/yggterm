@@ -12,5 +12,6 @@ ghostty-ffi = []
 [dependencies]
 anyhow.workspace = true
 thiserror.workspace = true
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
