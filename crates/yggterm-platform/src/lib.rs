@@ -28,7 +28,7 @@ pub struct ControlledGhosttyLaunch {
     pub lines: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DockRect {
     pub x: i32,
     pub y: i32,
@@ -152,7 +152,7 @@ pub fn sync_docked_ghostty_window(
         &rect.x.to_string(),
         &rect.y.to_string(),
     ])?;
-    run_xdotool(["windowraise", &window_id])?;
+    focus_docked_ghostty_window(&window_id)?;
 
     Ok(DockedGhosttyWindow { window_id })
 }
@@ -163,6 +163,15 @@ pub fn hide_docked_ghostty_window(window_id: &str) -> Result<()> {
         bail!(status.detail);
     }
     run_xdotool(["windowunmap", window_id])
+}
+
+pub fn focus_docked_ghostty_window(window_id: &str) -> Result<()> {
+    let status = controlled_ghostty_status();
+    if !status.available {
+        bail!(status.detail);
+    }
+    run_xdotool(["windowraise", window_id])?;
+    run_xdotool(["windowactivate", "--sync", window_id])
 }
 
 fn resolve_x11_window(pid: Option<u32>, token: Option<&str>) -> Result<String> {
