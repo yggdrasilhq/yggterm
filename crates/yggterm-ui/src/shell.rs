@@ -915,16 +915,17 @@ fn spawn_dock_retry(state: Signal<ShellState>, request: GhosttyDockRequest) {
     });
 }
 
-fn spawn_dock_hide(mut state: Signal<ShellState>, window_id: String) {
+fn spawn_dock_hide(mut state: Signal<ShellState>, pid: Option<u32>, window_id: String) {
     if state.read().dock_sync_in_flight {
         return;
     }
 
     state.with_mut(|shell| shell.dock_sync_in_flight = true);
     spawn(async move {
-        let outcome =
-            task::spawn_blocking(move || yggterm_platform::hide_docked_ghostty_window(&window_id))
-                .await;
+        let outcome = task::spawn_blocking(move || {
+            yggterm_platform::hide_docked_ghostty_window(pid, &window_id)
+        })
+        .await;
         state.with_mut(|shell| {
             shell.dock_sync_in_flight = false;
             shell.docked_window_id = None;
@@ -963,7 +964,6 @@ fn ghostty_dock_request(
     }
 
     let pid = session.terminal_process_id?;
-    let outer = desktop.outer_position().ok()?;
     let inner = desktop.inner_size();
     let scale = desktop.scale_factor();
     let left_sidebar = if snapshot.sidebar_open {
@@ -982,8 +982,8 @@ fn ghostty_dock_request(
     let bottom_padding = 10.0;
     let frame_inset = 1.0;
 
-    let x = outer.x + ((left_sidebar + frame_inset) * scale).round() as i32;
-    let y = outer.y + ((titlebar_height + top_padding + frame_inset) * scale).round() as i32;
+    let x = ((left_sidebar + frame_inset) * scale).round() as i32;
+    let y = ((titlebar_height + top_padding + frame_inset) * scale).round() as i32;
     let width = inner.width.saturating_sub(
         ((left_sidebar + right_sidebar + right_padding + frame_inset * 2.0) * scale).round()
             as u32,
@@ -1119,7 +1119,15 @@ fn app() -> Element {
                     || shell.last_dock_signature.as_ref() != Some(&request.signature())
             });
             let window_to_hide = if request.is_none() {
-                shell.docked_window_id.clone()
+                shell.docked_window_id.clone().map(|window_id| {
+                    (
+                        shell
+                            .server
+                            .active_session()
+                            .and_then(|session| session.terminal_process_id),
+                        window_id,
+                    )
+                })
             } else {
                 None
             };
@@ -1129,8 +1137,8 @@ fn app() -> Element {
             && should_sync
         {
             spawn_dock_sync(state, request);
-        } else if let Some(window_id) = window_to_hide {
-            spawn_dock_hide(state, window_id);
+        } else if let Some((pid, window_id)) = window_to_hide {
+            spawn_dock_hide(state, pid, window_id);
         }
     });
     let snapshot = state.read().snapshot();
