@@ -9,7 +9,9 @@ pub use daemon::{
     request_terminal_launch, set_all_preview_blocks_folded, set_view_mode, snapshot, status,
     sync_external_window, sync_theme, toggle_preview_block,
 };
-pub use host::{GhosttyHostKind, GhosttyHostSupport, detect_ghostty_host};
+pub use host::{
+    GhosttyHostKind, GhosttyHostSupport, GhosttyTerminalHostMode, detect_ghostty_host,
+};
 
 use yggterm_core::{SessionNode, TranscriptRole, UiTheme, read_codex_transcript_messages};
 use serde::{Deserialize, Serialize};
@@ -142,6 +144,9 @@ pub struct SnapshotSessionView {
     pub terminal_process_id: Option<u32>,
     pub terminal_window_id: Option<String>,
     pub terminal_host_token: Option<String>,
+    pub terminal_host_mode: GhosttyTerminalHostMode,
+    pub embedded_surface_id: Option<String>,
+    pub embedded_surface_detail: Option<String>,
     pub last_launch_error: Option<String>,
     pub last_window_error: Option<String>,
     pub ssh_target: Option<String>,
@@ -202,6 +207,9 @@ pub struct ManagedSessionView {
     pub terminal_process_id: Option<u32>,
     pub terminal_window_id: Option<String>,
     pub terminal_host_token: Option<String>,
+    pub terminal_host_mode: GhosttyTerminalHostMode,
+    pub embedded_surface_id: Option<String>,
+    pub embedded_surface_detail: Option<String>,
     pub last_launch_error: Option<String>,
     pub last_window_error: Option<String>,
     pub ssh_target: Option<String>,
@@ -532,6 +540,9 @@ impl YggtermServer {
                             session.terminal_process_id = outcome.process_id;
                             session.terminal_window_id = None;
                             session.terminal_host_token = outcome.host_token;
+                            session.terminal_host_mode = outcome.host_mode;
+                            session.embedded_surface_id = outcome.embedded_surface_id;
+                            session.embedded_surface_detail = outcome.embedded_surface_detail;
                             session.last_launch_error = None;
                             session.last_window_error = None;
                             session.launch_phase = if outcome.embedded_surface_reserved {
@@ -591,9 +602,30 @@ impl YggtermServer {
                 );
                 upsert_session_metadata(
                     &mut session.metadata,
+                    "Host Mode",
+                    describe_terminal_host_mode(session.terminal_host_mode).to_string(),
+                );
+                upsert_session_metadata(
+                    &mut session.metadata,
                     "Host Token",
                     session
                         .terminal_host_token
+                        .clone()
+                        .unwrap_or_else(|| "none".to_string()),
+                );
+                upsert_session_metadata(
+                    &mut session.metadata,
+                    "Embedded Surface",
+                    session
+                        .embedded_surface_id
+                        .clone()
+                        .unwrap_or_else(|| "none".to_string()),
+                );
+                upsert_session_metadata(
+                    &mut session.metadata,
+                    "Embedded Host",
+                    session
+                        .embedded_surface_detail
                         .clone()
                         .unwrap_or_else(|| "none".to_string()),
                 );
@@ -783,6 +815,9 @@ fn snapshot_session_view(session: ManagedSessionView) -> SnapshotSessionView {
         terminal_process_id: session.terminal_process_id,
         terminal_window_id: session.terminal_window_id,
         terminal_host_token: session.terminal_host_token,
+        terminal_host_mode: session.terminal_host_mode,
+        embedded_surface_id: session.embedded_surface_id,
+        embedded_surface_detail: session.embedded_surface_detail,
         last_launch_error: session.last_launch_error,
         last_window_error: session.last_window_error,
         ssh_target: session.ssh_target,
@@ -850,6 +885,9 @@ fn managed_session_from_snapshot(session: SnapshotSessionView) -> ManagedSession
         terminal_process_id: session.terminal_process_id,
         terminal_window_id: session.terminal_window_id,
         terminal_host_token: session.terminal_host_token,
+        terminal_host_mode: session.terminal_host_mode,
+        embedded_surface_id: session.embedded_surface_id,
+        embedded_surface_detail: session.embedded_surface_detail,
         last_launch_error: session.last_launch_error,
         last_window_error: session.last_window_error,
         ssh_target: session.ssh_target,
@@ -1142,6 +1180,10 @@ fn build_session(
             format!("$ codex resume {session_id}"),
             format!("Ghostty terminal host: {backend_label}"),
             "yggterm server launches ghostty for terminal mode".to_string(),
+            format!(
+                "Host strategy: {}",
+                describe_terminal_host_mode(ghostty_host_mode(backend, ghostty_bridge_enabled))
+            ),
             embedded_surface_note(ghostty_bridge_enabled),
         ],
         rendered_sections: vec![
@@ -1166,6 +1208,9 @@ fn build_session(
         terminal_process_id: None,
         terminal_window_id: None,
         terminal_host_token: None,
+        terminal_host_mode: ghostty_host_mode(backend, ghostty_bridge_enabled),
+        embedded_surface_id: None,
+        embedded_surface_detail: None,
         last_launch_error: None,
         last_window_error: None,
         ssh_target: None,
@@ -1220,6 +1265,10 @@ fn build_live_session(
             ),
             "Remote bootstrap: copy yggterm binary if missing".to_string(),
             "Ghostty bridge: request main viewport surface".to_string(),
+            format!(
+                "Host strategy: {}",
+                describe_terminal_host_mode(ghostty_host_mode(backend, ghostty_bridge_enabled))
+            ),
         ],
         rendered_sections: vec![],
         preview: SessionPreview {
@@ -1317,6 +1366,9 @@ fn build_live_session(
         terminal_process_id: None,
         terminal_window_id: None,
         terminal_host_token: None,
+        terminal_host_mode: ghostty_host_mode(backend, ghostty_bridge_enabled),
+        embedded_surface_id: None,
+        embedded_surface_detail: None,
         last_launch_error: None,
         last_window_error: None,
         ssh_target: Some(target.ssh_target.clone()),
@@ -1478,6 +1530,30 @@ fn embedded_surface_note(bridge_available: bool) -> String {
     } else {
         "The active host adapter decides whether this session lands in an embedded surface or an external Ghostty window."
             .to_string()
+    }
+}
+
+fn ghostty_host_mode(
+    backend: TerminalBackend,
+    ghostty_bridge_enabled: bool,
+) -> GhosttyTerminalHostMode {
+    if backend != TerminalBackend::Ghostty || !ghostty_bridge_enabled {
+        GhosttyTerminalHostMode::Unsupported
+    } else if cfg!(target_os = "macos") {
+        GhosttyTerminalHostMode::EmbeddedSurface
+    } else if cfg!(target_os = "linux") {
+        GhosttyTerminalHostMode::ControlledDock
+    } else {
+        GhosttyTerminalHostMode::ExternalWindow
+    }
+}
+
+fn describe_terminal_host_mode(mode: GhosttyTerminalHostMode) -> &'static str {
+    match mode {
+        GhosttyTerminalHostMode::EmbeddedSurface => "embedded surface",
+        GhosttyTerminalHostMode::ControlledDock => "controlled dock",
+        GhosttyTerminalHostMode::ExternalWindow => "external window",
+        GhosttyTerminalHostMode::Unsupported => "unsupported",
     }
 }
 

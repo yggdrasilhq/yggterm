@@ -6,6 +6,8 @@ use thiserror::Error;
 pub enum GhosttyBridgeError {
     #[error("ghostty FFI is not enabled in this build")]
     FfiDisabled,
+    #[error("embedded ghostty surfaces are not available on this platform")]
+    EmbeddedSurfaceUnsupported,
 }
 
 pub type Result<T> = std::result::Result<T, GhosttyBridgeError>;
@@ -35,6 +37,18 @@ impl GhosttyEnvironment {
 pub enum GhosttySurfaceEmbedding {
     Supported,
     Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GhosttyEmbeddedRuntime {
+    MacosLibghostty,
+}
+
+#[derive(Debug, Clone)]
+pub struct GhosttyEmbeddedSurfaceReservation {
+    pub surface_id: String,
+    pub runtime: GhosttyEmbeddedRuntime,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +93,36 @@ pub fn initialize_bridge() -> Result<()> {
         Ok(())
     } else {
         Err(GhosttyBridgeError::FfiDisabled)
+    }
+}
+
+pub fn reserve_embedded_surface(
+    surface_id_hint: Option<&str>,
+) -> Result<GhosttyEmbeddedSurfaceReservation> {
+    if !bridge_status().ffi_enabled {
+        return Err(GhosttyBridgeError::FfiDisabled);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use uuid::Uuid;
+
+        let surface_id = surface_id_hint
+            .filter(|value| !value.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("yggterm-surface-{}", Uuid::new_v4().simple()));
+        return Ok(GhosttyEmbeddedSurfaceReservation {
+            surface_id,
+            runtime: GhosttyEmbeddedRuntime::MacosLibghostty,
+            detail: "Reserved a libghostty surface identity for the macOS embedded host path."
+                .to_string(),
+        });
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = surface_id_hint;
+        Err(GhosttyBridgeError::EmbeddedSurfaceUnsupported)
     }
 }
 
