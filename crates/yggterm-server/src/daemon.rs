@@ -51,6 +51,9 @@ pub enum ServerRequest {
     ConnectSsh {
         target_ix: usize,
     },
+    StartLocalSession {
+        session_kind: SessionKind,
+    },
     FocusLive {
         key: String,
     },
@@ -220,6 +223,11 @@ impl DaemonRuntime {
                 let key = self.server.connect_ssh_target(target_ix);
                 self.persist()?;
                 self.snapshot_response(key.map(|key| format!("connected {key}")))
+            }
+            ServerRequest::StartLocalSession { session_kind } => {
+                let key = self.server.start_local_session(session_kind);
+                self.persist()?;
+                self.snapshot_response(Some(format!("started {key}")))
             }
             ServerRequest::FocusLive { key } => {
                 self.server.focus_live_session(&key);
@@ -394,6 +402,16 @@ pub fn connect_ssh(endpoint: &ServerEndpoint, target_ix: usize) -> Result<(Serve
     expect_snapshot(send_request(
         endpoint,
         &ServerRequest::ConnectSsh { target_ix },
+    )?)
+}
+
+pub fn start_local_session(
+    endpoint: &ServerEndpoint,
+    kind: SessionKind,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
+    expect_snapshot(send_request(
+        endpoint,
+        &ServerRequest::StartLocalSession { session_kind: kind },
     )?)
 }
 

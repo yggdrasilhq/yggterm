@@ -31,6 +31,7 @@ This repository is still scaffolding.
 - `yggterm server attach <uuid>` now creates reusable attach metadata under `~/.yggterm/runtime/attach/<uuid>/session.json` and falls back to `tmux` or the user shell.
 - Workspace documents are now stored under `~/.yggterm/workspace.db` and can be loaded into the same browser tree as Codex sessions.
 - The connect rail can now create both SSH-backed sessions and plain local shell sessions through the same daemon/runtime path.
+- The connect rail can now start fresh local agent sessions too, with a persisted `Codex` or `Codex LiteLLM` profile chosen from settings.
 - Session context menus can now create nearby notes so a workspace can keep a terminal and its scratch document together.
 - `yggterm` now opens the Dioxus shell directly.
 - The old CLI subcommands and the `eframe` scaffold path have been removed.
@@ -65,6 +66,7 @@ This is the direction:
 - preview mode and terminal mode are two lenses on the same underlying workspace
 - documents live near the sessions and commands they belong to
 - local shells and SSH shells share the same embedded terminal path instead of becoming special cases
+- agent sessions use the same daemon-owned PTY lifecycle, so Codex, Codex LiteLLM, and plain shells all restore through one runtime model
 - fast local metadata stores keep startup cheap even when the tree gets large
 
 References to keep in mind while iterating:
@@ -150,6 +152,8 @@ Inside the desktop shell, the same document model is available from a session ro
 ## Daemon lifecycle
 
 The desktop app talks to a long-lived `yggterm server daemon`. That daemon owns the PTYs and session restore state so terminals do not disappear just because the UI switched to preview mode or focused a different item.
+
+When the UI exits, the daemon is asked to shut down gracefully. Codex-flavored sessions receive `/quit`, while plain shells receive `exit`, before the PTY manager escalates to process termination.
 
 You can stop the daemon explicitly:
 

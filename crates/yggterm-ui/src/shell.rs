@@ -17,8 +17,8 @@ use tokio::task;
 use tokio::time::sleep;
 use tracing::{info, warn};
 use yggterm_core::{
-    AppSettings, BrowserRow, BrowserRowKind, SessionBrowserState, SessionNode, SessionStore,
-    UiTheme, save_settings_file,
+    AgentSessionProfile, AppSettings, BrowserRow, BrowserRowKind, SessionBrowserState,
+    SessionNode, SessionStore, UiTheme, save_settings_file,
 };
 use yggterm_platform::DockRect;
 use yggterm_server::{
@@ -28,8 +28,8 @@ use yggterm_server::{
     GhosttyTerminalHostMode, WorkspaceViewMode, YggtermServer, connect_ssh, focus_live,
     open_stored_session, request_terminal_launch,
     set_all_preview_blocks_folded, set_view_mode as daemon_set_view_mode, status,
-    snapshot as daemon_snapshot, ping, terminal_ensure, terminal_read, terminal_resize,
-    terminal_write,
+    snapshot as daemon_snapshot, ping, start_local_session, terminal_ensure, terminal_read,
+    terminal_resize, terminal_write,
     toggle_preview_block as daemon_toggle_preview_block,
 };
 
@@ -453,6 +453,17 @@ impl ShellState {
         self.last_action = "updated interface llm".to_string();
     }
 
+    fn update_default_agent_profile(&mut self, profile: AgentSessionProfile) {
+        self.settings.default_agent_profile = profile;
+        self.persist_settings();
+        self.last_action = match profile {
+            AgentSessionProfile::Codex => "new sessions now default to codex".to_string(),
+            AgentSessionProfile::CodexLiteLlm => {
+                "new sessions now default to codex-litellm".to_string()
+            }
+        };
+    }
+
     fn adjust_ui_zoom(&mut self, delta_steps: i32) {
         self.settings.ui_font_size = clamp_zoom_value(self.settings.ui_font_size + delta_steps as f32);
         self.persist_settings();
@@ -851,11 +862,30 @@ fn spawn_open_session_row(mut state: Signal<ShellState>, row: BrowserRow) {
     );
 }
 
+fn spawn_start_local_agent_session(state: Signal<ShellState>) {
+    let kind = agent_profile_kind(state.read().settings.default_agent_profile);
+    let pending = match kind {
+        SessionKind::Codex => "starting codex session".to_string(),
+        SessionKind::CodexLiteLlm => "starting codex-litellm session".to_string(),
+        _ => "starting local session".to_string(),
+    };
+    spawn_server_snapshot_action(state, pending, move |endpoint| {
+        start_local_session(&endpoint, kind)
+    });
+}
+
 fn session_kind_for_row(kind: BrowserRowKind) -> SessionKind {
     match kind {
         BrowserRowKind::Session => SessionKind::Codex,
         BrowserRowKind::Document => SessionKind::Document,
         BrowserRowKind::Group => SessionKind::Codex,
+    }
+}
+
+fn agent_profile_kind(profile: AgentSessionProfile) -> SessionKind {
+    match profile {
+        AgentSessionProfile::Codex => SessionKind::Codex,
+        AgentSessionProfile::CodexLiteLlm => SessionKind::CodexLiteLlm,
     }
 }
 
@@ -1344,9 +1374,13 @@ fn app() -> Element {
                         on_endpoint_change: move |value: String| state.with_mut(|shell| shell.update_litellm_endpoint(value)),
                         on_api_key_change: move |value: String| state.with_mut(|shell| shell.update_litellm_api_key(value)),
                         on_model_change: move |value: String| state.with_mut(|shell| shell.update_interface_llm_model(value)),
+                        on_set_agent_profile: move |profile: AgentSessionProfile| {
+                            state.with_mut(|shell| shell.update_default_agent_profile(profile))
+                        },
                         on_generate_titles: move |_| state.with_mut(|shell| shell.generate_session_titles()),
                         on_adjust_ui_zoom: move |delta: i32| state.with_mut(|shell| shell.adjust_ui_zoom(delta)),
                         on_adjust_main_zoom: move |delta: i32| state.with_mut(|shell| shell.adjust_main_zoom(delta)),
+                        on_start_local_agent_session: move |_| spawn_start_local_agent_session(state),
                         on_connect_ssh: move |ix: usize| spawn_server_snapshot_action(
                             state,
                             "connecting ssh".to_string(),
@@ -2722,9 +2756,11 @@ fn RightRail(
     on_endpoint_change: EventHandler<String>,
     on_api_key_change: EventHandler<String>,
     on_model_change: EventHandler<String>,
+    on_set_agent_profile: EventHandler<AgentSessionProfile>,
     on_generate_titles: EventHandler<MouseEvent>,
     on_adjust_ui_zoom: EventHandler<i32>,
     on_adjust_main_zoom: EventHandler<i32>,
+    on_start_local_agent_session: EventHandler<MouseEvent>,
     on_connect_ssh: EventHandler<usize>,
     on_focus_live: EventHandler<String>,
     on_clear_notification: EventHandler<u64>,
@@ -2754,6 +2790,7 @@ fn RightRail(
                     on_endpoint_change,
                     on_api_key_change,
                     on_model_change,
+                    on_set_agent_profile,
                     on_generate_titles,
                     on_adjust_ui_zoom,
                     on_adjust_main_zoom,
@@ -2761,6 +2798,7 @@ fn RightRail(
             } else if snapshot.right_panel_mode == RightPanelMode::Connect {
                 ConnectRailBody {
                     snapshot: snapshot.clone(),
+                    on_start_local_agent_session,
                     on_connect_ssh,
                     on_focus_live,
                 }
@@ -2822,6 +2860,7 @@ fn SettingsRailBody(
     on_endpoint_change: EventHandler<String>,
     on_api_key_change: EventHandler<String>,
     on_model_change: EventHandler<String>,
+    on_set_agent_profile: EventHandler<AgentSessionProfile>,
     on_generate_titles: EventHandler<MouseEvent>,
     on_adjust_ui_zoom: EventHandler<i32>,
     on_adjust_main_zoom: EventHandler<i32>,
@@ -2861,6 +2900,12 @@ fn SettingsRailBody(
                 secret: false,
                 palette: snapshot.palette,
                 on_change: on_model_change,
+            }
+            ProfileToggleRow {
+                label: "Agent Session".to_string(),
+                palette: snapshot.palette,
+                selected: snapshot.settings.default_agent_profile,
+                on_select: on_set_agent_profile,
             }
             ZoomSettingRow {
                 label: "Interface Zoom".to_string(),
@@ -2938,6 +2983,7 @@ fn NotificationsRailBody(
 #[component]
 fn ConnectRailBody(
     snapshot: RenderSnapshot,
+    on_start_local_agent_session: EventHandler<MouseEvent>,
     on_connect_ssh: EventHandler<usize>,
     on_focus_live: EventHandler<String>,
 ) -> Element {
@@ -2951,9 +2997,31 @@ fn ConnectRailBody(
         }
         div {
             style: "flex:1; overflow:auto; padding:10px 16px 14px 16px; display:flex; flex-direction:column; gap:16px;",
+            div {
+                style: "display:flex; flex-direction:column; gap:8px;",
+                button {
+                    style: sidebar_action_style(snapshot.palette),
+                    onclick: move |evt| on_start_local_agent_session.call(evt),
+                    div {
+                        style: "display:flex; flex-direction:column; align-items:flex-start; gap:3px; min-width:0;",
+                        span {
+                            style: format!("font-size:12px; font-weight:700; color:{};", snapshot.palette.text),
+                            "New Agent Session"
+                        }
+                        span {
+                            style: format!("font-size:11px; line-height:1.35; color:{}; white-space:pre-wrap;", snapshot.palette.muted),
+                            "{agent_profile_label(snapshot.settings.default_agent_profile)} · {agent_profile_command(snapshot.settings.default_agent_profile)}"
+                        }
+                    }
+                }
+            }
             if !snapshot.ssh_targets.is_empty() {
                 div {
                     style: "display:flex; flex-direction:column; gap:8px;",
+                    div {
+                        style: format!("font-size:11px; font-weight:700; color:{};", snapshot.palette.muted),
+                        "Shell Targets"
+                    }
                     for (ix, target) in snapshot.ssh_targets.iter().cloned().enumerate() {
                         {
                             let target_detail = if target.kind == SessionKind::Shell {
@@ -3157,6 +3225,20 @@ fn toast_right_inset(right_panel_mode: RightPanelMode) -> usize {
     18
 }
 
+fn agent_profile_label(profile: AgentSessionProfile) -> &'static str {
+    match profile {
+        AgentSessionProfile::Codex => "Codex",
+        AgentSessionProfile::CodexLiteLlm => "Codex LiteLLM",
+    }
+}
+
+fn agent_profile_command(profile: AgentSessionProfile) -> &'static str {
+    match profile {
+        AgentSessionProfile::Codex => "launches `codex`",
+        AgentSessionProfile::CodexLiteLlm => "launches `codex-litellm`",
+    }
+}
+
 #[component]
 fn SettingsField(
     label: String,
@@ -3179,6 +3261,46 @@ fn SettingsField(
                 placeholder: "{placeholder}",
                 style: settings_input_style(palette),
                 oninput: move |evt| on_change.call(evt.value()),
+            }
+        }
+    }
+}
+
+#[component]
+fn ProfileToggleRow(
+    label: String,
+    selected: AgentSessionProfile,
+    palette: Palette,
+    on_select: EventHandler<AgentSessionProfile>,
+) -> Element {
+    rsx! {
+        div {
+            style: "display:flex; flex-direction:column; gap:6px;",
+            div {
+                style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", palette.muted),
+                "{label}"
+            }
+            div {
+                style: format!(
+                    "display:flex; align-items:center; gap:6px; height:32px; padding:4px; border:none; border-radius:10px; \
+                     background:rgba(255,255,255,0.58); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.34);"
+                ),
+                button {
+                    style: profile_toggle_button_style(
+                        palette,
+                        selected == AgentSessionProfile::Codex,
+                    ),
+                    onclick: move |_| on_select.call(AgentSessionProfile::Codex),
+                    "Codex"
+                }
+                button {
+                    style: profile_toggle_button_style(
+                        palette,
+                        selected == AgentSessionProfile::CodexLiteLlm,
+                    ),
+                    onclick: move |_| on_select.call(AgentSessionProfile::CodexLiteLlm),
+                    "Codex LiteLLM"
+                }
             }
         }
     }
@@ -3409,6 +3531,20 @@ fn zoom_button_style(palette: Palette) -> String {
         "width:22px; height:22px; border:none; border-radius:8px; background:rgba(255,255,255,0.36); \
          color:{}; font-size:13px; font-weight:700; display:inline-flex; align-items:center; justify-content:center;",
         palette.text
+    )
+}
+
+fn profile_toggle_button_style(palette: Palette, selected: bool) -> String {
+    format!(
+        "flex:1; height:24px; border:none; border-radius:8px; background:{}; color:{}; font-size:11px; font-weight:{}; \
+         display:inline-flex; align-items:center; justify-content:center;",
+        if selected {
+            "rgba(255,255,255,0.78)"
+        } else {
+            "transparent"
+        },
+        if selected { palette.text } else { palette.muted },
+        if selected { 700 } else { 600 }
     )
 }
 

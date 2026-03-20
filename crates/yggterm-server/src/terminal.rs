@@ -222,14 +222,19 @@ impl PtySessionRuntime {
     }
 
     fn shutdown(&self, stop_command: Option<&str>) -> Result<()> {
+        let mut child = self.child.lock().expect("pty child lock poisoned");
         if let Some(command) = stop_command
             && !command.is_empty()
         {
             let _ = self.write(command);
-            thread::sleep(Duration::from_millis(180));
+            for _ in 0..12 {
+                if child.try_wait().context("checking terminal exit state")?.is_some() {
+                    return Ok(());
+                }
+                thread::sleep(Duration::from_millis(120));
+            }
         }
 
-        let mut child = self.child.lock().expect("pty child lock poisoned");
         let _ = child.kill();
         let _ = child.wait();
         Ok(())
