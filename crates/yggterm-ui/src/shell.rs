@@ -461,7 +461,7 @@ impl ShellState {
         self.settings.terminal_font_size =
             clamp_zoom_value_main(self.settings.terminal_font_size + delta_steps as f32);
         self.persist_settings();
-        self.last_action = format!("main zoom {}%", zoom_percent(self.settings.terminal_font_size, 13.0));
+        self.last_action = format!("terminal zoom {}%", zoom_percent(self.settings.terminal_font_size, 10.0));
     }
 
     fn toggle_maximized(&mut self) {
@@ -1224,11 +1224,6 @@ fn app() -> Element {
                                 move |endpoint| daemon_toggle_preview_block(&endpoint, ix),
                             )
                         },
-                        on_request_terminal: move || spawn_server_snapshot_action(
-                            state,
-                            "requesting terminal".to_string(),
-                            |endpoint| request_terminal_launch(&endpoint),
-                        ),
                         on_set_preview_layout: move |mode: PreviewLayoutMode| state.with_mut(|shell| shell.set_preview_layout(mode)),
                     }
                     RightRail {
@@ -1952,7 +1947,6 @@ fn MainSurface(
     on_expand_preview: EventHandler<()>,
     on_collapse_preview: EventHandler<()>,
     on_toggle_preview_block: EventHandler<usize>,
-    on_request_terminal: EventHandler<()>,
     on_set_preview_layout: EventHandler<PreviewLayoutMode>,
 ) -> Element {
     let body = if let Some(session) = snapshot.active_session.clone() {
@@ -1999,7 +1993,6 @@ fn MainSurface(
                         key: "{session.session_path}",
                         session: session.clone(),
                         snapshot: snapshot.clone(),
-                        on_request_terminal: move |_| on_request_terminal.call(()),
                     }
                 }
             },
@@ -2019,9 +2012,9 @@ fn MainSurface(
                 style: format!(
                     "flex:1; min-height:0; overflow:{}; padding:{}; background:{}; border-radius:11px; box-shadow:{}; zoom:{}%;",
                     if snapshot.active_view_mode == WorkspaceViewMode::Terminal { "hidden" } else { "auto" },
-                    if snapshot.active_view_mode == WorkspaceViewMode::Terminal { "12px" } else { "24px" },
+                    if snapshot.active_view_mode == WorkspaceViewMode::Terminal { "0" } else { "24px" },
                     snapshot.palette.panel, snapshot.palette.panel_shadow,
-                    zoom_percent_f32(snapshot.settings.terminal_font_size, 13.0)
+                    zoom_percent_f32(snapshot.settings.terminal_font_size, 10.0)
                 ),
                 {body}
             }
@@ -2275,7 +2268,6 @@ fn PreviewBlock(
 fn TerminalCanvas(
     session: ManagedSessionView,
     snapshot: RenderSnapshot,
-    on_request_terminal: EventHandler<MouseEvent>,
 ) -> Element {
     let endpoint = BOOTSTRAP
         .get()
@@ -2356,56 +2348,10 @@ fn TerminalCanvas(
             style: "display:flex; flex-direction:column; min-height:0; height:100%;",
             div {
                 style: format!(
-                    "display:flex; flex-direction:column; min-height:0; height:100%; gap:0; border-radius:14px; \
-                     background:{}; box-shadow:0 24px 48px rgba(148,163,184,0.12), inset 0 0 0 1px rgba(214,223,232,0.9); overflow:hidden;",
+                    "display:flex; flex-direction:column; min-height:0; height:100%; gap:0; border-radius:11px; \
+                     background:{}; overflow:hidden;",
                     theme.background
                 ),
-                div {
-                    style: format!(
-                        "display:flex; align-items:center; justify-content:space-between; gap:12px; \
-                         padding:14px 16px; background:{}; border-bottom:1px solid {};",
-                        theme.chrome, theme.chrome_border
-                    ),
-                    div {
-                        style: "display:flex; align-items:center; gap:10px;",
-                        div { style: "width:10px; height:10px; border-radius:999px; background:rgba(248,113,113,0.8);" }
-                        div { style: "width:10px; height:10px; border-radius:999px; background:rgba(251,191,36,0.82);" }
-                        div { style: "width:10px; height:10px; border-radius:999px; background:rgba(74,222,128,0.82);" }
-                        span {
-                            style: format!("margin-left:6px; font-size:12px; font-weight:700; color:{};", theme.chrome_text),
-                            "{session.title}"
-                        }
-                    }
-                    div {
-                        style: "display:flex; align-items:center; gap:10px;",
-                        span {
-                            style: format!("font-size:11px; color:{};", snapshot.palette.muted),
-                            "{session.status_line}"
-                        }
-                        button {
-                            style: chip_style(snapshot.palette, snapshot.server_busy),
-                            onclick: move |evt| on_request_terminal.call(evt),
-                            "Reconnect"
-                        }
-                    }
-                }
-                div {
-                    style: format!(
-                        "display:flex; align-items:center; gap:8px; padding:10px 16px; background:{}; border-bottom:1px solid {};",
-                        theme.chrome, theme.chrome_border
-                    ),
-                    span {
-                        style: format!(
-                            "display:inline-flex; align-items:center; justify-content:center; min-width:94px; height:24px; padding:0 10px; border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:700;",
-                            snapshot.palette.accent_soft, snapshot.palette.accent
-                        ),
-                        "Embedded PTY"
-                    }
-                    span {
-                        style: format!("font-size:12px; color:{};", snapshot.palette.muted),
-                        "The active session is attached to a yggterm-owned PTY and rendered inline through xterm.js."
-                    }
-                }
                 div {
                     id: "{host_id}",
                     style: format!(
@@ -2425,21 +2371,15 @@ struct TerminalTheme {
     cursor: String,
     font_size: f32,
     selection: String,
-    chrome: String,
-    chrome_border: String,
-    chrome_text: String,
 }
 
 fn terminal_theme(palette: Palette, font_size: f32) -> TerminalTheme {
     TerminalTheme {
-        background: "rgba(252,253,255,0.98)".to_string(),
+        background: palette.panel.to_string(),
         foreground: palette.text.to_string(),
         cursor: palette.accent.to_string(),
-        font_size: font_size.max(11.0),
+        font_size: font_size.max(10.0),
         selection: "rgba(107,165,255,0.16)".to_string(),
-        chrome: "rgba(245,249,252,0.98)".to_string(),
-        chrome_border: "rgba(214,223,232,0.9)".to_string(),
-        chrome_text: palette.text.to_string(),
     }
 }
 
@@ -2506,7 +2446,7 @@ fn terminal_eval_script(host_id: &str) -> String {
             allowTransparency: true,
             convertEol: true,
             cursorBlink: true,
-            fontFamily: "'Iosevka Term', 'JetBrains Mono', 'Fira Code', monospace",
+            fontFamily: "'JetBrains Mono', 'Iosevka Term', 'Fira Code', monospace",
             scrollback: 5000,
         }});
         const fitAddon = new window.FitAddon.FitAddon();
@@ -2793,8 +2733,8 @@ fn SettingsRailBody(
                 on_increase: move |_| on_adjust_ui_zoom.call(1),
             }
             ZoomSettingRow {
-                label: "Main Zoom".to_string(),
-                percent: zoom_percent(snapshot.settings.terminal_font_size, 13.0),
+                label: "Terminal Zoom".to_string(),
+                percent: zoom_percent(snapshot.settings.terminal_font_size, 10.0),
                 palette: snapshot.palette,
                 on_decrease: move |_| on_adjust_main_zoom.call(-1),
                 on_increase: move |_| on_adjust_main_zoom.call(1),

@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 use yggterm_core::{SessionStore, UiTheme};
 
+pub const SERVER_PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerEndpoint {
     #[cfg(unix)]
@@ -20,6 +22,7 @@ pub enum ServerEndpoint {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerRuntimeStatus {
+    pub server_version: String,
     pub host_kind: String,
     pub host_detail: String,
     pub embedded_surface_supported: bool,
@@ -136,6 +139,7 @@ impl DaemonRuntime {
 
     fn status(&self) -> ServerRuntimeStatus {
         ServerRuntimeStatus {
+            server_version: SERVER_PROTOCOL_VERSION.to_string(),
             host_kind: self.support.kind.as_str().to_string(),
             host_detail: self.support.detail.clone(),
             embedded_surface_supported: self.support.embedded_surface_supported,
@@ -292,7 +296,10 @@ impl DaemonRuntime {
 pub fn default_endpoint(home_dir: &Path) -> ServerEndpoint {
     #[cfg(unix)]
     {
-        ServerEndpoint::UnixSocket(home_dir.join("server.sock"))
+        ServerEndpoint::UnixSocket(home_dir.join(format!(
+            "server-{}.sock",
+            SERVER_PROTOCOL_VERSION.replace('.', "-")
+        )))
     }
 
     #[cfg(not(unix))]
@@ -300,9 +307,18 @@ pub fn default_endpoint(home_dir: &Path) -> ServerEndpoint {
         let _ = home_dir;
         ServerEndpoint::Tcp {
             host: "127.0.0.1".to_string(),
-            port: 58593,
+            port: versioned_tcp_port(),
         }
     }
+}
+
+#[cfg(not(unix))]
+fn versioned_tcp_port() -> u16 {
+    let mut parts = SERVER_PROTOCOL_VERSION.split('.');
+    let major = parts.next().and_then(|value| value.parse::<u16>().ok()).unwrap_or(2);
+    let minor = parts.next().and_then(|value| value.parse::<u16>().ok()).unwrap_or(0);
+    let patch = parts.next().and_then(|value| value.parse::<u16>().ok()).unwrap_or(0).min(9);
+    58000 + major.saturating_mul(100) + minor.saturating_mul(10) + patch
 }
 
 pub fn ping(endpoint: &ServerEndpoint) -> Result<()> {
