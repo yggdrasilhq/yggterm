@@ -1,10 +1,8 @@
 use anyhow::Result;
 use std::process::{Command, Stdio};
-use std::thread;
-use std::time::Duration;
 use yggterm_core::SessionStore;
 use yggterm_server::{
-    default_endpoint, detect_ghostty_host, ping, run_attach, run_daemon, snapshot, status,
+    default_endpoint, detect_ghostty_host, ping, run_attach, run_daemon,
 };
 
 fn main() -> Result<()> {
@@ -35,9 +33,10 @@ fn main() -> Result<()> {
     let prefer_ghostty_backend = settings.prefer_ghostty_backend;
     let endpoint = default_endpoint(store.home_dir());
     let host = detect_ghostty_host();
-    let server_daemon_detail = ensure_server_daemon(&endpoint)?;
-    let server_runtime = status(&endpoint).ok();
-    let (initial_server_snapshot, _) = snapshot(&endpoint)?;
+    let daemon_connected = ping(&endpoint).is_ok();
+    if !daemon_connected {
+        spawn_server_daemon()?;
+    }
 
     yggterm_ui::launch_shell(yggterm_ui::ShellBootstrap {
         tree,
@@ -45,24 +44,21 @@ fn main() -> Result<()> {
         settings,
         settings_path,
         server_endpoint: endpoint,
-        initial_server_snapshot,
+        initial_server_snapshot: None,
         theme,
         ghostty_bridge_enabled: host.bridge_enabled,
         ghostty_embedded_surface_supported: host.embedded_surface_supported,
-        ghostty_bridge_detail: match &server_runtime {
-            Some(runtime) => format!("{} · server {}", host.detail, runtime.host_kind),
-            None => host.detail.clone(),
+        ghostty_bridge_detail: host.detail.clone(),
+        server_daemon_detail: if daemon_connected {
+            "server connected".to_string()
+        } else {
+            "starting server…".to_string()
         },
-        server_daemon_detail,
         prefer_ghostty_backend,
     })
 }
 
-fn ensure_server_daemon(endpoint: &yggterm_server::ServerEndpoint) -> Result<String> {
-    if ping(endpoint).is_ok() {
-        return Ok(endpoint_detail(endpoint, true));
-    }
-
+fn spawn_server_daemon() -> Result<()> {
     let current_exe = std::env::current_exe()?;
     Command::new(current_exe)
         .arg("server")
@@ -71,26 +67,5 @@ fn ensure_server_daemon(endpoint: &yggterm_server::ServerEndpoint) -> Result<Str
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-
-    for _ in 0..20 {
-        thread::sleep(Duration::from_millis(150));
-        if ping(endpoint).is_ok() {
-            return Ok(endpoint_detail(endpoint, true));
-        }
-    }
-
-    Ok(endpoint_detail(endpoint, false))
-}
-
-fn endpoint_detail(endpoint: &yggterm_server::ServerEndpoint, connected: bool) -> String {
-    let status = if connected { "connected" } else { "unavailable" };
-    match endpoint {
-        #[cfg(unix)]
-        yggterm_server::ServerEndpoint::UnixSocket(path) => {
-            format!("server {status} via {}", path.display())
-        }
-        yggterm_server::ServerEndpoint::Tcp { host, port } => {
-            format!("server {status} via {host}:{port}")
-        }
-    }
+    Ok(())
 }

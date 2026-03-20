@@ -7,6 +7,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use titles::{SessionTitleResolver, settings_ready as litellm_settings_ready};
 
@@ -480,8 +481,9 @@ fn read_codex_session_summary(
 }
 
 fn read_codex_session_identity(path: &Path) -> Result<Option<CodexSessionIdentity>> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("failed to read codex session {}", path.display()))?;
+    let file =
+        fs::File::open(path).with_context(|| format!("failed to read codex session {}", path.display()))?;
+    let reader = BufReader::new(file);
 
     let fallback_id = path
         .file_stem()
@@ -492,8 +494,9 @@ fn read_codex_session_identity(path: &Path) -> Result<Option<CodexSessionIdentit
     let mut session_id = None;
     let mut cwd = None;
 
-    for line in content.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
+    for line in reader.lines() {
+        let line = line.with_context(|| format!("failed to read line from {}", path.display()))?;
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
 
