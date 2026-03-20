@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::process::{Command, Stdio};
 use yggterm_core::SessionStore;
 use yggterm_server::{
-    default_endpoint, detect_ghostty_host, ping, run_attach, run_daemon,
+    default_endpoint, detect_ghostty_host, ping, run_attach, run_daemon, status,
 };
 
 fn main() -> Result<()> {
@@ -34,6 +34,11 @@ fn main() -> Result<()> {
     let endpoint = default_endpoint(store.home_dir());
     let host = detect_ghostty_host();
     let daemon_connected = ping(&endpoint).is_ok();
+    let daemon_status = if daemon_connected {
+        status(&endpoint).ok()
+    } else {
+        None
+    };
     if !daemon_connected {
         spawn_server_daemon()?;
     }
@@ -49,7 +54,9 @@ fn main() -> Result<()> {
         ghostty_bridge_enabled: host.bridge_enabled,
         ghostty_embedded_surface_supported: host.embedded_surface_supported,
         ghostty_bridge_detail: host.detail.clone(),
-        server_daemon_detail: if daemon_connected {
+        server_daemon_detail: if let Some(status) = daemon_status {
+            format!("server {} connected", status.server_version)
+        } else if daemon_connected {
             "server connected".to_string()
         } else {
             "starting server…".to_string()
