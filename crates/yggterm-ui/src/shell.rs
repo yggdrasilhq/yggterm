@@ -70,6 +70,14 @@ struct ShellState {
     needs_initial_server_sync: bool,
     docked_window_id: Option<String>,
     dock_sync_in_flight: bool,
+    last_dock_signature: Option<DockSignature>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct DockSignature {
+    pid: Option<u32>,
+    host_token: Option<String>,
+    rect: DockRect,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -216,6 +224,7 @@ impl ShellState {
             needs_initial_server_sync,
             docked_window_id: None,
             dock_sync_in_flight: false,
+            last_dock_signature: None,
         };
         state.server_daemon_detail = state.bootstrap.server_daemon_detail.clone();
         state.sync_browser_settings();
@@ -812,6 +821,17 @@ struct GhosttyDockRequest {
     known_window_id: Option<String>,
     host_token: Option<String>,
     rect: DockRect,
+    retry_budget: u8,
+}
+
+impl GhosttyDockRequest {
+    fn signature(&self) -> DockSignature {
+        DockSignature {
+            pid: self.pid,
+            host_token: self.host_token.clone(),
+            rect: self.rect,
+        }
+    }
 }
 
 fn spawn_dock_sync(mut state: Signal<ShellState>, request: GhosttyDockRequest) {
@@ -821,16 +841,18 @@ fn spawn_dock_sync(mut state: Signal<ShellState>, request: GhosttyDockRequest) {
 
     state.with_mut(|shell| shell.dock_sync_in_flight = true);
     spawn(async move {
+        let request_for_task = request.clone();
         let outcome = task::spawn_blocking(move || {
             yggterm_platform::sync_docked_ghostty_window(
-                request.pid,
-                request.known_window_id.as_deref(),
-                request.host_token.as_deref(),
-                request.rect,
+                request_for_task.pid,
+                request_for_task.known_window_id.as_deref(),
+                request_for_task.host_token.as_deref(),
+                request_for_task.rect,
             )
         })
         .await;
 
+        let mut retry_request = None;
         state.with_mut(|shell| {
             shell.dock_sync_in_flight = false;
             match outcome {
@@ -838,12 +860,16 @@ fn spawn_dock_sync(mut state: Signal<ShellState>, request: GhosttyDockRequest) {
                     let first_dock =
                         shell.docked_window_id.as_deref() != Some(window.window_id.as_str());
                     shell.docked_window_id = Some(window.window_id.clone());
+                    shell.last_dock_signature = Some(request.signature());
                     if first_dock {
                         shell.last_action = format!("ghostty docked {}", window.window_id);
                     }
                 }
                 Ok(Err(error)) => {
-                    if !is_transient_dock_error(&error.to_string()) {
+                    shell.last_dock_signature = None;
+                    if is_transient_dock_error(&error.to_string()) {
+                        retry_request = Some(request.clone());
+                    } else {
                         shell.last_action = format!("ghostty dock failed: {error}");
                     }
                 }
@@ -852,6 +878,39 @@ fn spawn_dock_sync(mut state: Signal<ShellState>, request: GhosttyDockRequest) {
                 }
             }
         });
+        if let Some(request) = retry_request {
+            spawn_dock_retry(state, request);
+        }
+    });
+}
+
+fn spawn_dock_retry(state: Signal<ShellState>, request: GhosttyDockRequest) {
+    if request.retry_budget == 0 {
+        return;
+    }
+
+    spawn(async move {
+        let _ = task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(250))).await;
+        let should_retry = {
+            let shell = state.read();
+            if shell.server.active_view_mode() != WorkspaceViewMode::Terminal {
+                false
+            } else {
+                shell.server
+                    .active_session()
+                    .map(|session| {
+                        session.backend == TerminalBackend::Ghostty
+                            && session.terminal_process_id == request.pid
+                    })
+                    .unwrap_or(false)
+            }
+        };
+
+        if should_retry {
+            let mut next = request.clone();
+            next.retry_budget = next.retry_budget.saturating_sub(1);
+            spawn_dock_sync(state, next);
+        }
     });
 }
 
@@ -868,6 +927,7 @@ fn spawn_dock_hide(mut state: Signal<ShellState>, window_id: String) {
         state.with_mut(|shell| {
             shell.dock_sync_in_flight = false;
             shell.docked_window_id = None;
+            shell.last_dock_signature = None;
             if let Ok(Err(error)) = outcome
                 && !is_transient_dock_error(&error.to_string())
             {
@@ -943,7 +1003,35 @@ fn ghostty_dock_request(
             width,
             height,
         },
+        retry_budget: 16,
     })
+}
+
+fn focus_docked_host(mut state: Signal<ShellState>) {
+    let window_id = state
+        .read()
+        .docked_window_id
+        .clone()
+        .or_else(|| state.read().server.active_session().and_then(|session| session.terminal_window_id.clone()));
+
+    let Some(window_id) = window_id else {
+        spawn_server_snapshot_action(
+            state,
+            "focusing ghostty".to_string(),
+            |endpoint| raise_external_window(&endpoint),
+        );
+        return;
+    };
+
+    spawn(async move {
+        let focused =
+            task::spawn_blocking(move || yggterm_platform::focus_docked_ghostty_window(&window_id)).await;
+        state.with_mut(|shell| match focused {
+            Ok(Ok(())) => shell.last_action = "ghostty focused".to_string(),
+            Ok(Err(error)) => shell.last_action = format!("ghostty focus failed: {error}"),
+            Err(error) => shell.last_action = format!("ghostty focus task failed: {error}"),
+        });
+    });
 }
 
 pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
@@ -972,6 +1060,7 @@ fn app() -> Element {
     let desktop = use_window();
     let mut hovered = use_signal(|| None::<HoveredControl>);
     let mut startup_sync_started = use_signal(|| false);
+    let mut dock_pulse_started = use_signal(|| false);
     let mut window_epoch = use_signal(|| 0_u64);
     use_wry_event_handler(move |event, _| {
         if let TaoEvent::WindowEvent { event, .. } = event {
@@ -997,11 +1086,46 @@ fn app() -> Element {
         }
     });
     use_effect(move || {
+        if *dock_pulse_started.read() {
+            return;
+        }
+        dock_pulse_started.set(true);
+        spawn(async move {
+            loop {
+                let active = {
+                    let shell = state.read();
+                    shell.server.active_view_mode() == WorkspaceViewMode::Terminal
+                        || shell.docked_window_id.is_some()
+                };
+                if active {
+                    window_epoch.with_mut(|epoch| *epoch += 1);
+                }
+                let _ = task::spawn_blocking(|| thread::sleep(Duration::from_millis(350))).await;
+            }
+        });
+    });
+    use_effect(move || {
         let _ = *window_epoch.read();
         let snapshot = state.read().snapshot();
-        if let Some(request) = ghostty_dock_request(&desktop, &snapshot) {
+        let request = ghostty_dock_request(&desktop, &snapshot);
+        let (should_sync, window_to_hide) = {
+            let shell = state.read();
+            let should_sync = request.as_ref().is_some_and(|request| {
+                shell.docked_window_id.is_none()
+                    || shell.last_dock_signature.as_ref() != Some(&request.signature())
+            });
+            let window_to_hide = if request.is_none() {
+                shell.docked_window_id.clone()
+            } else {
+                None
+            };
+            (should_sync, window_to_hide)
+        };
+        if let Some(request) = request
+            && should_sync
+        {
             spawn_dock_sync(state, request);
-        } else if let Some(window_id) = state.read().docked_window_id.clone() {
+        } else if let Some(window_id) = window_to_hide {
             spawn_dock_hide(state, window_id);
         }
     });
@@ -1083,11 +1207,7 @@ fn app() -> Element {
                             "requesting terminal".to_string(),
                             |endpoint| request_terminal_launch(&endpoint),
                         ),
-                        on_focus_ghostty: move || spawn_server_snapshot_action(
-                            state,
-                            "focusing ghostty".to_string(),
-                            |endpoint| raise_external_window(&endpoint),
-                        ),
+                        on_focus_ghostty: move || focus_docked_host(state),
                         on_resolve_ghostty: move || spawn_server_snapshot_action(
                             state,
                             "resolving ghostty".to_string(),
@@ -1900,6 +2020,7 @@ fn MainSurface(
                     TerminalCanvas {
                         session: session.clone(),
                         snapshot: snapshot.clone(),
+                        on_focus_host: move |_| on_focus_ghostty.call(()),
                     }
                 }
             },
@@ -2170,12 +2291,17 @@ fn PreviewBlock(
 }
 
 #[component]
-fn TerminalCanvas(session: ManagedSessionView, snapshot: RenderSnapshot) -> Element {
+fn TerminalCanvas(
+    session: ManagedSessionView,
+    snapshot: RenderSnapshot,
+    on_focus_host: EventHandler<MouseEvent>,
+) -> Element {
     rsx! {
         div {
             style: "display:flex; flex-direction:column; gap:16px;",
             div {
                 style: "display:flex; flex-direction:column; gap:12px; padding:18px 20px; border-radius:20px; background:linear-gradient(180deg, rgba(13,18,24,0.98) 0%, rgba(19,27,35,0.97) 100%); box-shadow:0 28px 48px rgba(10,17,26,0.26), inset 0 0 0 1px rgba(132,155,177,0.12);",
+                onclick: move |evt| on_focus_host.call(evt),
                 div {
                     style: "display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;",
                     div {
