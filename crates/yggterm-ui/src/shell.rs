@@ -3,6 +3,9 @@ use dioxus::desktop::{Config, LogicalSize, WindowBuilder, window};
 use dioxus::prelude::*;
 use once_cell::sync::OnceCell;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 use tao::window::ResizeDirection;
 use tokio::task;
 use tracing::{info, warn};
@@ -12,10 +15,10 @@ use yggterm_core::{
 };
 use yggterm_server::{
     ManagedSessionView, PreviewTone, ServerEndpoint, ServerUiSnapshot, SessionMetadataEntry,
-    SessionPreviewBlock, SshConnectTarget, WorkspaceViewMode, YggtermServer, connect_ssh,
+    ServerRuntimeStatus, SessionPreviewBlock, SshConnectTarget, WorkspaceViewMode, YggtermServer, connect_ssh,
     focus_live, open_stored_session, raise_external_window, request_terminal_launch,
-    set_all_preview_blocks_folded, set_view_mode as daemon_set_view_mode,
-    sync_external_window,
+    set_all_preview_blocks_folded, set_view_mode as daemon_set_view_mode, status,
+    sync_external_window, snapshot as daemon_snapshot, ping,
     toggle_preview_block as daemon_toggle_preview_block,
 };
 
@@ -31,7 +34,7 @@ pub struct ShellBootstrap {
     pub settings: AppSettings,
     pub settings_path: PathBuf,
     pub server_endpoint: ServerEndpoint,
-    pub initial_server_snapshot: ServerUiSnapshot,
+    pub initial_server_snapshot: Option<ServerUiSnapshot>,
     pub theme: UiTheme,
     pub ghostty_bridge_enabled: bool,
     pub ghostty_embedded_surface_supported: bool,
@@ -57,6 +60,8 @@ struct ShellState {
     context_menu_row: Option<BrowserRow>,
     preview_layout: PreviewLayoutMode,
     server_busy: bool,
+    server_daemon_detail: String,
+    needs_initial_server_sync: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -178,8 +183,11 @@ impl ShellState {
                 ),
                 bootstrap.theme,
             );
-        server.apply_snapshot(bootstrap.initial_server_snapshot.clone());
+        if let Some(initial_server_snapshot) = bootstrap.initial_server_snapshot.clone() {
+            server.apply_snapshot(initial_server_snapshot);
+        }
 
+        let needs_initial_server_sync = bootstrap.initial_server_snapshot.is_none();
         let mut state = Self {
             settings,
             bootstrap,
@@ -195,8 +203,11 @@ impl ShellState {
             next_notification_id: 1,
             context_menu_row: None,
             preview_layout: PreviewLayoutMode::Chat,
-            server_busy: false,
+            server_busy: needs_initial_server_sync,
+            server_daemon_detail: String::new(),
+            needs_initial_server_sync,
         };
+        state.server_daemon_detail = state.bootstrap.server_daemon_detail.clone();
         state.sync_browser_settings();
         state
     }
@@ -217,7 +228,7 @@ impl ShellState {
             last_action: self.last_action.clone(),
             ghostty_embedded_surface_supported: self.bootstrap.ghostty_embedded_surface_supported,
             ghostty_bridge_detail: self.bootstrap.ghostty_bridge_detail.clone(),
-            server_daemon_detail: self.bootstrap.server_daemon_detail.clone(),
+            server_daemon_detail: self.server_daemon_detail.clone(),
             settings: self.settings.clone(),
             maximized: self.maximized,
             always_on_top: self.always_on_top,
@@ -330,12 +341,14 @@ impl ShellState {
             Ok((snapshot, message)) => {
                 self.server.apply_snapshot(snapshot);
                 self.server_busy = false;
+                self.needs_initial_server_sync = false;
                 if let Some(message) = message {
                     self.last_action = message;
                 }
             }
             Err(error) => {
                 self.server_busy = false;
+                self.needs_initial_server_sync = false;
                 self.last_action = format!("server sync failed: {error}");
                 self.push_notification(
                     NotificationTone::Error,
@@ -631,6 +644,83 @@ fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force:
     });
 }
 
+fn spawn_initial_server_sync(mut state: Signal<ShellState>) {
+    let endpoint = state.read().bootstrap.server_endpoint.clone();
+    spawn(async move {
+        let outcome = task::spawn_blocking(move || initial_server_sync(endpoint)).await;
+        state.with_mut(|shell| match outcome {
+            Ok(Ok((snapshot, runtime, detail))) => {
+                shell.server.apply_snapshot(snapshot);
+                shell.server_daemon_detail = detail;
+                shell.server_busy = false;
+                shell.needs_initial_server_sync = false;
+                if let Some(runtime) = runtime {
+                    shell.last_action = format!("server ready · {}", runtime.host_kind);
+                } else {
+                    shell.last_action = "server ready".to_string();
+                }
+            }
+            Ok(Err(error)) => {
+                shell.server_busy = false;
+                shell.needs_initial_server_sync = false;
+                shell.server_daemon_detail = format!("server unavailable: {error}");
+                shell.last_action = format!("server sync failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Warning,
+                    "Server Unavailable",
+                    error.to_string(),
+                );
+            }
+            Err(error) => {
+                shell.server_busy = false;
+                shell.needs_initial_server_sync = false;
+                shell.server_daemon_detail = format!("server task failed: {error}");
+                shell.last_action = format!("server task failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "Server Task Failed",
+                    error.to_string(),
+                );
+            }
+        });
+    });
+}
+
+fn initial_server_sync(
+    endpoint: ServerEndpoint,
+) -> Result<(ServerUiSnapshot, Option<ServerRuntimeStatus>, String)> {
+    if ping(&endpoint).is_err() {
+        let current_exe = std::env::current_exe()?;
+        Command::new(current_exe)
+            .arg("server")
+            .arg("daemon")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+
+        for _ in 0..20 {
+            thread::sleep(Duration::from_millis(150));
+            if ping(&endpoint).is_ok() {
+                break;
+            }
+        }
+    }
+
+    if ping(&endpoint).is_err() {
+        anyhow::bail!("daemon did not become reachable")
+    }
+
+    let runtime = status(&endpoint).ok();
+    let (snapshot, _) = daemon_snapshot(&endpoint)?;
+    let detail = match &endpoint {
+        #[cfg(unix)]
+        ServerEndpoint::UnixSocket(path) => format!("server connected via {}", path.display()),
+        ServerEndpoint::Tcp { host, port } => format!("server connected via {host}:{port}"),
+    };
+    Ok((snapshot, runtime, detail))
+}
+
 fn spawn_server_snapshot_action<F>(
     mut state: Signal<ShellState>,
     pending_label: String,
@@ -730,6 +820,17 @@ fn app() -> Element {
     let bootstrap = BOOTSTRAP.get().expect("shell bootstrap not initialized").clone();
     let mut state = use_signal(|| ShellState::new(bootstrap));
     let mut hovered = use_signal(|| None::<HoveredControl>);
+    let mut startup_sync_started = use_signal(|| false);
+    use_effect(move || {
+        let should_start = {
+            let shell = state.read();
+            shell.needs_initial_server_sync && !*startup_sync_started.read()
+        };
+        if should_start {
+            startup_sync_started.set(true);
+            spawn_initial_server_sync(state);
+        }
+    });
     let snapshot = state.read().snapshot();
     let titlebar_snapshot = snapshot.clone();
     let sidebar_snapshot = snapshot.clone();
