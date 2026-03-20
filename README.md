@@ -30,6 +30,8 @@ This repository is still scaffolding.
 - `yggterm server daemon` now owns session restore/runtime state and persists it under `~/.yggterm/server-state.json`.
 - `yggterm server attach <uuid>` now creates reusable attach metadata under `~/.yggterm/runtime/attach/<uuid>/session.json` and falls back to `tmux` or the user shell.
 - Workspace documents are now stored under `~/.yggterm/workspace.db` and can be loaded into the same browser tree as Codex sessions.
+- The connect rail can now create both SSH-backed sessions and plain local shell sessions through the same daemon/runtime path.
+- Session context menus can now create nearby notes so a workspace can keep a terminal and its scratch document together.
 - `yggterm` now opens the Dioxus shell directly.
 - The old CLI subcommands and the `eframe` scaffold path have been removed.
 - The shell chrome is now owned locally in `yggterm-ui`, while the adjacent Zed checkout remains the visual reference stack.
@@ -62,6 +64,7 @@ This is the direction:
 - terminal sessions stay alive in the daemon while you switch views
 - preview mode and terminal mode are two lenses on the same underlying workspace
 - documents live near the sessions and commands they belong to
+- local shells and SSH shells share the same embedded terminal path instead of becoming special cases
 - fast local metadata stores keep startup cheap even when the tree gets large
 
 References to keep in mind while iterating:
@@ -141,6 +144,8 @@ yggterm doc cat /home/pi/gh/yggterm/notes/release-plan
 ```
 
 The path is virtual. It describes where the note should appear in the sidebar tree, not where a markdown file needs to exist on disk.
+
+Inside the desktop shell, the same document model is available from a session row. The first pass is intentionally simple: right-click a session, create a note, and Yggterm opens that note near the session path it came from.
 
 ## Daemon lifecycle
 
