@@ -58,6 +58,14 @@ pub enum UiTheme {
     ZedLight,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSessionProfile {
+    #[default]
+    Codex,
+    CodexLiteLlm,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct AppSettings {
@@ -71,6 +79,7 @@ pub struct AppSettings {
     pub litellm_endpoint: String,
     pub litellm_api_key: String,
     pub interface_llm_model: String,
+    pub default_agent_profile: AgentSessionProfile,
     pub selected_browser_path: Option<String>,
     pub expanded_browser_paths: Vec<String>,
 }
@@ -88,6 +97,7 @@ impl Default for AppSettings {
             litellm_endpoint: String::new(),
             litellm_api_key: String::new(),
             interface_llm_model: String::new(),
+            default_agent_profile: AgentSessionProfile::Codex,
             selected_browser_path: None,
             expanded_browser_paths: Vec::new(),
         }
