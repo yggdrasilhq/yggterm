@@ -1,4 +1,5 @@
 mod browser;
+mod transcript;
 mod titles;
 
 use anyhow::{Context, Result};
@@ -12,6 +13,7 @@ use std::path::{Path, PathBuf};
 use titles::{SessionTitleResolver, settings_ready as litellm_settings_ready};
 
 pub use browser::{BrowserMetrics, BrowserRow, BrowserRowKind, SessionBrowserState};
+pub use transcript::{TranscriptMessage, TranscriptRole, message_lines_from_payload, read_codex_transcript_messages};
 
 pub const ENV_YGGTERM_HOME: &str = "YGGTERM_HOME";
 pub const DEFAULT_HOME_DIRNAME: &str = ".yggterm";
@@ -337,27 +339,6 @@ fn codex_leaf_label(path: &Path) -> String {
     }
 
     stem.to_string()
-}
-
-fn compress_session_tree(mut node: SessionNode, keep_root: bool) -> SessionNode {
-    node.children = node
-        .children
-        .into_iter()
-        .map(|child| compress_session_tree(child, false))
-        .collect();
-
-    if keep_root {
-        return node;
-    }
-
-    while node.children.len() == 1 && !node.children[0].children.is_empty() {
-        let child = node.children.pop().expect("single child exists");
-        node.name = join_session_label(&node.name, &child.name);
-        node.path = child.path;
-        node.children = child.children;
-    }
-
-    node
 }
 
 fn join_session_label(left: &str, right: &str) -> String {
