@@ -1,9 +1,8 @@
-use crate::AppSettings;
+use crate::{AppSettings, read_codex_transcript_messages};
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
 use rusqlite::{Connection, params};
 use serde_json::Value;
-use std::fs;
 use std::path::Path;
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -151,58 +150,13 @@ pub fn settings_ready(settings: &AppSettings) -> bool {
 }
 
 fn extract_tail_context(path: &Path) -> Result<String> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("failed to read session transcript {}", path.display()))?;
     let mut snippets = Vec::<String>::new();
-
-    for line in content.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let event_type = value.get("type").and_then(Value::as_str);
-        match event_type {
-            Some("response_item") => {
-                let Some(payload) = value.get("payload") else {
-                    continue;
-                };
-                if payload.get("type").and_then(Value::as_str) != Some("message") {
-                    continue;
-                }
-                push_context_snippet(&mut snippets, payload);
-            }
-            Some("compacted") => {
-                let Some(history) = value
-                    .get("payload")
-                    .and_then(|payload| payload.get("replacement_history"))
-                    .and_then(Value::as_array)
-                else {
-                    continue;
-                };
-                for item in history {
-                    if item.get("type").and_then(Value::as_str) != Some("message") {
-                        continue;
-                    }
-                    push_context_snippet(&mut snippets, item);
-                }
-            }
-            Some("event_msg") => {
-                let Some(payload) = value.get("payload") else {
-                    continue;
-                };
-                if payload.get("type").and_then(Value::as_str) != Some("user_message") {
-                    continue;
-                }
-                let Some(text) = payload.get("message").and_then(Value::as_str) else {
-                    continue;
-                };
-                let lines = normalize_preview_text(text);
-                if lines.is_empty() {
-                    continue;
-                }
-                snippets.push(format!("USER: {}", lines.join(" ")));
-            }
-            _ => {}
-        }
+    for message in read_codex_transcript_messages(path)? {
+        snippets.push(format!(
+            "{}: {}",
+            message.role.display_label(),
+            message.lines.join(" ")
+        ));
     }
 
     let tail = snippets
@@ -214,18 +168,6 @@ fn extract_tail_context(path: &Path) -> Result<String> {
         .rev()
         .collect::<Vec<_>>();
     Ok(tail.join("\n"))
-}
-
-fn push_context_snippet(snippets: &mut Vec<String>, payload: &Value) {
-    let role = payload
-        .get("role")
-        .and_then(Value::as_str)
-        .unwrap_or("assistant");
-    let lines = message_lines_from_payload(payload);
-    if lines.is_empty() {
-        return;
-    }
-    snippets.push(format!("{}: {}", role.to_uppercase(), lines.join(" ")));
 }
 
 fn request_litellm_title(settings: &AppSettings, context: &str) -> Result<String> {
@@ -291,21 +233,6 @@ fn sanitize_generated_title(raw: &str) -> Option<String> {
     }
     let shortened = sanitized.chars().take(72).collect::<String>();
     Some(shortened)
-}
-
-fn message_lines_from_payload(payload: &Value) -> Vec<String> {
-    let mut lines = Vec::new();
-    if let Some(text) = payload.get("content").and_then(Value::as_str) {
-        lines.extend(normalize_preview_text(text));
-    }
-    if let Some(content_items) = payload.get("content").and_then(Value::as_array) {
-        for item in content_items {
-            if let Some(text) = extract_text_fragment(item) {
-                lines.extend(normalize_preview_text(text));
-            }
-        }
-    }
-    lines
 }
 
 #[cfg(test)]
@@ -536,12 +463,4 @@ fn extract_text_fragment(value: &Value) -> Option<&str> {
         .or_else(|| value.get("output_text").and_then(Value::as_str))
         .or_else(|| value.get("content").and_then(Value::as_str))
         .or_else(|| value.get("value").and_then(Value::as_str))
-}
-
-fn normalize_preview_text(text: &str) -> Vec<String> {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
 }

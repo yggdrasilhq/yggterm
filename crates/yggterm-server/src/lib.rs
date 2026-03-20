@@ -11,7 +11,7 @@ pub use daemon::{
 };
 pub use host::{GhosttyHostKind, GhosttyHostSupport, detect_ghostty_host};
 
-use yggterm_core::{SessionNode, UiTheme};
+use yggterm_core::{SessionNode, TranscriptRole, UiTheme, read_codex_transcript_messages};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -1528,95 +1528,47 @@ fn format_system_time(time: SystemTime) -> String {
 }
 
 fn parse_stored_transcript(path: &str, fallback_started_at: &str) -> Option<StoredTranscript> {
-    let content = fs::read_to_string(path).ok()?;
     let mut started_at = None;
     let mut user_messages = 0usize;
     let mut assistant_messages = 0usize;
     let mut metadata_entries = Vec::new();
     let mut blocks = Vec::new();
 
+    let content = fs::read_to_string(path).ok()?;
     for line in content.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        let event_type = value.get("type").and_then(Value::as_str);
-
-        match event_type {
-            Some("session_meta") => {
-                if let Some(payload) = value.get("payload") {
-                    started_at = payload
-                        .get("timestamp")
-                        .and_then(Value::as_str)
-                        .map(parse_and_format_timestamp)
-                        .or(started_at);
-                }
-            }
-            Some("response_item") => {
-                let Some(payload) = value.get("payload") else {
-                    continue;
-                };
-                if payload.get("type").and_then(Value::as_str) != Some("message") {
-                    continue;
-                }
-                push_preview_block_from_message_payload(
-                    &mut blocks,
-                    &mut metadata_entries,
-                    &mut user_messages,
-                    &mut assistant_messages,
-                    payload,
-                    extract_timestamp(&value).unwrap_or_else(|| {
-                        started_at
-                            .clone()
-                            .unwrap_or_else(|| fallback_started_at.to_string())
-                    }),
-                );
-            }
-            Some("compacted") => {
-                let Some(history) = value
-                    .get("payload")
-                    .and_then(|payload| payload.get("replacement_history"))
-                    .and_then(Value::as_array)
-                else {
-                    continue;
-                };
-                let fallback_timestamp = extract_timestamp(&value)
-                    .unwrap_or_else(|| started_at.clone().unwrap_or_else(|| fallback_started_at.to_string()));
-                for item in history {
-                    if item.get("type").and_then(Value::as_str) != Some("message") {
-                        continue;
-                    }
-                    push_preview_block_from_message_payload(
-                        &mut blocks,
-                        &mut metadata_entries,
-                        &mut user_messages,
-                        &mut assistant_messages,
-                        item,
-                        extract_timestamp(item).unwrap_or_else(|| fallback_timestamp.clone()),
-                    );
-                }
-            }
-            Some("event_msg") => {
-                let Some(payload) = value.get("payload") else {
-                    continue;
-                };
-                if payload.get("type").and_then(Value::as_str) != Some("user_message") {
-                    continue;
-                }
-                let Some(text) = payload.get("message").and_then(Value::as_str) else {
-                    continue;
-                };
-                user_messages += 1;
-                blocks.push(SessionPreviewBlock {
-                    role: "USER",
-                    timestamp: extract_timestamp(&value)
-                        .unwrap_or_else(|| fallback_started_at.to_string()),
-                    tone: PreviewTone::User,
-                    folded: false,
-                    lines: normalize_preview_text(text),
-                });
-            }
-            _ => {}
+        if value.get("type").and_then(Value::as_str) == Some("session_meta")
+            && let Some(payload) = value.get("payload")
+        {
+            started_at = payload
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .map(parse_and_format_timestamp)
+                .or(started_at);
         }
+    }
+
+    for message in read_codex_transcript_messages(std::path::Path::new(path)).ok()? {
+        let timestamp = message
+            .timestamp
+            .as_deref()
+            .map(parse_and_format_timestamp)
+            .unwrap_or_else(|| {
+                started_at
+                    .clone()
+                    .unwrap_or_else(|| fallback_started_at.to_string())
+            });
+        push_preview_block(
+            &mut blocks,
+            &mut metadata_entries,
+            &mut user_messages,
+            &mut assistant_messages,
+            message.role,
+            message.lines,
+            timestamp,
+        );
     }
 
     Some(StoredTranscript {
@@ -1628,31 +1580,27 @@ fn parse_stored_transcript(path: &str, fallback_started_at: &str) -> Option<Stor
     })
 }
 
-fn push_preview_block_from_message_payload(
+fn push_preview_block(
     blocks: &mut Vec<SessionPreviewBlock>,
     metadata_entries: &mut Vec<SessionMetadataEntry>,
     user_messages: &mut usize,
     assistant_messages: &mut usize,
-    payload: &Value,
+    role: TranscriptRole,
+    lines: Vec<String>,
     timestamp: String,
 ) {
-    let role = payload
-        .get("role")
-        .and_then(Value::as_str)
-        .unwrap_or("assistant");
-    let lines = message_lines_from_payload(payload);
     if lines.is_empty() {
         return;
     }
-    if role == "assistant" && blocks.is_empty() && looks_like_session_metadata_block(&lines) {
+    if role == TranscriptRole::Assistant && blocks.is_empty() && looks_like_session_metadata_block(&lines) {
         *metadata_entries = parse_session_metadata_lines(&lines);
         return;
     }
 
     match role {
-        "user" | "developer" => *user_messages += 1,
-        "assistant" => *assistant_messages += 1,
-        _ => {}
+        TranscriptRole::User => *user_messages += 1,
+        TranscriptRole::Assistant => *assistant_messages += 1,
+        TranscriptRole::System => {}
     }
 
     blocks.push(SessionPreviewBlock {
@@ -1709,46 +1657,6 @@ fn parse_session_metadata_lines(lines: &[String]) -> Vec<SessionMetadataEntry> {
         .collect()
 }
 
-fn message_lines_from_payload(payload: &Value) -> Vec<String> {
-    let mut lines = Vec::new();
-    if let Some(content_items) = payload.get("content").and_then(Value::as_array) {
-        for item in content_items {
-            if let Some(text) = item
-                .get("text")
-                .or_else(|| item.get("input_text"))
-                .or_else(|| item.get("output_text"))
-                .and_then(Value::as_str)
-            {
-                lines.extend(normalize_preview_text(text));
-            }
-        }
-    }
-    lines
-}
-
-
-fn normalize_preview_text(text: &str) -> Vec<String> {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-fn extract_timestamp(value: &Value) -> Option<String> {
-    value
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .map(parse_and_format_timestamp)
-        .or_else(|| {
-            value
-                .get("payload")
-                .and_then(|payload| payload.get("timestamp"))
-                .and_then(Value::as_str)
-                .map(parse_and_format_timestamp)
-        })
-}
-
 fn format_display_datetime(datetime: OffsetDateTime) -> String {
     const DISPLAY_FORMAT: &[time::format_description::FormatItem<'static>] = format_description!(
         "[month repr:short] [day], [year] [hour repr:12 padding:zero]:[minute] [period] UTC[offset_hour sign:mandatory][offset_minute]"
@@ -1767,18 +1675,18 @@ fn parse_and_format_timestamp(value: &str) -> String {
         .unwrap_or_else(|_| value.to_string())
 }
 
-fn session_role_label(role: &str) -> &'static str {
+fn session_role_label(role: TranscriptRole) -> &'static str {
     match role {
-        "user" | "developer" => "USER",
-        "assistant" => "ASSISTANT",
-        _ => "SYSTEM",
+        TranscriptRole::User => "USER",
+        TranscriptRole::Assistant => "ASSISTANT",
+        TranscriptRole::System => "SYSTEM",
     }
 }
 
-fn session_preview_tone(role: &str) -> PreviewTone {
+fn session_preview_tone(role: TranscriptRole) -> PreviewTone {
     match role {
-        "user" | "developer" => PreviewTone::User,
-        _ => PreviewTone::Assistant,
+        TranscriptRole::User => PreviewTone::User,
+        TranscriptRole::Assistant | TranscriptRole::System => PreviewTone::Assistant,
     }
 }
 
