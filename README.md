@@ -33,6 +33,8 @@ This repository is still scaffolding.
 - The connect rail can now create both SSH-backed sessions and plain local shell sessions through the same daemon/runtime path.
 - The connect rail can now start fresh local agent sessions too, with a persisted `Codex` or `Codex LiteLLM` profile chosen from settings.
 - Session context menus can now create nearby notes so a workspace can keep a terminal and its scratch document together.
+- Live daemon-owned sessions now appear in the main sidebar tree instead of hiding only inside the connect panel.
+- Documents are editable in the main viewport now, not just previewed as static blocks.
 - `yggterm` now opens the Dioxus shell directly.
 - The old CLI subcommands and the `eframe` scaffold path have been removed.
 - The shell chrome is now owned locally in `yggterm-ui`, while the adjacent Zed checkout remains the visual reference stack.
@@ -148,6 +150,8 @@ yggterm doc cat /home/pi/gh/yggterm/notes/release-plan
 The path is virtual. It describes where the note should appear in the sidebar tree, not where a markdown file needs to exist on disk.
 
 Inside the desktop shell, the same document model is available from a session row. The first pass is intentionally simple: right-click a session, create a note, and Yggterm opens that note near the session path it came from.
+
+That flow no longer stops at note creation. Documents can be created directly from the settings rail and edited inline in the main viewport, while the CLI still works against the same `workspace.db` store for fast automation and scripting.
 
 ## Daemon lifecycle
 
