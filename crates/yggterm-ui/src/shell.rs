@@ -859,6 +859,107 @@ fn session_kind_for_row(kind: BrowserRowKind) -> SessionKind {
     }
 }
 
+fn queue_session_note_creation(mut state: Signal<ShellState>, row: BrowserRow) {
+    if row.kind != BrowserRowKind::Session {
+        return;
+    }
+
+    state.with_mut(|shell| {
+        shell.last_action = format!("creating note for {}", row.label);
+        shell.server_busy = true;
+    });
+
+    spawn(async move {
+        let row_for_task = row.clone();
+        let settings = state.read().settings.clone();
+        let outcome = task::spawn_blocking(move || -> Result<(yggterm_core::WorkspaceDocument, yggterm_core::SessionNode)> {
+            let store = SessionStore::open_or_init()?;
+            let document = store.save_document(
+                &session_note_virtual_path(&row_for_task),
+                Some(&format!("{} notes", row_for_task.label)),
+                &session_note_template(&row_for_task),
+            )?;
+            let browser_tree = store.load_codex_tree(&settings)?;
+            Ok((document, browser_tree))
+        })
+        .await;
+
+        state.with_mut(|shell| match outcome {
+            Ok(Ok((document, browser_tree))) => {
+                let expanded_paths = shell.browser.expanded_paths();
+                shell.browser = SessionBrowserState::new(browser_tree);
+                shell.browser.restore_ui_state(&expanded_paths, Some(&document.virtual_path));
+                shell.browser.select_path(document.virtual_path.clone());
+                shell.sync_browser_settings();
+                shell.apply_daemon_snapshot_result(open_stored_session(
+                    &shell.bootstrap.server_endpoint,
+                    SessionKind::Document,
+                    &document.virtual_path,
+                    Some(&document.id),
+                    Some(&document.virtual_path),
+                    Some(&document.title),
+                ));
+                shell.last_action = format!("created note for {}", row.label);
+                shell.push_notification(
+                    NotificationTone::Success,
+                    "Session Note Created",
+                    format!("Opened {}.", document.title),
+                );
+            }
+            Ok(Err(error)) => {
+                shell.server_busy = false;
+                shell.last_action = format!("note creation failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "Note Creation Failed",
+                    error.to_string(),
+                );
+            }
+            Err(error) => {
+                shell.server_busy = false;
+                shell.last_action = format!("note task failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "Note Task Failed",
+                    error.to_string(),
+                );
+            }
+        });
+    });
+}
+
+fn session_note_virtual_path(row: &BrowserRow) -> String {
+    let base = row
+        .session_cwd
+        .clone()
+        .unwrap_or_else(|| "/documents".to_string());
+    let slug = row
+        .label
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | '0'..='9' => ch,
+            _ => '-',
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    let slug = if slug.is_empty() { "session-note".to_string() } else { slug };
+    format!("{}/notes/{}", base.trim_end_matches('/'), slug)
+}
+
+fn session_note_template(row: &BrowserRow) -> String {
+    let location = row
+        .session_cwd
+        .clone()
+        .unwrap_or_else(|| row.full_path.clone());
+    format!(
+        "# {title}\n\nSession: {title}\nLocation: {location}\n\n## Goals\n- \n\n## Commands\n- \n\n## Notes\n- \n",
+        title = row.label,
+        location = location,
+    )
+}
+
 #[derive(Clone)]
 struct GhosttyDockRequest {
     pid: Option<u32>,
@@ -1265,9 +1366,19 @@ fn app() -> Element {
                         row: row.clone(),
                         palette: snapshot.palette,
                         on_close: move |_| state.with_mut(|shell| shell.close_context_menu()),
-                        on_regenerate: move |_| {
-                            state.with_mut(|shell| shell.regenerate_title_for_row(&row));
-                            queue_title_generation(state, row.clone(), true);
+                        on_create_note: {
+                            let row = row.clone();
+                            move |_| {
+                                state.with_mut(|shell| shell.close_context_menu());
+                                queue_session_note_creation(state, row.clone());
+                            }
+                        },
+                        on_regenerate: {
+                            let row = row.clone();
+                            move |_| {
+                                state.with_mut(|shell| shell.regenerate_title_for_row(&row));
+                                queue_title_generation(state, row.clone(), true);
+                            }
                         },
                     }
                 }
@@ -2845,7 +2956,12 @@ fn ConnectRailBody(
                     style: "display:flex; flex-direction:column; gap:8px;",
                     for (ix, target) in snapshot.ssh_targets.iter().cloned().enumerate() {
                         {
-                            let target_detail = if let Some(prefix) = target.prefix.as_ref() {
+                            let target_detail = if target.kind == SessionKind::Shell {
+                                target
+                                    .cwd
+                                    .clone()
+                                    .unwrap_or_else(|| "local shell".to_string())
+                            } else if let Some(prefix) = target.prefix.as_ref() {
                                 format!("{} · {}", target.ssh_target, prefix)
                             } else {
                                 target.ssh_target.clone()
@@ -2960,6 +3076,7 @@ fn ContextMenuOverlay(
     row: BrowserRow,
     palette: Palette,
     on_close: EventHandler<MouseEvent>,
+    on_create_note: EventHandler<MouseEvent>,
     on_regenerate: EventHandler<MouseEvent>,
 ) -> Element {
     rsx! {
@@ -2976,6 +3093,17 @@ fn ContextMenuOverlay(
                 div {
                     style: format!("padding:4px 8px 8px 8px; font-size:11px; font-weight:700; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.muted),
                     "{row.label}"
+                }
+                if row.kind == BrowserRowKind::Session {
+                    button {
+                        style: format!(
+                            "width:100%; height:30px; border:none; border-radius:10px; background:{}; color:{}; \
+                             font-size:12px; font-weight:600; text-align:left; padding:0 10px; margin-bottom:6px;",
+                            palette.panel_alt, palette.text
+                        ),
+                        onclick: move |evt| on_create_note.call(evt),
+                        "Create Note"
+                    }
                 }
                 button {
                     style: format!(
