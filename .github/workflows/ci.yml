@@ -41,9 +41,6 @@ jobs:
         with:
           toolchain: 1.94.0
 
-      - name: Install Zig
-        run: ./scripts/setup-zig.sh
-
       - name: Build release binary
         run: cargo build --release -p yggterm --no-default-features
 
@@ -53,6 +50,7 @@ jobs:
           bash -n scripts/package-deb.sh
           bash -n scripts/package-platform-release.sh
           bash -n scripts/package-release.sh
+          bash -n scripts/package-release-ffi.sh
 
       - name: Validate npm launcher
         run: node --check npm/bin/yggterm.js

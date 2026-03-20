@@ -11,5 +11,5 @@ Package: yggterm
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}
 Description: Yggdrasil Terminal
- Rust-first terminal workspace integrating Ghostty terminal capabilities
- with a Zed-inspired UI model and nested terminal session organization.
+ Rust-first terminal workspace with a Dioxus desktop shell,
+ server-owned PTYs, and an embedded xterm.js terminal surface.

@@ -76,8 +76,8 @@ jobs:
           path: |
             dist/yggterm-${{ matrix.label }}*
 
-  package-linux-extras:
-    name: Package Linux extras
+  package-linux-deb:
+    name: Package Linux deb
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
@@ -113,25 +113,14 @@ jobs:
         with:
           toolchain: 1.94.0
 
-      - name: Install Zig
-        run: ./scripts/setup-zig.sh
-
-      - name: Clone Ghostty sibling repo
-        run: git clone --depth 1 https://github.com/ghostty-org/ghostty ../ghostty
-
       - name: Package Debian artifact
         run: ./scripts/package-deb.sh
-
-      - name: Package FFI bundle
-        run: ./scripts/package-release-ffi.sh linux-x86_64
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: yggterm-linux-extras
+          name: yggterm-linux-deb
           path: |
-            dist/yggterm-linux-x86_64-ghostty-ffi.tar.gz
-            dist/yggterm-linux-x86_64-ghostty-ffi.tar.gz.sha256
             dist/yggterm_*.deb
             dist/yggterm_*.deb.sha256
 
@@ -140,7 +129,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs:
       - package
-      - package-linux-extras
+      - package-linux-deb
     runs-on: ubuntu-24.04
     steps:
       - name: Download artifacts

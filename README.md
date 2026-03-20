@@ -12,7 +12,7 @@ The product target is not "an editor with terminals". It is a remote-first termi
 - The left sidebar is a vertical tree of virtual folders and sessions.
 - Sidebar nodes represent session metadata, not a direct mirror of the local filesystem.
 - Session entries may point at Codex workflows, SSH targets, local shells, and other terminal contexts.
-- Example paths should feel like `remote/prod/codex-session-tui`, `machines/pi/ghostty-admin`, or `local/design/zed-chrome-study`.
+- Example paths should feel like `remote/prod/codex-session-tui`, `machines/pi/build-box`, or `local/design/zed-chrome-study`.
 - Restoring all sessions, durable terminal metadata, and clipboard or screenshot paste into remote sessions are explicit quality-of-life goals.
 
 ## Current status
@@ -29,9 +29,9 @@ This repository is still scaffolding.
 - `yggterm` now opens the Dioxus shell directly.
 - The old CLI subcommands and the `eframe` scaffold path have been removed.
 - The shell chrome is now owned locally in `yggterm-ui`, while the adjacent Zed checkout remains the visual reference stack.
-- Ghostty bridge code still exists as optional legacy integration work, but it is no longer the active terminal path.
+- Ghostty bridge code still exists as optional legacy integration work, but it is no longer part of the default release path.
 
-When working in this repo, optimize for getting the application closer to "Zed chrome + Ghostty sessions + virtual session tree", not for deepening temporary scaffolding choices.
+When working in this repo, optimize for getting the application closer to "Zed-shaped chrome + server-owned sessions + virtual session tree", not for deepening temporary scaffolding choices.
 
 ## Why Zed
 
@@ -54,7 +54,6 @@ Today, the scaffold persists session state under `~/.yggterm/sessions`, but that
 References to keep in mind while iterating:
 
 - local Zed checkout: `../zed`
-- local Ghostty checkout: `../ghostty`
 - Codex session UI reference: `~/gh/codex-session-tui`
 
 ## Usage
@@ -71,7 +70,6 @@ Requirements:
 
 - Rust stable
 - Rust `1.94.0` is the current pinned toolchain for the local desktop dependency stack.
-- Zig stable
 - no Ghostty checkout is required for the active embedded terminal path
 - optional local checkout of `../zed` as a design/reference repo while refining shell shape
 
@@ -129,18 +127,12 @@ Cross-platform release assets are produced by GitHub Actions on tag pushes:
 - `macos-x86_64`
 - `macos-aarch64`
 - `windows-x86_64`
-- `windows-x86_64`
+- Debian `.deb` package for Linux
 
 Build only the Debian package:
 
 ```bash
 ./scripts/package-deb.sh
-```
-
-Build the FFI bundle archive:
-
-```bash
-./scripts/package-release-ffi.sh linux-x86_64
 ```
 
 ## npm publishing

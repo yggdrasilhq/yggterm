@@ -12,18 +12,11 @@ VERSION="$("${CARGO_CMD[@]}" pkgid -p yggterm | sed 's/.*#//')"
 DEB_VERSION="${VERSION}-${DEB_REVISION}"
 PKG_NAME="yggterm"
 STAGE_DIR="${ROOT_DIR}/.yggterm-state/deb/${PKG_NAME}_${DEB_VERSION}_${ARCH}"
-GHOSTTY_PREFIX="${ROOT_DIR}/.yggterm-state/ghostty-prefix"
-GHOSTTY_LIB_DIR="${GHOSTTY_PREFIX}/lib"
-GHOSTTY_DIR="${ROOT_DIR}/../ghostty"
 
 mkdir -p "$DIST_DIR"
 
-if [[ ! -f "${GHOSTTY_LIB_DIR}/libghostty.so" ]]; then
-  "${ROOT_DIR}/scripts/build-ghostty-lib.sh"
-fi
-
 pushd "$ROOT_DIR" >/dev/null
-GHOSTTY_DIR="${GHOSTTY_DIR}" GHOSTTY_LIB_DIR="${GHOSTTY_LIB_DIR}" "${CARGO_CMD[@]}" build --release --features ghostty-ffi
+"${CARGO_CMD[@]}" build --release -p yggterm --no-default-features
 popd >/dev/null
 
 rm -rf "$STAGE_DIR"
@@ -34,11 +27,9 @@ mkdir -p \
   "$STAGE_DIR/usr/share/doc/${PKG_NAME}"
 
 install -m 0755 "$BIN_PATH" "$STAGE_DIR/usr/lib/yggterm/yggterm-bin"
-install -m 0755 "${GHOSTTY_LIB_DIR}/libghostty.so" "$STAGE_DIR/usr/lib/yggterm/libghostty.so"
 cat > "$STAGE_DIR/usr/bin/yggterm" <<'WRAPPER'
 #!/usr/bin/env bash
 set -euo pipefail
-export LD_LIBRARY_PATH="/usr/lib/yggterm:${LD_LIBRARY_PATH:-}"
 exec /usr/lib/yggterm/yggterm-bin "$@"
 WRAPPER
 chmod 0755 "$STAGE_DIR/usr/bin/yggterm"
@@ -65,8 +56,8 @@ Maintainer: Yggdrasil HQ <opensource@yggdrasilhq.invalid>
 Homepage: https://github.com/yggdrasilhq/yggterm
 Installed-Size: ${INSTALLED_SIZE}
 Description: Yggdrasil Terminal
- Rust-first terminal workspace integrating Ghostty terminal capabilities
- with a Zed-inspired UI model and nested terminal session organization.
+ Rust-first terminal workspace with a Dioxus desktop shell,
+ server-owned PTYs, and an embedded xterm.js terminal surface.
 CONTROL
 
 OUT_DEB="${DIST_DIR}/${PKG_NAME}_${DEB_VERSION}_${ARCH}.deb"
