@@ -7,6 +7,7 @@ license = "GPL-3.0-or-later"
 
 [dependencies]
 yggterm-core = { path = "../yggterm-core" }
+yggterm-platform = { path = "../yggterm-platform" }
 yggterm-server = { path = "../yggterm-server" }
 anyhow.workspace = true
 dioxus = { version = "0.7.3", features = ["desktop"] }
