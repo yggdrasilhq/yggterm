@@ -68,7 +68,7 @@ impl Default for AppSettings {
             show_tree: true,
             show_settings: false,
             tree_width: 300.0,
-            terminal_font_size: 13.0,
+            terminal_font_size: 10.0,
             ui_font_size: 14.0,
             prefer_ghostty_backend: true,
             litellm_endpoint: String::new(),
