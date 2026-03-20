@@ -1,8 +1,9 @@
 use anyhow::Result;
+use std::io::Read;
 use std::process::{Command, Stdio};
 use yggterm_core::SessionStore;
 use yggterm_server::{
-    default_endpoint, detect_ghostty_host, ping, run_attach, run_daemon, status,
+    default_endpoint, detect_ghostty_host, ping, run_attach, run_daemon, shutdown, status,
 };
 
 fn main() -> Result<()> {
@@ -21,6 +22,18 @@ fn main() -> Result<()> {
     }
     if args.len() == 3 && args[0] == "server" && args[1] == "attach" {
         return run_attach(&args[2]);
+    }
+    if args.as_slice() == ["server", "shutdown"] {
+        let endpoint = default_endpoint(store.home_dir());
+        if let Some(message) = shutdown(&endpoint)? {
+            println!("{message}");
+        }
+        return Ok(());
+    }
+    if let Some(command) = args.first()
+        && command == "doc"
+    {
+        return run_document_cli(&store, &args[1..]);
     }
 
     let tree = store.load_tree()?;
@@ -43,12 +56,12 @@ fn main() -> Result<()> {
         spawn_server_daemon()?;
     }
 
-    yggterm_ui::launch_shell(yggterm_ui::ShellBootstrap {
+    let launch_result = yggterm_ui::launch_shell(yggterm_ui::ShellBootstrap {
         tree,
         browser_tree,
         settings,
         settings_path,
-        server_endpoint: endpoint,
+        server_endpoint: endpoint.clone(),
         initial_server_snapshot: None,
         theme,
         ghostty_bridge_enabled: host.bridge_enabled,
@@ -62,7 +75,9 @@ fn main() -> Result<()> {
             "starting server…".to_string()
         },
         prefer_ghostty_backend,
-    })
+    });
+    let _ = shutdown(&endpoint);
+    launch_result
 }
 
 fn spawn_server_daemon() -> Result<()> {
@@ -75,4 +90,41 @@ fn spawn_server_daemon() -> Result<()> {
         .stderr(Stdio::null())
         .spawn()?;
     Ok(())
+}
+
+fn run_document_cli(store: &SessionStore, args: &[String]) -> Result<()> {
+    match args {
+        [command] if command == "list" || command == "ls" => {
+            for document in store.list_documents()? {
+                println!("{}\t{}", document.virtual_path, document.title);
+            }
+            Ok(())
+        }
+        [command, path] if command == "cat" => {
+            if let Some(document) = store.load_document(path)? {
+                print!("{}", document.body);
+            }
+            Ok(())
+        }
+        [command, path] if command == "write" => {
+            let mut body = String::new();
+            std::io::stdin().read_to_string(&mut body)?;
+            store.save_document(path, None, &body)?;
+            println!("saved {}", path);
+            Ok(())
+        }
+        [command, path, title] if command == "write" => {
+            let mut body = String::new();
+            std::io::stdin().read_to_string(&mut body)?;
+            store.save_document(path, Some(title), &body)?;
+            println!("saved {}", path);
+            Ok(())
+        }
+        _ => {
+            eprintln!(
+                "usage:\n  yggterm doc list\n  yggterm doc cat <virtual-path>\n  yggterm doc write <virtual-path> [title] < body.md"
+            );
+            Ok(())
+        }
+    }
 }
