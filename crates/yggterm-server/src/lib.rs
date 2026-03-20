@@ -565,8 +565,16 @@ impl YggtermServer {
     }
 
     pub fn focus_live_session(&mut self, key: &str) {
-        if self.sessions.contains_key(key) {
-            self.active_session_path = Some(key.to_string());
+        let resolved_key = if self.sessions.contains_key(key) {
+            Some(key.to_string())
+        } else {
+            self.sessions
+                .iter()
+                .find(|(_, session)| session.source == SessionSource::LiveSsh && session.session_path == key)
+                .map(|(session_key, _)| session_key.clone())
+        };
+        if let Some(resolved_key) = resolved_key {
+            self.active_session_path = Some(resolved_key);
             self.active_view_mode = WorkspaceViewMode::Terminal;
             self.request_terminal_launch_for_active();
         }
