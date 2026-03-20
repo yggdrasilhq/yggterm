@@ -168,15 +168,22 @@ fn extract_tail_context(path: &Path) -> Result<String> {
                 if payload.get("type").and_then(Value::as_str) != Some("message") {
                     continue;
                 }
-                let role = payload
-                    .get("role")
-                    .and_then(Value::as_str)
-                    .unwrap_or("assistant");
-                let lines = message_lines_from_payload(payload);
-                if lines.is_empty() {
+                push_context_snippet(&mut snippets, payload);
+            }
+            Some("compacted") => {
+                let Some(history) = value
+                    .get("payload")
+                    .and_then(|payload| payload.get("replacement_history"))
+                    .and_then(Value::as_array)
+                else {
                     continue;
+                };
+                for item in history {
+                    if item.get("type").and_then(Value::as_str) != Some("message") {
+                        continue;
+                    }
+                    push_context_snippet(&mut snippets, item);
                 }
-                snippets.push(format!("{}: {}", role.to_uppercase(), lines.join(" ")));
             }
             Some("event_msg") => {
                 let Some(payload) = value.get("payload") else {
@@ -207,6 +214,18 @@ fn extract_tail_context(path: &Path) -> Result<String> {
         .rev()
         .collect::<Vec<_>>();
     Ok(tail.join("\n"))
+}
+
+fn push_context_snippet(snippets: &mut Vec<String>, payload: &Value) {
+    let role = payload
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("assistant");
+    let lines = message_lines_from_payload(payload);
+    if lines.is_empty() {
+        return;
+    }
+    snippets.push(format!("{}: {}", role.to_uppercase(), lines.join(" ")));
 }
 
 fn request_litellm_title(settings: &AppSettings, context: &str) -> Result<String> {
@@ -287,6 +306,38 @@ fn message_lines_from_payload(payload: &Value) -> Vec<String> {
         }
     }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_tail_context;
+    use anyhow::Result;
+    use std::fs;
+
+    #[test]
+    fn extract_tail_context_includes_compacted_replacement_history() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "yggterm-titles-compacted-{}-{}.jsonl",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-03-20T10:00:00Z","type":"compacted","payload":{"replacement_history":[{"role":"user","type":"message","content":[{"type":"input_text","text":"first prompt"}]},{"role":"assistant","type":"message","content":[{"type":"output_text","text":"first answer"}]}]}}"#,
+                r#"{"timestamp":"2026-03-20T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"follow-up"}]}}"#,
+            ]
+            .join("\n"),
+        )?;
+
+        let context = extract_tail_context(&path)?;
+        assert!(context.contains("USER: first prompt"));
+        assert!(context.contains("ASSISTANT: first answer"));
+        assert!(context.contains("USER: follow-up"));
+
+        let _ = fs::remove_file(path);
+        Ok(())
+    }
 }
 
 fn extract_completion_text(value: &Value) -> Option<String> {

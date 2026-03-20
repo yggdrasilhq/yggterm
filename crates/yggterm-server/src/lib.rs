@@ -1558,40 +1558,42 @@ fn parse_stored_transcript(path: &str, fallback_started_at: &str) -> Option<Stor
                 if payload.get("type").and_then(Value::as_str) != Some("message") {
                     continue;
                 }
-
-                let role = payload
-                    .get("role")
-                    .and_then(Value::as_str)
-                    .unwrap_or("assistant");
-                let lines = message_lines_from_payload(payload);
-                if lines.is_empty() {
-                    continue;
-                }
-                if role == "assistant"
-                    && blocks.is_empty()
-                    && looks_like_session_metadata_block(&lines)
-                {
-                    metadata_entries = parse_session_metadata_lines(&lines);
-                    continue;
-                }
-
-                match role {
-                    "user" | "developer" => user_messages += 1,
-                    "assistant" => assistant_messages += 1,
-                    _ => {}
-                }
-
-                blocks.push(SessionPreviewBlock {
-                    role: session_role_label(role),
-                    timestamp: extract_timestamp(&value).unwrap_or_else(|| {
+                push_preview_block_from_message_payload(
+                    &mut blocks,
+                    &mut metadata_entries,
+                    &mut user_messages,
+                    &mut assistant_messages,
+                    payload,
+                    extract_timestamp(&value).unwrap_or_else(|| {
                         started_at
                             .clone()
                             .unwrap_or_else(|| fallback_started_at.to_string())
                     }),
-                    tone: session_preview_tone(role),
-                    folded: false,
-                    lines,
-                });
+                );
+            }
+            Some("compacted") => {
+                let Some(history) = value
+                    .get("payload")
+                    .and_then(|payload| payload.get("replacement_history"))
+                    .and_then(Value::as_array)
+                else {
+                    continue;
+                };
+                let fallback_timestamp = extract_timestamp(&value)
+                    .unwrap_or_else(|| started_at.clone().unwrap_or_else(|| fallback_started_at.to_string()));
+                for item in history {
+                    if item.get("type").and_then(Value::as_str) != Some("message") {
+                        continue;
+                    }
+                    push_preview_block_from_message_payload(
+                        &mut blocks,
+                        &mut metadata_entries,
+                        &mut user_messages,
+                        &mut assistant_messages,
+                        item,
+                        extract_timestamp(item).unwrap_or_else(|| fallback_timestamp.clone()),
+                    );
+                }
             }
             Some("event_msg") => {
                 let Some(payload) = value.get("payload") else {
@@ -1624,6 +1626,42 @@ fn parse_stored_transcript(path: &str, fallback_started_at: &str) -> Option<Stor
         metadata_entries,
         blocks,
     })
+}
+
+fn push_preview_block_from_message_payload(
+    blocks: &mut Vec<SessionPreviewBlock>,
+    metadata_entries: &mut Vec<SessionMetadataEntry>,
+    user_messages: &mut usize,
+    assistant_messages: &mut usize,
+    payload: &Value,
+    timestamp: String,
+) {
+    let role = payload
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("assistant");
+    let lines = message_lines_from_payload(payload);
+    if lines.is_empty() {
+        return;
+    }
+    if role == "assistant" && blocks.is_empty() && looks_like_session_metadata_block(&lines) {
+        *metadata_entries = parse_session_metadata_lines(&lines);
+        return;
+    }
+
+    match role {
+        "user" | "developer" => *user_messages += 1,
+        "assistant" => *assistant_messages += 1,
+        _ => {}
+    }
+
+    blocks.push(SessionPreviewBlock {
+        role: session_role_label(role),
+        timestamp,
+        tone: session_preview_tone(role),
+        folded: false,
+        lines,
+    });
 }
 
 fn looks_like_session_metadata_block(lines: &[String]) -> bool {
@@ -1772,5 +1810,41 @@ fn short_session_id(session_id: &str) -> String {
         format!("Q{}", &compact[compact.len() - 7..])
     } else {
         session_id.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_stored_transcript;
+    use anyhow::Result;
+    use std::fs;
+
+    #[test]
+    fn parse_stored_transcript_counts_compacted_replacement_history() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "yggterm-server-compacted-{}-{}.jsonl",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-03-20T10:00:00Z","type":"session_meta","payload":{"id":"orig","timestamp":"2026-03-20T10:00:00Z","cwd":"/tmp/x"}}"#,
+                r#"{"timestamp":"2026-03-20T10:00:01Z","type":"compacted","payload":{"replacement_history":[{"role":"user","type":"message","content":[{"type":"input_text","text":"first prompt"}]},{"role":"assistant","type":"message","content":[{"type":"output_text","text":"first answer"}]},{"role":"assistant","type":"message","content":[{"type":"output_text","text":"second answer"}]}]}}"#,
+                r#"{"timestamp":"2026-03-20T10:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"follow-up"}]}}"#,
+            ]
+            .join("\n"),
+        )?;
+
+        let transcript = parse_stored_transcript(path.to_string_lossy().as_ref(), "fallback")
+            .expect("transcript");
+        assert_eq!(transcript.user_messages, 2);
+        assert_eq!(transcript.assistant_messages, 2);
+        assert_eq!(transcript.blocks.len(), 4);
+        assert_eq!(transcript.blocks[1].lines[0], "first answer");
+        assert_eq!(transcript.blocks[2].lines[0], "second answer");
+
+        let _ = fs::remove_file(path);
+        Ok(())
     }
 }
