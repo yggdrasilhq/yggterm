@@ -1,4 +1,4 @@
-use crate::SessionNode;
+use crate::{SessionNode, SessionNodeKind};
 use dirs::home_dir;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -8,6 +8,7 @@ use std::time::Instant;
 pub enum BrowserRowKind {
     Group,
     Session,
+    Document,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,7 +132,7 @@ impl SessionBrowserState {
     pub fn total_sessions(&self) -> usize {
         self.rows
             .iter()
-            .filter(|row| row.kind == BrowserRowKind::Session)
+            .filter(|row| matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document))
             .count()
     }
 
@@ -148,7 +149,7 @@ impl SessionBrowserState {
         self.selected_path.as_deref().and_then(|path| {
             self.rows
                 .iter()
-                .position(|row| row.kind == BrowserRowKind::Session && row.full_path == path)
+                .position(|row| matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document) && row.full_path == path)
         })
     }
 
@@ -169,7 +170,7 @@ impl SessionBrowserState {
             self.selected_path = self
                 .rows
                 .iter()
-                .find(|row| row.kind == BrowserRowKind::Session)
+                .find(|row| matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document))
                 .map(|row| row.full_path.clone());
         }
     }
@@ -198,7 +199,7 @@ impl SessionBrowserState {
             .rows
             .iter()
             .enumerate()
-            .filter_map(|(ix, row)| (row.kind == BrowserRowKind::Session).then_some(ix))
+            .filter_map(|(ix, row)| matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document).then_some(ix))
             .collect::<Vec<_>>();
         if session_indexes.is_empty() {
             return None;
@@ -218,7 +219,7 @@ impl SessionBrowserState {
 }
 
 fn first_session_path(node: &SessionNode) -> Option<String> {
-    if node.children.is_empty() && node.session_id.is_some() {
+    if node.kind != SessionNodeKind::Group && node.session_id.is_some() {
         return Some(node.path.display().to_string());
     }
 
@@ -240,28 +241,32 @@ fn flatten_rows(
     rows: &mut Vec<BrowserRow>,
     include_root: bool,
 ) -> bool {
-    let is_session = node.children.is_empty();
+    let is_leaf = node.kind != SessionNodeKind::Group;
     let full_path = node.path.display().to_string();
-    if !matches_filter(node, filter) || (is_session && node.session_id.is_none()) {
+    if !matches_filter(node, filter) || (is_leaf && node.session_id.is_none()) {
         return false;
     }
 
     let descendant_sessions = count_leaf_sessions(node);
-    if !is_session && descendant_sessions == 0 {
+    if !is_leaf && descendant_sessions == 0 {
         return false;
     }
-    let expanded = is_session || !filter.is_empty() || expanded_paths.contains(&full_path);
+    let expanded = is_leaf || !filter.is_empty() || expanded_paths.contains(&full_path);
 
     if include_root {
         rows.push(BrowserRow {
-            kind: if is_session {
-                BrowserRowKind::Session
+            kind: if is_leaf {
+                match node.kind {
+                    SessionNodeKind::CodexSession => BrowserRowKind::Session,
+                    SessionNodeKind::Document => BrowserRowKind::Document,
+                    SessionNodeKind::Group => BrowserRowKind::Group,
+                }
             } else {
                 BrowserRowKind::Group
             },
-            label: format_row_label(node, short_ids, &full_path, is_session),
-            detail_label: detail_label_for_row(node, &full_path, is_session),
-            session_title: if is_session {
+            label: format_row_label(node, short_ids, &full_path, is_leaf),
+            detail_label: detail_label_for_row(node, &full_path, is_leaf),
+            session_title: if is_leaf {
                 node.title.clone()
             } else {
                 None
@@ -276,7 +281,7 @@ fn flatten_rows(
         });
     }
 
-    if !is_session && expanded {
+    if !is_leaf && expanded {
         for child in &node.children {
             flatten_rows(
                 child,
@@ -300,13 +305,17 @@ fn format_row_label(
     is_session: bool,
 ) -> String {
     if is_session {
-        node.title.clone().unwrap_or_else(|| {
-            short_ids
-                .get(full_path)
-                .cloned()
-                .or_else(|| node.session_id.as_deref().map(|id| session_id_suffix(id, 7)))
-                .unwrap_or_else(|| node.name.clone())
-        })
+        match node.kind {
+            SessionNodeKind::Document => node.title.clone().unwrap_or_else(|| node.name.clone()),
+            SessionNodeKind::CodexSession => node.title.clone().unwrap_or_else(|| {
+                short_ids
+                    .get(full_path)
+                    .cloned()
+                    .or_else(|| node.session_id.as_deref().map(|id| session_id_suffix(id, 7)))
+                    .unwrap_or_else(|| node.name.clone())
+            }),
+            SessionNodeKind::Group => node.name.clone(),
+        }
     } else {
         node.name.clone()
     }
@@ -314,6 +323,9 @@ fn format_row_label(
 
 fn detail_label_for_row(node: &SessionNode, full_path: &str, is_session: bool) -> String {
     if is_session {
+        if node.kind == SessionNodeKind::Document {
+            return String::new();
+        }
         let path_label = node
             .cwd
             .as_deref()

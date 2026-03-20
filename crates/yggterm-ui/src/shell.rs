@@ -22,7 +22,8 @@ use yggterm_core::{
 };
 use yggterm_platform::DockRect;
 use yggterm_server::{
-    ManagedSessionView, PreviewTone, ServerEndpoint, ServerUiSnapshot, SessionMetadataEntry,
+    ManagedSessionView, PreviewTone, ServerEndpoint, ServerUiSnapshot, SessionKind,
+    SessionMetadataEntry,
     ServerRuntimeStatus, SessionPreviewBlock, SshConnectTarget, TerminalBackend,
     GhosttyTerminalHostMode, WorkspaceViewMode, YggtermServer, connect_ssh, focus_live,
     open_stored_session, request_terminal_launch,
@@ -418,10 +419,11 @@ impl ShellState {
                 self.sync_browser_settings();
                 self.last_action = format!("toggled {}", row.label);
             }
-            BrowserRowKind::Session => {
+            BrowserRowKind::Session | BrowserRowKind::Document => {
                 self.context_menu_row = None;
                 self.apply_daemon_snapshot_result(open_stored_session(
                     &self.bootstrap.server_endpoint,
+                    session_kind_for_row(row.kind),
                     &row.full_path,
                     row.session_id.as_deref(),
                     row.session_cwd.as_deref(),
@@ -644,6 +646,7 @@ fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force:
                 shell.browser.set_filter_query(filter_query);
                 shell.apply_daemon_snapshot_result(open_stored_session(
                     &shell.bootstrap.server_endpoint,
+                    SessionKind::Codex,
                     &row.full_path,
                     row.session_id.as_deref(),
                     row.session_cwd.as_deref(),
@@ -838,6 +841,7 @@ fn spawn_open_session_row(mut state: Signal<ShellState>, row: BrowserRow) {
         move |endpoint| {
             open_stored_session(
                 &endpoint,
+                session_kind_for_row(row.kind),
                 &row.full_path,
                 row.session_id.as_deref(),
                 row.session_cwd.as_deref(),
@@ -845,6 +849,14 @@ fn spawn_open_session_row(mut state: Signal<ShellState>, row: BrowserRow) {
             )
         },
     );
+}
+
+fn session_kind_for_row(kind: BrowserRowKind) -> SessionKind {
+    match kind {
+        BrowserRowKind::Session => SessionKind::Codex,
+        BrowserRowKind::Document => SessionKind::Document,
+        BrowserRowKind::Group => SessionKind::Codex,
+    }
 }
 
 #[derive(Clone)]
@@ -1193,7 +1205,7 @@ fn app() -> Element {
                             let should_generate = row.kind == BrowserRowKind::Session && row.session_title.is_none();
                             match row.kind {
                                 BrowserRowKind::Group => state.with_mut(|shell| shell.select_row(&row)),
-                                BrowserRowKind::Session => spawn_open_session_row(state, row.clone()),
+                                BrowserRowKind::Session | BrowserRowKind::Document => spawn_open_session_row(state, row.clone()),
                             }
                             if should_generate {
                                 queue_title_generation(state, row.clone(), false);
@@ -1832,6 +1844,20 @@ fn TreeIcon(row: BrowserRow) -> Element {
             span {
                 style: "display:inline-flex; align-items:center; justify-content:center; font-size:13px; font-weight:700; line-height:1;",
                 ">_"
+            }
+        };
+    } else if row.kind == BrowserRowKind::Document {
+        return rsx! {
+            svg {
+                width: "18",
+                height: "18",
+                view_box: "0 0 18 18",
+                fill: "none",
+                xmlns: "http://www.w3.org/2000/svg",
+                rect { x: "4", y: "2.75", width: "10", height: "12.5", rx: "1.6", stroke: "currentColor", stroke_width: "1.15" }
+                path { d: "M6.4 6.5H11.6", stroke: "currentColor", stroke_width: "1.05", stroke_linecap: "round" }
+                path { d: "M6.4 9H11.6", stroke: "currentColor", stroke_width: "1.05", stroke_linecap: "round" }
+                path { d: "M6.4 11.5H10.2", stroke: "currentColor", stroke_width: "1.05", stroke_linecap: "round" }
             }
         };
     }

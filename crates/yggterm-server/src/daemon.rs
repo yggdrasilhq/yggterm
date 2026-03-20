@@ -1,5 +1,5 @@
 use crate::{
-    GhosttyHostSupport, PersistedDaemonState, ServerUiSnapshot, TerminalManager,
+    GhosttyHostSupport, PersistedDaemonState, ServerUiSnapshot, SessionKind, TerminalManager,
     WorkspaceViewMode, YggtermServer,
 };
 use anyhow::{Context, Result, bail};
@@ -42,6 +42,7 @@ pub enum ServerRequest {
     Status,
     Snapshot,
     OpenStoredSession {
+        session_kind: SessionKind,
         path: String,
         session_id: Option<String>,
         cwd: Option<String>,
@@ -84,6 +85,7 @@ pub enum ServerRequest {
     SyncTheme {
         theme: UiTheme,
     },
+    Shutdown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +110,7 @@ pub enum ServerResponse {
 struct DaemonRuntime {
     support: GhosttyHostSupport,
     state_path: PathBuf,
+    store: SessionStore,
     server: YggtermServer,
     terminals: TerminalManager,
 }
@@ -127,11 +130,12 @@ impl DaemonRuntime {
         );
         let state_path = store.home_dir().join("server-state.json");
         if let Some(saved) = load_persisted_state(&state_path)? {
-            server.restore_persisted_state(saved);
+            server.restore_persisted_state(saved, Some(&store));
         }
         Ok(Self {
             support,
             state_path,
+            store,
             server,
             terminals: TerminalManager::new(),
         })
@@ -189,16 +193,24 @@ impl DaemonRuntime {
             ServerRequest::Status => ServerResponse::Status(self.status()),
             ServerRequest::Snapshot => self.snapshot_response(None),
             ServerRequest::OpenStoredSession {
+                session_kind,
                 path,
                 session_id,
                 cwd,
                 title_hint,
             } => {
+                let document = if session_kind == SessionKind::Document {
+                    self.store.load_document(&path)?
+                } else {
+                    None
+                };
                 self.server.open_or_focus_session(
+                    session_kind,
                     &path,
                     session_id.as_deref(),
                     cwd.as_deref(),
                     title_hint.as_deref(),
+                    document.as_ref(),
                 );
                 self.server.set_view_mode(WorkspaceViewMode::Rendered);
                 self.persist()?;
@@ -288,6 +300,23 @@ impl DaemonRuntime {
                 self.persist()?;
                 self.snapshot_response(Some("theme synced".to_string()))
             }
+            ServerRequest::Shutdown => {
+                let summary = self
+                    .terminals
+                    .shutdown_all(|path| self.server.terminal_stop_command(path));
+                self.persist()?;
+                ServerResponse::Ack {
+                    message: Some(if summary.errors.is_empty() {
+                        format!("stopped {} terminal sessions", summary.stopped)
+                    } else {
+                        format!(
+                            "stopped {} terminal sessions, {} errors",
+                            summary.stopped,
+                            summary.errors.len()
+                        )
+                    }),
+                }
+            }
         };
         Ok(response)
     }
@@ -343,6 +372,7 @@ pub fn snapshot(endpoint: &ServerEndpoint) -> Result<(ServerUiSnapshot, Option<S
 
 pub fn open_stored_session(
     endpoint: &ServerEndpoint,
+    kind: SessionKind,
     path: &str,
     session_id: Option<&str>,
     cwd: Option<&str>,
@@ -351,6 +381,7 @@ pub fn open_stored_session(
     expect_snapshot(send_request(
         endpoint,
         &ServerRequest::OpenStoredSession {
+            session_kind: kind,
             path: path.to_string(),
             session_id: session_id.map(ToOwned::to_owned),
             cwd: cwd.map(ToOwned::to_owned),
@@ -480,6 +511,10 @@ pub fn sync_theme(
     )?)
 }
 
+pub fn shutdown(endpoint: &ServerEndpoint) -> Result<Option<String>> {
+    expect_ack(send_request(endpoint, &ServerRequest::Shutdown)?)
+}
+
 pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Result<()> {
     let runtime = Arc::new(Mutex::new(DaemonRuntime::load(runtime)?));
 
@@ -505,10 +540,13 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
         loop {
             let (stream, _) = listener.accept().context("accepting daemon client")?;
             let runtime = runtime.clone();
-            if let Err(error) = handle_unix_stream(stream, runtime) {
-                warn!(error=%error, "daemon request failed");
+            match handle_unix_stream(stream, runtime) {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(error) => warn!(error=%error, "daemon request failed"),
             }
         }
+        return Ok(());
     }
 
     match endpoint {
@@ -527,10 +565,13 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
             loop {
                 let (stream, _) = listener.accept().context("accepting daemon client")?;
                 let runtime = runtime.clone();
-                if let Err(error) = handle_tcp_stream(stream, runtime) {
-                    warn!(error=%error, "daemon request failed");
+                match handle_tcp_stream(stream, runtime) {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(error) => warn!(error=%error, "daemon request failed"),
                 }
             }
+            Ok(())
         }
     }
 }
@@ -583,25 +624,29 @@ fn read_request<R: std::io::Read>(reader: R) -> Result<ServerRequest> {
 fn handle_unix_stream(
     mut stream: std::os::unix::net::UnixStream,
     runtime: Arc<Mutex<DaemonRuntime>>,
-) -> Result<()> {
+) -> Result<bool> {
     let request = read_request(stream.try_clone().context("cloning unix stream")?)?;
+    let should_shutdown = matches!(request, ServerRequest::Shutdown);
     let response = {
         let mut runtime = runtime.lock().expect("daemon runtime lock poisoned");
         runtime.handle_request(request)?
     };
-    write_response(&mut stream, &response)
+    write_response(&mut stream, &response)?;
+    Ok(should_shutdown)
 }
 
 fn handle_tcp_stream(
     mut stream: std::net::TcpStream,
     runtime: Arc<Mutex<DaemonRuntime>>,
-) -> Result<()> {
+) -> Result<bool> {
     let request = read_request(stream.try_clone().context("cloning tcp stream")?)?;
+    let should_shutdown = matches!(request, ServerRequest::Shutdown);
     let response = {
         let mut runtime = runtime.lock().expect("daemon runtime lock poisoned");
         runtime.handle_request(request)?
     };
-    write_response(&mut stream, &response)
+    write_response(&mut stream, &response)?;
+    Ok(should_shutdown)
 }
 
 fn send_request(endpoint: &ServerEndpoint, request: &ServerRequest) -> Result<ServerResponse> {

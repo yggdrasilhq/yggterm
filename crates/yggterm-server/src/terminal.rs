@@ -1,10 +1,11 @@
 use anyhow::{Context, Result, bail};
-use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 const DEFAULT_COLS: u16 = 120;
 const DEFAULT_ROWS: u16 = 36;
@@ -24,6 +25,12 @@ pub struct TerminalReadResult {
 
 pub struct TerminalManager {
     sessions: HashMap<String, PtySessionRuntime>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TerminalShutdownSummary {
+    pub stopped: usize,
+    pub errors: Vec<String>,
 }
 
 impl TerminalManager {
@@ -69,11 +76,31 @@ impl TerminalManager {
     pub fn has_session(&self, key: &str) -> bool {
         self.sessions.contains_key(key)
     }
+
+    pub fn shutdown_all<F>(&mut self, stop_command: F) -> TerminalShutdownSummary
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let keys = self.sessions.keys().cloned().collect::<Vec<_>>();
+        let mut stopped = 0usize;
+        let mut errors = Vec::new();
+        for key in keys {
+            let Some(runtime) = self.sessions.remove(&key) else {
+                continue;
+            };
+            match runtime.shutdown(stop_command(&key).as_deref()) {
+                Ok(()) => stopped += 1,
+                Err(error) => errors.push(format!("{key}: {error}")),
+            }
+        }
+        TerminalShutdownSummary { stopped, errors }
+    }
 }
 
 struct PtySessionRuntime {
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     chunks: Arc<Mutex<VecDeque<TerminalChunk>>>,
     seq: Arc<AtomicU64>,
 }
@@ -91,7 +118,8 @@ impl PtySessionRuntime {
             .context("opening pty")?;
 
         let command = shell_command(launch_command, cwd);
-        pair.slave
+        let child = pair
+            .slave
             .spawn_command(command)
             .with_context(|| format!("spawning terminal session {key}"))?;
 
@@ -148,6 +176,7 @@ impl PtySessionRuntime {
         Ok(Self {
             master: Arc::new(Mutex::new(pair.master)),
             writer: Arc::new(Mutex::new(writer)),
+            child: Arc::new(Mutex::new(child)),
             chunks,
             seq,
         })
@@ -189,6 +218,20 @@ impl PtySessionRuntime {
                 pixel_height: 0,
             })
             .context("resizing pty")?;
+        Ok(())
+    }
+
+    fn shutdown(&self, stop_command: Option<&str>) -> Result<()> {
+        if let Some(command) = stop_command
+            && !command.is_empty()
+        {
+            let _ = self.write(command);
+            thread::sleep(Duration::from_millis(180));
+        }
+
+        let mut child = self.child.lock().expect("pty child lock poisoned");
+        let _ = child.kill();
+        let _ = child.wait();
         Ok(())
     }
 }
