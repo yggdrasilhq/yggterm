@@ -39,6 +39,7 @@ const CORNER_RESIZE_HANDLE: usize = 10;
 const XTERM_CSS: &str = include_str!("../../../assets/xterm/xterm.css");
 const XTERM_JS: &str = include_str!("../../../assets/xterm/xterm.js");
 const XTERM_FIT_JS: &str = include_str!("../../../assets/xterm/addon-fit.js");
+static XTERM_ASSETS_BOOTSTRAPPED: OnceCell<()> = OnceCell::new();
 
 #[derive(Debug, Clone)]
 pub struct ShellBootstrap {
@@ -189,6 +190,7 @@ enum TerminalJsCommand {
         background: String,
         foreground: String,
         cursor: String,
+        selection: String,
         font_size: f32,
     },
     Write {
@@ -1068,6 +1070,12 @@ fn app() -> Element {
     let mut startup_sync_started = use_signal(|| false);
     let mut dock_pulse_started = use_signal(|| false);
     let mut window_epoch = use_signal(|| 0_u64);
+    use_effect(move || {
+        if XTERM_ASSETS_BOOTSTRAPPED.get().is_none() {
+            let _ = XTERM_ASSETS_BOOTSTRAPPED.set(());
+            let _ = document::eval(&xterm_assets_bootstrap_script());
+        }
+    });
     use_wry_event_handler(move |event, _| {
         if let TaoEvent::WindowEvent { event, .. } = event {
             match event {
@@ -1152,15 +1160,6 @@ fn app() -> Element {
     let shell_radius = if maximized { 0 } else { 11 };
 
     rsx! {
-        document::Style {
-            "{XTERM_CSS}"
-        }
-        document::Script {
-            "{XTERM_JS}"
-        }
-        document::Script {
-            "{XTERM_FIT_JS}"
-        }
         div {
             style: format!(
                 "position: fixed; inset: 0; overflow: hidden; border-radius:{}px; \
@@ -1995,37 +1994,12 @@ fn MainSurface(
             },
             WorkspaceViewMode::Terminal => rsx! {
                 div {
-                    style: "display:flex; flex-direction:column; gap:16px; min-width:0; width:min(980px, 100%); margin:0 auto;",
-                    div {
-                        style: "display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap;",
-                        div {
-                            style: "display:flex; flex-direction:column; gap:6px;",
-                            div {
-                                style: format!("font-size:12px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:{};", snapshot.palette.muted),
-                                "Terminal Session"
-                            }
-                            div {
-                                style: format!("font-size:20px; font-weight:700; color:{};", snapshot.palette.text),
-                                "{session.title}"
-                            }
-                            div {
-                                style: format!("font-size:12px; color:{};", snapshot.palette.muted),
-                                "{session.status_line}"
-                            }
-                        }
-                        div {
-                            style: "display:flex; gap:8px; justify-content:flex-end;",
-                            button {
-                                style: chip_style(snapshot.palette, snapshot.server_busy),
-                                onclick: move |_| on_request_terminal.call(()),
-                                "Reconnect Terminal"
-                            }
-                        }
-                    }
+                    style: "display:flex; flex-direction:column; min-width:0; min-height:0; width:100%; height:100%;",
                     TerminalCanvas {
                         key: "{session.session_path}",
                         session: session.clone(),
                         snapshot: snapshot.clone(),
+                        on_request_terminal: move |_| on_request_terminal.call(()),
                     }
                 }
             },
@@ -2043,7 +2017,9 @@ fn MainSurface(
             ),
             div {
                 style: format!(
-                    "flex:1; overflow:auto; padding:24px; background:{}; border-radius:11px; box-shadow:{}; zoom:{}%;",
+                    "flex:1; min-height:0; overflow:{}; padding:{}; background:{}; border-radius:11px; box-shadow:{}; zoom:{}%;",
+                    if snapshot.active_view_mode == WorkspaceViewMode::Terminal { "hidden" } else { "auto" },
+                    if snapshot.active_view_mode == WorkspaceViewMode::Terminal { "12px" } else { "24px" },
                     snapshot.palette.panel, snapshot.palette.panel_shadow,
                     zoom_percent_f32(snapshot.settings.terminal_font_size, 13.0)
                 ),
@@ -2299,6 +2275,7 @@ fn PreviewBlock(
 fn TerminalCanvas(
     session: ManagedSessionView,
     snapshot: RenderSnapshot,
+    on_request_terminal: EventHandler<MouseEvent>,
 ) -> Element {
     let endpoint = BOOTSTRAP
         .get()
@@ -2310,12 +2287,13 @@ fn TerminalCanvas(
     let terminal_title = session.title.clone();
     let future_host_id = host_id.clone();
     let theme = terminal_theme(snapshot.palette, snapshot.settings.terminal_font_size);
+    let future_theme = theme.clone();
     use_future(move || {
         let endpoint = endpoint.clone();
         let session_path = session_path.clone();
         let host_id = future_host_id.clone();
         let title = terminal_title.clone();
-        let theme = theme.clone();
+        let theme = future_theme.clone();
         async move {
             if let Err(error) = terminal_ensure(&endpoint, &session_path) {
                 warn!(session=%session_path, error=%error, "failed to ensure terminal");
@@ -2327,6 +2305,7 @@ fn TerminalCanvas(
                 background: theme.background.clone(),
                 foreground: theme.foreground.clone(),
                 cursor: theme.cursor.clone(),
+                selection: theme.selection.clone(),
                 font_size: theme.font_size,
             });
             let mut cursor = 0u64;
@@ -2374,70 +2353,65 @@ fn TerminalCanvas(
     });
     rsx! {
         div {
-            style: "display:flex; flex-direction:column; gap:16px;",
+            style: "display:flex; flex-direction:column; min-height:0; height:100%;",
             div {
-                style: "display:flex; flex-direction:column; gap:12px; padding:18px 20px; border-radius:20px; background:linear-gradient(180deg, rgba(13,18,24,0.98) 0%, rgba(19,27,35,0.97) 100%); box-shadow:0 28px 48px rgba(10,17,26,0.26), inset 0 0 0 1px rgba(132,155,177,0.12);",
+                style: format!(
+                    "display:flex; flex-direction:column; min-height:0; height:100%; gap:0; border-radius:14px; \
+                     background:{}; box-shadow:0 24px 48px rgba(148,163,184,0.12), inset 0 0 0 1px rgba(214,223,232,0.9); overflow:hidden;",
+                    theme.background
+                ),
                 div {
-                    style: "display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;",
+                    style: format!(
+                        "display:flex; align-items:center; justify-content:space-between; gap:12px; \
+                         padding:14px 16px; background:{}; border-bottom:1px solid {};",
+                        theme.chrome, theme.chrome_border
+                    ),
                     div {
                         style: "display:flex; align-items:center; gap:10px;",
-                        div { style: "width:11px; height:11px; border-radius:999px; background:#fb7185;" }
-                        div { style: "width:11px; height:11px; border-radius:999px; background:#fbbf24;" }
-                        div { style: "width:11px; height:11px; border-radius:999px; background:#4ade80;" }
+                        div { style: "width:10px; height:10px; border-radius:999px; background:rgba(248,113,113,0.8);" }
+                        div { style: "width:10px; height:10px; border-radius:999px; background:rgba(251,191,36,0.82);" }
+                        div { style: "width:10px; height:10px; border-radius:999px; background:rgba(74,222,128,0.82);" }
                         span {
-                            style: "margin-left:6px; font-size:12px; font-weight:700; color:rgba(226,232,240,0.92);",
+                            style: format!("margin-left:6px; font-size:12px; font-weight:700; color:{};", theme.chrome_text),
                             "{session.title}"
                         }
                     }
-                    span {
-                        style: "font-size:11px; color:rgba(148,163,184,0.92);",
-                        "{session.status_line}"
+                    div {
+                        style: "display:flex; align-items:center; gap:10px;",
+                        span {
+                            style: format!("font-size:11px; color:{};", snapshot.palette.muted),
+                            "{session.status_line}"
+                        }
+                        button {
+                            style: chip_style(snapshot.palette, snapshot.server_busy),
+                            onclick: move |evt| on_request_terminal.call(evt),
+                            "Reconnect"
+                        }
                     }
                 }
                 div {
-                    style: "display:flex; align-items:center; gap:10px; flex-wrap:wrap;",
+                    style: format!(
+                        "display:flex; align-items:center; gap:8px; padding:10px 16px; background:{}; border-bottom:1px solid {};",
+                        theme.chrome, theme.chrome_border
+                    ),
                     span {
                         style: format!(
-                            "display:inline-flex; align-items:center; justify-content:center; min-width:108px; height:24px; padding:0 10px; border-radius:999px; background:rgba(125,211,252,0.12); color:{}; font-size:11px; font-weight:700;",
-                            snapshot.palette.accent
+                            "display:inline-flex; align-items:center; justify-content:center; min-width:94px; height:24px; padding:0 10px; border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:700;",
+                            snapshot.palette.accent_soft, snapshot.palette.accent
                         ),
                         "Embedded PTY"
                     }
-                }
-                div {
-                    style: "padding:12px 14px; border-radius:14px; background:rgba(255,255,255,0.06); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.08); font-size:13px; line-height:1.55; color:#d6e2ef;",
-                    "The active session is attached to a yggterm-owned PTY and rendered inline through xterm.js."
+                    span {
+                        style: format!("font-size:12px; color:{};", snapshot.palette.muted),
+                        "The active session is attached to a yggterm-owned PTY and rendered inline through xterm.js."
+                    }
                 }
                 div {
                     id: "{host_id}",
-                    style: "min-height:520px; border-radius:16px; overflow:hidden; background:#0b1220; box-shadow:inset 0 0 0 1px rgba(255,255,255,0.08);"
-                }
-            }
-            div {
-                style: "display:grid; grid-template-columns:1.1fr 0.9fr; gap:14px;",
-                div {
-                    style: "padding:16px 18px; border-radius:18px; background:rgba(251,253,255,0.92); box-shadow:0 16px 30px rgba(148,163,184,0.10), inset 0 0 0 1px rgba(255,255,255,0.72);",
-                    div {
-                        style: format!("font-size:12px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:{}; margin-bottom:8px;", snapshot.palette.muted),
-                        "Server Attach"
-                    }
-                    div {
-                        style: format!("display:flex; flex-direction:column; gap:8px; font-size:13px; line-height:1.58; color:{};", snapshot.palette.text),
-                        div { "{snapshot.server_daemon_detail}" }
-                        div { "The active session is already owned by the yggterm daemon and can be reopened via `yggterm server attach <uuid>` on remote hosts." }
-                    }
-                }
-                div {
-                    style: "padding:16px 18px; border-radius:18px; background:rgba(240,248,255,0.88); box-shadow:0 16px 30px rgba(148,163,184,0.10), inset 0 0 0 1px rgba(255,255,255,0.72);",
-                    div {
-                        style: format!("font-size:12px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:{}; margin-bottom:8px;", snapshot.palette.muted),
-                        "Embedded Terminal"
-                    }
-                    div {
-                        style: format!("display:flex; flex-direction:column; gap:8px; font-size:13px; line-height:1.58; color:{};", snapshot.palette.text),
-                        div { "xterm.js is embedded directly in the Dioxus viewport." }
-                        div { "Ghostty is no longer required for the active terminal path, which makes Wayland and Windows support much simpler." }
-                    }
+                    style: format!(
+                        "flex:1; min-height:0; width:100%; height:100%; background:{}; overflow:hidden;",
+                        theme.background
+                    )
                 }
             }
         }
@@ -2450,15 +2424,48 @@ struct TerminalTheme {
     foreground: String,
     cursor: String,
     font_size: f32,
+    selection: String,
+    chrome: String,
+    chrome_border: String,
+    chrome_text: String,
 }
 
 fn terminal_theme(palette: Palette, font_size: f32) -> TerminalTheme {
     TerminalTheme {
-        background: "#0b1220".to_string(),
-        foreground: "#d6e2ef".to_string(),
+        background: "rgba(252,253,255,0.98)".to_string(),
+        foreground: palette.text.to_string(),
         cursor: palette.accent.to_string(),
         font_size: font_size.max(11.0),
+        selection: "rgba(107,165,255,0.16)".to_string(),
+        chrome: "rgba(245,249,252,0.98)".to_string(),
+        chrome_border: "rgba(214,223,232,0.9)".to_string(),
+        chrome_text: palette.text.to_string(),
     }
+}
+
+fn xterm_assets_bootstrap_script() -> String {
+    let css = serde_json::to_string(XTERM_CSS).expect("serialize xterm css");
+    let xterm = serde_json::to_string(XTERM_JS).expect("serialize xterm js");
+    let fit = serde_json::to_string(XTERM_FIT_JS).expect("serialize xterm fit addon");
+    format!(
+        r#"
+        (() => {{
+          const styleId = "yggterm-xterm-style";
+          if (!document.getElementById(styleId)) {{
+            const style = document.createElement("style");
+            style.id = styleId;
+            style.textContent = {css};
+            document.head.appendChild(style);
+          }}
+          if (!window.Terminal) {{
+            window.eval({xterm});
+          }}
+          if (!window.FitAddon || !window.FitAddon.FitAddon) {{
+            window.eval({fit});
+          }}
+        }})();
+        "#
+    )
 }
 
 fn terminal_host_id(session_path: &str) -> String {
@@ -2531,15 +2538,15 @@ fn terminal_eval_script(host_id: &str) -> String {
                 continue;
             }}
             if (message.kind === "reset") {{
+                term.clear();
                 term.options.fontSize = message.font_size;
                 term.options.theme = {{
                     background: message.background,
                     foreground: message.foreground,
                     cursor: message.cursor,
-                    selectionBackground: "rgba(107,165,255,0.22)",
+                    selectionBackground: message.selection,
                 }};
-                term.clear();
-                term.reset();
+                requestAnimationFrame(() => emitResize());
             }} else if (message.kind === "write") {{
                 term.write(message.data);
             }}
