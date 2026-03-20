@@ -9,7 +9,7 @@ pub use daemon::{
     connect_ssh,
     default_endpoint, focus_live, open_stored_session, ping, raise_external_window, run_daemon,
     request_terminal_launch, set_all_preview_blocks_folded, set_view_mode, snapshot, status,
-    sync_external_window, sync_theme, terminal_ensure, terminal_read, terminal_resize,
+    shutdown, sync_external_window, sync_theme, terminal_ensure, terminal_read, terminal_resize,
     terminal_write, toggle_preview_block,
 };
 pub use host::{
@@ -17,7 +17,10 @@ pub use host::{
 };
 pub use terminal::{TerminalChunk, TerminalManager, TerminalReadResult};
 
-use yggterm_core::{SessionNode, TranscriptRole, UiTheme, read_codex_transcript_messages};
+use yggterm_core::{
+    SessionNode, SessionNodeKind, SessionStore, TranscriptRole, UiTheme, WorkspaceDocument,
+    read_codex_transcript_messages,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -79,6 +82,16 @@ pub enum SessionSource {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    Codex,
+    CodexLiteLlm,
+    Shell,
+    SshShell,
+    Document,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TerminalLaunchPhase {
     Queued,
     BridgePending,
@@ -133,6 +146,7 @@ pub struct SnapshotSessionView {
     pub id: String,
     pub session_path: String,
     pub title: String,
+    pub kind: SessionKind,
     pub host_label: String,
     pub source: SessionSource,
     pub backend: TerminalBackend,
@@ -169,6 +183,7 @@ pub struct ServerUiSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedStoredSession {
     pub path: String,
+    pub kind: SessionKind,
     pub session_id: Option<String>,
     pub cwd: Option<String>,
     pub title_hint: Option<String>,
@@ -179,6 +194,7 @@ pub struct PersistedLiveSession {
     pub key: String,
     pub id: String,
     pub title: String,
+    pub kind: SessionKind,
     pub ssh_target: String,
     pub prefix: Option<String>,
 }
@@ -196,6 +212,7 @@ pub struct ManagedSessionView {
     pub id: String,
     pub session_path: String,
     pub title: String,
+    pub kind: SessionKind,
     pub host_label: String,
     pub source: SessionSource,
     pub backend: TerminalBackend,
@@ -271,10 +288,16 @@ impl YggtermServer {
 
         if let Some(first_session) = first_session_leaf(tree) {
             this.open_or_focus_session(
+                match first_session.kind {
+                    SessionNodeKind::CodexSession => SessionKind::Codex,
+                    SessionNodeKind::Document => SessionKind::Document,
+                    SessionNodeKind::Group => SessionKind::Codex,
+                },
                 &first_session.path,
                 Some(&first_session.session_id),
                 Some(&first_session.cwd),
                 Some(&first_session.title),
+                None,
             );
         }
 
@@ -324,22 +347,27 @@ impl YggtermServer {
 
     pub fn open_or_focus_session(
         &mut self,
+        kind: SessionKind,
         path: &str,
         session_id: Option<&str>,
         cwd: Option<&str>,
         title_hint: Option<&str>,
+        document: Option<&WorkspaceDocument>,
     ) {
         let entry = self.sessions.entry(path.to_string()).or_insert_with(|| {
             build_session(
+                kind,
                 path,
                 session_id,
                 cwd,
                 title_hint,
+                document,
                 self.backend,
                 self.theme,
                 self.ghostty_host.bridge_enabled,
             )
         });
+        entry.kind = kind;
         entry.backend = self.backend;
         if let Some(session_id) = session_id {
             entry.id = session_id.to_string();
@@ -353,6 +381,9 @@ impl YggtermServer {
         }
         if let Some(title_hint) = title_hint {
             entry.title = title_hint.to_string();
+        }
+        if let Some(document) = document {
+            hydrate_document_session(entry, document);
         }
         self.active_session_path = Some(path.to_string());
     }
@@ -373,14 +404,26 @@ impl YggtermServer {
     }
 
     pub fn terminal_spec(&self, path: &str) -> Option<(String, Option<String>)> {
-        self.sessions.get(path).map(|session| {
+        self.sessions.get(path).and_then(|session| {
+            if session.kind == SessionKind::Document {
+                return None;
+            }
             let cwd = session
                 .metadata
                 .iter()
                 .find(|entry| entry.label == "Cwd")
                 .map(|entry| entry.value.clone());
-            (session.launch_command.clone(), cwd)
+            Some((session.launch_command.clone(), cwd))
         })
+    }
+
+    pub fn terminal_stop_command(&self, path: &str) -> Option<String> {
+        let session = self.sessions.get(path)?;
+        match session.kind {
+            SessionKind::Codex | SessionKind::CodexLiteLlm => Some("/quit\r".to_string()),
+            SessionKind::Shell | SessionKind::SshShell => Some("exit\r".to_string()),
+            SessionKind::Document => None,
+        }
     }
 
     pub fn ssh_targets(&self) -> &[SshConnectTarget] {
@@ -437,6 +480,7 @@ impl YggtermServer {
             .filter_map(|(path, session)| {
                 (session.source == SessionSource::Stored).then(|| PersistedStoredSession {
                     path: path.clone(),
+                    kind: session.kind,
                     session_id: Some(session.id.clone()),
                     cwd: session
                         .metadata
@@ -456,6 +500,7 @@ impl YggtermServer {
                     key: key.clone(),
                     id: session.id.clone(),
                     title: session.title.clone(),
+                    kind: session.kind,
                     ssh_target: ssh_target.clone(),
                     prefix: session.ssh_prefix.clone(),
                 })
@@ -470,13 +515,20 @@ impl YggtermServer {
         }
     }
 
-    pub fn restore_persisted_state(&mut self, state: PersistedDaemonState) {
+    pub fn restore_persisted_state(&mut self, state: PersistedDaemonState, store: Option<&SessionStore>) {
         for session in state.stored_sessions {
+            let document = if session.kind == SessionKind::Document {
+                store.and_then(|store| store.load_document(&session.path).ok().flatten())
+            } else {
+                None
+            };
             self.open_or_focus_session(
+                session.kind,
                 &session.path,
                 session.session_id.as_deref(),
                 session.cwd.as_deref(),
                 session.title_hint.as_deref(),
+                document.as_ref(),
             );
         }
         for live in state.live_sessions {
@@ -502,7 +554,7 @@ impl YggtermServer {
         let target = self.ssh_targets.get(target_ix)?.clone();
         let uuid = Uuid::new_v4().to_string();
         let key = format!("live::{uuid}");
-        self.insert_live_session(&key, &uuid, &target, Some(target.label.clone()));
+        self.insert_live_session(&key, &uuid, SessionKind::SshShell, &target, Some(target.label.clone()));
         Some(key)
     }
 
@@ -512,7 +564,7 @@ impl YggtermServer {
             ssh_target: live.ssh_target,
             prefix: live.prefix,
         };
-        self.insert_live_session(&live.key, &live.id, &target, Some(live.title));
+        self.insert_live_session(&live.key, &live.id, live.kind, &target, Some(live.title));
     }
 
     pub fn toggle_preview_block(&mut self, block_ix: usize) {
@@ -547,6 +599,16 @@ impl YggtermServer {
         let Some(session) = self.sessions.get_mut(path) else {
             return;
         };
+        if session.kind == SessionKind::Document {
+            self.active_view_mode = WorkspaceViewMode::Rendered;
+            session.status_line = "document · preview only".to_string();
+            upsert_session_metadata(
+                &mut session.metadata,
+                "Status",
+                "preview only".to_string(),
+            );
+            return;
+        }
 
         match session.source {
             SessionSource::Stored => {
@@ -662,11 +724,13 @@ impl YggtermServer {
         &mut self,
         key: &str,
         session_id: &str,
+        kind: SessionKind,
         target: &SshConnectTarget,
         title_override: Option<String>,
     ) {
         let mut session = build_live_session(
             session_id,
+            kind,
             target,
             self.backend,
             self.theme,
@@ -709,6 +773,7 @@ fn snapshot_session_view(session: ManagedSessionView) -> SnapshotSessionView {
         id: session.id,
         session_path: session.session_path,
         title: session.title,
+        kind: session.kind,
         host_label: session.host_label,
         source: session.source,
         backend: session.backend,
@@ -758,6 +823,7 @@ fn managed_session_from_snapshot(session: SnapshotSessionView) -> ManagedSession
         id: session.id,
         session_path: session.session_path,
         title: session.title,
+        kind: session.kind,
         host_label: session.host_label,
         source: session.source,
         backend: session.backend,
@@ -820,6 +886,7 @@ fn managed_session_from_snapshot(session: SnapshotSessionView) -> ManagedSession
 }
 
 struct StoredLeaf {
+    kind: SessionNodeKind,
     path: String,
     session_id: String,
     cwd: String,
@@ -842,8 +909,9 @@ struct StoredFileSnapshot {
 }
 
 fn first_session_leaf(node: &SessionNode) -> Option<StoredLeaf> {
-    if node.children.is_empty() {
+    if node.kind != SessionNodeKind::Group {
         return Some(StoredLeaf {
+            kind: node.kind,
             path: node.path.display().to_string(),
             session_id: node.session_id.clone().unwrap_or_else(|| node.name.clone()),
             cwd: node
@@ -864,10 +932,12 @@ fn first_session_leaf(node: &SessionNode) -> Option<StoredLeaf> {
 }
 
 fn build_session(
+    kind: SessionKind,
     path: &str,
     session_id: Option<&str>,
     cwd: Option<&str>,
     title_hint: Option<&str>,
+    document: Option<&WorkspaceDocument>,
     backend: TerminalBackend,
     theme: UiTheme,
     ghostty_bridge_enabled: bool,
@@ -893,13 +963,27 @@ fn build_session(
     let cwd = cwd
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| session_preview_cwd(path));
-    let launch_command = format!(
-        "cd '{}' && codex resume {}",
-        cwd.replace('\'', "'\\''"),
-        session_id
-    );
-    let transcript = parse_stored_transcript(path, &started_at);
-    let file_snapshot = stored_file_snapshot(path);
+    let launch_command = match kind {
+        SessionKind::Document => "document preview".to_string(),
+        _ => format!(
+            "cd '{}' && codex resume {}",
+            cwd.replace('\'', "'\\''"),
+            session_id
+        ),
+    };
+    let transcript = if kind == SessionKind::Document {
+        None
+    } else {
+        parse_stored_transcript(path, &started_at)
+    };
+    let file_snapshot = if kind == SessionKind::Document {
+        StoredFileSnapshot {
+            updated_at: document.map(|value| value.updated_at.clone()),
+            bytes: document.map(|value| value.body.len() as u64),
+        }
+    } else {
+        stored_file_snapshot(path)
+    };
     let started_at = transcript
         .as_ref()
         .map(|transcript| transcript.started_at.clone())
@@ -914,7 +998,7 @@ fn build_session(
         .unwrap_or(0);
     let mut preview_summary = vec![
         SessionMetadataEntry {
-            label: "Session",
+            label: if kind == SessionKind::Document { "Document" } else { "Session" },
             value: session_id.clone(),
         },
         SessionMetadataEntry {
@@ -968,8 +1052,16 @@ fn build_session(
                         tone: PreviewTone::User,
                         folded: false,
                         lines: vec![
-                            format!("Resume Codex session {session_id}."),
-                            format!("Open the workspace rooted at {cwd}."),
+                            if kind == SessionKind::Document {
+                                format!("Open document {title}.")
+                            } else {
+                                format!("Resume Codex session {session_id}.")
+                            },
+                            if kind == SessionKind::Document {
+                                "Documents live beside sessions in the same fast tree model.".to_string()
+                            } else {
+                                format!("Open the workspace rooted at {cwd}.")
+                            },
                         ],
                     },
                     SessionPreviewBlock {
@@ -978,9 +1070,21 @@ fn build_session(
                         tone: PreviewTone::Assistant,
                         folded: false,
                         lines: vec![
-                            format!("{backend_label} backend reserved for the live terminal surface."),
-                            "Rendered preview follows the session transcript first and tool activity second.".to_string(),
-                            format!("Terminal launch command: {launch_command}"),
+                            if kind == SessionKind::Document {
+                                "Preview mode renders document content immediately from the local workspace store.".to_string()
+                            } else {
+                                format!("{backend_label} backend reserved for the live terminal surface.")
+                            },
+                            if kind == SessionKind::Document {
+                                "Terminal mode is disabled for document nodes.".to_string()
+                            } else {
+                                "Rendered preview follows the session transcript first and tool activity second.".to_string()
+                            },
+                            if kind == SessionKind::Document {
+                                format!("Document path: {path}")
+                            } else {
+                                format!("Terminal launch command: {launch_command}")
+                            },
                         ],
                     },
                 ]
@@ -990,14 +1094,18 @@ fn build_session(
     let mut metadata = vec![
         SessionMetadataEntry {
             label: "Source",
-            value: "stored".to_string(),
+            value: if kind == SessionKind::Document {
+                "document".to_string()
+            } else {
+                "stored".to_string()
+            },
         },
         SessionMetadataEntry {
             label: "Host",
             value: host_label.clone(),
         },
         SessionMetadataEntry {
-            label: "Session",
+            label: if kind == SessionKind::Document { "Document" } else { "Session" },
             value: session_id.clone(),
         },
         SessionMetadataEntry {
@@ -1073,6 +1181,7 @@ fn build_session(
         id: session_id.clone(),
         session_path: path.to_string(),
         title: title.clone(),
+        kind,
         host_label: host_label.clone(),
         source: SessionSource::Stored,
         backend,
@@ -1089,20 +1198,48 @@ fn build_session(
             true,
         ),
         terminal_lines: vec![
-            format!("$ cd {cwd}"),
-            format!("$ codex resume {session_id}"),
+            if kind == SessionKind::Document {
+                "Document nodes do not launch a terminal surface.".to_string()
+            } else {
+                format!("$ cd {cwd}")
+            },
+            if kind == SessionKind::Document {
+                format!("Open {title} in preview mode.")
+            } else {
+                format!("$ codex resume {session_id}")
+            },
             format!("Terminal host: {backend_label}"),
-            "yggterm server launches an in-process PTY for terminal mode".to_string(),
-            "xterm.js renders the active PTY directly in the main viewport.".to_string(),
+            if kind == SessionKind::Document {
+                "Use yggterm doc write <path> to update this note from the CLI.".to_string()
+            } else {
+                "yggterm server launches an in-process PTY for terminal mode".to_string()
+            },
+            if kind == SessionKind::Document {
+                "Documents stay render-first and load from ~/.yggterm/workspace.db.".to_string()
+            } else {
+                "xterm.js renders the active PTY directly in the main viewport.".to_string()
+            },
             embedded_surface_note(ghostty_bridge_enabled),
         ],
         rendered_sections: vec![
             SessionRenderedSection {
                 title: "Rendered Session",
                 lines: vec![
-                    "Preview mode renders the stored Codex transcript as a chat surface.".to_string(),
-                    "Turn Preview off in the titlebar to hand the main viewport back to the embedded terminal.".to_string(),
-                    "The terminal/server session stays authoritative underneath.".to_string(),
+                    if kind == SessionKind::Document {
+                        "Preview mode renders the document body in place beside your session tree.".to_string()
+                    } else {
+                        "Preview mode renders the stored Codex transcript as a chat surface.".to_string()
+                    },
+                    if kind == SessionKind::Document {
+                        "Use the CLI to create or edit notes quickly without slowing down startup.".to_string()
+                    } else {
+                        "Turn Preview off in the titlebar to hand the main viewport back to the embedded terminal.".to_string()
+                    },
+                    if kind == SessionKind::Document {
+                        "This gives each problem space room for both sessions and nearby notes.".to_string()
+                    } else {
+                        "The terminal/server session stays authoritative underneath.".to_string()
+                    },
                 ],
             },
             SessionRenderedSection {
@@ -1130,6 +1267,7 @@ fn build_session(
 
 fn build_live_session(
     uuid: &str,
+    kind: SessionKind,
     target: &SshConnectTarget,
     backend: TerminalBackend,
     theme: UiTheme,
@@ -1150,6 +1288,7 @@ fn build_live_session(
         id: uuid.to_string(),
         session_path: format!("ssh://{}/{}", target.ssh_target, uuid),
         title: uuid.to_string(),
+        kind,
         host_label: target.label.clone(),
         source: SessionSource::LiveSsh,
         backend,
@@ -1280,6 +1419,57 @@ fn build_live_session(
         ssh_target: Some(target.ssh_target.clone()),
         ssh_prefix: target.prefix.clone(),
     }
+}
+
+fn hydrate_document_session(session: &mut ManagedSessionView, document: &WorkspaceDocument) {
+    session.kind = SessionKind::Document;
+    session.id = document.id.clone();
+    session.title = document.title.clone();
+    session.session_path = document.virtual_path.clone();
+    session.launch_command = "document preview".to_string();
+    session.preview = SessionPreview {
+        summary: vec![
+            SessionMetadataEntry {
+                label: "Document",
+                value: document.title.clone(),
+            },
+            SessionMetadataEntry {
+                label: "Storage",
+                value: document.virtual_path.clone(),
+            },
+            SessionMetadataEntry {
+                label: "Updated",
+                value: document.updated_at.clone(),
+            },
+        ],
+        blocks: vec![SessionPreviewBlock {
+            role: "NOTE",
+            timestamp: document.updated_at.clone(),
+            tone: PreviewTone::Assistant,
+            folded: false,
+            lines: document.body.lines().map(ToOwned::to_owned).collect(),
+        }],
+    };
+    session.rendered_sections = vec![SessionRenderedSection {
+        title: "Document",
+        lines: document.body.lines().map(ToOwned::to_owned).collect(),
+    }];
+    session.metadata.retain(|entry| {
+        !matches!(
+            entry.label,
+            "Session" | "Document" | "Storage" | "Updated" | "Status" | "Restore" | "Launch"
+        )
+    });
+    upsert_session_metadata(&mut session.metadata, "Source", "document".to_string());
+    upsert_session_metadata(&mut session.metadata, "Document", document.title.clone());
+    upsert_session_metadata(&mut session.metadata, "Storage", document.virtual_path.clone());
+    upsert_session_metadata(&mut session.metadata, "Updated", document.updated_at.clone());
+    upsert_session_metadata(&mut session.metadata, "Status", "preview only".to_string());
+    session.terminal_lines = vec![
+        format!("Document {}", document.title),
+        "Terminal mode is disabled for document nodes.".to_string(),
+        "Use yggterm doc write <path> to update this note from the CLI.".to_string(),
+    ];
 }
 
 fn describe_status_line(

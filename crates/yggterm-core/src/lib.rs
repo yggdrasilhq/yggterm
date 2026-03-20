@@ -1,6 +1,7 @@
 mod browser;
 mod transcript;
 mod titles;
+mod workspace;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -14,6 +15,10 @@ use titles::{SessionTitleResolver, settings_ready as litellm_settings_ready};
 
 pub use browser::{BrowserMetrics, BrowserRow, BrowserRowKind, SessionBrowserState};
 pub use transcript::{TranscriptMessage, TranscriptRole, message_lines_from_payload, read_codex_transcript_messages};
+pub use workspace::{
+    WorkspaceDocument, WorkspaceDocumentSummary, WorkspaceStore, default_document_title,
+    normalize_virtual_document_path,
+};
 
 pub const ENV_YGGTERM_HOME: &str = "YGGTERM_HOME";
 pub const DEFAULT_HOME_DIRNAME: &str = ".yggterm";
@@ -23,12 +28,21 @@ pub const SETTINGS_FILENAME: &str = "settings.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionNode {
+    pub kind: SessionNodeKind,
     pub name: String,
     pub title: Option<String>,
     pub path: PathBuf,
     pub children: Vec<SessionNode>,
     pub session_id: Option<String>,
     pub cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionNodeKind {
+    Group,
+    CodexSession,
+    Document,
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +157,23 @@ impl SessionStore {
     pub fn load_codex_tree(&self, settings: &AppSettings) -> Result<SessionNode> {
         let codex_root = resolve_codex_sessions_root()?;
         build_codex_browser_tree(&self.home, &codex_root, settings)
+    }
+
+    pub fn list_documents(&self) -> Result<Vec<WorkspaceDocumentSummary>> {
+        WorkspaceStore::open(&self.home)?.list_documents()
+    }
+
+    pub fn load_document(&self, virtual_path: &str) -> Result<Option<WorkspaceDocument>> {
+        WorkspaceStore::open(&self.home)?.get_document(virtual_path)
+    }
+
+    pub fn save_document(
+        &self,
+        virtual_path: &str,
+        title: Option<&str>,
+        body: &str,
+    ) -> Result<WorkspaceDocument> {
+        WorkspaceStore::open(&self.home)?.put_document(virtual_path, title, body)
     }
 
     pub fn generate_missing_codex_titles(
@@ -280,6 +311,7 @@ fn walk_directory_tree(path: &Path, include_codex_files: bool) -> Result<Session
             children.push(walk_directory_tree(&entry_path, include_codex_files)?);
         } else if include_codex_files && is_codex_session_file(&entry_path) {
             children.push(SessionNode {
+                kind: SessionNodeKind::CodexSession,
                 name: codex_leaf_label(&entry_path),
                 title: None,
                 path: entry_path,
@@ -292,6 +324,7 @@ fn walk_directory_tree(path: &Path, include_codex_files: bool) -> Result<Session
     children.sort_by(|a, b| a.name.cmp(&b.name));
 
     Ok(SessionNode {
+        kind: SessionNodeKind::Group,
         name,
         title: None,
         path: path.to_path_buf(),
@@ -369,6 +402,7 @@ struct CodexSessionIdentity {
 struct CodexProjectBucket {
     cwd: String,
     sessions: Vec<CodexSessionSummary>,
+    documents: Vec<WorkspaceDocumentSummary>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -405,7 +439,15 @@ fn build_codex_browser_tree(
         buckets.push(CodexProjectBucket {
             cwd,
             sessions: project_sessions,
+            documents: Vec::new(),
         });
+    }
+
+    for document in WorkspaceStore::open(home)
+        .and_then(|workspace| workspace.list_documents())
+        .unwrap_or_default()
+    {
+        insert_document_into_projects(&mut buckets, document);
     }
 
     let mut root = CodexBrowserTreeNode {
@@ -673,12 +715,22 @@ fn codex_browser_tree_to_session_node(node: &CodexBrowserTreeNode) -> SessionNod
 
     if let Some(project) = &node.project {
         children.extend(project.sessions.iter().map(|session| SessionNode {
+            kind: SessionNodeKind::CodexSession,
             name: short_session_id(&session.session_id),
             title: session.generated_title.clone(),
             path: session.file_path.clone(),
             children: Vec::new(),
             session_id: Some(session.session_id.clone()),
             cwd: Some(project.cwd.clone()),
+        }));
+        children.extend(project.documents.iter().map(|document| SessionNode {
+            kind: SessionNodeKind::Document,
+            name: document.title.clone(),
+            title: Some(document.title.clone()),
+            path: PathBuf::from(document.virtual_path.clone()),
+            children: Vec::new(),
+            session_id: Some(document.id.clone()),
+            cwd: Some(document.virtual_path.clone()),
         }));
     }
 
@@ -690,6 +742,7 @@ fn codex_browser_tree_to_session_node(node: &CodexBrowserTreeNode) -> SessionNod
     );
 
     SessionNode {
+        kind: SessionNodeKind::Group,
         name: node.name.clone(),
         title: None,
         path: PathBuf::from(node.full_path.clone()),
@@ -708,5 +761,42 @@ fn short_session_id(session_id: &str) -> String {
         format!("Q{}", &compact[compact.len() - 7..])
     } else {
         session_id.to_string()
+    }
+}
+
+fn insert_document_into_projects(
+    buckets: &mut Vec<CodexProjectBucket>,
+    document: WorkspaceDocumentSummary,
+) {
+    let parent_path = document_parent_path(&document.virtual_path);
+    if let Some(bucket) = buckets.iter_mut().find(|bucket| bucket.cwd == parent_path) {
+        bucket.documents.push(document);
+        bucket
+            .documents
+            .sort_by(|left, right| left.title.cmp(&right.title));
+        return;
+    }
+
+    buckets.push(CodexProjectBucket {
+        cwd: parent_path,
+        sessions: Vec::new(),
+        documents: vec![document],
+    });
+}
+
+fn document_parent_path(path: &str) -> String {
+    let normalized = normalize_virtual_document_path(path);
+    let mut segments = normalized
+        .trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if !segments.is_empty() {
+        segments.pop();
+    }
+    if segments.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", segments.join("/"))
     }
 }
