@@ -110,8 +110,10 @@ pub enum RemoteDeployState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SshConnectTarget {
     pub label: String,
+    pub kind: SessionKind,
     pub ssh_target: String,
     pub prefix: Option<String>,
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,6 +199,7 @@ pub struct PersistedLiveSession {
     pub kind: SessionKind,
     pub ssh_target: String,
     pub prefix: Option<String>,
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -269,18 +272,31 @@ impl YggtermServer {
             ssh_targets: vec![
                 SshConnectTarget {
                     label: "prod-app-01".to_string(),
+                    kind: SessionKind::SshShell,
                     ssh_target: "prod-app-01".to_string(),
                     prefix: Some("sudo machinectl shell prod".to_string()),
+                    cwd: None,
                 },
                 SshConnectTarget {
                     label: "design-01".to_string(),
+                    kind: SessionKind::SshShell,
                     ssh_target: "design-01".to_string(),
                     prefix: None,
+                    cwd: None,
                 },
                 SshConnectTarget {
                     label: "ghostty-admin".to_string(),
+                    kind: SessionKind::SshShell,
                     ssh_target: "ghostty-admin".to_string(),
                     prefix: Some("tmux new-session -A -s yggterm".to_string()),
+                    cwd: None,
+                },
+                SshConnectTarget {
+                    label: "local-shell".to_string(),
+                    kind: SessionKind::Shell,
+                    ssh_target: "localhost".to_string(),
+                    prefix: None,
+                    cwd: dirs::home_dir().map(|path| path.display().to_string()),
                 },
             ],
             live_session_order: Vec::new(),
@@ -503,6 +519,11 @@ impl YggtermServer {
                     kind: session.kind,
                     ssh_target: ssh_target.clone(),
                     prefix: session.ssh_prefix.clone(),
+                    cwd: session
+                        .metadata
+                        .iter()
+                        .find(|entry| entry.label == "Cwd")
+                        .map(|entry| entry.value.clone()),
                 })
             })
             .collect();
@@ -553,16 +574,21 @@ impl YggtermServer {
     pub fn connect_ssh_target(&mut self, target_ix: usize) -> Option<String> {
         let target = self.ssh_targets.get(target_ix)?.clone();
         let uuid = Uuid::new_v4().to_string();
-        let key = format!("live::{uuid}");
-        self.insert_live_session(&key, &uuid, SessionKind::SshShell, &target, Some(target.label.clone()));
+        let key = match target.kind {
+            SessionKind::Shell => format!("local::{uuid}"),
+            _ => format!("live::{uuid}"),
+        };
+        self.insert_live_session(&key, &uuid, target.kind, &target, Some(target.label.clone()));
         Some(key)
     }
 
     pub fn restore_live_session(&mut self, live: PersistedLiveSession) {
         let target = SshConnectTarget {
             label: live.title.clone(),
+            kind: live.kind,
             ssh_target: live.ssh_target,
             prefix: live.prefix,
+            cwd: live.cwd,
         };
         self.insert_live_session(&live.key, &live.id, live.kind, &target, Some(live.title));
     }
@@ -1278,15 +1304,29 @@ fn build_live_session(
         Some(prefix) => format!("{prefix} && yggterm server attach {uuid}"),
         None => format!("yggterm server attach {uuid}"),
     };
-    let launch_command = format!(
-        "ssh {} {}",
-        target.ssh_target,
-        shell_single_quote(&remote_command)
-    );
+    let shell_program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+    let launch_command = if kind == SessionKind::Shell {
+        let cwd = target
+            .cwd
+            .clone()
+            .unwrap_or_else(|| dirs::home_dir().map(|path| path.display().to_string()).unwrap_or_else(|| "/".to_string()));
+        format!("cd '{}' && {} -l", cwd.replace('\'', "'\\''"), shell_program)
+    } else {
+        format!(
+            "ssh {} {}",
+            target.ssh_target,
+            shell_single_quote(&remote_command)
+        )
+    };
+    let session_path = if kind == SessionKind::Shell {
+        format!("local://{uuid}")
+    } else {
+        format!("ssh://{}/{}", target.ssh_target, uuid)
+    };
 
     ManagedSessionView {
         id: uuid.to_string(),
-        session_path: format!("ssh://{}/{}", target.ssh_target, uuid),
+        session_path,
         title: uuid.to_string(),
         kind,
         host_label: target.label.clone(),
@@ -1324,11 +1364,22 @@ fn build_live_session(
                 },
                 SessionMetadataEntry {
                     label: "Target",
-                    value: target.ssh_target.clone(),
+                    value: if kind == SessionKind::Shell {
+                        target
+                            .cwd
+                            .clone()
+                            .unwrap_or_else(|| "local shell".to_string())
+                    } else {
+                        target.ssh_target.clone()
+                    },
                 },
                 SessionMetadataEntry {
                     label: "Prefix",
-                    value: target.prefix.clone().unwrap_or_else(|| "none".to_string()),
+                    value: if kind == SessionKind::Shell {
+                        shell_program.clone()
+                    } else {
+                        target.prefix.clone().unwrap_or_else(|| "none".to_string())
+                    },
                 },
                 SessionMetadataEntry {
                     label: "Started",
@@ -1351,7 +1402,11 @@ fn build_live_session(
                     folded: false,
                     lines: vec![
                         format!("Open live terminal {uuid} through the Yggterm server."),
-                        "This session should land in the main viewport as an embedded xterm.js terminal.".to_string(),
+                        if kind == SessionKind::Shell {
+                            "This local shell should stay alive in the daemon while you browse elsewhere.".to_string()
+                        } else {
+                            "This session should land in the main viewport as an embedded xterm.js terminal.".to_string()
+                        },
                     ],
                 },
                 SessionPreviewBlock {
@@ -1361,7 +1416,11 @@ fn build_live_session(
                     folded: false,
                     lines: vec![
                         format!("Launch command prepared: {launch_command}"),
-                        "Remote bootstrap will eventually ship the yggterm binary before attach.".to_string(),
+                        if kind == SessionKind::Shell {
+                            "This local shell uses the same PTY/runtime path as other embedded terminals.".to_string()
+                        } else {
+                            "Remote bootstrap will eventually ship the yggterm binary before attach.".to_string()
+                        },
                     ],
                 },
             ],
@@ -1369,7 +1428,11 @@ fn build_live_session(
         metadata: vec![
             SessionMetadataEntry {
                 label: "Source",
-                value: "live-ssh".to_string(),
+                value: if kind == SessionKind::Shell {
+                    "local-shell".to_string()
+                } else {
+                    "live-ssh".to_string()
+                },
             },
             SessionMetadataEntry {
                 label: "Host",
@@ -1381,15 +1444,30 @@ fn build_live_session(
             },
             SessionMetadataEntry {
                 label: "Target",
-                value: target.ssh_target.clone(),
+                value: if kind == SessionKind::Shell {
+                    target
+                        .cwd
+                        .clone()
+                        .unwrap_or_else(|| "local shell".to_string())
+                } else {
+                    target.ssh_target.clone()
+                },
             },
             SessionMetadataEntry {
                 label: "Prefix",
-                value: target.prefix.clone().unwrap_or_else(|| "none".to_string()),
+                value: if kind == SessionKind::Shell {
+                    shell_program.clone()
+                } else {
+                    target.prefix.clone().unwrap_or_else(|| "none".to_string())
+                },
             },
             SessionMetadataEntry {
                 label: "Deploy",
-                value: "planned".to_string(),
+                value: if kind == SessionKind::Shell {
+                    "not required".to_string()
+                } else {
+                    "planned".to_string()
+                },
             },
             SessionMetadataEntry {
                 label: "Launch PID",
@@ -1547,7 +1625,11 @@ fn build_live_terminal_lines(session: &ManagedSessionView) -> Vec<String> {
     vec![
         format!("$ {}", session.launch_command),
         format!("Launching live SSH session {}", session.id),
-        format!("Target: {}", session.host_label),
+        format!(
+            "{}: {}",
+            if session.kind == SessionKind::Shell { "Shell" } else { "Target" },
+            session.host_label
+        ),
         format!("Deploy state: {deploy}"),
         format!("Launch phase: {launch}"),
         "Terminal surface: embedded xterm.js".to_string(),
