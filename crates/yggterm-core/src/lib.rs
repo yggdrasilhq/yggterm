@@ -24,7 +24,8 @@ pub use install::{
 pub use transcript::{TranscriptMessage, TranscriptRole, message_lines_from_payload, read_codex_transcript_messages};
 pub use workspace::{
     WorkspaceDocument, WorkspaceDocumentInput, WorkspaceDocumentKind, WorkspaceDocumentSummary,
-    WorkspaceStore, default_document_title, normalize_virtual_document_path,
+    WorkspaceGroup, WorkspaceStore, default_document_title, normalize_virtual_document_path,
+    normalize_virtual_group_path,
 };
 
 pub const ENV_YGGTERM_HOME: &str = "YGGTERM_HOME";
@@ -181,8 +182,16 @@ impl SessionStore {
         WorkspaceStore::open(&self.home)?.list_documents()
     }
 
+    pub fn list_groups(&self) -> Result<Vec<WorkspaceGroup>> {
+        WorkspaceStore::open(&self.home)?.list_groups()
+    }
+
     pub fn load_document(&self, virtual_path: &str) -> Result<Option<WorkspaceDocument>> {
         WorkspaceStore::open(&self.home)?.get_document(virtual_path)
+    }
+
+    pub fn save_group(&self, virtual_path: &str, title: Option<&str>) -> Result<WorkspaceGroup> {
+        WorkspaceStore::open(&self.home)?.put_group(virtual_path, title)
     }
 
     pub fn save_document(
@@ -437,6 +446,7 @@ struct CodexProjectBucket {
 struct CodexBrowserTreeNode {
     name: String,
     full_path: String,
+    explicit_title: Option<String>,
     project: Option<CodexProjectBucket>,
     children: BTreeMap<String, CodexBrowserTreeNode>,
 }
@@ -471,19 +481,24 @@ fn build_codex_browser_tree(
         });
     }
 
-    for document in WorkspaceStore::open(home)
-        .and_then(|workspace| workspace.list_documents())
-        .unwrap_or_default()
-    {
-        insert_document_into_projects(&mut buckets, document);
-    }
-
     let mut root = CodexBrowserTreeNode {
         name: String::from("local [ok]"),
         full_path: String::from("local"),
+        explicit_title: None,
         project: None,
         children: BTreeMap::new(),
     };
+
+    if let Ok(workspace) = WorkspaceStore::open(home) {
+        for document in workspace.list_documents().unwrap_or_default() {
+            insert_document_into_projects(&mut buckets, document);
+        }
+
+        for group in workspace.list_groups().unwrap_or_default() {
+            insert_workspace_group(&mut root, &group);
+        }
+    }
+
     for bucket in buckets {
         insert_codex_browser_project(&mut root, &bucket);
     }
@@ -678,9 +693,39 @@ fn insert_codex_browser_path(
         .or_insert_with(|| CodexBrowserTreeNode {
             name: segment.clone(),
             full_path: child_path,
+            explicit_title: None,
             ..Default::default()
         });
     insert_codex_browser_path(child, &segments[1..], project);
+}
+
+fn insert_workspace_group(root: &mut CodexBrowserTreeNode, group: &WorkspaceGroup) {
+    let segments = browser_tree_segments(&group.virtual_path);
+    insert_workspace_group_path(root, &segments, group);
+}
+
+fn insert_workspace_group_path(
+    node: &mut CodexBrowserTreeNode,
+    segments: &[String],
+    group: &WorkspaceGroup,
+) {
+    if segments.is_empty() {
+        node.explicit_title = Some(group.title.clone());
+        return;
+    }
+
+    let segment = &segments[0];
+    let child_path = browser_tree_child_path(&node.full_path, segment);
+    let child = node
+        .children
+        .entry(segment.clone())
+        .or_insert_with(|| CodexBrowserTreeNode {
+            name: segment.clone(),
+            full_path: child_path,
+            explicit_title: None,
+            ..Default::default()
+        });
+    insert_workspace_group_path(child, &segments[1..], group);
 }
 
 fn browser_tree_segments(cwd: &str) -> Vec<String> {
@@ -729,8 +774,12 @@ fn compress_codex_browser_tree(node: &mut CodexBrowserTreeNode, can_compress_sel
         return;
     }
 
-    while node.project.is_none() && node.children.len() == 1 {
+    while node.project.is_none() && node.explicit_title.is_none() && node.children.len() == 1 {
         let (_, child) = node.children.pop_first().expect("single child exists");
+        if child.explicit_title.is_some() {
+            node.children.insert(child.name.clone(), child);
+            break;
+        }
         node.name = join_session_label(&node.name, &child.name);
         node.full_path = child.full_path;
         node.project = child.project;
@@ -774,7 +823,7 @@ fn codex_browser_tree_to_session_node(node: &CodexBrowserTreeNode) -> SessionNod
     SessionNode {
         kind: SessionNodeKind::Group,
         name: node.name.clone(),
-        title: None,
+        title: node.explicit_title.clone(),
         document_kind: None,
         path: PathBuf::from(node.full_path.clone()),
         children,

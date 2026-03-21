@@ -1329,6 +1329,61 @@ fn queue_new_document_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
     });
 }
 
+fn queue_new_group_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
+    state.with_mut(|shell| {
+        shell.server_busy = true;
+        shell.last_action = format!("creating group in {}", row.label);
+        shell.close_context_menu();
+    });
+
+    let settings = state.read().settings.clone();
+    spawn(async move {
+        let row_for_task = row.clone();
+        let outcome = task::spawn_blocking(move || -> Result<(String, yggterm_core::SessionNode)> {
+            let store = SessionStore::open_or_init()?;
+            let virtual_path = new_group_virtual_path_for_row(&row_for_task);
+            store.save_group(&virtual_path, Some("New Group"))?;
+            Ok((virtual_path, store.load_codex_tree(&settings)?))
+        })
+        .await;
+
+        state.with_mut(|shell| match outcome {
+            Ok(Ok((selected_path, browser_tree))) => {
+                let expanded_paths = shell.browser.expanded_paths();
+                shell.browser = SessionBrowserState::new(browser_tree);
+                shell.browser.restore_ui_state(&expanded_paths, Some(&selected_path));
+                shell.browser.select_path(selected_path.clone());
+                shell.sync_browser_settings();
+                shell.server_busy = false;
+                shell.last_action = format!("created group in {}", row.label);
+                shell.push_notification(
+                    NotificationTone::Success,
+                    "Workspace Group Created",
+                    format!("Added a new virtual group under {}.", row.label),
+                );
+            }
+            Ok(Err(error)) => {
+                shell.server_busy = false;
+                shell.last_action = format!("group creation failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "Group Creation Failed",
+                    error.to_string(),
+                );
+            }
+            Err(error) => {
+                shell.server_busy = false;
+                shell.last_action = format!("group task failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "Group Task Failed",
+                    error.to_string(),
+                );
+            }
+        });
+    });
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AfterSaveAction {
     SaveOnly,
@@ -1557,6 +1612,21 @@ fn new_document_virtual_path_for_row(row: &BrowserRow) -> String {
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
     format!("{}/notes/untitled-{}", base.trim_end_matches('/'), stamp)
+}
+
+fn new_group_virtual_path_for_row(row: &BrowserRow) -> String {
+    let base = match row.kind {
+        BrowserRowKind::Group if row.full_path == "local" => "/workspace".to_string(),
+        BrowserRowKind::Group if row.full_path.starts_with("__live_") => "/workspace".to_string(),
+        BrowserRowKind::Group => row.full_path.clone(),
+        BrowserRowKind::Session => row.session_cwd.clone().unwrap_or_else(|| "/workspace".to_string()),
+        BrowserRowKind::Document => parent_virtual_path(&row.full_path).unwrap_or_else(|| "/workspace".to_string()),
+    };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    format!("{}/group-{}", base.trim_end_matches('/'), stamp)
 }
 
 fn group_session_cwd(row: &BrowserRow) -> Option<String> {
@@ -2085,6 +2155,10 @@ fn app() -> Element {
                         on_create_group_codex: {
                             let row = row.clone();
                             move |_| spawn_start_group_session(state, row.clone(), SessionKind::Codex)
+                        },
+                        on_create_group: {
+                            let row = row.clone();
+                            move |_| queue_new_group_for_row(state, row.clone())
                         },
                         on_create_group_codex_litellm: {
                             let row = row.clone();
@@ -4204,6 +4278,7 @@ fn ContextMenuOverlay(
     row: BrowserRow,
     palette: Palette,
     on_close: EventHandler<MouseEvent>,
+    on_create_group: EventHandler<MouseEvent>,
     on_create_group_codex: EventHandler<MouseEvent>,
     on_create_group_codex_litellm: EventHandler<MouseEvent>,
     on_create_group_shell: EventHandler<MouseEvent>,
@@ -4228,6 +4303,15 @@ fn ContextMenuOverlay(
                     "{row.label}"
                 }
                 if row.kind == BrowserRowKind::Group && !row.full_path.starts_with("__live_") {
+                    button {
+                        style: format!(
+                            "width:100%; height:30px; border:none; border-radius:10px; background:{}; color:{}; \
+                             font-size:12px; font-weight:600; text-align:left; padding:0 10px; margin-bottom:6px;",
+                            palette.panel_alt, palette.text
+                        ),
+                        onclick: move |evt| on_create_group.call(evt),
+                        "New Group"
+                    }
                     button {
                         style: format!(
                             "width:100%; height:30px; border:none; border-radius:10px; background:{}; color:{}; \

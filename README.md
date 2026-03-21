@@ -114,6 +114,7 @@ The sidebar is now an active workspace surface.
 
 Examples of what you can do:
 
+- right-click a folder or group and create a new virtual group there
 - right-click a folder or group and create a new Codex session there
 - right-click a folder or group and create a local shell in that context
 - right-click a folder or group and create a nearby document
@@ -122,6 +123,8 @@ Examples of what you can do:
 - regenerate generated titles for a session when needed
 
 The intent is simple: organizing the tree should naturally create the right place to work next.
+
+Virtual groups are stored under `~/.yggterm/workspace.db`, so they load quickly and do not depend on walking a large on-disk workspace before the UI becomes useful.
 
 ## Documents and recipes
 
