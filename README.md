@@ -1,89 +1,6 @@
 # yggterm
 
-Yggdrasil Terminal (`yggterm`) is a Rust-first terminal workspace that combines a Dioxus desktop shell shaped like Zed with a server-owned PTY runtime and an embedded xterm.js terminal surface.
-
-The product target is not "an editor with terminals". It is a remote-first terminal application with a strong sidebar, persistent session metadata, and room for many long-lived shells across different machines.
-
-What that means in practice is simple: a project space in Yggterm should be able to hold the live terminal, the recovered Codex transcript, and nearby notes for the same problem. The sidebar is not just a launcher. It is the memory of the workspace.
-
-## Product direction
-
-- Dioxus desktop is the active app shell and Zed remains the primary visual and structural reference.
-- xterm.js is the active embedded terminal surface.
-- Yggterm's daemon owns PTYs, restore state, and session attachment.
-- The left sidebar is a vertical tree of virtual folders and sessions.
-- Sidebar nodes represent session metadata, not a direct mirror of the local filesystem.
-- Session entries may point at Codex workflows, SSH targets, local shells, documents, and other terminal contexts.
-- Example paths should feel like `remote/prod/codex-session-tui`, `machines/pi/build-box`, or `local/design/zed-chrome-study`.
-- Restoring all sessions, durable terminal metadata, and clipboard or screenshot paste into remote sessions are explicit quality-of-life goals.
-- The Yggterm daemon is intended to stay authoritative underneath the UI so terminals can survive view switches and session hopping cleanly.
-
-## Current status
-
-This repository is still scaffolding.
-
-- Rust workspace structure is in place.
-- xterm.js is embedded directly inside the main viewport for terminal mode.
-- A Dioxus desktop shell exists for fast iteration on layout and interaction.
-- The current shell lives in `crates/yggterm-ui` and is the active product surface.
-- Session orchestration now has a dedicated crate boundary in `crates/yggterm-server`.
-- `yggterm server daemon` now owns session restore/runtime state and persists it under `~/.yggterm/server-state.json`.
-- `yggterm server attach <uuid>` now creates reusable attach metadata under `~/.yggterm/runtime/attach/<uuid>/session.json` and falls back to `tmux` or the user shell.
-- Workspace documents are now stored under `~/.yggterm/workspace.db` and can be loaded into the same browser tree as Codex sessions.
-- The connect rail can now create both SSH-backed sessions and plain local shell sessions through the same daemon/runtime path.
-- The connect rail can now start fresh local agent sessions too, with a persisted `Codex` or `Codex LiteLLM` profile chosen from settings.
-- Session context menus can now create nearby notes so a workspace can keep a terminal and its scratch document together.
-- Live daemon-owned sessions now appear in the main sidebar tree instead of hiding only inside the connect panel.
-- Documents are editable in the main viewport now, not just previewed as static blocks.
-- The sidebar can start fresh Codex, Codex LiteLLM, shell, and document workflows directly, instead of forcing those flows through a side panel.
-- The virtual tree is now an active workspace surface, not just a picker: right-click a folder or group and spawn a new Codex session, LiteLLM session, shell, or nearby document in that context.
-- The workspace store now distinguishes plain notes from terminal recipes, so session-derived documents can carry replay seeds and source-session metadata.
-- `yggterm` now opens the Dioxus shell directly.
-- The old CLI subcommands and the `eframe` scaffold path have been removed.
-- The shell chrome is now owned locally in `yggterm-ui`, while the adjacent Zed checkout remains the visual reference stack.
-- Ghostty bridge code still exists as optional legacy integration work, but it is no longer part of the default release path.
-- Direct GitHub-release installs now own the fast update path instead of npm.
-- The app now detects direct installs versus package-manager installs and only self-updates when it owns the install root.
-
-When working in this repo, optimize for getting the application closer to "Zed-shaped chrome + server-owned sessions + virtual session tree", not for deepening temporary scaffolding choices.
-
-## Why Zed
-
-Yggterm should inherit the parts of Zed that already work well for a dense workstation UI:
-
-- title bar and window chrome proportions
-- left-sidebar rhythm and hierarchy
-- pane vocabulary
-- focus routing and panel behavior
-- theme behavior
-
-The key change is that the center of the app is terminal sessions and session groups instead of editors and projects.
-
-## Session model
-
-`YGGTERM_HOME` defaults to `~/.yggterm`.
-
-Today, the scaffold persists session state under `~/.yggterm/sessions`, but that storage layout is only a stepping stone. The long-term model is metadata-first: the sidebar tree should be able to describe terminal sessions that map to SSH hosts, Codex workspaces, restore groups, and other non-file concepts.
-
-That same model now applies to documents. Notes are not treated as an afterthought bolted onto a filesystem panel. They are first-class workspace items stored in `~/.yggterm/workspace.db`, so they can sit right beside the sessions they explain.
-
-This is the direction:
-
-- terminal sessions stay alive in the daemon while you switch views
-- preview mode and terminal mode are two lenses on the same underlying workspace
-- documents live near the sessions and commands they belong to
-- local shells and SSH shells share the same embedded terminal path instead of becoming special cases
-- agent sessions use the same daemon-owned PTY lifecycle, so Codex, Codex LiteLLM, and plain shells all restore through one runtime model
-- fast local metadata stores keep startup cheap even when the tree gets large
-
-References to keep in mind while iterating:
-
-- local Zed checkout: `../zed`
-- Codex session UI reference: `~/gh/codex-session-tui`
-
-## Install
-
-During this fast iteration period, the primary install path is a direct GitHub-release install. It pulls the latest matching artifact for your OS and architecture, installs it into a managed user-space root, and lets the app self-update on launch.
+Install the latest build directly from GitHub Releases:
 
 Linux and macOS:
 
@@ -97,57 +14,118 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/yggdrasilhq/yggterm/main/scripts/install.ps1 | iex
 ```
 
-What direct install does today:
+Yggterm installs into a managed user-space location, wires up desktop integration, and keeps itself current on launch when it owns that install root.
 
-- downloads the latest GitHub release artifact for your platform and architecture
-- installs Yggterm into a managed direct-install root
-- refreshes desktop integration on launch
-- self-updates on launch when a newer GitHub release is available
+## What yggterm is
 
-Package-managed installs are intentionally different:
+Yggdrasil Terminal (`yggterm`) is a remote-first terminal workspace built in Rust. It is meant for the way people actually work with terminals now: many long-lived sessions, many machines, restored context, Codex-heavy workflows, quick notes beside the terminal, and a sidebar that remembers how everything is related.
 
-- `.deb`, Homebrew, Winget, Scoop, Flatpak, and Snap installs do not self-mutate
-- Yggterm detects those install channels and switches to notify-only update behavior
-- update notifications tell you to use the matching package manager instead
+The product target is not “an editor with a terminal panel.” The terminal is the center. Everything else exists to help you find, restore, explain, automate, and organize terminal work without losing momentum.
 
-## Usage
+That means:
 
-Launch the current desktop shell:
+- one desktop shell for sessions, notes, recipes, and metadata
+- a daemon-owned PTY runtime so terminals survive view switches cleanly
+- a virtual tree of sessions and documents, not a raw filesystem browser
+- first-class support for Codex sessions, local shells, SSH sessions, and workspace notes
+- fast startup from local metadata under `~/.yggterm`
 
-```bash
-yggterm
-```
+## Why use it
 
-## Build from source
+Yggterm is trying to solve a specific problem: terminal work is usually scattered across shell history, tmux panes, half-remembered commands, AI transcripts, scratch files, and SSH tabs. That fragmentation kills flow.
 
-Requirements:
+Yggterm keeps those things nearby:
 
-- Rust stable
-- Rust `1.94.0` is the current pinned toolchain for the local desktop dependency stack.
-- no Ghostty checkout is required for the active embedded terminal path
-- optional local checkout of `../zed` as a design/reference repo while refining shell shape
+- the live terminal
+- the recovered Codex session or other session preview
+- notes and executable recipe documents
+- session metadata and restore state
 
-Current runtime model:
+The left tree is not just a launcher. It is the workspace memory.
 
-- The active terminal path is `yggterm-server` PTYs plus an embedded xterm.js surface inside the Dioxus viewport.
-- Preview mode stays rendered in-process.
-- Ghostty crates remain in the repo only as optional legacy integration work and are no longer required for the default app build.
+## Install and update model
 
-Build the workspace:
+The direct install path above is the mainline channel right now.
 
-```bash
-cargo +1.94.0 build
-```
+What it does:
 
-Run locally:
+- detects your OS and architecture
+- downloads the latest matching GitHub Release artifact
+- installs it into a managed user-space root
+- creates desktop integration for direct installs
+- refreshes integration when assets change
+- self-updates on launch when a newer direct-release build is available
 
-```bash
-cargo +1.94.0 run
-```
+Package-managed installs behave differently on purpose:
 
-## Documents from the CLI
+- `.deb`, Homebrew, Winget, Scoop, Flatpak, and Snap installs are detected
+- those installs switch to notify-only update mode
+- Yggterm tells the user to update with the matching package manager instead of mutating the install behind its back
 
-Yggterm documents already have a simple CLI path so notes can be created or updated without opening another editor surface first.
+This split keeps the fast-moving direct channel frictionless while respecting native platform ownership when the app was installed by a package manager.
+
+## Current product shape
+
+Today the active stack is:
+
+- Dioxus desktop shell for the app surface
+- xterm.js embedded in the main viewport for terminal mode
+- `yggterm-server` as the daemon-owned PTY/runtime layer
+- SQLite-backed local metadata for workspace documents and generated titles
+
+That means the current app already supports:
+
+- embedded terminal mode in the main canvas
+- rendered preview mode for stored sessions and documents
+- daemon-owned live sessions that survive switching between items
+- local shell sessions, SSH-backed sessions, and Codex-style agent sessions
+- workspace notes stored in `~/.yggterm/workspace.db`
+- recipe documents that can be edited in preview mode and executed in terminal mode
+- generated session titles through a configured LiteLLM endpoint
+- direct install with self-update and package-manager-aware notify-only mode
+
+## The workspace model
+
+`YGGTERM_HOME` defaults to `~/.yggterm`.
+
+The long-term model is metadata-first. The tree should describe work, not just folders on disk. A path in Yggterm is allowed to mean:
+
+- a Codex workspace
+- a local shell area
+- an SSH target or machine group
+- a session-derived document cluster
+- a restore grouping
+- a future recipe or automation bucket
+
+Documents are first-class workspace items, not a bolted-on notes tab. They live in `~/.yggterm/workspace.db` and appear in the same tree as sessions.
+
+This is the direction:
+
+- terminals stay alive in the daemon while you switch views
+- preview and terminal are two lenses on the same workspace item
+- notes live beside the sessions they explain
+- recipes carry replay commands and source-session metadata
+- local shells, Codex sessions, and SSH sessions share one runtime model
+- fast local metadata keeps startup cheap even when the tree gets large
+
+## Tree workflow
+
+The sidebar is now an active workspace surface.
+
+Examples of what you can do:
+
+- right-click a folder or group and create a new Codex session there
+- right-click a folder or group and create a local shell in that context
+- right-click a folder or group and create a nearby document
+- right-click a stored session and create a note beside it
+- right-click a stored session and create a recipe derived from it
+- regenerate generated titles for a session when needed
+
+The intent is simple: organizing the tree should naturally create the right place to work next.
+
+## Documents and recipes
+
+Yggterm documents already have a CLI path so notes can be created or updated outside the UI.
 
 List documents:
 
@@ -168,29 +146,71 @@ Read a document back:
 yggterm doc cat /home/pi/gh/yggterm/notes/release-plan
 ```
 
-The path is virtual. It describes where the note should appear in the sidebar tree, not where a markdown file needs to exist on disk.
+The path is virtual. It controls where the item appears in the Yggterm tree; it is not a requirement to mirror files on disk.
 
-Inside the desktop shell, the same document model is available from the tree itself. Right-click a stored session to create a nearby note or recipe, or right-click a folder/group to start a fresh Codex session, LiteLLM session, shell, or document directly in that workspace context.
+Inside the desktop shell:
 
-That flow no longer stops at note creation. Documents can be created directly from the settings rail and edited inline in the main viewport, while the CLI still works against the same `workspace.db` store for fast automation and scripting. Session rows can now also create terminal recipes, which are documents with extra metadata about where they came from and which commands should be replayed.
+- notes open in preview mode for editing
+- recipes can store replay commands and source cwd metadata
+- `Run Recipe` saves the editor state and opens that same item in terminal mode through the daemon runtime
 
-Recipe documents are no longer passive. If a recipe has replay commands, `Run Recipe` now saves the current editor state and reopens that same workspace item in terminal mode through the daemon-owned PTY runtime. Preview mode stays the place to edit and explain the recipe; terminal mode becomes the place to actually execute it.
+That is the beginning of a bigger idea: a workspace can hold the terminal, the explanation, and the repeatable command flow together.
 
 ## Daemon lifecycle
 
-The desktop app talks to a long-lived `yggterm server daemon`. That daemon owns the PTYs and session restore state so terminals do not disappear just because the UI switched to preview mode or focused a different item.
+The desktop app talks to a long-lived `yggterm server daemon`.
 
-When the UI exits, the daemon is asked to shut down gracefully. Codex-flavored sessions receive `/quit`, while plain shells receive `exit`, before the PTY manager escalates to process termination.
+That daemon owns:
 
-For lifecycle work during development, `yggterm server smoke` now boots a temporary daemon home, starts a local shell session, and shuts it back down cleanly.
+- PTYs
+- session restore state
+- live-session lifecycle
+- terminal attachment
+- graceful shutdown behavior
 
-You can stop the daemon explicitly:
+This matters because terminals should not disappear just because the UI changed view or focused a different item.
+
+Current lifecycle behavior:
+
+- live PTYs remain available while you switch between preview and terminal
+- the UI asks the daemon to shut down on exit
+- Codex-flavored sessions receive `/quit`
+- plain shells receive `exit`
+- the PTY manager escalates only if the graceful stop path fails
+
+For development, there is also a smoke command:
+
+```bash
+yggterm server smoke
+```
+
+That boots a temporary daemon home, starts a local shell session, and shuts it back down cleanly.
+
+You can stop the daemon explicitly too:
 
 ```bash
 yggterm server shutdown
 ```
 
-The app also sends that shutdown request on exit so active sessions can be asked to stop gracefully instead of being dropped blindly.
+## Build from source
+
+Requirements:
+
+- Rust `1.94.0`
+- Node is not required for the release/install path
+- no Ghostty checkout is required for the default embedded terminal path
+
+Build:
+
+```bash
+cargo +1.94.0 build
+```
+
+Run:
+
+```bash
+cargo +1.94.0 run
+```
 
 ## Release artifacts
 
@@ -202,14 +222,13 @@ Build the portable Linux release artifacts:
 ./scripts/package-release.sh linux-x86_64
 ```
 
-This produces:
+Build only the Debian package:
 
-- `yggterm-linux-x86_64`
-- `yggterm-linux-x86_64.tar.gz`
-- `yggterm_<version>-<revision>_amd64.deb`
-- corresponding `.sha256` files
+```bash
+./scripts/package-deb.sh
+```
 
-Cross-platform release assets are produced by GitHub Actions on tag pushes:
+Current GitHub release matrix:
 
 - `linux-x86_64`
 - `linux-aarch64`
@@ -217,32 +236,19 @@ Cross-platform release assets are produced by GitHub Actions on tag pushes:
 - `macos-aarch64`
 - `windows-x86_64`
 - `windows-aarch64`
-- Debian `.deb` package for Linux
+- Debian `.deb`
 
-Build only the Debian package:
-
-```bash
-./scripts/package-deb.sh
-```
-
-## Update behavior
-
-Yggterm now has two distinct update modes:
-
-- direct install: checks GitHub Releases on launch and installs the newest matching artifact before the UI opens
-- package-managed install: checks for newer releases in notify-only mode and tells you to update with your package manager
-
-This split matters because it keeps the fast-moving direct channel frictionless without trampling native package-manager ownership when Yggterm is installed through `.deb`, Homebrew, Winget, Scoop, Flatpak, or Snap.
+Each release artifact should also ship with a checksum.
 
 ## Repository layout
 
 - `apps/yggterm`: CLI entrypoint and desktop launcher
-- `crates/yggterm-core`: session model, workspace documents, and settings persistence
-- `crates/yggterm-server`: session orchestration, daemon/IPC state, PTY runtime, and terminal attachment
-- `crates/yggterm-ui`: Dioxus desktop shell, titlebar, statusbar, and view rendering
-- `crates/yggterm-platform`: platform detection
-- `crates/yggterm-ghostty-bridge`: optional legacy Ghostty runtime bridge
-- `scripts/`: packaging, direct installer, and toolchain helpers
+- `crates/yggterm-core`: settings, workspace store, title generation, install detection, and browser state
+- `crates/yggterm-server`: daemon, IPC, PTY runtime, and session orchestration
+- `crates/yggterm-ui`: Dioxus shell and app interaction surface
+- `crates/yggterm-platform`: platform detection helpers
+- `crates/yggterm-ghostty-bridge`: optional legacy bridge code, not part of the default path
+- `scripts/`: installers, packaging, and release helpers
 - `debian/`: Debian package metadata
 
 ## License

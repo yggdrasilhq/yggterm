@@ -1,3 +1,11 @@
+yggterm (2.0.2-1) unstable; urgency=medium
+
+  * Rewrite the README around the direct installer, daemon-owned PTY runtime, and embedded xterm.js terminal path.
+  * Add context-aware folder and group right-click actions for new Codex, LiteLLM, shell, and document workflows.
+  * Keep release packaging aligned with the direct-install update channel and generated checksums.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sat, 21 Mar 2026 00:00:00 +0000
+
 yggterm (2.0.1-1) unstable; urgency=medium
 
   * Replace the npm launcher path with direct GitHub-release installers for Linux, macOS, and Windows.
