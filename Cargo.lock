@@ -5484,6 +5484,7 @@ dependencies = [
  "anyhow",
  "dioxus",
  "once_cell",
+ "png",
  "serde",
  "serde_json",
  "tao",
