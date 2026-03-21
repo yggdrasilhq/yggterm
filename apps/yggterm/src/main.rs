@@ -24,6 +24,8 @@ fn main() -> Result<()> {
     let current_exe = std::env::current_exe()?;
     let install_context = detect_install_context(&current_exe)?;
     let store = SessionStore::open_or_init()?;
+    let mut pending_update_restart = None;
+    let mut launch_install_context = install_context.clone();
     if args.as_slice() == ["server", "daemon"] {
         let _ = refresh_desktop_integration(&install_context);
         let endpoint = default_endpoint(store.home_dir());
@@ -64,8 +66,20 @@ fn main() -> Result<()> {
             match check_for_update(&install_context) {
                 Ok(Some(update)) => match install_release_update(&install_context, &update) {
                     Ok(next_exe) => {
-                        Command::new(&next_exe).spawn()?;
-                        return Ok(());
+                        launch_install_context = detect_install_context(&next_exe).unwrap_or_else(|_| InstallContext {
+                            channel: install_context.channel,
+                            update_policy: install_context.update_policy,
+                            repo: install_context.repo.clone(),
+                            asset_label: install_context.asset_label.clone(),
+                            current_version: update.version.clone(),
+                            executable_path: next_exe.clone(),
+                            managed_root: install_context.managed_root.clone(),
+                            manager_hint: install_context.manager_hint.clone(),
+                        });
+                        pending_update_restart = Some(yggterm_ui::PendingUpdateRestart {
+                            version: update.version,
+                            executable: next_exe,
+                        });
                     }
                     Err(error) => warn!(error=%error, "failed to install direct update"),
                 },
@@ -99,7 +113,7 @@ fn main() -> Result<()> {
         tree,
         browser_tree,
         settings,
-        install_context,
+        install_context: launch_install_context,
         settings_path,
         server_endpoint: endpoint.clone(),
         initial_server_snapshot: None,
@@ -115,6 +129,7 @@ fn main() -> Result<()> {
             "starting server…".to_string()
         },
         prefer_ghostty_backend,
+        pending_update_restart,
     });
     let _ = shutdown(&endpoint);
     launch_result
