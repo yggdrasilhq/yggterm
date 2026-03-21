@@ -59,18 +59,6 @@ pub struct ReleaseUpdate {
     pub checksum_url: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct GitHubRelease {
-    tag_name: String,
-    assets: Vec<GitHubAsset>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GitHubAsset {
-    name: String,
-    browser_download_url: String,
-}
-
 pub fn current_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
@@ -427,42 +415,41 @@ fn refresh_windows_integration(context: &InstallContext) -> Result<Vec<String>> 
 
 pub fn check_for_update(context: &InstallContext) -> Result<Option<ReleaseUpdate>> {
     let client = release_client()?;
-    let url = format!(
-        "https://api.github.com/repos/{}/releases/latest",
-        context.repo
-    );
-    let release: GitHubRelease = client
-        .get(url)
+    let latest_url = format!("https://github.com/{}/releases/latest", context.repo);
+    let response = client
+        .get(&latest_url)
         .send()
-        .context("failed to query GitHub Releases")?
+        .context("failed to query latest GitHub release")?
         .error_for_status()
-        .context("failed to read latest GitHub release metadata")?
-        .json()
-        .context("failed to parse latest GitHub release metadata")?;
-
-    let latest_version = release.tag_name.trim_start_matches('v').to_string();
+        .context("failed to read latest GitHub release redirect")?;
+    let final_url = response.url().clone();
+    let tag_name = final_url
+        .path_segments()
+        .and_then(|segments| segments.last())
+        .filter(|segment| segment.starts_with('v'))
+        .context("failed to resolve latest release tag from redirect")?
+        .to_string();
+    let latest_version = tag_name.trim_start_matches('v').to_string();
     if !is_newer_version(&latest_version, &context.current_version)? {
         return Ok(None);
     }
 
     let archive_name = format!("yggterm-{}.tar.gz", context.asset_label);
     let checksum_name = format!("{archive_name}.sha256");
-    let archive = release
-        .assets
-        .iter()
-        .find(|asset| asset.name == archive_name)
-        .with_context(|| format!("failed to find release asset {archive_name}"))?;
-    let checksum = release
-        .assets
-        .iter()
-        .find(|asset| asset.name == checksum_name)
-        .map(|asset| asset.browser_download_url.clone());
+    let archive_url = format!(
+        "https://github.com/{}/releases/download/{}/{}",
+        context.repo, tag_name, archive_name
+    );
+    let checksum_url = format!(
+        "https://github.com/{}/releases/download/{}/{}",
+        context.repo, tag_name, checksum_name
+    );
 
     Ok(Some(ReleaseUpdate {
         version: latest_version,
-        tag_name: release.tag_name,
-        archive_url: archive.browser_download_url.clone(),
-        checksum_url: checksum,
+        tag_name,
+        archive_url,
+        checksum_url: Some(checksum_url),
     }))
 }
 
