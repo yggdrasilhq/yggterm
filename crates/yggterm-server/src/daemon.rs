@@ -53,6 +53,8 @@ pub enum ServerRequest {
     },
     StartLocalSession {
         session_kind: SessionKind,
+        cwd: Option<String>,
+        title_hint: Option<String>,
     },
     FocusLive {
         key: String,
@@ -224,8 +226,14 @@ impl DaemonRuntime {
                 self.persist()?;
                 self.snapshot_response(key.map(|key| format!("connected {key}")))
             }
-            ServerRequest::StartLocalSession { session_kind } => {
-                let key = self.server.start_local_session(session_kind);
+            ServerRequest::StartLocalSession {
+                session_kind,
+                cwd,
+                title_hint,
+            } => {
+                let key = self
+                    .server
+                    .start_local_session(session_kind, cwd.as_deref(), title_hint.as_deref());
                 self.persist()?;
                 self.snapshot_response(Some(format!("started {key}")))
             }
@@ -409,9 +417,22 @@ pub fn start_local_session(
     endpoint: &ServerEndpoint,
     kind: SessionKind,
 ) -> Result<(ServerUiSnapshot, Option<String>)> {
+    start_local_session_at(endpoint, kind, None, None)
+}
+
+pub fn start_local_session_at(
+    endpoint: &ServerEndpoint,
+    kind: SessionKind,
+    cwd: Option<&str>,
+    title_hint: Option<&str>,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
     expect_snapshot(send_request(
         endpoint,
-        &ServerRequest::StartLocalSession { session_kind: kind },
+        &ServerRequest::StartLocalSession {
+            session_kind: kind,
+            cwd: cwd.map(ToOwned::to_owned),
+            title_hint: title_hint.map(ToOwned::to_owned),
+        },
     )?)
 }
 
