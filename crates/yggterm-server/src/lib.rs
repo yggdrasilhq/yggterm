@@ -9,7 +9,7 @@ pub use daemon::{
     connect_ssh,
     default_endpoint, focus_live, open_stored_session, ping, raise_external_window, run_daemon,
     request_terminal_launch, set_all_preview_blocks_folded, set_view_mode, snapshot,
-    start_local_session, status,
+    start_local_session, start_local_session_at, status,
     shutdown, sync_external_window, sync_theme, terminal_ensure, terminal_read, terminal_resize,
     terminal_write, toggle_preview_block,
 };
@@ -596,7 +596,12 @@ impl YggtermServer {
         Some(key)
     }
 
-    pub fn start_local_session(&mut self, kind: SessionKind) -> String {
+    pub fn start_local_session(
+        &mut self,
+        kind: SessionKind,
+        cwd: Option<&str>,
+        title_hint: Option<&str>,
+    ) -> String {
         let uuid = Uuid::new_v4().to_string();
         let key = match kind {
             SessionKind::Codex => format!("codex::{uuid}"),
@@ -605,8 +610,11 @@ impl YggtermServer {
             SessionKind::SshShell => format!("live::{uuid}"),
             SessionKind::Document => format!("document::{uuid}"),
         };
-        let target = local_session_target(kind);
-        self.insert_live_session(&key, &uuid, kind, &target, Some(target.label.clone()));
+        let target = local_session_target(kind, cwd);
+        let title = title_hint
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| target.label.clone());
+        self.insert_live_session(&key, &uuid, kind, &target, Some(title));
         key
     }
 
@@ -1868,8 +1876,11 @@ fn local_default_cwd() -> String {
         .unwrap_or_else(|| "/".to_string())
 }
 
-fn local_session_target(kind: SessionKind) -> SshConnectTarget {
-    let cwd = Some(local_default_cwd());
+fn local_session_target(kind: SessionKind, cwd: Option<&str>) -> SshConnectTarget {
+    let cwd = Some(
+        cwd.map(ToOwned::to_owned)
+            .unwrap_or_else(local_default_cwd),
+    );
     match kind {
         SessionKind::Codex => SshConnectTarget {
             label: "codex".to_string(),
