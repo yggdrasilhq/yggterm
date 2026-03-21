@@ -36,6 +36,7 @@ This repository is still scaffolding.
 - Live daemon-owned sessions now appear in the main sidebar tree instead of hiding only inside the connect panel.
 - Documents are editable in the main viewport now, not just previewed as static blocks.
 - The sidebar can start fresh Codex, Codex LiteLLM, shell, and document workflows directly, instead of forcing those flows through a side panel.
+- The workspace store now distinguishes plain notes from terminal recipes, so session-derived documents can carry replay seeds and source-session metadata.
 - `yggterm` now opens the Dioxus shell directly.
 - The old CLI subcommands and the `eframe` scaffold path have been removed.
 - The shell chrome is now owned locally in `yggterm-ui`, while the adjacent Zed checkout remains the visual reference stack.
@@ -152,7 +153,7 @@ The path is virtual. It describes where the note should appear in the sidebar tr
 
 Inside the desktop shell, the same document model is available from a session row. The first pass is intentionally simple: right-click a session, create a note, and Yggterm opens that note near the session path it came from.
 
-That flow no longer stops at note creation. Documents can be created directly from the settings rail and edited inline in the main viewport, while the CLI still works against the same `workspace.db` store for fast automation and scripting.
+That flow no longer stops at note creation. Documents can be created directly from the settings rail and edited inline in the main viewport, while the CLI still works against the same `workspace.db` store for fast automation and scripting. Session rows can now also create terminal recipes, which are just documents with extra metadata about where they came from and which commands should eventually be replayed.
 
 ## Daemon lifecycle
 
