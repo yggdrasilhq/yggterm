@@ -18,9 +18,9 @@ use tokio::task;
 use tokio::time::sleep;
 use tracing::{info, warn};
 use yggterm_core::{
-    AgentSessionProfile, AppSettings, BrowserRow, BrowserRowKind, SessionBrowserState,
-    SessionNode, SessionStore, UiTheme, WorkspaceDocumentInput, WorkspaceDocumentKind,
-    save_settings_file,
+    AgentSessionProfile, AppSettings, BrowserRow, BrowserRowKind, InstallContext,
+    SessionBrowserState, SessionNode, SessionStore, UiTheme, WorkspaceDocumentInput,
+    WorkspaceDocumentKind, check_for_update, save_settings_file, update_command_hint,
 };
 use yggterm_platform::DockRect;
 use yggterm_server::{
@@ -49,6 +49,7 @@ pub struct ShellBootstrap {
     pub tree: SessionNode,
     pub browser_tree: SessionNode,
     pub settings: AppSettings,
+    pub install_context: InstallContext,
     pub settings_path: PathBuf,
     pub server_endpoint: ServerEndpoint,
     pub initial_server_snapshot: Option<ServerUiSnapshot>,
@@ -140,6 +141,7 @@ struct RenderSnapshot {
     ghostty_bridge_detail: String,
     server_daemon_detail: String,
     settings: AppSettings,
+    install_context: InstallContext,
     maximized: bool,
     always_on_top: bool,
     notifications: Vec<ToastNotification>,
@@ -295,6 +297,7 @@ impl ShellState {
             ghostty_bridge_detail: self.bootstrap.ghostty_bridge_detail.clone(),
             server_daemon_detail: self.server_daemon_detail.clone(),
             settings: self.settings.clone(),
+            install_context: self.bootstrap.install_context.clone(),
             maximized: self.maximized,
             always_on_top: self.always_on_top,
             notifications: self.notifications.clone(),
@@ -759,6 +762,38 @@ fn spawn_initial_server_sync(mut state: Signal<ShellState>) {
                     "Server Task Failed",
                     error.to_string(),
                 );
+            }
+        });
+    });
+}
+
+fn spawn_notify_only_update_check(mut state: Signal<ShellState>) {
+    let install_context = state.read().bootstrap.install_context.clone();
+    spawn(async move {
+        let outcome = task::spawn_blocking(move || check_for_update(&install_context)).await;
+        state.with_mut(|shell| match outcome {
+            Ok(Ok(Some(update))) => {
+                let hint = update_command_hint(shell.bootstrap.install_context.channel);
+                let suffix = if hint.is_empty() {
+                    shell.bootstrap.install_context
+                        .manager_hint
+                        .clone()
+                        .unwrap_or_else(|| "Use your package manager to update Yggterm.".to_string())
+                } else {
+                    format!("Run `{hint}` to update.")
+                };
+                shell.push_notification(
+                    NotificationTone::Warning,
+                    "Update Available",
+                    format!("Yggterm {} is available. {suffix}", update.version),
+                );
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => {
+                warn!(error=%error, "notify-only update check failed");
+            }
+            Err(error) => {
+                warn!(error=%error, "notify-only update task failed");
             }
         });
     });
@@ -1634,6 +1669,7 @@ fn app() -> Element {
     let desktop = use_window();
     let mut hovered = use_signal(|| None::<HoveredControl>);
     let mut startup_sync_started = use_signal(|| false);
+    let mut update_check_started = use_signal(|| false);
     let mut dock_pulse_started = use_signal(|| false);
     let mut window_epoch = use_signal(|| 0_u64);
     use_effect(move || {
@@ -1663,6 +1699,20 @@ fn app() -> Element {
         if should_start {
             startup_sync_started.set(true);
             spawn_initial_server_sync(state);
+        }
+    });
+    use_effect(move || {
+        if *update_check_started.read() {
+            return;
+        }
+        let should_start = {
+            let shell = state.read();
+            shell.bootstrap.install_context.update_policy == yggterm_core::UpdatePolicy::NotifyOnly
+                && shell.bootstrap.install_context.channel != yggterm_core::InstallChannel::Unknown
+        };
+        if should_start {
+            update_check_started.set(true);
+            spawn_notify_only_update_check(state);
         }
     });
     use_effect(move || {
@@ -3568,6 +3618,31 @@ fn SettingsRailBody(
         div {
             style: "flex:1; overflow:auto; padding:10px 16px 14px 16px; display:flex; flex-direction:column; gap:14px; \
              text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
+            MetadataGroup {
+                title: "Install".to_string(),
+                entries: vec![
+                    SessionMetadataEntry {
+                        label: "Version",
+                        value: snapshot.install_context.current_version.clone(),
+                    },
+                    SessionMetadataEntry {
+                        label: "Channel",
+                        value: format!("{:?}", snapshot.install_context.channel).to_lowercase(),
+                    },
+                    SessionMetadataEntry {
+                        label: "Updates",
+                        value: match snapshot.install_context.update_policy {
+                            yggterm_core::UpdatePolicy::Auto => "Automatic on launch".to_string(),
+                            yggterm_core::UpdatePolicy::NotifyOnly => snapshot
+                                .install_context
+                                .manager_hint
+                                .clone()
+                                .unwrap_or_else(|| "Notify only".to_string()),
+                        },
+                    },
+                ],
+                palette: snapshot.palette,
+            }
             SettingsField {
                 label: "LiteLLM Endpoint".to_string(),
                 value: snapshot.settings.litellm_endpoint.clone(),

@@ -20,6 +20,9 @@ jobs:
           - label: linux-x86_64
             runs_on: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+          - label: linux-aarch64
+            runs_on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
           - label: macos-x86_64
             runs_on: macos-14
             target: x86_64-apple-darwin
@@ -29,6 +32,9 @@ jobs:
           - label: windows-x86_64
             runs_on: windows-2022
             target: x86_64-pc-windows-msvc
+          - label: windows-aarch64
+            runs_on: windows-11-arm
+            target: aarch64-pc-windows-msvc
     steps:
       - name: Checkout
         uses: actions/checkout@v4

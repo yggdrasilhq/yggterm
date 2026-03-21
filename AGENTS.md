@@ -58,6 +58,7 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 - Document integration assumptions in `README.md` or module-level docs.
 - The active shell is Dioxus-based. Keep steering it toward a polished Zed-shaped terminal workspace rather than rebuilding parallel frontend experiments.
 - Development and release workflow is server-first: builds happen in this server environment and release artifacts are pulled from `dist/` to a laptop for runtime testing.
+- The primary install channel is a direct GitHub-release installer with self-update on launch for direct installs; package-managed installs must stay notify-only.
 - Always produce checksums for release artifacts and keep packaging repeatable via project scripts.
 - Keep `debian/` metadata and packaging scripts current so each release can emit a usable `.deb` with accurate runtime dependencies.
 - For every release build, always generate the `.deb` package (and checksum) in `dist/` so laptop-side GUI/runtime testing can be done outside the SSH server environment.
