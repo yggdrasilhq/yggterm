@@ -128,6 +128,12 @@ The intent is simple: organizing the tree should naturally create the right plac
 
 Virtual groups are stored under `~/.yggterm/workspace.db`, so they load quickly and do not depend on walking a large on-disk workspace before the UI becomes useful.
 
+The SSH connect rail is guided on purpose:
+
+- type `user@ip`, `user@host`, or a shortcut from your `~/.ssh/config` such as `dev`
+- optionally add a remote prefix if you want the session to start inside `machinectl`, `tmux`, or another remote wrapper
+- reconnecting to the same SSH target focuses the existing live session instead of spawning a duplicate
+
 ## Documents and recipes
 
 Yggterm documents already have a CLI path so notes can be created or updated outside the UI.

@@ -6,7 +6,7 @@ mod terminal;
 pub use attach::{AttachMetadata, run_attach};
 pub use daemon::{
     ServerEndpoint, ServerRequest, ServerResponse, ServerRuntimeStatus, TerminalStreamChunk,
-    connect_ssh,
+    connect_ssh, connect_ssh_custom,
     default_endpoint, focus_live, open_stored_session, ping, raise_external_window, run_daemon,
     request_terminal_launch, set_all_preview_blocks_folded, set_view_mode, snapshot,
     start_command_session, start_local_session, start_local_session_at, status,
@@ -585,15 +585,41 @@ impl YggtermServer {
         }
     }
 
-    pub fn connect_ssh_target(&mut self, target_ix: usize) -> Option<String> {
-        let target = self.ssh_targets.get(target_ix)?.clone();
-        let uuid = Uuid::new_v4().to_string();
-        let key = match target.kind {
-            SessionKind::Shell => format!("local::{uuid}"),
-            _ => format!("live::{uuid}"),
+    pub fn connect_ssh_target(&mut self, target_ix: usize) -> (Option<String>, bool) {
+        let Some(target) = self.ssh_targets.get(target_ix).cloned() else {
+            return (None, false);
         };
-        self.insert_live_session(&key, &uuid, target.kind, &target, Some(target.label.clone()));
-        Some(key)
+        self.connect_ssh_like_target(&target)
+    }
+
+    pub fn connect_ssh_custom(
+        &mut self,
+        target: &str,
+        prefix: Option<&str>,
+    ) -> anyhow::Result<(String, bool)> {
+        let ssh_target = target.trim();
+        if ssh_target.is_empty() {
+            anyhow::bail!("enter an SSH target such as dev, pi@jojo, or user@ip");
+        }
+        let prefix = prefix
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let label = ssh_target
+            .rsplit('@')
+            .next()
+            .unwrap_or(ssh_target)
+            .to_string();
+        let target = SshConnectTarget {
+            label,
+            kind: SessionKind::SshShell,
+            ssh_target: ssh_target.to_string(),
+            prefix,
+            cwd: None,
+        };
+        let (key, reused) = self.connect_ssh_like_target(&target);
+        key.map(|key| (key, reused))
+            .ok_or_else(|| anyhow::anyhow!("failed to create ssh session"))
     }
 
     pub fn start_local_session(
@@ -893,6 +919,31 @@ impl YggtermServer {
         self.active_session_path = Some(key.to_string());
         self.active_view_mode = WorkspaceViewMode::Terminal;
         self.request_terminal_launch_for_active();
+    }
+
+    fn connect_ssh_like_target(&mut self, target: &SshConnectTarget) -> (Option<String>, bool) {
+        if let Some(existing_key) = self
+            .sessions
+            .iter()
+            .find(|(_, session)| {
+                session.source == SessionSource::LiveSsh
+                    && session.kind == target.kind
+                    && session.ssh_target.as_deref() == Some(target.ssh_target.as_str())
+                    && session.ssh_prefix.as_deref() == target.prefix.as_deref()
+            })
+            .map(|(key, _)| key.clone())
+        {
+            self.focus_live_session(&existing_key);
+            return (Some(existing_key), true);
+        }
+
+        let uuid = Uuid::new_v4().to_string();
+        let key = match target.kind {
+            SessionKind::Shell => format!("local::{uuid}"),
+            _ => format!("live::{uuid}"),
+        };
+        self.insert_live_session(&key, &uuid, target.kind, target, Some(target.label.clone()));
+        (Some(key), false)
     }
 }
 
