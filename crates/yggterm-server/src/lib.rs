@@ -425,7 +425,7 @@ impl YggtermServer {
     pub fn terminal_spec(&self, path: &str) -> Option<(String, Option<String>)> {
         self.sessions.get(path).and_then(|session| {
             if session.kind == SessionKind::Document {
-                return None;
+                return recipe_terminal_spec(session);
             }
             let cwd = session
                 .metadata
@@ -438,6 +438,9 @@ impl YggtermServer {
 
     pub fn terminal_stop_command(&self, path: &str) -> Option<String> {
         let session = self.sessions.get(path)?;
+        if session.kind == SessionKind::Document {
+            return recipe_terminal_spec(session).map(|_| "exit\r".to_string());
+        }
         match session.kind {
             SessionKind::Codex | SessionKind::CodexLiteLlm => Some("/quit\r".to_string()),
             SessionKind::Shell | SessionKind::SshShell => Some("exit\r".to_string()),
@@ -651,13 +654,45 @@ impl YggtermServer {
             return;
         };
         if session.kind == SessionKind::Document {
+            if let Some((launch_command, _cwd)) = recipe_terminal_spec(session) {
+                self.active_view_mode = WorkspaceViewMode::Terminal;
+                session.backend = TerminalBackend::Xterm;
+                session.terminal_process_id = None;
+                session.terminal_window_id = None;
+                session.terminal_host_token = None;
+                session.terminal_host_mode = GhosttyTerminalHostMode::Unsupported;
+                session.embedded_surface_id = None;
+                session.embedded_surface_detail = None;
+                session.last_launch_error = None;
+                session.last_window_error = None;
+                session.launch_phase = TerminalLaunchPhase::Running;
+                session.launch_command = launch_command.clone();
+                session.terminal_lines = vec![
+                    format!("$ {launch_command}"),
+                    "This recipe is attached to a daemon-owned PTY and rendered inline through xterm.js.".to_string(),
+                    "Switch back to Preview to edit the recipe document without losing the running terminal.".to_string(),
+                ];
+                upsert_session_metadata(&mut session.metadata, "Backend", "xterm.js".to_string());
+                upsert_session_metadata(&mut session.metadata, "Launch PID", "daemon pty".to_string());
+                upsert_session_metadata(&mut session.metadata, "Launch Error", "none".to_string());
+                upsert_session_metadata(&mut session.metadata, "Ghostty Window", "not used".to_string());
+                upsert_session_metadata(
+                    &mut session.metadata,
+                    "Host Mode",
+                    "embedded xterm.js".to_string(),
+                );
+                upsert_session_metadata(&mut session.metadata, "Host Token", "daemon".to_string());
+                upsert_session_metadata(&mut session.metadata, "Embedded Surface", "webview".to_string());
+                upsert_session_metadata(&mut session.metadata, "Embedded Host", "xterm.js".to_string());
+                upsert_session_metadata(&mut session.metadata, "Window Error", "none".to_string());
+                upsert_session_metadata(&mut session.metadata, "Status", "recipe running".to_string());
+                session.status_line = "xterm.js · recipe runtime attached".to_string();
+                return;
+            }
+
             self.active_view_mode = WorkspaceViewMode::Rendered;
             session.status_line = "document · preview only".to_string();
-            upsert_session_metadata(
-                &mut session.metadata,
-                "Status",
-                "preview only".to_string(),
-            );
+            upsert_session_metadata(&mut session.metadata, "Status", "preview only".to_string());
             return;
         }
 
@@ -1656,6 +1691,9 @@ fn hydrate_document_session(session: &mut ManagedSessionView, document: &Workspa
     if let Some(source_session_kind) = document.source_session_kind.clone() {
         upsert_session_metadata(&mut session.metadata, "Source Kind", source_session_kind);
     }
+    if let Some(source_session_cwd) = document.source_session_cwd.clone() {
+        upsert_session_metadata(&mut session.metadata, "Source Cwd", source_session_cwd);
+    }
     upsert_session_metadata(
         &mut session.metadata,
         "Replay",
@@ -1670,7 +1708,8 @@ fn hydrate_document_session(session: &mut ManagedSessionView, document: &Workspa
         format!("Document {}", document.title),
         match document.kind {
             WorkspaceDocumentKind::TerminalRecipe => {
-                "This recipe stays render-first until replay execution is implemented.".to_string()
+                "Use Terminal view or Run Recipe to execute these commands in a daemon-owned PTY."
+                    .to_string()
             }
             WorkspaceDocumentKind::Note => {
                 "Terminal mode is disabled for document nodes.".to_string()
@@ -1678,6 +1717,34 @@ fn hydrate_document_session(session: &mut ManagedSessionView, document: &Workspa
         },
         "Use yggterm doc write <path> to update this note from the CLI.".to_string(),
     ];
+}
+
+fn recipe_terminal_spec(session: &ManagedSessionView) -> Option<(String, Option<String>)> {
+    if metadata_value(session, "Kind") != "terminal recipe" {
+        return None;
+    }
+    let commands = session
+        .rendered_sections
+        .iter()
+        .find(|section| section.title == "Replay Commands")
+        .map(|section| {
+            section
+                .lines
+                .iter()
+                .map(|line| line.trim())
+                .filter(|line| !line.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if commands.is_empty() {
+        return None;
+    }
+    let cwd = metadata_value(session, "Source Cwd");
+    Some((
+        commands.join("\n"),
+        if cwd.is_empty() { None } else { Some(cwd) },
+    ))
 }
 
 fn describe_status_line(
@@ -1897,6 +1964,15 @@ fn upsert_session_metadata(
     }
 }
 
+fn metadata_value(session: &ManagedSessionView, label: &str) -> String {
+    session
+        .metadata
+        .iter()
+        .find(|entry| entry.label == label)
+        .map(|entry| entry.value.clone())
+        .unwrap_or_default()
+}
+
 fn format_system_time(time: SystemTime) -> String {
     let datetime: OffsetDateTime = time.into();
     format_display_datetime(datetime)
@@ -2030,6 +2106,83 @@ fn parse_session_metadata_lines(lines: &[String]) -> Vec<SessionMetadataEntry> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod recipe_tests {
+    use super::*;
+
+    fn sample_session() -> ManagedSessionView {
+        ManagedSessionView {
+            id: "doc-1".to_string(),
+            session_path: "/documents/recipes/demo".to_string(),
+            title: "demo recipe".to_string(),
+            kind: SessionKind::Document,
+            host_label: "document".to_string(),
+            source: SessionSource::Stored,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: TerminalLaunchPhase::Queued,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: "document preview".to_string(),
+            status_line: "preview only".to_string(),
+            terminal_lines: Vec::new(),
+            rendered_sections: vec![],
+            preview: SessionPreview {
+                summary: vec![],
+                blocks: vec![],
+            },
+            metadata: vec![],
+            terminal_process_id: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+        }
+    }
+
+    #[test]
+    fn recipe_terminal_spec_uses_replay_commands_and_cwd() {
+        let mut session = sample_session();
+        session.metadata.push(SessionMetadataEntry {
+            label: "Kind",
+            value: "terminal recipe".to_string(),
+        });
+        session.metadata.push(SessionMetadataEntry {
+            label: "Source Cwd",
+            value: "/tmp/demo".to_string(),
+        });
+        session.rendered_sections.push(SessionRenderedSection {
+            title: "Replay Commands",
+            lines: vec!["echo hello".to_string(), "pwd".to_string()],
+        });
+
+        let spec = recipe_terminal_spec(&session);
+        assert_eq!(
+            spec,
+            Some(("echo hello\npwd".to_string(), Some("/tmp/demo".to_string())))
+        );
+    }
+
+    #[test]
+    fn note_documents_do_not_expose_terminal_spec() {
+        let mut session = sample_session();
+        session.metadata.push(SessionMetadataEntry {
+            label: "Kind",
+            value: "note".to_string(),
+        });
+        session.rendered_sections.push(SessionRenderedSection {
+            title: "Replay Commands",
+            lines: vec!["echo nope".to_string()],
+        });
+
+        assert_eq!(recipe_terminal_spec(&session), None);
+    }
 }
 
 fn format_display_datetime(datetime: OffsetDateTime) -> String {

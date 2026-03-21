@@ -1120,6 +1120,7 @@ fn queue_session_recipe_creation(mut state: Signal<ShellState>, row: BrowserRow)
                     body: session_recipe_template(&row_for_task),
                     source_session_path: Some(row_for_task.full_path.clone()),
                     source_session_kind: Some(inferred_session_kind_name(&row_for_task).to_string()),
+                    source_session_cwd: row_for_task.session_cwd.clone(),
                     replay_commands: initial_replay_commands_for_row(&row_for_task),
                 },
             )?;
@@ -1240,7 +1241,12 @@ fn queue_new_document(mut state: Signal<ShellState>) {
     });
 }
 
-fn queue_document_save(mut state: Signal<ShellState>, virtual_path: String, input: WorkspaceDocumentInput) {
+fn queue_document_save(
+    mut state: Signal<ShellState>,
+    virtual_path: String,
+    input: WorkspaceDocumentInput,
+    run_after_save: bool,
+) {
     state.with_mut(|shell| {
         shell.server_busy = true;
         shell.last_action = format!(
@@ -1259,6 +1265,7 @@ fn queue_document_save(mut state: Signal<ShellState>, virtual_path: String, inpu
         })
         .await;
 
+        let mut should_run = false;
         state.with_mut(|shell| match outcome {
             Ok(Ok((document, browser_tree))) => {
                 let expanded_paths = shell.browser.expanded_paths();
@@ -1282,6 +1289,10 @@ fn queue_document_save(mut state: Signal<ShellState>, virtual_path: String, inpu
                     "Document Saved",
                     format!("Updated {}.", document.title),
                 );
+                if run_after_save {
+                    shell.last_action = format!("running {}", document.title);
+                    should_run = true;
+                }
             }
             Ok(Err(error)) => {
                 shell.server_busy = false;
@@ -1302,6 +1313,10 @@ fn queue_document_save(mut state: Signal<ShellState>, virtual_path: String, inpu
                 );
             }
         });
+
+        if should_run {
+            spawn_set_view_mode(state, WorkspaceViewMode::Terminal);
+        }
     });
 }
 
@@ -1866,7 +1881,10 @@ fn app() -> Element {
                         },
                         on_set_preview_layout: move |mode: PreviewLayoutMode| state.with_mut(|shell| shell.set_preview_layout(mode)),
                         on_save_document: move |(path, input): (String, WorkspaceDocumentInput)| {
-                            queue_document_save(state, path, input)
+                            queue_document_save(state, path, input, false)
+                        },
+                        on_run_recipe_document: move |(path, input): (String, WorkspaceDocumentInput)| {
+                            queue_document_save(state, path, input, true)
                         },
                     }
                     RightRail {
@@ -2720,6 +2738,7 @@ fn MainSurface(
     on_toggle_preview_block: EventHandler<usize>,
     on_set_preview_layout: EventHandler<PreviewLayoutMode>,
     on_save_document: EventHandler<(String, WorkspaceDocumentInput)>,
+    on_run_recipe_document: EventHandler<(String, WorkspaceDocumentInput)>,
 ) -> Element {
     let body = if let Some(session) = snapshot.active_session.clone() {
         match snapshot.active_view_mode {
@@ -2732,6 +2751,7 @@ fn MainSurface(
                             palette: snapshot.palette,
                             server_busy: snapshot.server_busy,
                             on_save: on_save_document,
+                            on_run_recipe_document,
                         }
                     }
                 } else {
@@ -2885,6 +2905,7 @@ fn DocumentEditor(
     palette: Palette,
     server_busy: bool,
     on_save: EventHandler<(String, WorkspaceDocumentInput)>,
+    on_run_recipe_document: EventHandler<(String, WorkspaceDocumentInput)>,
 ) -> Element {
     let mut title = use_signal(|| session.title.clone());
     let initial_body = session
@@ -2911,7 +2932,7 @@ fn DocumentEditor(
     let document_kind = metadata_value(&session, "Kind");
     let source_session_path = metadata_value(&session, "Source Session");
     let source_session_kind = metadata_value(&session, "Source Kind");
-
+    let source_session_cwd = metadata_value(&session, "Source Cwd");
     rsx! {
         div {
             style: "display:flex; flex-direction:column; gap:18px; min-width:0; width:min(980px, 100%); height:100%; margin:0 auto;",
@@ -2936,37 +2957,56 @@ fn DocumentEditor(
                         "{storage_path}"
                     }
                 }
-                button {
-                    style: chip_style(palette, server_busy),
-                    onclick: move |_| on_save.call((
-                        storage_path.clone(),
-                        WorkspaceDocumentInput {
-                            title: Some(title()),
-                            kind: if document_kind == "terminal recipe" {
-                                WorkspaceDocumentKind::TerminalRecipe
-                            } else {
-                                WorkspaceDocumentKind::Note
+                div {
+                    style: "display:flex; align-items:center; gap:8px; flex-wrap:wrap;",
+                    if document_kind == "terminal recipe" && !replay().trim().is_empty() {
+                        button {
+                            style: chip_style(palette, server_busy),
+                            onclick: {
+                                let storage_path = storage_path.clone();
+                                let document_kind = document_kind.clone();
+                                let source_session_path = source_session_path.clone();
+                                let source_session_kind = source_session_kind.clone();
+                                let source_session_cwd = source_session_cwd.clone();
+                                move |_| on_run_recipe_document.call((
+                                    storage_path.clone(),
+                                    build_document_input(
+                                        &document_kind,
+                                        title(),
+                                        body(),
+                                        &source_session_path,
+                                        &source_session_kind,
+                                        &source_session_cwd,
+                                        replay(),
+                                    ),
+                                ))
                             },
-                            body: body(),
-                            source_session_path: if source_session_path.is_empty() {
-                                None
-                            } else {
-                                Some(source_session_path.clone())
-                            },
-                            source_session_kind: if source_session_kind.is_empty() {
-                                None
-                            } else {
-                                Some(source_session_kind.clone())
-                            },
-                            replay_commands: replay()
-                                .lines()
-                                .map(str::trim)
-                                .filter(|line| !line.is_empty())
-                                .map(ToOwned::to_owned)
-                                .collect(),
+                            "Run Recipe"
                         }
-                    )),
-                    "Save"
+                    }
+                    button {
+                        style: chip_style(palette, server_busy),
+                        onclick: {
+                            let storage_path = storage_path.clone();
+                            let document_kind = document_kind.clone();
+                            let source_session_path = source_session_path.clone();
+                            let source_session_kind = source_session_kind.clone();
+                            let source_session_cwd = source_session_cwd.clone();
+                            move |_| on_save.call((
+                                storage_path.clone(),
+                                build_document_input(
+                                    &document_kind,
+                                    title(),
+                                    body(),
+                                    &source_session_path,
+                                    &source_session_kind,
+                                    &source_session_cwd,
+                                    replay(),
+                                ),
+                            ))
+                        },
+                        "Save"
+                    }
                 }
             }
             textarea {
@@ -2999,6 +3039,47 @@ fn DocumentEditor(
                 }
             }
         }
+    }
+}
+
+fn build_document_input(
+    document_kind: &str,
+    title: String,
+    body: String,
+    source_session_path: &str,
+    source_session_kind: &str,
+    source_session_cwd: &str,
+    replay: String,
+) -> WorkspaceDocumentInput {
+    WorkspaceDocumentInput {
+        title: Some(title),
+        kind: if document_kind == "terminal recipe" {
+            WorkspaceDocumentKind::TerminalRecipe
+        } else {
+            WorkspaceDocumentKind::Note
+        },
+        body,
+        source_session_path: if source_session_path.is_empty() {
+            None
+        } else {
+            Some(source_session_path.to_string())
+        },
+        source_session_kind: if source_session_kind.is_empty() {
+            None
+        } else {
+            Some(source_session_kind.to_string())
+        },
+        source_session_cwd: if source_session_cwd.is_empty() {
+            None
+        } else {
+            Some(source_session_cwd.to_string())
+        },
+        replay_commands: replay
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
     }
 }
 
