@@ -9,8 +9,6 @@ use std::time::Duration;
 
 const DEFAULT_RELEASE_REPO: &str = "yggdrasilhq/yggterm";
 const INSTALL_STATE_FILENAME: &str = "install-state.json";
-const ICON_REVISION: &str = env!("CARGO_PKG_VERSION");
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InstallChannel {
@@ -270,7 +268,7 @@ pub fn write_direct_install_state(
         asset_label: asset_label.to_string(),
         active_version: version.to_string(),
         active_executable: executable.to_path_buf(),
-        icon_revision: ICON_REVISION.to_string(),
+        icon_revision: version.to_string(),
     };
     let encoded = serde_json::to_vec_pretty(&state).context("failed to serialize install state")?;
     fs::write(root.join(INSTALL_STATE_FILENAME), encoded)
