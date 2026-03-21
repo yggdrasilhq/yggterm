@@ -249,7 +249,7 @@ fn flatten_rows(
     }
 
     let descendant_sessions = count_leaf_sessions(node);
-    if !is_leaf && descendant_sessions == 0 {
+    if !is_leaf && descendant_sessions == 0 && node.title.is_none() {
         return false;
     }
     let expanded = is_leaf || !filter.is_empty() || expanded_paths.contains(&full_path);
@@ -316,10 +316,10 @@ fn format_row_label(
                     .or_else(|| node.session_id.as_deref().map(|id| session_id_suffix(id, 7)))
                     .unwrap_or_else(|| node.name.clone())
             }),
-            SessionNodeKind::Group => node.name.clone(),
+            SessionNodeKind::Group => node.title.clone().unwrap_or_else(|| node.name.clone()),
         }
     } else {
-        node.name.clone()
+        node.title.clone().unwrap_or_else(|| node.name.clone())
     }
 }
 
