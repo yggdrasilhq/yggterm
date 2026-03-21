@@ -1,5 +1,6 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env sh
+set -eu
+(set -o pipefail) >/dev/null 2>&1 && set -o pipefail
 
 REPO="${YGGTERM_REPO:-yggdrasilhq/yggterm}"
 API_URL="https://api.github.com/repos/${REPO}/releases/latest"
@@ -71,7 +72,7 @@ release_version="$(
 )"
 
 asset_url() {
-  local pattern="$1"
+  pattern="$1"
   printf '%s' "${release_json}" \
     | sed 's/\\\\\//\//g' \
     | sed -n "s/.*\"browser_download_url\"[[:space:]]*:[[:space:]]*\"\\([^\"]*${pattern}[^\"]*\\)\".*/\\1/p" \
@@ -81,7 +82,7 @@ asset_url() {
 archive_url="$(asset_url "yggterm-${target_label}\\.tar\\.gz")"
 checksum_url="$(asset_url "yggterm-${target_label}\\.tar\\.gz\\.sha256")"
 
-if [[ -z "${release_version}" || -z "${archive_url}" ]]; then
+if [ -z "${release_version}" ] || [ -z "${archive_url}" ]; then
   log "failed to locate a compatible release asset for ${target_label}"
   log "available release assets:"
   printf '%s' "${release_json}" \
@@ -94,7 +95,7 @@ archive_path="${TMP_DIR}/yggterm.tar.gz"
 checksum_path="${TMP_DIR}/yggterm.tar.gz.sha256"
 log "downloading yggterm ${release_version}"
 curl -fL "${archive_url}" -o "${archive_path}"
-if [[ -n "${checksum_url}" ]]; then
+if [ -n "${checksum_url}" ]; then
   curl -fL "${checksum_url}" -o "${checksum_path}"
   log "verifying checksum"
   expected="$(awk '{print $1}' "${checksum_path}")"
@@ -103,7 +104,7 @@ if [[ -n "${checksum_url}" ]]; then
   else
     actual="$(shasum -a 256 "${archive_path}" | awk '{print $1}')"
   fi
-  [[ "${expected}" == "${actual}" ]] || {
+  [ "${expected}" = "${actual}" ] || {
     fail "checksum verification failed"
   }
 fi
@@ -112,13 +113,16 @@ version_dir="${install_root}/versions/${release_version}"
 mkdir -p "${version_dir}"
 tar -xzf "${archive_path}" -C "${TMP_DIR}"
 
-if [[ "${target_label}" == windows-* ]]; then
+case "${target_label}" in
+  windows-*)
   binary_name="yggterm-${target_label}.exe"
   installed_binary="${version_dir}/yggterm.exe"
-else
+  ;;
+  *)
   binary_name="yggterm-${target_label}"
   installed_binary="${version_dir}/yggterm"
-fi
+  ;;
+esac
 
 cp "${TMP_DIR}/${binary_name}" "${installed_binary}"
 chmod 0755 "${installed_binary}" || true
@@ -136,13 +140,17 @@ JSON
 
 bin_dir="${HOME}/.local/bin"
 mkdir -p "${bin_dir}"
-ln -sfn "${installed_binary}" "${bin_dir}/yggterm"
+rm -f "${bin_dir}/yggterm"
+ln -s "${installed_binary}" "${bin_dir}/yggterm"
 
 log "refreshing desktop integration"
 "${installed_binary}" install integrate >/dev/null 2>&1 || true
 
 log "installed yggterm ${release_version}"
 log "binary: ${installed_binary}"
-if [[ ":${PATH}:" != *":${bin_dir}:"* ]]; then
+case ":${PATH:-}:" in
+  *":${bin_dir}:"*) ;;
+  *)
   log "add ${bin_dir} to PATH if you want the yggterm command in your shell"
-fi
+  ;;
+esac
