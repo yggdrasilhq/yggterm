@@ -55,6 +55,7 @@ What it does:
 - creates desktop integration for direct installs
 - refreshes integration when assets change
 - self-updates on launch when a newer direct-release build is available
+- shows a lightweight in-app update notification before restarting into the new version
 
 Package-managed installs behave differently on purpose:
 
