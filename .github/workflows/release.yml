@@ -42,7 +42,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install system packages
-        if: matrix.runs_on == 'ubuntu-24.04'
+        if: startsWith(matrix.runs_on, 'ubuntu-24.04')
         run: |
           sudo apt-get update
           sudo apt-get install -y \
