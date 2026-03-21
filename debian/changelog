@@ -1,3 +1,9 @@
+yggterm (2.0.5-1) unstable; urgency=medium
+
+  * Avoid GitHub Releases API rate limits by resolving direct updates through the latest-release redirect path.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sat, 21 Mar 2026 23:55:00 +0530
+
 yggterm (2.0.4-1) unstable; urgency=medium
 
   * Add visible direct-update UX with in-app restart messaging instead of silent process swaps.
