@@ -16,6 +16,8 @@ irm https://raw.githubusercontent.com/yggdrasilhq/yggterm/main/scripts/install.p
 
 Yggterm installs into a managed user-space location, wires up desktop integration, and keeps itself current on launch when it owns that install root.
 
+Rerun the same one-liner any time to force a manual update of a direct install.
+
 ## What yggterm is
 
 Yggdrasil Terminal (`yggterm`) is a remote-first terminal workspace built in Rust. It is meant for the way people actually work with terminals now: many long-lived sessions, many machines, restored context, Codex-heavy workflows, quick notes beside the terminal, and a sidebar that remembers how everything is related.
@@ -56,6 +58,7 @@ What it does:
 - refreshes integration when assets change
 - self-updates on launch when a newer direct-release build is available
 - shows a lightweight in-app update notification before restarting into the new version
+- reruns of the install one-liner act as an explicit manual updater for direct installs
 
 Package-managed installs behave differently on purpose:
 

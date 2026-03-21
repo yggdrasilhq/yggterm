@@ -1,3 +1,10 @@
+yggterm (2.0.6-1) unstable; urgency=medium
+
+  * Make the direct install script resolve the latest release through GitHub's redirect path instead of the rate-limited API.
+  * Treat rerunning the curl installer as an explicit manual update flow for existing direct installs, with clear install/update status output.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sat, 21 Mar 2026 23:59:00 +0530
+
 yggterm (2.0.5-1) unstable; urgency=medium
 
   * Avoid GitHub Releases API rate limits by resolving direct updates through the latest-release redirect path.
