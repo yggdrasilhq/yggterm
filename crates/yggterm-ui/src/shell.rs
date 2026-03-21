@@ -1,4 +1,5 @@
 use anyhow::Result;
+use crate::window_icon;
 use dioxus::desktop::{
     Config, LogicalSize, WindowBuilder, WindowEvent as DesktopWindowEvent, use_window,
     use_wry_event_handler, window,
@@ -1433,6 +1434,7 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
             Config::new().with_window(
                 WindowBuilder::new()
                     .with_title("yggterm")
+                    .with_window_icon(Some(window_icon::load_window_icon()))
                     .with_transparent(true)
                     .with_decorations(false)
                     .with_resizable(true)

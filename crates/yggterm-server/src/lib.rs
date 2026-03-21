@@ -186,6 +186,7 @@ pub struct ServerUiSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedStoredSession {
     pub path: String,
+    #[serde(default = "default_persisted_stored_kind")]
     pub kind: SessionKind,
     pub session_id: Option<String>,
     pub cwd: Option<String>,
@@ -197,6 +198,7 @@ pub struct PersistedLiveSession {
     pub key: String,
     pub id: String,
     pub title: String,
+    #[serde(default = "default_persisted_live_kind")]
     pub kind: SessionKind,
     pub ssh_target: String,
     pub prefix: Option<String>,
@@ -1783,6 +1785,14 @@ fn session_kind_label(kind: SessionKind) -> &'static str {
         SessionKind::SshShell => "ssh",
         SessionKind::Document => "document",
     }
+}
+
+fn default_persisted_stored_kind() -> SessionKind {
+    SessionKind::Codex
+}
+
+fn default_persisted_live_kind() -> SessionKind {
+    SessionKind::SshShell
 }
 
 fn embedded_surface_note(bridge_available: bool) -> String {
