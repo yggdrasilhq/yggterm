@@ -171,7 +171,9 @@ The path is virtual. It describes where the note should appear in the sidebar tr
 
 Inside the desktop shell, the same document model is available from a session row. The first pass is intentionally simple: right-click a session, create a note, and Yggterm opens that note near the session path it came from.
 
-That flow no longer stops at note creation. Documents can be created directly from the settings rail and edited inline in the main viewport, while the CLI still works against the same `workspace.db` store for fast automation and scripting. Session rows can now also create terminal recipes, which are just documents with extra metadata about where they came from and which commands should eventually be replayed.
+That flow no longer stops at note creation. Documents can be created directly from the settings rail and edited inline in the main viewport, while the CLI still works against the same `workspace.db` store for fast automation and scripting. Session rows can now also create terminal recipes, which are documents with extra metadata about where they came from and which commands should be replayed.
+
+Recipe documents are no longer passive. If a recipe has replay commands, `Run Recipe` now saves the current editor state and reopens that same workspace item in terminal mode through the daemon-owned PTY runtime. Preview mode stays the place to edit and explain the recipe; terminal mode becomes the place to actually execute it.
 
 ## Daemon lifecycle
 
