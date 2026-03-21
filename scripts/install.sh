@@ -3,9 +3,6 @@ set -euo pipefail
 
 REPO="${YGGTERM_REPO:-yggdrasilhq/yggterm}"
 API_URL="https://api.github.com/repos/${REPO}/releases/latest"
-INSTALL_ROOT="${YGGTERM_INSTALL_ROOT:-${HOME}/.local}"
-BIN_DIR="${INSTALL_ROOT}/bin"
-LIB_DIR="${INSTALL_ROOT}/lib/yggterm"
 TMP_DIR="$(mktemp -d)"
 
 cleanup() {
@@ -21,65 +18,115 @@ need_cmd() {
 }
 
 need_cmd curl
-need_cmd uname
 need_cmd tar
+need_cmd uname
 
 os="$(uname -s)"
 arch="$(uname -m)"
 
 case "${os}" in
-  Linux) ;;
+  Linux)
+    install_root="${YGGTERM_INSTALL_ROOT:-${HOME}/.local/share/yggterm/direct}"
+    ;;
+  Darwin)
+    install_root="${YGGTERM_INSTALL_ROOT:-${HOME}/Library/Application Support/yggterm/direct}"
+    ;;
   *)
     echo "unsupported operating system: ${os}" >&2
     exit 1
     ;;
 esac
 
-case "${arch}" in
-  x86_64|amd64)
+case "${os}:${arch}" in
+  Linux:x86_64|Linux:amd64)
     target_label="linux-x86_64"
-    deb_arch="amd64"
+    ;;
+  Linux:aarch64|Linux:arm64)
+    target_label="linux-aarch64"
+    ;;
+  Darwin:x86_64)
+    target_label="macos-x86_64"
+    ;;
+  Darwin:arm64|Darwin:aarch64)
+    target_label="macos-aarch64"
     ;;
   *)
-    echo "unsupported architecture: ${arch}" >&2
+    echo "unsupported architecture: ${arch} on ${os}" >&2
     exit 1
     ;;
 esac
 
 release_json="$(curl -fsSL "${API_URL}")"
+release_version="$(printf '%s' "${release_json}" | sed -n 's/.*"tag_name":"v\([^"]*\)".*/\1/p' | head -n1)"
 
 asset_url() {
   local pattern="$1"
-  printf '%s' "${release_json}" | sed 's/\\\\\//\//g' | grep -o "\"browser_download_url\":\"[^\"]*${pattern}[^\"]*\"" | head -n1 | cut -d'"' -f4
+  printf '%s' "${release_json}" \
+    | sed 's/\\\\\//\//g' \
+    | grep -o "\"browser_download_url\":\"[^\"]*${pattern}[^\"]*\"" \
+    | head -n1 \
+    | cut -d'"' -f4
 }
 
-deb_url="$(asset_url "yggterm_.*_${deb_arch}\\.deb")"
-tar_url="$(asset_url "yggterm-${target_label}\\.tar\\.gz")"
+archive_url="$(asset_url "yggterm-${target_label}\\.tar\\.gz")"
+checksum_url="$(asset_url "yggterm-${target_label}\\.tar\\.gz\\.sha256")"
 
-if command -v dpkg >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1 && [[ -n "${deb_url}" ]]; then
-  deb_path="${TMP_DIR}/yggterm.deb"
-  curl -fL "${deb_url}" -o "${deb_path}"
-  sudo dpkg -i "${deb_path}"
-  echo "installed yggterm via .deb"
-  exit 0
-fi
-
-if [[ -z "${tar_url}" ]]; then
+if [[ -z "${release_version}" || -z "${archive_url}" ]]; then
   echo "failed to locate a compatible release asset for ${target_label}" >&2
   exit 1
 fi
 
-mkdir -p "${BIN_DIR}" "${LIB_DIR}"
 archive_path="${TMP_DIR}/yggterm.tar.gz"
-curl -fL "${tar_url}" -o "${archive_path}"
+checksum_path="${TMP_DIR}/yggterm.tar.gz.sha256"
+curl -fL "${archive_url}" -o "${archive_path}"
+if [[ -n "${checksum_url}" ]]; then
+  curl -fL "${checksum_url}" -o "${checksum_path}"
+  if command -v sha256sum >/dev/null 2>&1; then
+    (cd "${TMP_DIR}" && sha256sum -c "$(basename "${checksum_path}")")
+  else
+    expected="$(cut -d' ' -f1 "${checksum_path}")"
+    actual="$(shasum -a 256 "${archive_path}" | awk '{print $1}')"
+    [[ "${expected}" == "${actual}" ]] || {
+      echo "checksum verification failed" >&2
+      exit 1
+    }
+  fi
+fi
+
+version_dir="${install_root}/versions/${release_version}"
+mkdir -p "${version_dir}"
 tar -xzf "${archive_path}" -C "${TMP_DIR}"
 
-cp "${TMP_DIR}/yggterm-${target_label}" "${BIN_DIR}/yggterm"
-chmod 0755 "${BIN_DIR}/yggterm"
-
-if [[ ":${PATH}:" != *":${BIN_DIR}:"* ]]; then
-  echo "installed to ${BIN_DIR}/yggterm"
-  echo "add ${BIN_DIR} to PATH if needed"
+if [[ "${target_label}" == windows-* ]]; then
+  binary_name="yggterm-${target_label}.exe"
+  installed_binary="${version_dir}/yggterm.exe"
 else
-  echo "installed to ${BIN_DIR}/yggterm"
+  binary_name="yggterm-${target_label}"
+  installed_binary="${version_dir}/yggterm"
+fi
+
+cp "${TMP_DIR}/${binary_name}" "${installed_binary}"
+chmod 0755 "${installed_binary}" || true
+
+cat > "${install_root}/install-state.json" <<JSON
+{
+  "channel": "direct",
+  "repo": "${REPO}",
+  "asset_label": "${target_label}",
+  "active_version": "${release_version}",
+  "active_executable": "${installed_binary}",
+  "icon_revision": "${release_version}"
+}
+JSON
+
+bin_dir="${HOME}/.local/bin"
+mkdir -p "${bin_dir}"
+ln -sfn "${installed_binary}" "${bin_dir}/yggterm"
+
+"${installed_binary}" install integrate >/dev/null 2>&1 || true
+
+echo "installed yggterm ${release_version}"
+echo "binary: ${installed_binary}"
+if [[ ":${PATH}:" != *":${bin_dir}:"* ]]; then
+  echo "add ${bin_dir} to PATH if you want the yggterm command in your shell"
 fi

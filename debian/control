@@ -1,7 +1,7 @@
 Source: yggterm
 Section: utils
 Priority: optional
-Maintainer: Yggdrasil HQ <opensource@yggdrasilhq.invalid>
+Maintainer: Yggdrasil HQ <avi@gour.top>
 Build-Depends: debhelper-compat (= 13), cargo, rustc
 Standards-Version: 4.6.2
 Homepage: https://github.com/yggdrasilhq/yggterm
