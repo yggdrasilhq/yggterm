@@ -51,6 +51,10 @@ pub enum ServerRequest {
     ConnectSsh {
         target_ix: usize,
     },
+    ConnectSshCustom {
+        target: String,
+        prefix: Option<String>,
+    },
     StartLocalSession {
         session_kind: SessionKind,
         cwd: Option<String>,
@@ -228,9 +232,24 @@ impl DaemonRuntime {
                 self.snapshot_response(Some(format!("opened {path}")))
             }
             ServerRequest::ConnectSsh { target_ix } => {
-                let key = self.server.connect_ssh_target(target_ix);
+                let (key, reused) = self.server.connect_ssh_target(target_ix);
                 self.persist()?;
-                self.snapshot_response(key.map(|key| format!("connected {key}")))
+                self.snapshot_response(key.map(|key| {
+                    if reused {
+                        format!("focused existing {key}")
+                    } else {
+                        format!("connected {key}")
+                    }
+                }))
+            }
+            ServerRequest::ConnectSshCustom { target, prefix } => {
+                let (key, reused) = self.server.connect_ssh_custom(&target, prefix.as_deref())?;
+                self.persist()?;
+                self.snapshot_response(Some(if reused {
+                    format!("focused existing {key}")
+                } else {
+                    format!("connected {key}")
+                }))
             }
             ServerRequest::StartLocalSession {
                 session_kind,
@@ -431,6 +450,20 @@ pub fn connect_ssh(endpoint: &ServerEndpoint, target_ix: usize) -> Result<(Serve
     expect_snapshot(send_request(
         endpoint,
         &ServerRequest::ConnectSsh { target_ix },
+    )?)
+}
+
+pub fn connect_ssh_custom(
+    endpoint: &ServerEndpoint,
+    target: &str,
+    prefix: Option<&str>,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
+    expect_snapshot(send_request(
+        endpoint,
+        &ServerRequest::ConnectSshCustom {
+            target: target.to_string(),
+            prefix: prefix.map(ToOwned::to_owned),
+        },
     )?)
 }
 

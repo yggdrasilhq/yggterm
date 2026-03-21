@@ -28,6 +28,7 @@ use yggterm_server::{
     SessionMetadataEntry,
     ServerRuntimeStatus, SessionPreviewBlock, SshConnectTarget, TerminalBackend,
     GhosttyTerminalHostMode, WorkspaceViewMode, YggtermServer, connect_ssh, focus_live,
+    connect_ssh_custom,
     open_stored_session, request_terminal_launch,
     set_all_preview_blocks_folded, set_view_mode as daemon_set_view_mode, status,
     snapshot as daemon_snapshot, ping, start_command_session, start_local_session, start_local_session_at,
@@ -81,6 +82,8 @@ struct ShellState {
     server_busy: bool,
     server_daemon_detail: String,
     needs_initial_server_sync: bool,
+    ssh_connect_target: String,
+    ssh_connect_prefix: String,
     docked_window_id: Option<String>,
     dock_sync_in_flight: bool,
     last_dock_signature: Option<DockSignature>,
@@ -150,6 +153,8 @@ struct RenderSnapshot {
     context_menu_row: Option<BrowserRow>,
     preview_layout: PreviewLayoutMode,
     server_busy: bool,
+    ssh_connect_target: String,
+    ssh_connect_prefix: String,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -261,6 +266,8 @@ impl ShellState {
             server_busy: needs_initial_server_sync,
             server_daemon_detail: String::new(),
             needs_initial_server_sync,
+            ssh_connect_target: String::new(),
+            ssh_connect_prefix: String::new(),
             docked_window_id: None,
             dock_sync_in_flight: false,
             last_dock_signature: None,
@@ -307,6 +314,8 @@ impl ShellState {
             context_menu_row: self.context_menu_row.clone(),
             preview_layout: self.preview_layout,
             server_busy: self.server_busy,
+            ssh_connect_target: self.ssh_connect_target.clone(),
+            ssh_connect_prefix: self.ssh_connect_prefix.clone(),
         }
     }
 
@@ -379,6 +388,16 @@ impl ShellState {
             RightPanelMode::Settings => "settings opened".to_string(),
             RightPanelMode::Notifications => "notifications opened".to_string(),
         };
+    }
+
+    fn update_ssh_connect_target(&mut self, value: String) {
+        self.ssh_connect_target = value;
+        self.last_action = "editing ssh target".to_string();
+    }
+
+    fn update_ssh_connect_prefix(&mut self, value: String) {
+        self.ssh_connect_prefix = value;
+        self.last_action = "editing ssh prefix".to_string();
     }
 
     fn toggle_notifications_panel(&mut self) {
@@ -922,6 +941,122 @@ fn spawn_start_local_agent_session(state: Signal<ShellState>) {
     };
     spawn_server_snapshot_action(state, pending, move |endpoint| {
         start_local_session(&endpoint, kind)
+    });
+}
+
+fn spawn_connect_ssh_target(mut state: Signal<ShellState>, target_ix: usize) {
+    let label = state
+        .read()
+        .server
+        .ssh_targets()
+        .get(target_ix)
+        .map(|target| target.label.clone())
+        .unwrap_or_else(|| "ssh target".to_string());
+    state.with_mut(|shell| {
+        shell.server_busy = true;
+        shell.last_action = format!("connecting {label}");
+    });
+    let endpoint = state.read().bootstrap.server_endpoint.clone();
+    spawn(async move {
+        let outcome = task::spawn_blocking(move || connect_ssh(&endpoint, target_ix)).await;
+        state.with_mut(|shell| match outcome {
+            Ok(Ok((snapshot, message))) => {
+                shell.server.apply_snapshot(snapshot);
+                shell.server_busy = false;
+                shell.needs_initial_server_sync = false;
+                shell.last_action = message.clone().unwrap_or_else(|| format!("connected {label}"));
+                shell.push_notification(
+                    NotificationTone::Success,
+                    "SSH Connected",
+                    format!("Ready: {label}"),
+                );
+            }
+            Ok(Err(error)) => {
+                shell.server_busy = false;
+                shell.last_action = format!("ssh connect failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "SSH Connection Failed",
+                    error.to_string(),
+                );
+            }
+            Err(error) => {
+                shell.server_busy = false;
+                shell.last_action = format!("ssh task failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "SSH Task Failed",
+                    error.to_string(),
+                );
+            }
+        });
+    });
+}
+
+fn spawn_connect_ssh_custom(mut state: Signal<ShellState>) {
+    let target = state.read().ssh_connect_target.trim().to_string();
+    let prefix = state.read().ssh_connect_prefix.trim().to_string();
+    if target.is_empty() {
+        state.with_mut(|shell| {
+            shell.push_notification(
+                NotificationTone::Warning,
+                "SSH Target Needed",
+                "Enter an SSH target such as dev, pi@jojo, or user@ip.",
+            );
+        });
+        return;
+    }
+    state.with_mut(|shell| {
+        shell.server_busy = true;
+        shell.last_action = format!("connecting {target}");
+    });
+    let endpoint = state.read().bootstrap.server_endpoint.clone();
+    spawn(async move {
+        let target_for_request = target.clone();
+        let target_for_message = target.clone();
+        let outcome = task::spawn_blocking(move || {
+            connect_ssh_custom(
+                &endpoint,
+                &target_for_request,
+                (!prefix.is_empty()).then_some(prefix.as_str()),
+            )
+        })
+        .await;
+        state.with_mut(|shell| match outcome {
+            Ok(Ok((snapshot, message))) => {
+                shell.server.apply_snapshot(snapshot);
+                shell.server_busy = false;
+                shell.needs_initial_server_sync = false;
+                shell.last_action = message
+                    .clone()
+                    .unwrap_or_else(|| format!("connected {target_for_message}"));
+                shell.ssh_connect_target.clear();
+                shell.ssh_connect_prefix.clear();
+                shell.push_notification(
+                    NotificationTone::Success,
+                    "SSH Connected",
+                    format!("Ready: {target_for_message}"),
+                );
+            }
+            Ok(Err(error)) => {
+                shell.server_busy = false;
+                shell.last_action = format!("ssh connect failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "SSH Connection Failed",
+                    error.to_string(),
+                );
+            }
+            Err(error) => {
+                shell.server_busy = false;
+                shell.last_action = format!("ssh task failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "SSH Task Failed",
+                    error.to_string(),
+                );
+            }
+        });
     });
 }
 
@@ -2269,11 +2404,10 @@ fn app() -> Element {
                         on_adjust_ui_zoom: move |delta: i32| state.with_mut(|shell| shell.adjust_ui_zoom(delta)),
                         on_adjust_main_zoom: move |delta: i32| state.with_mut(|shell| shell.adjust_main_zoom(delta)),
                         on_start_local_agent_session: move |_| spawn_start_local_agent_session(state),
-                        on_connect_ssh: move |ix: usize| spawn_server_snapshot_action(
-                            state,
-                            "connecting ssh".to_string(),
-                            move |endpoint| connect_ssh(&endpoint, ix),
-                        ),
+                        on_connect_ssh: move |ix: usize| spawn_connect_ssh_target(state, ix),
+                        on_connect_ssh_custom: move |_| spawn_connect_ssh_custom(state),
+                        on_ssh_target_change: move |value: String| state.with_mut(|shell| shell.update_ssh_connect_target(value)),
+                        on_ssh_prefix_change: move |value: String| state.with_mut(|shell| shell.update_ssh_connect_prefix(value)),
                         on_focus_live: move |id: String| spawn_server_snapshot_action(
                             state,
                             format!("focusing {id}"),
@@ -4005,6 +4139,9 @@ fn RightRail(
     on_adjust_main_zoom: EventHandler<i32>,
     on_start_local_agent_session: EventHandler<MouseEvent>,
     on_connect_ssh: EventHandler<usize>,
+    on_connect_ssh_custom: EventHandler<MouseEvent>,
+    on_ssh_target_change: EventHandler<String>,
+    on_ssh_prefix_change: EventHandler<String>,
     on_focus_live: EventHandler<String>,
     on_clear_notification: EventHandler<u64>,
     on_clear_notifications: EventHandler<MouseEvent>,
@@ -4044,6 +4181,9 @@ fn RightRail(
                     snapshot: snapshot.clone(),
                     on_start_local_agent_session,
                     on_connect_ssh,
+                    on_connect_ssh_custom,
+                    on_ssh_target_change,
+                    on_ssh_prefix_change,
                     on_focus_live,
                 }
             } else if snapshot.right_panel_mode == RightPanelMode::Notifications {
@@ -4264,6 +4404,9 @@ fn ConnectRailBody(
     snapshot: RenderSnapshot,
     on_start_local_agent_session: EventHandler<MouseEvent>,
     on_connect_ssh: EventHandler<usize>,
+    on_connect_ssh_custom: EventHandler<MouseEvent>,
+    on_ssh_target_change: EventHandler<String>,
+    on_ssh_prefix_change: EventHandler<String>,
     on_focus_live: EventHandler<String>,
 ) -> Element {
     rsx! {
@@ -4276,6 +4419,54 @@ fn ConnectRailBody(
         }
         div {
             style: "flex:1; overflow:auto; padding:10px 16px 14px 16px; display:flex; flex-direction:column; gap:16px;",
+            div {
+                style: format!(
+                    "display:flex; flex-direction:column; gap:10px; padding:14px; border-radius:14px; background:rgba(255,255,255,0.68); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.52);"
+                ),
+                div {
+                    style: format!("font-size:12px; font-weight:700; color:{};", snapshot.palette.text),
+                    "Type an SSH target"
+                }
+                div {
+                    style: format!("font-size:11px; line-height:1.5; color:{};", snapshot.palette.muted),
+                    "Use `user@ip`, `user@host`, or a shortcut from your SSH config such as `dev`. If you need a remote prelude, add it below as an optional prefix."
+                }
+                input {
+                    r#type: "text",
+                    value: "{snapshot.ssh_connect_target}",
+                    placeholder: "dev or pi@jojo or user@192.168.1.15",
+                    style: format!(
+                        "height:34px; padding:0 12px; border:none; border-radius:10px; background:{}; color:{}; font-size:12px; outline:none;",
+                        snapshot.palette.panel_alt, snapshot.palette.text
+                    ),
+                    oninput: move |evt| on_ssh_target_change.call(evt.value()),
+                }
+                input {
+                    r#type: "text",
+                    value: "{snapshot.ssh_connect_prefix}",
+                    placeholder: "Optional prefix, e.g. sudo machinectl shell prod",
+                    style: format!(
+                        "height:34px; padding:0 12px; border:none; border-radius:10px; background:{}; color:{}; font-size:12px; outline:none;",
+                        snapshot.palette.panel_alt, snapshot.palette.text
+                    ),
+                    oninput: move |evt| on_ssh_prefix_change.call(evt.value()),
+                }
+                button {
+                    style: sidebar_action_style(snapshot.palette),
+                    onclick: move |evt| on_connect_ssh_custom.call(evt),
+                    div {
+                        style: "display:flex; flex-direction:column; align-items:flex-start; gap:3px; min-width:0;",
+                        span {
+                            style: format!("font-size:12px; font-weight:700; color:{};", snapshot.palette.text),
+                            "Proceed"
+                        }
+                        span {
+                            style: format!("font-size:11px; line-height:1.35; color:{}; white-space:pre-wrap;", snapshot.palette.muted),
+                            "Yggterm will open or focus a terminal session for this target."
+                        }
+                    }
+                }
+            }
             div {
                 style: "display:flex; flex-direction:column; gap:8px;",
                 button {
@@ -4299,7 +4490,7 @@ fn ConnectRailBody(
                     style: "display:flex; flex-direction:column; gap:8px;",
                     div {
                         style: format!("font-size:11px; font-weight:700; color:{};", snapshot.palette.muted),
-                        "Shell Targets"
+                        "Quick Targets"
                     }
                     for (ix, target) in snapshot.ssh_targets.iter().cloned().enumerate() {
                         {

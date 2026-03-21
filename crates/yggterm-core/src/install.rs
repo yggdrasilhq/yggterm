@@ -306,17 +306,36 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
     let data_dir = dirs::data_local_dir().context("unable to resolve local data dir")?;
     let applications_dir = data_dir.join("applications");
     let icons_dir = data_dir.join("icons").join("hicolor").join("512x512").join("apps");
+    let scalable_icons_dir = data_dir.join("icons").join("hicolor").join("scalable").join("apps");
     fs::create_dir_all(&applications_dir)?;
     fs::create_dir_all(&icons_dir)?;
+    fs::create_dir_all(&scalable_icons_dir)?;
 
     let icon_path = icons_dir.join("yggterm.png");
     write_if_changed(&icon_path, include_bytes!("../../../assets/brand/yggterm-icon-512.png"))?;
+    let scalable_icon_path = scalable_icons_dir.join("yggterm.svg");
+    write_if_changed(
+        &scalable_icon_path,
+        include_bytes!("../../../assets/brand/yggterm-icon.svg"),
+    )?;
     let desktop_path = applications_dir.join("dev.yggterm.Yggterm.desktop");
     let desktop_contents = format!(
-        "[Desktop Entry]\nType=Application\nName=Yggterm\nComment=Remote-first terminal workspace\nExec={}\nIcon=yggterm\nTerminal=false\nCategories=System;TerminalEmulator;Development;\nStartupNotify=true\n",
-        desktop_exec_escape(&context.executable_path)
+        "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Yggterm\nComment=Remote-first terminal workspace\nExec={}\nTryExec={}\nIcon={}\nTerminal=false\nCategories=System;TerminalEmulator;Development;\nStartupNotify=true\nStartupWMClass=yggterm\nX-Desktop-File-Install-Version=0.27\n",
+        desktop_exec_escape(&context.executable_path),
+        desktop_exec_escape(&context.executable_path),
+        desktop_exec_escape(&icon_path),
     );
     write_if_changed(&desktop_path, desktop_contents.as_bytes())?;
+    let _ = std::process::Command::new("update-desktop-database")
+        .arg(&applications_dir)
+        .status();
+    let _ = std::process::Command::new("gtk-update-icon-cache")
+        .arg("-f")
+        .arg("-t")
+        .arg(data_dir.join("icons").join("hicolor"))
+        .status();
+    let _ = std::process::Command::new("kbuildsycoca6").status();
+    let _ = std::process::Command::new("kbuildsycoca5").status();
 
     if let Some(bin_dir) = linux_user_bin_dir() {
         fs::create_dir_all(&bin_dir)?;

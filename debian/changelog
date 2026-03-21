@@ -1,3 +1,11 @@
+yggterm (2.0.3-1) unstable; urgency=medium
+
+  * Add a guided SSH connect rail with custom targets, optional prefixes, and duplicate-session focus reuse.
+  * Improve direct-install Linux desktop integration so KDE sees the app icon more reliably.
+  * Extend workspace grouping so virtual groups can act as destinations for notes and recipes.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sat, 21 Mar 2026 23:15:00 +0530
+
 yggterm (2.0.2-1) unstable; urgency=medium
 
   * Rewrite the README around the direct installer, daemon-owned PTY runtime, and embedded xterm.js terminal path.
