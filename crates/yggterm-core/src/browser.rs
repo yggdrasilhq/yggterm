@@ -1,4 +1,4 @@
-use crate::{SessionNode, SessionNodeKind};
+use crate::{SessionNode, SessionNodeKind, WorkspaceDocumentKind};
 use dirs::home_dir;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -17,6 +17,7 @@ pub struct BrowserRow {
     pub full_path: String,
     pub label: String,
     pub detail_label: String,
+    pub document_kind: Option<WorkspaceDocumentKind>,
     pub session_title: Option<String>,
     pub depth: usize,
     pub host_label: String,
@@ -271,6 +272,7 @@ fn flatten_rows(
             } else {
                 None
             },
+            document_kind: node.document_kind,
             full_path: full_path.clone(),
             depth,
             host_label: host_label_for_row(node, depth),

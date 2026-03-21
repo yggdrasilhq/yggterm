@@ -20,7 +20,7 @@ pub use terminal::{TerminalChunk, TerminalManager, TerminalReadResult};
 
 use yggterm_core::{
     SessionNode, SessionNodeKind, SessionStore, TranscriptRole, UiTheme, WorkspaceDocument,
-    read_codex_transcript_messages,
+    WorkspaceDocumentKind, read_codex_transcript_messages,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1570,11 +1570,35 @@ fn hydrate_document_session(session: &mut ManagedSessionView, document: &Workspa
     session.title = document.title.clone();
     session.session_path = document.virtual_path.clone();
     session.launch_command = "document preview".to_string();
+    let kind_label = match document.kind {
+        WorkspaceDocumentKind::Note => "note",
+        WorkspaceDocumentKind::TerminalRecipe => "terminal recipe",
+    };
+    let mut preview_blocks = vec![SessionPreviewBlock {
+        role: "NOTE",
+        timestamp: document.updated_at.clone(),
+        tone: PreviewTone::Assistant,
+        folded: false,
+        lines: document.body.lines().map(ToOwned::to_owned).collect(),
+    }];
+    if !document.replay_commands.is_empty() {
+        preview_blocks.push(SessionPreviewBlock {
+            role: "REPLAY",
+            timestamp: "document:replay".to_string(),
+            tone: PreviewTone::User,
+            folded: false,
+            lines: document.replay_commands.clone(),
+        });
+    }
     session.preview = SessionPreview {
         summary: vec![
             SessionMetadataEntry {
                 label: "Document",
                 value: document.title.clone(),
+            },
+            SessionMetadataEntry {
+                label: "Kind",
+                value: kind_label.to_string(),
             },
             SessionMetadataEntry {
                 label: "Storage",
@@ -1584,33 +1608,74 @@ fn hydrate_document_session(session: &mut ManagedSessionView, document: &Workspa
                 label: "Updated",
                 value: document.updated_at.clone(),
             },
+            SessionMetadataEntry {
+                label: "Replay",
+                value: if document.replay_commands.is_empty() {
+                    "none".to_string()
+                } else {
+                    format!("{} commands", document.replay_commands.len())
+                },
+            },
         ],
-        blocks: vec![SessionPreviewBlock {
-            role: "NOTE",
-            timestamp: document.updated_at.clone(),
-            tone: PreviewTone::Assistant,
-            folded: false,
-            lines: document.body.lines().map(ToOwned::to_owned).collect(),
-        }],
+        blocks: preview_blocks,
     };
     session.rendered_sections = vec![SessionRenderedSection {
         title: "Document",
         lines: document.body.lines().map(ToOwned::to_owned).collect(),
     }];
+    if !document.replay_commands.is_empty() {
+        session.rendered_sections.push(SessionRenderedSection {
+            title: "Replay Commands",
+            lines: document.replay_commands.clone(),
+        });
+    }
     session.metadata.retain(|entry| {
         !matches!(
             entry.label,
-            "Session" | "Document" | "Storage" | "Updated" | "Status" | "Restore" | "Launch"
+            "Session"
+                | "Document"
+                | "Kind"
+                | "Storage"
+                | "Updated"
+                | "Replay"
+                | "Source Session"
+                | "Source Kind"
+                | "Status"
+                | "Restore"
+                | "Launch"
         )
     });
     upsert_session_metadata(&mut session.metadata, "Source", "document".to_string());
     upsert_session_metadata(&mut session.metadata, "Document", document.title.clone());
+    upsert_session_metadata(&mut session.metadata, "Kind", kind_label.to_string());
     upsert_session_metadata(&mut session.metadata, "Storage", document.virtual_path.clone());
     upsert_session_metadata(&mut session.metadata, "Updated", document.updated_at.clone());
+    if let Some(source_session_path) = document.source_session_path.clone() {
+        upsert_session_metadata(&mut session.metadata, "Source Session", source_session_path);
+    }
+    if let Some(source_session_kind) = document.source_session_kind.clone() {
+        upsert_session_metadata(&mut session.metadata, "Source Kind", source_session_kind);
+    }
+    upsert_session_metadata(
+        &mut session.metadata,
+        "Replay",
+        if document.replay_commands.is_empty() {
+            "none".to_string()
+        } else {
+            format!("{} commands", document.replay_commands.len())
+        },
+    );
     upsert_session_metadata(&mut session.metadata, "Status", "preview only".to_string());
     session.terminal_lines = vec![
         format!("Document {}", document.title),
-        "Terminal mode is disabled for document nodes.".to_string(),
+        match document.kind {
+            WorkspaceDocumentKind::TerminalRecipe => {
+                "This recipe stays render-first until replay execution is implemented.".to_string()
+            }
+            WorkspaceDocumentKind::Note => {
+                "Terminal mode is disabled for document nodes.".to_string()
+            }
+        },
         "Use yggterm doc write <path> to update this note from the CLI.".to_string(),
     ];
 }
