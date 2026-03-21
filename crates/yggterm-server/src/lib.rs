@@ -9,7 +9,7 @@ pub use daemon::{
     connect_ssh,
     default_endpoint, focus_live, open_stored_session, ping, raise_external_window, run_daemon,
     request_terminal_launch, set_all_preview_blocks_folded, set_view_mode, snapshot,
-    start_local_session, start_local_session_at, status,
+    start_command_session, start_local_session, start_local_session_at, status,
     shutdown, sync_external_window, sync_theme, terminal_ensure, terminal_read, terminal_resize,
     terminal_write, toggle_preview_block,
 };
@@ -615,6 +615,52 @@ impl YggtermServer {
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| target.label.clone());
         self.insert_live_session(&key, &uuid, kind, &target, Some(title));
+        key
+    }
+
+    pub fn start_command_session(
+        &mut self,
+        cwd: Option<&str>,
+        title_hint: Option<&str>,
+        launch_command: &str,
+        source_label: Option<&str>,
+    ) -> String {
+        let uuid = Uuid::new_v4().to_string();
+        let key = format!("local::{uuid}");
+        let target = local_session_target(SessionKind::Shell, cwd);
+        let title = title_hint
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| "recipe shell".to_string());
+        self.insert_live_session(&key, &uuid, SessionKind::Shell, &target, Some(title.clone()));
+        if let Some(session) = self.sessions.get_mut(&key) {
+            session.title = title.clone();
+            session.launch_command = launch_command.to_string();
+            session.status_line = describe_status_line(
+                session.backend,
+                self.theme,
+                session.source,
+                TerminalLaunchPhase::Queued,
+                session.remote_deploy_state,
+                session.bridge_available,
+            );
+            upsert_session_metadata(
+                &mut session.metadata,
+                "Source",
+                source_label.unwrap_or("recipe-session").to_string(),
+            );
+            upsert_session_metadata(&mut session.metadata, "Launch", launch_command.to_string());
+            upsert_session_metadata(&mut session.metadata, "Status", "planned".to_string());
+            session.terminal_lines = vec![
+                format!("$ {launch_command}"),
+                format!("Queue live shell session {}", session.id),
+                format!(
+                    "Workspace: {}",
+                    target.cwd.clone().unwrap_or_else(local_default_cwd)
+                ),
+                "Daemon PTY: request main viewport terminal stream".to_string(),
+            ];
+        }
+        self.request_terminal_launch_for_path(&key);
         key
     }
 
