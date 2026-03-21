@@ -132,6 +132,7 @@ struct RenderSnapshot {
     right_panel_mode: RightPanelMode,
     rows: Vec<BrowserRow>,
     selected_path: Option<String>,
+    selected_row: Option<BrowserRow>,
     active_session: Option<ManagedSessionView>,
     active_view_mode: WorkspaceViewMode,
     ssh_targets: Vec<SshConnectTarget>,
@@ -288,6 +289,7 @@ impl ShellState {
             right_panel_mode: self.right_panel_mode,
             rows,
             selected_path,
+            selected_row: self.browser.selected_row().cloned(),
             active_session: self.server.active_session().cloned(),
             active_view_mode: self.server.active_view_mode(),
             ssh_targets: self.server.ssh_targets().to_vec(),
@@ -1437,6 +1439,78 @@ fn queue_new_group_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
     });
 }
 
+fn queue_move_selected_document_to_group(mut state: Signal<ShellState>, target_group: BrowserRow) {
+    let Some(selected_row) = state.read().browser.selected_row().cloned() else {
+        return;
+    };
+    if selected_row.kind != BrowserRowKind::Document || target_group.kind != BrowserRowKind::Group {
+        return;
+    }
+
+    state.with_mut(|shell| {
+        shell.server_busy = true;
+        shell.last_action = format!("moving {} to {}", selected_row.label, target_group.label);
+        shell.close_context_menu();
+    });
+
+    let settings = state.read().settings.clone();
+    spawn(async move {
+        let selected_for_task = selected_row.clone();
+        let target_for_task = target_group.clone();
+        let outcome =
+            task::spawn_blocking(move || -> Result<(yggterm_core::WorkspaceDocument, yggterm_core::SessionNode)> {
+                let store = SessionStore::open_or_init()?;
+                let destination = moved_document_virtual_path(&selected_for_task, &target_for_task);
+                let document = store.move_document(&selected_for_task.full_path, &destination)?;
+                let browser_tree = store.load_codex_tree(&settings)?;
+                Ok((document, browser_tree))
+            })
+            .await;
+
+        state.with_mut(|shell| match outcome {
+            Ok(Ok((document, browser_tree))) => {
+                let expanded_paths = shell.browser.expanded_paths();
+                shell.browser = SessionBrowserState::new(browser_tree);
+                shell.browser.restore_ui_state(&expanded_paths, Some(&document.virtual_path));
+                shell.browser.select_path(document.virtual_path.clone());
+                shell.sync_browser_settings();
+                shell.apply_daemon_snapshot_result(open_stored_session(
+                    &shell.bootstrap.server_endpoint,
+                    SessionKind::Document,
+                    &document.virtual_path,
+                    Some(&document.id),
+                    Some(&document.virtual_path),
+                    Some(&document.title),
+                ));
+                shell.last_action = format!("moved {} to {}", document.title, target_group.label);
+                shell.push_notification(
+                    NotificationTone::Success,
+                    "Document Moved",
+                    format!("Moved {} into {}.", document.title, target_group.label),
+                );
+            }
+            Ok(Err(error)) => {
+                shell.server_busy = false;
+                shell.last_action = format!("move failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "Document Move Failed",
+                    error.to_string(),
+                );
+            }
+            Err(error) => {
+                shell.server_busy = false;
+                shell.last_action = format!("move task failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "Document Move Task Failed",
+                    error.to_string(),
+                );
+            }
+        });
+    });
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AfterSaveAction {
     SaveOnly,
@@ -1680,6 +1754,15 @@ fn new_group_virtual_path_for_row(row: &BrowserRow) -> String {
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
     format!("{}/group-{}", base.trim_end_matches('/'), stamp)
+}
+
+fn moved_document_virtual_path(document_row: &BrowserRow, target_group: &BrowserRow) -> String {
+    let name = document_row
+        .full_path
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or("document");
+    format!("{}/{}", target_group.full_path.trim_end_matches('/'), name)
 }
 
 fn group_session_cwd(row: &BrowserRow) -> Option<String> {
@@ -2203,6 +2286,7 @@ fn app() -> Element {
                 if let Some(row) = snapshot.context_menu_row.clone() {
                     ContextMenuOverlay {
                         row: row.clone(),
+                        selected_row: snapshot.selected_row.clone(),
                         palette: snapshot.palette,
                         on_close: move |_| state.with_mut(|shell| shell.close_context_menu()),
                         on_create_group_codex: {
@@ -2228,6 +2312,10 @@ fn app() -> Element {
                         on_create_group_recipe: {
                             let row = row.clone();
                             move |_| queue_new_recipe_for_row(state, row.clone())
+                        },
+                        on_move_selected_document_here: {
+                            let row = row.clone();
+                            move |_| queue_move_selected_document_to_group(state, row.clone())
                         },
                         on_create_note: {
                             let row = row.clone();
@@ -4333,6 +4421,7 @@ fn NotificationCard(
 #[component]
 fn ContextMenuOverlay(
     row: BrowserRow,
+    selected_row: Option<BrowserRow>,
     palette: Palette,
     on_close: EventHandler<MouseEvent>,
     on_create_group: EventHandler<MouseEvent>,
@@ -4341,10 +4430,18 @@ fn ContextMenuOverlay(
     on_create_group_shell: EventHandler<MouseEvent>,
     on_create_group_document: EventHandler<MouseEvent>,
     on_create_group_recipe: EventHandler<MouseEvent>,
+    on_move_selected_document_here: EventHandler<MouseEvent>,
     on_create_note: EventHandler<MouseEvent>,
     on_create_recipe: EventHandler<MouseEvent>,
     on_regenerate: EventHandler<MouseEvent>,
 ) -> Element {
+    let can_move_selected_document = selected_row.as_ref().is_some_and(|selected| {
+        selected.kind == BrowserRowKind::Document
+            && !row.full_path.starts_with("__live_")
+            && parent_virtual_path(&selected.full_path)
+                .as_deref()
+                != Some(row.full_path.as_str())
+    });
     rsx! {
         div {
             style: "position:fixed; inset:0; z-index:90; background:transparent;",
@@ -4361,6 +4458,17 @@ fn ContextMenuOverlay(
                     "{row.label}"
                 }
                 if row.kind == BrowserRowKind::Group && !row.full_path.starts_with("__live_") {
+                    if can_move_selected_document {
+                        button {
+                            style: format!(
+                                "width:100%; height:30px; border:none; border-radius:10px; background:{}; color:{}; \
+                                 font-size:12px; font-weight:600; text-align:left; padding:0 10px; margin-bottom:6px;",
+                                palette.accent_soft, palette.text
+                            ),
+                            onclick: move |evt| on_move_selected_document_here.call(evt),
+                            "Move Selected Here"
+                        }
+                    }
                     button {
                         style: format!(
                             "width:100%; height:30px; border:none; border-radius:10px; background:{}; color:{}; \
