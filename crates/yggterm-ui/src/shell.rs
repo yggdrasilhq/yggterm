@@ -19,7 +19,8 @@ use tokio::time::sleep;
 use tracing::{info, warn};
 use yggterm_core::{
     AgentSessionProfile, AppSettings, BrowserRow, BrowserRowKind, SessionBrowserState,
-    SessionNode, SessionStore, UiTheme, save_settings_file,
+    SessionNode, SessionStore, UiTheme, WorkspaceDocumentInput, WorkspaceDocumentKind,
+    save_settings_file,
 };
 use yggterm_platform::DockRect;
 use yggterm_server::{
@@ -922,6 +923,7 @@ fn merged_sidebar_rows(
         full_path: "__live_sessions__".to_string(),
         label: "live".to_string(),
         detail_label: String::new(),
+        document_kind: None,
         session_title: None,
         depth: 0,
         host_label: String::new(),
@@ -930,7 +932,41 @@ fn merged_sidebar_rows(
         session_id: None,
         session_cwd: None,
     });
-    for session in live_sessions {
+    push_live_group_rows(&mut rows, "agent sessions", "__live_agents__", 1, live_sessions.iter().filter(|session| matches!(session.kind, SessionKind::Codex | SessionKind::CodexLiteLlm)));
+    push_live_group_rows(&mut rows, "shell sessions", "__live_shells__", 1, live_sessions.iter().filter(|session| session.kind == SessionKind::Shell));
+    push_live_group_rows(&mut rows, "ssh sessions", "__live_ssh__", 1, live_sessions.iter().filter(|session| session.kind == SessionKind::SshShell));
+    rows.extend_from_slice(stored_rows);
+    rows
+}
+
+fn push_live_group_rows<'a, I>(
+    rows: &mut Vec<BrowserRow>,
+    label: &str,
+    group_path: &str,
+    depth: usize,
+    sessions: I,
+) where
+    I: Iterator<Item = &'a ManagedSessionView>,
+{
+    let collected = sessions.collect::<Vec<_>>();
+    if collected.is_empty() {
+        return;
+    }
+    rows.push(BrowserRow {
+        kind: BrowserRowKind::Group,
+        full_path: group_path.to_string(),
+        label: label.to_string(),
+        detail_label: String::new(),
+        document_kind: None,
+        session_title: None,
+        depth,
+        host_label: "live".to_string(),
+        descendant_sessions: collected.len(),
+        expanded: true,
+        session_id: None,
+        session_cwd: None,
+    });
+    for session in collected {
         let label = if session.title.trim().is_empty() {
             session.id.clone()
         } else {
@@ -941,8 +977,9 @@ fn merged_sidebar_rows(
             full_path: session.session_path.clone(),
             label,
             detail_label: session.status_line.clone(),
+            document_kind: None,
             session_title: Some(session.title.clone()),
-            depth: 1,
+            depth: depth + 1,
             host_label: "live".to_string(),
             descendant_sessions: 1,
             expanded: true,
@@ -954,8 +991,6 @@ fn merged_sidebar_rows(
                 .map(|entry| entry.value.clone()),
         });
     }
-    rows.extend_from_slice(stored_rows);
-    rows
 }
 
 fn queue_session_note_creation(mut state: Signal<ShellState>, row: BrowserRow) {
@@ -1020,6 +1055,81 @@ fn queue_session_note_creation(mut state: Signal<ShellState>, row: BrowserRow) {
                 shell.push_notification(
                     NotificationTone::Error,
                     "Note Task Failed",
+                    error.to_string(),
+                );
+            }
+        });
+    });
+}
+
+fn queue_session_recipe_creation(mut state: Signal<ShellState>, row: BrowserRow) {
+    if row.kind != BrowserRowKind::Session {
+        return;
+    }
+
+    state.with_mut(|shell| {
+        shell.last_action = format!("creating recipe for {}", row.label);
+        shell.server_busy = true;
+    });
+
+    spawn(async move {
+        let row_for_task = row.clone();
+        let settings = state.read().settings.clone();
+        let outcome = task::spawn_blocking(move || -> Result<(yggterm_core::WorkspaceDocument, yggterm_core::SessionNode)> {
+            let store = SessionStore::open_or_init()?;
+            let document = store.save_document_input(
+                &session_recipe_virtual_path(&row_for_task),
+                WorkspaceDocumentInput {
+                    title: Some(format!("{} recipe", row_for_task.label)),
+                    kind: WorkspaceDocumentKind::TerminalRecipe,
+                    body: session_recipe_template(&row_for_task),
+                    source_session_path: Some(row_for_task.full_path.clone()),
+                    source_session_kind: Some(inferred_session_kind_name(&row_for_task).to_string()),
+                    replay_commands: initial_replay_commands_for_row(&row_for_task),
+                },
+            )?;
+            let browser_tree = store.load_codex_tree(&settings)?;
+            Ok((document, browser_tree))
+        })
+        .await;
+
+        state.with_mut(|shell| match outcome {
+            Ok(Ok((document, browser_tree))) => {
+                let expanded_paths = shell.browser.expanded_paths();
+                shell.browser = SessionBrowserState::new(browser_tree);
+                shell.browser.restore_ui_state(&expanded_paths, Some(&document.virtual_path));
+                shell.browser.select_path(document.virtual_path.clone());
+                shell.sync_browser_settings();
+                shell.apply_daemon_snapshot_result(open_stored_session(
+                    &shell.bootstrap.server_endpoint,
+                    SessionKind::Document,
+                    &document.virtual_path,
+                    Some(&document.id),
+                    Some(&document.virtual_path),
+                    Some(&document.title),
+                ));
+                shell.last_action = format!("created recipe for {}", row.label);
+                shell.push_notification(
+                    NotificationTone::Success,
+                    "Session Recipe Created",
+                    format!("Opened {}.", document.title),
+                );
+            }
+            Ok(Err(error)) => {
+                shell.server_busy = false;
+                shell.last_action = format!("recipe creation failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "Recipe Creation Failed",
+                    error.to_string(),
+                );
+            }
+            Err(error) => {
+                shell.server_busy = false;
+                shell.last_action = format!("recipe task failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "Recipe Task Failed",
                     error.to_string(),
                 );
             }
@@ -1095,17 +1205,20 @@ fn queue_new_document(mut state: Signal<ShellState>) {
     });
 }
 
-fn queue_document_save(mut state: Signal<ShellState>, virtual_path: String, title: String, body: String) {
+fn queue_document_save(mut state: Signal<ShellState>, virtual_path: String, input: WorkspaceDocumentInput) {
     state.with_mut(|shell| {
         shell.server_busy = true;
-        shell.last_action = format!("saving {}", title);
+        shell.last_action = format!(
+            "saving {}",
+            input.title.clone().unwrap_or_else(|| "document".to_string())
+        );
     });
 
     let settings = state.read().settings.clone();
     spawn(async move {
         let outcome = task::spawn_blocking(move || -> Result<(yggterm_core::WorkspaceDocument, yggterm_core::SessionNode)> {
             let store = SessionStore::open_or_init()?;
-            let document = store.save_document(&virtual_path, Some(&title), &body)?;
+            let document = store.save_document_input(&virtual_path, input)?;
             let browser_tree = store.load_codex_tree(&settings)?;
             Ok((document, browser_tree))
         })
@@ -1189,6 +1302,68 @@ fn session_note_template(row: &BrowserRow) -> String {
     )
 }
 
+fn session_recipe_virtual_path(row: &BrowserRow) -> String {
+    let base = row
+        .session_cwd
+        .clone()
+        .unwrap_or_else(|| "/documents".to_string());
+    let slug = row
+        .label
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | '0'..='9' => ch,
+            _ => '-',
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    let slug = if slug.is_empty() { "terminal-recipe".to_string() } else { slug };
+    format!("{}/recipes/{}", base.trim_end_matches('/'), slug)
+}
+
+fn session_recipe_template(row: &BrowserRow) -> String {
+    let location = row
+        .session_cwd
+        .clone()
+        .unwrap_or_else(|| row.full_path.clone());
+    let kind = inferred_session_kind_name(row);
+    format!(
+        "# {title} recipe\n\nSource Session: {title}\nSession Kind: {kind}\nLocation: {location}\n\n## Intent\n- \n\n## Replay Plan\n- \n\n## Expected State\n- \n",
+        title = row.label,
+        kind = kind,
+        location = location,
+    )
+}
+
+fn inferred_session_kind_name(row: &BrowserRow) -> &'static str {
+    if row.full_path.starts_with("codex-litellm://") {
+        "codex_litellm"
+    } else if row.full_path.starts_with("codex://") {
+        "codex"
+    } else if row.full_path.starts_with("local://") {
+        "shell"
+    } else if row.full_path.starts_with("ssh://") {
+        "ssh_shell"
+    } else if row.kind == BrowserRowKind::Session {
+        "codex"
+    } else {
+        "session"
+    }
+}
+
+fn initial_replay_commands_for_row(row: &BrowserRow) -> Vec<String> {
+    if row.full_path.starts_with("codex-litellm://") {
+        vec!["CODEX_HOME=\"$HOME/.codex-litellm\" codex-litellm".to_string()]
+    } else if row.full_path.starts_with("codex://") || row.kind == BrowserRowKind::Session {
+        vec!["codex".to_string()]
+    } else if row.full_path.starts_with("local://") {
+        vec!["$SHELL -l".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
 fn new_document_virtual_path(selected_row: Option<&BrowserRow>, active_session: Option<&ManagedSessionView>) -> String {
     let base = selected_row
         .and_then(document_parent_base)
@@ -1205,7 +1380,13 @@ fn document_parent_base(row: &BrowserRow) -> Option<String> {
     match row.kind {
         BrowserRowKind::Session => row.session_cwd.clone(),
         BrowserRowKind::Document => parent_virtual_path(&row.full_path),
-        BrowserRowKind::Group => Some(row.full_path.clone()),
+        BrowserRowKind::Group => {
+            if row.full_path.starts_with("__live_") {
+                Some("/documents".to_string())
+            } else {
+                Some(row.full_path.clone())
+            }
+        }
     }
 }
 
@@ -1634,8 +1815,8 @@ fn app() -> Element {
                             )
                         },
                         on_set_preview_layout: move |mode: PreviewLayoutMode| state.with_mut(|shell| shell.set_preview_layout(mode)),
-                        on_save_document: move |(path, title, body): (String, String, String)| {
-                            queue_document_save(state, path, title, body)
+                        on_save_document: move |(path, input): (String, WorkspaceDocumentInput)| {
+                            queue_document_save(state, path, input)
                         },
                     }
                     RightRail {
@@ -1675,6 +1856,13 @@ fn app() -> Element {
                             move |_| {
                                 state.with_mut(|shell| shell.close_context_menu());
                                 queue_session_note_creation(state, row.clone());
+                            }
+                        },
+                        on_create_recipe: {
+                            let row = row.clone();
+                            move |_| {
+                                state.with_mut(|shell| shell.close_context_menu());
+                                queue_session_recipe_creation(state, row.clone());
                             }
                         },
                         on_regenerate: {
@@ -2301,6 +2489,30 @@ fn SidebarQuickAction(
 #[component]
 fn TreeIcon(row: BrowserRow) -> Element {
     if row.kind == BrowserRowKind::Session {
+        if row.full_path.starts_with("codex-litellm://") {
+            return rsx! {
+                span {
+                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:13px; font-weight:700; line-height:1;",
+                    "✦"
+                }
+            };
+        }
+        if row.full_path.starts_with("local://") {
+            return rsx! {
+                span {
+                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:13px; font-weight:700; line-height:1;",
+                    "⌘"
+                }
+            };
+        }
+        if row.full_path.starts_with("ssh://") {
+            return rsx! {
+                span {
+                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:13px; font-weight:700; line-height:1;",
+                    "⇄"
+                }
+            };
+        }
         return rsx! {
             span {
                 style: "display:inline-flex; align-items:center; justify-content:center; font-size:13px; font-weight:700; line-height:1;",
@@ -2308,6 +2520,20 @@ fn TreeIcon(row: BrowserRow) -> Element {
             }
         };
     } else if row.kind == BrowserRowKind::Document {
+        if row.document_kind == Some(WorkspaceDocumentKind::TerminalRecipe) {
+            return rsx! {
+                svg {
+                    width: "18",
+                    height: "18",
+                    view_box: "0 0 18 18",
+                    fill: "none",
+                    xmlns: "http://www.w3.org/2000/svg",
+                    rect { x: "3.2", y: "3.2", width: "11.6", height: "11.6", rx: "2.2", stroke: "currentColor", stroke_width: "1.15" }
+                    path { d: "M6 7.2L8 9L6 10.8", stroke: "currentColor", stroke_width: "1.1", stroke_linecap: "round", stroke_linejoin: "round" }
+                    path { d: "M9.5 10.8H12", stroke: "currentColor", stroke_width: "1.1", stroke_linecap: "round" }
+                }
+            };
+        }
         return rsx! {
             svg {
                 width: "18",
@@ -2324,6 +2550,14 @@ fn TreeIcon(row: BrowserRow) -> Element {
     }
 
     if row.depth == 0 {
+        if row.full_path == "__live_sessions__" {
+            return rsx! {
+                span {
+                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:13px; font-weight:700; line-height:1;",
+                    "◉"
+                }
+            };
+        }
         return rsx! {
             svg {
                 width: "18",
@@ -2435,7 +2669,7 @@ fn MainSurface(
     on_collapse_preview: EventHandler<()>,
     on_toggle_preview_block: EventHandler<usize>,
     on_set_preview_layout: EventHandler<PreviewLayoutMode>,
-    on_save_document: EventHandler<(String, String, String)>,
+    on_save_document: EventHandler<(String, WorkspaceDocumentInput)>,
 ) -> Element {
     let body = if let Some(session) = snapshot.active_session.clone() {
         match snapshot.active_view_mode {
@@ -2600,7 +2834,7 @@ fn DocumentEditor(
     session: ManagedSessionView,
     palette: Palette,
     server_busy: bool,
-    on_save: EventHandler<(String, String, String)>,
+    on_save: EventHandler<(String, WorkspaceDocumentInput)>,
 ) -> Element {
     let mut title = use_signal(|| session.title.clone());
     let initial_body = session
@@ -2615,8 +2849,18 @@ fn DocumentEditor(
                 .map(|block| block.lines.join("\n"))
         })
         .unwrap_or_default();
+    let initial_replay = session
+        .rendered_sections
+        .iter()
+        .find(|section| section.title == "Replay Commands")
+        .map(|section| section.lines.join("\n"))
+        .unwrap_or_default();
     let mut body = use_signal(|| initial_body);
+    let mut replay = use_signal(|| initial_replay);
     let storage_path = session.session_path.clone();
+    let document_kind = metadata_value(&session, "Kind");
+    let source_session_path = metadata_value(&session, "Source Session");
+    let source_session_kind = metadata_value(&session, "Source Kind");
 
     rsx! {
         div {
@@ -2644,7 +2888,34 @@ fn DocumentEditor(
                 }
                 button {
                     style: chip_style(palette, server_busy),
-                    onclick: move |_| on_save.call((storage_path.clone(), title(), body())),
+                    onclick: move |_| on_save.call((
+                        storage_path.clone(),
+                        WorkspaceDocumentInput {
+                            title: Some(title()),
+                            kind: if document_kind == "terminal recipe" {
+                                WorkspaceDocumentKind::TerminalRecipe
+                            } else {
+                                WorkspaceDocumentKind::Note
+                            },
+                            body: body(),
+                            source_session_path: if source_session_path.is_empty() {
+                                None
+                            } else {
+                                Some(source_session_path.clone())
+                            },
+                            source_session_kind: if source_session_kind.is_empty() {
+                                None
+                            } else {
+                                Some(source_session_kind.clone())
+                            },
+                            replay_commands: replay()
+                                .lines()
+                                .map(str::trim)
+                                .filter(|line| !line.is_empty())
+                                .map(ToOwned::to_owned)
+                                .collect(),
+                        }
+                    )),
                     "Save"
                 }
             }
@@ -2657,6 +2928,25 @@ fn DocumentEditor(
                     palette.text, interface_font_family()
                 ),
                 oninput: move |evt| body.set(evt.value()),
+            }
+            if document_kind == "terminal recipe" {
+                div {
+                    style: "display:flex; flex-direction:column; gap:8px;",
+                    div {
+                        style: format!("font-size:11px; font-weight:700; color:{};", palette.muted),
+                        "Replay Commands"
+                    }
+                    textarea {
+                        value: "{replay}",
+                        style: format!(
+                            "min-height:120px; width:100%; resize:vertical; padding:14px 16px; border:none; border-radius:14px; \
+                             background:rgba(255,255,255,0.66); color:{}; outline:none; font-size:13px; line-height:1.6; \
+                             box-shadow: inset 0 0 0 1px rgba(170,190,212,0.16); font-family:'JetBrains Mono', 'Iosevka Term', monospace;",
+                            palette.text
+                        ),
+                        oninput: move |evt| replay.set(evt.value()),
+                    }
+                }
             }
         }
     }
@@ -3555,6 +3845,7 @@ fn ContextMenuOverlay(
     palette: Palette,
     on_close: EventHandler<MouseEvent>,
     on_create_note: EventHandler<MouseEvent>,
+    on_create_recipe: EventHandler<MouseEvent>,
     on_regenerate: EventHandler<MouseEvent>,
 ) -> Element {
     rsx! {
@@ -3581,6 +3872,15 @@ fn ContextMenuOverlay(
                         ),
                         onclick: move |evt| on_create_note.call(evt),
                         "Create Note"
+                    }
+                    button {
+                        style: format!(
+                            "width:100%; height:30px; border:none; border-radius:10px; background:{}; color:{}; \
+                             font-size:12px; font-weight:600; text-align:left; padding:0 10px; margin-bottom:6px;",
+                            palette.panel_alt, palette.text
+                        ),
+                        onclick: move |evt| on_create_recipe.call(evt),
+                        "Create Recipe"
                     }
                 }
                 button {

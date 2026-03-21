@@ -16,8 +16,8 @@ use titles::{SessionTitleResolver, settings_ready as litellm_settings_ready};
 pub use browser::{BrowserMetrics, BrowserRow, BrowserRowKind, SessionBrowserState};
 pub use transcript::{TranscriptMessage, TranscriptRole, message_lines_from_payload, read_codex_transcript_messages};
 pub use workspace::{
-    WorkspaceDocument, WorkspaceDocumentSummary, WorkspaceStore, default_document_title,
-    normalize_virtual_document_path,
+    WorkspaceDocument, WorkspaceDocumentInput, WorkspaceDocumentKind, WorkspaceDocumentSummary,
+    WorkspaceStore, default_document_title, normalize_virtual_document_path,
 };
 
 pub const ENV_YGGTERM_HOME: &str = "YGGTERM_HOME";
@@ -31,6 +31,7 @@ pub struct SessionNode {
     pub kind: SessionNodeKind,
     pub name: String,
     pub title: Option<String>,
+    pub document_kind: Option<WorkspaceDocumentKind>,
     pub path: PathBuf,
     pub children: Vec<SessionNode>,
     pub session_id: Option<String>,
@@ -186,6 +187,14 @@ impl SessionStore {
         WorkspaceStore::open(&self.home)?.put_document(virtual_path, title, body)
     }
 
+    pub fn save_document_input(
+        &self,
+        virtual_path: &str,
+        input: WorkspaceDocumentInput,
+    ) -> Result<WorkspaceDocument> {
+        WorkspaceStore::open(&self.home)?.put_document_input(virtual_path, input)
+    }
+
     pub fn generate_missing_codex_titles(
         &self,
         settings: &AppSettings,
@@ -324,6 +333,7 @@ fn walk_directory_tree(path: &Path, include_codex_files: bool) -> Result<Session
                 kind: SessionNodeKind::CodexSession,
                 name: codex_leaf_label(&entry_path),
                 title: None,
+                document_kind: None,
                 path: entry_path,
                 children: Vec::new(),
                 session_id: None,
@@ -337,6 +347,7 @@ fn walk_directory_tree(path: &Path, include_codex_files: bool) -> Result<Session
         kind: SessionNodeKind::Group,
         name,
         title: None,
+        document_kind: None,
         path: path.to_path_buf(),
         children,
         session_id: None,
@@ -728,6 +739,7 @@ fn codex_browser_tree_to_session_node(node: &CodexBrowserTreeNode) -> SessionNod
             kind: SessionNodeKind::CodexSession,
             name: short_session_id(&session.session_id),
             title: session.generated_title.clone(),
+            document_kind: None,
             path: session.file_path.clone(),
             children: Vec::new(),
             session_id: Some(session.session_id.clone()),
@@ -737,6 +749,7 @@ fn codex_browser_tree_to_session_node(node: &CodexBrowserTreeNode) -> SessionNod
             kind: SessionNodeKind::Document,
             name: document.title.clone(),
             title: Some(document.title.clone()),
+            document_kind: Some(document.kind),
             path: PathBuf::from(document.virtual_path.clone()),
             children: Vec::new(),
             session_id: Some(document.id.clone()),
@@ -755,6 +768,7 @@ fn codex_browser_tree_to_session_node(node: &CodexBrowserTreeNode) -> SessionNod
         kind: SessionNodeKind::Group,
         name: node.name.clone(),
         title: None,
+        document_kind: None,
         path: PathBuf::from(node.full_path.clone()),
         children,
         session_id: None,
