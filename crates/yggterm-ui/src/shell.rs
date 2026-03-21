@@ -27,8 +27,7 @@ use yggterm_server::{
     ManagedSessionView, PreviewTone, ServerEndpoint, ServerUiSnapshot, SessionKind,
     SessionMetadataEntry,
     ServerRuntimeStatus, SessionPreviewBlock, SshConnectTarget, TerminalBackend,
-    GhosttyTerminalHostMode, WorkspaceViewMode, YggtermServer, connect_ssh, focus_live,
-    connect_ssh_custom,
+    GhosttyTerminalHostMode, WorkspaceViewMode, YggtermServer, focus_live, connect_ssh_custom,
     open_stored_session, request_terminal_launch,
     set_all_preview_blocks_folded, set_view_mode as daemon_set_view_mode, status,
     snapshot as daemon_snapshot, ping, start_command_session, start_local_session, start_local_session_at,
@@ -952,67 +951,6 @@ fn spawn_open_session_row(mut state: Signal<ShellState>, row: BrowserRow) {
     );
 }
 
-fn spawn_start_local_agent_session(state: Signal<ShellState>) {
-    let kind = agent_profile_kind(state.read().settings.default_agent_profile);
-    let pending = match kind {
-        SessionKind::Codex => "starting codex session".to_string(),
-        SessionKind::CodexLiteLlm => "starting codex-litellm session".to_string(),
-        _ => "starting local session".to_string(),
-    };
-    spawn_server_snapshot_action(state, pending, move |endpoint| {
-        start_local_session(&endpoint, kind)
-    });
-}
-
-fn spawn_connect_ssh_target(mut state: Signal<ShellState>, target_ix: usize) {
-    let label = state
-        .read()
-        .server
-        .ssh_targets()
-        .get(target_ix)
-        .map(|target| target.label.clone())
-        .unwrap_or_else(|| "ssh target".to_string());
-    state.with_mut(|shell| {
-        shell.server_busy = true;
-        shell.last_action = format!("connecting {label}");
-    });
-    let endpoint = state.read().bootstrap.server_endpoint.clone();
-    spawn(async move {
-        let outcome = task::spawn_blocking(move || connect_ssh(&endpoint, target_ix)).await;
-        state.with_mut(|shell| match outcome {
-            Ok(Ok((snapshot, message))) => {
-                shell.server.apply_snapshot(snapshot);
-                shell.server_busy = false;
-                shell.needs_initial_server_sync = false;
-                shell.last_action = message.clone().unwrap_or_else(|| format!("connected {label}"));
-                shell.push_notification(
-                    NotificationTone::Success,
-                    "SSH Connected",
-                    format!("Ready: {label}"),
-                );
-            }
-            Ok(Err(error)) => {
-                shell.server_busy = false;
-                shell.last_action = format!("ssh connect failed: {error}");
-                shell.push_notification(
-                    NotificationTone::Error,
-                    "SSH Connection Failed",
-                    error.to_string(),
-                );
-            }
-            Err(error) => {
-                shell.server_busy = false;
-                shell.last_action = format!("ssh task failed: {error}");
-                shell.push_notification(
-                    NotificationTone::Error,
-                    "SSH Task Failed",
-                    error.to_string(),
-                );
-            }
-        });
-    });
-}
-
 fn spawn_connect_ssh_custom(mut state: Signal<ShellState>) {
     let target = state.read().ssh_connect_target.trim().to_string();
     let prefix = state.read().ssh_connect_prefix.trim().to_string();
@@ -1105,13 +1043,6 @@ fn session_kind_action_label(kind: SessionKind) -> &'static str {
         SessionKind::Shell => "shell session",
         SessionKind::SshShell => "ssh session",
         SessionKind::Document => "document",
-    }
-}
-
-fn agent_profile_kind(profile: AgentSessionProfile) -> SessionKind {
-    match profile {
-        AgentSessionProfile::Codex => SessionKind::Codex,
-        AgentSessionProfile::CodexLiteLlm => SessionKind::CodexLiteLlm,
     }
 }
 
@@ -2464,16 +2395,9 @@ fn app() -> Element {
                         on_generate_titles: move |_| state.with_mut(|shell| shell.generate_session_titles()),
                         on_adjust_ui_zoom: move |delta: i32| state.with_mut(|shell| shell.adjust_ui_zoom(delta)),
                         on_adjust_main_zoom: move |delta: i32| state.with_mut(|shell| shell.adjust_main_zoom(delta)),
-                        on_start_local_agent_session: move |_| spawn_start_local_agent_session(state),
-                        on_connect_ssh: move |ix: usize| spawn_connect_ssh_target(state, ix),
                         on_connect_ssh_custom: move |_| spawn_connect_ssh_custom(state),
                         on_ssh_target_change: move |value: String| state.with_mut(|shell| shell.update_ssh_connect_target(value)),
                         on_ssh_prefix_change: move |value: String| state.with_mut(|shell| shell.update_ssh_connect_prefix(value)),
-                        on_focus_live: move |id: String| spawn_server_snapshot_action(
-                            state,
-                            format!("focusing {id}"),
-                            move |endpoint| focus_live(&endpoint, &id),
-                        ),
                         on_clear_notification: move |id: u64| state.with_mut(|shell| shell.clear_notification(id)),
                         on_clear_notifications: move |_| state.with_mut(|shell| shell.clear_notifications()),
                     }
@@ -4209,12 +4133,9 @@ fn RightRail(
     on_generate_titles: EventHandler<MouseEvent>,
     on_adjust_ui_zoom: EventHandler<i32>,
     on_adjust_main_zoom: EventHandler<i32>,
-    on_start_local_agent_session: EventHandler<MouseEvent>,
-    on_connect_ssh: EventHandler<usize>,
     on_connect_ssh_custom: EventHandler<MouseEvent>,
     on_ssh_target_change: EventHandler<String>,
     on_ssh_prefix_change: EventHandler<String>,
-    on_focus_live: EventHandler<String>,
     on_clear_notification: EventHandler<u64>,
     on_clear_notifications: EventHandler<MouseEvent>,
 ) -> Element {
@@ -4251,12 +4172,9 @@ fn RightRail(
             } else if snapshot.right_panel_mode == RightPanelMode::Connect {
                 ConnectRailBody {
                     snapshot: snapshot.clone(),
-                    on_start_local_agent_session,
-                    on_connect_ssh,
                     on_connect_ssh_custom,
                     on_ssh_target_change,
                     on_ssh_prefix_change,
-                    on_focus_live,
                 }
             } else if snapshot.right_panel_mode == RightPanelMode::Notifications {
                 NotificationsRailBody {
@@ -4474,12 +4392,9 @@ fn NotificationsRailBody(
 #[component]
 fn ConnectRailBody(
     snapshot: RenderSnapshot,
-    on_start_local_agent_session: EventHandler<MouseEvent>,
-    on_connect_ssh: EventHandler<usize>,
     on_connect_ssh_custom: EventHandler<MouseEvent>,
     on_ssh_target_change: EventHandler<String>,
     on_ssh_prefix_change: EventHandler<String>,
-    on_focus_live: EventHandler<String>,
 ) -> Element {
     rsx! {
         div {
@@ -4491,17 +4406,17 @@ fn ConnectRailBody(
         }
         div {
             style: "flex:1; overflow:auto; padding:10px 16px 14px 16px; display:flex; flex-direction:column; gap:16px;",
-            div {
-                style: format!(
+                div {
+                    style: format!(
                     "display:flex; flex-direction:column; gap:10px; padding:14px; border-radius:14px; background:rgba(255,255,255,0.68); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.52);"
                 ),
                 div {
                     style: format!("font-size:12px; font-weight:700; color:{};", snapshot.palette.text),
-                    "Type an SSH target"
+                    "Connect a remote machine"
                 }
                 div {
                     style: format!("font-size:11px; line-height:1.5; color:{};", snapshot.palette.muted),
-                    "Use `user@ip`, `user@host`, or a shortcut from your SSH config such as `dev`. If you need a remote prelude, add it below as an optional prefix."
+                    "Use `user@ip`, `user@host`, or a shortcut from your SSH config such as `dev`. Yggterm will open that machine as a live terminal session."
                 }
                 input {
                     r#type: "text",
@@ -4535,90 +4450,6 @@ fn ConnectRailBody(
                         span {
                             style: format!("font-size:11px; line-height:1.35; color:{}; white-space:pre-wrap;", snapshot.palette.muted),
                             "Yggterm will open or focus a terminal session for this target."
-                        }
-                    }
-                }
-            }
-            div {
-                style: "display:flex; flex-direction:column; gap:8px;",
-                button {
-                    style: sidebar_action_style(snapshot.palette),
-                    onclick: move |evt| on_start_local_agent_session.call(evt),
-                    div {
-                        style: "display:flex; flex-direction:column; align-items:flex-start; gap:3px; min-width:0;",
-                        span {
-                            style: format!("font-size:12px; font-weight:700; color:{};", snapshot.palette.text),
-                            "New Agent Session"
-                        }
-                        span {
-                            style: format!("font-size:11px; line-height:1.35; color:{}; white-space:pre-wrap;", snapshot.palette.muted),
-                            "{agent_profile_label(snapshot.settings.default_agent_profile)} · {agent_profile_command(snapshot.settings.default_agent_profile)}"
-                        }
-                    }
-                }
-            }
-            if !snapshot.ssh_targets.is_empty() {
-                div {
-                    style: "display:flex; flex-direction:column; gap:8px;",
-                    div {
-                        style: format!("font-size:11px; font-weight:700; color:{};", snapshot.palette.muted),
-                        "Quick Targets"
-                    }
-                    for (ix, target) in snapshot.ssh_targets.iter().cloned().enumerate() {
-                        {
-                            let target_detail = if target.kind == SessionKind::Shell {
-                                target
-                                    .cwd
-                                    .clone()
-                                    .unwrap_or_else(|| "local shell".to_string())
-                            } else if let Some(prefix) = target.prefix.as_ref() {
-                                format!("{} · {}", target.ssh_target, prefix)
-                            } else {
-                                target.ssh_target.clone()
-                            };
-                            rsx! {
-                                button {
-                                    style: sidebar_action_style(snapshot.palette),
-                                    onclick: move |_| on_connect_ssh.call(ix),
-                                    div {
-                                        style: "display:flex; flex-direction:column; align-items:flex-start; gap:3px; min-width:0;",
-                                        span {
-                                            style: format!("font-size:12px; font-weight:600; color:{};", snapshot.palette.text),
-                                            "{target.label}"
-                                        }
-                                        span {
-                                            style: format!("font-size:11px; line-height:1.35; color:{}; white-space:pre-wrap;", snapshot.palette.muted),
-                                            "{target_detail}"
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if !snapshot.live_sessions.is_empty() {
-                div {
-                    style: "display:flex; flex-direction:column; gap:8px;",
-                    div {
-                        style: format!("font-size:11px; font-weight:700; color:{};", snapshot.palette.muted),
-                        "Live Sessions"
-                    }
-                    for session in snapshot.live_sessions.iter().cloned() {
-                        button {
-                            style: sidebar_action_style(snapshot.palette),
-                            onclick: move |_| on_focus_live.call(session.session_path.clone()),
-                            div {
-                                style: "display:flex; flex-direction:column; align-items:flex-start; gap:3px; min-width:0;",
-                                span {
-                                    style: format!("font-size:12px; font-weight:600; color:{};", snapshot.palette.text),
-                                    "{session.title}"
-                                }
-                                span {
-                                    style: format!("font-size:11px; line-height:1.35; color:{}; white-space:pre-wrap;", snapshot.palette.muted),
-                                    "{session.status_line}"
-                                }
-                            }
                         }
                     }
                 }
@@ -4858,20 +4689,6 @@ fn ToastViewport(
 fn toast_right_inset(right_panel_mode: RightPanelMode) -> usize {
     let _ = right_panel_mode;
     18
-}
-
-fn agent_profile_label(profile: AgentSessionProfile) -> &'static str {
-    match profile {
-        AgentSessionProfile::Codex => "Codex",
-        AgentSessionProfile::CodexLiteLlm => "Codex LiteLLM",
-    }
-}
-
-fn agent_profile_command(profile: AgentSessionProfile) -> &'static str {
-    match profile {
-        AgentSessionProfile::Codex => "launches `codex`",
-        AgentSessionProfile::CodexLiteLlm => "launches `codex-litellm`",
-    }
 }
 
 #[component]
