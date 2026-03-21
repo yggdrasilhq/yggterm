@@ -36,6 +36,7 @@ This repository is still scaffolding.
 - Live daemon-owned sessions now appear in the main sidebar tree instead of hiding only inside the connect panel.
 - Documents are editable in the main viewport now, not just previewed as static blocks.
 - The sidebar can start fresh Codex, Codex LiteLLM, shell, and document workflows directly, instead of forcing those flows through a side panel.
+- The virtual tree is now an active workspace surface, not just a picker: right-click a folder or group and spawn a new Codex session, LiteLLM session, shell, or nearby document in that context.
 - The workspace store now distinguishes plain notes from terminal recipes, so session-derived documents can carry replay seeds and source-session metadata.
 - `yggterm` now opens the Dioxus shell directly.
 - The old CLI subcommands and the `eframe` scaffold path have been removed.
@@ -169,7 +170,7 @@ yggterm doc cat /home/pi/gh/yggterm/notes/release-plan
 
 The path is virtual. It describes where the note should appear in the sidebar tree, not where a markdown file needs to exist on disk.
 
-Inside the desktop shell, the same document model is available from a session row. The first pass is intentionally simple: right-click a session, create a note, and Yggterm opens that note near the session path it came from.
+Inside the desktop shell, the same document model is available from the tree itself. Right-click a stored session to create a nearby note or recipe, or right-click a folder/group to start a fresh Codex session, LiteLLM session, shell, or document directly in that workspace context.
 
 That flow no longer stops at note creation. Documents can be created directly from the settings rail and edited inline in the main viewport, while the CLI still works against the same `workspace.db` store for fast automation and scripting. Session rows can now also create terminal recipes, which are documents with extra metadata about where they came from and which commands should be replayed.
 
