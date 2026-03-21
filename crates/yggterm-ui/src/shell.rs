@@ -30,7 +30,8 @@ use yggterm_server::{
     GhosttyTerminalHostMode, WorkspaceViewMode, YggtermServer, connect_ssh, focus_live,
     open_stored_session, request_terminal_launch,
     set_all_preview_blocks_folded, set_view_mode as daemon_set_view_mode, status,
-    snapshot as daemon_snapshot, ping, start_local_session, terminal_ensure, terminal_read,
+    snapshot as daemon_snapshot, ping, start_local_session, start_local_session_at,
+    terminal_ensure, terminal_read,
     terminal_resize, terminal_write,
     toggle_preview_block as daemon_toggle_preview_block,
 };
@@ -922,11 +923,31 @@ fn spawn_start_local_agent_session(state: Signal<ShellState>) {
     });
 }
 
+fn spawn_start_group_session(mut state: Signal<ShellState>, row: BrowserRow, kind: SessionKind) {
+    let cwd = group_session_cwd(&row);
+    let title_hint = Some(group_session_title_hint(&row, kind));
+    let pending = format!("starting {} in {}", session_kind_action_label(kind), row.label);
+    state.with_mut(|shell| shell.close_context_menu());
+    spawn_server_snapshot_action(state, pending, move |endpoint| {
+        start_local_session_at(&endpoint, kind, cwd.as_deref(), title_hint.as_deref())
+    });
+}
+
 fn session_kind_for_row(kind: BrowserRowKind) -> SessionKind {
     match kind {
         BrowserRowKind::Session => SessionKind::Codex,
         BrowserRowKind::Document => SessionKind::Document,
         BrowserRowKind::Group => SessionKind::Codex,
+    }
+}
+
+fn session_kind_action_label(kind: SessionKind) -> &'static str {
+    match kind {
+        SessionKind::Codex => "codex session",
+        SessionKind::CodexLiteLlm => "codex-litellm session",
+        SessionKind::Shell => "shell session",
+        SessionKind::SshShell => "ssh session",
+        SessionKind::Document => "document",
     }
 }
 
@@ -1241,6 +1262,73 @@ fn queue_new_document(mut state: Signal<ShellState>) {
     });
 }
 
+fn queue_new_document_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
+    state.with_mut(|shell| {
+        shell.server_busy = true;
+        shell.last_action = format!("creating document in {}", row.label);
+        shell.close_context_menu();
+    });
+
+    let settings = state.read().settings.clone();
+    spawn(async move {
+        let row_for_task = row.clone();
+        let outcome = task::spawn_blocking(move || -> Result<(yggterm_core::WorkspaceDocument, yggterm_core::SessionNode)> {
+            let store = SessionStore::open_or_init()?;
+            let virtual_path = new_document_virtual_path_for_row(&row_for_task);
+            let document = store.save_document(
+                &virtual_path,
+                Some("Untitled note"),
+                "# Untitled note\n\nStart writing here.\n",
+            )?;
+            let browser_tree = store.load_codex_tree(&settings)?;
+            Ok((document, browser_tree))
+        })
+        .await;
+
+        state.with_mut(|shell| match outcome {
+            Ok(Ok((document, browser_tree))) => {
+                let expanded_paths = shell.browser.expanded_paths();
+                shell.browser = SessionBrowserState::new(browser_tree);
+                shell.browser.restore_ui_state(&expanded_paths, Some(&document.virtual_path));
+                shell.browser.select_path(document.virtual_path.clone());
+                shell.sync_browser_settings();
+                shell.apply_daemon_snapshot_result(open_stored_session(
+                    &shell.bootstrap.server_endpoint,
+                    SessionKind::Document,
+                    &document.virtual_path,
+                    Some(&document.id),
+                    Some(&document.virtual_path),
+                    Some(&document.title),
+                ));
+                shell.last_action = format!("created {}", document.title);
+                shell.push_notification(
+                    NotificationTone::Success,
+                    "Document Created",
+                    format!("Opened {}.", document.title),
+                );
+            }
+            Ok(Err(error)) => {
+                shell.server_busy = false;
+                shell.last_action = format!("document creation failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "Document Creation Failed",
+                    error.to_string(),
+                );
+            }
+            Err(error) => {
+                shell.server_busy = false;
+                shell.last_action = format!("document task failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "Document Task Failed",
+                    error.to_string(),
+                );
+            }
+        });
+    });
+}
+
 fn queue_document_save(
     mut state: Signal<ShellState>,
     virtual_path: String,
@@ -1424,6 +1512,36 @@ fn new_document_virtual_path(selected_row: Option<&BrowserRow>, active_session: 
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
     format!("{}/notes/untitled-{}", base.trim_end_matches('/'), stamp)
+}
+
+fn new_document_virtual_path_for_row(row: &BrowserRow) -> String {
+    let base = document_parent_base(row).unwrap_or_else(|| "/documents".to_string());
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    format!("{}/notes/untitled-{}", base.trim_end_matches('/'), stamp)
+}
+
+fn group_session_cwd(row: &BrowserRow) -> Option<String> {
+    if row.full_path.starts_with("__live_") {
+        return None;
+    }
+    if row.full_path == "local" {
+        return std::env::var_os("HOME").map(|path| path.to_string_lossy().into_owned());
+    }
+    Some(row.full_path.clone())
+}
+
+fn group_session_title_hint(row: &BrowserRow, kind: SessionKind) -> String {
+    let suffix = match kind {
+        SessionKind::Codex => "codex",
+        SessionKind::CodexLiteLlm => "codex-litellm",
+        SessionKind::Shell => "shell",
+        SessionKind::SshShell => "ssh",
+        SessionKind::Document => "document",
+    };
+    format!("{} {}", row.label, suffix)
 }
 
 fn document_parent_base(row: &BrowserRow) -> Option<String> {
@@ -1919,6 +2037,22 @@ fn app() -> Element {
                         row: row.clone(),
                         palette: snapshot.palette,
                         on_close: move |_| state.with_mut(|shell| shell.close_context_menu()),
+                        on_create_group_codex: {
+                            let row = row.clone();
+                            move |_| spawn_start_group_session(state, row.clone(), SessionKind::Codex)
+                        },
+                        on_create_group_codex_litellm: {
+                            let row = row.clone();
+                            move |_| spawn_start_group_session(state, row.clone(), SessionKind::CodexLiteLlm)
+                        },
+                        on_create_group_shell: {
+                            let row = row.clone();
+                            move |_| spawn_start_group_session(state, row.clone(), SessionKind::Shell)
+                        },
+                        on_create_group_document: {
+                            let row = row.clone();
+                            move |_| queue_new_document_for_row(state, row.clone())
+                        },
                         on_create_note: {
                             let row = row.clone();
                             move |_| {
@@ -4000,6 +4134,10 @@ fn ContextMenuOverlay(
     row: BrowserRow,
     palette: Palette,
     on_close: EventHandler<MouseEvent>,
+    on_create_group_codex: EventHandler<MouseEvent>,
+    on_create_group_codex_litellm: EventHandler<MouseEvent>,
+    on_create_group_shell: EventHandler<MouseEvent>,
+    on_create_group_document: EventHandler<MouseEvent>,
     on_create_note: EventHandler<MouseEvent>,
     on_create_recipe: EventHandler<MouseEvent>,
     on_regenerate: EventHandler<MouseEvent>,
@@ -4019,7 +4157,44 @@ fn ContextMenuOverlay(
                     style: format!("padding:4px 8px 8px 8px; font-size:11px; font-weight:700; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.muted),
                     "{row.label}"
                 }
-                if row.kind == BrowserRowKind::Session {
+                if row.kind == BrowserRowKind::Group && !row.full_path.starts_with("__live_") {
+                    button {
+                        style: format!(
+                            "width:100%; height:30px; border:none; border-radius:10px; background:{}; color:{}; \
+                             font-size:12px; font-weight:600; text-align:left; padding:0 10px; margin-bottom:6px;",
+                            palette.panel_alt, palette.text
+                        ),
+                        onclick: move |evt| on_create_group_codex.call(evt),
+                        "New Codex Session"
+                    }
+                    button {
+                        style: format!(
+                            "width:100%; height:30px; border:none; border-radius:10px; background:{}; color:{}; \
+                             font-size:12px; font-weight:600; text-align:left; padding:0 10px; margin-bottom:6px;",
+                            palette.panel_alt, palette.text
+                        ),
+                        onclick: move |evt| on_create_group_codex_litellm.call(evt),
+                        "New Codex LiteLLM"
+                    }
+                    button {
+                        style: format!(
+                            "width:100%; height:30px; border:none; border-radius:10px; background:{}; color:{}; \
+                             font-size:12px; font-weight:600; text-align:left; padding:0 10px; margin-bottom:6px;",
+                            palette.panel_alt, palette.text
+                        ),
+                        onclick: move |evt| on_create_group_shell.call(evt),
+                        "New Shell Session"
+                    }
+                    button {
+                        style: format!(
+                            "width:100%; height:30px; border:none; border-radius:10px; background:{}; color:{}; \
+                             font-size:12px; font-weight:600; text-align:left; padding:0 10px;",
+                            palette.accent_soft, palette.text
+                        ),
+                        onclick: move |evt| on_create_group_document.call(evt),
+                        "New Document"
+                    }
+                } else if row.kind == BrowserRowKind::Session {
                     button {
                         style: format!(
                             "width:100%; height:30px; border:none; border-radius:10px; background:{}; color:{}; \
@@ -4039,14 +4214,16 @@ fn ContextMenuOverlay(
                         "Create Recipe"
                     }
                 }
-                button {
-                    style: format!(
-                        "width:100%; height:30px; border:none; border-radius:10px; background:{}; color:{}; \
-                         font-size:12px; font-weight:600; text-align:left; padding:0 10px;",
-                        palette.accent_soft, palette.text
-                    ),
-                    onclick: move |evt| on_regenerate.call(evt),
-                    "Regenerate Title"
+                if row.kind == BrowserRowKind::Session {
+                    button {
+                        style: format!(
+                            "width:100%; height:30px; border:none; border-radius:10px; background:{}; color:{}; \
+                             font-size:12px; font-weight:600; text-align:left; padding:0 10px;",
+                            palette.accent_soft, palette.text
+                        ),
+                        onclick: move |evt| on_regenerate.call(evt),
+                        "Regenerate Title"
+                    }
                 }
             }
         }
