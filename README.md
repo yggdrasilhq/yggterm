@@ -152,7 +152,8 @@ Inside the desktop shell:
 
 - notes open in preview mode for editing
 - recipes can store replay commands and source cwd metadata
-- `Run Recipe` saves the editor state and opens that same item in terminal mode through the daemon runtime
+- `Run Here` saves the recipe and reuses the current document-backed terminal view
+- `Run In New Session` saves the recipe and starts a fresh daemon-owned shell session from the recipe cwd and replay commands
 
 That is the beginning of a bigger idea: a workspace can hold the terminal, the explanation, and the repeatable command flow together.
 

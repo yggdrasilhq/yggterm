@@ -30,7 +30,7 @@ use yggterm_server::{
     GhosttyTerminalHostMode, WorkspaceViewMode, YggtermServer, connect_ssh, focus_live,
     open_stored_session, request_terminal_launch,
     set_all_preview_blocks_folded, set_view_mode as daemon_set_view_mode, status,
-    snapshot as daemon_snapshot, ping, start_local_session, start_local_session_at,
+    snapshot as daemon_snapshot, ping, start_command_session, start_local_session, start_local_session_at,
     terminal_ensure, terminal_read,
     terminal_resize, terminal_write,
     toggle_preview_block as daemon_toggle_preview_block,
@@ -1329,11 +1329,18 @@ fn queue_new_document_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
     });
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterSaveAction {
+    SaveOnly,
+    RunHere,
+    RunNewSession,
+}
+
 fn queue_document_save(
     mut state: Signal<ShellState>,
     virtual_path: String,
     input: WorkspaceDocumentInput,
-    run_after_save: bool,
+    after_save: AfterSaveAction,
 ) {
     state.with_mut(|shell| {
         shell.server_busy = true;
@@ -1353,7 +1360,8 @@ fn queue_document_save(
         })
         .await;
 
-        let mut should_run = false;
+        let mut should_run_here = false;
+        let mut run_new_session: Option<(Option<String>, String, String, String)> = None;
         state.with_mut(|shell| match outcome {
             Ok(Ok((document, browser_tree))) => {
                 let expanded_paths = shell.browser.expanded_paths();
@@ -1377,9 +1385,19 @@ fn queue_document_save(
                     "Document Saved",
                     format!("Updated {}.", document.title),
                 );
-                if run_after_save {
+                if matches!(after_save, AfterSaveAction::RunHere) {
                     shell.last_action = format!("running {}", document.title);
-                    should_run = true;
+                    should_run_here = true;
+                } else if matches!(after_save, AfterSaveAction::RunNewSession) {
+                    if !document.replay_commands.is_empty() {
+                        run_new_session = Some((
+                            document.source_session_cwd.clone(),
+                            format!("{} session", document.title),
+                            document.replay_commands.join("\n"),
+                            document.title.clone(),
+                        ));
+                        shell.last_action = format!("starting {}", document.title);
+                    }
                 }
             }
             Ok(Err(error)) => {
@@ -1402,8 +1420,26 @@ fn queue_document_save(
             }
         });
 
-        if should_run {
+        if should_run_here {
             spawn_set_view_mode(state, WorkspaceViewMode::Terminal);
+        } else if let Some((cwd, title, launch_command, source_title)) = run_new_session {
+            state.with_mut(|shell| {
+                shell.server_busy = true;
+                shell.last_action = format!("starting {}", source_title);
+            });
+            spawn_server_snapshot_action(
+                state,
+                format!("starting {title}"),
+                move |endpoint| {
+                    start_command_session(
+                        &endpoint,
+                        cwd.as_deref(),
+                        Some(&title),
+                        &launch_command,
+                        Some(&source_title),
+                    )
+                },
+            );
         }
     });
 }
@@ -1999,10 +2035,19 @@ fn app() -> Element {
                         },
                         on_set_preview_layout: move |mode: PreviewLayoutMode| state.with_mut(|shell| shell.set_preview_layout(mode)),
                         on_save_document: move |(path, input): (String, WorkspaceDocumentInput)| {
-                            queue_document_save(state, path, input, false)
+                            queue_document_save(state, path, input, AfterSaveAction::SaveOnly)
                         },
-                        on_run_recipe_document: move |(path, input): (String, WorkspaceDocumentInput)| {
-                            queue_document_save(state, path, input, true)
+                        on_run_recipe_document: move |(path, input, run_new_session): (String, WorkspaceDocumentInput, bool)| {
+                            queue_document_save(
+                                state,
+                                path,
+                                input,
+                                if run_new_session {
+                                    AfterSaveAction::RunNewSession
+                                } else {
+                                    AfterSaveAction::RunHere
+                                },
+                            )
                         },
                     }
                     RightRail {
@@ -2872,7 +2917,7 @@ fn MainSurface(
     on_toggle_preview_block: EventHandler<usize>,
     on_set_preview_layout: EventHandler<PreviewLayoutMode>,
     on_save_document: EventHandler<(String, WorkspaceDocumentInput)>,
-    on_run_recipe_document: EventHandler<(String, WorkspaceDocumentInput)>,
+    on_run_recipe_document: EventHandler<(String, WorkspaceDocumentInput, bool)>,
 ) -> Element {
     let body = if let Some(session) = snapshot.active_session.clone() {
         match snapshot.active_view_mode {
@@ -3039,7 +3084,7 @@ fn DocumentEditor(
     palette: Palette,
     server_busy: bool,
     on_save: EventHandler<(String, WorkspaceDocumentInput)>,
-    on_run_recipe_document: EventHandler<(String, WorkspaceDocumentInput)>,
+    on_run_recipe_document: EventHandler<(String, WorkspaceDocumentInput, bool)>,
 ) -> Element {
     let mut title = use_signal(|| session.title.clone());
     let initial_body = session
@@ -3113,9 +3158,34 @@ fn DocumentEditor(
                                         &source_session_cwd,
                                         replay(),
                                     ),
+                                    false,
                                 ))
                             },
-                            "Run Recipe"
+                            "Run Here"
+                        }
+                        button {
+                            style: chip_style(palette, server_busy),
+                            onclick: {
+                                let storage_path = storage_path.clone();
+                                let document_kind = document_kind.clone();
+                                let source_session_path = source_session_path.clone();
+                                let source_session_kind = source_session_kind.clone();
+                                let source_session_cwd = source_session_cwd.clone();
+                                move |_| on_run_recipe_document.call((
+                                    storage_path.clone(),
+                                    build_document_input(
+                                        &document_kind,
+                                        title(),
+                                        body(),
+                                        &source_session_path,
+                                        &source_session_kind,
+                                        &source_session_cwd,
+                                        replay(),
+                                    ),
+                                    true,
+                                ))
+                            },
+                            "Run In New Session"
                         }
                     }
                     button {
