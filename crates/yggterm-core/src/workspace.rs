@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -303,6 +303,38 @@ impl WorkspaceStore {
             )
             .context("workspace group was not readable after save")
     }
+
+    pub fn move_document(&self, from_virtual_path: &str, to_virtual_path: &str) -> Result<WorkspaceDocument> {
+        let from_normalized = normalize_virtual_document_path(from_virtual_path);
+        let to_normalized = normalize_virtual_document_path(to_virtual_path);
+        if from_normalized == to_normalized {
+            return self
+                .get_document(&from_normalized)?
+                .context("workspace document was not readable for move");
+        }
+
+        if self.get_document(&to_normalized)?.is_some() {
+            bail!("destination document path already exists: {to_normalized}");
+        }
+
+        let Some(existing) = self.get_document(&from_normalized)? else {
+            bail!("workspace document not found: {from_normalized}");
+        };
+        let now = OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
+        self.conn.execute(
+            "UPDATE documents
+             SET virtual_path = ?1, updated_at = ?2
+             WHERE virtual_path = ?3",
+            params![to_normalized, now, from_normalized],
+        )?;
+
+        self.get_document(&to_normalized)?
+            .context("workspace document was not readable after move")
+            .map(|mut document| {
+                document.title = existing.title;
+                document
+            })
+    }
 }
 
 fn ensure_optional_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
@@ -402,6 +434,31 @@ mod tests {
         assert_eq!(groups[0].virtual_path, "/projects/alpha/ideas");
         assert_eq!(groups[0].title, "Ideas");
         assert_eq!(group.title, "Ideas");
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn moves_workspace_documents() {
+        let home = temp_home();
+        let store = WorkspaceStore::open(&home).expect("open workspace");
+        store
+            .put_document("/projects/alpha/notes/todo", Some("Todo"), "body")
+            .expect("save document");
+
+        let moved = store
+            .move_document("/projects/alpha/notes/todo", "/projects/beta/notes/todo")
+            .expect("move document");
+
+        assert_eq!(moved.virtual_path, "/projects/beta/notes/todo");
+        assert!(store
+            .get_document("/projects/alpha/notes/todo")
+            .expect("read source")
+            .is_none());
+        assert!(store
+            .get_document("/projects/beta/notes/todo")
+            .expect("read destination")
+            .is_some());
 
         let _ = fs::remove_dir_all(home);
     }

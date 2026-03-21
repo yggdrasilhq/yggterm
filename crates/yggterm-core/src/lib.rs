@@ -194,6 +194,10 @@ impl SessionStore {
         WorkspaceStore::open(&self.home)?.put_group(virtual_path, title)
     }
 
+    pub fn move_document(&self, from_virtual_path: &str, to_virtual_path: &str) -> Result<WorkspaceDocument> {
+        WorkspaceStore::open(&self.home)?.move_document(from_virtual_path, to_virtual_path)
+    }
+
     pub fn save_document(
         &self,
         virtual_path: &str,
