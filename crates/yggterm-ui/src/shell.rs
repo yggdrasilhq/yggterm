@@ -61,6 +61,13 @@ pub struct ShellBootstrap {
     pub ghostty_bridge_detail: String,
     pub server_daemon_detail: String,
     pub prefer_ghostty_backend: bool,
+    pub pending_update_restart: Option<PendingUpdateRestart>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingUpdateRestart {
+    pub version: String,
+    pub executable: PathBuf,
 }
 
 #[derive(Clone)]
@@ -84,6 +91,7 @@ struct ShellState {
     needs_initial_server_sync: bool,
     ssh_connect_target: String,
     ssh_connect_prefix: String,
+    pending_update_restart: Option<PendingUpdateRestart>,
     docked_window_id: Option<String>,
     dock_sync_in_flight: bool,
     last_dock_signature: Option<DockSignature>,
@@ -155,6 +163,7 @@ struct RenderSnapshot {
     server_busy: bool,
     ssh_connect_target: String,
     ssh_connect_prefix: String,
+    pending_update_restart: Option<PendingUpdateRestart>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -221,6 +230,7 @@ enum TerminalJsEvent {
 impl ShellState {
     fn new(bootstrap: ShellBootstrap) -> Self {
         let settings = bootstrap.settings.clone();
+        let pending_update_restart = bootstrap.pending_update_restart.clone();
         let right_panel_mode = if settings.show_settings {
             RightPanelMode::Settings
         } else {
@@ -268,11 +278,20 @@ impl ShellState {
             needs_initial_server_sync,
             ssh_connect_target: String::new(),
             ssh_connect_prefix: String::new(),
+            pending_update_restart,
             docked_window_id: None,
             dock_sync_in_flight: false,
             last_dock_signature: None,
         };
         state.server_daemon_detail = state.bootstrap.server_daemon_detail.clone();
+        if let Some(update) = state.pending_update_restart.clone() {
+            state.last_action = format!("update {} ready", update.version);
+            state.push_notification(
+                NotificationTone::Success,
+                "Update Ready",
+                format!("Yggterm {} was installed. Restarting now…", update.version),
+            );
+        }
         state.sync_browser_settings();
         state
     }
@@ -316,6 +335,7 @@ impl ShellState {
             server_busy: self.server_busy,
             ssh_connect_target: self.ssh_connect_target.clone(),
             ssh_connect_prefix: self.ssh_connect_prefix.clone(),
+            pending_update_restart: self.pending_update_restart.clone(),
         }
     }
 
@@ -2180,6 +2200,7 @@ fn app() -> Element {
     let mut hovered = use_signal(|| None::<HoveredControl>);
     let mut startup_sync_started = use_signal(|| false);
     let mut update_check_started = use_signal(|| false);
+    let mut update_restart_started = use_signal(|| false);
     let mut dock_pulse_started = use_signal(|| false);
     let mut window_epoch = use_signal(|| 0_u64);
     use_effect(move || {
@@ -2224,6 +2245,46 @@ fn app() -> Element {
             update_check_started.set(true);
             spawn_notify_only_update_check(state);
         }
+    });
+    use_effect(move || {
+        if *update_restart_started.read() {
+            return;
+        }
+        let pending = state.read().pending_update_restart.clone();
+        let Some(update) = pending else {
+            return;
+        };
+        update_restart_started.set(true);
+        spawn(async move {
+            sleep(Duration::from_millis(1800)).await;
+            let next_exe = update.executable.clone();
+            let next_version = update.version.clone();
+            let launched = task::spawn_blocking(move || Command::new(&next_exe).spawn()).await;
+            state.with_mut(|shell| match launched {
+                Ok(Ok(_)) => {
+                    shell.last_action = format!("restarting into {}", next_version);
+                    window().close();
+                }
+                Ok(Err(error)) => {
+                    shell.pending_update_restart = None;
+                    shell.last_action = format!("restart failed: {error}");
+                    shell.push_notification(
+                        NotificationTone::Error,
+                        "Update Restart Failed",
+                        error.to_string(),
+                    );
+                }
+                Err(error) => {
+                    shell.pending_update_restart = None;
+                    shell.last_action = format!("restart task failed: {error}");
+                    shell.push_notification(
+                        NotificationTone::Error,
+                        "Update Restart Failed",
+                        error.to_string(),
+                    );
+                }
+            });
+        });
     });
     use_effect(move || {
         if *dock_pulse_started.read() {
@@ -2581,6 +2642,17 @@ fn Titlebar(
                     onmousedown: |evt| evt.stop_propagation(),
                     ondoubleclick: |evt| evt.stop_propagation(),
                     oninput: move |evt| on_search.call(evt.value()),
+                }
+                if let Some(update) = snapshot.pending_update_restart.clone() {
+                    div {
+                        style: format!(
+                            "display:inline-flex; align-items:center; gap:6px; height:28px; padding:0 11px; border-radius:10px; \
+                             background:rgba(255,255,255,0.82); color:{}; font-size:11px; font-weight:700; \
+                             box-shadow: inset 0 0 0 1px rgba(170,190,212,0.24); white-space:nowrap;",
+                            snapshot.palette.accent
+                        ),
+                        "Updating to {update.version}…"
+                    }
                 }
                 div {
                     style: "flex:1; min-width:84px; height:100%;",
