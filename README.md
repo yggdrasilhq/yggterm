@@ -35,6 +35,7 @@ This repository is still scaffolding.
 - Session context menus can now create nearby notes so a workspace can keep a terminal and its scratch document together.
 - Live daemon-owned sessions now appear in the main sidebar tree instead of hiding only inside the connect panel.
 - Documents are editable in the main viewport now, not just previewed as static blocks.
+- The sidebar can start fresh Codex, Codex LiteLLM, shell, and document workflows directly, instead of forcing those flows through a side panel.
 - `yggterm` now opens the Dioxus shell directly.
 - The old CLI subcommands and the `eframe` scaffold path have been removed.
 - The shell chrome is now owned locally in `yggterm-ui`, while the adjacent Zed checkout remains the visual reference stack.
@@ -158,6 +159,8 @@ That flow no longer stops at note creation. Documents can be created directly fr
 The desktop app talks to a long-lived `yggterm server daemon`. That daemon owns the PTYs and session restore state so terminals do not disappear just because the UI switched to preview mode or focused a different item.
 
 When the UI exits, the daemon is asked to shut down gracefully. Codex-flavored sessions receive `/quit`, while plain shells receive `exit`, before the PTY manager escalates to process termination.
+
+For lifecycle work during development, `yggterm server smoke` now boots a temporary daemon home, starts a local shell session, and shuts it back down cleanly.
 
 You can stop the daemon explicitly:
 

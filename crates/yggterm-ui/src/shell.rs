@@ -1572,6 +1572,22 @@ fn app() -> Element {
                     style: "display: flex; flex: 1; min-height: 0; overflow: hidden;",
                     Sidebar {
                         snapshot: sidebar_snapshot,
+                        on_start_codex: move |_| spawn_server_snapshot_action(
+                            state,
+                            "starting codex session".to_string(),
+                            move |endpoint| start_local_session(&endpoint, SessionKind::Codex),
+                        ),
+                        on_start_codex_litellm: move |_| spawn_server_snapshot_action(
+                            state,
+                            "starting codex-litellm session".to_string(),
+                            move |endpoint| start_local_session(&endpoint, SessionKind::CodexLiteLlm),
+                        ),
+                        on_start_shell: move |_| spawn_server_snapshot_action(
+                            state,
+                            "starting local shell".to_string(),
+                            move |endpoint| start_local_session(&endpoint, SessionKind::Shell),
+                        ),
+                        on_create_document: move |_| queue_new_document(state),
                         on_select_row: move |row: BrowserRow| {
                             if is_live_sidebar_row(&row) {
                                 spawn_server_snapshot_action(
@@ -2111,6 +2127,10 @@ fn ResizeHandle(style: String, direction: ResizeDirection) -> Element {
 #[component]
 fn Sidebar(
     snapshot: RenderSnapshot,
+    on_start_codex: EventHandler<MouseEvent>,
+    on_start_codex_litellm: EventHandler<MouseEvent>,
+    on_start_shell: EventHandler<MouseEvent>,
+    on_create_document: EventHandler<MouseEvent>,
     on_select_row: EventHandler<BrowserRow>,
     on_open_context_menu: EventHandler<BrowserRow>,
 ) -> Element {
@@ -2128,7 +2148,30 @@ fn Sidebar(
                 zoom_percent_f32(snapshot.settings.ui_font_size, 14.0)
             ),
             div {
-                style: "flex:1; min-height:0; overflow:auto; padding:14px 12px 12px 12px;",
+                style: "padding:12px 12px 0 12px; display:flex; gap:8px;",
+                SidebarQuickAction {
+                    label: "+Codex".to_string(),
+                    palette: snapshot.palette,
+                    onclick: on_start_codex,
+                }
+                SidebarQuickAction {
+                    label: "+LiteLLM".to_string(),
+                    palette: snapshot.palette,
+                    onclick: on_start_codex_litellm,
+                }
+                SidebarQuickAction {
+                    label: "+Shell".to_string(),
+                    palette: snapshot.palette,
+                    onclick: on_start_shell,
+                }
+                SidebarQuickAction {
+                    label: "+Doc".to_string(),
+                    palette: snapshot.palette,
+                    onclick: on_create_document,
+                }
+            }
+            div {
+                style: "flex:1; min-height:0; overflow:auto; padding:12px 12px 12px 12px;",
                 for row in snapshot.rows.iter().cloned() {
                     {
                         let select_row = row.clone();
@@ -2230,6 +2273,25 @@ fn SidebarRow(
                     "{row.detail_label}"
                 }
             }
+        }
+    }
+}
+
+#[component]
+fn SidebarQuickAction(
+    label: String,
+    palette: Palette,
+    onclick: EventHandler<MouseEvent>,
+) -> Element {
+    rsx! {
+        button {
+            style: format!(
+                "flex:1; height:28px; border:none; border-radius:10px; background:{}; color:{}; \
+                 font-size:11px; font-weight:700; white-space:nowrap;",
+                palette.panel_alt, palette.text
+            ),
+            onclick: move |evt| onclick.call(evt),
+            "{label}"
         }
     }
 }
