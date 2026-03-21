@@ -118,6 +118,7 @@ Examples of what you can do:
 - right-click a folder or group and create a new Codex session there
 - right-click a folder or group and create a local shell in that context
 - right-click a folder or group and create a nearby document
+- right-click a folder or group and create a nearby recipe
 - right-click a stored session and create a note beside it
 - right-click a stored session and create a recipe derived from it
 - regenerate generated titles for a session when needed
