@@ -23,6 +23,7 @@ pub struct WorkspaceDocument {
     pub body: String,
     pub source_session_path: Option<String>,
     pub source_session_kind: Option<String>,
+    pub source_session_cwd: Option<String>,
     pub replay_commands: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -44,6 +45,7 @@ pub struct WorkspaceDocumentInput {
     pub body: String,
     pub source_session_path: Option<String>,
     pub source_session_kind: Option<String>,
+    pub source_session_cwd: Option<String>,
     pub replay_commands: Vec<String>,
 }
 
@@ -65,6 +67,7 @@ impl WorkspaceStore {
                 body TEXT NOT NULL,
                 source_session_path TEXT,
                 source_session_kind TEXT,
+                source_session_cwd TEXT,
                 replay_commands TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -80,6 +83,7 @@ impl WorkspaceStore {
         )?;
         ensure_optional_column(&conn, "documents", "source_session_path", "TEXT")?;
         ensure_optional_column(&conn, "documents", "source_session_kind", "TEXT")?;
+        ensure_optional_column(&conn, "documents", "source_session_cwd", "TEXT")?;
         ensure_optional_column(&conn, "documents", "replay_commands", "TEXT")?;
         Ok(Self { conn })
     }
@@ -107,7 +111,7 @@ impl WorkspaceStore {
         let normalized = normalize_virtual_document_path(virtual_path);
         self.conn
             .query_row(
-                "SELECT id, virtual_path, title, kind, body, source_session_path, source_session_kind, replay_commands, created_at, updated_at
+                "SELECT id, virtual_path, title, kind, body, source_session_path, source_session_kind, source_session_cwd, replay_commands, created_at, updated_at
                  FROM documents
                  WHERE virtual_path = ?1",
                 params![normalized],
@@ -120,13 +124,14 @@ impl WorkspaceStore {
                         body: row.get(4)?,
                         source_session_path: row.get(5)?,
                         source_session_kind: row.get(6)?,
+                        source_session_cwd: row.get(7)?,
                         replay_commands: row
-                            .get::<_, Option<String>>(7)?
+                            .get::<_, Option<String>>(8)?
                             .as_deref()
                             .map(parse_replay_commands)
                             .unwrap_or_default(),
-                        created_at: row.get(8)?,
-                        updated_at: row.get(9)?,
+                        created_at: row.get(9)?,
+                        updated_at: row.get(10)?,
                     })
                 },
             )
@@ -180,14 +185,15 @@ impl WorkspaceStore {
         };
 
         self.conn.execute(
-            "INSERT INTO documents (id, virtual_path, title, kind, body, source_session_path, source_session_kind, replay_commands, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "INSERT INTO documents (id, virtual_path, title, kind, body, source_session_path, source_session_kind, source_session_cwd, replay_commands, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(virtual_path) DO UPDATE SET
                title = excluded.title,
                kind = excluded.kind,
                body = excluded.body,
                source_session_path = excluded.source_session_path,
                source_session_kind = excluded.source_session_kind,
+               source_session_cwd = excluded.source_session_cwd,
                replay_commands = excluded.replay_commands,
                updated_at = excluded.updated_at",
             params![
@@ -198,6 +204,7 @@ impl WorkspaceStore {
                 input.body,
                 input.source_session_path,
                 input.source_session_kind,
+                input.source_session_cwd,
                 replay_commands,
                 created_at,
                 now
