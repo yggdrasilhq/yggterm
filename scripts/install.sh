@@ -5,7 +5,7 @@ set -eu
 (set -o pipefail) >/dev/null 2>&1 && set -o pipefail
 
 REPO="${YGGTERM_REPO:-yggdrasilhq/yggterm}"
-API_URL="https://api.github.com/repos/${REPO}/releases/latest"
+LATEST_URL="https://github.com/${REPO}/releases/latest"
 TMP_DIR="$(mktemp -d)"
 
 log() {
@@ -31,6 +31,7 @@ need_cmd() {
 need_cmd curl
 need_cmd tar
 need_cmd uname
+need_cmd sed
 
 os="$(uname -s)"
 arch="$(uname -m)"
@@ -66,31 +67,40 @@ case "${os}:${arch}" in
 esac
 
 log "checking latest release for ${target_label}"
-release_json="$(curl -fsSL "${API_URL}")"
-release_version="$(
-  printf '%s' "${release_json}" \
-    | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\([^"]*\)".*/\1/p' \
-    | head -n1
-)"
+latest_effective_url="$(curl -fsSL -o /dev/null -w '%{url_effective}' "${LATEST_URL}")"
+release_tag="$(printf '%s\n' "${latest_effective_url}" | sed -n 's#.*/tag/\(v[^/?#]*\).*#\1#p' | tail -n1)"
+release_version="$(printf '%s' "${release_tag}" | sed 's/^v//')"
+archive_url="https://github.com/${REPO}/releases/download/${release_tag}/yggterm-${target_label}.tar.gz"
+checksum_url="${archive_url}.sha256"
 
-asset_url() {
-  pattern="$1"
-  printf '%s' "${release_json}" \
-    | sed 's/\\\\\//\//g' \
-    | sed -n "s/.*\"browser_download_url\"[[:space:]]*:[[:space:]]*\"\\([^\"]*${pattern}[^\"]*\\)\".*/\\1/p" \
-    | head -n1
-}
+[ -n "${release_tag}" ] || fail "failed to resolve latest release tag from ${LATEST_URL}"
+[ -n "${release_version}" ] || fail "failed to resolve latest release version from ${release_tag}"
 
-archive_url="$(asset_url "yggterm-${target_label}\\.tar\\.gz")"
-checksum_url="$(asset_url "yggterm-${target_label}\\.tar\\.gz\\.sha256")"
+current_version=""
+state_path="${install_root}/install-state.json"
+if [ -f "${state_path}" ]; then
+  current_version="$(
+    sed -n 's/.*"active_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${state_path}" | head -n1
+  )"
+fi
 
-if [ -z "${release_version}" ] || [ -z "${archive_url}" ]; then
-  log "failed to locate a compatible release asset for ${target_label}"
-  log "available release assets:"
-  printf '%s' "${release_json}" \
-    | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/  - \1/p' \
-    | sed -n '/^  - yggterm/p' >&2
-  exit 1
+if [ -n "${current_version}" ] && [ "${current_version}" = "${release_version}" ]; then
+  log "yggterm ${release_version} is already installed"
+  current_binary="$(
+    sed -n 's/.*"active_executable"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${state_path}" | head -n1
+  )"
+  if [ -n "${current_binary}" ] && [ -x "${current_binary}" ]; then
+    log "refreshing desktop integration"
+    "${current_binary}" install integrate >/dev/null 2>&1 || true
+    log "binary: ${current_binary}"
+  fi
+  exit 0
+fi
+
+if [ -n "${current_version}" ]; then
+  log "updating yggterm ${current_version} -> ${release_version}"
+else
+  log "installing yggterm ${release_version}"
 fi
 
 archive_path="${TMP_DIR}/yggterm.tar.gz"
@@ -150,6 +160,7 @@ log "refreshing desktop integration"
 
 log "installed yggterm ${release_version}"
 log "binary: ${installed_binary}"
+log "rerun this same install command any time to update manually"
 case ":${PATH:-}:" in
   *":${bin_dir}:"*) ;;
   *)
