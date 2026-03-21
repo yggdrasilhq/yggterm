@@ -52,7 +52,7 @@ Section: utils
 Priority: optional
 Architecture: ${ARCH}
 Depends: ${DEPENDS_LINE}
-Maintainer: Yggdrasil HQ <opensource@yggdrasilhq.invalid>
+Maintainer: Yggdrasil HQ <avi@gour.top>
 Homepage: https://github.com/yggdrasilhq/yggterm
 Installed-Size: ${INSTALLED_SIZE}
 Description: Yggdrasil Terminal

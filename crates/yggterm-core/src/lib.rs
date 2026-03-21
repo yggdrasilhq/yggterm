@@ -1,4 +1,5 @@
 mod browser;
+mod install;
 mod transcript;
 mod titles;
 mod workspace;
@@ -14,6 +15,12 @@ use std::path::{Path, PathBuf};
 use titles::{SessionTitleResolver, settings_ready as litellm_settings_ready};
 
 pub use browser::{BrowserMetrics, BrowserRow, BrowserRowKind, SessionBrowserState};
+pub use install::{
+    InstallChannel, InstallContext, ReleaseUpdate, UpdatePolicy, check_for_update,
+    current_asset_label, current_version, detect_install_context, direct_install_root,
+    install_mode_summary, install_release_update, refresh_desktop_integration,
+    update_command_hint, write_direct_install_state,
+};
 pub use transcript::{TranscriptMessage, TranscriptRole, message_lines_from_payload, read_codex_transcript_messages};
 pub use workspace::{
     WorkspaceDocument, WorkspaceDocumentInput, WorkspaceDocumentKind, WorkspaceDocumentSummary,

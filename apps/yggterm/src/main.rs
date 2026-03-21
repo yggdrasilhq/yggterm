@@ -3,7 +3,11 @@ use std::fs;
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::Duration;
-use yggterm_core::{ENV_YGGTERM_HOME, SessionStore};
+use tracing::warn;
+use yggterm_core::{
+    ENV_YGGTERM_HOME, InstallContext, SessionStore, UpdatePolicy, check_for_update,
+    detect_install_context, install_release_update, refresh_desktop_integration,
+};
 use yggterm_server::{
     SessionKind, default_endpoint, detect_ghostty_host, ping, run_attach, run_daemon, shutdown,
     start_local_session, status,
@@ -17,8 +21,11 @@ fn main() -> Result<()> {
         .init();
 
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let current_exe = std::env::current_exe()?;
+    let install_context = detect_install_context(&current_exe)?;
     let store = SessionStore::open_or_init()?;
     if args.as_slice() == ["server", "daemon"] {
+        let _ = refresh_desktop_integration(&install_context);
         let endpoint = default_endpoint(store.home_dir());
         let host = detect_ghostty_host();
         return run_daemon(&endpoint, host);
@@ -37,9 +44,35 @@ fn main() -> Result<()> {
         return run_server_smoke();
     }
     if let Some(command) = args.first()
+        && command == "install"
+    {
+        return run_install_cli(&install_context);
+    }
+    if let Some(command) = args.first()
         && command == "doc"
     {
         return run_document_cli(&store, &args[1..]);
+    }
+
+    if args.is_empty() {
+        if let Err(error) = refresh_desktop_integration(&install_context) {
+            warn!(error=%error, "failed to refresh desktop integration");
+        }
+        if install_context.update_policy == UpdatePolicy::Auto
+            && std::env::var_os("YGGTERM_SKIP_SELF_UPDATE").is_none()
+        {
+            match check_for_update(&install_context) {
+                Ok(Some(update)) => match install_release_update(&install_context, &update) {
+                    Ok(next_exe) => {
+                        Command::new(&next_exe).spawn()?;
+                        return Ok(());
+                    }
+                    Err(error) => warn!(error=%error, "failed to install direct update"),
+                },
+                Ok(None) => {}
+                Err(error) => warn!(error=%error, "failed to check for update"),
+            }
+        }
     }
 
     let tree = store.load_tree()?;
@@ -66,6 +99,7 @@ fn main() -> Result<()> {
         tree,
         browser_tree,
         settings,
+        install_context,
         settings_path,
         server_endpoint: endpoint.clone(),
         initial_server_snapshot: None,
@@ -84,6 +118,41 @@ fn main() -> Result<()> {
     });
     let _ = shutdown(&endpoint);
     launch_result
+}
+
+fn run_install_cli(context: &InstallContext) -> Result<()> {
+    let args = std::env::args().skip(2).collect::<Vec<_>>();
+    match args.as_slice() {
+        [command] if command == "integrate" => {
+            for note in refresh_desktop_integration(context)? {
+                println!("{note}");
+            }
+            Ok(())
+        }
+        [command] if command == "state" => {
+            println!("{}", serde_json::to_string_pretty(context)?);
+            Ok(())
+        }
+        [command] if command == "self-update" => {
+            if context.update_policy != UpdatePolicy::Auto {
+                println!("self-update disabled for this install channel");
+                return Ok(());
+            }
+            if let Some(update) = check_for_update(context)? {
+                let next = install_release_update(context, &update)?;
+                println!("installed {} at {}", update.version, next.display());
+            } else {
+                println!("already up to date");
+            }
+            Ok(())
+        }
+        _ => {
+            eprintln!(
+                "usage:\n  yggterm install integrate\n  yggterm install state\n  yggterm install self-update"
+            );
+            Ok(())
+        }
+    }
 }
 
 fn spawn_server_daemon() -> Result<()> {

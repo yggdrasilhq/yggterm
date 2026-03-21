@@ -1,3 +1,11 @@
+yggterm (2.0.1-1) unstable; urgency=medium
+
+  * Replace the npm launcher path with direct GitHub-release installers for Linux, macOS, and Windows.
+  * Add install-channel detection so direct installs self-update on launch while package-manager installs stay notify-only.
+  * Refresh desktop integration on direct launches and extend the release matrix to Linux and Windows ARM builds.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sat, 21 Mar 2026 00:00:00 +0000
+
 yggterm (2.0.0-1) unstable; urgency=medium
 
   * Replace the active terminal path with a yggterm-owned PTY plus embedded xterm.js viewport.
@@ -5,14 +13,14 @@ yggterm (2.0.0-1) unstable; urgency=medium
   * Re-enable Windows release builds alongside Linux and macOS packaging.
   * Align Debian and GitHub release packaging with the default xterm.js build.
 
- -- Yggdrasil HQ <opensource@yggdrasilhq.invalid>  Fri, 20 Mar 2026 00:00:00 +0000
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 20 Mar 2026 00:00:00 +0000
 
 yggterm (1.0.3-1) unstable; urgency=medium
 
   * Build both macOS release assets from the macOS 14 runner.
   * Keep the multi-platform release matrix aligned with npm launcher targets.
 
- -- Yggdrasil HQ <opensource@yggdrasilhq.invalid>  Thu, 19 Mar 2026 00:00:00 +0000
+ -- Yggdrasil HQ <avi@gour.top>  Thu, 19 Mar 2026 00:00:00 +0000
 
 yggterm (1.0.2-1) unstable; urgency=medium
 
@@ -20,7 +28,7 @@ yggterm (1.0.2-1) unstable; urgency=medium
   * Add a platform-aware npm launcher for GitHub release downloads.
   * Keep Linux-specific Ghostty FFI and Debian packaging as release extras.
 
- -- Yggdrasil HQ <opensource@yggdrasilhq.invalid>  Thu, 19 Mar 2026 00:00:00 +0000
+ -- Yggdrasil HQ <avi@gour.top>  Thu, 19 Mar 2026 00:00:00 +0000
 
 yggterm (1.0.1-1) unstable; urgency=medium
 
@@ -28,7 +36,7 @@ yggterm (1.0.1-1) unstable; urgency=medium
   * Improve shell notifications and metadata rail legibility.
   * Recover session titles from reasoning-only LiteLLM model responses.
 
- -- Yggdrasil HQ <opensource@yggdrasilhq.invalid>  Thu, 19 Mar 2026 00:00:00 +0000
+ -- Yggdrasil HQ <avi@gour.top>  Thu, 19 Mar 2026 00:00:00 +0000
 
 yggterm (1.0.0-1) unstable; urgency=medium
 
@@ -36,7 +44,7 @@ yggterm (1.0.0-1) unstable; urgency=medium
   * Polish the translucent workspace chrome and centered main canvas.
   * Prepare npm-based binary launch via the GitHub release assets.
 
- -- Yggdrasil HQ <opensource@yggdrasilhq.invalid>  Wed, 18 Mar 2026 00:00:00 +0000
+ -- Yggdrasil HQ <avi@gour.top>  Wed, 18 Mar 2026 00:00:00 +0000
 
 yggterm (0.1.5-1) unstable; urgency=medium
 
@@ -44,7 +52,7 @@ yggterm (0.1.5-1) unstable; urgency=medium
   * Make yggterm-ui the owned GPUI shell crate for chrome and workspace rendering.
   * Keep release workflow, packaging, and licensing aligned with the Apache-only crate layout.
 
- -- Yggdrasil HQ <opensource@yggdrasilhq.invalid>  Wed, 18 Mar 2026 00:00:00 +0000
+ -- Yggdrasil HQ <avi@gour.top>  Wed, 18 Mar 2026 00:00:00 +0000
 
 yggterm (0.1.4-1) unstable; urgency=medium
 
@@ -52,13 +60,13 @@ yggterm (0.1.4-1) unstable; urgency=medium
   * Improve top-level window dragging and resize interactions.
   * Add draggable mock pane splitters for the inspector and bottom dock.
 
- -- Yggdrasil HQ <opensource@yggdrasilhq.invalid>  Tue, 17 Mar 2026 00:00:00 +0000
+ -- Yggdrasil HQ <avi@gour.top>  Tue, 17 Mar 2026 00:00:00 +0000
 
 yggterm (0.1.3-1) unstable; urgency=medium
 
   * Fix Ghostty doctor output to avoid leaking stale build-time header paths.
 
- -- Yggdrasil HQ <opensource@yggdrasilhq.invalid>  Sat, 14 Mar 2026 00:00:00 +0000
+ -- Yggdrasil HQ <avi@gour.top>  Sat, 14 Mar 2026 00:00:00 +0000
 
 yggterm (0.1.2-1) unstable; urgency=medium
 
@@ -66,17 +74,17 @@ yggterm (0.1.2-1) unstable; urgency=medium
   * Add GitHub release installer script and public-facing documentation.
   * Normalize release packaging around GitHub org remote.
 
- -- Yggdrasil HQ <opensource@yggdrasilhq.invalid>  Sat, 14 Mar 2026 00:00:00 +0000
+ -- Yggdrasil HQ <avi@gour.top>  Sat, 14 Mar 2026 00:00:00 +0000
 
 yggterm (0.1.1-1) unstable; urgency=medium
 
   * Improve GUI chrome and settings UX.
   * Package deb with ghostty-ffi runtime wrapper and bundled libghostty.so.
 
- -- Yggdrasil HQ <opensource@yggdrasilhq.invalid>  Wed, 25 Feb 2026 00:00:00 +0000
+ -- Yggdrasil HQ <avi@gour.top>  Wed, 25 Feb 2026 00:00:00 +0000
 
 yggterm (0.1.0-1) unstable; urgency=medium
 
   * Initial package.
 
- -- Yggdrasil HQ <opensource@yggdrasilhq.invalid>  Wed, 25 Feb 2026 00:00:00 +0000
+ -- Yggdrasil HQ <avi@gour.top>  Wed, 25 Feb 2026 00:00:00 +0000

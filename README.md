@@ -41,6 +41,8 @@ This repository is still scaffolding.
 - The old CLI subcommands and the `eframe` scaffold path have been removed.
 - The shell chrome is now owned locally in `yggterm-ui`, while the adjacent Zed checkout remains the visual reference stack.
 - Ghostty bridge code still exists as optional legacy integration work, but it is no longer part of the default release path.
+- Direct GitHub-release installs now own the fast update path instead of npm.
+- The app now detects direct installs versus package-manager installs and only self-updates when it owns the install root.
 
 When working in this repo, optimize for getting the application closer to "Zed-shaped chrome + server-owned sessions + virtual session tree", not for deepening temporary scaffolding choices.
 
@@ -78,6 +80,35 @@ References to keep in mind while iterating:
 - local Zed checkout: `../zed`
 - Codex session UI reference: `~/gh/codex-session-tui`
 
+## Install
+
+During this fast iteration period, the primary install path is a direct GitHub-release install. It pulls the latest matching artifact for your OS and architecture, installs it into a managed user-space root, and lets the app self-update on launch.
+
+Linux and macOS:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/yggdrasilhq/yggterm/main/scripts/install.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/yggdrasilhq/yggterm/main/scripts/install.ps1 | iex
+```
+
+What direct install does today:
+
+- downloads the latest GitHub release artifact for your platform and architecture
+- installs Yggterm into a managed direct-install root
+- refreshes desktop integration on launch
+- self-updates on launch when a newer GitHub release is available
+
+Package-managed installs are intentionally different:
+
+- `.deb`, Homebrew, Winget, Scoop, Flatpak, and Snap installs do not self-mutate
+- Yggterm detects those install channels and switches to notify-only update behavior
+- update notifications tell you to use the matching package manager instead
+
 ## Usage
 
 Launch the current desktop shell:
@@ -112,19 +143,6 @@ Run locally:
 ```bash
 cargo +1.94.0 run
 ```
-
-Run via npm:
-
-```bash
-npx -y yggterm
-```
-
-The npm launcher currently supports:
-
-- Linux `x86_64`
-- macOS `x86_64`
-- macOS `aarch64`
-- Windows `x86_64`
 
 ## Documents from the CLI
 
@@ -191,9 +209,11 @@ This produces:
 Cross-platform release assets are produced by GitHub Actions on tag pushes:
 
 - `linux-x86_64`
+- `linux-aarch64`
 - `macos-x86_64`
 - `macos-aarch64`
 - `windows-x86_64`
+- `windows-aarch64`
 - Debian `.deb` package for Linux
 
 Build only the Debian package:
@@ -202,21 +222,14 @@ Build only the Debian package:
 ./scripts/package-deb.sh
 ```
 
-## npm publishing
+## Update behavior
 
-The npm launcher package lives under [`npm/`](./npm) and is published by GitHub Actions from:
+Yggterm now has two distinct update modes:
 
-- [npm-publish.yml](/home/pi/gh/yggterm/.github/workflows/npm-publish.yml)
+- direct install: checks GitHub Releases on launch and installs the newest matching artifact before the UI opens
+- package-managed install: checks for newer releases in notify-only mode and tells you to update with your package manager
 
-That workflow publishes on version tag pushes and can also be run manually. It is designed for npm trusted publishing rather than a long-lived `NPM_TOKEN`.
-
-For npm trusted publisher setup on npmjs.com, use:
-
-- Organization or user: `yggdrasilhq`
-- Repository: `yggterm`
-- Workflow filename: `npm-publish.yml`
-
-Only the filename is entered on npmjs.com, not the full path.
+This split matters because it keeps the fast-moving direct channel frictionless without trampling native package-manager ownership when Yggterm is installed through `.deb`, Homebrew, Winget, Scoop, Flatpak, or Snap.
 
 ## Repository layout
 
@@ -226,7 +239,7 @@ Only the filename is entered on npmjs.com, not the full path.
 - `crates/yggterm-ui`: Dioxus desktop shell, titlebar, statusbar, and view rendering
 - `crates/yggterm-platform`: platform detection
 - `crates/yggterm-ghostty-bridge`: optional legacy Ghostty runtime bridge
-- `scripts/`: packaging, installer, and toolchain helpers
+- `scripts/`: packaging, direct installer, and toolchain helpers
 - `debian/`: Debian package metadata
 
 ## License
