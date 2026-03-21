@@ -1,4 +1,6 @@
 #!/usr/bin/env sh
+# Keep this script POSIX-sh compatible because the documented install flow is:
+# curl -fsSL .../install.sh | sh
 set -eu
 (set -o pipefail) >/dev/null 2>&1 && set -o pipefail
 
