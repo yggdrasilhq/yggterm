@@ -56,6 +56,12 @@ pub enum ServerRequest {
         cwd: Option<String>,
         title_hint: Option<String>,
     },
+    StartCommandSession {
+        cwd: Option<String>,
+        title_hint: Option<String>,
+        launch_command: String,
+        source_label: Option<String>,
+    },
     FocusLive {
         key: String,
     },
@@ -234,6 +240,21 @@ impl DaemonRuntime {
                 let key = self
                     .server
                     .start_local_session(session_kind, cwd.as_deref(), title_hint.as_deref());
+                self.persist()?;
+                self.snapshot_response(Some(format!("started {key}")))
+            }
+            ServerRequest::StartCommandSession {
+                cwd,
+                title_hint,
+                launch_command,
+                source_label,
+            } => {
+                let key = self.server.start_command_session(
+                    cwd.as_deref(),
+                    title_hint.as_deref(),
+                    &launch_command,
+                    source_label.as_deref(),
+                );
                 self.persist()?;
                 self.snapshot_response(Some(format!("started {key}")))
             }
@@ -432,6 +453,24 @@ pub fn start_local_session_at(
             session_kind: kind,
             cwd: cwd.map(ToOwned::to_owned),
             title_hint: title_hint.map(ToOwned::to_owned),
+        },
+    )?)
+}
+
+pub fn start_command_session(
+    endpoint: &ServerEndpoint,
+    cwd: Option<&str>,
+    title_hint: Option<&str>,
+    launch_command: &str,
+    source_label: Option<&str>,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
+    expect_snapshot(send_request(
+        endpoint,
+        &ServerRequest::StartCommandSession {
+            cwd: cwd.map(ToOwned::to_owned),
+            title_hint: title_hint.map(ToOwned::to_owned),
+            launch_command: launch_command.to_string(),
+            source_label: source_label.map(ToOwned::to_owned),
         },
     )?)
 }
