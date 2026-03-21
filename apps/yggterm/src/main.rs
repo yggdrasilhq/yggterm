@@ -1,9 +1,12 @@
 use anyhow::Result;
+use std::fs;
 use std::io::Read;
 use std::process::{Command, Stdio};
-use yggterm_core::SessionStore;
+use std::time::Duration;
+use yggterm_core::{ENV_YGGTERM_HOME, SessionStore};
 use yggterm_server::{
-    default_endpoint, detect_ghostty_host, ping, run_attach, run_daemon, shutdown, status,
+    SessionKind, default_endpoint, detect_ghostty_host, ping, run_attach, run_daemon, shutdown,
+    start_local_session, status,
 };
 
 fn main() -> Result<()> {
@@ -29,6 +32,9 @@ fn main() -> Result<()> {
             println!("{message}");
         }
         return Ok(());
+    }
+    if args.as_slice() == ["server", "smoke"] {
+        return run_server_smoke();
     }
     if let Some(command) = args.first()
         && command == "doc"
@@ -127,4 +133,47 @@ fn run_document_cli(store: &SessionStore, args: &[String]) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn run_server_smoke() -> Result<()> {
+    let temp_home = std::env::temp_dir().join(format!(
+        "yggterm-smoke-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs()
+    ));
+    fs::create_dir_all(&temp_home)?;
+    let endpoint = default_endpoint(&temp_home);
+    let current_exe = std::env::current_exe()?;
+    let mut child = Command::new(current_exe)
+        .arg("server")
+        .arg("daemon")
+        .env(ENV_YGGTERM_HOME, &temp_home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let result = (|| -> Result<()> {
+        for _ in 0..40 {
+            if ping(&endpoint).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        ping(&endpoint)?;
+        let runtime = status(&endpoint)?;
+        let _ = start_local_session(&endpoint, SessionKind::Shell)?;
+        if let Some(message) = shutdown(&endpoint)? {
+            println!("{message}");
+        }
+        println!("server {} smoke ok", runtime.server_version);
+        Ok(())
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = fs::remove_dir_all(&temp_home);
+    result
 }
