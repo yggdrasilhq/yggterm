@@ -1262,28 +1262,81 @@ fn queue_new_document(mut state: Signal<ShellState>) {
     });
 }
 
-fn queue_new_document_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
+fn queue_new_document_for_row(state: Signal<ShellState>, row: BrowserRow) {
+    queue_new_workspace_document_for_row(
+        state,
+        row,
+        WorkspaceDocumentKind::Note,
+        "Untitled note",
+        "# Untitled note\n\nStart writing here.\n".to_string(),
+        None,
+    );
+}
+
+fn queue_new_recipe_for_row(state: Signal<ShellState>, row: BrowserRow) {
+    let title = if row.kind == BrowserRowKind::Group {
+        format!("{} recipe", row.label)
+    } else {
+        "Untitled recipe".to_string()
+    };
+    let body = format!(
+        "# {title}\n\n```bash\n# commands to replay here\n```\n"
+    );
+    queue_new_workspace_document_for_row(
+        state,
+        row,
+        WorkspaceDocumentKind::TerminalRecipe,
+        &title,
+        body,
+        Some(Vec::new()),
+    );
+}
+
+fn queue_new_workspace_document_for_row(
+    mut state: Signal<ShellState>,
+    row: BrowserRow,
+    kind: WorkspaceDocumentKind,
+    title: &str,
+    body: String,
+    replay_commands: Option<Vec<String>>,
+) {
+    let action_label = match kind {
+        WorkspaceDocumentKind::Note => "document",
+        WorkspaceDocumentKind::TerminalRecipe => "recipe",
+    };
+    let created_label = match kind {
+        WorkspaceDocumentKind::Note => "Document Created",
+        WorkspaceDocumentKind::TerminalRecipe => "Recipe Created",
+    };
+
     state.with_mut(|shell| {
         shell.server_busy = true;
-        shell.last_action = format!("creating document in {}", row.label);
+        shell.last_action = format!("creating {action_label} in {}", row.label);
         shell.close_context_menu();
     });
 
     let settings = state.read().settings.clone();
+    let title = title.to_string();
     spawn(async move {
         let row_for_task = row.clone();
-        let outcome = task::spawn_blocking(move || -> Result<(yggterm_core::WorkspaceDocument, yggterm_core::SessionNode)> {
-            let store = SessionStore::open_or_init()?;
-            let virtual_path = new_document_virtual_path_for_row(&row_for_task);
-            let document = store.save_document(
-                &virtual_path,
-                Some("Untitled note"),
-                "# Untitled note\n\nStart writing here.\n",
-            )?;
-            let browser_tree = store.load_codex_tree(&settings)?;
-            Ok((document, browser_tree))
-        })
-        .await;
+        let outcome =
+            task::spawn_blocking(move || -> Result<(yggterm_core::WorkspaceDocument, yggterm_core::SessionNode)> {
+                let store = SessionStore::open_or_init()?;
+                let virtual_path = new_document_virtual_path_for_row(&row_for_task);
+                let document = store.save_document_input(
+                    &virtual_path,
+                    WorkspaceDocumentInput {
+                        title: Some(title),
+                        kind,
+                        body,
+                        replay_commands: replay_commands.unwrap_or_default(),
+                        ..WorkspaceDocumentInput::default()
+                    },
+                )?;
+                let browser_tree = store.load_codex_tree(&settings)?;
+                Ok((document, browser_tree))
+            })
+            .await;
 
         state.with_mut(|shell| match outcome {
             Ok(Ok((document, browser_tree))) => {
@@ -1303,25 +1356,25 @@ fn queue_new_document_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
                 shell.last_action = format!("created {}", document.title);
                 shell.push_notification(
                     NotificationTone::Success,
-                    "Document Created",
+                    created_label,
                     format!("Opened {}.", document.title),
                 );
             }
             Ok(Err(error)) => {
                 shell.server_busy = false;
-                shell.last_action = format!("document creation failed: {error}");
+                shell.last_action = format!("{action_label} creation failed: {error}");
                 shell.push_notification(
                     NotificationTone::Error,
-                    "Document Creation Failed",
+                    "Workspace Create Failed",
                     error.to_string(),
                 );
             }
             Err(error) => {
                 shell.server_busy = false;
-                shell.last_action = format!("document task failed: {error}");
+                shell.last_action = format!("{action_label} task failed: {error}");
                 shell.push_notification(
                     NotificationTone::Error,
-                    "Document Task Failed",
+                    "Workspace Task Failed",
                     error.to_string(),
                 );
             }
@@ -2171,6 +2224,10 @@ fn app() -> Element {
                         on_create_group_document: {
                             let row = row.clone();
                             move |_| queue_new_document_for_row(state, row.clone())
+                        },
+                        on_create_group_recipe: {
+                            let row = row.clone();
+                            move |_| queue_new_recipe_for_row(state, row.clone())
                         },
                         on_create_note: {
                             let row = row.clone();
@@ -4283,6 +4340,7 @@ fn ContextMenuOverlay(
     on_create_group_codex_litellm: EventHandler<MouseEvent>,
     on_create_group_shell: EventHandler<MouseEvent>,
     on_create_group_document: EventHandler<MouseEvent>,
+    on_create_group_recipe: EventHandler<MouseEvent>,
     on_create_note: EventHandler<MouseEvent>,
     on_create_recipe: EventHandler<MouseEvent>,
     on_regenerate: EventHandler<MouseEvent>,
@@ -4347,6 +4405,15 @@ fn ContextMenuOverlay(
                         ),
                         onclick: move |evt| on_create_group_document.call(evt),
                         "New Document"
+                    }
+                    button {
+                        style: format!(
+                            "width:100%; height:30px; border:none; border-radius:10px; background:{}; color:{}; \
+                             font-size:12px; font-weight:600; text-align:left; padding:0 10px; margin-top:6px;",
+                            palette.panel_alt, palette.text
+                        ),
+                        onclick: move |evt| on_create_group_recipe.call(evt),
+                        "New Recipe"
                     }
                 } else if row.kind == BrowserRowKind::Session {
                     button {
