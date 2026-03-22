@@ -9,7 +9,7 @@ use dioxus::prelude::*;
 use keyboard_types::{Key, Modifiers};
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -94,6 +94,7 @@ struct ShellState {
     selected_tree_paths: HashSet<String>,
     selection_anchor: Option<String>,
     context_menu_row: Option<BrowserRow>,
+    context_menu_position: Option<(f64, f64)>,
     preview_layout: PreviewLayoutMode,
     server_busy: bool,
     server_daemon_detail: String,
@@ -105,6 +106,8 @@ struct ShellState {
     dock_sync_in_flight: bool,
     last_dock_signature: Option<DockSignature>,
     last_terminal_debug: String,
+    generated_precis: BTreeMap<String, String>,
+    precis_requests_in_flight: HashSet<String>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -178,12 +181,14 @@ struct RenderSnapshot {
     notifications: Vec<ToastNotification>,
     selected_tree_paths: Vec<String>,
     context_menu_row: Option<BrowserRow>,
+    context_menu_position: Option<(f64, f64)>,
     preview_layout: PreviewLayoutMode,
     server_busy: bool,
     ssh_connect_target: String,
     ssh_connect_prefix: String,
     pending_update_restart: Option<PendingUpdateRestart>,
     last_terminal_debug: String,
+    active_precis: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -295,6 +300,7 @@ impl ShellState {
             selected_tree_paths: HashSet::new(),
             selection_anchor: None,
             context_menu_row: None,
+            context_menu_position: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: needs_initial_server_sync,
             server_daemon_detail: String::new(),
@@ -306,6 +312,8 @@ impl ShellState {
             dock_sync_in_flight: false,
             last_dock_signature: None,
             last_terminal_debug: "terminal debug idle".to_string(),
+            generated_precis: BTreeMap::new(),
+            precis_requests_in_flight: HashSet::new(),
         };
         if let Some(path) = state.browser.selected_path().map(ToOwned::to_owned) {
             state.selected_tree_paths.insert(path.clone());
@@ -360,12 +368,17 @@ impl ShellState {
             notifications: self.notifications.clone(),
             selected_tree_paths: self.selected_tree_paths.iter().cloned().collect(),
             context_menu_row: self.context_menu_row.clone(),
+            context_menu_position: self.context_menu_position,
             preview_layout: self.preview_layout,
             server_busy: self.server_busy,
             ssh_connect_target: self.ssh_connect_target.clone(),
             ssh_connect_prefix: self.ssh_connect_prefix.clone(),
             pending_update_restart: self.pending_update_restart.clone(),
             last_terminal_debug: self.last_terminal_debug.clone(),
+            active_precis: self
+                .server
+                .active_session()
+                .and_then(|session| self.generated_precis.get(&session.session_path).cloned()),
         }
     }
 
@@ -606,12 +619,14 @@ impl ShellState {
         };
     }
 
-    fn open_context_menu(&mut self, row: BrowserRow) {
+    fn open_context_menu(&mut self, row: BrowserRow, position: (f64, f64)) {
         self.context_menu_row = Some(row);
+        self.context_menu_position = Some(position);
     }
 
     fn close_context_menu(&mut self) {
         self.context_menu_row = None;
+        self.context_menu_position = None;
     }
 
     fn clear_notification(&mut self, id: u64) {
@@ -887,6 +902,64 @@ fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force:
                     "Title Task Failed",
                     error.to_string(),
                 );
+            }
+        });
+    });
+}
+
+fn spawn_precis_generation(mut state: Signal<ShellState>, session: ManagedSessionView) {
+    if !session.kind.is_agent() {
+        return;
+    }
+
+    let session_path = session.session_path.clone();
+    let settings = state.read().settings.clone();
+    if settings.litellm_endpoint.trim().is_empty()
+        || settings.litellm_api_key.trim().is_empty()
+        || settings.interface_llm_model.trim().is_empty()
+    {
+        return;
+    }
+
+    let should_start = state.with_mut(|shell| {
+        if shell.generated_precis.contains_key(&session_path)
+            || shell.precis_requests_in_flight.contains(&session_path)
+        {
+            false
+        } else {
+            shell.precis_requests_in_flight.insert(session_path.clone());
+            true
+        }
+    });
+    if !should_start {
+        return;
+    }
+
+    spawn(async move {
+        let path_for_task = session_path.clone();
+        let settings_for_task = settings.clone();
+        let outcome = task::spawn_blocking(move || -> Result<Option<String>> {
+            let store = SessionStore::open_or_init()?;
+            if let Some(precis) = store.resolve_precis_for_session_path(&path_for_task)? {
+                return Ok(Some(precis));
+            }
+            store.generate_precis_for_session_path(&settings_for_task, &path_for_task, false)
+        })
+        .await;
+
+        state.with_mut(|shell| {
+            shell.precis_requests_in_flight.remove(&session_path);
+            match outcome {
+                Ok(Ok(Some(precis))) => {
+                    shell.generated_precis.insert(session_path.clone(), precis);
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => {
+                    shell.last_action = format!("precis generation failed: {error}");
+                }
+                Err(error) => {
+                    shell.last_action = format!("precis task failed: {error}");
+                }
             }
         });
     });
@@ -2492,6 +2565,20 @@ fn app() -> Element {
         });
     });
     use_effect(move || {
+        let active = state.read().server.active_session().cloned();
+        let Some(session) = active else {
+            return;
+        };
+        let has_precis = state
+            .read()
+            .generated_precis
+            .contains_key(&session.session_path);
+        if has_precis {
+            return;
+        }
+        spawn_precis_generation(state, session);
+    });
+    use_effect(move || {
         if *dock_pulse_started.read() {
             return;
         }
@@ -2616,7 +2703,9 @@ fn app() -> Element {
                             }
                         },
                         on_delete_selected_documents: move |_| queue_delete_selected_documents(state),
-                        on_open_context_menu: move |row: BrowserRow| state.with_mut(|shell| shell.open_context_menu(row)),
+                        on_open_context_menu: move |(row, position): (BrowserRow, (f64, f64))| {
+                            state.with_mut(|shell| shell.open_context_menu(row, position))
+                        },
                     }
                     MainSurface {
                         snapshot: main_snapshot,
@@ -2706,6 +2795,7 @@ fn app() -> Element {
                 if let Some(row) = snapshot.context_menu_row.clone() {
                     ContextMenuOverlay {
                         row: row.clone(),
+                        position: snapshot.context_menu_position.unwrap_or((18.0, 60.0)),
                         selected_row: snapshot.selected_row.clone(),
                         palette: snapshot.palette,
                         on_close: move |_| state.with_mut(|shell| shell.close_context_menu()),
@@ -3215,7 +3305,7 @@ fn Sidebar(
     on_create_document: EventHandler<MouseEvent>,
     on_select_row: EventHandler<(BrowserRow, bool)>,
     on_delete_selected_documents: EventHandler<KeyboardEvent>,
-    on_open_context_menu: EventHandler<BrowserRow>,
+    on_open_context_menu: EventHandler<(BrowserRow, (f64, f64))>,
 ) -> Element {
     let width = if snapshot.sidebar_open {
         SIDE_RAIL_WIDTH
@@ -3281,7 +3371,7 @@ fn Sidebar(
                                     let extend = evt.modifiers().contains(Modifiers::SHIFT);
                                     on_select_row.call((select_row.clone(), extend));
                                 },
-                                on_open_context_menu: move |_| on_open_context_menu.call(context_row.clone()),
+                                on_open_context_menu: move |coords: (f64, f64)| on_open_context_menu.call((context_row.clone(), coords)),
                             }
                         }
                     }
@@ -3297,7 +3387,7 @@ fn SidebarRow(
     selected: bool,
     palette: Palette,
     on_select: EventHandler<MouseEvent>,
-    on_open_context_menu: EventHandler<MouseEvent>,
+    on_open_context_menu: EventHandler<(f64, f64)>,
 ) -> Element {
     let indent = row.depth * 12 + 12;
     let background = if selected {
@@ -3334,7 +3424,8 @@ fn SidebarRow(
             onclick: move |evt| on_select.call(evt),
             oncontextmenu: move |evt| {
                 evt.prevent_default();
-                on_open_context_menu.call(evt);
+                let coords = evt.client_coordinates();
+                on_open_context_menu.call((coords.x, coords.y));
             },
             div {
                 style: "display:flex; align-items:center; justify-content:space-between; gap:8px;",
@@ -3639,6 +3730,10 @@ fn MainSurface(
                     style: "display:flex; flex-direction:column; min-width:0; min-height:0; width:100%; height:100%;",
                     TerminalHeader {
                         session: session.clone(),
+                        precis: snapshot
+                            .active_precis
+                            .clone()
+                            .unwrap_or_else(|| terminal_precis(&session)),
                         palette: snapshot.palette,
                         server_busy: snapshot.server_busy,
                         on_switch_agent_mode,
@@ -3678,11 +3773,11 @@ fn MainSurface(
 #[component]
 fn TerminalHeader(
     session: ManagedSessionView,
+    precis: String,
     palette: Palette,
     server_busy: bool,
     on_switch_agent_mode: EventHandler<SessionKind>,
 ) -> Element {
-    let precis = terminal_precis(&session);
     rsx! {
         div {
             style: "display:flex; align-items:flex-start; justify-content:space-between; gap:16px; padding:22px 26px 14px 26px; border-bottom:1px solid rgba(170,190,212,0.16);",
@@ -3690,7 +3785,7 @@ fn TerminalHeader(
                 style: "display:flex; flex-direction:column; gap:6px; min-width:0;",
                 div {
                     style: format!("font-size:22px; font-weight:700; color:{}; line-height:1.2;", palette.text),
-                    "#{session.title}"
+                    "{session.title}"
                 }
                 div {
                     style: format!("font-size:12px; line-height:1.6; color:{}; max-width:720px; white-space:pre-wrap;", palette.muted),
@@ -4919,16 +5014,11 @@ fn SettingsRailBody(
                 palette: snapshot.palette,
                 on_change: on_model_change,
             }
-            NotificationDeliveryRow {
+            NotificationSettingsSection {
                 palette: snapshot.palette,
                 selected: notification_delivery_mode(&snapshot.settings),
+                sound_enabled: snapshot.settings.notification_sound,
                 on_select: on_set_notification_delivery,
-            }
-            BooleanSettingRow {
-                label: "Notification Sound".to_string(),
-                value: snapshot.settings.notification_sound,
-                palette: snapshot.palette,
-                recommended_label: None,
                 on_change: on_set_notification_sound,
             }
             ZoomSettingRow {
@@ -5211,6 +5301,7 @@ fn NotificationCard(
 #[component]
 fn ContextMenuOverlay(
     row: BrowserRow,
+    position: (f64, f64),
     selected_row: Option<BrowserRow>,
     palette: Palette,
     on_close: EventHandler<MouseEvent>,
@@ -5224,6 +5315,8 @@ fn ContextMenuOverlay(
     on_create_recipe: EventHandler<MouseEvent>,
     on_regenerate: EventHandler<MouseEvent>,
 ) -> Element {
+    let menu_left = position.0.clamp(10.0, 1400.0);
+    let menu_top = position.1.clamp(48.0, 980.0);
     let can_move_selected_document = selected_row.as_ref().is_some_and(|selected| {
         selected.kind == BrowserRowKind::Document
             && !row.full_path.starts_with("__live_")
@@ -5235,99 +5328,65 @@ fn ContextMenuOverlay(
             onclick: move |evt| on_close.call(evt),
             div {
                 style: format!(
-                    "position:absolute; top:60px; left:18px; min-width:180px; padding:8px; border-radius:14px; \
-                     background:rgba(255,255,255,0.96); box-shadow: 0 18px 44px rgba(69,108,136,0.18);"
+                    "position:absolute; top:{}px; left:{}px; min-width:220px; padding:6px; border-radius:10px; \
+                     background:rgba(248,249,252,0.98); box-shadow: 0 18px 38px rgba(57,78,98,0.18), inset 0 0 0 1px rgba(214,220,228,0.9); \
+                     backdrop-filter: blur(20px) saturate(150%); -webkit-backdrop-filter: blur(20px) saturate(150%);",
+                    menu_top, menu_left
                 ),
                 onmousedown: |evt| evt.stop_propagation(),
                 onclick: |evt| evt.stop_propagation(),
                 div {
-                    style: format!("padding:4px 8px 8px 8px; font-size:11px; font-weight:700; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.muted),
+                    style: format!("padding:6px 12px 8px 12px; font-size:11px; font-weight:700; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.muted),
                     "{row.label}"
                 }
                 if row.kind == BrowserRowKind::Group && !row.full_path.starts_with("__live_") {
                     if can_move_selected_document {
                         button {
-                            style: format!(
-                                "width:100%; height:30px; border:none; border-radius:10px; background:{}; color:{}; \
-                                 font-size:12px; font-weight:600; text-align:left; padding:0 10px; margin-bottom:6px;",
-                                palette.accent_soft, palette.text
-                            ),
+                            style: context_menu_action_style(palette, true),
                             onclick: move |evt| on_move_selected_document_here.call(evt),
                             "Move Selected Here"
                         }
                     }
                     button {
-                        style: format!(
-                            "width:100%; height:30px; border:none; border-radius:10px; background:{}; color:{}; \
-                             font-size:12px; font-weight:600; text-align:left; padding:0 10px; margin-bottom:6px;",
-                            palette.panel_alt, palette.text
-                        ),
+                        style: context_menu_action_style(palette, false),
                         onclick: move |evt| on_create_group.call(evt),
-                        "New Group"
+                        "New Space"
                     }
                     button {
-                        style: format!(
-                            "width:100%; height:30px; border:none; border-radius:10px; background:{}; color:{}; \
-                             font-size:12px; font-weight:600; text-align:left; padding:0 10px; margin-bottom:6px;",
-                            palette.panel_alt, palette.text
-                        ),
+                        style: context_menu_action_style(palette, false),
                         onclick: move |evt| on_create_group_codex.call(evt),
                         "New Codex Session"
                     }
                     button {
-                        style: format!(
-                            "width:100%; height:30px; border:none; border-radius:10px; background:{}; color:{}; \
-                             font-size:12px; font-weight:600; text-align:left; padding:0 10px; margin-bottom:6px;",
-                            palette.panel_alt, palette.text
-                        ),
+                        style: context_menu_action_style(palette, false),
                         onclick: move |evt| on_create_group_shell.call(evt),
                         "New Shell Session"
                     }
                     button {
-                        style: format!(
-                            "width:100%; height:30px; border:none; border-radius:10px; background:{}; color:{}; \
-                             font-size:12px; font-weight:600; text-align:left; padding:0 10px;",
-                            palette.accent_soft, palette.text
-                        ),
+                        style: context_menu_action_style(palette, true),
                         onclick: move |evt| on_create_group_document.call(evt),
-                        "New Document"
+                        "New Paper"
                     }
                     button {
-                        style: format!(
-                            "width:100%; height:30px; border:none; border-radius:10px; background:{}; color:{}; \
-                             font-size:12px; font-weight:600; text-align:left; padding:0 10px; margin-top:6px;",
-                            palette.panel_alt, palette.text
-                        ),
+                        style: context_menu_action_style(palette, false),
                         onclick: move |evt| on_create_group_recipe.call(evt),
-                        "New Recipe"
+                        "New Runbook"
                     }
                 } else if row.kind == BrowserRowKind::Session {
                     button {
-                        style: format!(
-                            "width:100%; height:30px; border:none; border-radius:10px; background:{}; color:{}; \
-                             font-size:12px; font-weight:600; text-align:left; padding:0 10px; margin-bottom:6px;",
-                            palette.panel_alt, palette.text
-                        ),
+                        style: context_menu_action_style(palette, false),
                         onclick: move |evt| on_create_note.call(evt),
-                        "Create Note"
+                        "Create Paper"
                     }
                     button {
-                        style: format!(
-                            "width:100%; height:30px; border:none; border-radius:10px; background:{}; color:{}; \
-                             font-size:12px; font-weight:600; text-align:left; padding:0 10px; margin-bottom:6px;",
-                            palette.panel_alt, palette.text
-                        ),
+                        style: context_menu_action_style(palette, false),
                         onclick: move |evt| on_create_recipe.call(evt),
-                        "Create Recipe"
+                        "Create Runbook"
                     }
                 }
                 if row.kind == BrowserRowKind::Session {
                     button {
-                        style: format!(
-                            "width:100%; height:30px; border:none; border-radius:10px; background:{}; color:{}; \
-                             font-size:12px; font-weight:600; text-align:left; padding:0 10px;",
-                            palette.accent_soft, palette.text
-                        ),
+                        style: context_menu_action_style(palette, true),
                         onclick: move |evt| on_regenerate.call(evt),
                         "Regenerate Title"
                     }
@@ -5405,14 +5464,16 @@ fn SettingsField(
 }
 
 #[component]
-fn NotificationDeliveryRow(
+fn NotificationSettingsSection(
     palette: Palette,
     selected: NotificationDeliveryMode,
+    sound_enabled: bool,
     on_select: EventHandler<NotificationDeliveryMode>,
+    on_change: EventHandler<bool>,
 ) -> Element {
     rsx! {
         div {
-            style: "display:flex; flex-direction:column; gap:6px;",
+            style: "display:flex; flex-direction:column; gap:8px;",
             div {
                 style: "display:flex; align-items:center; justify-content:space-between; gap:8px;",
                 div {
@@ -5426,69 +5487,53 @@ fn NotificationDeliveryRow(
             }
             div {
                 style: format!(
-                    "display:flex; align-items:center; gap:6px; height:32px; padding:4px; border:none; border-radius:999px; \
-                     background:rgba(255,255,255,0.58); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.34);"
+                    "display:flex; flex-direction:column; gap:10px; padding:10px; border-radius:14px; \
+                     background:rgba(255,255,255,0.56); box-shadow: inset 0 0 0 1px rgba(196,214,228,0.42);"
                 ),
-                button {
-                    style: segmented_pill_button_style(palette, selected == NotificationDeliveryMode::InApp),
-                    onclick: move |_| on_select.call(NotificationDeliveryMode::InApp),
-                    "App"
-                }
-                button {
-                    style: segmented_pill_button_style(palette, selected == NotificationDeliveryMode::Both),
-                    onclick: move |_| on_select.call(NotificationDeliveryMode::Both),
-                    "Both"
-                }
-                button {
-                    style: segmented_pill_button_style(palette, selected == NotificationDeliveryMode::System),
-                    onclick: move |_| on_select.call(NotificationDeliveryMode::System),
-                    "System"
-                }
-            }
-        }
-    }
-}
-
-#[component]
-fn BooleanSettingRow(
-    label: String,
-    value: bool,
-    palette: Palette,
-    recommended_label: Option<String>,
-    on_change: EventHandler<bool>,
-) -> Element {
-    rsx! {
-        div {
-            style: "display:flex; flex-direction:column; gap:6px;",
-            div {
-                style: "display:flex; align-items:center; justify-content:space-between; gap:8px;",
-                div {
-                    style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", palette.muted),
-                    "{label}"
-                }
-                if let Some(recommended_label) = recommended_label {
-                    span {
-                        style: format!("font-size:10px; font-weight:700; color:{};", palette.accent),
-                        "{recommended_label}"
-                    }
-                }
-            }
-            button {
-                style: format!(
-                    "display:flex; align-items:center; justify-content:{}; height:32px; padding:4px; border:none; border-radius:10px; \
-                     background:rgba(255,255,255,0.58); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.34);",
-                    if value { "flex-end" } else { "flex-start" }
-                ),
-                onclick: move |_| on_change.call(!value),
                 div {
                     style: format!(
-                        "width:54px; height:24px; border-radius:999px; background:{}; display:flex; align-items:center; \
-                         justify-content:{}; padding:0 3px; transition: all 160ms ease;",
-                        if value { palette.accent } else { "rgba(189,201,212,0.92)" },
-                        if value { "flex-end" } else { "flex-start" }
+                        "display:flex; align-items:center; gap:5px; height:34px; padding:4px; border-radius:999px; \
+                         background:rgba(236,242,247,0.94); box-shadow: inset 0 0 0 1px rgba(210,221,232,0.92);"
                     ),
+                    button {
+                        style: segmented_pill_button_style(palette, selected == NotificationDeliveryMode::InApp),
+                        onclick: move |_| on_select.call(NotificationDeliveryMode::InApp),
+                        "App"
+                    }
+                    button {
+                        style: segmented_pill_button_style(palette, selected == NotificationDeliveryMode::Both),
+                        onclick: move |_| on_select.call(NotificationDeliveryMode::Both),
+                        "Both"
+                    }
+                    button {
+                        style: segmented_pill_button_style(palette, selected == NotificationDeliveryMode::System),
+                        onclick: move |_| on_select.call(NotificationDeliveryMode::System),
+                        "System"
+                    }
+                }
+                div {
+                    style: "display:flex; align-items:center; justify-content:space-between; gap:10px;",
                     div {
-                        style: "width:18px; height:18px; border-radius:999px; background:white; box-shadow:0 2px 8px rgba(36,48,58,0.18);",
+                        style: format!("font-size:11px; font-weight:700; color:{};", palette.muted),
+                        "Sound"
+                    }
+                    button {
+                        style: inline_toggle_style(palette, sound_enabled),
+                        onclick: move |_| on_change.call(!sound_enabled),
+                        span {
+                            style: format!("font-size:10px; font-weight:700; color:{};", if sound_enabled { palette.accent } else { palette.muted }),
+                            if sound_enabled { "On" } else { "Off" }
+                        }
+                        div {
+                            style: format!(
+                                "width:34px; height:18px; border-radius:999px; background:{}; display:flex; align-items:center; justify-content:{}; padding:0 2px;",
+                                if sound_enabled { palette.accent } else { "rgba(189,201,212,0.92)" },
+                                if sound_enabled { "flex-end" } else { "flex-start" }
+                            ),
+                            div {
+                                style: "width:14px; height:14px; border-radius:999px; background:white; box-shadow:0 2px 8px rgba(36,48,58,0.18);",
+                            }
+                        }
                     }
                 }
             }
@@ -5758,10 +5803,10 @@ fn zoom_button_style(palette: Palette) -> String {
 
 fn segmented_pill_button_style(palette: Palette, selected: bool) -> String {
     format!(
-        "flex:1; height:24px; border:none; border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:{}; \
-         display:inline-flex; align-items:center; justify-content:center;",
+        "flex:1; height:26px; border:none; border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:{}; \
+         display:inline-flex; align-items:center; justify-content:center; box-shadow:{};",
         if selected {
-            palette.panel
+            "rgba(255,255,255,0.98)"
         } else {
             "transparent"
         },
@@ -5770,7 +5815,34 @@ fn segmented_pill_button_style(palette: Palette, selected: bool) -> String {
         } else {
             palette.muted
         },
-        if selected { 700 } else { 600 }
+        if selected { 700 } else { 600 },
+        if selected {
+            "0 3px 10px rgba(89,111,132,0.12), inset 0 0 0 1px rgba(216,227,236,0.96)"
+        } else {
+            "none"
+        }
+    )
+}
+
+fn context_menu_action_style(palette: Palette, emphasized: bool) -> String {
+    format!(
+        "width:100%; height:32px; border:none; border-radius:8px; background:{}; color:{}; \
+         font-size:12px; font-weight:{}; text-align:left; padding:0 12px; margin-bottom:4px;",
+        if emphasized {
+            "rgba(233,241,255,0.98)"
+        } else {
+            "transparent"
+        },
+        if emphasized { palette.accent } else { palette.text },
+        if emphasized { 700 } else { 600 }
+    )
+}
+
+fn inline_toggle_style(_palette: Palette, enabled: bool) -> String {
+    format!(
+        "display:flex; align-items:center; gap:10px; height:28px; padding:0 2px 0 0; border:none; background:transparent; \
+         justify-content:flex-end; width:auto; opacity:{};",
+        if enabled { "1" } else { "0.92" }
     )
 }
 
