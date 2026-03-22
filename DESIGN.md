@@ -159,21 +159,26 @@ Do not invent new nouns casually.
 
 Current preferred user-facing terms:
 
-- `Session`: a live or stored terminal/agent context
-- `Group`: a virtual container in the tree
-- `Paper`: a lightweight text/note canvas
-- `Runbook`: an executable or replay-oriented document
+- `Session`: an agent-oriented live or stored context
+- `Terminal`: a generic daemon-owned shell/process context
+- `Paper`: a rich canvas surface for thinking and organizing work
+- `Folder`: a virtual organizational node, often tied to a cwd or project context
+- `Separator`: a lightweight visual divider in the tree
 
 Terms to avoid unless deliberately revisited:
 
 - `Space`
+- `Group` as the primary tree noun
+- `Runbook` as the primary executable-document noun
 - `Workspace` as a tree-item label
 
 Reason:
 
-- `Group` is concrete and understandable
+- `Session` clearly means the agent-led flow
+- `Terminal` clearly means the generic shell/automation flow
 - `Paper` is softer and more intentional than `Document`
-- `Runbook` communicates “instructions with intent”, not just “text file”
+- `Folder` is more familiar than `Group`
+- `Separator` communicates visual organization without overexplaining
 - `Space` is vague and overloaded
 
 ### “New” vs “Create”
@@ -197,8 +202,27 @@ The left sidebar is a real workspace organizer, not a file browser clone.
 - Icons should be grayscale by default.
 - Expanded root emphasis may use blue subtly.
 - The tree should support right-click as a first-class workflow.
-- Sessions, groups, papers, and runbooks should be visually distinguishable.
+- Sessions, terminals, folders, separators, and papers should be visually distinguishable.
 - Session rows should not drown users in hashes or duplicate metadata lines.
+
+### Tree creation language
+
+The primary quick actions should read like:
+
+- `+Session`
+- `+Terminal`
+- `+Paper`
+
+And right-click folder context menus should prefer:
+
+- `New Session`
+- `New Terminal`
+- `New Paper`
+- separator
+- `Add Folder`
+- `Add Separator`
+
+Avoid exposing internal implementation nouns in the tree unless they are truly user-facing product concepts.
 
 ## Header behavior
 
@@ -217,6 +241,22 @@ It should not contain:
 - gratuitous terminal framing
 
 The precis should ideally come from the interface model when available, with a sensible local fallback.
+
+## Paper surfaces
+
+`Paper` is not just a note blob.
+
+It should grow toward a canvas surface that can host multiple richer modes over time, such as:
+
+- writing
+- checklist/planning
+- calendar views
+- kanban-style organization
+- spreadsheet-like surfaces
+
+If a paper surface gains structured tools, it should use a ribbon-like action strip beneath the titlebar rather than scattering controls around the canvas.
+
+This is closer to a calm Office/Notion hybrid than a markdown editor with a toolbar.
 
 ## Notifications
 
