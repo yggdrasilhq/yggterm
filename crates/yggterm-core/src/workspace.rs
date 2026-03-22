@@ -386,6 +386,151 @@ impl WorkspaceStore {
         tx.commit()?;
         Ok(deleted)
     }
+
+    pub fn move_group(&self, from_virtual_path: &str, to_virtual_path: &str) -> Result<WorkspaceGroup> {
+        let from_normalized = normalize_virtual_group_path(from_virtual_path);
+        let to_normalized = normalize_virtual_group_path(to_virtual_path);
+        if from_normalized == to_normalized {
+            return self
+                .get_group(&from_normalized)?
+                .context("workspace group was not readable for move");
+        }
+        if to_normalized == "/" || to_normalized.starts_with(&(from_normalized.clone() + "/")) {
+            bail!("cannot move a folder into itself: {from_normalized} -> {to_normalized}");
+        }
+        if self.get_group(&to_normalized)?.is_some() {
+            bail!("destination group path already exists: {to_normalized}");
+        }
+        if self.get_document(&to_normalized)?.is_some() {
+            bail!("destination path already exists as a paper: {to_normalized}");
+        }
+
+        let Some(group) = self.get_group(&from_normalized)? else {
+            bail!("workspace group not found: {from_normalized}");
+        };
+
+        let descendant_groups = self.list_groups()?;
+        let descendant_documents = self.list_documents()?;
+        for candidate in descendant_groups
+            .iter()
+            .filter(|candidate| is_same_or_descendant_path(&candidate.virtual_path, &from_normalized))
+        {
+            let rewritten = rewrite_virtual_prefix(&candidate.virtual_path, &from_normalized, &to_normalized);
+            if rewritten != candidate.virtual_path
+                && self.get_group(&rewritten)?.is_some()
+                && !is_same_or_descendant_path(&rewritten, &from_normalized)
+            {
+                bail!("destination group path already exists: {rewritten}");
+            }
+        }
+        for candidate in descendant_documents
+            .iter()
+            .filter(|candidate| is_same_or_descendant_path(&candidate.virtual_path, &from_normalized))
+        {
+            let rewritten = rewrite_virtual_prefix(&candidate.virtual_path, &from_normalized, &to_normalized);
+            if rewritten != candidate.virtual_path && self.get_document(&rewritten)?.is_some() {
+                bail!("destination paper path already exists: {rewritten}");
+            }
+        }
+
+        let now =
+            OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION;")?;
+        let result: Result<()> = (|| {
+            let descendants_prefix = format!("{from_normalized}/%");
+            self.conn.execute(
+                "UPDATE workspace_groups
+                 SET virtual_path = REPLACE(virtual_path, ?1, ?2), updated_at = ?3
+                 WHERE virtual_path = ?1 OR virtual_path LIKE ?4",
+                params![from_normalized, to_normalized, now, descendants_prefix],
+            )?;
+            self.conn.execute(
+                "UPDATE documents
+                 SET virtual_path = REPLACE(virtual_path, ?1, ?2), updated_at = ?3
+                 WHERE virtual_path LIKE ?4",
+                params![from_normalized, to_normalized, now, descendants_prefix],
+            )?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => self.conn.execute_batch("COMMIT;")?,
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                return Err(error);
+            }
+        }
+
+        self.get_group(&to_normalized)?
+            .context("workspace group was not readable after move")
+            .map(|mut moved| {
+                moved.title = group.title;
+                moved
+            })
+    }
+
+    pub fn delete_workspace_items(
+        &self,
+        document_paths: &[String],
+        group_paths: &[String],
+    ) -> Result<usize> {
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION;")?;
+        let result: Result<usize> = (|| {
+            let mut deleted = 0usize;
+            for path in document_paths {
+                let normalized = normalize_virtual_document_path(path);
+                deleted += self.conn.execute(
+                    "DELETE FROM documents WHERE virtual_path = ?1",
+                    params![normalized],
+                )?;
+            }
+            for path in group_paths {
+                let normalized = normalize_virtual_group_path(path);
+                let descendants_prefix = format!("{normalized}/%");
+                deleted += self.conn.execute(
+                    "DELETE FROM documents WHERE virtual_path LIKE ?1",
+                    params![descendants_prefix],
+                )?;
+                deleted += self.conn.execute(
+                    "DELETE FROM workspace_groups WHERE virtual_path = ?1 OR virtual_path LIKE ?2",
+                    params![normalized, descendants_prefix],
+                )?;
+            }
+            Ok(deleted)
+        })();
+
+        match result {
+            Ok(deleted) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(deleted)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(error)
+            }
+        }
+    }
+
+    fn get_group(&self, virtual_path: &str) -> Result<Option<WorkspaceGroup>> {
+        self.conn
+            .query_row(
+                "SELECT id, virtual_path, title, kind, created_at, updated_at
+                 FROM workspace_groups WHERE virtual_path = ?1",
+                params![normalize_virtual_group_path(virtual_path)],
+                |row| {
+                    Ok(WorkspaceGroup {
+                        id: row.get(0)?,
+                        virtual_path: row.get(1)?,
+                        title: row.get(2)?,
+                        kind: parse_group_kind(row.get::<_, String>(3)?),
+                        created_at: row.get(4)?,
+                        updated_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .context("failed to read workspace group")
+    }
 }
 
 fn ensure_optional_column(
@@ -433,6 +578,24 @@ fn parse_group_kind(raw: String) -> WorkspaceGroupKind {
     match raw.as_str() {
         "separator" => WorkspaceGroupKind::Separator,
         _ => WorkspaceGroupKind::Folder,
+    }
+}
+
+fn is_same_or_descendant_path(candidate: &str, parent: &str) -> bool {
+    candidate == parent
+        || candidate
+            .strip_prefix(parent)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn rewrite_virtual_prefix(path: &str, from: &str, to: &str) -> String {
+    if path == from {
+        return to.to_string();
+    }
+    if let Some(rest) = path.strip_prefix(&(from.to_string() + "/")) {
+        format!("{}/{}", to.trim_end_matches('/'), rest)
+    } else {
+        path.to_string()
     }
 }
 
@@ -537,6 +700,79 @@ mod tests {
                 .get_document("/projects/beta/notes/todo")
                 .expect("read destination")
                 .is_some()
+        );
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn moves_workspace_group_subtree() {
+        let home = temp_home();
+        let store = WorkspaceStore::open(&home).expect("open workspace");
+        store
+            .put_group_with_kind("/projects/alpha/folder-a", Some("Folder A"), WorkspaceGroupKind::Folder)
+            .expect("save folder");
+        store
+            .put_group_with_kind("/projects/alpha/folder-a/divider", Some("Divider"), WorkspaceGroupKind::Separator)
+            .expect("save separator");
+        store
+            .put_document("/projects/alpha/folder-a/notes/todo", Some("Todo"), "body")
+            .expect("save paper");
+
+        let moved = store
+            .move_group("/projects/alpha/folder-a", "/projects/beta/folder-a")
+            .expect("move folder");
+
+        assert_eq!(moved.virtual_path, "/projects/beta/folder-a");
+        assert!(
+            store
+                .get_document("/projects/beta/folder-a/notes/todo")
+                .expect("read moved paper")
+                .is_some()
+        );
+        assert!(
+            store
+                .get_group("/projects/beta/folder-a/divider")
+                .expect("read moved separator")
+                .is_some()
+        );
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn deletes_workspace_items_recursively() {
+        let home = temp_home();
+        let store = WorkspaceStore::open(&home).expect("open workspace");
+        store
+            .put_group_with_kind("/projects/alpha/folder-a", Some("Folder A"), WorkspaceGroupKind::Folder)
+            .expect("save folder");
+        store
+            .put_document("/projects/alpha/folder-a/notes/todo", Some("Todo"), "body")
+            .expect("save paper");
+        store
+            .put_document("/projects/alpha/notes/standalone", Some("Standalone"), "body")
+            .expect("save standalone paper");
+
+        let deleted = store
+            .delete_workspace_items(
+                &[String::from("/projects/alpha/notes/standalone")],
+                &[String::from("/projects/alpha/folder-a")],
+            )
+            .expect("delete items");
+
+        assert_eq!(deleted, 3);
+        assert!(
+            store
+                .get_document("/projects/alpha/folder-a/notes/todo")
+                .expect("read nested paper")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_document("/projects/alpha/notes/standalone")
+                .expect("read standalone paper")
+                .is_none()
         );
 
         let _ = fs::remove_dir_all(home);
