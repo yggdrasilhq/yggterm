@@ -92,12 +92,7 @@ impl WorkspaceStore {
             CREATE INDEX IF NOT EXISTS idx_workspace_groups_virtual_path ON workspace_groups(virtual_path);",
         )
         .context("failed to initialize workspace db schema")?;
-        ensure_optional_column(
-            &conn,
-            "documents",
-            "kind",
-            "TEXT NOT NULL DEFAULT 'note'",
-        )?;
+        ensure_optional_column(&conn, "documents", "kind", "TEXT NOT NULL DEFAULT 'note'")?;
         ensure_optional_column(&conn, "documents", "source_session_path", "TEXT")?;
         ensure_optional_column(&conn, "documents", "source_session_kind", "TEXT")?;
         ensure_optional_column(&conn, "documents", "source_session_cwd", "TEXT")?;
@@ -197,7 +192,8 @@ impl WorkspaceStore {
         input: WorkspaceDocumentInput,
     ) -> Result<WorkspaceDocument> {
         let normalized = normalize_virtual_document_path(virtual_path);
-        let now = OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
+        let now =
+            OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
         let existing = self.get_document(&normalized)?;
         let id = existing
             .as_ref()
@@ -253,7 +249,8 @@ impl WorkspaceStore {
 
     pub fn put_group(&self, virtual_path: &str, title: Option<&str>) -> Result<WorkspaceGroup> {
         let normalized = normalize_virtual_group_path(virtual_path);
-        let now = OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
+        let now =
+            OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
         let existing = self
             .conn
             .query_row(
@@ -304,7 +301,11 @@ impl WorkspaceStore {
             .context("workspace group was not readable after save")
     }
 
-    pub fn move_document(&self, from_virtual_path: &str, to_virtual_path: &str) -> Result<WorkspaceDocument> {
+    pub fn move_document(
+        &self,
+        from_virtual_path: &str,
+        to_virtual_path: &str,
+    ) -> Result<WorkspaceDocument> {
         let from_normalized = normalize_virtual_document_path(from_virtual_path);
         let to_normalized = normalize_virtual_document_path(to_virtual_path);
         if from_normalized == to_normalized {
@@ -320,7 +321,8 @@ impl WorkspaceStore {
         let Some(existing) = self.get_document(&from_normalized)? else {
             bail!("workspace document not found: {from_normalized}");
         };
-        let now = OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
+        let now =
+            OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
         self.conn.execute(
             "UPDATE documents
              SET virtual_path = ?1, updated_at = ?2
@@ -335,9 +337,28 @@ impl WorkspaceStore {
                 document
             })
     }
+
+    pub fn delete_documents(&self, virtual_paths: &[String]) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut deleted = 0usize;
+        for path in virtual_paths {
+            let normalized = normalize_virtual_document_path(path);
+            deleted += tx.execute(
+                "DELETE FROM documents WHERE virtual_path = ?1",
+                params![normalized],
+            )?;
+        }
+        tx.commit()?;
+        Ok(deleted)
+    }
 }
 
-fn ensure_optional_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+fn ensure_optional_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
     let existing = rows.collect::<std::result::Result<Vec<_>, _>>()?;
@@ -416,7 +437,8 @@ mod tests {
     use std::fs;
 
     fn temp_home() -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("yggterm-workspace-test-{}", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("yggterm-workspace-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&path).expect("create temp home");
         path
     }
@@ -451,14 +473,18 @@ mod tests {
             .expect("move document");
 
         assert_eq!(moved.virtual_path, "/projects/beta/notes/todo");
-        assert!(store
-            .get_document("/projects/alpha/notes/todo")
-            .expect("read source")
-            .is_none());
-        assert!(store
-            .get_document("/projects/beta/notes/todo")
-            .expect("read destination")
-            .is_some());
+        assert!(
+            store
+                .get_document("/projects/alpha/notes/todo")
+                .expect("read source")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_document("/projects/beta/notes/todo")
+                .expect("read destination")
+                .is_some()
+        );
 
         let _ = fs::remove_dir_all(home);
     }

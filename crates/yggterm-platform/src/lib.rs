@@ -87,7 +87,10 @@ pub fn controlled_ghostty_status() -> ControlledGhosttyStatus {
     }
 }
 
-pub fn launch_controlled_ghostty(launch_command: &str, token: &str) -> Result<ControlledGhosttyLaunch> {
+pub fn launch_controlled_ghostty(
+    launch_command: &str,
+    token: &str,
+) -> Result<ControlledGhosttyLaunch> {
     let status = controlled_ghostty_status();
     if !status.available {
         bail!(status.detail);
@@ -131,11 +134,12 @@ pub fn sync_docked_ghostty_window(
         bail!(status.detail);
     }
 
-    let window_id = if let Some(window_id) = known_window_id.filter(|value| !value.trim().is_empty()) {
-        window_id.to_string()
-    } else {
-        resolve_x11_window(pid, token)?
-    };
+    let window_id =
+        if let Some(window_id) = known_window_id.filter(|value| !value.trim().is_empty()) {
+            window_id.to_string()
+        } else {
+            resolve_x11_window(pid, token)?
+        };
 
     let parent_window = resolve_current_app_window()?;
     run_xdotool(["windowreparent", &window_id, &parent_window])?;
@@ -182,7 +186,12 @@ pub fn focus_docked_ghostty_window(window_id: &str) -> Result<()> {
 }
 
 fn resolve_current_app_window() -> Result<String> {
-    xdotool_search(["search", "--onlyvisible", "--pid", &std::process::id().to_string()])
+    xdotool_search([
+        "search",
+        "--onlyvisible",
+        "--pid",
+        &std::process::id().to_string(),
+    ])
 }
 
 fn resolve_x11_window(pid: Option<u32>, token: Option<&str>) -> Result<String> {
