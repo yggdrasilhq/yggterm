@@ -5,6 +5,7 @@ use dioxus::desktop::{
     use_wry_event_handler, window,
 };
 use dioxus::document;
+use dioxus::html::input_data::MouseButton;
 use dioxus::prelude::*;
 use keyboard_types::{Key, Modifiers};
 use once_cell::sync::OnceCell;
@@ -2006,6 +2007,9 @@ fn queue_new_separator_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
             task::spawn_blocking(move || -> Result<(String, yggterm_core::SessionNode)> {
                 let store = SessionStore::open_or_init()?;
                 let virtual_path = new_separator_virtual_path_for_row(&row_for_task);
+                if cfg!(debug_assertions) {
+                    info!(source=%row_for_task.full_path, target=%virtual_path, "creating separator");
+                }
                 store.save_group_with_kind(
                     &virtual_path,
                     Some("Separator"),
@@ -2710,20 +2714,18 @@ fn group_session_title_hint(row: &BrowserRow, kind: SessionKind) -> String {
 }
 
 fn document_parent_base(row: &BrowserRow) -> Option<String> {
-    let normalize_legacy_notes_parent = |path: String| {
-        if path.ends_with("/notes") {
-            parent_virtual_path(&path).unwrap_or(path)
-        } else {
-            path
-        }
+    let normalize_legacy_parent = |path: String| {
+        path.replace("/notes/notes/", "/notes/")
+            .replace("/notes/notes", "/notes")
+            .replace("/local/", "/")
     };
     match row.kind {
         BrowserRowKind::Session => row.session_cwd.clone(),
         BrowserRowKind::Document => {
-            parent_virtual_path(&row.full_path).map(normalize_legacy_notes_parent)
+            parent_virtual_path(&row.full_path).map(normalize_legacy_parent)
         }
         BrowserRowKind::Separator => {
-            parent_virtual_path(&row.full_path).map(normalize_legacy_notes_parent)
+            parent_virtual_path(&row.full_path).map(normalize_legacy_parent)
         }
         BrowserRowKind::Group => {
             if row.full_path.starts_with("__live_") {
@@ -2733,6 +2735,42 @@ fn document_parent_base(row: &BrowserRow) -> Option<String> {
             }
         }
     }
+}
+
+fn resolve_creation_context_row(rows: &[BrowserRow], row: &BrowserRow) -> BrowserRow {
+    match row.kind {
+        BrowserRowKind::Group
+            if row.group_kind != Some(WorkspaceGroupKind::Separator)
+                && !row.full_path.starts_with("__live_") =>
+        {
+            row.clone()
+        }
+        BrowserRowKind::Document | BrowserRowKind::Separator => {
+            nearest_workspace_group_row(rows, &row.full_path).unwrap_or_else(|| row.clone())
+        }
+        BrowserRowKind::Session => row
+            .session_cwd
+            .as_deref()
+            .and_then(|cwd| nearest_workspace_group_row(rows, cwd))
+            .unwrap_or_else(|| row.clone()),
+        BrowserRowKind::Group => row.clone(),
+    }
+}
+
+fn nearest_workspace_group_row(rows: &[BrowserRow], path: &str) -> Option<BrowserRow> {
+    let mut cursor = Some(path.to_string());
+    while let Some(candidate) = cursor {
+        if let Some(row) = rows.iter().find(|row| {
+            row.kind == BrowserRowKind::Group
+                && row.full_path == candidate
+                && row.group_kind != Some(WorkspaceGroupKind::Separator)
+                && !row.full_path.starts_with("__live_")
+        }) {
+            return Some(row.clone());
+        }
+        cursor = parent_virtual_path(&candidate);
+    }
+    None
 }
 
 fn active_session_document_base(session: &ManagedSessionView) -> Option<String> {
@@ -3143,6 +3181,10 @@ fn app() -> Element {
     let preferred_agent_kind = preferred_agent_session_kind(&snapshot.settings);
     let maximized = snapshot.maximized;
     let shell_radius = if maximized { 0 } else { 11 };
+    let context_menu_overlay = snapshot.context_menu_row.clone().map(|row| {
+        let context_row = resolve_creation_context_row(&snapshot.rows, &row);
+        (row, context_row)
+    });
 
     rsx! {
         div {
@@ -3323,7 +3365,7 @@ fn app() -> Element {
                         on_clear_notifications: move |_| state.with_mut(|shell| shell.clear_notifications()),
                     }
                 }
-                if let Some(row) = snapshot.context_menu_row.clone() {
+                if let Some((row, context_row)) = context_menu_overlay.clone() {
                     ContextMenuOverlay {
                         row: row.clone(),
                         position: snapshot.context_menu_position.unwrap_or((18.0, 60.0)),
@@ -3332,30 +3374,30 @@ fn app() -> Element {
                         palette: snapshot.palette,
                         on_close: move |_| state.with_mut(|shell| shell.close_context_menu()),
                         on_create_group_codex: {
-                            let row = row.clone();
+                            let row = context_row.clone();
                             let preferred_agent_kind = preferred_agent_kind;
                             move |_| {
                                 spawn_start_group_session(state, row.clone(), preferred_agent_kind)
                             }
                         },
                         on_create_group: {
-                            let row = row.clone();
+                            let row = context_row.clone();
                             move |_| queue_new_group_for_row(state, row.clone())
                         },
                         on_create_group_shell: {
-                            let row = row.clone();
+                            let row = context_row.clone();
                             move |_| spawn_start_group_session(state, row.clone(), SessionKind::Shell)
                         },
                         on_create_group_document: {
-                            let row = row.clone();
+                            let row = context_row.clone();
                             move |_| queue_new_document_for_row(state, row.clone())
                         },
                         on_create_group_recipe: {
-                            let row = row.clone();
+                            let row = context_row.clone();
                             move |_| queue_new_separator_for_row(state, row.clone())
                         },
                         on_move_selected_document_here: {
-                            let row = row.clone();
+                            let row = context_row.clone();
                             move |_| queue_move_selected_items_to_group(state, row.clone())
                         },
                         on_create_note: {
@@ -3916,6 +3958,7 @@ fn Sidebar(
             }
             div {
                 style: "flex:1; min-height:0; overflow:auto; padding:12px 12px 12px 12px;",
+                onmouseup: move |_| on_end_drag.call(()),
                 for row in snapshot.rows.iter().cloned() {
                     {
                         let select_row = row.clone();
@@ -3989,11 +4032,11 @@ fn SidebarRow(
     on_update_rename: EventHandler<String>,
     on_commit_rename: EventHandler<()>,
     on_cancel_rename: EventHandler<()>,
-    on_start_drag: EventHandler<DragEvent>,
-    on_drag_hover: EventHandler<DragEvent>,
-    on_drag_leave: EventHandler<DragEvent>,
-    on_drop_into_row: EventHandler<DragEvent>,
-    on_end_drag: EventHandler<DragEvent>,
+    on_start_drag: EventHandler<MouseEvent>,
+    on_drag_hover: EventHandler<MouseEvent>,
+    on_drag_leave: EventHandler<MouseEvent>,
+    on_drop_into_row: EventHandler<MouseEvent>,
+    on_end_drag: EventHandler<MouseEvent>,
 ) -> Element {
     let indent = row.depth * 12 + 12;
     let draggable = is_workspace_row(&row);
@@ -4002,13 +4045,18 @@ fn SidebarRow(
             div {
                 style: format!(
                     "width:100%; display:flex; align-items:center; gap:10px; border:none; background:transparent; cursor:default; \
-                     padding:8px 9px 8px {}px; margin:4px 0; opacity:{}; border-radius:12px; background:{};",
+                     padding:8px 9px 8px {}px; margin:4px 0; opacity:{}; border-radius:12px; background:{}; box-sizing:border-box; min-width:0; overflow:hidden;",
                     indent
                     , if dragging { "0.58" } else { "1" },
                     if selected { palette.accent_soft } else { "transparent" }
                 ),
-                draggable: draggable,
+                draggable: false,
                 onclick: move |evt| on_select.call(evt),
+                onmousedown: move |evt| {
+                    if draggable && evt.trigger_button() == Some(MouseButton::Primary) {
+                        on_start_drag.call(evt);
+                    }
+                },
                 ondoubleclick: move |evt| on_begin_rename.call(evt),
                 oncontextmenu: move |evt| {
                     evt.prevent_default();
@@ -4016,20 +4064,21 @@ fn SidebarRow(
                     let coords = evt.client_coordinates();
                     on_open_context_menu.call((coords.x, coords.y));
                 },
-                ondragstart: move |evt| on_start_drag.call(evt),
-                ondragover: move |evt| {
-                    evt.prevent_default();
-                    on_drag_hover.call(evt);
+                onmousemove: move |evt| {
+                    if evt.held_buttons().contains(MouseButton::Primary) {
+                        on_drag_hover.call(evt);
+                    }
                 },
-                ondragleave: move |evt| on_drag_leave.call(evt),
-                ondrop: move |evt| {
-                    evt.prevent_default();
-                    on_drop_into_row.call(evt);
+                onmouseleave: move |evt| on_drag_leave.call(evt),
+                onmouseup: move |evt| {
+                    if evt.trigger_button() == Some(MouseButton::Primary) {
+                        on_drop_into_row.call(evt.clone());
+                        on_end_drag.call(evt);
+                    }
                 },
-                ondragend: move |evt| on_end_drag.call(evt),
                 div {
                     style: format!(
-                        "flex:1; height:{}px; background:{}; opacity:{};",
+                        "flex:1; min-width:0; height:{}px; background:{}; opacity:{};",
                         if drop_hovered { 2 } else { 1 },
                         if drop_hovered || selected { palette.accent } else { palette.border },
                         if drop_hovered || selected { "0.96" } else { "0.72" }
@@ -4065,7 +4114,7 @@ fn SidebarRow(
                 } else {
                     span {
                         style: format!(
-                            "font-size:10.5px; font-weight:700; letter-spacing:0.04em; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                            "min-width:0; font-size:10.5px; font-weight:700; letter-spacing:0.04em; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
                             if drop_hovered || selected { palette.accent } else { palette.muted }
                         ),
                         "{row.label}"
@@ -4073,7 +4122,7 @@ fn SidebarRow(
                 }
                 div {
                     style: format!(
-                        "flex:1; height:{}px; background:{}; opacity:{};",
+                        "flex:1; min-width:0; height:{}px; background:{}; opacity:{};",
                         if drop_hovered { 2 } else { 1 },
                         if drop_hovered || selected { palette.accent } else { palette.border },
                         if drop_hovered || selected { "0.96" } else { "0.72" }
@@ -4112,11 +4161,16 @@ fn SidebarRow(
         div {
             style: format!(
                 "width:100%; display:flex; flex-direction:column; align-items:stretch; gap:2px; \
-                 border:none; border-radius:12px; background:{}; padding:6px 9px 6px {}px; margin-bottom:2px; opacity:{}; cursor:default;",
+                 border:none; border-radius:12px; background:{}; padding:6px 9px 6px {}px; margin-bottom:2px; opacity:{}; cursor:default; box-sizing:border-box; min-width:0; overflow:hidden;",
                 background, indent, if dragging { "0.58" } else { "1" }
             ),
-            draggable: draggable,
+            draggable: false,
             onclick: move |evt| on_select.call(evt),
+            onmousedown: move |evt| {
+                if draggable && evt.trigger_button() == Some(MouseButton::Primary) {
+                    on_start_drag.call(evt);
+                }
+            },
             ondoubleclick: move |evt| on_begin_rename.call(evt),
             oncontextmenu: move |evt| {
                 evt.prevent_default();
@@ -4124,17 +4178,18 @@ fn SidebarRow(
                 let coords = evt.client_coordinates();
                 on_open_context_menu.call((coords.x, coords.y));
             },
-            ondragstart: move |evt| on_start_drag.call(evt),
-            ondragover: move |evt| {
-                evt.prevent_default();
-                on_drag_hover.call(evt);
+            onmousemove: move |evt| {
+                if evt.held_buttons().contains(MouseButton::Primary) {
+                    on_drag_hover.call(evt);
+                }
             },
-            ondragleave: move |evt| on_drag_leave.call(evt),
-            ondrop: move |evt| {
-                evt.prevent_default();
-                on_drop_into_row.call(evt);
+            onmouseleave: move |evt| on_drag_leave.call(evt),
+            onmouseup: move |evt| {
+                if evt.trigger_button() == Some(MouseButton::Primary) {
+                    on_drop_into_row.call(evt.clone());
+                    on_end_drag.call(evt);
+                }
             },
-            ondragend: move |evt| on_end_drag.call(evt),
             div {
                 style: "display:flex; align-items:center; justify-content:space-between; gap:8px;",
                 div {
@@ -6924,6 +6979,79 @@ mod tests {
             &["/home/pi/gh/notes/other-paper".to_string()],
             &target
         ));
+    }
+
+    #[test]
+    fn creation_context_for_paper_resolves_to_parent_folder() {
+        let folder = BrowserRow {
+            kind: BrowserRowKind::Group,
+            full_path: "/home/pi/gh/notes".to_string(),
+            label: "notes".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: Some(WorkspaceGroupKind::Folder),
+            session_title: None,
+            depth: 3,
+            host_label: String::new(),
+            descendant_sessions: 0,
+            expanded: true,
+            session_id: None,
+            session_cwd: None,
+        };
+        let paper = BrowserRow {
+            kind: BrowserRowKind::Document,
+            full_path: "/home/pi/gh/notes/paper-123".to_string(),
+            label: "Untitled paper".to_string(),
+            detail_label: String::new(),
+            document_kind: Some(WorkspaceDocumentKind::Note),
+            group_kind: None,
+            session_title: None,
+            depth: 4,
+            host_label: String::new(),
+            descendant_sessions: 0,
+            expanded: false,
+            session_id: None,
+            session_cwd: None,
+        };
+        let resolved = resolve_creation_context_row(&[folder.clone(), paper.clone()], &paper);
+        assert_eq!(resolved.full_path, folder.full_path);
+    }
+
+    #[test]
+    fn creation_context_for_separator_resolves_to_parent_folder() {
+        let folder = BrowserRow {
+            kind: BrowserRowKind::Group,
+            full_path: "/home/pi/gh/notes".to_string(),
+            label: "notes".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: Some(WorkspaceGroupKind::Folder),
+            session_title: None,
+            depth: 3,
+            host_label: String::new(),
+            descendant_sessions: 0,
+            expanded: true,
+            session_id: None,
+            session_cwd: None,
+        };
+        let separator = BrowserRow {
+            kind: BrowserRowKind::Separator,
+            full_path: "/home/pi/gh/notes/separator-123".to_string(),
+            label: "Separator".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: Some(WorkspaceGroupKind::Separator),
+            session_title: None,
+            depth: 4,
+            host_label: String::new(),
+            descendant_sessions: 0,
+            expanded: false,
+            session_id: None,
+            session_cwd: None,
+        };
+        let resolved =
+            resolve_creation_context_row(&[folder.clone(), separator.clone()], &separator);
+        assert_eq!(resolved.full_path, folder.full_path);
     }
 }
 
