@@ -22,7 +22,8 @@ use tracing::{info, warn};
 use yggterm_core::{
     AgentSessionProfile, AppSettings, BrowserRow, BrowserRowKind, InstallContext,
     SessionBrowserState, SessionNode, SessionStore, UiTheme, WorkspaceDocumentInput,
-    WorkspaceDocumentKind, check_for_update, save_settings_file, update_command_hint,
+    WorkspaceDocumentKind, WorkspaceGroupKind, check_for_update, save_settings_file,
+    update_command_hint,
 };
 use yggterm_platform::DockRect;
 use yggterm_server::{
@@ -516,6 +517,10 @@ impl ShellState {
                 self.browser.toggle_group(&row.full_path);
                 self.sync_browser_settings();
                 self.last_action = format!("toggled {}", row.label);
+            }
+            BrowserRowKind::Separator => {
+                self.context_menu_row = None;
+                self.last_action = format!("selected {}", row.label);
             }
             BrowserRowKind::Session | BrowserRowKind::Document => {
                 self.context_menu_row = None;
@@ -1228,6 +1233,9 @@ fn spawn_switch_agent_session_mode(mut state: Signal<ShellState>, path: String, 
 }
 
 fn spawn_start_group_session(mut state: Signal<ShellState>, row: BrowserRow, kind: SessionKind) {
+    if row.kind == BrowserRowKind::Separator || row.group_kind == Some(WorkspaceGroupKind::Separator) {
+        return;
+    }
     let cwd = group_session_cwd(&row);
     let title_hint = Some(group_session_title_hint(&row, kind));
     let pending = format!(
@@ -1241,21 +1249,28 @@ fn spawn_start_group_session(mut state: Signal<ShellState>, row: BrowserRow, kin
     });
 }
 
+fn preferred_agent_session_kind(settings: &AppSettings) -> SessionKind {
+    match settings.default_agent_profile {
+        AgentSessionProfile::CodexLiteLlm => SessionKind::CodexLiteLlm,
+        AgentSessionProfile::Codex => SessionKind::Codex,
+    }
+}
+
 fn session_kind_for_row(kind: BrowserRowKind) -> SessionKind {
     match kind {
         BrowserRowKind::Session => SessionKind::Codex,
         BrowserRowKind::Document => SessionKind::Document,
         BrowserRowKind::Group => SessionKind::Codex,
+        BrowserRowKind::Separator => SessionKind::Codex,
     }
 }
 
 fn session_kind_action_label(kind: SessionKind) -> &'static str {
     match kind {
-        SessionKind::Codex => "codex session",
-        SessionKind::CodexLiteLlm => "codex-litellm session",
-        SessionKind::Shell => "shell session",
+        SessionKind::Codex | SessionKind::CodexLiteLlm => "session",
+        SessionKind::Shell => "terminal",
         SessionKind::SshShell => "ssh session",
-        SessionKind::Document => "document",
+        SessionKind::Document => "paper",
     }
 }
 
@@ -1281,6 +1296,7 @@ fn merged_sidebar_rows(
         label: "live".to_string(),
         detail_label: String::new(),
         document_kind: None,
+        group_kind: None,
         session_title: None,
         depth: 0,
         host_label: String::new(),
@@ -1339,6 +1355,7 @@ fn push_live_group_rows<'a, I>(
         label: label.to_string(),
         detail_label: String::new(),
         document_kind: None,
+        group_kind: None,
         session_title: None,
         depth,
         host_label: "live".to_string(),
@@ -1359,6 +1376,7 @@ fn push_live_group_rows<'a, I>(
             label,
             detail_label: session.status_line.clone(),
             document_kind: None,
+            group_kind: None,
             session_title: Some(session.title.clone()),
             depth: depth + 1,
             host_label: "live".to_string(),
@@ -1613,23 +1631,6 @@ fn queue_new_document_for_row(state: Signal<ShellState>, row: BrowserRow) {
     );
 }
 
-fn queue_new_recipe_for_row(state: Signal<ShellState>, row: BrowserRow) {
-    let title = if row.kind == BrowserRowKind::Group {
-        format!("{} recipe", row.label)
-    } else {
-        "Untitled recipe".to_string()
-    };
-    let body = format!("# {title}\n\n```bash\n# commands to replay here\n```\n");
-    queue_new_workspace_document_for_row(
-        state,
-        row,
-        WorkspaceDocumentKind::TerminalRecipe,
-        &title,
-        body,
-        Some(Vec::new()),
-    );
-}
-
 fn queue_new_workspace_document_for_row(
     mut state: Signal<ShellState>,
     row: BrowserRow,
@@ -1737,7 +1738,7 @@ fn queue_new_group_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
             task::spawn_blocking(move || -> Result<(String, yggterm_core::SessionNode)> {
                 let store = SessionStore::open_or_init()?;
                 let virtual_path = new_group_virtual_path_for_row(&row_for_task);
-                store.save_group(&virtual_path, Some("New Group"))?;
+                store.save_group_with_kind(&virtual_path, Some("New Folder"), WorkspaceGroupKind::Folder)?;
                 Ok((virtual_path, store.load_codex_tree(&settings)?))
             })
             .await;
@@ -1752,28 +1753,93 @@ fn queue_new_group_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
                 shell.browser.select_path(selected_path.clone());
                 shell.sync_browser_settings();
                 shell.server_busy = false;
-                shell.last_action = format!("created group in {}", row.label);
+                shell.last_action = format!("added folder in {}", row.label);
                 shell.push_notification(
                     NotificationTone::Success,
-                    "Workspace Group Created",
-                    format!("Added a new virtual group under {}.", row.label),
+                    "Folder Added",
+                    format!("Added a new folder under {}.", row.label),
                 );
             }
             Ok(Err(error)) => {
                 shell.server_busy = false;
-                shell.last_action = format!("group creation failed: {error}");
+                shell.last_action = format!("folder creation failed: {error}");
                 shell.push_notification(
                     NotificationTone::Error,
-                    "Group Creation Failed",
+                    "Folder Creation Failed",
                     error.to_string(),
                 );
             }
             Err(error) => {
                 shell.server_busy = false;
-                shell.last_action = format!("group task failed: {error}");
+                shell.last_action = format!("folder task failed: {error}");
                 shell.push_notification(
                     NotificationTone::Error,
-                    "Group Task Failed",
+                    "Folder Task Failed",
+                    error.to_string(),
+                );
+            }
+        });
+    });
+}
+
+fn queue_new_separator_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
+    if row.kind == BrowserRowKind::Separator || row.group_kind == Some(WorkspaceGroupKind::Separator) {
+        return;
+    }
+    state.with_mut(|shell| {
+        shell.server_busy = true;
+        shell.last_action = format!("adding separator in {}", row.label);
+        shell.close_context_menu();
+    });
+
+    let settings = state.read().settings.clone();
+    spawn(async move {
+        let row_for_task = row.clone();
+        let outcome =
+            task::spawn_blocking(move || -> Result<(String, yggterm_core::SessionNode)> {
+                let store = SessionStore::open_or_init()?;
+                let virtual_path = new_separator_virtual_path_for_row(&row_for_task);
+                store.save_group_with_kind(
+                    &virtual_path,
+                    Some("Separator"),
+                    WorkspaceGroupKind::Separator,
+                )?;
+                Ok((virtual_path, store.load_codex_tree(&settings)?))
+            })
+            .await;
+
+        state.with_mut(|shell| match outcome {
+            Ok(Ok((selected_path, browser_tree))) => {
+                let expanded_paths = shell.browser.expanded_paths();
+                shell.browser = SessionBrowserState::new(browser_tree);
+                shell
+                    .browser
+                    .restore_ui_state(&expanded_paths, Some(&selected_path));
+                shell.browser.select_path(selected_path.clone());
+                shell.sync_browser_settings();
+                shell.server_busy = false;
+                shell.last_action = format!("added separator in {}", row.label);
+                shell.push_notification(
+                    NotificationTone::Success,
+                    "Separator Added",
+                    format!("Added a separator under {}.", row.label),
+                );
+            }
+            Ok(Err(error)) => {
+                shell.server_busy = false;
+                shell.last_action = format!("separator creation failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "Separator Creation Failed",
+                    error.to_string(),
+                );
+            }
+            Err(error) => {
+                shell.server_busy = false;
+                shell.last_action = format!("separator task failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "Separator Task Failed",
                     error.to_string(),
                 );
             }
@@ -2171,6 +2237,9 @@ fn new_group_virtual_path_for_row(row: &BrowserRow) -> String {
         BrowserRowKind::Group if row.full_path == "local" => "/workspace".to_string(),
         BrowserRowKind::Group if row.full_path.starts_with("__live_") => "/workspace".to_string(),
         BrowserRowKind::Group => row.full_path.clone(),
+        BrowserRowKind::Separator => {
+            parent_virtual_path(&row.full_path).unwrap_or_else(|| "/workspace".to_string())
+        }
         BrowserRowKind::Session => row
             .session_cwd
             .clone()
@@ -2183,7 +2252,30 @@ fn new_group_virtual_path_for_row(row: &BrowserRow) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
-    format!("{}/group-{}", base.trim_end_matches('/'), stamp)
+    format!("{}/folder-{}", base.trim_end_matches('/'), stamp)
+}
+
+fn new_separator_virtual_path_for_row(row: &BrowserRow) -> String {
+    let base = match row.kind {
+        BrowserRowKind::Group if row.full_path == "local" => "/workspace".to_string(),
+        BrowserRowKind::Group if row.full_path.starts_with("__live_") => "/workspace".to_string(),
+        BrowserRowKind::Group => row.full_path.clone(),
+        BrowserRowKind::Separator => {
+            parent_virtual_path(&row.full_path).unwrap_or_else(|| "/workspace".to_string())
+        }
+        BrowserRowKind::Session => row
+            .session_cwd
+            .clone()
+            .unwrap_or_else(|| "/workspace".to_string()),
+        BrowserRowKind::Document => {
+            parent_virtual_path(&row.full_path).unwrap_or_else(|| "/workspace".to_string())
+        }
+    };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    format!("{}/separator-{}", base.trim_end_matches('/'), stamp)
 }
 
 fn moved_document_virtual_path(document_row: &BrowserRow, target_group: &BrowserRow) -> String {
@@ -2220,6 +2312,7 @@ fn document_parent_base(row: &BrowserRow) -> Option<String> {
     match row.kind {
         BrowserRowKind::Session => row.session_cwd.clone(),
         BrowserRowKind::Document => parent_virtual_path(&row.full_path),
+        BrowserRowKind::Separator => parent_virtual_path(&row.full_path),
         BrowserRowKind::Group => {
             if row.full_path.starts_with("__live_") {
                 Some("/documents".to_string())
@@ -2635,6 +2728,7 @@ fn app() -> Element {
     let sidebar_snapshot = snapshot.clone();
     let main_snapshot = snapshot.clone();
     let metadata_snapshot = snapshot.clone();
+    let preferred_agent_kind = preferred_agent_session_kind(&snapshot.settings);
     let maximized = snapshot.maximized;
     let shell_radius = if maximized { 0 } else { 11 };
 
@@ -2669,17 +2763,17 @@ fn app() -> Element {
                     style: "display: flex; flex: 1; min-height: 0; overflow: hidden;",
                     Sidebar {
                         snapshot: sidebar_snapshot,
-                        on_start_codex: move |_| spawn_server_snapshot_action(
+                        on_start_session: move |_| spawn_server_snapshot_action(
                             state,
-                            "starting codex session".to_string(),
-                            move |endpoint| start_local_session(&endpoint, SessionKind::Codex),
+                            "starting session".to_string(),
+                            move |endpoint| start_local_session(&endpoint, preferred_agent_kind),
                         ),
-                        on_start_shell: move |_| spawn_server_snapshot_action(
+                        on_start_terminal: move |_| spawn_server_snapshot_action(
                             state,
-                            "starting local shell".to_string(),
+                            "starting terminal".to_string(),
                             move |endpoint| start_local_session(&endpoint, SessionKind::Shell),
                         ),
-                        on_create_document: move |_| queue_new_document(state),
+                        on_create_paper: move |_| queue_new_document(state),
                         on_select_row: move |(row, extend_range): (BrowserRow, bool)| {
                             state.with_mut(|shell| shell.select_tree_row(&row, extend_range));
                             if extend_range && row.kind == BrowserRowKind::Document {
@@ -2695,7 +2789,7 @@ fn app() -> Element {
                             }
                             let should_generate = row.kind == BrowserRowKind::Session && row.session_title.is_none();
                             match row.kind {
-                                BrowserRowKind::Group => state.with_mut(|shell| shell.select_row(&row)),
+                                BrowserRowKind::Group | BrowserRowKind::Separator => state.with_mut(|shell| shell.select_row(&row)),
                                 BrowserRowKind::Session | BrowserRowKind::Document => spawn_open_session_row(state, row.clone()),
                             }
                             if should_generate {
@@ -2801,7 +2895,10 @@ fn app() -> Element {
                         on_close: move |_| state.with_mut(|shell| shell.close_context_menu()),
                         on_create_group_codex: {
                             let row = row.clone();
-                            move |_| spawn_start_group_session(state, row.clone(), SessionKind::Codex)
+                            let preferred_agent_kind = preferred_agent_kind;
+                            move |_| {
+                                spawn_start_group_session(state, row.clone(), preferred_agent_kind)
+                            }
                         },
                         on_create_group: {
                             let row = row.clone();
@@ -2817,7 +2914,7 @@ fn app() -> Element {
                         },
                         on_create_group_recipe: {
                             let row = row.clone();
-                            move |_| queue_new_recipe_for_row(state, row.clone())
+                            move |_| queue_new_separator_for_row(state, row.clone())
                         },
                         on_move_selected_document_here: {
                             let row = row.clone();
@@ -3300,9 +3397,9 @@ fn ResizeHandle(style: String, direction: ResizeDirection) -> Element {
 #[component]
 fn Sidebar(
     snapshot: RenderSnapshot,
-    on_start_codex: EventHandler<MouseEvent>,
-    on_start_shell: EventHandler<MouseEvent>,
-    on_create_document: EventHandler<MouseEvent>,
+    on_start_session: EventHandler<MouseEvent>,
+    on_start_terminal: EventHandler<MouseEvent>,
+    on_create_paper: EventHandler<MouseEvent>,
     on_select_row: EventHandler<(BrowserRow, bool)>,
     on_delete_selected_documents: EventHandler<KeyboardEvent>,
     on_open_context_menu: EventHandler<(BrowserRow, (f64, f64))>,
@@ -3337,19 +3434,19 @@ fn Sidebar(
             div {
                 style: "padding:12px 12px 0 12px; display:flex; gap:8px;",
                 SidebarQuickAction {
-                    label: "+Codex".to_string(),
+                    label: "+Session".to_string(),
                     palette: snapshot.palette,
-                    onclick: on_start_codex,
+                    onclick: on_start_session,
                 }
                 SidebarQuickAction {
-                    label: "+Shell".to_string(),
+                    label: "+Terminal".to_string(),
                     palette: snapshot.palette,
-                    onclick: on_start_shell,
+                    onclick: on_start_terminal,
                 }
                 SidebarQuickAction {
-                    label: "+Doc".to_string(),
+                    label: "+Paper".to_string(),
                     palette: snapshot.palette,
-                    onclick: on_create_document,
+                    onclick: on_create_paper,
                 }
             }
             div {
@@ -3390,6 +3487,33 @@ fn SidebarRow(
     on_open_context_menu: EventHandler<(f64, f64)>,
 ) -> Element {
     let indent = row.depth * 12 + 12;
+    if row.kind == BrowserRowKind::Separator {
+        return rsx! {
+            button {
+                style: format!(
+                    "width:100%; display:flex; align-items:center; gap:10px; border:none; background:transparent; \
+                     padding:8px 9px 8px {}px; margin:4px 0;",
+                    indent
+                ),
+                onclick: move |evt| on_select.call(evt),
+                oncontextmenu: move |evt| {
+                    evt.prevent_default();
+                    let coords = evt.client_coordinates();
+                    on_open_context_menu.call((coords.x, coords.y));
+                },
+                div {
+                    style: format!("flex:1; height:1px; background:{}; opacity:0.72;", palette.border),
+                }
+                span {
+                    style: format!("font-size:10px; font-weight:700; letter-spacing:0.08em; text-transform:uppercase; color:{};", palette.muted),
+                    "{row.label}"
+                }
+                div {
+                    style: format!("flex:1; height:1px; background:{}; opacity:0.72;", palette.border),
+                }
+            }
+        };
+    }
     let background = if selected {
         palette.accent_soft
     } else if row.kind == BrowserRowKind::Group && row.depth == 0 {
@@ -3488,6 +3612,15 @@ fn SidebarQuickAction(
 
 #[component]
 fn TreeIcon(row: BrowserRow) -> Element {
+    if row.kind == BrowserRowKind::Separator {
+        return rsx! {
+            span {
+                style: "display:inline-flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; line-height:1;",
+                "—"
+            }
+        };
+    }
+
     if row.kind == BrowserRowKind::Session {
         if row.full_path.starts_with("codex-litellm://") {
             return rsx! {
@@ -5339,7 +5472,10 @@ fn ContextMenuOverlay(
                     style: format!("padding:6px 12px 8px 12px; font-size:11px; font-weight:700; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.muted),
                     "{row.label}"
                 }
-                if row.kind == BrowserRowKind::Group && !row.full_path.starts_with("__live_") {
+                if (row.kind == BrowserRowKind::Group || row.kind == BrowserRowKind::Separator)
+                    && !row.full_path.starts_with("__live_")
+                    && row.group_kind != Some(WorkspaceGroupKind::Separator)
+                {
                     if can_move_selected_document {
                         button {
                             style: context_menu_action_style(palette, true),
@@ -5350,38 +5486,41 @@ fn ContextMenuOverlay(
                     button {
                         style: context_menu_action_style(palette, false),
                         onclick: move |evt| on_create_group.call(evt),
-                        "New Space"
+                        "Add Folder"
                     }
                     button {
                         style: context_menu_action_style(palette, false),
                         onclick: move |evt| on_create_group_codex.call(evt),
-                        "New Codex Session"
+                        "New Session"
                     }
                     button {
                         style: context_menu_action_style(palette, false),
                         onclick: move |evt| on_create_group_shell.call(evt),
-                        "New Shell Session"
+                        "New Terminal"
                     }
                     button {
                         style: context_menu_action_style(palette, true),
                         onclick: move |evt| on_create_group_document.call(evt),
                         "New Paper"
                     }
+                    div {
+                        style: format!("height:1px; margin:6px 4px; background:{}; opacity:0.7;", palette.border),
+                    }
                     button {
                         style: context_menu_action_style(palette, false),
                         onclick: move |evt| on_create_group_recipe.call(evt),
-                        "New Runbook"
+                        "Add Separator"
                     }
                 } else if row.kind == BrowserRowKind::Session {
                     button {
                         style: context_menu_action_style(palette, false),
                         onclick: move |evt| on_create_note.call(evt),
-                        "Create Paper"
+                        "New Paper"
                     }
                     button {
                         style: context_menu_action_style(palette, false),
                         onclick: move |evt| on_create_recipe.call(evt),
-                        "Create Runbook"
+                        "New Terminal Plan"
                     }
                 }
                 if row.kind == BrowserRowKind::Session {

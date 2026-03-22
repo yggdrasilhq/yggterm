@@ -26,7 +26,8 @@ pub use transcript::{
 };
 pub use workspace::{
     WorkspaceDocument, WorkspaceDocumentInput, WorkspaceDocumentKind, WorkspaceDocumentSummary,
-    WorkspaceGroup, WorkspaceStore, default_document_title, normalize_virtual_document_path,
+    WorkspaceGroup, WorkspaceGroupKind, WorkspaceStore, default_document_title,
+    normalize_virtual_document_path,
     normalize_virtual_group_path,
 };
 
@@ -42,6 +43,7 @@ pub struct SessionNode {
     pub name: String,
     pub title: Option<String>,
     pub document_kind: Option<WorkspaceDocumentKind>,
+    pub group_kind: Option<WorkspaceGroupKind>,
     pub path: PathBuf,
     pub children: Vec<SessionNode>,
     pub session_id: Option<String>,
@@ -200,6 +202,15 @@ impl SessionStore {
 
     pub fn save_group(&self, virtual_path: &str, title: Option<&str>) -> Result<WorkspaceGroup> {
         WorkspaceStore::open(&self.home)?.put_group(virtual_path, title)
+    }
+
+    pub fn save_group_with_kind(
+        &self,
+        virtual_path: &str,
+        title: Option<&str>,
+        kind: WorkspaceGroupKind,
+    ) -> Result<WorkspaceGroup> {
+        WorkspaceStore::open(&self.home)?.put_group_with_kind(virtual_path, title, kind)
     }
 
     pub fn move_document(
@@ -405,6 +416,7 @@ fn walk_directory_tree(path: &Path, include_codex_files: bool) -> Result<Session
                 name: codex_leaf_label(&entry_path),
                 title: None,
                 document_kind: None,
+                group_kind: None,
                 path: entry_path,
                 children: Vec::new(),
                 session_id: None,
@@ -419,6 +431,7 @@ fn walk_directory_tree(path: &Path, include_codex_files: bool) -> Result<Session
         name,
         title: None,
         document_kind: None,
+        group_kind: None,
         path: path.to_path_buf(),
         children,
         session_id: None,
@@ -502,6 +515,7 @@ struct CodexBrowserTreeNode {
     name: String,
     full_path: String,
     explicit_title: Option<String>,
+    group_kind: Option<WorkspaceGroupKind>,
     project: Option<CodexProjectBucket>,
     children: BTreeMap<String, CodexBrowserTreeNode>,
 }
@@ -540,6 +554,7 @@ fn build_codex_browser_tree(
         name: String::from("local [ok]"),
         full_path: String::from("local"),
         explicit_title: None,
+        group_kind: Some(WorkspaceGroupKind::Folder),
         project: None,
         children: BTreeMap::new(),
     };
@@ -756,6 +771,7 @@ fn insert_codex_browser_path(
             name: segment.clone(),
             full_path: child_path,
             explicit_title: None,
+            group_kind: None,
             ..Default::default()
         });
     insert_codex_browser_path(child, &segments[1..], project);
@@ -773,6 +789,7 @@ fn insert_workspace_group_path(
 ) {
     if segments.is_empty() {
         node.explicit_title = Some(group.title.clone());
+        node.group_kind = Some(group.kind);
         return;
     }
 
@@ -785,6 +802,7 @@ fn insert_workspace_group_path(
             name: segment.clone(),
             full_path: child_path,
             explicit_title: None,
+            group_kind: None,
             ..Default::default()
         });
     insert_workspace_group_path(child, &segments[1..], group);
@@ -858,6 +876,7 @@ fn codex_browser_tree_to_session_node(node: &CodexBrowserTreeNode) -> SessionNod
             name: short_session_id(&session.session_id),
             title: session.generated_title.clone(),
             document_kind: None,
+            group_kind: None,
             path: session.file_path.clone(),
             children: Vec::new(),
             session_id: Some(session.session_id.clone()),
@@ -868,6 +887,7 @@ fn codex_browser_tree_to_session_node(node: &CodexBrowserTreeNode) -> SessionNod
             name: document.title.clone(),
             title: Some(document.title.clone()),
             document_kind: Some(document.kind),
+            group_kind: None,
             path: PathBuf::from(document.virtual_path.clone()),
             children: Vec::new(),
             session_id: Some(document.id.clone()),
@@ -887,6 +907,7 @@ fn codex_browser_tree_to_session_node(node: &CodexBrowserTreeNode) -> SessionNod
         name: node.name.clone(),
         title: node.explicit_title.clone(),
         document_kind: None,
+        group_kind: node.group_kind,
         path: PathBuf::from(node.full_path.clone()),
         children,
         session_id: None,
