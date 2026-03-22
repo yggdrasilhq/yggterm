@@ -253,6 +253,14 @@ enum WorkspaceDropPlacement {
     AfterPath(String),
 }
 
+#[derive(Debug, Clone)]
+struct WorkspaceReorderPlanItem {
+    kind: BrowserRowKind,
+    from_path: String,
+    temp_path: String,
+    final_path: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ContextMenuPlacement {
     left: Option<f64>,
@@ -2334,10 +2342,19 @@ fn queue_move_selected_items_to_group(
     placement: WorkspaceDropPlacement,
     target_label: String,
 ) {
-    let selected_rows = state.read().selected_workspace_rows();
+    let (selected_rows, reorder_plan) = {
+        let shell = state.read();
+        let selected_rows = shell.selected_workspace_rows();
+        let rows = merged_sidebar_rows(shell.browser.rows(), &shell.server.live_sessions());
+        let reorder_plan = build_workspace_reorder_plan(&rows, &selected_rows, &placement);
+        (selected_rows, reorder_plan)
+    };
     if selected_rows.is_empty() {
         return;
     }
+    let Some(reorder_plan) = reorder_plan else {
+        return;
+    };
 
     state.with_mut(|shell| {
         shell.server_busy = true;
@@ -2357,27 +2374,11 @@ fn queue_move_selected_items_to_group(
 
     let settings = state.read().settings.clone();
     spawn(async move {
-        let selected_for_task = selected_rows.clone();
-        let placement_for_task = placement.clone();
+        let reorder_plan_for_task = reorder_plan.clone();
         let outcome = task::spawn_blocking(
             move || -> Result<(Vec<String>, yggterm_core::SessionNode)> {
                 let store = SessionStore::open_or_init()?;
-                let mut moved_paths = Vec::new();
-                for (ix, row) in selected_for_task.iter().enumerate() {
-                    let destination =
-                        moved_workspace_item_virtual_path_with_index(row, &placement_for_task, ix);
-                    match row.kind {
-                        BrowserRowKind::Document => {
-                            let document = store.move_document(&row.full_path, &destination)?;
-                            moved_paths.push(document.virtual_path);
-                        }
-                        BrowserRowKind::Group | BrowserRowKind::Separator => {
-                            let group = store.move_group(&row.full_path, &destination)?;
-                            moved_paths.push(group.virtual_path);
-                        }
-                        BrowserRowKind::Session => {}
-                    }
-                }
+                let moved_paths = apply_workspace_reorder_plan(&store, &reorder_plan_for_task)?;
                 let browser_tree = store.load_codex_tree(&settings)?;
                 Ok((moved_paths, browser_tree))
             },
@@ -2898,25 +2899,6 @@ fn canonical_workspace_leaf_name(path: &str) -> String {
     }
 }
 
-fn moved_workspace_item_virtual_path_with_index(
-    item_row: &BrowserRow,
-    placement: &WorkspaceDropPlacement,
-    index: usize,
-) -> String {
-    let leaf = canonical_workspace_leaf_name(&item_row.full_path);
-    let indexed_leaf = format!("{index:04}-{leaf}");
-    match placement {
-        WorkspaceDropPlacement::TopOfGroup(group_path) => {
-            join_workspace_child_path(group_path, &format!("!{indexed_leaf}"))
-        }
-        WorkspaceDropPlacement::AfterPath(anchor_path) => {
-            let base = workspace_parent_path(anchor_path).unwrap_or_else(|| "/workspace".to_string());
-            let anchor = canonical_workspace_leaf_name(anchor_path);
-            join_workspace_child_path(&base, &format!("{anchor}~{indexed_leaf}"))
-        }
-    }
-}
-
 fn join_workspace_child_path(base: &str, leaf: &str) -> String {
     let trimmed = base.trim_end_matches('/');
     if trimmed.is_empty() || trimmed == "/" {
@@ -3007,6 +2989,127 @@ fn context_menu_drop_placement(row: &BrowserRow) -> Option<WorkspaceDropPlacemen
         }
         BrowserRowKind::Group | BrowserRowKind::Session => None,
     }
+}
+
+fn ordered_workspace_item_virtual_path(parent: &str, row: &BrowserRow, index: usize) -> String {
+    let leaf = canonical_workspace_leaf_name(&row.full_path);
+    join_workspace_child_path(parent, &format!("{index:04}-{leaf}"))
+}
+
+fn staging_workspace_item_virtual_path(parent: &str, row: &BrowserRow, token: &str, index: usize) -> String {
+    let leaf = canonical_workspace_leaf_name(&row.full_path);
+    join_workspace_child_path(parent, &format!("__yggtmp-{token}-{index:04}-{leaf}"))
+}
+
+fn build_workspace_reorder_plan(
+    rows: &[BrowserRow],
+    selected_rows: &[BrowserRow],
+    placement: &WorkspaceDropPlacement,
+) -> Option<Vec<WorkspaceReorderPlanItem>> {
+    if selected_rows.is_empty() {
+        return Some(Vec::new());
+    }
+    let moved_set = selected_rows
+        .iter()
+        .map(|row| row.full_path.clone())
+        .collect::<HashSet<_>>();
+    let target_parent = match placement {
+        WorkspaceDropPlacement::TopOfGroup(path) => path.clone(),
+        WorkspaceDropPlacement::AfterPath(path) => workspace_parent_path(path)?,
+    };
+
+    let mut siblings_by_parent = BTreeMap::<String, Vec<BrowserRow>>::new();
+    for row in rows.iter().filter(|row| is_workspace_row(row)) {
+        if let Some(parent) = direct_workspace_parent_path(row) {
+            siblings_by_parent.entry(parent).or_default().push(row.clone());
+        }
+    }
+
+    for siblings in siblings_by_parent.values_mut() {
+        siblings.retain(|row| !moved_set.contains(&row.full_path));
+    }
+
+    let moved_rows = selected_rows.to_vec();
+    let target_siblings = siblings_by_parent.entry(target_parent.clone()).or_default();
+    let insert_at = match placement {
+        WorkspaceDropPlacement::TopOfGroup(_) => 0,
+        WorkspaceDropPlacement::AfterPath(anchor) => target_siblings
+            .iter()
+            .position(|row| row.full_path == *anchor)
+            .map(|index| index + 1)
+            .unwrap_or(target_siblings.len()),
+    };
+    for (offset, row) in moved_rows.iter().cloned().enumerate() {
+        target_siblings.insert(insert_at + offset, row);
+    }
+
+    let mut affected_parents = selected_rows
+        .iter()
+        .filter_map(direct_workspace_parent_path)
+        .collect::<HashSet<_>>();
+    affected_parents.insert(target_parent);
+
+    let temp_token = unique_workspace_leaf_suffix();
+    let mut plan = Vec::new();
+    let mut temp_index = 0usize;
+
+    for parent in affected_parents {
+        let Some(siblings) = siblings_by_parent.get(&parent) else {
+            continue;
+        };
+        for (index, row) in siblings.iter().enumerate() {
+            let final_path = ordered_workspace_item_virtual_path(&parent, row, index);
+            if final_path == row.full_path {
+                continue;
+            }
+            let original_parent =
+                direct_workspace_parent_path(row).unwrap_or_else(|| parent.clone());
+            let temp_path =
+                staging_workspace_item_virtual_path(&original_parent, row, &temp_token, temp_index);
+            temp_index += 1;
+            plan.push(WorkspaceReorderPlanItem {
+                kind: row.kind,
+                from_path: row.full_path.clone(),
+                temp_path,
+                final_path,
+            });
+        }
+    }
+
+    Some(plan)
+}
+
+fn apply_workspace_reorder_plan(
+    store: &SessionStore,
+    plan: &[WorkspaceReorderPlanItem],
+) -> Result<Vec<String>> {
+    for item in plan {
+        match item.kind {
+            BrowserRowKind::Document => {
+                store.move_document(&item.from_path, &item.temp_path)?;
+            }
+            BrowserRowKind::Group | BrowserRowKind::Separator => {
+                store.move_group(&item.from_path, &item.temp_path)?;
+            }
+            BrowserRowKind::Session => {}
+        }
+    }
+
+    let mut moved_paths = Vec::new();
+    for item in plan {
+        match item.kind {
+            BrowserRowKind::Document => {
+                let document = store.move_document(&item.temp_path, &item.final_path)?;
+                moved_paths.push(document.virtual_path);
+            }
+            BrowserRowKind::Group | BrowserRowKind::Separator => {
+                let group = store.move_group(&item.temp_path, &item.final_path)?;
+                moved_paths.push(group.virtual_path);
+            }
+            BrowserRowKind::Session => {}
+        }
+    }
+    Ok(moved_paths)
 }
 
 fn is_workspace_row(row: &BrowserRow) -> bool {
@@ -7598,7 +7701,7 @@ mod tests {
     }
 
     #[test]
-    fn moved_workspace_item_path_for_document_target_anchors_after_target() {
+    fn ordered_workspace_item_path_uses_flat_index_prefix() {
         let item = BrowserRow {
             kind: BrowserRowKind::Document,
             full_path: "/home/pi/gh/notes/paper-a".to_string(),
@@ -7614,13 +7717,9 @@ mod tests {
             session_id: Some("paper-a-id".to_string()),
             session_cwd: Some("/home/pi/gh/notes".to_string()),
         };
-        let destination = moved_workspace_item_virtual_path_with_index(
-            &item,
-            &WorkspaceDropPlacement::AfterPath("/home/pi/gh/notes/paper-b".to_string()),
-            0,
-        );
+        let destination = ordered_workspace_item_virtual_path("/home/pi/gh/notes", &item, 0);
 
-        assert_eq!(destination, "/home/pi/gh/notes/paper-b~0000-paper-a");
+        assert_eq!(destination, "/home/pi/gh/notes/0000-paper-a");
     }
 
     #[test]
