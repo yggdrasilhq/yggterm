@@ -225,6 +225,22 @@ impl SessionStore {
         WorkspaceStore::open(&self.home)?.delete_documents(virtual_paths)
     }
 
+    pub fn move_group(
+        &self,
+        from_virtual_path: &str,
+        to_virtual_path: &str,
+    ) -> Result<WorkspaceGroup> {
+        WorkspaceStore::open(&self.home)?.move_group(from_virtual_path, to_virtual_path)
+    }
+
+    pub fn delete_workspace_items(
+        &self,
+        document_paths: &[String],
+        group_paths: &[String],
+    ) -> Result<usize> {
+        WorkspaceStore::open(&self.home)?.delete_workspace_items(document_paths, group_paths)
+    }
+
     pub fn save_document(
         &self,
         virtual_path: &str,

@@ -109,6 +109,9 @@ struct ShellState {
     last_terminal_debug: String,
     generated_precis: BTreeMap<String, String>,
     precis_requests_in_flight: HashSet<String>,
+    drag_paths: Vec<String>,
+    drag_hover_target: Option<String>,
+    pending_delete: Option<PendingDeleteDialog>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -157,6 +160,14 @@ struct ToastNotification {
     created_at_ms: u64,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct PendingDeleteDialog {
+    document_paths: Vec<String>,
+    group_paths: Vec<String>,
+    labels: Vec<String>,
+    hard_delete: bool,
+}
+
 #[derive(Clone, PartialEq)]
 struct RenderSnapshot {
     palette: Palette,
@@ -190,6 +201,9 @@ struct RenderSnapshot {
     pending_update_restart: Option<PendingUpdateRestart>,
     last_terminal_debug: String,
     active_precis: Option<String>,
+    drag_paths: Vec<String>,
+    drag_hover_target: Option<String>,
+    pending_delete: Option<PendingDeleteDialog>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -315,6 +329,9 @@ impl ShellState {
             last_terminal_debug: "terminal debug idle".to_string(),
             generated_precis: BTreeMap::new(),
             precis_requests_in_flight: HashSet::new(),
+            drag_paths: Vec::new(),
+            drag_hover_target: None,
+            pending_delete: None,
         };
         if let Some(path) = state.browser.selected_path().map(ToOwned::to_owned) {
             state.selected_tree_paths.insert(path.clone());
@@ -380,6 +397,9 @@ impl ShellState {
                 .server
                 .active_session()
                 .and_then(|session| self.generated_precis.get(&session.session_path).cloned()),
+            drag_paths: self.drag_paths.clone(),
+            drag_hover_target: self.drag_hover_target.clone(),
+            pending_delete: self.pending_delete.clone(),
         }
     }
 
@@ -644,7 +664,7 @@ impl ShellState {
     }
 
     fn select_tree_row(&mut self, row: &BrowserRow, extend_range: bool) {
-        if extend_range && row.kind == BrowserRowKind::Document {
+        if extend_range && is_workspace_row(row) {
             self.extend_tree_selection(row);
             return;
         }
@@ -679,7 +699,7 @@ impl ShellState {
         };
         self.selected_tree_paths.clear();
         for candidate in rows.iter().skip(start).take(end - start + 1) {
-            if candidate.kind == BrowserRowKind::Document {
+            if is_workspace_row(candidate) {
                 self.selected_tree_paths.insert(candidate.full_path.clone());
             }
         }
@@ -689,13 +709,92 @@ impl ShellState {
         self.browser.select_path(row.full_path.clone());
     }
 
-    fn selected_document_paths(&self) -> Vec<String> {
+    fn selected_workspace_rows(&self) -> Vec<BrowserRow> {
         let rows = merged_sidebar_rows(self.browser.rows(), &self.server.live_sessions());
-        rows.into_iter()
-            .filter(|row| row.kind == BrowserRowKind::Document)
+        let selected = rows
+            .into_iter()
             .filter(|row| self.selected_tree_paths.contains(&row.full_path))
-            .map(|row| row.full_path)
+            .filter(is_workspace_row)
+            .collect::<Vec<_>>();
+        selected
+            .iter()
+            .filter(|candidate| {
+                !selected.iter().any(|other| {
+                other.full_path != candidate.full_path
+                    && workspace_path_contains(&other.full_path, &candidate.full_path)
+                })
+            })
+            .cloned()
             .collect()
+    }
+
+    fn selected_workspace_delete_paths(&self) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let rows = self.selected_workspace_rows();
+        let mut document_paths = Vec::new();
+        let mut group_paths = Vec::new();
+        let mut labels = Vec::new();
+        for row in rows {
+            labels.push(row.label.clone());
+            match row.kind {
+                BrowserRowKind::Document => document_paths.push(row.full_path),
+                BrowserRowKind::Group | BrowserRowKind::Separator => group_paths.push(row.full_path),
+                BrowserRowKind::Session => {}
+            }
+        }
+        (document_paths, group_paths, labels)
+    }
+
+    fn begin_drag(&mut self, row: &BrowserRow) {
+        if !is_workspace_row(row) {
+            self.drag_paths.clear();
+            self.drag_hover_target = None;
+            return;
+        }
+        if !self.selected_tree_paths.contains(&row.full_path) {
+            self.selected_tree_paths.clear();
+            self.selected_tree_paths.insert(row.full_path.clone());
+            self.selection_anchor = Some(row.full_path.clone());
+            self.browser.select_path(row.full_path.clone());
+        }
+        self.drag_paths = self
+            .selected_workspace_rows()
+            .into_iter()
+            .map(|candidate| candidate.full_path)
+            .collect();
+        self.drag_hover_target = None;
+    }
+
+    fn set_drag_hover_target(&mut self, row: &BrowserRow) {
+        self.drag_hover_target = valid_drop_target(self.drag_paths.as_slice(), row)
+            .then(|| row.full_path.clone());
+    }
+
+    fn clear_drag_state(&mut self) {
+        self.drag_paths.clear();
+        self.drag_hover_target = None;
+    }
+
+    fn open_delete_dialog(&mut self, hard_delete: bool) {
+        let (document_paths, group_paths, labels) = self.selected_workspace_delete_paths();
+        if document_paths.is_empty() && group_paths.is_empty() {
+            return;
+        }
+        self.pending_delete = Some(PendingDeleteDialog {
+            document_paths,
+            group_paths,
+            labels,
+            hard_delete,
+        });
+        self.close_context_menu();
+        self.last_action = if hard_delete {
+            "deleting selected items".to_string()
+        } else {
+            "confirm delete".to_string()
+        };
+    }
+
+    fn cancel_delete_dialog(&mut self) {
+        self.pending_delete = None;
     }
 
     fn generate_session_titles(&mut self) {
@@ -1847,74 +1946,92 @@ fn queue_new_separator_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
     });
 }
 
-fn queue_move_selected_document_to_group(mut state: Signal<ShellState>, target_group: BrowserRow) {
-    let Some(selected_row) = state.read().browser.selected_row().cloned() else {
+fn queue_move_selected_items_to_group(mut state: Signal<ShellState>, target_group: BrowserRow) {
+    if !valid_drop_target(&state.read().drag_paths, &target_group)
+        && !is_drop_target_row(&target_group)
+    {
         return;
-    };
-    if selected_row.kind != BrowserRowKind::Document || target_group.kind != BrowserRowKind::Group {
+    }
+    let selected_rows = state.read().selected_workspace_rows();
+    if selected_rows.is_empty() {
         return;
     }
 
     state.with_mut(|shell| {
         shell.server_busy = true;
-        shell.last_action = format!("moving {} to {}", selected_row.label, target_group.label);
+        shell.last_action = format!("moving {} item(s) to {}", selected_rows.len(), target_group.label);
         shell.close_context_menu();
+        shell.drag_hover_target = None;
     });
 
     let settings = state.read().settings.clone();
     spawn(async move {
-        let selected_for_task = selected_row.clone();
+        let selected_for_task = selected_rows.clone();
         let target_for_task = target_group.clone();
         let outcome = task::spawn_blocking(
-            move || -> Result<(yggterm_core::WorkspaceDocument, yggterm_core::SessionNode)> {
+            move || -> Result<(Vec<String>, yggterm_core::SessionNode)> {
                 let store = SessionStore::open_or_init()?;
-                let destination = moved_document_virtual_path(&selected_for_task, &target_for_task);
-                let document = store.move_document(&selected_for_task.full_path, &destination)?;
+                let mut moved_paths = Vec::new();
+                for row in &selected_for_task {
+                    let destination = moved_workspace_item_virtual_path(row, &target_for_task);
+                    match row.kind {
+                        BrowserRowKind::Document => {
+                            let document = store.move_document(&row.full_path, &destination)?;
+                            moved_paths.push(document.virtual_path);
+                        }
+                        BrowserRowKind::Group | BrowserRowKind::Separator => {
+                            let group = store.move_group(&row.full_path, &destination)?;
+                            moved_paths.push(group.virtual_path);
+                        }
+                        BrowserRowKind::Session => {}
+                    }
+                }
                 let browser_tree = store.load_codex_tree(&settings)?;
-                Ok((document, browser_tree))
+                Ok((moved_paths, browser_tree))
             },
         )
         .await;
 
         state.with_mut(|shell| match outcome {
-            Ok(Ok((document, browser_tree))) => {
+            Ok(Ok((moved_paths, browser_tree))) => {
                 let expanded_paths = shell.browser.expanded_paths();
                 shell.browser = SessionBrowserState::new(browser_tree);
                 shell
                     .browser
-                    .restore_ui_state(&expanded_paths, Some(&document.virtual_path));
-                shell.browser.select_path(document.virtual_path.clone());
+                    .restore_ui_state(&expanded_paths, moved_paths.first().map(String::as_str));
+                shell.selected_tree_paths = moved_paths.iter().cloned().collect();
+                if let Some(path) = moved_paths.first() {
+                    shell.browser.select_path(path.clone());
+                    shell.selection_anchor = Some(path.clone());
+                }
                 shell.sync_browser_settings();
-                shell.apply_daemon_snapshot_result(open_stored_session(
-                    &shell.bootstrap.server_endpoint,
-                    SessionKind::Document,
-                    &document.virtual_path,
-                    Some(&document.id),
-                    Some(&document.virtual_path),
-                    Some(&document.title),
-                ));
-                shell.last_action = format!("moved {} to {}", document.title, target_group.label);
+                shell.server_busy = false;
+                shell.clear_drag_state();
+                shell.last_action =
+                    format!("moved {} item(s) to {}", moved_paths.len(), target_group.label);
                 shell.push_notification(
                     NotificationTone::Success,
-                    "Document Moved",
-                    format!("Moved {} into {}.", document.title, target_group.label),
+                    "Items Moved",
+                    format!("Moved {} item(s) into {}.", moved_paths.len(), target_group.label),
                 );
             }
             Ok(Err(error)) => {
                 shell.server_busy = false;
+                shell.clear_drag_state();
                 shell.last_action = format!("move failed: {error}");
                 shell.push_notification(
                     NotificationTone::Error,
-                    "Document Move Failed",
+                    "Move Failed",
                     error.to_string(),
                 );
             }
             Err(error) => {
                 shell.server_busy = false;
+                shell.clear_drag_state();
                 shell.last_action = format!("move task failed: {error}");
                 shell.push_notification(
                     NotificationTone::Error,
-                    "Document Move Task Failed",
+                    "Move Task Failed",
                     error.to_string(),
                 );
             }
@@ -1922,23 +2039,50 @@ fn queue_move_selected_document_to_group(mut state: Signal<ShellState>, target_g
     });
 }
 
-fn queue_delete_selected_documents(mut state: Signal<ShellState>) {
-    let selected_paths = state.read().selected_document_paths();
-    if selected_paths.is_empty() {
-        return;
-    }
+fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool) {
+    let pending = if let Some(pending) = state.read().pending_delete.clone() {
+        pending
+    } else {
+        let mut shell = state.write();
+        let (document_paths, group_paths, labels) = shell.selected_workspace_delete_paths();
+        if document_paths.is_empty() && group_paths.is_empty() {
+            return;
+        }
+        let pending = PendingDeleteDialog {
+            document_paths,
+            group_paths,
+            labels,
+            hard_delete,
+        };
+        if !hard_delete {
+            shell.pending_delete = Some(pending);
+            shell.close_context_menu();
+            shell.last_action = "confirm delete".to_string();
+            return;
+        }
+        pending
+    };
 
     state.with_mut(|shell| {
         shell.server_busy = true;
-        shell.last_action = format!("deleting {} document(s)", selected_paths.len());
+        shell.pending_delete = None;
+        let item_count = pending.document_paths.len() + pending.group_paths.len();
+        shell.last_action = if hard_delete {
+            format!("permanently deleting {item_count} item(s)")
+        } else {
+            format!("deleting {item_count} item(s)")
+        };
         shell.close_context_menu();
     });
 
     spawn(async move {
-        let selected_for_task = selected_paths.clone();
+        let pending_for_task = pending.clone();
         let outcome = task::spawn_blocking(move || -> Result<(usize, yggterm_core::SessionNode)> {
             let store = SessionStore::open_or_init()?;
-            let deleted = store.delete_documents(&selected_for_task)?;
+            let deleted = store.delete_workspace_items(
+                &pending_for_task.document_paths,
+                &pending_for_task.group_paths,
+            )?;
             let settings = store.load_settings().unwrap_or_default();
             let browser_tree = store.load_codex_tree(&settings)?;
             Ok((deleted, browser_tree))
@@ -1959,11 +2103,12 @@ fn queue_delete_selected_documents(mut state: Signal<ShellState>) {
                 }
                 shell.sync_browser_settings();
                 shell.server_busy = false;
-                shell.last_action = format!("deleted {deleted} document(s)");
+                shell.clear_drag_state();
+                shell.last_action = format!("deleted {deleted} workspace item(s)");
                 shell.push_notification(
                     NotificationTone::Success,
-                    "Documents Deleted",
-                    format!("Removed {deleted} document(s) from the workspace tree."),
+                    "Items Deleted",
+                    format!("Removed {deleted} item(s) from the workspace tree."),
                 );
             }
             Ok(Err(error)) => {
@@ -2278,13 +2423,51 @@ fn new_separator_virtual_path_for_row(row: &BrowserRow) -> String {
     format!("{}/separator-{}", base.trim_end_matches('/'), stamp)
 }
 
-fn moved_document_virtual_path(document_row: &BrowserRow, target_group: &BrowserRow) -> String {
-    let name = document_row
+fn moved_workspace_item_virtual_path(item_row: &BrowserRow, target_group: &BrowserRow) -> String {
+    let name = item_row
         .full_path
         .rsplit('/')
         .find(|segment| !segment.is_empty())
-        .unwrap_or("document");
+        .unwrap_or("item");
     format!("{}/{}", target_group.full_path.trim_end_matches('/'), name)
+}
+
+fn is_workspace_row(row: &BrowserRow) -> bool {
+    match row.kind {
+        BrowserRowKind::Document | BrowserRowKind::Separator => true,
+        BrowserRowKind::Group => {
+            !row.full_path.starts_with("__live_")
+                && row.full_path != "local"
+                && row.full_path != "/"
+                && row.group_kind.is_some()
+        }
+        BrowserRowKind::Session => false,
+    }
+}
+
+fn is_drop_target_row(row: &BrowserRow) -> bool {
+    row.kind == BrowserRowKind::Group
+        && row.group_kind != Some(WorkspaceGroupKind::Separator)
+        && !row.full_path.starts_with("__live_")
+        && row.full_path != "local"
+}
+
+fn workspace_path_contains(parent: &str, child: &str) -> bool {
+    child == parent
+        || child
+            .strip_prefix(parent)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn valid_drop_target(drag_paths: &[String], target_row: &BrowserRow) -> bool {
+    if !is_drop_target_row(target_row) || drag_paths.is_empty() {
+        return false;
+    }
+    drag_paths.iter().all(|path| {
+        path != &target_row.full_path
+            && !workspace_path_contains(path, &target_row.full_path)
+            && parent_virtual_path(path).as_deref() != Some(target_row.full_path.as_str())
+    })
 }
 
 fn group_session_cwd(row: &BrowserRow) -> Option<String> {
@@ -2776,7 +2959,7 @@ fn app() -> Element {
                         on_create_paper: move |_| queue_new_document(state),
                         on_select_row: move |(row, extend_range): (BrowserRow, bool)| {
                             state.with_mut(|shell| shell.select_tree_row(&row, extend_range));
-                            if extend_range && row.kind == BrowserRowKind::Document {
+                            if extend_range && is_workspace_row(&row) {
                                 return;
                             }
                             if is_live_sidebar_row(&row) {
@@ -2796,10 +2979,24 @@ fn app() -> Element {
                                 queue_title_generation(state, row.clone(), false);
                             }
                         },
-                        on_delete_selected_documents: move |_| queue_delete_selected_documents(state),
+                        on_delete_selected_items: move |hard_delete: bool| queue_delete_selected_items(state, hard_delete),
                         on_open_context_menu: move |(row, position): (BrowserRow, (f64, f64))| {
-                            state.with_mut(|shell| shell.open_context_menu(row, position))
+                            state.with_mut(|shell| {
+                                if !shell.selected_tree_paths.contains(&row.full_path) {
+                                    shell.select_tree_row(&row, false);
+                                }
+                                shell.open_context_menu(row, position)
+                            })
                         },
+                        on_start_drag: move |row: BrowserRow| state.with_mut(|shell| shell.begin_drag(&row)),
+                        on_drag_hover: move |row: BrowserRow| state.with_mut(|shell| shell.set_drag_hover_target(&row)),
+                        on_drag_leave: move |row: BrowserRow| state.with_mut(|shell| {
+                            if shell.drag_hover_target.as_deref() == Some(row.full_path.as_str()) {
+                                shell.drag_hover_target = None;
+                            }
+                        }),
+                        on_drop_into_row: move |row: BrowserRow| queue_move_selected_items_to_group(state, row),
+                        on_end_drag: move |_| state.with_mut(|shell| shell.clear_drag_state()),
                     }
                     MainSurface {
                         snapshot: main_snapshot,
@@ -2891,6 +3088,7 @@ fn app() -> Element {
                         row: row.clone(),
                         position: snapshot.context_menu_position.unwrap_or((18.0, 60.0)),
                         selected_row: snapshot.selected_row.clone(),
+                        selected_tree_paths: snapshot.selected_tree_paths.clone(),
                         palette: snapshot.palette,
                         on_close: move |_| state.with_mut(|shell| shell.close_context_menu()),
                         on_create_group_codex: {
@@ -2918,7 +3116,7 @@ fn app() -> Element {
                         },
                         on_move_selected_document_here: {
                             let row = row.clone();
-                            move |_| queue_move_selected_document_to_group(state, row.clone())
+                            move |_| queue_move_selected_items_to_group(state, row.clone())
                         },
                         on_create_note: {
                             let row = row.clone();
@@ -2941,6 +3139,23 @@ fn app() -> Element {
                                 queue_title_generation(state, row.clone(), true);
                             }
                         },
+                        on_delete_item: {
+                            let row = row.clone();
+                            move |_| {
+                                state.with_mut(|shell| {
+                                    shell.select_tree_row(&row, false);
+                                    shell.open_delete_dialog(false);
+                                });
+                            }
+                        },
+                    }
+                }
+                if let Some(pending_delete) = snapshot.pending_delete.clone() {
+                    DeleteConfirmOverlay {
+                        pending: pending_delete,
+                        palette: snapshot.palette,
+                        on_cancel: move |_| state.with_mut(|shell| shell.cancel_delete_dialog()),
+                        on_confirm: move |_| queue_delete_selected_items(state, true),
                     }
                 }
                 if !snapshot.notifications.is_empty() {
@@ -3401,8 +3616,13 @@ fn Sidebar(
     on_start_terminal: EventHandler<MouseEvent>,
     on_create_paper: EventHandler<MouseEvent>,
     on_select_row: EventHandler<(BrowserRow, bool)>,
-    on_delete_selected_documents: EventHandler<KeyboardEvent>,
+    on_delete_selected_items: EventHandler<bool>,
     on_open_context_menu: EventHandler<(BrowserRow, (f64, f64))>,
+    on_start_drag: EventHandler<BrowserRow>,
+    on_drag_hover: EventHandler<BrowserRow>,
+    on_drag_leave: EventHandler<BrowserRow>,
+    on_drop_into_row: EventHandler<BrowserRow>,
+    on_end_drag: EventHandler<()>,
 ) -> Element {
     let width = if snapshot.sidebar_open {
         SIDE_RAIL_WIDTH
@@ -3428,7 +3648,8 @@ fn Sidebar(
             tabindex: "0",
             onkeydown: move |evt| {
                 if evt.key() == Key::Delete {
-                    on_delete_selected_documents.call(evt);
+                    let hard_delete = evt.modifiers().contains(Modifiers::SHIFT);
+                    on_delete_selected_items.call(hard_delete);
                 }
             },
             div {
@@ -3463,12 +3684,31 @@ fn Sidebar(
                                         snapshot.selected_tree_paths.is_empty()
                                             && snapshot.selected_path.as_deref() == Some(row.full_path.as_str())
                                     ),
+                                drop_hovered: snapshot.drag_hover_target.as_deref() == Some(row.full_path.as_str()),
+                                dragging: snapshot.drag_paths.iter().any(|path| path == &row.full_path),
                                 palette: snapshot.palette,
                                 on_select: move |evt: MouseEvent| {
                                     let extend = evt.modifiers().contains(Modifiers::SHIFT);
                                     on_select_row.call((select_row.clone(), extend));
                                 },
                                 on_open_context_menu: move |coords: (f64, f64)| on_open_context_menu.call((context_row.clone(), coords)),
+                                on_start_drag: {
+                                    let row = row.clone();
+                                    move |_| on_start_drag.call(row.clone())
+                                },
+                                on_drag_hover: {
+                                    let row = row.clone();
+                                    move |_| on_drag_hover.call(row.clone())
+                                },
+                                on_drag_leave: {
+                                    let row = row.clone();
+                                    move |_| on_drag_leave.call(row.clone())
+                                },
+                                on_drop_into_row: {
+                                    let row = row.clone();
+                                    move |_| on_drop_into_row.call(row.clone())
+                                },
+                                on_end_drag: move |_| on_end_drag.call(()),
                             }
                         }
                     }
@@ -3482,39 +3722,75 @@ fn Sidebar(
 fn SidebarRow(
     row: BrowserRow,
     selected: bool,
+    drop_hovered: bool,
+    dragging: bool,
     palette: Palette,
     on_select: EventHandler<MouseEvent>,
     on_open_context_menu: EventHandler<(f64, f64)>,
+    on_start_drag: EventHandler<DragEvent>,
+    on_drag_hover: EventHandler<DragEvent>,
+    on_drag_leave: EventHandler<DragEvent>,
+    on_drop_into_row: EventHandler<DragEvent>,
+    on_end_drag: EventHandler<DragEvent>,
 ) -> Element {
     let indent = row.depth * 12 + 12;
+    let draggable = is_workspace_row(&row);
     if row.kind == BrowserRowKind::Separator {
         return rsx! {
             button {
                 style: format!(
                     "width:100%; display:flex; align-items:center; gap:10px; border:none; background:transparent; \
-                     padding:8px 9px 8px {}px; margin:4px 0;",
+                     padding:8px 9px 8px {}px; margin:4px 0; opacity:{};",
                     indent
+                    , if dragging { "0.58" } else { "1" }
                 ),
+                draggable: draggable,
                 onclick: move |evt| on_select.call(evt),
                 oncontextmenu: move |evt| {
                     evt.prevent_default();
                     let coords = evt.client_coordinates();
                     on_open_context_menu.call((coords.x, coords.y));
                 },
+                ondragstart: move |evt| on_start_drag.call(evt),
+                ondragover: move |evt| {
+                    evt.prevent_default();
+                    on_drag_hover.call(evt);
+                },
+                ondragleave: move |evt| on_drag_leave.call(evt),
+                ondrop: move |evt| {
+                    evt.prevent_default();
+                    on_drop_into_row.call(evt);
+                },
+                ondragend: move |evt| on_end_drag.call(evt),
                 div {
-                    style: format!("flex:1; height:1px; background:{}; opacity:0.72;", palette.border),
+                    style: format!(
+                        "flex:1; height:{}px; background:{}; opacity:{};",
+                        if drop_hovered { 2 } else { 1 },
+                        if drop_hovered { palette.accent } else { palette.border },
+                        if drop_hovered { "0.96" } else { "0.72" }
+                    ),
                 }
                 span {
-                    style: format!("font-size:10px; font-weight:700; letter-spacing:0.08em; text-transform:uppercase; color:{};", palette.muted),
+                    style: format!(
+                        "font-size:10px; font-weight:700; letter-spacing:0.08em; text-transform:uppercase; color:{};",
+                        if drop_hovered { palette.accent } else { palette.muted }
+                    ),
                     "{row.label}"
                 }
                 div {
-                    style: format!("flex:1; height:1px; background:{}; opacity:0.72;", palette.border),
+                    style: format!(
+                        "flex:1; height:{}px; background:{}; opacity:{};",
+                        if drop_hovered { 2 } else { 1 },
+                        if drop_hovered { palette.accent } else { palette.border },
+                        if drop_hovered { "0.96" } else { "0.72" }
+                    ),
                 }
             }
         };
     }
-    let background = if selected {
+    let background = if drop_hovered {
+        "rgba(95, 168, 255, 0.14)"
+    } else if selected {
         palette.accent_soft
     } else if row.kind == BrowserRowKind::Group && row.depth == 0 {
         palette.panel_alt
@@ -3542,15 +3818,27 @@ fn SidebarRow(
         button {
             style: format!(
                 "width:100%; display:flex; flex-direction:column; align-items:stretch; gap:2px; \
-                 border:none; border-radius:12px; background:{}; padding:6px 9px 6px {}px; margin-bottom:2px;",
-                background, indent
+                 border:none; border-radius:12px; background:{}; padding:6px 9px 6px {}px; margin-bottom:2px; opacity:{};",
+                background, indent, if dragging { "0.58" } else { "1" }
             ),
+            draggable: draggable,
             onclick: move |evt| on_select.call(evt),
             oncontextmenu: move |evt| {
                 evt.prevent_default();
                 let coords = evt.client_coordinates();
                 on_open_context_menu.call((coords.x, coords.y));
             },
+            ondragstart: move |evt| on_start_drag.call(evt),
+            ondragover: move |evt| {
+                evt.prevent_default();
+                on_drag_hover.call(evt);
+            },
+            ondragleave: move |evt| on_drag_leave.call(evt),
+            ondrop: move |evt| {
+                evt.prevent_default();
+                on_drop_into_row.call(evt);
+            },
+            ondragend: move |evt| on_end_drag.call(evt),
             div {
                 style: "display:flex; align-items:center; justify-content:space-between; gap:8px;",
                 div {
@@ -5436,6 +5724,7 @@ fn ContextMenuOverlay(
     row: BrowserRow,
     position: (f64, f64),
     selected_row: Option<BrowserRow>,
+    selected_tree_paths: Vec<String>,
     palette: Palette,
     on_close: EventHandler<MouseEvent>,
     on_create_group: EventHandler<MouseEvent>,
@@ -5447,14 +5736,20 @@ fn ContextMenuOverlay(
     on_create_note: EventHandler<MouseEvent>,
     on_create_recipe: EventHandler<MouseEvent>,
     on_regenerate: EventHandler<MouseEvent>,
+    on_delete_item: EventHandler<MouseEvent>,
 ) -> Element {
     let menu_left = position.0.clamp(10.0, 1400.0);
     let menu_top = position.1.clamp(48.0, 980.0);
-    let can_move_selected_document = selected_row.as_ref().is_some_and(|selected| {
-        selected.kind == BrowserRowKind::Document
-            && !row.full_path.starts_with("__live_")
-            && parent_virtual_path(&selected.full_path).as_deref() != Some(row.full_path.as_str())
-    });
+    let drag_paths = if selected_tree_paths.is_empty() {
+        selected_row
+            .as_ref()
+            .filter(|selected| is_workspace_row(selected))
+            .map(|selected| vec![selected.full_path.clone()])
+            .unwrap_or_default()
+    } else {
+        selected_tree_paths
+    };
+    let can_move_selected_document = valid_drop_target(&drag_paths, &row);
     rsx! {
         div {
             style: "position:fixed; inset:0; z-index:90; background:transparent;",
@@ -5528,6 +5823,91 @@ fn ContextMenuOverlay(
                         style: context_menu_action_style(palette, true),
                         onclick: move |evt| on_regenerate.call(evt),
                         "Regenerate Title"
+                    }
+                }
+                if is_workspace_row(&row) {
+                    div {
+                        style: format!("height:1px; margin:6px 4px; background:{}; opacity:0.7;", palette.border),
+                    }
+                    button {
+                        style: context_menu_action_style_destructive(palette),
+                        onclick: move |evt| on_delete_item.call(evt),
+                        "Delete…"
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn DeleteConfirmOverlay(
+    pending: PendingDeleteDialog,
+    palette: Palette,
+    on_cancel: EventHandler<MouseEvent>,
+    on_confirm: EventHandler<MouseEvent>,
+) -> Element {
+    let item_count = pending.document_paths.len() + pending.group_paths.len();
+    let preview = pending
+        .labels
+        .iter()
+        .take(4)
+        .cloned()
+        .collect::<Vec<_>>();
+    rsx! {
+        div {
+            style: "position:fixed; inset:0; z-index:95; display:flex; align-items:center; justify-content:center; background:rgba(230,239,248,0.28); backdrop-filter: blur(18px) saturate(130%); -webkit-backdrop-filter: blur(18px) saturate(130%);",
+            onclick: move |evt| on_cancel.call(evt),
+            div {
+                style: format!(
+                    "width:min(460px, calc(100vw - 40px)); display:flex; flex-direction:column; gap:14px; \
+                     padding:22px; border-radius:18px; background:rgba(250,252,255,0.96); color:{}; \
+                     box-shadow:0 24px 54px rgba(55,83,112,0.18), inset 0 0 0 1px rgba(214,223,232,0.9);",
+                    palette.text
+                ),
+                onmousedown: |evt| evt.stop_propagation(),
+                onclick: |evt| evt.stop_propagation(),
+                div {
+                    style: "display:flex; flex-direction:column; gap:6px;",
+                    div {
+                        style: format!("font-size:18px; font-weight:700; color:{};", palette.text),
+                        if pending.hard_delete { "Delete Permanently?" } else { "Delete Selected Items?" }
+                    }
+                    div {
+                        style: format!("font-size:12px; line-height:1.55; color:{};", palette.muted),
+                        if pending.hard_delete {
+                            "This will permanently remove the selected items from the workspace tree."
+                        } else {
+                            "This will remove the selected items from the workspace tree. Hold Shift while pressing Delete to skip this dialog."
+                        }
+                    }
+                }
+                div {
+                    style: "display:flex; flex-direction:column; gap:6px; max-height:180px; overflow:auto; padding-right:4px;",
+                    for label in preview {
+                        div {
+                            style: format!("font-size:12px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.text),
+                            "• {label}"
+                        }
+                    }
+                    if item_count > 4 {
+                        div {
+                            style: format!("font-size:11px; color:{};", palette.muted),
+                            "+ {item_count - 4} more"
+                        }
+                    }
+                }
+                div {
+                    style: "display:flex; justify-content:flex-end; gap:10px;",
+                    button {
+                        style: chip_style(palette, false),
+                        onclick: move |evt| on_cancel.call(evt),
+                        "Cancel"
+                    }
+                    button {
+                        style: delete_confirm_button_style(palette, pending.hard_delete),
+                        onclick: move |evt| on_confirm.call(evt),
+                        if pending.hard_delete { "Delete Permanently" } else { "Delete" }
                     }
                 }
             }
@@ -5977,6 +6357,22 @@ fn context_menu_action_style(palette: Palette, emphasized: bool) -> String {
     )
 }
 
+fn context_menu_action_style_destructive(_palette: Palette) -> String {
+    format!(
+        "width:100%; height:32px; border:none; border-radius:8px; background:transparent; color:{}; \
+         font-size:12px; font-weight:700; text-align:left; padding:0 12px; margin-bottom:4px;",
+        "#c23f4d"
+    )
+}
+
+fn delete_confirm_button_style(_palette: Palette, hard_delete: bool) -> String {
+    format!(
+        "height:34px; padding:0 16px; border:none; border-radius:12px; background:{}; color:#ffffff; \
+         font-size:12px; font-weight:700;",
+        if hard_delete { "#c23f4d" } else { "#5fa8ff" }
+    )
+}
+
 fn inline_toggle_style(_palette: Palette, enabled: bool) -> String {
     format!(
         "display:flex; align-items:center; gap:10px; height:28px; padding:0 2px 0 0; border:none; background:transparent; \
@@ -6068,6 +6464,64 @@ mod tests {
         assert_ne!(small, large);
         assert!(small.ends_with("-10.0"));
         assert!(large.ends_with("-20.0"));
+    }
+
+    #[test]
+    fn workspace_rows_exclude_live_groups() {
+        let live_group = BrowserRow {
+            kind: BrowserRowKind::Group,
+            full_path: "__live_shells__".to_string(),
+            label: "shell sessions".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: None,
+            depth: 1,
+            host_label: String::new(),
+            descendant_sessions: 1,
+            expanded: true,
+            session_id: None,
+            session_cwd: None,
+        };
+        let folder = BrowserRow {
+            kind: BrowserRowKind::Group,
+            full_path: "/home/pi/gh/notes/folder-a".to_string(),
+            label: "folder-a".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: Some(WorkspaceGroupKind::Folder),
+            session_title: None,
+            depth: 2,
+            host_label: String::new(),
+            descendant_sessions: 0,
+            expanded: true,
+            session_id: None,
+            session_cwd: None,
+        };
+        assert!(!is_workspace_row(&live_group));
+        assert!(is_workspace_row(&folder));
+    }
+
+    #[test]
+    fn drop_target_rejects_self_and_descendants() {
+        let target = BrowserRow {
+            kind: BrowserRowKind::Group,
+            full_path: "/home/pi/gh/notes/folder-a/sub".to_string(),
+            label: "sub".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: Some(WorkspaceGroupKind::Folder),
+            session_title: None,
+            depth: 3,
+            host_label: String::new(),
+            descendant_sessions: 0,
+            expanded: true,
+            session_id: None,
+            session_cwd: None,
+        };
+        assert!(!valid_drop_target(&["/home/pi/gh/notes/folder-a".to_string()], &target));
+        assert!(!valid_drop_target(&["/home/pi/gh/notes/folder-a/sub".to_string()], &target));
+        assert!(valid_drop_target(&["/home/pi/gh/notes/other-paper".to_string()], &target));
     }
 }
 
