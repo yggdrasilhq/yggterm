@@ -279,6 +279,17 @@ enum TerminalJsEvent {
     Debug { message: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PreviewContentBlock {
+    Heading { level: u8, text: String },
+    Paragraph(String),
+    Bullet(String),
+    Numbered { number: usize, text: String },
+    Task { done: bool, text: String },
+    Quote(String),
+    Code { language: Option<String>, code: String },
+}
+
 impl ShellState {
     fn new(bootstrap: ShellBootstrap) -> Self {
         let settings = bootstrap.settings.clone();
@@ -5522,10 +5533,85 @@ fn build_document_input(
 
 #[component]
 fn PreviewGraph(session: ManagedSessionView, palette: Palette) -> Element {
+    let summary_entries = session
+        .preview
+        .summary
+        .iter()
+        .filter(|entry| {
+            !matches!(
+                entry.label,
+                "Session" | "Storage" | "Cwd" | "Started" | "Updated"
+            ) && !entry.value.trim().is_empty()
+        })
+        .take(4)
+        .cloned()
+        .collect::<Vec<_>>();
+    let timeline_excerpt = session
+        .preview
+        .blocks
+        .iter()
+        .rev()
+        .find_map(|block| preview_block_excerpt(block, 140))
+        .unwrap_or_else(|| preview_summary_text(&session));
     rsx! {
         div {
-            style: "display:flex; flex-direction:column; gap:14px; padding:12px 0 4px 0;",
-            for (ix, block) in session.preview.blocks.iter().enumerate() {
+            style: "display:flex; flex-direction:column; gap:18px; padding:6px 0 4px 0;",
+            div {
+                style: "display:flex; flex-direction:column; gap:14px;",
+                div {
+                    style: "display:flex; align-items:flex-start; justify-content:space-between; gap:16px; flex-wrap:wrap;",
+                    div {
+                        style: "display:flex; flex-direction:column; gap:6px; min-width:0; flex:1;",
+                        div {
+                            style: format!("font-size:13px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:{};", palette.muted),
+                            "Conversation Overview"
+                        }
+                        div {
+                            style: format!("font-size:15px; line-height:1.7; color:{}; max-width:720px; white-space:pre-wrap;", palette.text),
+                            "{timeline_excerpt}"
+                        }
+                    }
+                    div {
+                        style: "display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end;",
+                        OverviewStatCard {
+                            label: "Messages".to_string(),
+                            value: metadata_value(&session, "Messages"),
+                            palette,
+                        }
+                        OverviewStatCard {
+                            label: "Blocks".to_string(),
+                            value: metadata_value(&session, "Preview Blocks"),
+                            palette,
+                        }
+                        OverviewStatCard {
+                            label: "Updated".to_string(),
+                            value: metadata_value(&session, "Updated"),
+                            palette,
+                        }
+                    }
+                }
+                if !summary_entries.is_empty() {
+                    div {
+                        style: "display:flex; gap:10px; flex-wrap:wrap;",
+                        for entry in summary_entries {
+                            div {
+                                style: "display:flex; flex-direction:column; gap:4px; min-width:140px; max-width:240px; padding:12px 14px; border-radius:16px; background:rgba(255,255,255,0.78); box-shadow:inset 0 0 0 1px rgba(170,190,212,0.14);",
+                                div {
+                                    style: format!("font-size:11px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:{};", palette.muted),
+                                    "{entry.label}"
+                                }
+                                div {
+                                    style: format!("font-size:13px; line-height:1.5; color:{}; white-space:pre-wrap; overflow-wrap:anywhere;", palette.text),
+                                    "{entry.value}"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            div {
+                style: "display:flex; flex-direction:column; gap:14px; padding-top:2px;",
+                for (ix, block) in session.preview.blocks.iter().enumerate() {
                 div {
                     style: "display:grid; grid-template-columns:56px 1fr; gap:18px; align-items:flex-start;",
                     div {
@@ -5564,21 +5650,39 @@ fn PreviewGraph(session: ManagedSessionView, palette: Palette) -> Element {
                         }
                         div {
                             style: format!("display:flex; flex-direction:column; gap:8px; color:{};", palette.text),
-                            for line in block.lines.iter().take(3) {
+                            if let Some(excerpt) = preview_block_excerpt(block, 220) {
                                 div {
-                                    style: "font-size:13px; line-height:1.55; white-space:pre-wrap;",
-                                    "{line}"
+                                    style: "font-size:13px; line-height:1.62; white-space:pre-wrap;",
+                                    "{excerpt}"
                                 }
                             }
-                            if block.lines.len() > 3 {
+                            if block.lines.len() > 2 {
                                 div {
                                     style: format!("font-size:11px; color:{};", palette.muted),
-                                    "+ {block.lines.len() - 3} more lines"
+                                    "+ {block.lines.len() - 2} more lines"
                                 }
                             }
                         }
                     }
                 }
+            }
+            }
+        }
+    }
+}
+
+#[component]
+fn OverviewStatCard(label: String, value: String, palette: Palette) -> Element {
+    rsx! {
+        div {
+            style: "display:flex; flex-direction:column; gap:4px; min-width:110px; padding:12px 14px; border-radius:16px; background:rgba(255,255,255,0.82); box-shadow:inset 0 0 0 1px rgba(170,190,212,0.14);",
+            div {
+                style: format!("font-size:11px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:{};", palette.muted),
+                "{label}"
+            }
+            div {
+                style: format!("font-size:14px; font-weight:700; color:{}; line-height:1.4;", palette.text),
+                "{value}"
             }
         }
     }
@@ -5782,15 +5886,7 @@ fn PreviewBlock(
                             "{block.lines.len()} lines hidden"
                         }
                     } else {
-                        div {
-                            style: format!("display:flex; flex-direction:column; gap:10px; color:{};", palette.text),
-                            for line in block.lines.iter() {
-                                div {
-                                    style: "font-size:13px; line-height:1.66; white-space:pre-wrap;",
-                                    "{line}"
-                                }
-                            }
-                        }
+                        PreviewContent { lines: block.lines.clone(), palette }
                     }
                 }
                 if user_block {
@@ -5808,6 +5904,281 @@ fn PreviewBlock(
             }
         }
     }
+}
+
+#[component]
+fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
+    let blocks = preview_content_blocks(&lines);
+    rsx! {
+        div {
+            style: format!("display:flex; flex-direction:column; gap:10px; color:{};", palette.text),
+            for block in blocks {
+                match block {
+                    PreviewContentBlock::Heading { level, text } => rsx! {
+                        div {
+                            style: format!(
+                                "font-size:{}px; line-height:1.38; font-weight:750; letter-spacing:-0.01em; color:{}; white-space:pre-wrap; padding-top:{}px;",
+                                match level {
+                                    1 => 18,
+                                    2 => 16,
+                                    _ => 14,
+                                },
+                                palette.text,
+                                if level == 1 { 4 } else { 2 }
+                            ),
+                            "{text}"
+                        }
+                    },
+                    PreviewContentBlock::Paragraph(text) => rsx! {
+                        div {
+                            style: "font-size:13px; line-height:1.66; white-space:pre-wrap;",
+                            "{text}"
+                        }
+                    },
+                    PreviewContentBlock::Bullet(text) => rsx! {
+                        div {
+                            style: "display:flex; align-items:flex-start; gap:10px;",
+                            div {
+                                style: format!("width:6px; height:6px; border-radius:999px; background:{}; margin-top:8px; flex:0 0 auto;", palette.accent_soft),
+                            }
+                            div {
+                                style: "font-size:13px; line-height:1.66; white-space:pre-wrap;",
+                                "{text}"
+                            }
+                        }
+                    },
+                    PreviewContentBlock::Numbered { number, text } => rsx! {
+                        div {
+                            style: "display:flex; align-items:flex-start; gap:10px;",
+                            div {
+                                style: format!("min-width:22px; color:{}; font-size:12px; font-weight:700; line-height:1.66; flex:0 0 auto;", palette.accent),
+                                "{number}."
+                            }
+                            div {
+                                style: "font-size:13px; line-height:1.66; white-space:pre-wrap;",
+                                "{text}"
+                            }
+                        }
+                    },
+                    PreviewContentBlock::Task { done, text } => rsx! {
+                        div {
+                            style: "display:flex; align-items:flex-start; gap:10px;",
+                            div {
+                                style: format!(
+                                    "width:16px; height:16px; border-radius:5px; margin-top:2px; flex:0 0 auto; \
+                                     display:flex; align-items:center; justify-content:center; font-size:10px; font-weight:800; \
+                                     color:{}; background:{}; box-shadow:inset 0 0 0 1px {};",
+                                    if done { "white" } else { "transparent" },
+                                    if done { palette.accent.to_string() } else { "rgba(255,255,255,0.82)".to_string() },
+                                    if done { palette.accent.to_string() } else { "rgba(170,190,212,0.28)".to_string() }
+                                ),
+                                {if done { "✓" } else { "" }}
+                            }
+                            div {
+                                style: format!(
+                                    "font-size:13px; line-height:1.66; white-space:pre-wrap; color:{};",
+                                    if done { palette.muted } else { palette.text }
+                                ),
+                                "{text}"
+                            }
+                        }
+                    },
+                    PreviewContentBlock::Quote(text) => rsx! {
+                        div {
+                            style: "display:flex; align-items:stretch; gap:12px; padding:2px 0;",
+                            div {
+                                style: format!("width:3px; border-radius:999px; background:{}; flex:0 0 auto;", palette.accent_soft),
+                            }
+                            div {
+                                style: format!("font-size:13px; line-height:1.68; white-space:pre-wrap; color:{};", palette.muted),
+                                "{text}"
+                            }
+                        }
+                    },
+                    PreviewContentBlock::Code { language, code } => rsx! {
+                        div {
+                            style: "display:flex; flex-direction:column; gap:8px; border-radius:16px; background:rgba(15,23,42,0.92); color:#e5eef8; overflow:hidden;",
+                            div {
+                                style: "display:flex; align-items:center; justify-content:space-between; gap:12px; padding:10px 14px; border-bottom:1px solid rgba(255,255,255,0.08);",
+                                div {
+                                    style: "font-size:11px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:rgba(226,232,240,0.78);",
+                                    "{language.clone().unwrap_or_else(|| \"Code\".to_string())}"
+                                }
+                            }
+                            pre {
+                                style: "margin:0; padding:14px 16px 16px 16px; overflow:auto; white-space:pre-wrap; font-size:12px; line-height:1.68; font-family:'JetBrains Mono', 'Iosevka Term', monospace;",
+                                code { "{code}" }
+                            }
+                        }
+                    },
+                }
+            }
+        }
+    }
+}
+
+fn preview_content_blocks(lines: &[String]) -> Vec<PreviewContentBlock> {
+    let mut blocks = Vec::new();
+    let mut paragraph = Vec::<String>::new();
+    let mut code = Vec::<String>::new();
+    let mut code_language = None::<String>;
+    let mut in_code = false;
+
+    let flush_paragraph = |blocks: &mut Vec<PreviewContentBlock>, paragraph: &mut Vec<String>| {
+        if paragraph.is_empty() {
+            return;
+        }
+        let text = paragraph.join("\n").trim().to_string();
+        if !text.is_empty() {
+            blocks.push(PreviewContentBlock::Paragraph(text));
+        }
+        paragraph.clear();
+    };
+
+    for raw in lines {
+        let line = raw.trim_end();
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            if in_code {
+                blocks.push(PreviewContentBlock::Code {
+                    language: code_language.take(),
+                    code: code.join("\n"),
+                });
+                code.clear();
+                in_code = false;
+            } else {
+                flush_paragraph(&mut blocks, &mut paragraph);
+                let language = trimmed.trim_start_matches('`').trim();
+                code_language = (!language.is_empty()).then_some(language.to_string());
+                in_code = true;
+            }
+            continue;
+        }
+        if in_code {
+            code.push(line.to_string());
+            continue;
+        }
+        if trimmed.is_empty() {
+            flush_paragraph(&mut blocks, &mut paragraph);
+            continue;
+        }
+        if let Some(heading) = trimmed.strip_prefix("### ") {
+            flush_paragraph(&mut blocks, &mut paragraph);
+            blocks.push(PreviewContentBlock::Heading {
+                level: 3,
+                text: heading.trim().to_string(),
+            });
+            continue;
+        }
+        if let Some(heading) = trimmed.strip_prefix("## ") {
+            flush_paragraph(&mut blocks, &mut paragraph);
+            blocks.push(PreviewContentBlock::Heading {
+                level: 2,
+                text: heading.trim().to_string(),
+            });
+            continue;
+        }
+        if let Some(heading) = trimmed.strip_prefix("# ") {
+            flush_paragraph(&mut blocks, &mut paragraph);
+            blocks.push(PreviewContentBlock::Heading {
+                level: 1,
+                text: heading.trim().to_string(),
+            });
+            continue;
+        }
+        if let Some(task) = trimmed
+            .strip_prefix("- [ ] ")
+            .or_else(|| trimmed.strip_prefix("* [ ] "))
+        {
+            flush_paragraph(&mut blocks, &mut paragraph);
+            blocks.push(PreviewContentBlock::Task {
+                done: false,
+                text: task.trim().to_string(),
+            });
+            continue;
+        }
+        if let Some(task) = trimmed
+            .strip_prefix("- [x] ")
+            .or_else(|| trimmed.strip_prefix("* [x] "))
+            .or_else(|| trimmed.strip_prefix("- [X] "))
+            .or_else(|| trimmed.strip_prefix("* [X] "))
+        {
+            flush_paragraph(&mut blocks, &mut paragraph);
+            blocks.push(PreviewContentBlock::Task {
+                done: true,
+                text: task.trim().to_string(),
+            });
+            continue;
+        }
+        if let Some(bullet) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
+            flush_paragraph(&mut blocks, &mut paragraph);
+            blocks.push(PreviewContentBlock::Bullet(bullet.trim().to_string()));
+            continue;
+        }
+        if let Some((number, item)) = parse_numbered_preview_item(trimmed) {
+            flush_paragraph(&mut blocks, &mut paragraph);
+            blocks.push(PreviewContentBlock::Numbered {
+                number,
+                text: item,
+            });
+            continue;
+        }
+        if let Some(quote) = trimmed.strip_prefix("> ") {
+            flush_paragraph(&mut blocks, &mut paragraph);
+            blocks.push(PreviewContentBlock::Quote(quote.trim().to_string()));
+            continue;
+        }
+        paragraph.push(line.to_string());
+    }
+
+    if in_code {
+        blocks.push(PreviewContentBlock::Code {
+            language: code_language,
+            code: code.join("\n"),
+        });
+    } else {
+        flush_paragraph(&mut blocks, &mut paragraph);
+    }
+
+    blocks
+}
+
+fn parse_numbered_preview_item(line: &str) -> Option<(usize, String)> {
+    let (number, text) = line.split_once(". ")?;
+    if number.is_empty() || !number.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    Some((number.parse().ok()?, text.trim().to_string()))
+}
+
+fn preview_block_excerpt(block: &SessionPreviewBlock, max_chars: usize) -> Option<String> {
+    let mut parts = Vec::new();
+    for line in block.lines.iter().map(|line| line.trim()).filter(|line| !line.is_empty()) {
+        if line.starts_with("```") {
+            continue;
+        }
+        parts.push(line.to_string());
+        let joined = parts.join(" ");
+        if joined.len() >= max_chars {
+            return Some(truncate_preview_excerpt(&joined, max_chars));
+        }
+        if parts.len() >= 3 {
+            return Some(joined);
+        }
+    }
+    (!parts.is_empty()).then(|| truncate_preview_excerpt(&parts.join(" "), max_chars))
+}
+
+fn truncate_preview_excerpt(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let excerpt = trimmed.chars().take(max_chars.saturating_sub(1)).collect::<String>();
+    format!("{}…", excerpt.trim_end())
 }
 
 #[component]
@@ -7854,6 +8225,52 @@ mod tests {
         assert_eq!(placement.top, None);
         assert_eq!(placement.right, Some(90.0));
         assert_eq!(placement.bottom, Some(50.0));
+    }
+
+    #[test]
+    fn preview_content_blocks_render_markdown_shapes() {
+        let blocks = preview_content_blocks(&[
+            "# Heading".to_string(),
+            String::new(),
+            "- bullet".to_string(),
+            "1. first".to_string(),
+            "- [x] done".to_string(),
+            "> quoted".to_string(),
+            "```rust".to_string(),
+            "fn main() {}".to_string(),
+            "```".to_string(),
+        ]);
+
+        assert!(matches!(
+            blocks.first(),
+            Some(PreviewContentBlock::Heading { level: 1, text }) if text == "Heading"
+        ));
+        assert!(blocks.iter().any(|block| matches!(block, PreviewContentBlock::Bullet(text) if text == "bullet")));
+        assert!(blocks.iter().any(|block| matches!(block, PreviewContentBlock::Numbered { number: 1, text } if text == "first")));
+        assert!(blocks.iter().any(|block| matches!(block, PreviewContentBlock::Task { done: true, text } if text == "done")));
+        assert!(blocks.iter().any(|block| matches!(block, PreviewContentBlock::Quote(text) if text == "quoted")));
+        assert!(blocks.iter().any(|block| matches!(block, PreviewContentBlock::Code { language: Some(language), code } if language == "rust" && code == "fn main() {}")));
+    }
+
+    #[test]
+    fn preview_block_excerpt_ignores_code_fence_markers() {
+        let block = SessionPreviewBlock {
+            role: "ASSISTANT",
+            timestamp: "now".to_string(),
+            tone: PreviewTone::Assistant,
+            folded: false,
+            lines: vec![
+                "```bash".to_string(),
+                "cargo test".to_string(),
+                "```".to_string(),
+                "Runs the focused regression suite.".to_string(),
+            ],
+        };
+
+        assert_eq!(
+            preview_block_excerpt(&block, 120).as_deref(),
+            Some("cargo test Runs the focused regression suite.")
+        );
     }
 }
 
