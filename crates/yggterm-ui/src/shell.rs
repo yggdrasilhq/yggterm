@@ -2357,12 +2357,30 @@ fn queue_move_selected_items_to_group(
     placement: WorkspaceDropPlacement,
     target_label: String,
 ) {
-    let (selected_rows, reorder_plan) = {
+    let (selected_rows, selected_source_paths, selected_final_paths, reorder_plan) = {
         let shell = state.read();
         let selected_rows = shell.selected_workspace_rows();
         let rows = merged_sidebar_rows(shell.browser.rows(), &shell.server.live_sessions());
         let reorder_plan = build_workspace_reorder_plan(&rows, &selected_rows, &placement);
-        (selected_rows, reorder_plan)
+        let selected_source_paths = selected_rows
+            .iter()
+            .map(|row| row.full_path.clone())
+            .collect::<Vec<_>>();
+        let selected_final_paths = reorder_plan
+            .as_ref()
+            .map(|plan| {
+                plan.iter()
+                    .filter(|item| selected_source_paths.iter().any(|path| path == &item.from_path))
+                    .map(|item| item.final_path.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        (
+            selected_rows,
+            selected_source_paths,
+            selected_final_paths,
+            reorder_plan,
+        )
     };
     if selected_rows.is_empty() {
         state.with_mut(|shell| {
@@ -2394,12 +2412,13 @@ fn queue_move_selected_items_to_group(
             "tree_drop_requested",
             json!({
                 "target_label": target_label,
-                "selected_rows": selected_rows.iter().map(|row| row.full_path.clone()).collect::<Vec<_>>(),
+                "selected_rows": selected_source_paths,
                 "plan_len": reorder_plan.len(),
                 "plan_preview": reorder_plan.iter().take(8).map(|item| json!({
                     "from": item.from_path,
                     "final": item.final_path,
                 })).collect::<Vec<_>>(),
+                "selected_final_paths": selected_final_paths,
             }),
         );
     });
@@ -2439,6 +2458,7 @@ fn queue_move_selected_items_to_group(
                     "tree_drop_succeeded",
                     json!({
                         "moved_paths": moved_paths,
+                        "selected_final_paths": selected_final_paths,
                         "target_label": target_label,
                     }),
                 );
@@ -2446,9 +2466,9 @@ fn queue_move_selected_items_to_group(
                 shell.browser = SessionBrowserState::new(browser_tree);
                 shell
                     .browser
-                    .restore_ui_state(&expanded_paths, moved_paths.first().map(String::as_str));
-                shell.selected_tree_paths = moved_paths.iter().cloned().collect();
-                if let Some(path) = moved_paths.first() {
+                    .restore_ui_state(&expanded_paths, selected_final_paths.first().map(String::as_str));
+                shell.selected_tree_paths = selected_final_paths.iter().cloned().collect();
+                if let Some(path) = selected_final_paths.first() {
                     shell.browser.select_path(path.clone());
                     shell.selection_anchor = Some(path.clone());
                 }
@@ -2457,7 +2477,7 @@ fn queue_move_selected_items_to_group(
                 shell.clear_drag_state();
                 shell.last_action = format!(
                     "moved {} item(s) to {}",
-                    moved_paths.len(),
+                    selected_final_paths.len(),
                     target_label
                 );
                 shell.push_notification(
@@ -2465,7 +2485,7 @@ fn queue_move_selected_items_to_group(
                     "Items Moved",
                     format!(
                         "Moved {} item(s) near {}.",
-                        moved_paths.len(),
+                        selected_final_paths.len(),
                         target_label
                     ),
                 );
