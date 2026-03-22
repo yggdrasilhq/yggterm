@@ -10,7 +10,10 @@ use dioxus::prelude::*;
 use keyboard_types::{Key, Modifiers};
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -218,6 +221,14 @@ enum TreeSelectionMode {
     Replace,
     ExtendRange,
     Toggle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ContextMenuPlacement {
+    left: Option<f64>,
+    top: Option<f64>,
+    right: Option<f64>,
+    bottom: Option<f64>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -553,6 +564,14 @@ impl ShellState {
 
     fn select_row(&mut self, row: &BrowserRow) {
         self.browser.select_path(row.full_path.clone());
+        self.record_ui_telemetry(
+            "tree_activate",
+            json!({
+                "path": row.full_path,
+                "kind": format!("{:?}", row.kind),
+                "selected_paths": self.selected_tree_paths.iter().cloned().collect::<Vec<_>>(),
+            }),
+        );
         match row.kind {
             BrowserRowKind::Group => {
                 self.browser.toggle_group(&row.full_path);
@@ -671,6 +690,15 @@ impl ShellState {
     fn open_context_menu(&mut self, row: BrowserRow, position: (f64, f64)) {
         self.context_menu_row = Some(row);
         self.context_menu_position = Some(position);
+        self.record_ui_telemetry(
+            "context_menu_open",
+            json!({
+                "row_path": self.context_menu_row.as_ref().map(|row| row.full_path.clone()),
+                "row_kind": self.context_menu_row.as_ref().map(|row| format!("{:?}", row.kind)),
+                "position": { "x": position.0, "y": position.1 },
+                "selected_paths": self.selected_tree_paths.iter().cloned().collect::<Vec<_>>(),
+            }),
+        );
         self.refresh_tree_debug("open_context_menu");
     }
 
@@ -713,6 +741,13 @@ impl ShellState {
                     "tree row toggled"
                 );
             }
+            self.record_ui_telemetry(
+                "tree_select_toggle",
+                json!({
+                    "path": row.full_path,
+                    "selected_paths": self.selected_tree_paths.iter().cloned().collect::<Vec<_>>(),
+                }),
+            );
             self.refresh_tree_debug("toggle_tree_row");
             return;
         }
@@ -723,6 +758,14 @@ impl ShellState {
         if cfg!(debug_assertions) {
             info!(path=%row.full_path, mode=?mode, "tree row selected");
         }
+        self.record_ui_telemetry(
+            "tree_select",
+            json!({
+                "path": row.full_path,
+                "mode": format!("{mode:?}"),
+                "selected_paths": self.selected_tree_paths.iter().cloned().collect::<Vec<_>>(),
+            }),
+        );
         self.refresh_tree_debug("select_tree_row");
     }
 
@@ -765,6 +808,14 @@ impl ShellState {
         if cfg!(debug_assertions) {
             info!(anchor=%anchor, target=%row.full_path, selected=%self.selected_tree_paths.len(), "tree range selected");
         }
+        self.record_ui_telemetry(
+            "tree_select_range",
+            json!({
+                "anchor": anchor,
+                "target": row.full_path,
+                "selected_paths": self.selected_tree_paths.iter().cloned().collect::<Vec<_>>(),
+            }),
+        );
         self.refresh_tree_debug("extend_tree_selection");
     }
 
@@ -827,6 +878,13 @@ impl ShellState {
         if cfg!(debug_assertions) {
             info!(drag_count=%self.drag_paths.len(), anchor=%row.full_path, "tree drag started");
         }
+        self.record_ui_telemetry(
+            "tree_drag_begin",
+            json!({
+                "anchor": row.full_path,
+                "drag_paths": self.drag_paths,
+            }),
+        );
         self.refresh_tree_debug("begin_drag");
     }
 
@@ -838,6 +896,13 @@ impl ShellState {
         {
             info!(target=%target, drag_count=%self.drag_paths.len(), "tree drag hover");
         }
+        self.record_ui_telemetry(
+            "tree_drag_hover",
+            json!({
+                "target": self.drag_hover_target,
+                "drag_paths": self.drag_paths,
+            }),
+        );
         self.refresh_tree_debug("set_drag_hover_target");
     }
 
@@ -925,6 +990,24 @@ impl ShellState {
                 .clone()
                 .unwrap_or_else(|| "none".to_string())
         );
+    }
+
+    fn record_ui_telemetry(&self, event: &str, payload: Value) {
+        let telemetry = json!({
+            "ts": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default()
+                .to_string(),
+            "event": event,
+            "payload": payload,
+        });
+        if let Ok(store) = SessionStore::open_or_init() {
+            let path = store.home_dir().join("ui-telemetry.jsonl");
+            if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(file, "{}", telemetry);
+            }
+        }
     }
 
     fn generate_session_titles(&mut self) {
@@ -2021,6 +2104,14 @@ fn queue_new_separator_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
     state.with_mut(|shell| {
         shell.server_busy = true;
         shell.last_action = format!("adding separator in {}", row.label);
+        shell.record_ui_telemetry(
+            "separator_create_requested",
+            json!({
+                "source_path": row.full_path,
+                "source_kind": format!("{:?}", row.kind),
+                "source_group_kind": row.group_kind.map(|kind| format!("{kind:?}")),
+            }),
+        );
         shell.close_context_menu();
     });
 
@@ -2057,6 +2148,13 @@ fn queue_new_separator_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
                 shell.sync_browser_settings();
                 shell.server_busy = false;
                 shell.last_action = format!("added separator in {}", row.label);
+                shell.record_ui_telemetry(
+                    "separator_create_finished",
+                    json!({
+                        "source_path": row.full_path,
+                        "selected_path": selected_path,
+                    }),
+                );
                 shell.refresh_tree_debug("added_separator");
             }
             Ok(Err(error)) => {
@@ -2640,26 +2738,38 @@ fn new_group_virtual_path_for_row(row: &BrowserRow) -> String {
 }
 
 fn new_separator_virtual_path_for_row(row: &BrowserRow) -> String {
-    let base = match row.kind {
-        BrowserRowKind::Group if row.full_path == "local" => "/workspace".to_string(),
-        BrowserRowKind::Group if row.full_path.starts_with("__live_") => "/workspace".to_string(),
-        BrowserRowKind::Group => row.full_path.clone(),
-        BrowserRowKind::Separator => {
-            document_parent_base(row).unwrap_or_else(|| "/workspace".to_string())
+    let (base, anchor_leaf) = match row.kind {
+        BrowserRowKind::Group if row.full_path == "local" => ("/workspace".to_string(), None),
+        BrowserRowKind::Group if row.full_path.starts_with("__live_") => {
+            ("/workspace".to_string(), None)
         }
-        BrowserRowKind::Session => row
-            .session_cwd
-            .clone()
-            .unwrap_or_else(|| "/workspace".to_string()),
-        BrowserRowKind::Document => {
-            document_parent_base(row).unwrap_or_else(|| "/workspace".to_string())
-        }
+        BrowserRowKind::Group => (row.full_path.clone(), None),
+        BrowserRowKind::Separator => (
+            document_parent_base(row).unwrap_or_else(|| "/workspace".to_string()),
+            workspace_leaf_name(&row.full_path),
+        ),
+        BrowserRowKind::Session => (
+            row.session_cwd
+                .clone()
+                .unwrap_or_else(|| "/workspace".to_string()),
+            None,
+        ),
+        BrowserRowKind::Document => (
+            document_parent_base(row).unwrap_or_else(|| "/workspace".to_string()),
+            workspace_leaf_name(&row.full_path),
+        ),
     };
-    format!(
-        "{}/~separator-{}",
-        base.trim_end_matches('/'),
-        unique_workspace_leaf_suffix()
-    )
+    let suffix = unique_workspace_leaf_suffix();
+    if let Some(anchor_leaf) = anchor_leaf {
+        format!(
+            "{}/{}~separator-{}",
+            base.trim_end_matches('/'),
+            anchor_leaf,
+            suffix
+        )
+    } else {
+        format!("{}/~separator-{}", base.trim_end_matches('/'), suffix)
+    }
 }
 
 fn unique_workspace_leaf_suffix() -> String {
@@ -2676,6 +2786,12 @@ fn moved_workspace_item_virtual_path(item_row: &BrowserRow, target_group: &Brows
         .find(|segment| !segment.is_empty())
         .unwrap_or("item");
     format!("{}/{}", target_group.full_path.trim_end_matches('/'), name)
+}
+
+fn workspace_leaf_name(path: &str) -> Option<String> {
+    path.rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn is_workspace_row(row: &BrowserRow) -> bool {
@@ -2716,19 +2832,40 @@ fn valid_drop_target(drag_paths: &[String], target_row: &BrowserRow) -> bool {
     })
 }
 
-fn clamp_context_menu_position(
+fn context_menu_placement(
     position: (f64, f64),
     window_size: (f64, f64),
     menu_size: (f64, f64),
-) -> (f64, f64) {
+) -> ContextMenuPlacement {
     let margin = 12.0;
-    let min_top = 44.0;
-    let max_left = (window_size.0 - menu_size.0 - margin).max(margin);
-    let max_top = (window_size.1 - menu_size.1 - margin).max(min_top);
-    (
-        position.0.clamp(margin, max_left),
-        position.1.clamp(min_top, max_top),
-    )
+    let min_top = 44.0 + margin;
+    let can_anchor_right = position.0 + menu_size.0 > window_size.0 - margin;
+    let can_anchor_bottom = position.1 + menu_size.1 > window_size.1 - margin;
+    let left = (!can_anchor_right).then(|| position.0.clamp(margin, (window_size.0 - menu_size.0 - margin).max(margin)));
+    let top = (!can_anchor_bottom).then(|| position.1.clamp(min_top, (window_size.1 - menu_size.1 - margin).max(min_top)));
+    let right = can_anchor_right.then(|| (window_size.0 - position.0).clamp(margin, (window_size.0 - menu_size.0 - margin).max(margin)));
+    let bottom = can_anchor_bottom.then(|| (window_size.1 - position.1).clamp(margin, (window_size.1 - menu_size.1 - margin).max(margin)));
+    ContextMenuPlacement {
+        left,
+        top,
+        right,
+        bottom,
+    }
+}
+
+fn context_menu_position_style(placement: ContextMenuPlacement) -> String {
+    let mut parts = Vec::new();
+    if let Some(left) = placement.left {
+        parts.push(format!("left:{left}px;"));
+    } else if let Some(right) = placement.right {
+        parts.push(format!("right:{right}px;"));
+    }
+    if let Some(top) = placement.top {
+        parts.push(format!("top:{top}px;"));
+    } else if let Some(bottom) = placement.bottom {
+        parts.push(format!("bottom:{bottom}px;"));
+    }
+    parts.join(" ")
 }
 
 fn group_session_cwd(row: &BrowserRow) -> Option<String> {
@@ -3276,7 +3413,7 @@ fn app() -> Element {
                         on_create_paper: move |_| queue_new_document(state),
                         on_select_row: move |(row, mode): (BrowserRow, TreeSelectionMode)| {
                             state.with_mut(|shell| shell.select_tree_row(&row, mode));
-                            if mode == TreeSelectionMode::ExtendRange && is_workspace_row(&row) {
+                            if mode != TreeSelectionMode::Replace {
                                 return;
                             }
                             if is_live_sidebar_row(&row) {
@@ -3436,7 +3573,7 @@ fn app() -> Element {
                             move |_| queue_new_document_for_row(state, row.clone())
                         },
                         on_create_group_recipe: {
-                            let row = context_row.clone();
+                            let row = row.clone();
                             move |_| queue_new_separator_for_row(state, row.clone())
                         },
                         on_move_selected_document_here: {
@@ -4091,6 +4228,7 @@ fn SidebarRow(
 ) -> Element {
     let indent = row.depth * 12 + 12;
     let draggable = is_workspace_row(&row);
+    let mut drag_started = use_signal(|| false);
     if row.kind == BrowserRowKind::Separator {
         return rsx! {
             div {
@@ -4105,7 +4243,13 @@ fn SidebarRow(
                 draggable: false,
                 onclick: move |evt| on_select.call(evt),
                 onmousedown: move |evt| {
-                    if draggable && evt.trigger_button() == Some(MouseButton::Primary) {
+                    if draggable
+                        && evt.trigger_button() == Some(MouseButton::Primary)
+                        && !evt.modifiers().contains(Modifiers::SHIFT)
+                        && !evt.modifiers().contains(Modifiers::CONTROL)
+                        && !evt.modifiers().contains(Modifiers::META)
+                    {
+                        drag_started.set(true);
                         on_start_drag.call(evt);
                     }
                 },
@@ -4121,11 +4265,16 @@ fn SidebarRow(
                         on_drag_hover.call(evt);
                     }
                 },
-                onmouseleave: move |evt| on_drag_leave.call(evt),
+                onmouseleave: move |evt| {
+                    on_drag_leave.call(evt);
+                },
                 onmouseup: move |evt| {
                     if evt.trigger_button() == Some(MouseButton::Primary) {
-                        on_drop_into_row.call(evt.clone());
-                        on_end_drag.call(evt);
+                        if drag_started() {
+                            on_drop_into_row.call(evt.clone());
+                            on_end_drag.call(evt);
+                        }
+                        drag_started.set(false);
                     }
                 },
                 div {
@@ -4222,7 +4371,13 @@ fn SidebarRow(
             draggable: false,
             onclick: move |evt| on_select.call(evt),
             onmousedown: move |evt| {
-                if draggable && evt.trigger_button() == Some(MouseButton::Primary) {
+                if draggable
+                    && evt.trigger_button() == Some(MouseButton::Primary)
+                    && !evt.modifiers().contains(Modifiers::SHIFT)
+                    && !evt.modifiers().contains(Modifiers::CONTROL)
+                    && !evt.modifiers().contains(Modifiers::META)
+                {
+                    drag_started.set(true);
                     on_start_drag.call(evt);
                 }
             },
@@ -4238,11 +4393,16 @@ fn SidebarRow(
                     on_drag_hover.call(evt);
                 }
             },
-            onmouseleave: move |evt| on_drag_leave.call(evt),
+            onmouseleave: move |evt| {
+                on_drag_leave.call(evt);
+            },
             onmouseup: move |evt| {
                 if evt.trigger_button() == Some(MouseButton::Primary) {
-                    on_drop_into_row.call(evt.clone());
-                    on_end_drag.call(evt);
+                    if drag_started() {
+                        on_drop_into_row.call(evt.clone());
+                        on_end_drag.call(evt);
+                    }
+                    drag_started.set(false);
                 }
             },
             div {
@@ -6210,8 +6370,8 @@ fn ContextMenuOverlay(
     on_regenerate: EventHandler<MouseEvent>,
     on_delete_item: EventHandler<MouseEvent>,
 ) -> Element {
-    let (menu_left, menu_top) =
-        clamp_context_menu_position(position, window_size, (224.0, 420.0));
+    let placement = context_menu_placement(position, window_size, (224.0, 420.0));
+    let placement_style = context_menu_position_style(placement);
     let drag_paths = if selected_tree_paths.is_empty() {
         selected_row
             .as_ref()
@@ -6239,10 +6399,10 @@ fn ContextMenuOverlay(
             onclick: move |evt| on_close.call(evt),
             div {
                 style: format!(
-                    "position:absolute; top:{}px; left:{}px; min-width:188px; max-width:220px; padding:6px; border-radius:10px; \
+                    "position:absolute; {}; min-width:188px; max-width:220px; max-height:calc(100vh - 24px); overflow:auto; padding:6px; border-radius:10px; \
                      background:rgba(248,249,252,0.98); box-shadow: 0 18px 38px rgba(57,78,98,0.18), inset 0 0 0 1px rgba(214,220,228,0.9); \
                      backdrop-filter: blur(20px) saturate(150%); -webkit-backdrop-filter: blur(20px) saturate(150%);",
-                    menu_top, menu_left
+                    placement_style
                 ),
                 onmousedown: |evt| evt.stop_propagation(),
                 onclick: |evt| evt.stop_propagation(),
@@ -7134,10 +7294,36 @@ mod tests {
     }
 
     #[test]
-    fn context_menu_position_clamps_inside_window_bounds() {
-        let position = clamp_context_menu_position((1010.0, 770.0), (1100.0, 820.0), (224.0, 420.0));
+    fn new_separator_virtual_path_for_document_anchors_after_clicked_row() {
+        let document = BrowserRow {
+            kind: BrowserRowKind::Document,
+            full_path: "/home/pi/gh/notes/untitled-1774153234".to_string(),
+            label: "Untitled note".to_string(),
+            detail_label: String::new(),
+            document_kind: Some(WorkspaceDocumentKind::Note),
+            group_kind: None,
+            session_title: None,
+            depth: 4,
+            host_label: String::new(),
+            descendant_sessions: 0,
+            expanded: false,
+            session_id: Some("paper-id".to_string()),
+            session_cwd: Some("/home/pi/gh/notes".to_string()),
+        };
 
-        assert_eq!(position, (864.0, 388.0));
+        let path = new_separator_virtual_path_for_row(&document);
+
+        assert!(path.starts_with("/home/pi/gh/notes/untitled-1774153234~separator-"));
+    }
+
+    #[test]
+    fn context_menu_position_clamps_inside_window_bounds() {
+        let placement = context_menu_placement((1010.0, 770.0), (1100.0, 820.0), (224.0, 420.0));
+
+        assert_eq!(placement.left, None);
+        assert_eq!(placement.top, None);
+        assert_eq!(placement.right, Some(90.0));
+        assert_eq!(placement.bottom, Some(50.0));
     }
 }
 

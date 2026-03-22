@@ -988,14 +988,15 @@ fn cmp_browser_child_node(left: &SessionNode, right: &SessionNode) -> std::cmp::
 
 fn browser_child_sort_key(node: &SessionNode) -> (u8, String) {
     let bucket = match (node.kind, node.group_kind) {
-        (SessionNodeKind::Group, Some(WorkspaceGroupKind::Separator)) => 2,
+        (SessionNodeKind::Group, Some(WorkspaceGroupKind::Separator)) => 1,
         (SessionNodeKind::Document, _) => 1,
         (SessionNodeKind::Group, _) => 0,
         (SessionNodeKind::CodexSession, _) => 1,
     };
     let title = node
-        .title
-        .as_deref()
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
         .unwrap_or(&node.name)
         .to_ascii_lowercase();
     (bucket, title)
