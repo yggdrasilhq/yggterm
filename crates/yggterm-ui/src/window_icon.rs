@@ -18,6 +18,10 @@ pub fn load_window_icon() -> Icon {
         matches!(info.bit_depth, png::BitDepth::Eight),
         "yggterm window icon must use 8-bit channels"
     );
-    Icon::from_rgba(buffer[..info.buffer_size()].to_vec(), info.width, info.height)
-        .expect("construct yggterm window icon")
+    Icon::from_rgba(
+        buffer[..info.buffer_size()].to_vec(),
+        info.width,
+        info.height,
+    )
+    .expect("construct yggterm window icon")
 }

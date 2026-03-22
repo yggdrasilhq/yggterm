@@ -57,7 +57,8 @@ impl SessionTitleStore {
         model: &str,
         source: &str,
     ) -> Result<()> {
-        let updated_at = OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
+        let updated_at =
+            OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
         self.conn.execute(
             "INSERT INTO session_titles (session_id, title, cwd, source, model, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -124,7 +125,11 @@ impl SessionTitleResolver {
             warn!(session_id, file_path=%file_path.display(), "no transcript context extracted for title generation");
             return Ok(None);
         }
-        info!(session_id, context_chars=context.len(), "requesting title from litellm");
+        info!(
+            session_id,
+            context_chars = context.len(),
+            "requesting title from litellm"
+        );
 
         let title = request_litellm_title(settings, &context)?;
         let Some(title) = sanitize_generated_title(&title) else {
@@ -201,7 +206,9 @@ fn request_litellm_title(settings: &AppSettings, context: &str) -> Result<String
         .error_for_status()
         .context("LiteLLM returned an error status")?;
 
-    let value: Value = response.json().context("failed to parse LiteLLM response")?;
+    let value: Value = response
+        .json()
+        .context("failed to parse LiteLLM response")?;
     let title = extract_completion_text(&value)
         .or_else(|| extract_reasoning_title(&value))
         .or_else(|| heuristic_title_from_context(context))

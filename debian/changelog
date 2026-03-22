@@ -1,3 +1,14 @@
+yggterm (2.0.8-1) unstable; urgency=medium
+
+  * Fix live terminal zoom updates in the embedded xterm viewport.
+  * Keep terminal debug telemetry visible only in debug builds.
+  * Add notification settings and auto-fading in-app toasts.
+  * Support multi-select document deletion and constrain note editor overflow.
+  * Improve the SSH connect guide and button affordance.
+  * Filter legacy demo SSH entries from restored server state.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sun, 22 Mar 2026 10:25:00 +0530
+
 yggterm (2.0.7-1) unstable; urgency=medium
 
   * Raise the default terminal zoom to 130 percent for better readability in the embedded viewport.

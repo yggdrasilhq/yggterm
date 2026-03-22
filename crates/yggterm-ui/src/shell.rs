@@ -1,13 +1,15 @@
-use anyhow::Result;
 use crate::window_icon;
+use anyhow::Result;
 use dioxus::desktop::{
     Config, LogicalSize, WindowBuilder, WindowEvent as DesktopWindowEvent, use_window,
     use_wry_event_handler, window,
 };
 use dioxus::document;
 use dioxus::prelude::*;
+use keyboard_types::{Key, Modifiers};
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -24,16 +26,13 @@ use yggterm_core::{
 };
 use yggterm_platform::DockRect;
 use yggterm_server::{
-    ManagedSessionView, PreviewTone, ServerEndpoint, ServerUiSnapshot, SessionKind,
-    SessionMetadataEntry,
-    ServerRuntimeStatus, SessionPreviewBlock, SshConnectTarget, TerminalBackend,
-    GhosttyTerminalHostMode, WorkspaceViewMode, YggtermServer, focus_live, connect_ssh_custom,
-    open_stored_session, request_terminal_launch,
-    set_all_preview_blocks_folded, set_view_mode as daemon_set_view_mode, status,
-    snapshot as daemon_snapshot, ping, start_command_session, start_local_session, start_local_session_at,
-    terminal_ensure, terminal_read,
-    terminal_resize, terminal_write,
-    toggle_preview_block as daemon_toggle_preview_block,
+    GhosttyTerminalHostMode, ManagedSessionView, PreviewTone, ServerEndpoint, ServerRuntimeStatus,
+    ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionPreviewBlock, SshConnectTarget,
+    TerminalBackend, WorkspaceViewMode, YggtermServer, connect_ssh_custom, focus_live,
+    open_stored_session, ping, request_terminal_launch, set_all_preview_blocks_folded,
+    set_view_mode as daemon_set_view_mode, snapshot as daemon_snapshot, start_command_session,
+    start_local_session, start_local_session_at, status, terminal_ensure, terminal_read,
+    terminal_resize, terminal_write, toggle_preview_block as daemon_toggle_preview_block,
 };
 
 static BOOTSTRAP: OnceCell<ShellBootstrap> = OnceCell::new();
@@ -44,6 +43,14 @@ const XTERM_CSS: &str = include_str!("../../../assets/xterm/xterm.css");
 const XTERM_JS: &str = include_str!("../../../assets/xterm/xterm.js");
 const XTERM_FIT_JS: &str = include_str!("../../../assets/xterm/addon-fit.js");
 static XTERM_ASSETS_BOOTSTRAPPED: OnceCell<()> = OnceCell::new();
+const TOAST_CSS: &str = r#"
+@keyframes yggterm-toast-fade {
+  0% { opacity: 0; transform: translateY(-4px); }
+  8% { opacity: 1; transform: translateY(0); }
+  78% { opacity: 1; transform: translateY(0); }
+  100% { opacity: 0; transform: translateY(-6px); }
+}
+"#;
 
 #[derive(Debug, Clone)]
 pub struct ShellBootstrap {
@@ -83,6 +90,8 @@ struct ShellState {
     always_on_top: bool,
     notifications: Vec<ToastNotification>,
     next_notification_id: u64,
+    selected_tree_paths: HashSet<String>,
+    selection_anchor: Option<String>,
     context_menu_row: Option<BrowserRow>,
     preview_layout: PreviewLayoutMode,
     server_busy: bool,
@@ -94,6 +103,7 @@ struct ShellState {
     docked_window_id: Option<String>,
     dock_sync_in_flight: bool,
     last_dock_signature: Option<DockSignature>,
+    last_terminal_debug: String,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -132,6 +142,7 @@ struct ToastNotification {
     tone: NotificationTone,
     title: String,
     message: String,
+    created_at_ms: u64,
 }
 
 #[derive(Clone, PartialEq)]
@@ -157,12 +168,14 @@ struct RenderSnapshot {
     maximized: bool,
     always_on_top: bool,
     notifications: Vec<ToastNotification>,
+    selected_tree_paths: Vec<String>,
     context_menu_row: Option<BrowserRow>,
     preview_layout: PreviewLayoutMode,
     server_busy: bool,
     ssh_connect_target: String,
     ssh_connect_prefix: String,
     pending_update_restart: Option<PendingUpdateRestart>,
+    last_terminal_debug: String,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -224,6 +237,7 @@ enum TerminalJsEvent {
     Ready,
     Input { data: String },
     Resize { cols: u16, rows: u16 },
+    Debug { message: String },
 }
 
 impl ShellState {
@@ -243,15 +257,15 @@ impl ShellState {
         );
 
         let mut server = YggtermServer::new(
-                &bootstrap.browser_tree,
-                bootstrap.prefer_ghostty_backend,
-                yggterm_server::GhosttyHostSupport::shadow(
-                    bootstrap.ghostty_bridge_detail.clone(),
-                    bootstrap.ghostty_embedded_surface_supported,
-                    bootstrap.ghostty_bridge_enabled,
-                ),
-                bootstrap.theme,
-            );
+            &bootstrap.browser_tree,
+            bootstrap.prefer_ghostty_backend,
+            yggterm_server::GhosttyHostSupport::shadow(
+                bootstrap.ghostty_bridge_detail.clone(),
+                bootstrap.ghostty_embedded_surface_supported,
+                bootstrap.ghostty_bridge_enabled,
+            ),
+            bootstrap.theme,
+        );
         if let Some(initial_server_snapshot) = bootstrap.initial_server_snapshot.clone() {
             server.apply_snapshot(initial_server_snapshot);
         }
@@ -270,6 +284,8 @@ impl ShellState {
             always_on_top: false,
             notifications: Vec::new(),
             next_notification_id: 1,
+            selected_tree_paths: HashSet::new(),
+            selection_anchor: None,
             context_menu_row: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: needs_initial_server_sync,
@@ -281,7 +297,12 @@ impl ShellState {
             docked_window_id: None,
             dock_sync_in_flight: false,
             last_dock_signature: None,
+            last_terminal_debug: "terminal debug idle".to_string(),
         };
+        if let Some(path) = state.browser.selected_path().map(ToOwned::to_owned) {
+            state.selected_tree_paths.insert(path.clone());
+            state.selection_anchor = Some(path);
+        }
         state.server_daemon_detail = state.bootstrap.server_daemon_detail.clone();
         if let Some(update) = state.pending_update_restart.clone() {
             state.last_action = format!("update {} ready", update.version);
@@ -329,12 +350,14 @@ impl ShellState {
             maximized: self.maximized,
             always_on_top: self.always_on_top,
             notifications: self.notifications.clone(),
+            selected_tree_paths: self.selected_tree_paths.iter().cloned().collect(),
             context_menu_row: self.context_menu_row.clone(),
             preview_layout: self.preview_layout,
             server_busy: self.server_busy,
             ssh_connect_target: self.ssh_connect_target.clone(),
             ssh_connect_prefix: self.ssh_connect_prefix.clone(),
             pending_update_restart: self.pending_update_restart.clone(),
+            last_terminal_debug: self.last_terminal_debug.clone(),
         }
     }
 
@@ -442,10 +465,7 @@ impl ShellState {
         };
     }
 
-    fn apply_daemon_snapshot_result(
-        &mut self,
-        result: Result<(ServerUiSnapshot, Option<String>)>,
-    ) {
+    fn apply_daemon_snapshot_result(&mut self, result: Result<(ServerUiSnapshot, Option<String>)>) {
         match result {
             Ok((snapshot, message)) => {
                 self.server.apply_snapshot(snapshot);
@@ -521,17 +541,67 @@ impl ShellState {
         };
     }
 
-    fn adjust_ui_zoom(&mut self, delta_steps: i32) {
-        self.settings.ui_font_size = clamp_zoom_value(self.settings.ui_font_size + delta_steps as f32);
+    fn update_in_app_notifications(&mut self, enabled: bool) {
+        self.settings.in_app_notifications = enabled;
         self.persist_settings();
-        self.last_action = format!("interface zoom {}%", zoom_percent(self.settings.ui_font_size, 14.0));
+        self.last_action = if enabled {
+            "in-app notifications enabled".to_string()
+        } else {
+            "in-app notifications disabled".to_string()
+        };
+    }
+
+    fn update_system_notifications(&mut self, enabled: bool) {
+        self.settings.system_notifications = enabled;
+        self.persist_settings();
+        self.last_action = if enabled {
+            "system notifications enabled".to_string()
+        } else {
+            "system notifications disabled".to_string()
+        };
+    }
+
+    fn update_notification_sound(&mut self, enabled: bool) {
+        self.settings.notification_sound = enabled;
+        self.persist_settings();
+        self.last_action = if enabled {
+            "notification sound enabled".to_string()
+        } else {
+            "notification sound disabled".to_string()
+        };
+    }
+
+    fn adjust_ui_zoom(&mut self, delta_steps: i32) {
+        self.settings.ui_font_size =
+            clamp_zoom_value(self.settings.ui_font_size + delta_steps as f32);
+        self.persist_settings();
+        self.last_action = format!(
+            "interface zoom {}%",
+            zoom_percent(self.settings.ui_font_size, 14.0)
+        );
     }
 
     fn adjust_main_zoom(&mut self, delta_steps: i32) {
+        let before = self.settings.terminal_font_size;
         self.settings.terminal_font_size =
             clamp_zoom_value_main(self.settings.terminal_font_size + delta_steps as f32);
         self.persist_settings();
-        self.last_action = format!("terminal zoom {}%", zoom_percent(self.settings.terminal_font_size, 10.0));
+        self.last_terminal_debug = if let Some(session) = self.server.active_session() {
+            format!(
+                "zoom {} -> {} for {} ({})",
+                before,
+                self.settings.terminal_font_size,
+                session.session_path,
+                terminal_host_id(&session.session_path)
+            )
+        } else {
+            format!("zoom {} -> {} with no active session", before, self.settings.terminal_font_size)
+        };
+        info!(before, after=self.settings.terminal_font_size, debug=%self.last_terminal_debug, "terminal zoom changed");
+        self.last_action = format!(
+            "terminal zoom {}%",
+            zoom_percent(self.settings.terminal_font_size, 10.0)
+        );
     }
 
     fn toggle_maximized(&mut self) {
@@ -558,11 +628,67 @@ impl ShellState {
     }
 
     fn clear_notification(&mut self, id: u64) {
-        self.notifications.retain(|notification| notification.id != id);
+        self.notifications
+            .retain(|notification| notification.id != id);
     }
 
     fn clear_notifications(&mut self) {
         self.notifications.clear();
+    }
+
+    fn select_tree_row(&mut self, row: &BrowserRow, extend_range: bool) {
+        if extend_range && row.kind == BrowserRowKind::Document {
+            self.extend_tree_selection(row);
+            return;
+        }
+        self.selected_tree_paths.clear();
+        self.selected_tree_paths.insert(row.full_path.clone());
+        self.selection_anchor = Some(row.full_path.clone());
+        self.browser.select_path(row.full_path.clone());
+    }
+
+    fn extend_tree_selection(&mut self, row: &BrowserRow) {
+        let rows = merged_sidebar_rows(self.browser.rows(), &self.server.live_sessions());
+        let anchor = self
+            .selection_anchor
+            .clone()
+            .or_else(|| self.browser.selected_path().map(ToOwned::to_owned))
+            .unwrap_or_else(|| row.full_path.clone());
+        let Some(anchor_ix) = rows.iter().position(|candidate| candidate.full_path == anchor) else {
+            self.select_tree_row(row, false);
+            return;
+        };
+        let Some(target_ix) = rows
+            .iter()
+            .position(|candidate| candidate.full_path == row.full_path)
+        else {
+            self.select_tree_row(row, false);
+            return;
+        };
+        let (start, end) = if anchor_ix <= target_ix {
+            (anchor_ix, target_ix)
+        } else {
+            (target_ix, anchor_ix)
+        };
+        self.selected_tree_paths.clear();
+        for candidate in rows.iter().skip(start).take(end - start + 1) {
+            if candidate.kind == BrowserRowKind::Document {
+                self.selected_tree_paths.insert(candidate.full_path.clone());
+            }
+        }
+        if self.selected_tree_paths.is_empty() {
+            self.selected_tree_paths.insert(row.full_path.clone());
+        }
+        self.browser.select_path(row.full_path.clone());
+    }
+
+    fn selected_document_paths(&self) -> Vec<String> {
+        let rows = merged_sidebar_rows(self.browser.rows(), &self.server.live_sessions());
+        rows.into_iter()
+            .filter(|row| row.kind == BrowserRowKind::Document)
+            .filter(|row| self.selected_tree_paths.contains(&row.full_path))
+            .map(|row| row.full_path)
+            .collect()
     }
 
     fn generate_session_titles(&mut self) {
@@ -640,12 +766,23 @@ impl ShellState {
         title: impl Into<String>,
         message: impl Into<String>,
     ) {
-        self.notifications.push(ToastNotification {
-            id: self.next_notification_id,
-            tone,
-            title: title.into(),
-            message: message.into(),
-        });
+        let title = title.into();
+        let message = message.into();
+        if self.settings.in_app_notifications {
+            self.notifications.push(ToastNotification {
+                id: self.next_notification_id,
+                tone,
+                title: title.clone(),
+                message: message.clone(),
+                created_at_ms: current_millis(),
+            });
+        }
+        if self.settings.system_notifications {
+            emit_system_notification(&title, &message);
+        }
+        if self.settings.notification_sound {
+            emit_notification_chime();
+        }
         self.next_notification_id += 1;
         if self.notifications.len() > 1000 {
             let overflow = self.notifications.len() - 1000;
@@ -686,17 +823,19 @@ fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force:
     spawn(async move {
         let row_for_task = row.clone();
         let settings_for_task = settings.clone();
-        let outcome = task::spawn_blocking(move || -> Result<(Option<String>, yggterm_core::SessionNode)> {
-            info!(session_path=%row_for_task.full_path, force, "running title generation task");
-            let store = SessionStore::open_or_init()?;
-            let title = store.generate_title_for_session_path(
-                &settings_for_task,
-                &row_for_task.full_path,
-                force,
-            )?;
-            let browser_tree = store.load_codex_tree(&settings_for_task)?;
-            Ok((title, browser_tree))
-        })
+        let outcome = task::spawn_blocking(
+            move || -> Result<(Option<String>, yggterm_core::SessionNode)> {
+                info!(session_path=%row_for_task.full_path, force, "running title generation task");
+                let store = SessionStore::open_or_init()?;
+                let title = store.generate_title_for_session_path(
+                    &settings_for_task,
+                    &row_for_task.full_path,
+                    force,
+                )?;
+                let browser_tree = store.load_codex_tree(&settings_for_task)?;
+                Ok((title, browser_tree))
+            },
+        )
         .await;
 
         state.with_mut(|shell| match outcome {
@@ -816,10 +955,14 @@ fn spawn_notify_only_update_check(mut state: Signal<ShellState>) {
             Ok(Ok(Some(update))) => {
                 let hint = update_command_hint(shell.bootstrap.install_context.channel);
                 let suffix = if hint.is_empty() {
-                    shell.bootstrap.install_context
+                    shell
+                        .bootstrap
+                        .install_context
                         .manager_hint
                         .clone()
-                        .unwrap_or_else(|| "Use your package manager to update Yggterm.".to_string())
+                        .unwrap_or_else(|| {
+                            "Use your package manager to update Yggterm.".to_string()
+                        })
                 } else {
                     format!("Run `{hint}` to update.")
                 };
@@ -875,11 +1018,8 @@ fn initial_server_sync(
     Ok((snapshot, runtime, detail))
 }
 
-fn spawn_server_snapshot_action<F>(
-    mut state: Signal<ShellState>,
-    pending_label: String,
-    request: F,
-) where
+fn spawn_server_snapshot_action<F>(mut state: Signal<ShellState>, pending_label: String, request: F)
+where
     F: FnOnce(ServerEndpoint) -> Result<(ServerUiSnapshot, Option<String>)> + Send + 'static,
 {
     let endpoint = state.read().bootstrap.server_endpoint.clone();
@@ -914,17 +1054,13 @@ fn spawn_set_view_mode(mut state: Signal<ShellState>, mode: WorkspaceViewMode) {
             WorkspaceViewMode::Terminal => "switching to terminal".to_string(),
         };
     });
-    spawn_server_snapshot_action(
-        state,
-        "syncing view mode".to_string(),
-        move |endpoint| {
-            if mode == WorkspaceViewMode::Terminal {
-                request_terminal_launch(&endpoint)
-            } else {
-                daemon_set_view_mode(&endpoint, mode)
-            }
-        },
-    );
+    spawn_server_snapshot_action(state, "syncing view mode".to_string(), move |endpoint| {
+        if mode == WorkspaceViewMode::Terminal {
+            request_terminal_launch(&endpoint)
+        } else {
+            daemon_set_view_mode(&endpoint, mode)
+        }
+    });
 }
 
 fn spawn_open_session_row(mut state: Signal<ShellState>, row: BrowserRow) {
@@ -935,20 +1071,16 @@ fn spawn_open_session_row(mut state: Signal<ShellState>, row: BrowserRow) {
         shell.server_busy = true;
         shell.last_action = format!("opening {}", row.label);
     });
-    spawn_server_snapshot_action(
-        state,
-        format!("opening {}", row.label),
-        move |endpoint| {
-            open_stored_session(
-                &endpoint,
-                session_kind_for_row(row.kind),
-                &row.full_path,
-                row.session_id.as_deref(),
-                row.session_cwd.as_deref(),
-                Some(row.label.as_str()),
-            )
-        },
-    );
+    spawn_server_snapshot_action(state, format!("opening {}", row.label), move |endpoint| {
+        open_stored_session(
+            &endpoint,
+            session_kind_for_row(row.kind),
+            &row.full_path,
+            row.session_id.as_deref(),
+            row.session_cwd.as_deref(),
+            Some(row.label.as_str()),
+        )
+    });
 }
 
 fn spawn_connect_ssh_custom(mut state: Signal<ShellState>) {
@@ -1021,7 +1153,11 @@ fn spawn_connect_ssh_custom(mut state: Signal<ShellState>) {
 fn spawn_start_group_session(mut state: Signal<ShellState>, row: BrowserRow, kind: SessionKind) {
     let cwd = group_session_cwd(&row);
     let title_hint = Some(group_session_title_hint(&row, kind));
-    let pending = format!("starting {} in {}", session_kind_action_label(kind), row.label);
+    let pending = format!(
+        "starting {} in {}",
+        session_kind_action_label(kind),
+        row.label
+    );
     state.with_mut(|shell| shell.close_context_menu());
     spawn_server_snapshot_action(state, pending, move |endpoint| {
         start_local_session_at(&endpoint, kind, cwd.as_deref(), title_hint.as_deref())
@@ -1076,9 +1212,33 @@ fn merged_sidebar_rows(
         session_id: None,
         session_cwd: None,
     });
-    push_live_group_rows(&mut rows, "agent sessions", "__live_agents__", 1, live_sessions.iter().filter(|session| matches!(session.kind, SessionKind::Codex | SessionKind::CodexLiteLlm)));
-    push_live_group_rows(&mut rows, "shell sessions", "__live_shells__", 1, live_sessions.iter().filter(|session| session.kind == SessionKind::Shell));
-    push_live_group_rows(&mut rows, "ssh sessions", "__live_ssh__", 1, live_sessions.iter().filter(|session| session.kind == SessionKind::SshShell));
+    push_live_group_rows(
+        &mut rows,
+        "agent sessions",
+        "__live_agents__",
+        1,
+        live_sessions.iter().filter(|session| {
+            matches!(session.kind, SessionKind::Codex | SessionKind::CodexLiteLlm)
+        }),
+    );
+    push_live_group_rows(
+        &mut rows,
+        "shell sessions",
+        "__live_shells__",
+        1,
+        live_sessions
+            .iter()
+            .filter(|session| session.kind == SessionKind::Shell),
+    );
+    push_live_group_rows(
+        &mut rows,
+        "ssh sessions",
+        "__live_ssh__",
+        1,
+        live_sessions
+            .iter()
+            .filter(|session| session.kind == SessionKind::SshShell),
+    );
     rows.extend_from_slice(stored_rows);
     rows
 }
@@ -1150,23 +1310,27 @@ fn queue_session_note_creation(mut state: Signal<ShellState>, row: BrowserRow) {
     spawn(async move {
         let row_for_task = row.clone();
         let settings = state.read().settings.clone();
-        let outcome = task::spawn_blocking(move || -> Result<(yggterm_core::WorkspaceDocument, yggterm_core::SessionNode)> {
-            let store = SessionStore::open_or_init()?;
-            let document = store.save_document(
-                &session_note_virtual_path(&row_for_task),
-                Some(&format!("{} notes", row_for_task.label)),
-                &session_note_template(&row_for_task),
-            )?;
-            let browser_tree = store.load_codex_tree(&settings)?;
-            Ok((document, browser_tree))
-        })
+        let outcome = task::spawn_blocking(
+            move || -> Result<(yggterm_core::WorkspaceDocument, yggterm_core::SessionNode)> {
+                let store = SessionStore::open_or_init()?;
+                let document = store.save_document(
+                    &session_note_virtual_path(&row_for_task),
+                    Some(&format!("{} notes", row_for_task.label)),
+                    &session_note_template(&row_for_task),
+                )?;
+                let browser_tree = store.load_codex_tree(&settings)?;
+                Ok((document, browser_tree))
+            },
+        )
         .await;
 
         state.with_mut(|shell| match outcome {
             Ok(Ok((document, browser_tree))) => {
                 let expanded_paths = shell.browser.expanded_paths();
                 shell.browser = SessionBrowserState::new(browser_tree);
-                shell.browser.restore_ui_state(&expanded_paths, Some(&document.virtual_path));
+                shell
+                    .browser
+                    .restore_ui_state(&expanded_paths, Some(&document.virtual_path));
                 shell.browser.select_path(document.virtual_path.clone());
                 shell.sync_browser_settings();
                 shell.apply_daemon_snapshot_result(open_stored_session(
@@ -1219,30 +1383,36 @@ fn queue_session_recipe_creation(mut state: Signal<ShellState>, row: BrowserRow)
     spawn(async move {
         let row_for_task = row.clone();
         let settings = state.read().settings.clone();
-        let outcome = task::spawn_blocking(move || -> Result<(yggterm_core::WorkspaceDocument, yggterm_core::SessionNode)> {
-            let store = SessionStore::open_or_init()?;
-            let document = store.save_document_input(
-                &session_recipe_virtual_path(&row_for_task),
-                WorkspaceDocumentInput {
-                    title: Some(format!("{} recipe", row_for_task.label)),
-                    kind: WorkspaceDocumentKind::TerminalRecipe,
-                    body: session_recipe_template(&row_for_task),
-                    source_session_path: Some(row_for_task.full_path.clone()),
-                    source_session_kind: Some(inferred_session_kind_name(&row_for_task).to_string()),
-                    source_session_cwd: row_for_task.session_cwd.clone(),
-                    replay_commands: initial_replay_commands_for_row(&row_for_task),
-                },
-            )?;
-            let browser_tree = store.load_codex_tree(&settings)?;
-            Ok((document, browser_tree))
-        })
+        let outcome = task::spawn_blocking(
+            move || -> Result<(yggterm_core::WorkspaceDocument, yggterm_core::SessionNode)> {
+                let store = SessionStore::open_or_init()?;
+                let document = store.save_document_input(
+                    &session_recipe_virtual_path(&row_for_task),
+                    WorkspaceDocumentInput {
+                        title: Some(format!("{} recipe", row_for_task.label)),
+                        kind: WorkspaceDocumentKind::TerminalRecipe,
+                        body: session_recipe_template(&row_for_task),
+                        source_session_path: Some(row_for_task.full_path.clone()),
+                        source_session_kind: Some(
+                            inferred_session_kind_name(&row_for_task).to_string(),
+                        ),
+                        source_session_cwd: row_for_task.session_cwd.clone(),
+                        replay_commands: initial_replay_commands_for_row(&row_for_task),
+                    },
+                )?;
+                let browser_tree = store.load_codex_tree(&settings)?;
+                Ok((document, browser_tree))
+            },
+        )
         .await;
 
         state.with_mut(|shell| match outcome {
             Ok(Ok((document, browser_tree))) => {
                 let expanded_paths = shell.browser.expanded_paths();
                 shell.browser = SessionBrowserState::new(browser_tree);
-                shell.browser.restore_ui_state(&expanded_paths, Some(&document.virtual_path));
+                shell
+                    .browser
+                    .restore_ui_state(&expanded_paths, Some(&document.virtual_path));
                 shell.browser.select_path(document.virtual_path.clone());
                 shell.sync_browser_settings();
                 shell.apply_daemon_snapshot_result(open_stored_session(
@@ -1293,24 +1463,29 @@ fn queue_new_document(mut state: Signal<ShellState>) {
     let settings = state.read().settings.clone();
 
     spawn(async move {
-        let outcome = task::spawn_blocking(move || -> Result<(yggterm_core::WorkspaceDocument, yggterm_core::SessionNode)> {
-            let store = SessionStore::open_or_init()?;
-            let virtual_path = new_document_virtual_path(selected_row.as_ref(), active_session.as_ref());
-            let document = store.save_document(
-                &virtual_path,
-                Some("Untitled note"),
-                "# Untitled note\n\nStart writing here.\n",
-            )?;
-            let browser_tree = store.load_codex_tree(&settings)?;
-            Ok((document, browser_tree))
-        })
+        let outcome = task::spawn_blocking(
+            move || -> Result<(yggterm_core::WorkspaceDocument, yggterm_core::SessionNode)> {
+                let store = SessionStore::open_or_init()?;
+                let virtual_path =
+                    new_document_virtual_path(selected_row.as_ref(), active_session.as_ref());
+                let document = store.save_document(
+                    &virtual_path,
+                    Some("Untitled note"),
+                    "# Untitled note\n\nStart writing here.\n",
+                )?;
+                let browser_tree = store.load_codex_tree(&settings)?;
+                Ok((document, browser_tree))
+            },
+        )
         .await;
 
         state.with_mut(|shell| match outcome {
             Ok(Ok((document, browser_tree))) => {
                 let expanded_paths = shell.browser.expanded_paths();
                 shell.browser = SessionBrowserState::new(browser_tree);
-                shell.browser.restore_ui_state(&expanded_paths, Some(&document.virtual_path));
+                shell
+                    .browser
+                    .restore_ui_state(&expanded_paths, Some(&document.virtual_path));
                 shell.browser.select_path(document.virtual_path.clone());
                 shell.sync_browser_settings();
                 shell.apply_daemon_snapshot_result(open_stored_session(
@@ -1367,9 +1542,7 @@ fn queue_new_recipe_for_row(state: Signal<ShellState>, row: BrowserRow) {
     } else {
         "Untitled recipe".to_string()
     };
-    let body = format!(
-        "# {title}\n\n```bash\n# commands to replay here\n```\n"
-    );
+    let body = format!("# {title}\n\n```bash\n# commands to replay here\n```\n");
     queue_new_workspace_document_for_row(
         state,
         row,
@@ -1407,8 +1580,8 @@ fn queue_new_workspace_document_for_row(
     let title = title.to_string();
     spawn(async move {
         let row_for_task = row.clone();
-        let outcome =
-            task::spawn_blocking(move || -> Result<(yggterm_core::WorkspaceDocument, yggterm_core::SessionNode)> {
+        let outcome = task::spawn_blocking(
+            move || -> Result<(yggterm_core::WorkspaceDocument, yggterm_core::SessionNode)> {
                 let store = SessionStore::open_or_init()?;
                 let virtual_path = new_document_virtual_path_for_row(&row_for_task);
                 let document = store.save_document_input(
@@ -1423,14 +1596,17 @@ fn queue_new_workspace_document_for_row(
                 )?;
                 let browser_tree = store.load_codex_tree(&settings)?;
                 Ok((document, browser_tree))
-            })
-            .await;
+            },
+        )
+        .await;
 
         state.with_mut(|shell| match outcome {
             Ok(Ok((document, browser_tree))) => {
                 let expanded_paths = shell.browser.expanded_paths();
                 shell.browser = SessionBrowserState::new(browser_tree);
-                shell.browser.restore_ui_state(&expanded_paths, Some(&document.virtual_path));
+                shell
+                    .browser
+                    .restore_ui_state(&expanded_paths, Some(&document.virtual_path));
                 shell.browser.select_path(document.virtual_path.clone());
                 shell.sync_browser_settings();
                 shell.apply_daemon_snapshot_result(open_stored_session(
@@ -1480,19 +1656,22 @@ fn queue_new_group_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
     let settings = state.read().settings.clone();
     spawn(async move {
         let row_for_task = row.clone();
-        let outcome = task::spawn_blocking(move || -> Result<(String, yggterm_core::SessionNode)> {
-            let store = SessionStore::open_or_init()?;
-            let virtual_path = new_group_virtual_path_for_row(&row_for_task);
-            store.save_group(&virtual_path, Some("New Group"))?;
-            Ok((virtual_path, store.load_codex_tree(&settings)?))
-        })
-        .await;
+        let outcome =
+            task::spawn_blocking(move || -> Result<(String, yggterm_core::SessionNode)> {
+                let store = SessionStore::open_or_init()?;
+                let virtual_path = new_group_virtual_path_for_row(&row_for_task);
+                store.save_group(&virtual_path, Some("New Group"))?;
+                Ok((virtual_path, store.load_codex_tree(&settings)?))
+            })
+            .await;
 
         state.with_mut(|shell| match outcome {
             Ok(Ok((selected_path, browser_tree))) => {
                 let expanded_paths = shell.browser.expanded_paths();
                 shell.browser = SessionBrowserState::new(browser_tree);
-                shell.browser.restore_ui_state(&expanded_paths, Some(&selected_path));
+                shell
+                    .browser
+                    .restore_ui_state(&expanded_paths, Some(&selected_path));
                 shell.browser.select_path(selected_path.clone());
                 shell.sync_browser_settings();
                 shell.server_busy = false;
@@ -1543,21 +1722,24 @@ fn queue_move_selected_document_to_group(mut state: Signal<ShellState>, target_g
     spawn(async move {
         let selected_for_task = selected_row.clone();
         let target_for_task = target_group.clone();
-        let outcome =
-            task::spawn_blocking(move || -> Result<(yggterm_core::WorkspaceDocument, yggterm_core::SessionNode)> {
+        let outcome = task::spawn_blocking(
+            move || -> Result<(yggterm_core::WorkspaceDocument, yggterm_core::SessionNode)> {
                 let store = SessionStore::open_or_init()?;
                 let destination = moved_document_virtual_path(&selected_for_task, &target_for_task);
                 let document = store.move_document(&selected_for_task.full_path, &destination)?;
                 let browser_tree = store.load_codex_tree(&settings)?;
                 Ok((document, browser_tree))
-            })
-            .await;
+            },
+        )
+        .await;
 
         state.with_mut(|shell| match outcome {
             Ok(Ok((document, browser_tree))) => {
                 let expanded_paths = shell.browser.expanded_paths();
                 shell.browser = SessionBrowserState::new(browser_tree);
-                shell.browser.restore_ui_state(&expanded_paths, Some(&document.virtual_path));
+                shell
+                    .browser
+                    .restore_ui_state(&expanded_paths, Some(&document.virtual_path));
                 shell.browser.select_path(document.virtual_path.clone());
                 shell.sync_browser_settings();
                 shell.apply_daemon_snapshot_result(open_stored_session(
@@ -1597,6 +1779,72 @@ fn queue_move_selected_document_to_group(mut state: Signal<ShellState>, target_g
     });
 }
 
+fn queue_delete_selected_documents(mut state: Signal<ShellState>) {
+    let selected_paths = state.read().selected_document_paths();
+    if selected_paths.is_empty() {
+        return;
+    }
+
+    state.with_mut(|shell| {
+        shell.server_busy = true;
+        shell.last_action = format!("deleting {} document(s)", selected_paths.len());
+        shell.close_context_menu();
+    });
+
+    spawn(async move {
+        let selected_for_task = selected_paths.clone();
+        let outcome = task::spawn_blocking(move || -> Result<(usize, yggterm_core::SessionNode)> {
+            let store = SessionStore::open_or_init()?;
+            let deleted = store.delete_documents(&selected_for_task)?;
+            let settings = store.load_settings().unwrap_or_default();
+            let browser_tree = store.load_codex_tree(&settings)?;
+            Ok((deleted, browser_tree))
+        })
+        .await;
+
+        state.with_mut(|shell| match outcome {
+            Ok(Ok((deleted, browser_tree))) => {
+                let expanded_paths = shell.browser.expanded_paths();
+                shell.browser = SessionBrowserState::new(browser_tree);
+                shell.browser.restore_ui_state(&expanded_paths, None);
+                shell.selected_tree_paths.clear();
+                if let Some(path) = shell.browser.selected_path().map(ToOwned::to_owned) {
+                    shell.selected_tree_paths.insert(path.clone());
+                    shell.selection_anchor = Some(path);
+                } else {
+                    shell.selection_anchor = None;
+                }
+                shell.sync_browser_settings();
+                shell.server_busy = false;
+                shell.last_action = format!("deleted {deleted} document(s)");
+                shell.push_notification(
+                    NotificationTone::Success,
+                    "Documents Deleted",
+                    format!("Removed {deleted} document(s) from the workspace tree."),
+                );
+            }
+            Ok(Err(error)) => {
+                shell.server_busy = false;
+                shell.last_action = format!("delete failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "Delete Failed",
+                    error.to_string(),
+                );
+            }
+            Err(error) => {
+                shell.server_busy = false;
+                shell.last_action = format!("delete task failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "Delete Task Failed",
+                    error.to_string(),
+                );
+            }
+        });
+    });
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AfterSaveAction {
     SaveOnly,
@@ -1614,18 +1862,23 @@ fn queue_document_save(
         shell.server_busy = true;
         shell.last_action = format!(
             "saving {}",
-            input.title.clone().unwrap_or_else(|| "document".to_string())
+            input
+                .title
+                .clone()
+                .unwrap_or_else(|| "document".to_string())
         );
     });
 
     let settings = state.read().settings.clone();
     spawn(async move {
-        let outcome = task::spawn_blocking(move || -> Result<(yggterm_core::WorkspaceDocument, yggterm_core::SessionNode)> {
-            let store = SessionStore::open_or_init()?;
-            let document = store.save_document_input(&virtual_path, input)?;
-            let browser_tree = store.load_codex_tree(&settings)?;
-            Ok((document, browser_tree))
-        })
+        let outcome = task::spawn_blocking(
+            move || -> Result<(yggterm_core::WorkspaceDocument, yggterm_core::SessionNode)> {
+                let store = SessionStore::open_or_init()?;
+                let document = store.save_document_input(&virtual_path, input)?;
+                let browser_tree = store.load_codex_tree(&settings)?;
+                Ok((document, browser_tree))
+            },
+        )
         .await;
 
         let mut should_run_here = false;
@@ -1635,7 +1888,9 @@ fn queue_document_save(
                 let expanded_paths = shell.browser.expanded_paths();
                 let filter_query = shell.search_query.clone();
                 shell.browser = SessionBrowserState::new(browser_tree);
-                shell.browser.restore_ui_state(&expanded_paths, Some(&document.virtual_path));
+                shell
+                    .browser
+                    .restore_ui_state(&expanded_paths, Some(&document.virtual_path));
                 shell.browser.set_filter_query(filter_query);
                 shell.browser.select_path(document.virtual_path.clone());
                 shell.sync_browser_settings();
@@ -1695,19 +1950,15 @@ fn queue_document_save(
                 shell.server_busy = true;
                 shell.last_action = format!("starting {}", source_title);
             });
-            spawn_server_snapshot_action(
-                state,
-                format!("starting {title}"),
-                move |endpoint| {
-                    start_command_session(
-                        &endpoint,
-                        cwd.as_deref(),
-                        Some(&title),
-                        &launch_command,
-                        Some(&source_title),
-                    )
-                },
-            );
+            spawn_server_snapshot_action(state, format!("starting {title}"), move |endpoint| {
+                start_command_session(
+                    &endpoint,
+                    cwd.as_deref(),
+                    Some(&title),
+                    &launch_command,
+                    Some(&source_title),
+                )
+            });
         }
     });
 }
@@ -1728,7 +1979,11 @@ fn session_note_virtual_path(row: &BrowserRow) -> String {
         .collect::<String>()
         .trim_matches('-')
         .to_string();
-    let slug = if slug.is_empty() { "session-note".to_string() } else { slug };
+    let slug = if slug.is_empty() {
+        "session-note".to_string()
+    } else {
+        slug
+    };
     format!("{}/notes/{}", base.trim_end_matches('/'), slug)
 }
 
@@ -1760,7 +2015,11 @@ fn session_recipe_virtual_path(row: &BrowserRow) -> String {
         .collect::<String>()
         .trim_matches('-')
         .to_string();
-    let slug = if slug.is_empty() { "terminal-recipe".to_string() } else { slug };
+    let slug = if slug.is_empty() {
+        "terminal-recipe".to_string()
+    } else {
+        slug
+    };
     format!("{}/recipes/{}", base.trim_end_matches('/'), slug)
 }
 
@@ -1806,7 +2065,10 @@ fn initial_replay_commands_for_row(row: &BrowserRow) -> Vec<String> {
     }
 }
 
-fn new_document_virtual_path(selected_row: Option<&BrowserRow>, active_session: Option<&ManagedSessionView>) -> String {
+fn new_document_virtual_path(
+    selected_row: Option<&BrowserRow>,
+    active_session: Option<&ManagedSessionView>,
+) -> String {
     let base = selected_row
         .and_then(document_parent_base)
         .or_else(|| active_session.and_then(active_session_document_base))
@@ -1832,8 +2094,13 @@ fn new_group_virtual_path_for_row(row: &BrowserRow) -> String {
         BrowserRowKind::Group if row.full_path == "local" => "/workspace".to_string(),
         BrowserRowKind::Group if row.full_path.starts_with("__live_") => "/workspace".to_string(),
         BrowserRowKind::Group => row.full_path.clone(),
-        BrowserRowKind::Session => row.session_cwd.clone().unwrap_or_else(|| "/workspace".to_string()),
-        BrowserRowKind::Document => parent_virtual_path(&row.full_path).unwrap_or_else(|| "/workspace".to_string()),
+        BrowserRowKind::Session => row
+            .session_cwd
+            .clone()
+            .unwrap_or_else(|| "/workspace".to_string()),
+        BrowserRowKind::Document => {
+            parent_virtual_path(&row.full_path).unwrap_or_else(|| "/workspace".to_string())
+        }
     };
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1989,7 +2256,8 @@ fn spawn_dock_retry(state: Signal<ShellState>, request: GhosttyDockRequest) {
             if shell.server.active_view_mode() != WorkspaceViewMode::Terminal {
                 false
             } else {
-                shell.server
+                shell
+                    .server
                     .active_session()
                     .map(|session| {
                         session.backend == TerminalBackend::Ghostty
@@ -2077,8 +2345,7 @@ fn ghostty_dock_request(
     let x = ((left_sidebar + frame_inset) * scale).round() as i32;
     let y = ((titlebar_height + top_padding + frame_inset) * scale).round() as i32;
     let width = inner.width.saturating_sub(
-        ((left_sidebar + right_sidebar + right_padding + frame_inset * 2.0) * scale).round()
-            as u32,
+        ((left_sidebar + right_sidebar + right_padding + frame_inset * 2.0) * scale).round() as u32,
     );
     let height = inner.height.saturating_sub(
         ((titlebar_height + top_padding + bottom_padding + frame_inset * 2.0) * scale).round()
@@ -2125,7 +2392,10 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
 }
 
 fn app() -> Element {
-    let bootstrap = BOOTSTRAP.get().expect("shell bootstrap not initialized").clone();
+    let bootstrap = BOOTSTRAP
+        .get()
+        .expect("shell bootstrap not initialized")
+        .clone();
     let mut state = use_signal(|| ShellState::new(bootstrap));
     let desktop = use_window();
     let mut hovered = use_signal(|| None::<HoveredControl>);
@@ -2285,6 +2555,7 @@ fn app() -> Element {
                  -webkit-backdrop-filter: blur(30px) saturate(165%);",
                 shell_radius, snapshot.palette.shell, snapshot.palette.gradient
             ),
+            style { "{TOAST_CSS}" }
             div {
                 style: shell_style(snapshot.palette, shell_radius),
                 WindowResizeHandles {}
@@ -2323,7 +2594,11 @@ fn app() -> Element {
                             move |endpoint| start_local_session(&endpoint, SessionKind::Shell),
                         ),
                         on_create_document: move |_| queue_new_document(state),
-                        on_select_row: move |row: BrowserRow| {
+                        on_select_row: move |(row, extend_range): (BrowserRow, bool)| {
+                            state.with_mut(|shell| shell.select_tree_row(&row, extend_range));
+                            if extend_range && row.kind == BrowserRowKind::Document {
+                                return;
+                            }
                             if is_live_sidebar_row(&row) {
                                 spawn_server_snapshot_action(
                                     state,
@@ -2341,6 +2616,7 @@ fn app() -> Element {
                                 queue_title_generation(state, row.clone(), false);
                             }
                         },
+                        on_delete_selected_documents: move |_| queue_delete_selected_documents(state),
                         on_open_context_menu: move |row: BrowserRow| state.with_mut(|shell| shell.open_context_menu(row)),
                     }
                     MainSurface {
@@ -2391,10 +2667,22 @@ fn app() -> Element {
                         on_set_agent_profile: move |profile: AgentSessionProfile| {
                             state.with_mut(|shell| shell.update_default_agent_profile(profile))
                         },
+                        on_set_in_app_notifications: move |enabled: bool| {
+                            state.with_mut(|shell| shell.update_in_app_notifications(enabled))
+                        },
+                        on_set_system_notifications: move |enabled: bool| {
+                            state.with_mut(|shell| shell.update_system_notifications(enabled))
+                        },
+                        on_set_notification_sound: move |enabled: bool| {
+                            state.with_mut(|shell| shell.update_notification_sound(enabled))
+                        },
                         on_create_document: move |_| queue_new_document(state),
                         on_generate_titles: move |_| state.with_mut(|shell| shell.generate_session_titles()),
                         on_adjust_ui_zoom: move |delta: i32| state.with_mut(|shell| shell.adjust_ui_zoom(delta)),
-                        on_adjust_main_zoom: move |delta: i32| state.with_mut(|shell| shell.adjust_main_zoom(delta)),
+                        on_adjust_main_zoom: move |delta: i32| {
+                            state.with_mut(|shell| shell.adjust_main_zoom(delta));
+                            apply_active_terminal_zoom(state);
+                        },
                         on_connect_ssh_custom: move |_| spawn_connect_ssh_custom(state),
                         on_ssh_target_change: move |value: String| state.with_mut(|shell| shell.update_ssh_connect_target(value)),
                         on_ssh_prefix_change: move |value: String| state.with_mut(|shell| shell.update_ssh_connect_prefix(value)),
@@ -2917,12 +3205,21 @@ fn Sidebar(
     on_start_codex_litellm: EventHandler<MouseEvent>,
     on_start_shell: EventHandler<MouseEvent>,
     on_create_document: EventHandler<MouseEvent>,
-    on_select_row: EventHandler<BrowserRow>,
+    on_select_row: EventHandler<(BrowserRow, bool)>,
+    on_delete_selected_documents: EventHandler<KeyboardEvent>,
     on_open_context_menu: EventHandler<BrowserRow>,
 ) -> Element {
-    let width = if snapshot.sidebar_open { SIDE_RAIL_WIDTH } else { 0 };
+    let width = if snapshot.sidebar_open {
+        SIDE_RAIL_WIDTH
+    } else {
+        0
+    };
     let opacity = if snapshot.sidebar_open { "1" } else { "0" };
-    let translate = if snapshot.sidebar_open { "translateX(0)" } else { "translateX(-14px)" };
+    let translate = if snapshot.sidebar_open {
+        "translateX(0)"
+    } else {
+        "translateX(-14px)"
+    };
     rsx! {
         div {
             style: format!(
@@ -2933,6 +3230,12 @@ fn Sidebar(
                 if snapshot.sidebar_open { "auto" } else { "none" },
                 zoom_percent_f32(snapshot.settings.ui_font_size, 14.0)
             ),
+            tabindex: "0",
+            onkeydown: move |evt| {
+                if evt.key() == Key::Delete {
+                    on_delete_selected_documents.call(evt);
+                }
+            },
             div {
                 style: "padding:12px 12px 0 12px; display:flex; gap:8px;",
                 SidebarQuickAction {
@@ -2965,9 +3268,16 @@ fn Sidebar(
                         rsx! {
                             SidebarRow {
                                 row: row.clone(),
-                                selected: snapshot.selected_path.as_deref() == Some(row.full_path.as_str()),
+                                selected: snapshot.selected_tree_paths.iter().any(|path| path == &row.full_path)
+                                    || (
+                                        snapshot.selected_tree_paths.is_empty()
+                                            && snapshot.selected_path.as_deref() == Some(row.full_path.as_str())
+                                    ),
                                 palette: snapshot.palette,
-                                on_select: move |_| on_select_row.call(select_row.clone()),
+                                on_select: move |evt: MouseEvent| {
+                                    let extend = evt.modifiers().contains(Modifiers::SHIFT);
+                                    on_select_row.call((select_row.clone(), extend));
+                                },
                                 on_open_context_menu: move |_| on_open_context_menu.call(context_row.clone()),
                             }
                         }
@@ -3324,7 +3634,7 @@ fn MainSurface(
                 div {
                     style: "display:flex; flex-direction:column; min-width:0; min-height:0; width:100%; height:100%;",
                     TerminalCanvas {
-                        key: "{session.session_path}",
+                        key: "{terminal_instance_key(&session.session_path, snapshot.settings.terminal_font_size)}",
                         session: session.clone(),
                         snapshot: snapshot.clone(),
                     }
@@ -3344,11 +3654,10 @@ fn MainSurface(
             ),
             div {
                 style: format!(
-                    "flex:1; min-height:0; overflow:{}; padding:{}; background:{}; border-radius:11px; box-shadow:{}; zoom:{}%;",
+                    "flex:1; min-height:0; overflow:{}; padding:{}; background:{}; border-radius:11px; box-shadow:{};",
                     if snapshot.active_view_mode == WorkspaceViewMode::Terminal { "hidden" } else { "auto" },
                     if snapshot.active_view_mode == WorkspaceViewMode::Terminal { "0" } else { "24px" },
-                    snapshot.palette.panel, snapshot.palette.panel_shadow,
-                    zoom_percent_f32(snapshot.settings.terminal_font_size, 10.0)
+                    snapshot.palette.panel, snapshot.palette.panel_shadow
                 ),
                 {body}
             }
@@ -3463,7 +3772,7 @@ fn DocumentEditor(
     let source_session_cwd = metadata_value(&session, "Source Cwd");
     rsx! {
         div {
-            style: "display:flex; flex-direction:column; gap:18px; min-width:0; width:min(980px, 100%); height:100%; margin:0 auto;",
+            style: "display:flex; flex-direction:column; gap:18px; min-width:0; width:min(980px, 100%); max-width:100%; height:100%; margin:0 auto; overflow:hidden;",
             div {
                 style: "display:flex; align-items:center; justify-content:space-between; gap:14px; flex-wrap:wrap;",
                 div {
@@ -3473,7 +3782,7 @@ fn DocumentEditor(
                         value: "{title}",
                         placeholder: "Document title",
                         style: format!(
-                            "height:40px; min-width:min(440px, 100%); padding:0 14px; border:none; border-radius:10px; \
+                            "height:40px; min-width:min(440px, 100%); max-width:100%; box-sizing:border-box; padding:0 14px; border:none; border-radius:10px; \
                              background:rgba(255,255,255,0.76); color:{}; font-size:18px; font-weight:700; outline:none; \
                              box-shadow: inset 0 0 0 1px rgba(170,190,212,0.18);",
                             palette.text
@@ -3564,10 +3873,11 @@ fn DocumentEditor(
             }
             textarea {
                 value: "{body}",
+                wrap: "soft",
                 style: format!(
-                    "flex:1; min-height:560px; width:100%; resize:none; padding:18px 20px; border:none; border-radius:14px; \
+                    "flex:1; min-height:560px; width:100%; max-width:100%; box-sizing:border-box; resize:none; overflow-x:hidden; padding:18px 20px; border:none; border-radius:14px; \
                      background:rgba(255,255,255,0.72); color:{}; outline:none; font-size:14px; line-height:1.7; \
-                     box-shadow: inset 0 0 0 1px rgba(170,190,212,0.16); font-family:{};",
+                     box-shadow: inset 0 0 0 1px rgba(170,190,212,0.16); font-family:{}; white-space:pre-wrap; overflow-wrap:anywhere;",
                     palette.text, interface_font_family()
                 ),
                 oninput: move |evt| body.set(evt.value()),
@@ -3581,10 +3891,11 @@ fn DocumentEditor(
                     }
                     textarea {
                         value: "{replay}",
+                        wrap: "soft",
                         style: format!(
-                            "min-height:120px; width:100%; resize:vertical; padding:14px 16px; border:none; border-radius:14px; \
+                            "min-height:120px; width:100%; max-width:100%; box-sizing:border-box; resize:vertical; overflow-x:hidden; padding:14px 16px; border:none; border-radius:14px; \
                              background:rgba(255,255,255,0.66); color:{}; outline:none; font-size:13px; line-height:1.6; \
-                             box-shadow: inset 0 0 0 1px rgba(170,190,212,0.16); font-family:'JetBrains Mono', 'Iosevka Term', monospace;",
+                             box-shadow: inset 0 0 0 1px rgba(170,190,212,0.16); font-family:'JetBrains Mono', 'Iosevka Term', monospace; white-space:pre-wrap; overflow-wrap:anywhere;",
                             palette.text
                         ),
                         oninput: move |evt| replay.set(evt.value()),
@@ -3808,10 +4119,7 @@ fn PreviewBlock(
 }
 
 #[component]
-fn TerminalCanvas(
-    session: ManagedSessionView,
-    snapshot: RenderSnapshot,
-) -> Element {
+fn TerminalCanvas(session: ManagedSessionView, snapshot: RenderSnapshot) -> Element {
     let endpoint = BOOTSTRAP
         .get()
         .expect("shell bootstrap initialized")
@@ -3819,10 +4127,25 @@ fn TerminalCanvas(
         .clone();
     let session_path = session.session_path.clone();
     let host_id = terminal_host_id(&session_path);
+    let instance_key = terminal_instance_key(&session_path, snapshot.settings.terminal_font_size);
     let terminal_title = session.title.clone();
     let future_host_id = host_id.clone();
     let theme = terminal_theme(snapshot.palette, snapshot.settings.terminal_font_size);
     let future_theme = theme.clone();
+    info!(
+        session=%session_path,
+        host_id=%host_id,
+        instance_key=%instance_key,
+        font_size=theme.font_size,
+        "rendering terminal canvas"
+    );
+    {
+        let host_id = host_id.clone();
+        let theme = theme.clone();
+        use_effect(move || {
+            let _ = document::eval(&terminal_apply_script(&host_id, &theme));
+        });
+    }
     use_future(move || {
         let endpoint = endpoint.clone();
         let session_path = session_path.clone();
@@ -3834,7 +4157,7 @@ fn TerminalCanvas(
                 warn!(session=%session_path, error=%error, "failed to ensure terminal");
                 return;
             }
-            let mut eval = document::eval(&terminal_eval_script(&host_id));
+            let mut eval = document::eval(&terminal_eval_script(&host_id, &theme));
             let _ = eval.send(TerminalJsCommand::Reset {
                 title,
                 background: theme.background.clone(),
@@ -3861,6 +4184,9 @@ fn TerminalCanvas(
                             }
                             Ok(TerminalJsEvent::Resize { cols, rows }) => {
                                 let _ = terminal_resize(&endpoint, &session_path, cols, rows);
+                            }
+                            Ok(TerminalJsEvent::Debug { message }) => {
+                                info!(session=%session_path, %message, "terminal js debug");
                             }
                             Err(error) => {
                                 warn!(session=%session_path, error=%error, "terminal eval bridge closed");
@@ -3921,7 +4247,7 @@ fn terminal_theme(palette: Palette, font_size: f32) -> TerminalTheme {
         background: palette.panel.to_string(),
         foreground: palette.text.to_string(),
         cursor: palette.accent.to_string(),
-        font_size: font_size.max(10.0),
+        font_size: font_size.max(5.0),
         selection: "rgba(107,165,255,0.16)".to_string(),
     }
 }
@@ -3963,7 +4289,105 @@ fn terminal_host_id(session_path: &str) -> String {
     id
 }
 
-fn terminal_eval_script(host_id: &str) -> String {
+fn terminal_instance_key(session_path: &str, font_size: f32) -> String {
+    format!("{session_path}-{font_size:.1}")
+}
+
+fn current_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn emit_notification_chime() {
+    let _ = document::eval(
+        r#"
+        (() => {
+          try {
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.type = "sine";
+            osc.frequency.value = 880;
+            gain.gain.value = 0.03;
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.start();
+            setTimeout(() => {
+              try { osc.stop(); } catch (_error) {}
+              try { ctx.close(); } catch (_error) {}
+            }, 85);
+          } catch (_error) {}
+        })();
+        "#,
+    );
+}
+
+fn emit_system_notification(title: &str, message: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = Command::new("notify-send")
+            .arg(title)
+            .arg(message)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            "display notification {} with title {}",
+            serde_json::to_string(message).unwrap_or_else(|_| "\"\"".to_string()),
+            serde_json::to_string(title).unwrap_or_else(|_| "\"Yggterm\"".to_string())
+        );
+        let _ = Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+}
+
+fn apply_active_terminal_zoom(state: Signal<ShellState>) {
+    let snapshot = state.read().snapshot();
+    if snapshot.active_view_mode != WorkspaceViewMode::Terminal {
+        return;
+    }
+    let Some(session) = snapshot.active_session else {
+        return;
+    };
+    let host_id = terminal_host_id(&session.session_path);
+    let theme = terminal_theme(snapshot.palette, snapshot.settings.terminal_font_size);
+    info!(
+        session=%session.session_path,
+        host_id=%host_id,
+        font_size=theme.font_size,
+        "applying live terminal zoom"
+    );
+    let _ = document::eval(&terminal_apply_script(&host_id, &theme));
+}
+
+fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
+    let background =
+        serde_json::to_string(&theme.background).expect("serialize terminal background");
+    let foreground =
+        serde_json::to_string(&theme.foreground).expect("serialize terminal foreground");
+    let cursor = serde_json::to_string(&theme.cursor).expect("serialize terminal cursor");
+    let selection = serde_json::to_string(&theme.selection).expect("serialize terminal selection");
+    let constructed_debug = if cfg!(debug_assertions) {
+        "dioxus.send({ kind: \"debug\", message: `constructed host=${hostId} fontSize=${term.options.fontSize} cols=${term.cols} rows=${term.rows}` });"
+    } else {
+        ""
+    };
+    let reset_debug = if cfg!(debug_assertions) {
+        "dioxus.send({ kind: \"debug\", message: `reset host=${hostId} fontSize=${term.options.fontSize}` });"
+    } else {
+        ""
+    };
     format!(
         r#"
         const hostId = {host_id:?};
@@ -3990,11 +4414,20 @@ fn terminal_eval_script(host_id: &str) -> String {
             convertEol: true,
             cursorBlink: true,
             fontFamily: "'JetBrains Mono', 'Iosevka Term', 'Fira Code', monospace",
+            fontSize: {font_size},
             scrollback: 5000,
+            theme: {{
+                background: {background},
+                foreground: {foreground},
+                cursor: {cursor},
+                selectionBackground: {selection},
+            }},
         }});
         const fitAddon = new window.FitAddon.FitAddon();
         term.loadAddon(fitAddon);
         term.open(host);
+        window.__yggtermXtermHosts = window.__yggtermXtermHosts || {{}};
+        window.__yggtermXtermHosts[hostId] = {{ term, fitAddon }};
         const emitResize = () => {{
             try {{
                 fitAddon.fit();
@@ -4011,9 +4444,15 @@ fn terminal_eval_script(host_id: &str) -> String {
             try {{
                 term.dispose();
             }} catch (_error) {{}}
+            try {{
+                if (window.__yggtermXtermHosts) {{
+                    delete window.__yggtermXtermHosts[hostId];
+                }}
+            }} catch (_error) {{}}
             host.innerHTML = "";
         }};
         emitResize();
+        {constructed_debug}
         dioxus.send({{ kind: "ready" }});
         while (true) {{
             const message = await dioxus.recv();
@@ -4029,12 +4468,62 @@ fn terminal_eval_script(host_id: &str) -> String {
                     cursor: message.cursor,
                     selectionBackground: message.selection,
                 }};
+                {reset_debug}
                 requestAnimationFrame(() => emitResize());
             }} else if (message.kind === "write") {{
                 term.write(message.data);
             }}
         }}
-        "#
+        "#,
+        font_size = theme.font_size,
+        background = background,
+        foreground = foreground,
+        cursor = cursor,
+        selection = selection,
+        constructed_debug = constructed_debug,
+        reset_debug = reset_debug
+    )
+}
+
+fn terminal_apply_script(host_id: &str, theme: &TerminalTheme) -> String {
+    let background =
+        serde_json::to_string(&theme.background).expect("serialize terminal background");
+    let foreground =
+        serde_json::to_string(&theme.foreground).expect("serialize terminal foreground");
+    let cursor = serde_json::to_string(&theme.cursor).expect("serialize terminal cursor");
+    let selection = serde_json::to_string(&theme.selection).expect("serialize terminal selection");
+    format!(
+        r#"
+        (() => {{
+          const hostId = {host_id:?};
+          const registry = window.__yggtermXtermHosts || {{}};
+          const entry = registry[hostId];
+          if (!entry || !entry.term) {{
+            return;
+          }}
+          entry.term.options.fontSize = {font_size};
+          entry.term.options.theme = {{
+            background: {background},
+            foreground: {foreground},
+            cursor: {cursor},
+            selectionBackground: {selection},
+          }};
+          try {{
+            entry.fitAddon && entry.fitAddon.fit();
+          }} catch (_error) {{}}
+          window.__yggtermLastApply = {{
+            hostId,
+            fontSize: entry.term.options.fontSize,
+            appliedAt: Date.now(),
+          }};
+        }})();
+        "#,
+        host_id = host_id,
+        font_size = theme.font_size,
+        background = background,
+        foreground = foreground,
+        cursor = cursor,
+        selection = selection,
     )
 }
 
@@ -4129,6 +4618,9 @@ fn RightRail(
     on_api_key_change: EventHandler<String>,
     on_model_change: EventHandler<String>,
     on_set_agent_profile: EventHandler<AgentSessionProfile>,
+    on_set_in_app_notifications: EventHandler<bool>,
+    on_set_system_notifications: EventHandler<bool>,
+    on_set_notification_sound: EventHandler<bool>,
     on_create_document: EventHandler<MouseEvent>,
     on_generate_titles: EventHandler<MouseEvent>,
     on_adjust_ui_zoom: EventHandler<i32>,
@@ -4142,7 +4634,11 @@ fn RightRail(
     let visible = snapshot.right_panel_mode != RightPanelMode::Hidden;
     let width = if visible { SIDE_RAIL_WIDTH } else { 0 };
     let opacity = if visible { "1" } else { "0" };
-    let translate = if visible { "translateX(0)" } else { "translateX(14px)" };
+    let translate = if visible {
+        "translateX(0)"
+    } else {
+        "translateX(14px)"
+    };
     rsx! {
         div {
             style: format!(
@@ -4164,6 +4660,9 @@ fn RightRail(
                     on_api_key_change,
                     on_model_change,
                     on_set_agent_profile,
+                    on_set_in_app_notifications,
+                    on_set_system_notifications,
+                    on_set_notification_sound,
                     on_create_document,
                     on_generate_titles,
                     on_adjust_ui_zoom,
@@ -4235,6 +4734,9 @@ fn SettingsRailBody(
     on_api_key_change: EventHandler<String>,
     on_model_change: EventHandler<String>,
     on_set_agent_profile: EventHandler<AgentSessionProfile>,
+    on_set_in_app_notifications: EventHandler<bool>,
+    on_set_system_notifications: EventHandler<bool>,
+    on_set_notification_sound: EventHandler<bool>,
     on_create_document: EventHandler<MouseEvent>,
     on_generate_titles: EventHandler<MouseEvent>,
     on_adjust_ui_zoom: EventHandler<i32>,
@@ -4307,6 +4809,27 @@ fn SettingsRailBody(
                 selected: snapshot.settings.default_agent_profile,
                 on_select: on_set_agent_profile,
             }
+            BooleanSettingRow {
+                label: "In-App Notifications".to_string(),
+                value: snapshot.settings.in_app_notifications,
+                palette: snapshot.palette,
+                recommended_label: Some("Recommended".to_string()),
+                on_change: on_set_in_app_notifications,
+            }
+            BooleanSettingRow {
+                label: "System Notifications".to_string(),
+                value: snapshot.settings.system_notifications,
+                palette: snapshot.palette,
+                recommended_label: None,
+                on_change: on_set_system_notifications,
+            }
+            BooleanSettingRow {
+                label: "Notification Sound".to_string(),
+                value: snapshot.settings.notification_sound,
+                palette: snapshot.palette,
+                recommended_label: None,
+                on_change: on_set_notification_sound,
+            }
             button {
                 style: format!(
                     "height:32px; border:none; border-radius:10px; background:{}; color:{}; \
@@ -4329,6 +4852,30 @@ fn SettingsRailBody(
                 palette: snapshot.palette,
                 on_decrease: move |_| on_adjust_main_zoom.call(-1),
                 on_increase: move |_| on_adjust_main_zoom.call(1),
+            }
+            if cfg!(debug_assertions) {
+                MetadataGroup {
+                    title: "Terminal Debug".to_string(),
+                    entries: vec![
+                        SessionMetadataEntry {
+                            label: "State",
+                            value: snapshot.last_terminal_debug.clone(),
+                        },
+                        SessionMetadataEntry {
+                            label: "Active",
+                            value: snapshot.active_session.as_ref().map(|session| session.session_path.clone()).unwrap_or_else(|| "none".to_string()),
+                        },
+                        SessionMetadataEntry {
+                            label: "Host",
+                            value: snapshot.active_session.as_ref().map(|session| terminal_host_id(&session.session_path)).unwrap_or_else(|| "none".to_string()),
+                        },
+                        SessionMetadataEntry {
+                            label: "Font",
+                            value: format!("{:.1}", snapshot.settings.terminal_font_size),
+                        },
+                    ],
+                    palette: snapshot.palette,
+                }
             }
             button {
                 style: format!(
@@ -4405,50 +4952,106 @@ fn ConnectRailBody(
             "Connect SSH"
         }
         div {
-            style: "flex:1; overflow:auto; padding:10px 16px 14px 16px; display:flex; flex-direction:column; gap:16px;",
+            style: "flex:1; overflow:auto; padding:10px 16px 14px 16px; display:flex; flex-direction:column; gap:14px; \
+             text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
+            div {
+                style: "display:flex; flex-direction:column; gap:10px; padding-bottom:10px;",
                 div {
                     style: format!(
-                    "display:flex; flex-direction:column; gap:10px; padding:14px; border-radius:14px; background:rgba(255,255,255,0.68); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.52);"
-                ),
-                div {
-                    style: format!("font-size:12px; font-weight:700; color:{};", snapshot.palette.text),
-                    "Connect a remote machine"
+                        "font-size:11px; font-weight:700; letter-spacing:0.02em; color:{}; \
+                         text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
+                        snapshot.palette.muted
+                    ),
+                    "Guide"
                 }
                 div {
-                    style: format!("font-size:11px; line-height:1.5; color:{};", snapshot.palette.muted),
-                    "Use `user@ip`, `user@host`, or a shortcut from your SSH config such as `dev`. Yggterm will open that machine as a live terminal session."
+                    style: format!(
+                        "font-size:12px; line-height:1.55; color:{}; white-space:pre-wrap;",
+                        snapshot.palette.text
+                    ),
+                    "Use `user@ip`, `user@host`, or an SSH config alias such as `dev` in the target field. Yggterm will SSH there and open or focus a live terminal session."
+                }
+                div {
+                    style: format!(
+                        "font-size:12px; line-height:1.55; color:{}; white-space:pre-wrap;",
+                        snapshot.palette.text
+                    ),
+                    "The prefix field is optional. Think of it as the command that should run immediately after SSH lands on the remote machine."
+                }
+                div {
+                    style: format!(
+                        "font-size:12px; line-height:1.55; color:{}; white-space:pre-wrap;",
+                        snapshot.palette.text
+                    ),
+                    "Example: if `dev` is your SSH host and the real work happens inside an LXC guest there, enter `dev` as the target and use `lxc exec yggdrasil -- bash` as the prefix. Yggterm will SSH into `dev`, run that prefix, and continue from inside the container."
+                }
+                div {
+                    style: format!(
+                        "font-size:12px; line-height:1.55; color:{}; white-space:pre-wrap;",
+                        snapshot.palette.text
+                    ),
+                    "The same pattern works for tmux (`tmux new-session -A -s yggterm`), Docker (`docker exec -it web sh`), or systemd/machinectl shells (`sudo machinectl shell prod /bin/bash`)."
+                }
+            }
+            div {
+                style: format!(
+                    "display:flex; flex-direction:column; gap:8px; padding-bottom:10px;"
+                ),
+                div {
+                    style: format!(
+                        "font-size:11px; font-weight:700; letter-spacing:0.02em; color:{}; \
+                         text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
+                        snapshot.palette.muted
+                    ),
+                    "Target"
                 }
                 input {
                     r#type: "text",
                     value: "{snapshot.ssh_connect_target}",
                     placeholder: "dev or pi@jojo or user@192.168.1.15",
                     style: format!(
-                        "height:34px; padding:0 12px; border:none; border-radius:10px; background:{}; color:{}; font-size:12px; outline:none;",
-                        snapshot.palette.panel_alt, snapshot.palette.text
+                        "height:36px; padding:0 12px; border:1px solid {}; border-radius:10px; background:{}; color:{}; \
+                         font-size:12px; outline:none; box-shadow: inset 0 1px 0 rgba(255,255,255,0.55);",
+                        snapshot.palette.border, snapshot.palette.panel, snapshot.palette.text
                     ),
                     oninput: move |evt| on_ssh_target_change.call(evt.value()),
+                }
+            }
+            div {
+                style: "display:flex; flex-direction:column; gap:8px; padding-bottom:10px;",
+                div {
+                    style: format!(
+                        "font-size:11px; font-weight:700; letter-spacing:0.02em; color:{}; \
+                         text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
+                        snapshot.palette.muted
+                    ),
+                    "Optional Prefix"
                 }
                 input {
                     r#type: "text",
                     value: "{snapshot.ssh_connect_prefix}",
                     placeholder: "Optional prefix, e.g. sudo machinectl shell prod",
                     style: format!(
-                        "height:34px; padding:0 12px; border:none; border-radius:10px; background:{}; color:{}; font-size:12px; outline:none;",
-                        snapshot.palette.panel_alt, snapshot.palette.text
+                        "height:36px; padding:0 12px; border:1px solid {}; border-radius:10px; background:{}; color:{}; \
+                         font-size:12px; outline:none; box-shadow: inset 0 1px 0 rgba(255,255,255,0.55);",
+                        snapshot.palette.border, snapshot.palette.panel, snapshot.palette.text
                     ),
                     oninput: move |evt| on_ssh_prefix_change.call(evt.value()),
                 }
+            }
+            div {
+                style: "display:flex; flex-direction:column; gap:8px; padding-bottom:10px;",
                 button {
-                    style: sidebar_action_style(snapshot.palette),
+                    style: primary_action_style(snapshot.palette),
                     onclick: move |evt| on_connect_ssh_custom.call(evt),
                     div {
                         style: "display:flex; flex-direction:column; align-items:flex-start; gap:3px; min-width:0;",
                         span {
-                            style: format!("font-size:12px; font-weight:700; color:{};", snapshot.palette.text),
-                            "Proceed"
+                            style: "font-size:12px; font-weight:800; color:white;",
+                            "Proceed ->"
                         }
                         span {
-                            style: format!("font-size:11px; line-height:1.35; color:{}; white-space:pre-wrap;", snapshot.palette.muted),
+                            style: "font-size:11px; line-height:1.35; color:rgba(255,255,255,0.88); white-space:pre-wrap;",
                             "Yggterm will open or focus a terminal session for this target."
                         }
                     }
@@ -4470,7 +5073,8 @@ fn NotificationCard(
             style: format!(
                 "display:flex; flex-direction:column; gap:7px; padding:12px 12px 11px 12px; border-radius:14px; \
                  background:rgba(249,250,252,0.86); backdrop-filter: blur(28px) saturate(165%); \
-                 -webkit-backdrop-filter: blur(28px) saturate(165%); box-shadow: 0 18px 38px rgba(49,67,82,0.14), inset 0 0 0 1px rgba(255,255,255,0.72);",
+                 -webkit-backdrop-filter: blur(28px) saturate(165%); box-shadow: 0 18px 38px rgba(49,67,82,0.14), inset 0 0 0 1px rgba(255,255,255,0.72); \
+                 animation:yggterm-toast-fade 7s ease forwards;",
             ),
             div {
                 style: "display:flex; align-items:center; justify-content:space-between; gap:8px;",
@@ -4532,9 +5136,7 @@ fn ContextMenuOverlay(
     let can_move_selected_document = selected_row.as_ref().is_some_and(|selected| {
         selected.kind == BrowserRowKind::Document
             && !row.full_path.starts_with("__live_")
-            && parent_virtual_path(&selected.full_path)
-                .as_deref()
-                != Some(row.full_path.as_str())
+            && parent_virtual_path(&selected.full_path).as_deref() != Some(row.full_path.as_str())
     });
     rsx! {
         div {
@@ -4660,9 +5262,11 @@ fn ToastViewport(
     right_inset: usize,
     on_clear_notification: EventHandler<u64>,
 ) -> Element {
+    let now = current_millis();
     let items = notifications
         .into_iter()
         .rev()
+        .filter(|notification| now.saturating_sub(notification.created_at_ms) <= 7000)
         .filter(|notification| notification.tone != NotificationTone::Info)
         .take(3)
         .collect::<Vec<_>>();
@@ -4759,6 +5363,53 @@ fn ProfileToggleRow(
 }
 
 #[component]
+fn BooleanSettingRow(
+    label: String,
+    value: bool,
+    palette: Palette,
+    recommended_label: Option<String>,
+    on_change: EventHandler<bool>,
+) -> Element {
+    rsx! {
+        div {
+            style: "display:flex; flex-direction:column; gap:6px;",
+            div {
+                style: "display:flex; align-items:center; justify-content:space-between; gap:8px;",
+                div {
+                    style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", palette.muted),
+                    "{label}"
+                }
+                if let Some(recommended_label) = recommended_label {
+                    span {
+                        style: format!("font-size:10px; font-weight:700; color:{};", palette.accent),
+                        "{recommended_label}"
+                    }
+                }
+            }
+            button {
+                style: format!(
+                    "display:flex; align-items:center; justify-content:{}; height:32px; padding:4px; border:none; border-radius:10px; \
+                     background:rgba(255,255,255,0.58); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.34);",
+                    if value { "flex-end" } else { "flex-start" }
+                ),
+                onclick: move |_| on_change.call(!value),
+                div {
+                    style: format!(
+                        "width:54px; height:24px; border-radius:999px; background:{}; display:flex; align-items:center; \
+                         justify-content:{}; padding:0 3px; transition: all 160ms ease;",
+                        if value { palette.accent } else { "rgba(189,201,212,0.92)" },
+                        if value { "flex-end" } else { "flex-start" }
+                    ),
+                    div {
+                        style: "width:18px; height:18px; border-radius:999px; background:white; box-shadow:0 2px 8px rgba(36,48,58,0.18);",
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
 fn ZoomSettingRow(
     label: String,
     percent: i32,
@@ -4798,11 +5449,7 @@ fn ZoomSettingRow(
 }
 
 #[component]
-fn MetadataGroup(
-    title: String,
-    entries: Vec<SessionMetadataEntry>,
-    palette: Palette,
-) -> Element {
+fn MetadataGroup(title: String, entries: Vec<SessionMetadataEntry>, palette: Palette) -> Element {
     rsx! {
         div {
             style: "display:flex; flex-direction:column; gap:8px; padding-bottom:10px;",
@@ -4885,7 +5532,11 @@ fn shell_style(palette: Palette, radius: u8) -> String {
         "position:fixed; inset:0; display:flex; flex-direction:column; overflow:hidden; \
          border-radius:{}px; background-color:{}; background-image:{}; box-shadow:{}; backdrop-filter: blur(30px) saturate(165%); \
          -webkit-backdrop-filter: blur(30px) saturate(165%); font-family:{};",
-        radius, palette.shell, palette.gradient, palette.shadow, interface_font_family()
+        radius,
+        palette.shell,
+        palette.gradient,
+        palette.shadow,
+        interface_font_family()
     )
 }
 
@@ -4914,7 +5565,11 @@ fn utility_icon_style_sized(palette: Palette, selected: bool, font_size_px: u8) 
     format!(
         "width:28px; height:28px; border:none; border-radius:10px; background:transparent; color:{}; font-size:{}px; font-weight:{}; \
          user-select:none; -webkit-user-select:none; pointer-events:auto;",
-        if selected { palette.accent } else { palette.muted },
+        if selected {
+            palette.accent
+        } else {
+            palette.muted
+        },
         font_size_px,
         if selected { 800 } else { 700 }
     )
@@ -4924,7 +5579,11 @@ fn connect_button_style(palette: Palette, selected: bool) -> String {
     format!(
         "height:28px; padding:0 11px; border:none; border-radius:10px; background:transparent; color:{}; \
          font-size:11px; font-weight:700; white-space:nowrap; user-select:none; -webkit-user-select:none; pointer-events:auto;",
-        if selected { palette.accent } else { palette.muted }
+        if selected {
+            palette.accent
+        } else {
+            palette.muted
+        }
     )
 }
 
@@ -4932,17 +5591,30 @@ fn chip_style(palette: Palette, selected: bool) -> String {
     format!(
         "height:24px; padding:0 10px; border-radius:999px; border:1px solid {}; background:{}; \
          color:{}; font-size:11px; font-weight:600;",
-        if selected { palette.accent } else { "rgba(255,255,255,0.10)" },
-        if selected { palette.accent_soft } else { "rgba(255,255,255,0.28)" },
-        if selected { palette.text } else { palette.muted }
+        if selected {
+            palette.accent
+        } else {
+            "rgba(255,255,255,0.10)"
+        },
+        if selected {
+            palette.accent_soft
+        } else {
+            "rgba(255,255,255,0.28)"
+        },
+        if selected {
+            palette.text
+        } else {
+            palette.muted
+        }
     )
 }
 
-fn sidebar_action_style(palette: Palette) -> String {
+fn primary_action_style(palette: Palette) -> String {
     format!(
-        "width:100%; border:none; border-radius:12px; background:{}; padding:8px 10px; text-align:left; \
+        "width:100%; border:none; border-radius:12px; background:{}; color:white; padding:10px 12px; text-align:left; \
+         box-shadow: 0 12px 28px rgba(47,124,246,0.24), inset 0 0 0 1px rgba(255,255,255,0.18); \
          text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased;",
-        palette.sidebar_hover
+        palette.accent
     )
 }
 
@@ -4956,8 +5628,16 @@ fn toggle_slider_end_style(palette: Palette, selected: bool) -> String {
     format!(
         "height:26px; min-width:82px; padding:0 12px; border:none; border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:700; \
          user-select:none; -webkit-user-select:none;",
-        if selected { palette.panel } else { "transparent" },
-        if selected { palette.text } else { palette.muted }
+        if selected {
+            palette.panel
+        } else {
+            "transparent"
+        },
+        if selected {
+            palette.text
+        } else {
+            palette.muted
+        }
     )
 }
 
@@ -4969,7 +5649,10 @@ fn settings_input_style(palette: Palette) -> String {
     )
 }
 
-fn notification_tone_colors(tone: NotificationTone, palette: Palette) -> (&'static str, &'static str) {
+fn notification_tone_colors(
+    tone: NotificationTone,
+    palette: Palette,
+) -> (&'static str, &'static str) {
     match tone {
         NotificationTone::Info => (palette.accent, "#315066"),
         NotificationTone::Success => ("#2f9e62", "#315066"),
@@ -4995,17 +5678,21 @@ fn profile_toggle_button_style(palette: Palette, selected: bool) -> String {
         } else {
             "transparent"
         },
-        if selected { palette.text } else { palette.muted },
+        if selected {
+            palette.text
+        } else {
+            palette.muted
+        },
         if selected { 700 } else { 600 }
     )
 }
 
 fn clamp_zoom_value(value: f32) -> f32 {
-    value.clamp(10.0, 20.0)
+    value.clamp(7.0, 20.0)
 }
 
 fn clamp_zoom_value_main(value: f32) -> f32 {
-    value.clamp(10.0, 20.0)
+    value.clamp(5.0, 20.0)
 }
 
 fn zoom_percent(value: f32, base: f32) -> i32 {
@@ -5033,6 +5720,57 @@ fn interface_font_family() -> &'static str {
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn interface_font_family() -> &'static str {
     "system-ui, sans-serif"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_zoom_clamps_to_fifty_percent_floor() {
+        assert_eq!(clamp_zoom_value_main(0.0), 5.0);
+        assert_eq!(clamp_zoom_value_main(4.0), 5.0);
+        assert_eq!(zoom_percent(clamp_zoom_value_main(4.0), 10.0), 50);
+    }
+
+    #[test]
+    fn interface_zoom_clamps_to_fifty_percent_floor() {
+        assert_eq!(clamp_zoom_value(0.0), 7.0);
+        assert_eq!(clamp_zoom_value(6.0), 7.0);
+        assert_eq!(zoom_percent(clamp_zoom_value(6.0), 14.0), 50);
+    }
+
+    #[test]
+    fn terminal_theme_uses_requested_font_size_down_to_floor() {
+        let theme = terminal_theme(palette(UiTheme::ZedLight), 5.0);
+        assert_eq!(theme.font_size, 5.0);
+
+        let clamped = terminal_theme(palette(UiTheme::ZedLight), 2.0);
+        assert_eq!(clamped.font_size, 5.0);
+    }
+
+    #[test]
+    fn terminal_eval_script_bakes_font_size_into_xterm_constructor() {
+        let theme = terminal_theme(palette(UiTheme::ZedLight), 13.0);
+        let script = terminal_eval_script("yggterm-terminal-test", &theme);
+        assert!(script.contains("fontSize: 13"));
+    }
+
+    #[test]
+    fn terminal_apply_script_updates_live_xterm_font_size() {
+        let theme = terminal_theme(palette(UiTheme::ZedLight), 5.0);
+        let script = terminal_apply_script("yggterm-terminal-test", &theme);
+        assert!(script.contains("entry.term.options.fontSize = 5"));
+    }
+
+    #[test]
+    fn terminal_instance_key_changes_with_font_size() {
+        let small = terminal_instance_key("/tmp/example", 10.0);
+        let large = terminal_instance_key("/tmp/example", 20.0);
+        assert_ne!(small, large);
+        assert!(small.ends_with("-10.0"));
+        assert!(large.ends_with("-20.0"));
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
