@@ -114,6 +114,7 @@ impl WorkspaceStore {
             "TEXT NOT NULL DEFAULT 'folder'",
         )?;
         migrate_legacy_workspace_paths(&conn)?;
+        migrate_workspace_order_paths(&conn)?;
         Ok(Self { conn })
     }
 
@@ -641,6 +642,111 @@ fn migrate_legacy_workspace_paths(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_workspace_order_paths(conn: &Connection) -> Result<()> {
+    let document_paths = {
+        let mut stmt =
+            conn.prepare("SELECT virtual_path FROM documents ORDER BY virtual_path ASC")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let group_paths = {
+        let mut stmt =
+            conn.prepare("SELECT virtual_path FROM workspace_groups ORDER BY virtual_path ASC")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    conn.execute_batch("BEGIN IMMEDIATE TRANSACTION;")?;
+    let result: Result<()> = (|| {
+        for path in document_paths {
+            let rewritten = simplify_workspace_order_path(&path);
+            if rewritten == path {
+                continue;
+            }
+            let target_exists = conn
+                .query_row(
+                    "SELECT 1 FROM documents WHERE virtual_path = ?1",
+                    params![rewritten],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !target_exists {
+                conn.execute(
+                    "UPDATE documents SET virtual_path = ?1 WHERE virtual_path = ?2",
+                    params![rewritten, path],
+                )?;
+            }
+        }
+
+        for path in group_paths {
+            let rewritten = simplify_workspace_order_path(&path);
+            if rewritten == path {
+                continue;
+            }
+            let target_exists = conn
+                .query_row(
+                    "SELECT 1 FROM workspace_groups WHERE virtual_path = ?1",
+                    params![rewritten],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !target_exists {
+                conn.execute(
+                    "UPDATE workspace_groups SET virtual_path = ?1 WHERE virtual_path = ?2",
+                    params![rewritten, path],
+                )?;
+            }
+        }
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT;")?,
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            return Err(error);
+        }
+    }
+
+    Ok(())
+}
+
+fn simplify_workspace_order_path(path: &str) -> String {
+    let mut normalized_segments = Vec::new();
+    for segment in path.split('/') {
+        if segment.is_empty() {
+            continue;
+        }
+        let parts = segment
+            .split('~')
+            .map(simplify_workspace_order_part)
+            .collect::<Vec<_>>();
+        normalized_segments.push(parts.join("~"));
+    }
+    if normalized_segments.is_empty() {
+        "/documents/untitled".to_string()
+    } else {
+        format!("/{}", normalized_segments.join("/"))
+    }
+}
+
+fn simplify_workspace_order_part(part: &str) -> String {
+    let (prefix, mut rest) = if let Some(stripped) = part.strip_prefix('!') {
+        ("!", stripped)
+    } else {
+        ("", part)
+    };
+    while rest.len() > 5
+        && rest.as_bytes().get(4) == Some(&b'-')
+        && rest.as_bytes()[0..4].iter().all(|byte| byte.is_ascii_digit())
+    {
+        rest = &rest[5..];
+    }
+    format!("{prefix}{rest}")
+}
+
 fn rewrite_legacy_workspace_path(path: &str) -> String {
     let mut rewritten = path.to_string();
     if let Some(rest) = rewritten.strip_prefix("/local") {
@@ -906,6 +1012,22 @@ mod tests {
         assert_eq!(
             rewrite_legacy_workspace_path("/home/pi/gh/notes/notes/untitled-1"),
             "/home/pi/gh/notes/untitled-1"
+        );
+    }
+
+    #[test]
+    fn simplifies_compounded_workspace_order_paths() {
+        assert_eq!(
+            simplify_workspace_order_path(
+                "/home/pi/gh/notes/0000-0008-0000-untitled-1774119990~0002-0002-0001-note"
+            ),
+            "/home/pi/gh/notes/untitled-1774119990~note"
+        );
+        assert_eq!(
+            simplify_workspace_order_path(
+                "/home/pi/gh/notes/!0000-0000-separator-1774185969049440371"
+            ),
+            "/home/pi/gh/notes/!separator-1774185969049440371"
         );
     }
 }
