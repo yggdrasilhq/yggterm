@@ -2270,9 +2270,9 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
     });
 }
 
-fn queue_move_selected_items_to_group(mut state: Signal<ShellState>, target_group: BrowserRow) {
-    if !valid_drop_target(&state.read().drag_paths, &target_group)
-        && !is_drop_target_row(&target_group)
+fn queue_move_selected_items_to_group(mut state: Signal<ShellState>, target_row: BrowserRow) {
+    if !valid_drop_target(&state.read().drag_paths, &target_row)
+        && !is_drop_target_row(&target_row)
     {
         return;
     }
@@ -2286,7 +2286,7 @@ fn queue_move_selected_items_to_group(mut state: Signal<ShellState>, target_grou
         shell.last_action = format!(
             "moving {} item(s) to {}",
             selected_rows.len(),
-            target_group.label
+            target_row.label
         );
         shell.close_context_menu();
         shell.drag_hover_target = None;
@@ -2295,13 +2295,14 @@ fn queue_move_selected_items_to_group(mut state: Signal<ShellState>, target_grou
     let settings = state.read().settings.clone();
     spawn(async move {
         let selected_for_task = selected_rows.clone();
-        let target_for_task = target_group.clone();
+        let target_for_task = target_row.clone();
         let outcome = task::spawn_blocking(
             move || -> Result<(Vec<String>, yggterm_core::SessionNode)> {
                 let store = SessionStore::open_or_init()?;
                 let mut moved_paths = Vec::new();
-                for row in &selected_for_task {
-                    let destination = moved_workspace_item_virtual_path(row, &target_for_task);
+                for (ix, row) in selected_for_task.iter().enumerate() {
+                    let destination =
+                        moved_workspace_item_virtual_path_with_index(row, &target_for_task, ix);
                     match row.kind {
                         BrowserRowKind::Document => {
                             let document = store.move_document(&row.full_path, &destination)?;
@@ -2338,15 +2339,15 @@ fn queue_move_selected_items_to_group(mut state: Signal<ShellState>, target_grou
                 shell.last_action = format!(
                     "moved {} item(s) to {}",
                     moved_paths.len(),
-                    target_group.label
+                    target_row.label
                 );
                 shell.push_notification(
                     NotificationTone::Success,
                     "Items Moved",
                     format!(
-                        "Moved {} item(s) into {}.",
+                        "Moved {} item(s) near {}.",
                         moved_paths.len(),
-                        target_group.label
+                        target_row.label
                     ),
                 );
             }
@@ -2784,19 +2785,62 @@ fn unique_workspace_leaf_suffix() -> String {
         .unwrap_or_else(|_| "0".to_string())
 }
 
-fn moved_workspace_item_virtual_path(item_row: &BrowserRow, target_group: &BrowserRow) -> String {
-    let name = item_row
-        .full_path
-        .rsplit('/')
-        .find(|segment| !segment.is_empty())
-        .unwrap_or("item");
-    format!("{}/{}", target_group.full_path.trim_end_matches('/'), name)
-}
-
 fn workspace_leaf_name(path: &str) -> Option<String> {
     path.rsplit('/')
         .find(|segment| !segment.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn canonical_workspace_leaf_name(path: &str) -> String {
+    let leaf = workspace_leaf_name(path).unwrap_or_else(|| "item".to_string());
+    let unanchored = leaf
+        .rsplit('~')
+        .next()
+        .unwrap_or(leaf.as_str())
+        .trim_start_matches('!');
+    if unanchored.is_empty() {
+        "item".to_string()
+    } else {
+        unanchored.to_string()
+    }
+}
+
+fn moved_workspace_item_virtual_path_with_index(
+    item_row: &BrowserRow,
+    target_row: &BrowserRow,
+    index: usize,
+) -> String {
+    let leaf = canonical_workspace_leaf_name(&item_row.full_path);
+    let indexed_leaf = format!("{index:04}-{leaf}");
+    match target_row.kind {
+        BrowserRowKind::Group if is_drop_target_row(target_row) => format!(
+            "{}/!{}",
+            target_row.full_path.trim_end_matches('/'),
+            indexed_leaf
+        ),
+        BrowserRowKind::Document | BrowserRowKind::Separator => {
+            let base = document_parent_base(target_row).unwrap_or_else(|| "/workspace".to_string());
+            let anchor = canonical_workspace_leaf_name(&target_row.full_path);
+            format!(
+                "{}/{}~{}",
+                base.trim_end_matches('/'),
+                anchor,
+                indexed_leaf
+            )
+        }
+        BrowserRowKind::Group => format!(
+            "{}/!{}",
+            target_row.full_path.trim_end_matches('/'),
+            indexed_leaf
+        ),
+        BrowserRowKind::Session => {
+            let base = target_row
+                .session_cwd
+                .clone()
+                .unwrap_or_else(|| "/workspace".to_string());
+            format!("{}/!{}", base.trim_end_matches('/'), indexed_leaf)
+        }
+    }
 }
 
 fn is_workspace_row(row: &BrowserRow) -> bool {
@@ -2813,10 +2857,15 @@ fn is_workspace_row(row: &BrowserRow) -> bool {
 }
 
 fn is_drop_target_row(row: &BrowserRow) -> bool {
-    row.kind == BrowserRowKind::Group
-        && row.group_kind != Some(WorkspaceGroupKind::Separator)
-        && !row.full_path.starts_with("__live_")
-        && row.full_path != "local"
+    match row.kind {
+        BrowserRowKind::Group => {
+            row.group_kind != Some(WorkspaceGroupKind::Separator)
+                && !row.full_path.starts_with("__live_")
+                && row.full_path != "local"
+        }
+        BrowserRowKind::Document | BrowserRowKind::Separator => true,
+        BrowserRowKind::Session => false,
+    }
 }
 
 fn workspace_path_contains(parent: &str, child: &str) -> bool {
@@ -2833,7 +2882,15 @@ fn valid_drop_target(drag_paths: &[String], target_row: &BrowserRow) -> bool {
     drag_paths.iter().all(|path| {
         path != &target_row.full_path
             && !workspace_path_contains(path, &target_row.full_path)
-            && parent_virtual_path(path).as_deref() != Some(target_row.full_path.as_str())
+            && match target_row.kind {
+                BrowserRowKind::Group => {
+                    parent_virtual_path(path).as_deref() != Some(target_row.full_path.as_str())
+                }
+                BrowserRowKind::Document | BrowserRowKind::Separator => {
+                    parent_virtual_path(path).is_some()
+                }
+                BrowserRowKind::Session => false,
+            }
     })
 }
 
@@ -4111,7 +4168,8 @@ fn Sidebar(
             style: format!(
                 "width:{}px; min-width:{}px; max-width:{}px; display:flex; flex-direction:column; \
                  background:{}; overflow:hidden; transition: opacity 180ms ease, transform 180ms ease; \
-                 opacity:{}; transform:{}; pointer-events:{}; zoom:{}%;",
+                 opacity:{}; transform:{}; pointer-events:{}; zoom:{}%; user-select:none; \
+                 -webkit-user-select:none;",
                 width, width, width, snapshot.palette.sidebar, opacity, translate,
                 if snapshot.sidebar_open { "auto" } else { "none" },
                 zoom_percent_f32(snapshot.settings.ui_font_size, 14.0)
@@ -4241,7 +4299,8 @@ fn SidebarRow(
             div {
                 style: format!(
                     "width:100%; display:flex; align-items:center; gap:10px; border:none; background:transparent; cursor:{}; \
-                     padding:8px 9px 8px {}px; margin:4px 0; opacity:{}; border-radius:12px; background:{}; box-sizing:border-box; min-width:0; overflow:hidden;",
+                     padding:8px 9px 8px {}px; margin:4px 0; opacity:{}; border-radius:12px; background:{}; \
+                     box-sizing:border-box; min-width:0; overflow:hidden; user-select:none; -webkit-user-select:none;",
                     if dragging { "grabbing" } else if draggable { "grab" } else { "default" },
                     indent
                     , if dragging { "0.58" } else { "1" },
@@ -4256,6 +4315,7 @@ fn SidebarRow(
                         && !evt.modifiers().contains(Modifiers::CONTROL)
                         && !evt.modifiers().contains(Modifiers::META)
                     {
+                        evt.prevent_default();
                         drag_started.set(true);
                         on_start_drag.call(evt);
                     }
@@ -4389,6 +4449,7 @@ fn SidebarRow(
                     && !evt.modifiers().contains(Modifiers::CONTROL)
                     && !evt.modifiers().contains(Modifiers::META)
                 {
+                    evt.prevent_default();
                     drag_started.set(true);
                     on_start_drag.call(evt);
                 }
@@ -7212,6 +7273,67 @@ mod tests {
             &["/home/pi/gh/notes/other-paper".to_string()],
             &target
         ));
+    }
+
+    #[test]
+    fn document_rows_are_valid_drop_targets_for_reorder() {
+        let target = BrowserRow {
+            kind: BrowserRowKind::Document,
+            full_path: "/home/pi/gh/notes/paper-b".to_string(),
+            label: "paper-b".to_string(),
+            detail_label: String::new(),
+            document_kind: Some(WorkspaceDocumentKind::Note),
+            group_kind: None,
+            session_title: None,
+            depth: 3,
+            host_label: String::new(),
+            descendant_sessions: 0,
+            expanded: false,
+            session_id: Some("paper-b-id".to_string()),
+            session_cwd: Some("/home/pi/gh/notes".to_string()),
+        };
+        assert!(valid_drop_target(
+            &["/home/pi/gh/notes/paper-a".to_string()],
+            &target
+        ));
+    }
+
+    #[test]
+    fn moved_workspace_item_path_for_document_target_anchors_after_target() {
+        let item = BrowserRow {
+            kind: BrowserRowKind::Document,
+            full_path: "/home/pi/gh/notes/paper-a".to_string(),
+            label: "paper-a".to_string(),
+            detail_label: String::new(),
+            document_kind: Some(WorkspaceDocumentKind::Note),
+            group_kind: None,
+            session_title: None,
+            depth: 3,
+            host_label: String::new(),
+            descendant_sessions: 0,
+            expanded: false,
+            session_id: Some("paper-a-id".to_string()),
+            session_cwd: Some("/home/pi/gh/notes".to_string()),
+        };
+        let target = BrowserRow {
+            kind: BrowserRowKind::Document,
+            full_path: "/home/pi/gh/notes/paper-b".to_string(),
+            label: "paper-b".to_string(),
+            detail_label: String::new(),
+            document_kind: Some(WorkspaceDocumentKind::Note),
+            group_kind: None,
+            session_title: None,
+            depth: 3,
+            host_label: String::new(),
+            descendant_sessions: 0,
+            expanded: false,
+            session_id: Some("paper-b-id".to_string()),
+            session_cwd: Some("/home/pi/gh/notes".to_string()),
+        };
+
+        let destination = moved_workspace_item_virtual_path_with_index(&item, &target, 0);
+
+        assert_eq!(destination, "/home/pi/gh/notes/paper-b~0000-paper-a");
     }
 
     #[test]
