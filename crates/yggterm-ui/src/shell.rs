@@ -107,6 +107,7 @@ struct ShellState {
     dock_sync_in_flight: bool,
     last_dock_signature: Option<DockSignature>,
     last_terminal_debug: String,
+    last_tree_debug: String,
     generated_precis: BTreeMap<String, String>,
     precis_requests_in_flight: HashSet<String>,
     drag_paths: Vec<String>,
@@ -200,6 +201,7 @@ struct RenderSnapshot {
     ssh_connect_prefix: String,
     pending_update_restart: Option<PendingUpdateRestart>,
     last_terminal_debug: String,
+    last_tree_debug: String,
     active_precis: Option<String>,
     drag_paths: Vec<String>,
     drag_hover_target: Option<String>,
@@ -327,6 +329,7 @@ impl ShellState {
             dock_sync_in_flight: false,
             last_dock_signature: None,
             last_terminal_debug: "terminal debug idle".to_string(),
+            last_tree_debug: "tree debug idle".to_string(),
             generated_precis: BTreeMap::new(),
             precis_requests_in_flight: HashSet::new(),
             drag_paths: Vec::new(),
@@ -337,6 +340,7 @@ impl ShellState {
             state.selected_tree_paths.insert(path.clone());
             state.selection_anchor = Some(path);
         }
+        state.refresh_tree_debug("init");
         state.server_daemon_detail = state.bootstrap.server_daemon_detail.clone();
         if let Some(update) = state.pending_update_restart.clone() {
             state.last_action = format!("update {} ready", update.version);
@@ -393,6 +397,7 @@ impl ShellState {
             ssh_connect_prefix: self.ssh_connect_prefix.clone(),
             pending_update_restart: self.pending_update_restart.clone(),
             last_terminal_debug: self.last_terminal_debug.clone(),
+            last_tree_debug: self.last_tree_debug.clone(),
             active_precis: self
                 .server
                 .active_session()
@@ -620,7 +625,10 @@ impl ShellState {
                 terminal_host_id(&session.session_path)
             )
         } else {
-            format!("zoom {} -> {} with no active session", before, self.settings.terminal_font_size)
+            format!(
+                "zoom {} -> {} with no active session",
+                before, self.settings.terminal_font_size
+            )
         };
         info!(before, after=self.settings.terminal_font_size, debug=%self.last_terminal_debug, "terminal zoom changed");
         self.last_action = format!(
@@ -647,11 +655,13 @@ impl ShellState {
     fn open_context_menu(&mut self, row: BrowserRow, position: (f64, f64)) {
         self.context_menu_row = Some(row);
         self.context_menu_position = Some(position);
+        self.refresh_tree_debug("open_context_menu");
     }
 
     fn close_context_menu(&mut self) {
         self.context_menu_row = None;
         self.context_menu_position = None;
+        self.refresh_tree_debug("close_context_menu");
     }
 
     fn clear_notification(&mut self, id: u64) {
@@ -672,6 +682,10 @@ impl ShellState {
         self.selected_tree_paths.insert(row.full_path.clone());
         self.selection_anchor = Some(row.full_path.clone());
         self.browser.select_path(row.full_path.clone());
+        if cfg!(debug_assertions) {
+            info!(path=%row.full_path, extend_range, "tree row selected");
+        }
+        self.refresh_tree_debug("select_tree_row");
     }
 
     fn extend_tree_selection(&mut self, row: &BrowserRow) {
@@ -681,7 +695,10 @@ impl ShellState {
             .clone()
             .or_else(|| self.browser.selected_path().map(ToOwned::to_owned))
             .unwrap_or_else(|| row.full_path.clone());
-        let Some(anchor_ix) = rows.iter().position(|candidate| candidate.full_path == anchor) else {
+        let Some(anchor_ix) = rows
+            .iter()
+            .position(|candidate| candidate.full_path == anchor)
+        else {
             self.select_tree_row(row, false);
             return;
         };
@@ -707,6 +724,10 @@ impl ShellState {
             self.selected_tree_paths.insert(row.full_path.clone());
         }
         self.browser.select_path(row.full_path.clone());
+        if cfg!(debug_assertions) {
+            info!(anchor=%anchor, target=%row.full_path, selected=%self.selected_tree_paths.len(), "tree range selected");
+        }
+        self.refresh_tree_debug("extend_tree_selection");
     }
 
     fn selected_workspace_rows(&self) -> Vec<BrowserRow> {
@@ -720,8 +741,8 @@ impl ShellState {
             .iter()
             .filter(|candidate| {
                 !selected.iter().any(|other| {
-                other.full_path != candidate.full_path
-                    && workspace_path_contains(&other.full_path, &candidate.full_path)
+                    other.full_path != candidate.full_path
+                        && workspace_path_contains(&other.full_path, &candidate.full_path)
                 })
             })
             .cloned()
@@ -737,7 +758,9 @@ impl ShellState {
             labels.push(row.label.clone());
             match row.kind {
                 BrowserRowKind::Document => document_paths.push(row.full_path),
-                BrowserRowKind::Group | BrowserRowKind::Separator => group_paths.push(row.full_path),
+                BrowserRowKind::Group | BrowserRowKind::Separator => {
+                    group_paths.push(row.full_path)
+                }
                 BrowserRowKind::Session => {}
             }
         }
@@ -748,6 +771,7 @@ impl ShellState {
         if !is_workspace_row(row) {
             self.drag_paths.clear();
             self.drag_hover_target = None;
+            self.refresh_tree_debug("begin_drag_ignored");
             return;
         }
         if !self.selected_tree_paths.contains(&row.full_path) {
@@ -762,16 +786,27 @@ impl ShellState {
             .map(|candidate| candidate.full_path)
             .collect();
         self.drag_hover_target = None;
+        if cfg!(debug_assertions) {
+            info!(drag_count=%self.drag_paths.len(), anchor=%row.full_path, "tree drag started");
+        }
+        self.refresh_tree_debug("begin_drag");
     }
 
     fn set_drag_hover_target(&mut self, row: &BrowserRow) {
-        self.drag_hover_target = valid_drop_target(self.drag_paths.as_slice(), row)
-            .then(|| row.full_path.clone());
+        self.drag_hover_target =
+            valid_drop_target(self.drag_paths.as_slice(), row).then(|| row.full_path.clone());
+        if cfg!(debug_assertions)
+            && let Some(target) = self.drag_hover_target.as_deref()
+        {
+            info!(target=%target, drag_count=%self.drag_paths.len(), "tree drag hover");
+        }
+        self.refresh_tree_debug("set_drag_hover_target");
     }
 
     fn clear_drag_state(&mut self) {
         self.drag_paths.clear();
         self.drag_hover_target = None;
+        self.refresh_tree_debug("clear_drag_state");
     }
 
     fn open_delete_dialog(&mut self, hard_delete: bool) {
@@ -791,10 +826,42 @@ impl ShellState {
         } else {
             "confirm delete".to_string()
         };
+        if cfg!(debug_assertions) {
+            info!(
+                hard_delete,
+                documents=%self.pending_delete.as_ref().map(|pending| pending.document_paths.len()).unwrap_or(0),
+                groups=%self.pending_delete.as_ref().map(|pending| pending.group_paths.len()).unwrap_or(0),
+                "tree delete dialog opened"
+            );
+        }
+        self.refresh_tree_debug("open_delete_dialog");
     }
 
     fn cancel_delete_dialog(&mut self) {
         self.pending_delete = None;
+        self.refresh_tree_debug("cancel_delete_dialog");
+    }
+
+    fn refresh_tree_debug(&mut self, source: &str) {
+        self.last_tree_debug = format!(
+            "{source} | selected={} [{}] | drag={} [{}] | hover={} | pending_delete={}",
+            self.selected_tree_paths.len(),
+            join_debug_paths(self.selected_tree_paths.iter().cloned().collect()),
+            self.drag_paths.len(),
+            join_debug_paths(self.drag_paths.clone()),
+            self.drag_hover_target
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
+            self.pending_delete
+                .as_ref()
+                .map(|pending| format!(
+                    "docs:{} groups:{} hard:{}",
+                    pending.document_paths.len(),
+                    pending.group_paths.len(),
+                    pending.hard_delete
+                ))
+                .unwrap_or_else(|| "none".to_string())
+        );
     }
 
     fn generate_session_titles(&mut self) {
@@ -1314,7 +1381,11 @@ fn spawn_connect_ssh_custom(mut state: Signal<ShellState>) {
     });
 }
 
-fn spawn_switch_agent_session_mode(mut state: Signal<ShellState>, path: String, target_kind: SessionKind) {
+fn spawn_switch_agent_session_mode(
+    mut state: Signal<ShellState>,
+    path: String,
+    target_kind: SessionKind,
+) {
     state.with_mut(|shell| {
         shell.server_busy = true;
         shell.last_action = format!(
@@ -1332,7 +1403,9 @@ fn spawn_switch_agent_session_mode(mut state: Signal<ShellState>, path: String, 
 }
 
 fn spawn_start_group_session(mut state: Signal<ShellState>, row: BrowserRow, kind: SessionKind) {
-    if row.kind == BrowserRowKind::Separator || row.group_kind == Some(WorkspaceGroupKind::Separator) {
+    if row.kind == BrowserRowKind::Separator
+        || row.group_kind == Some(WorkspaceGroupKind::Separator)
+    {
         return;
     }
     let cwd = group_session_cwd(&row);
@@ -1837,7 +1910,11 @@ fn queue_new_group_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
             task::spawn_blocking(move || -> Result<(String, yggterm_core::SessionNode)> {
                 let store = SessionStore::open_or_init()?;
                 let virtual_path = new_group_virtual_path_for_row(&row_for_task);
-                store.save_group_with_kind(&virtual_path, Some("New Folder"), WorkspaceGroupKind::Folder)?;
+                store.save_group_with_kind(
+                    &virtual_path,
+                    Some("New Folder"),
+                    WorkspaceGroupKind::Folder,
+                )?;
                 Ok((virtual_path, store.load_codex_tree(&settings)?))
             })
             .await;
@@ -1882,7 +1959,9 @@ fn queue_new_group_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
 }
 
 fn queue_new_separator_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
-    if row.kind == BrowserRowKind::Separator || row.group_kind == Some(WorkspaceGroupKind::Separator) {
+    if row.kind == BrowserRowKind::Separator
+        || row.group_kind == Some(WorkspaceGroupKind::Separator)
+    {
         return;
     }
     state.with_mut(|shell| {
@@ -1959,7 +2038,11 @@ fn queue_move_selected_items_to_group(mut state: Signal<ShellState>, target_grou
 
     state.with_mut(|shell| {
         shell.server_busy = true;
-        shell.last_action = format!("moving {} item(s) to {}", selected_rows.len(), target_group.label);
+        shell.last_action = format!(
+            "moving {} item(s) to {}",
+            selected_rows.len(),
+            target_group.label
+        );
         shell.close_context_menu();
         shell.drag_hover_target = None;
     });
@@ -2007,23 +2090,26 @@ fn queue_move_selected_items_to_group(mut state: Signal<ShellState>, target_grou
                 shell.sync_browser_settings();
                 shell.server_busy = false;
                 shell.clear_drag_state();
-                shell.last_action =
-                    format!("moved {} item(s) to {}", moved_paths.len(), target_group.label);
+                shell.last_action = format!(
+                    "moved {} item(s) to {}",
+                    moved_paths.len(),
+                    target_group.label
+                );
                 shell.push_notification(
                     NotificationTone::Success,
                     "Items Moved",
-                    format!("Moved {} item(s) into {}.", moved_paths.len(), target_group.label),
+                    format!(
+                        "Moved {} item(s) into {}.",
+                        moved_paths.len(),
+                        target_group.label
+                    ),
                 );
             }
             Ok(Err(error)) => {
                 shell.server_busy = false;
                 shell.clear_drag_state();
                 shell.last_action = format!("move failed: {error}");
-                shell.push_notification(
-                    NotificationTone::Error,
-                    "Move Failed",
-                    error.to_string(),
-                );
+                shell.push_notification(NotificationTone::Error, "Move Failed", error.to_string());
             }
             Err(error) => {
                 shell.server_busy = false;
@@ -2058,6 +2144,7 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
             shell.pending_delete = Some(pending);
             shell.close_context_menu();
             shell.last_action = "confirm delete".to_string();
+            shell.refresh_tree_debug("queue_delete_selected_items");
             return;
         }
         pending
@@ -2073,21 +2160,23 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
             format!("deleting {item_count} item(s)")
         };
         shell.close_context_menu();
+        shell.refresh_tree_debug("delete_confirmed");
     });
 
     spawn(async move {
         let pending_for_task = pending.clone();
-        let outcome = task::spawn_blocking(move || -> Result<(usize, yggterm_core::SessionNode)> {
-            let store = SessionStore::open_or_init()?;
-            let deleted = store.delete_workspace_items(
-                &pending_for_task.document_paths,
-                &pending_for_task.group_paths,
-            )?;
-            let settings = store.load_settings().unwrap_or_default();
-            let browser_tree = store.load_codex_tree(&settings)?;
-            Ok((deleted, browser_tree))
-        })
-        .await;
+        let outcome =
+            task::spawn_blocking(move || -> Result<(usize, yggterm_core::SessionNode)> {
+                let store = SessionStore::open_or_init()?;
+                let deleted = store.delete_workspace_items(
+                    &pending_for_task.document_paths,
+                    &pending_for_task.group_paths,
+                )?;
+                let settings = store.load_settings().unwrap_or_default();
+                let browser_tree = store.load_codex_tree(&settings)?;
+                Ok((deleted, browser_tree))
+            })
+            .await;
 
         state.with_mut(|shell| match outcome {
             Ok(Ok((deleted, browser_tree))) => {
@@ -2105,6 +2194,7 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
                 shell.server_busy = false;
                 shell.clear_drag_state();
                 shell.last_action = format!("deleted {deleted} workspace item(s)");
+                shell.refresh_tree_debug("delete_finished");
                 shell.push_notification(
                     NotificationTone::Success,
                     "Items Deleted",
@@ -2114,6 +2204,7 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
             Ok(Err(error)) => {
                 shell.server_busy = false;
                 shell.last_action = format!("delete failed: {error}");
+                shell.refresh_tree_debug("delete_failed");
                 shell.push_notification(
                     NotificationTone::Error,
                     "Delete Failed",
@@ -2123,6 +2214,7 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
             Err(error) => {
                 shell.server_busy = false;
                 shell.last_action = format!("delete task failed: {error}");
+                shell.refresh_tree_debug("delete_task_failed");
                 shell.push_notification(
                     NotificationTone::Error,
                     "Delete Task Failed",
@@ -5479,6 +5571,75 @@ fn SettingsRailBody(
                     ],
                     palette: snapshot.palette,
                 }
+                MetadataGroup {
+                    title: "Tree Debug".to_string(),
+                    entries: vec![
+                        SessionMetadataEntry {
+                            label: "State",
+                            value: snapshot.last_tree_debug.clone(),
+                        },
+                        SessionMetadataEntry {
+                            label: "Selected",
+                            value: if snapshot.selected_tree_paths.is_empty() {
+                                "none".to_string()
+                            } else {
+                                snapshot.selected_tree_paths.join(", ")
+                            },
+                        },
+                        SessionMetadataEntry {
+                            label: "Drag Target",
+                            value: snapshot.drag_hover_target.clone().unwrap_or_else(|| "none".to_string()),
+                        },
+                        SessionMetadataEntry {
+                            label: "Pending Delete",
+                            value: snapshot.pending_delete.as_ref().map(|pending| {
+                                format!(
+                                    "{} item(s), hard={}",
+                                    pending.document_paths.len() + pending.group_paths.len(),
+                                    pending.hard_delete
+                                )
+                            }).unwrap_or_else(|| "none".to_string()),
+                        },
+                    ],
+                    palette: snapshot.palette,
+                }
+                MetadataGroup {
+                    title: "Tree Debug".to_string(),
+                    entries: vec![
+                        SessionMetadataEntry {
+                            label: "State",
+                            value: snapshot.last_tree_debug.clone(),
+                        },
+                        SessionMetadataEntry {
+                            label: "Selected",
+                            value: if snapshot.selected_tree_paths.is_empty() {
+                                "none".to_string()
+                            } else {
+                                snapshot.selected_tree_paths.join(", ")
+                            },
+                        },
+                        SessionMetadataEntry {
+                            label: "Drag Target",
+                            value: snapshot
+                                .drag_hover_target
+                                .clone()
+                                .unwrap_or_else(|| "none".to_string()),
+                        },
+                        SessionMetadataEntry {
+                            label: "Pending Delete",
+                            value: snapshot
+                                .pending_delete
+                                .as_ref()
+                                .map(|pending| format!(
+                                    "{} item(s), hard={}",
+                                    pending.document_paths.len() + pending.group_paths.len(),
+                                    pending.hard_delete
+                                ))
+                                .unwrap_or_else(|| "none".to_string()),
+                        },
+                    ],
+                    palette: snapshot.palette,
+                }
             }
             button {
                 style: format!(
@@ -5848,12 +6009,7 @@ fn DeleteConfirmOverlay(
     on_confirm: EventHandler<MouseEvent>,
 ) -> Element {
     let item_count = pending.document_paths.len() + pending.group_paths.len();
-    let preview = pending
-        .labels
-        .iter()
-        .take(4)
-        .cloned()
-        .collect::<Vec<_>>();
+    let preview = pending.labels.iter().take(4).cloned().collect::<Vec<_>>();
     rsx! {
         div {
             style: "position:fixed; inset:0; z-index:95; display:flex; align-items:center; justify-content:center; background:rgba(230,239,248,0.28); backdrop-filter: blur(18px) saturate(130%); -webkit-backdrop-filter: blur(18px) saturate(130%);",
@@ -6352,7 +6508,11 @@ fn context_menu_action_style(palette: Palette, emphasized: bool) -> String {
         } else {
             "transparent"
         },
-        if emphasized { palette.accent } else { palette.text },
+        if emphasized {
+            palette.accent
+        } else {
+            palette.text
+        },
         if emphasized { 700 } else { 600 }
     )
 }
@@ -6371,6 +6531,20 @@ fn delete_confirm_button_style(_palette: Palette, hard_delete: bool) -> String {
          font-size:12px; font-weight:700;",
         if hard_delete { "#c23f4d" } else { "#5fa8ff" }
     )
+}
+
+fn join_debug_paths(mut paths: Vec<String>) -> String {
+    if paths.is_empty() {
+        return "none".to_string();
+    }
+    paths.sort();
+    if paths.len() > 4 {
+        let extra = paths.len() - 4;
+        paths.truncate(4);
+        format!("{}, +{} more", paths.join(", "), extra)
+    } else {
+        paths.join(", ")
+    }
 }
 
 fn inline_toggle_style(_palette: Palette, enabled: bool) -> String {
@@ -6519,9 +6693,18 @@ mod tests {
             session_id: None,
             session_cwd: None,
         };
-        assert!(!valid_drop_target(&["/home/pi/gh/notes/folder-a".to_string()], &target));
-        assert!(!valid_drop_target(&["/home/pi/gh/notes/folder-a/sub".to_string()], &target));
-        assert!(valid_drop_target(&["/home/pi/gh/notes/other-paper".to_string()], &target));
+        assert!(!valid_drop_target(
+            &["/home/pi/gh/notes/folder-a".to_string()],
+            &target
+        ));
+        assert!(!valid_drop_target(
+            &["/home/pi/gh/notes/folder-a/sub".to_string()],
+            &target
+        ));
+        assert!(valid_drop_target(
+            &["/home/pi/gh/notes/other-paper".to_string()],
+            &target
+        ));
     }
 }
 
