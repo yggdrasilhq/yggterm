@@ -911,6 +911,7 @@ impl ShellState {
     fn set_drag_hover_target(&mut self, row: &BrowserRow) {
         self.drag_hover_target =
             valid_drop_target(self.drag_paths.as_slice(), row).then(|| row.full_path.clone());
+        self.optimistic_drag_target = self.drag_hover_target.clone();
         if cfg!(debug_assertions)
             && let Some(target) = self.drag_hover_target.as_deref()
         {
@@ -2455,6 +2456,21 @@ fn queue_move_selected_items_to_group(mut state: Signal<ShellState>, target_row:
     });
 }
 
+fn queue_drop_current_drag_target(state: Signal<ShellState>) {
+    let target_row = {
+        let shell = state.read();
+        let Some(target_path) = shell.drag_hover_target.clone() else {
+            return;
+        };
+        let rows = merged_sidebar_rows(shell.browser.rows(), &shell.server.live_sessions());
+        let Some(row) = rows.into_iter().find(|row| row.full_path == target_path) else {
+            return;
+        };
+        row
+    };
+    queue_move_selected_items_to_group(state, target_row);
+}
+
 fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool) {
     let pending = if let Some(pending) = state.read().pending_delete.clone() {
         pending
@@ -3595,7 +3611,7 @@ fn app() -> Element {
                                 shell.drag_hover_target = None;
                             }
                         }),
-                        on_drop_into_row: move |row: BrowserRow| queue_move_selected_items_to_group(state, row),
+                        on_drop_into_row: move |_| queue_drop_current_drag_target(state),
                         on_end_drag: move |_| state.with_mut(|shell| shell.clear_drag_state()),
                         on_begin_rename: move |row: BrowserRow| state.with_mut(|shell| shell.begin_tree_rename(&row)),
                         on_update_rename: move |value: String| state.with_mut(|shell| shell.update_tree_rename_value(value)),
@@ -4229,7 +4245,7 @@ fn Sidebar(
     on_start_drag: EventHandler<BrowserRow>,
     on_drag_hover: EventHandler<BrowserRow>,
     on_drag_leave: EventHandler<BrowserRow>,
-    on_drop_into_row: EventHandler<BrowserRow>,
+    on_drop_into_row: EventHandler<()>,
     on_end_drag: EventHandler<()>,
     on_begin_rename: EventHandler<BrowserRow>,
     on_update_rename: EventHandler<String>,
@@ -4340,8 +4356,7 @@ fn Sidebar(
                                     move |_| on_drag_leave.call(row.clone())
                                 },
                                 on_drop_into_row: {
-                                    let row = row.clone();
-                                    move |_| on_drop_into_row.call(row.clone())
+                                    move |_| on_drop_into_row.call(())
                                 },
                                 on_end_drag: move |_| on_end_drag.call(()),
                             }
@@ -4372,7 +4387,7 @@ fn SidebarRow(
     on_start_drag: EventHandler<MouseEvent>,
     on_drag_hover: EventHandler<MouseEvent>,
     on_drag_leave: EventHandler<MouseEvent>,
-    on_drop_into_row: EventHandler<MouseEvent>,
+    on_drop_into_row: EventHandler<()>,
     on_end_drag: EventHandler<MouseEvent>,
 ) -> Element {
     let indent = row.depth * 12 + 12;
@@ -4383,11 +4398,14 @@ fn SidebarRow(
                 style: format!(
                     "width:100%; display:flex; align-items:center; gap:10px; border:none; background:transparent; cursor:{}; \
                      padding:8px 9px 8px {}px; margin:4px 0; opacity:{}; border-radius:12px; background:{}; \
-                     box-sizing:border-box; min-width:0; overflow:hidden; user-select:none; -webkit-user-select:none;",
+                     box-sizing:border-box; min-width:0; overflow:hidden; user-select:none; -webkit-user-select:none; \
+                     transition: margin 140ms ease, transform 140ms ease, background 140ms ease, opacity 140ms ease; \
+                     margin-top:{}px;",
                     if dragging { "grabbing" } else if draggable { "grab" } else { "default" },
                     indent
                     , if dragging { "0.58" } else { "1" },
-                    if selected { palette.accent_soft } else { "transparent" }
+                    if selected { palette.accent_soft } else { "transparent" },
+                    if drop_hovered && drag_active { 18 } else { 4 }
                 ),
                 draggable: false,
                 onclick: move |evt| on_select.call(evt),
@@ -4424,7 +4442,7 @@ fn SidebarRow(
                 },
                 onmouseup: move |evt| {
                     if drag_active {
-                        on_drop_into_row.call(evt.clone());
+                        on_drop_into_row.call(());
                         on_end_drag.call(evt);
                     }
                 },
@@ -4513,9 +4531,12 @@ fn SidebarRow(
         div {
             style: format!(
                 "width:100%; display:flex; flex-direction:column; align-items:stretch; gap:2px; \
-                 border:none; border-radius:12px; background:{}; padding:6px 9px 6px {}px; margin-bottom:2px; opacity:{}; cursor:{}; box-sizing:border-box; min-width:0; overflow:hidden;",
+                 border:none; border-radius:12px; background:{}; padding:6px 9px 6px {}px; margin-bottom:{}px; opacity:{}; cursor:{}; \
+                 box-sizing:border-box; min-width:0; overflow:hidden; user-select:none; -webkit-user-select:none; \
+                 transition: margin 140ms ease, transform 140ms ease, background 140ms ease, opacity 140ms ease;",
                 background,
                 indent,
+                if drop_hovered && drag_active { 18 } else { 2 },
                 if dragging { "0.58" } else { "1" },
                 if dragging { "grabbing" } else if draggable { "grab" } else { "default" }
             ),
@@ -4554,8 +4575,8 @@ fn SidebarRow(
             },
             onmouseup: move |evt| {
                 if drag_active {
-                    on_drop_into_row.call(evt.clone());
-                    on_end_drag.call(evt);
+                        on_drop_into_row.call(());
+                        on_end_drag.call(evt);
                 }
             },
             div {
