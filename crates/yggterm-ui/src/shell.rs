@@ -934,12 +934,12 @@ impl ShellState {
         &mut self,
         row: &BrowserRow,
         pointer: (f64, f64),
-        local_pointer_y: f64,
+        placement: DragDropPlacement,
     ) {
         self.drag_pointer = Some(pointer);
         let rows = merged_sidebar_rows(self.browser.rows(), &self.server.live_sessions());
         self.drag_hover_target =
-            resolve_drag_drop_target(&rows, self.drag_paths.as_slice(), row, local_pointer_y);
+            resolve_drag_drop_target(&rows, self.drag_paths.as_slice(), row, placement);
         self.optimistic_drag_target = self.drag_hover_target.clone();
         if cfg!(debug_assertions)
             && let Some(target) = self.drag_hover_target.as_ref()
@@ -2945,30 +2945,11 @@ fn resolve_drag_drop_target(
     rows: &[BrowserRow],
     drag_paths: &[String],
     row: &BrowserRow,
-    pointer_y: f64,
+    placement: DragDropPlacement,
 ) -> Option<DragDropTarget> {
     if !valid_drop_target(drag_paths, row) {
         return None;
     }
-    let placement = match row.kind {
-        BrowserRowKind::Group if row.group_kind != Some(WorkspaceGroupKind::Separator) => {
-            if pointer_y < 12.0 {
-                DragDropPlacement::Before
-            } else if pointer_y > 30.0 {
-                DragDropPlacement::After
-            } else {
-                DragDropPlacement::Into
-            }
-        }
-        BrowserRowKind::Document | BrowserRowKind::Separator => {
-            if pointer_y < 16.0 {
-                DragDropPlacement::Before
-            } else {
-                DragDropPlacement::After
-            }
-        }
-        BrowserRowKind::Session | BrowserRowKind::Group => DragDropPlacement::After,
-    };
     let target = DragDropTarget {
         path: row.full_path.clone(),
         placement,
@@ -3685,8 +3666,8 @@ fn app() -> Element {
                         on_start_drag: move |(row, pointer): (BrowserRow, (f64, f64))| {
                             state.with_mut(|shell| shell.begin_drag(&row, pointer))
                         },
-                        on_drag_hover: move |(row, pointer, local_y): (BrowserRow, (f64, f64), f64)| {
-                            state.with_mut(|shell| shell.set_drag_hover_target(&row, pointer, local_y))
+                        on_drag_hover: move |(row, pointer, placement): (BrowserRow, (f64, f64), DragDropPlacement)| {
+                            state.with_mut(|shell| shell.set_drag_hover_target(&row, pointer, placement))
                         },
                         on_drag_move: move |pointer: (f64, f64)| {
                             state.with_mut(|shell| shell.update_drag_pointer(pointer))
@@ -4337,7 +4318,7 @@ fn Sidebar(
     on_delete_selected_items: EventHandler<bool>,
     on_open_context_menu: EventHandler<(BrowserRow, (f64, f64))>,
     on_start_drag: EventHandler<(BrowserRow, (f64, f64))>,
-    on_drag_hover: EventHandler<(BrowserRow, (f64, f64), f64)>,
+    on_drag_hover: EventHandler<(BrowserRow, (f64, f64), DragDropPlacement)>,
     on_drag_move: EventHandler<(f64, f64)>,
     on_drag_leave: EventHandler<BrowserRow>,
     on_drop_into_row: EventHandler<()>,
@@ -4421,10 +4402,11 @@ fn Sidebar(
                                         snapshot.selected_tree_paths.is_empty()
                                             && snapshot.selected_path.as_deref() == Some(row.full_path.as_str())
                                     ),
-                                drop_hovered: snapshot
+                                drop_target: snapshot
                                     .drag_hover_target
                                     .as_ref()
-                                    .is_some_and(|target| target.path == row.full_path),
+                                    .filter(|target| target.path == row.full_path)
+                                    .map(|target| target.placement),
                                 dragging: snapshot.drag_paths.iter().any(|path| path == &row.full_path),
                                 drag_active: !snapshot.drag_paths.is_empty(),
                                 renaming: snapshot.tree_rename_path.as_deref() == Some(row.full_path.as_str()),
@@ -4462,10 +4444,9 @@ fn Sidebar(
                                 },
                                 on_drag_hover: {
                                     let row = row.clone();
-                                    move |evt: MouseEvent| {
+                                    move |(placement, evt): (DragDropPlacement, MouseEvent)| {
                                         let coords = evt.client_coordinates();
-                                        let local = evt.element_coordinates();
-                                        on_drag_hover.call((row.clone(), (coords.x, coords.y), local.y))
+                                        on_drag_hover.call((row.clone(), (coords.x, coords.y), placement))
                                     }
                                 },
                                 on_drag_leave: {
@@ -4485,7 +4466,7 @@ fn Sidebar(
 fn SidebarRow(
     row: BrowserRow,
     selected: bool,
-    drop_hovered: bool,
+    drop_target: Option<DragDropPlacement>,
     dragging: bool,
     drag_active: bool,
     renaming: bool,
@@ -4498,11 +4479,17 @@ fn SidebarRow(
     on_commit_rename: EventHandler<()>,
     on_cancel_rename: EventHandler<()>,
     on_start_drag: EventHandler<MouseEvent>,
-    on_drag_hover: EventHandler<MouseEvent>,
+    on_drag_hover: EventHandler<(DragDropPlacement, MouseEvent)>,
     on_drag_leave: EventHandler<MouseEvent>,
 ) -> Element {
     let indent = row.depth * 12 + 12;
     let draggable = is_workspace_row(&row);
+    let drop_hovered = drop_target.is_some();
+    let can_drop_inside =
+        row.kind == BrowserRowKind::Group && row.group_kind != Some(WorkspaceGroupKind::Separator);
+    let top_line = drop_target == Some(DragDropPlacement::Before);
+    let bottom_line = drop_target == Some(DragDropPlacement::After);
+    let fill_target = drop_target == Some(DragDropPlacement::Into);
     if row.kind == BrowserRowKind::Separator {
         return rsx! {
             div {
@@ -4511,17 +4498,18 @@ fn SidebarRow(
                      padding:8px 9px 8px {}px; margin:0; opacity:{}; border-radius:12px; background:{}; \
                      box-sizing:border-box; min-width:0; overflow:hidden; user-select:none; -webkit-user-select:none; \
                      transition: transform 140ms ease, background 140ms ease, opacity 140ms ease, box-shadow 140ms ease; \
-                     transform:translateY({}px); box-shadow:{};",
+                     transform:translateY(0px); box-shadow:{}; position:relative;",
                     if dragging { "grabbing" } else if draggable { "grab" } else { "default" },
                     indent
                     , if dragging { "0.58" } else { "1" },
-                    if selected { palette.accent_soft } else { "transparent" },
-                    if drop_hovered && drag_active { 10 } else { 0 },
-                    if drop_hovered && drag_active {
+                    if selected || fill_target { palette.accent_soft } else { "transparent" },
+                    if top_line && drag_active {
                         format!("inset 0 2px 0 {}", palette.accent)
+                    } else if bottom_line && drag_active {
+                        format!("inset 0 -2px 0 {}", palette.accent)
                     } else {
                         "none".to_string()
-                    }
+                    },
                 ),
                 draggable: false,
                 onclick: move |evt| on_select.call(evt),
@@ -4543,20 +4531,21 @@ fn SidebarRow(
                     let coords = evt.client_coordinates();
                     on_open_context_menu.call((coords.x, coords.y));
                 },
-                onmousemove: move |evt| {
-                    if drag_active || evt.held_buttons().contains(MouseButton::Primary) {
-                        evt.prevent_default();
-                        on_drag_hover.call(evt);
-                    }
-                },
-                onmouseenter: move |evt| {
-                    if drag_active {
-                        on_drag_hover.call(evt);
-                    }
-                },
                 onmouseleave: move |evt| {
                     on_drag_leave.call(evt);
                 },
+                if drag_active {
+                    div {
+                        style: "position:absolute; left:0; right:0; top:0; height:12px; z-index:2;",
+                        onmouseenter: move |evt| on_drag_hover.call((DragDropPlacement::Before, evt)),
+                        onmousemove: move |evt| on_drag_hover.call((DragDropPlacement::Before, evt)),
+                    }
+                    div {
+                        style: "position:absolute; left:0; right:0; bottom:0; height:12px; z-index:2;",
+                        onmouseenter: move |evt| on_drag_hover.call((DragDropPlacement::After, evt)),
+                        onmousemove: move |evt| on_drag_hover.call((DragDropPlacement::After, evt)),
+                    }
+                }
                 div {
                     style: format!(
                         "flex:1; min-width:0; height:{}px; background:{}; opacity:{};",
@@ -4645,17 +4634,18 @@ fn SidebarRow(
                  border:none; border-radius:12px; background:{}; padding:6px 9px 6px {}px; margin:0; opacity:{}; cursor:{}; \
                  box-sizing:border-box; min-width:0; overflow:hidden; user-select:none; -webkit-user-select:none; \
                  transition: transform 140ms ease, background 140ms ease, opacity 140ms ease, box-shadow 140ms ease; \
-                 transform:translateY({}px); box-shadow:{};",
-                background,
+                 transform:translateY(0px); box-shadow:{}; position:relative;",
+                if fill_target { "rgba(95, 168, 255, 0.14)" } else { background },
                 indent,
                 if dragging { "0.58" } else { "1" },
                 if dragging { "grabbing" } else if draggable { "grab" } else { "default" },
-                if drop_hovered && drag_active { 10 } else { 0 },
-                if drop_hovered && drag_active {
+                if top_line && drag_active {
                     format!("inset 0 2px 0 {}", palette.accent)
+                } else if bottom_line && drag_active {
+                    format!("inset 0 -2px 0 {}", palette.accent)
                 } else {
                     "none".to_string()
-                }
+                },
             ),
             draggable: false,
             onclick: move |evt| on_select.call(evt),
@@ -4677,20 +4667,28 @@ fn SidebarRow(
                 let coords = evt.client_coordinates();
                 on_open_context_menu.call((coords.x, coords.y));
             },
-            onmousemove: move |evt| {
-                if drag_active || evt.held_buttons().contains(MouseButton::Primary) {
-                    evt.prevent_default();
-                    on_drag_hover.call(evt);
-                }
-            },
-            onmouseenter: move |evt| {
-                if drag_active {
-                    on_drag_hover.call(evt);
-                }
-            },
             onmouseleave: move |evt| {
                 on_drag_leave.call(evt);
             },
+            if drag_active {
+                div {
+                    style: "position:absolute; left:0; right:0; top:0; height:12px; z-index:2;",
+                    onmouseenter: move |evt| on_drag_hover.call((DragDropPlacement::Before, evt)),
+                    onmousemove: move |evt| on_drag_hover.call((DragDropPlacement::Before, evt)),
+                }
+                if can_drop_inside {
+                    div {
+                        style: "position:absolute; left:0; right:0; top:12px; bottom:12px; z-index:2;",
+                        onmouseenter: move |evt| on_drag_hover.call((DragDropPlacement::Into, evt)),
+                        onmousemove: move |evt| on_drag_hover.call((DragDropPlacement::Into, evt)),
+                    }
+                }
+                div {
+                    style: "position:absolute; left:0; right:0; bottom:0; height:12px; z-index:2;",
+                    onmouseenter: move |evt| on_drag_hover.call((DragDropPlacement::After, evt)),
+                    onmousemove: move |evt| on_drag_hover.call((DragDropPlacement::After, evt)),
+                }
+            }
             div {
                 style: "display:flex; align-items:center; justify-content:space-between; gap:8px;",
                 div {
