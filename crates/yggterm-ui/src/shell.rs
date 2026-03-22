@@ -5702,63 +5702,107 @@ fn PreviewBlock(
     palette: Palette,
     on_toggle: EventHandler<MouseEvent>,
 ) -> Element {
-    let background = match block.tone {
-        PreviewTone::User => "rgba(230, 242, 255, 0.98)",
-        PreviewTone::Assistant => "rgba(255, 255, 255, 0.94)",
+    let user_block = block.tone == PreviewTone::User;
+    let background = if user_block {
+        "rgba(231, 243, 255, 0.98)"
+    } else {
+        "rgba(255, 255, 255, 0.96)"
     };
-    let badge = match block.tone {
-        PreviewTone::User => palette.accent,
-        PreviewTone::Assistant => palette.muted,
+    let badge_background = if user_block {
+        "rgba(37, 99, 235, 0.12)"
+    } else {
+        "rgba(15, 23, 42, 0.06)"
     };
-    let outline = match block.tone {
-        PreviewTone::User => "rgba(66, 153, 225, 0.18)",
-        PreviewTone::Assistant => "rgba(148, 163, 184, 0.18)",
+    let badge = if user_block { palette.accent } else { palette.text };
+    let outline = if user_block {
+        "rgba(66, 153, 225, 0.18)"
+    } else {
+        "rgba(148, 163, 184, 0.14)"
     };
+    let row_justify = if user_block { "flex-end" } else { "flex-start" };
+    let card_width = if user_block { "min(76%, 760px)" } else { "min(92%, 900px)" };
+    let avatar_bg = if user_block {
+        "linear-gradient(180deg, rgba(73,138,255,0.18) 0%, rgba(73,138,255,0.10) 100%)"
+    } else {
+        "linear-gradient(180deg, rgba(255,255,255,0.96) 0%, rgba(248,252,255,0.88) 100%)"
+    };
+    let avatar_fg = if user_block { palette.accent } else { palette.text };
+    let avatar_label = if user_block { "U" } else { "A" };
 
     rsx! {
-        button {
-            style: format!(
-                "width:100%; border:none; text-align:left; background:{}; border-radius:18px; \
-                 padding:20px 20px; box-shadow: inset 0 0 0 1px {}, 0 14px 28px rgba(148,163,184,0.08);",
-                background, outline
-            ),
-            onclick: move |evt| on_toggle.call(evt),
+        div {
+            style: format!("display:flex; justify-content:{}; width:100%;", row_justify),
             div {
-                style: "display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px;",
-                div {
-                    style: "display:flex; align-items:center; gap:8px;",
-                    span {
+                style: format!("display:flex; align-items:flex-start; gap:12px; width:{};", card_width),
+                if !user_block {
+                    div {
                         style: format!(
-                            "display:inline-flex; align-items:center; justify-content:center; min-width:54px; height:22px; \
-                             border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:700;",
-                            if block.tone == PreviewTone::User { "rgba(37,99,235,0.12)" } else { "rgba(108,114,127,0.10)" },
-                            badge
+                            "width:34px; height:34px; border-radius:999px; background:{}; color:{}; \
+                             display:flex; align-items:center; justify-content:center; font-size:12px; font-weight:800; \
+                             flex:0 0 auto; box-shadow: inset 0 0 0 1px rgba(170,190,212,0.18);",
+                            avatar_bg,
+                            avatar_fg
                         ),
-                        "{block.role}"
-                    }
-                    span {
-                        style: format!("font-size:11px; color:{};", palette.muted),
-                        "{block.timestamp}"
+                        "{avatar_label}"
                     }
                 }
-                span {
-                    style: format!("font-size:11px; color:{};", palette.muted),
-                    {if block.folded { format!("Expand {}", block_ix + 1) } else { format!("Collapse {}", block_ix + 1) }}
-                }
-            }
-            if block.folded {
-                div {
-                    style: format!("font-size:12px; color:{};", palette.muted),
-                    "{block.lines.len()} lines hidden"
-                }
-            } else {
-                div {
-                    style: format!("display:flex; flex-direction:column; gap:9px; color:{};", palette.text),
-                    for line in block.lines.iter() {
+                button {
+                    style: format!(
+                        "width:100%; border:none; text-align:left; background:{}; border-radius:20px; \
+                         padding:18px 20px; box-shadow: inset 0 0 0 1px {}, 0 16px 32px rgba(148,163,184,0.08);",
+                        background, outline
+                    ),
+                    onclick: move |evt| on_toggle.call(evt),
+                    div {
+                        style: "display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px;",
                         div {
-                            style: "font-size:13px; line-height:1.62; white-space:pre-wrap;",
-                            "{line}"
+                            style: "display:flex; align-items:center; gap:8px;",
+                            span {
+                                style: format!(
+                                    "display:inline-flex; align-items:center; justify-content:center; min-width:58px; height:23px; \
+                                     border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:700;",
+                                    badge_background,
+                                    badge
+                                ),
+                                "{block.role}"
+                            }
+                            span {
+                                style: format!("font-size:11px; color:{};", palette.muted),
+                                "{block.timestamp}"
+                            }
                         }
+                        span {
+                            style: format!("font-size:11px; color:{};", palette.muted),
+                            {if block.folded { format!("Expand {}", block_ix + 1) } else { format!("Collapse {}", block_ix + 1) }}
+                        }
+                    }
+                    if block.folded {
+                        div {
+                            style: format!("font-size:12px; color:{};", palette.muted),
+                            "{block.lines.len()} lines hidden"
+                        }
+                    } else {
+                        div {
+                            style: format!("display:flex; flex-direction:column; gap:10px; color:{};", palette.text),
+                            for line in block.lines.iter() {
+                                div {
+                                    style: "font-size:13px; line-height:1.66; white-space:pre-wrap;",
+                                    "{line}"
+                                }
+                            }
+                        }
+                    }
+                }
+                if user_block {
+                    div {
+                        style: format!(
+                            "width:34px; height:34px; border-radius:999px; background:{}; color:{}; \
+                             display:flex; align-items:center; justify-content:center; font-size:12px; font-weight:800; \
+                             flex:0 0 auto; box-shadow: inset 0 0 0 1px rgba(170,190,212,0.18);",
+                            avatar_bg,
+                            avatar_fg
+                        ),
+                        "{avatar_label}"
                     }
                 }
             }
