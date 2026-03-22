@@ -49,12 +49,13 @@ use yggterm_core::{
 use yggterm_platform::DockRect;
 use yggterm_server::{
     GhosttyTerminalHostMode, ManagedSessionView, PreviewTone, ServerEndpoint, ServerRuntimeStatus,
-    ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionPreviewBlock, SshConnectTarget,
-    TerminalBackend, WorkspaceViewMode, YggtermServer, connect_ssh_custom, focus_live,
-    open_stored_session, ping, request_terminal_launch, set_all_preview_blocks_folded,
-    set_view_mode as daemon_set_view_mode, snapshot as daemon_snapshot, start_command_session,
-    start_local_session, start_local_session_at, status, switch_agent_session_mode,
-    terminal_ensure, terminal_read, terminal_resize, terminal_write,
+    ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionPreviewBlock,
+    SessionRenderedSection, SshConnectTarget, TerminalBackend, WorkspaceViewMode, YggtermServer,
+    connect_ssh_custom, focus_live, open_stored_session, ping, request_terminal_launch,
+    set_all_preview_blocks_folded, set_view_mode as daemon_set_view_mode,
+    snapshot as daemon_snapshot, start_command_session, start_local_session,
+    start_local_session_at, status, switch_agent_session_mode, terminal_ensure, terminal_read,
+    terminal_resize, terminal_write,
     toggle_preview_block as daemon_toggle_preview_block,
 };
 
@@ -5076,6 +5077,12 @@ fn MainSurface(
                             if snapshot.preview_layout == PreviewLayoutMode::Chat {
                                 div {
                                     style: "display:flex; flex-direction:column; gap:18px;",
+                                    if !session.rendered_sections.is_empty() {
+                                        RenderedSectionsStrip {
+                                            sections: session.rendered_sections.clone(),
+                                            palette: snapshot.palette,
+                                        }
+                                    }
                                     for (ix, block) in session.preview.blocks.iter().cloned().enumerate() {
                                         PreviewBlock {
                                             block_ix: ix,
@@ -5608,6 +5615,12 @@ fn PreviewGraph(session: ManagedSessionView, palette: Palette) -> Element {
                         }
                     }
                 }
+                if !session.rendered_sections.is_empty() {
+                    RenderedSectionsStrip {
+                        sections: session.rendered_sections.clone(),
+                        palette,
+                    }
+                }
             }
             div {
                 style: "display:flex; flex-direction:column; gap:14px; padding-top:2px;",
@@ -5666,6 +5679,75 @@ fn PreviewGraph(session: ManagedSessionView, palette: Palette) -> Element {
                     }
                 }
             }
+            }
+        }
+    }
+}
+
+#[component]
+fn RenderedSectionsStrip(sections: Vec<SessionRenderedSection>, palette: Palette) -> Element {
+    rsx! {
+        div {
+            style: "display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:12px;",
+            for section in sections {
+                RenderedSectionCard {
+                    section,
+                    palette,
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn RenderedSectionCard(section: SessionRenderedSection, palette: Palette) -> Element {
+    let is_commands = section.title.to_ascii_lowercase().contains("command");
+    let visible_lines = section.lines.iter().take(3).cloned().collect::<Vec<_>>();
+    let visible_count = visible_lines.len();
+    rsx! {
+        div {
+            style: format!(
+                "display:flex; flex-direction:column; gap:10px; min-width:0; padding:14px 16px; border-radius:18px; \
+                 background:rgba(255,255,255,0.82); box-shadow:inset 0 0 0 1px rgba(170,190,212,0.14);"
+            ),
+            div {
+                style: "display:flex; align-items:center; justify-content:space-between; gap:12px;",
+                div {
+                    style: format!("font-size:12px; font-weight:700; letter-spacing:0.03em; text-transform:uppercase; color:{};", palette.muted),
+                    "{section.title}"
+                }
+                if section.lines.len() > visible_count {
+                    div {
+                        style: format!("font-size:11px; color:{};", palette.muted),
+                        "{section.lines.len()} lines"
+                    }
+                }
+            }
+            div {
+                style: "display:flex; flex-direction:column; gap:8px; min-width:0;",
+                for line in visible_lines {
+                    if is_commands {
+                        div {
+                            style: format!(
+                                "font-size:12px; line-height:1.6; white-space:pre-wrap; font-family:'JetBrains Mono', 'Iosevka Term', monospace; \
+                                 color:{}; padding:8px 10px; border-radius:12px; background:rgba(15,23,42,0.06); overflow-wrap:anywhere;",
+                                palette.text
+                            ),
+                            "{line}"
+                        }
+                    } else {
+                        div {
+                            style: format!("font-size:13px; line-height:1.62; white-space:pre-wrap; color:{};", palette.text),
+                            "{line}"
+                        }
+                    }
+                }
+                if section.lines.len() > visible_count {
+                    div {
+                        style: format!("font-size:11px; font-weight:600; color:{};", palette.muted),
+                        "+ {section.lines.len() - visible_count} more"
+                    }
+                }
             }
         }
     }
