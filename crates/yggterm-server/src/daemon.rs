@@ -274,7 +274,10 @@ impl DaemonRuntime {
                 self.snapshot_response(Some(format!("started {key}")))
             }
             ServerRequest::SwitchAgentSessionMode { path, session_kind } => {
-                if self.terminals.recent_activity(&path, std::time::Duration::from_secs(4)) {
+                if self
+                    .terminals
+                    .recent_activity(&path, std::time::Duration::from_secs(4))
+                {
                     bail!("session is still active; wait for it to settle before switching modes");
                 }
                 let stop_command = self.server.terminal_stop_command(&path);
