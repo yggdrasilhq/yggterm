@@ -206,6 +206,17 @@ If a project has drag-and-drop tree or list reordering:
 - multi-select drag can use stacked-card visuals
 - the final placement must match the visible snap indicator exactly
 
+### Preview surfaces
+
+If a project has a conversation preview surface:
+
+- preview reading mode and runtime/live mode should share one header system
+- generated title, precis, and summary should be treated as refreshable navigational aids
+- preview content should render like content, not raw log lines
+- headings, bullets, task items, quotes, and code fences should each have distinct treatment
+- overview/graph mode should feel structural, not like the same chat list in a second skin
+- overview mode should highlight summary, counts, and message progression before full transcript detail
+
 ### Reusable shell guidance
 
 If a project has:
