@@ -1,3 +1,10 @@
+use crate::drag_tree::{
+    DragDropPlacement, DragDropTarget, TreeDropPlacement as WorkspaceDropPlacement,
+    TreeReorderItem, TreeReorderPlanItem, build_tree_reorder_plan,
+    resolve_drag_drop_target as resolve_tree_drag_drop_target,
+    resolve_tree_drop_placement, tree_parent_path, tree_path_contains,
+    valid_drop_target as valid_tree_drop_target,
+};
 use crate::window_icon;
 use anyhow::{Result, anyhow};
 use dioxus::desktop::{
@@ -49,6 +56,7 @@ const XTERM_CSS: &str = include_str!("../../../assets/xterm/xterm.css");
 const XTERM_JS: &str = include_str!("../../../assets/xterm/xterm.js");
 const XTERM_FIT_JS: &str = include_str!("../../../assets/xterm/addon-fit.js");
 static XTERM_ASSETS_BOOTSTRAPPED: OnceCell<()> = OnceCell::new();
+type WorkspaceReorderPlanItem = TreeReorderPlanItem<BrowserRowKind>;
 const TOAST_CSS: &str = r#"
 @keyframes yggterm-toast-stack-in {
   0% { opacity: 0; transform: translateY(12px); }
@@ -232,34 +240,6 @@ enum TreeSelectionMode {
     Replace,
     ExtendRange,
     Toggle,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum DragDropPlacement {
-    Before,
-    Into,
-    After,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct DragDropTarget {
-    path: String,
-    placement: DragDropPlacement,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum WorkspaceDropPlacement {
-    TopOfGroup(String),
-    AfterPath(String),
-}
-
-#[derive(Debug, Clone)]
-struct WorkspaceReorderPlanItem {
-    kind: BrowserRowKind,
-    from_path: String,
-    temp_path: String,
-    final_path: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -3002,43 +2982,8 @@ fn workspace_leaf_name(path: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn canonical_workspace_leaf_name(path: &str) -> String {
-    let leaf = workspace_leaf_name(path).unwrap_or_else(|| "item".to_string());
-    let unanchored = leaf.rsplit('~').next().unwrap_or(leaf.as_str());
-    let mut stripped = unanchored.trim_start_matches('!');
-    while stripped.len() > 5
-        && stripped.as_bytes().get(4) == Some(&b'-')
-        && stripped.as_bytes()[0..4].iter().all(|byte| byte.is_ascii_digit())
-    {
-        stripped = &stripped[5..];
-    }
-    if stripped.is_empty() {
-        "item".to_string()
-    } else {
-        stripped.to_string()
-    }
-}
-
-fn join_workspace_child_path(base: &str, leaf: &str) -> String {
-    let trimmed = base.trim_end_matches('/');
-    if trimmed.is_empty() || trimmed == "/" {
-        format!("/{leaf}")
-    } else {
-        format!("{trimmed}/{leaf}")
-    }
-}
-
 fn workspace_parent_path(path: &str) -> Option<String> {
-    let normalized = path.trim_end_matches('/');
-    if normalized.is_empty() || normalized == "/" {
-        return None;
-    }
-    let parent = normalized.rsplit_once('/')?.0;
-    if parent.is_empty() {
-        Some("/".to_string())
-    } else {
-        Some(parent.to_string())
-    }
+    tree_parent_path(path)
 }
 
 fn direct_workspace_parent_path(row: &BrowserRow) -> Option<String> {
@@ -3050,53 +2995,45 @@ fn direct_workspace_parent_path(row: &BrowserRow) -> Option<String> {
     }
 }
 
+fn browser_row_tree_item(row: &BrowserRow) -> Option<TreeReorderItem<BrowserRowKind>> {
+    if !is_workspace_row(row) && !is_drop_target_row(row) {
+        return None;
+    }
+    Some(TreeReorderItem {
+        kind: row.kind,
+        path: row.full_path.clone(),
+        parent_path: direct_workspace_parent_path(row),
+        accepts_drop_inside: row.kind == BrowserRowKind::Group
+            && row.group_kind != Some(WorkspaceGroupKind::Separator)
+            && !row.full_path.starts_with("__live_")
+            && row.full_path != "local",
+        droppable: is_drop_target_row(row),
+    })
+}
+
 fn resolve_drag_drop_target(
     rows: &[BrowserRow],
     drag_paths: &[String],
     row: &BrowserRow,
     placement: DragDropPlacement,
 ) -> Option<DragDropTarget> {
-    if !valid_drop_target(drag_paths, row) {
-        return None;
-    }
-    let target = DragDropTarget {
-        path: row.full_path.clone(),
-        placement,
-    };
-    resolve_workspace_drop_placement(rows, &target).map(|_| target)
+    let items = rows
+        .iter()
+        .filter_map(browser_row_tree_item)
+        .collect::<Vec<_>>();
+    let row_item = browser_row_tree_item(row)?;
+    resolve_tree_drag_drop_target(&items, drag_paths, &row_item, placement)
 }
 
 fn resolve_workspace_drop_placement(
     rows: &[BrowserRow],
     target: &DragDropTarget,
 ) -> Option<WorkspaceDropPlacement> {
-    let target_index = rows.iter().position(|row| row.full_path == target.path)?;
-    let target_row = rows.get(target_index)?;
-    match target.placement {
-        DragDropPlacement::Into => match target_row.kind {
-            BrowserRowKind::Group if is_drop_target_row(target_row) => {
-                Some(WorkspaceDropPlacement::TopOfGroup(target_row.full_path.clone()))
-            }
-            BrowserRowKind::Document | BrowserRowKind::Separator => {
-                Some(WorkspaceDropPlacement::AfterPath(target_row.full_path.clone()))
-            }
-            _ => None,
-        },
-        DragDropPlacement::After => Some(WorkspaceDropPlacement::AfterPath(target_row.full_path.clone())),
-        DragDropPlacement::Before => {
-            let parent = direct_workspace_parent_path(target_row)?;
-            let previous_sibling = rows[..target_index].iter().rev().find(|candidate| {
-                is_workspace_row(candidate)
-                    && candidate.depth == target_row.depth
-                    && direct_workspace_parent_path(candidate).as_deref() == Some(parent.as_str())
-            });
-            if let Some(previous) = previous_sibling {
-                Some(WorkspaceDropPlacement::AfterPath(previous.full_path.clone()))
-            } else {
-                Some(WorkspaceDropPlacement::TopOfGroup(parent))
-            }
-        }
-    }
+    let items = rows
+        .iter()
+        .filter_map(browser_row_tree_item)
+        .collect::<Vec<_>>();
+    resolve_tree_drop_placement(&items, target)
 }
 
 fn context_menu_drop_placement(row: &BrowserRow) -> Option<WorkspaceDropPlacement> {
@@ -3111,98 +3048,20 @@ fn context_menu_drop_placement(row: &BrowserRow) -> Option<WorkspaceDropPlacemen
     }
 }
 
-fn ordered_workspace_item_virtual_path(parent: &str, row: &BrowserRow, index: usize) -> String {
-    let leaf = canonical_workspace_leaf_name(&row.full_path);
-    join_workspace_child_path(parent, &format!("{index:04}-{leaf}"))
-}
-
-fn staging_workspace_item_virtual_path(parent: &str, row: &BrowserRow, token: &str, index: usize) -> String {
-    let leaf = canonical_workspace_leaf_name(&row.full_path);
-    join_workspace_child_path(parent, &format!("__yggtmp-{token}-{index:04}-{leaf}"))
-}
-
 fn build_workspace_reorder_plan(
     rows: &[BrowserRow],
     selected_rows: &[BrowserRow],
     placement: &WorkspaceDropPlacement,
 ) -> Option<Vec<WorkspaceReorderPlanItem>> {
-    if selected_rows.is_empty() {
-        return Some(Vec::new());
-    }
-    let moved_set = selected_rows
+    let items = rows
         .iter()
-        .map(|row| row.full_path.clone())
-        .collect::<HashSet<_>>();
-    let target_parent = match placement {
-        WorkspaceDropPlacement::TopOfGroup(path) => path.clone(),
-        WorkspaceDropPlacement::AfterPath(path) => workspace_parent_path(path)?,
-    };
-
-    let mut siblings_by_parent = BTreeMap::<String, Vec<BrowserRow>>::new();
-    for row in rows.iter().filter(|row| is_workspace_row(row)) {
-        if let Some(parent) = direct_workspace_parent_path(row) {
-            siblings_by_parent.entry(parent).or_default().push(row.clone());
-        }
-    }
-
-    let original_target_siblings = siblings_by_parent
-        .get(&target_parent)
-        .cloned()
-        .unwrap_or_default();
-
-    for siblings in siblings_by_parent.values_mut() {
-        siblings.retain(|row| !moved_set.contains(&row.full_path));
-    }
-
-    let moved_rows = selected_rows.to_vec();
-    let target_siblings = siblings_by_parent.entry(target_parent.clone()).or_default();
-    let insert_at = match placement {
-        WorkspaceDropPlacement::TopOfGroup(_) => 0,
-        WorkspaceDropPlacement::AfterPath(anchor) => original_target_siblings
-            .iter()
-            .take_while(|row| row.full_path != *anchor)
-            .filter(|row| !moved_set.contains(&row.full_path))
-            .count()
-            + usize::from(!moved_set.contains(anchor)),
-    };
-    for (offset, row) in moved_rows.iter().cloned().enumerate() {
-        target_siblings.insert(insert_at + offset, row);
-    }
-
-    let mut affected_parents = selected_rows
+        .filter_map(browser_row_tree_item)
+        .collect::<Vec<_>>();
+    let selected_items = selected_rows
         .iter()
-        .filter_map(direct_workspace_parent_path)
-        .collect::<HashSet<_>>();
-    affected_parents.insert(target_parent);
-
-    let temp_token = unique_workspace_leaf_suffix();
-    let mut plan = Vec::new();
-    let mut temp_index = 0usize;
-
-    for parent in affected_parents {
-        let Some(siblings) = siblings_by_parent.get(&parent) else {
-            continue;
-        };
-        for (index, row) in siblings.iter().enumerate() {
-            let final_path = ordered_workspace_item_virtual_path(&parent, row, index);
-            if final_path == row.full_path {
-                continue;
-            }
-            let original_parent =
-                direct_workspace_parent_path(row).unwrap_or_else(|| parent.clone());
-            let temp_path =
-                staging_workspace_item_virtual_path(&original_parent, row, &temp_token, temp_index);
-            temp_index += 1;
-            plan.push(WorkspaceReorderPlanItem {
-                kind: row.kind,
-                from_path: row.full_path.clone(),
-                temp_path,
-                final_path,
-            });
-        }
-    }
-
-    Some(plan)
+        .filter_map(browser_row_tree_item)
+        .collect::<Vec<_>>();
+    build_tree_reorder_plan(&items, &selected_items, placement, &unique_workspace_leaf_suffix())
 }
 
 fn apply_workspace_reorder_plan(
@@ -3264,29 +3123,14 @@ fn is_drop_target_row(row: &BrowserRow) -> bool {
 }
 
 fn workspace_path_contains(parent: &str, child: &str) -> bool {
-    child == parent
-        || child
-            .strip_prefix(parent)
-            .is_some_and(|suffix| suffix.starts_with('/'))
+    tree_path_contains(parent, child)
 }
 
 fn valid_drop_target(drag_paths: &[String], target_row: &BrowserRow) -> bool {
-    if !is_drop_target_row(target_row) || drag_paths.is_empty() {
+    let Some(item) = browser_row_tree_item(target_row) else {
         return false;
-    }
-    drag_paths.iter().all(|path| {
-        path != &target_row.full_path
-            && !workspace_path_contains(path, &target_row.full_path)
-            && match target_row.kind {
-                BrowserRowKind::Group => {
-                    parent_virtual_path(path).as_deref() != Some(target_row.full_path.as_str())
-                }
-                BrowserRowKind::Document | BrowserRowKind::Separator => {
-                    parent_virtual_path(path).is_some()
-                }
-                BrowserRowKind::Session => false,
-            }
-    })
+    };
+    valid_tree_drop_target(drag_paths, &item)
 }
 
 fn context_menu_placement(
@@ -7898,7 +7742,8 @@ mod tests {
             session_id: Some("paper-a-id".to_string()),
             session_cwd: Some("/home/pi/gh/notes".to_string()),
         };
-        let destination = ordered_workspace_item_virtual_path("/home/pi/gh/notes", &item, 0);
+        let destination =
+            crate::drag_tree::ordered_tree_child_path("/home/pi/gh/notes", &item.full_path, 0);
 
         assert_eq!(destination, "/home/pi/gh/notes/0000-paper-a");
     }

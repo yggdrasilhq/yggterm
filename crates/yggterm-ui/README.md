@@ -1,0 +1,33 @@
+# yggterm-ui
+
+`yggterm-ui` contains Dioxus shell primitives and reusable interaction logic for Yggdrasil applications.
+
+## Reusable drag tree
+
+The sidebar drag-and-drop engine is intentionally reusable and lives in:
+
+- [src/drag_tree.rs](/home/pi/gh/yggterm/crates/yggterm-ui/src/drag_tree.rs)
+
+Use it when another app needs Yggterm-style tree reordering.
+
+### What it provides
+
+- explicit drop zones: `before`, `inside`, `after`
+- path-based target resolution
+- stable sibling reorder planning
+- two-phase `temp -> final` rewrite planning for persistence layers
+- regression-tested handling for adjacent snap boundaries and dragged-anchor cases
+
+### Integration steps
+
+1. Adapt your tree rows into `TreeReorderItem<K>`.
+2. Feed hover state into `resolve_drag_drop_target(...)`.
+3. Convert the result into `TreeDropPlacement`.
+4. Build a plan with `build_tree_reorder_plan(...)`.
+5. Apply the returned `from_path`, `temp_path`, and `final_path` to your own store.
+
+### Notes
+
+- The engine is path-oriented because Yggterm persists virtual paths instead of raw list indices.
+- The UI layer is free to style drag ghosts, make-way gaps, or stacked-card affordances independently.
+- The current Yggterm sidebar in `src/shell.rs` is the production reference integration.
