@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
-use tao::event::{ElementState, Event as TaoEvent, MouseButton as TaoMouseButton};
+use tao::event::Event as TaoEvent;
 use tao::window::ResizeDirection;
 use tokio::task;
 use tokio::time::sleep;
@@ -3546,16 +3546,6 @@ fn app() -> Element {
                 | DesktopWindowEvent::ScaleFactorChanged { .. } => {
                     window_epoch.with_mut(|epoch| *epoch += 1);
                 }
-                DesktopWindowEvent::MouseInput {
-                    state: ElementState::Released,
-                    button: TaoMouseButton::Left,
-                    ..
-                } => {
-                    if !state.read().drag_paths.is_empty() {
-                        queue_drop_current_drag_target(state);
-                        state.with_mut(|shell| shell.clear_drag_state());
-                    }
-                }
                 _ => {}
             }
         }
@@ -3714,6 +3704,12 @@ fn app() -> Element {
                  -webkit-backdrop-filter: blur(30px) saturate(165%);",
                 shell_radius, snapshot.palette.shell, snapshot.palette.gradient
             ),
+            onmouseup: move |_| {
+                if !state.read().drag_paths.is_empty() {
+                    queue_drop_current_drag_target(state);
+                    state.with_mut(|shell| shell.clear_drag_state());
+                }
+            },
             oncontextmenu: |evt| {
                 evt.prevent_default();
                 evt.stop_propagation();
