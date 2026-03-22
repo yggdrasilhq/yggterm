@@ -115,9 +115,9 @@ struct ShellState {
     generated_precis: BTreeMap<String, String>,
     precis_requests_in_flight: HashSet<String>,
     drag_paths: Vec<String>,
-    drag_hover_target: Option<String>,
+    drag_hover_target: Option<DragDropTarget>,
     optimistic_drag_paths: Vec<String>,
-    optimistic_drag_target: Option<String>,
+    optimistic_drag_target: Option<DragDropTarget>,
     drag_pointer: Option<(f64, f64)>,
     pending_delete: Option<PendingDeleteDialog>,
     tree_rename_path: Option<String>,
@@ -213,9 +213,9 @@ struct RenderSnapshot {
     last_tree_debug: String,
     active_precis: Option<String>,
     drag_paths: Vec<String>,
-    drag_hover_target: Option<String>,
+    drag_hover_target: Option<DragDropTarget>,
     optimistic_drag_paths: Vec<String>,
-    optimistic_drag_target: Option<String>,
+    optimistic_drag_target: Option<DragDropTarget>,
     drag_pointer: Option<(f64, f64)>,
     pending_delete: Option<PendingDeleteDialog>,
     tree_rename_path: Option<String>,
@@ -227,6 +227,26 @@ enum TreeSelectionMode {
     Replace,
     ExtendRange,
     Toggle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DragDropPlacement {
+    Before,
+    Into,
+    After,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct DragDropTarget {
+    path: String,
+    placement: DragDropPlacement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkspaceDropPlacement {
+    TopOfGroup(String),
+    AfterPath(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -912,18 +932,20 @@ impl ShellState {
 
     fn set_drag_hover_target(&mut self, row: &BrowserRow, pointer: (f64, f64)) {
         self.drag_pointer = Some(pointer);
+        let rows = merged_sidebar_rows(self.browser.rows(), &self.server.live_sessions());
         self.drag_hover_target =
-            valid_drop_target(self.drag_paths.as_slice(), row).then(|| row.full_path.clone());
+            resolve_drag_drop_target(&rows, self.drag_paths.as_slice(), row, pointer.1);
         self.optimistic_drag_target = self.drag_hover_target.clone();
         if cfg!(debug_assertions)
-            && let Some(target) = self.drag_hover_target.as_deref()
+            && let Some(target) = self.drag_hover_target.as_ref()
         {
-            info!(target=%target, drag_count=%self.drag_paths.len(), "tree drag hover");
+            info!(target=%target.path, placement=?target.placement, drag_count=%self.drag_paths.len(), "tree drag hover");
         }
         self.record_ui_telemetry(
             "tree_drag_hover",
             json!({
-                "target": self.drag_hover_target,
+                "target": self.drag_hover_target.as_ref().map(|target| target.path.clone()),
+                "placement": self.drag_hover_target.as_ref().map(|target| format!("{:?}", target.placement).to_ascii_lowercase()),
                 "drag_paths": self.drag_paths,
             }),
         );
@@ -1002,7 +1024,8 @@ impl ShellState {
             self.drag_paths.len(),
             join_debug_paths(self.drag_paths.clone()),
             self.drag_hover_target
-                .clone()
+                .as_ref()
+                .map(|target| format!("{}:{:?}", target.path, target.placement))
                 .unwrap_or_else(|| "none".to_string()),
             self.pending_delete
                 .as_ref()
@@ -2297,12 +2320,11 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
     });
 }
 
-fn queue_move_selected_items_to_group(mut state: Signal<ShellState>, target_row: BrowserRow) {
-    if !valid_drop_target(&state.read().drag_paths, &target_row)
-        && !is_drop_target_row(&target_row)
-    {
-        return;
-    }
+fn queue_move_selected_items_to_group(
+    mut state: Signal<ShellState>,
+    placement: WorkspaceDropPlacement,
+    target_label: String,
+) {
     let selected_rows = state.read().selected_workspace_rows();
     if selected_rows.is_empty() {
         return;
@@ -2313,7 +2335,7 @@ fn queue_move_selected_items_to_group(mut state: Signal<ShellState>, target_row:
         shell.last_action = format!(
             "moving {} item(s) to {}",
             selected_rows.len(),
-            target_row.label
+            target_label
         );
         shell.close_context_menu();
         shell.drag_hover_target = None;
@@ -2321,20 +2343,20 @@ fn queue_move_selected_items_to_group(mut state: Signal<ShellState>, target_row:
             .iter()
             .map(|row| row.full_path.clone())
             .collect();
-        shell.optimistic_drag_target = Some(target_row.full_path.clone());
+        shell.optimistic_drag_target = None;
     });
 
     let settings = state.read().settings.clone();
     spawn(async move {
         let selected_for_task = selected_rows.clone();
-        let target_for_task = target_row.clone();
+        let placement_for_task = placement.clone();
         let outcome = task::spawn_blocking(
             move || -> Result<(Vec<String>, yggterm_core::SessionNode)> {
                 let store = SessionStore::open_or_init()?;
                 let mut moved_paths = Vec::new();
                 for (ix, row) in selected_for_task.iter().enumerate() {
                     let destination =
-                        moved_workspace_item_virtual_path_with_index(row, &target_for_task, ix);
+                        moved_workspace_item_virtual_path_with_index(row, &placement_for_task, ix);
                     match row.kind {
                         BrowserRowKind::Document => {
                             let document = store.move_document(&row.full_path, &destination)?;
@@ -2371,7 +2393,7 @@ fn queue_move_selected_items_to_group(mut state: Signal<ShellState>, target_row:
                 shell.last_action = format!(
                     "moved {} item(s) to {}",
                     moved_paths.len(),
-                    target_row.label
+                    target_label
                 );
                 shell.push_notification(
                     NotificationTone::Success,
@@ -2379,7 +2401,7 @@ fn queue_move_selected_items_to_group(mut state: Signal<ShellState>, target_row:
                     format!(
                         "Moved {} item(s) near {}.",
                         moved_paths.len(),
-                        target_row.label
+                        target_label
                     ),
                 );
             }
@@ -2408,18 +2430,26 @@ fn queue_move_selected_items_to_group(mut state: Signal<ShellState>, target_row:
 }
 
 fn queue_drop_current_drag_target(state: Signal<ShellState>) {
-    let target_row = {
+    let (placement, target_label) = {
         let shell = state.read();
-        let Some(target_path) = shell.drag_hover_target.clone() else {
+        let Some(target) = shell.drag_hover_target.clone() else {
             return;
         };
         let rows = merged_sidebar_rows(shell.browser.rows(), &shell.server.live_sessions());
-        let Some(row) = rows.into_iter().find(|row| row.full_path == target_path) else {
+        let Some(row) = rows.iter().find(|row| row.full_path == target.path).cloned() else {
             return;
         };
-        row
+        let Some(placement) = resolve_workspace_drop_placement(&rows, &target) else {
+            return;
+        };
+        let target_label = match target.placement {
+            DragDropPlacement::Into => format!("inside {}", row.label),
+            DragDropPlacement::Before => format!("before {}", row.label),
+            DragDropPlacement::After => format!("after {}", row.label),
+        };
+        (placement, target_label)
     };
-    queue_move_selected_items_to_group(state, target_row);
+    queue_move_selected_items_to_group(state, placement, target_label);
 }
 
 fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool) {
@@ -2858,39 +2888,131 @@ fn canonical_workspace_leaf_name(path: &str) -> String {
 
 fn moved_workspace_item_virtual_path_with_index(
     item_row: &BrowserRow,
-    target_row: &BrowserRow,
+    placement: &WorkspaceDropPlacement,
     index: usize,
 ) -> String {
     let leaf = canonical_workspace_leaf_name(&item_row.full_path);
     let indexed_leaf = format!("{index:04}-{leaf}");
-    match target_row.kind {
-        BrowserRowKind::Group if is_drop_target_row(target_row) => format!(
-            "{}/!{}",
-            target_row.full_path.trim_end_matches('/'),
-            indexed_leaf
-        ),
+    match placement {
+        WorkspaceDropPlacement::TopOfGroup(group_path) => {
+            join_workspace_child_path(group_path, &format!("!{indexed_leaf}"))
+        }
+        WorkspaceDropPlacement::AfterPath(anchor_path) => {
+            let base = workspace_parent_path(anchor_path).unwrap_or_else(|| "/workspace".to_string());
+            let anchor = canonical_workspace_leaf_name(anchor_path);
+            join_workspace_child_path(&base, &format!("{anchor}~{indexed_leaf}"))
+        }
+    }
+}
+
+fn join_workspace_child_path(base: &str, leaf: &str) -> String {
+    let trimmed = base.trim_end_matches('/');
+    if trimmed.is_empty() || trimmed == "/" {
+        format!("/{leaf}")
+    } else {
+        format!("{trimmed}/{leaf}")
+    }
+}
+
+fn workspace_parent_path(path: &str) -> Option<String> {
+    let normalized = path.trim_end_matches('/');
+    if normalized.is_empty() || normalized == "/" {
+        return None;
+    }
+    let parent = normalized.rsplit_once('/')?.0;
+    if parent.is_empty() {
+        Some("/".to_string())
+    } else {
+        Some(parent.to_string())
+    }
+}
+
+fn direct_workspace_parent_path(row: &BrowserRow) -> Option<String> {
+    match row.kind {
+        BrowserRowKind::Group | BrowserRowKind::Document | BrowserRowKind::Separator => {
+            workspace_parent_path(&row.full_path)
+        }
+        BrowserRowKind::Session => row.session_cwd.as_deref().and_then(workspace_parent_path),
+    }
+}
+
+fn resolve_drag_drop_target(
+    rows: &[BrowserRow],
+    drag_paths: &[String],
+    row: &BrowserRow,
+    pointer_y: f64,
+) -> Option<DragDropTarget> {
+    if !valid_drop_target(drag_paths, row) {
+        return None;
+    }
+    let placement = match row.kind {
+        BrowserRowKind::Group if row.group_kind != Some(WorkspaceGroupKind::Separator) => {
+            if pointer_y < 12.0 {
+                DragDropPlacement::Before
+            } else if pointer_y > 30.0 {
+                DragDropPlacement::After
+            } else {
+                DragDropPlacement::Into
+            }
+        }
         BrowserRowKind::Document | BrowserRowKind::Separator => {
-            let base = document_parent_base(target_row).unwrap_or_else(|| "/workspace".to_string());
-            let anchor = canonical_workspace_leaf_name(&target_row.full_path);
-            format!(
-                "{}/{}~{}",
-                base.trim_end_matches('/'),
-                anchor,
-                indexed_leaf
-            )
+            if pointer_y < 16.0 {
+                DragDropPlacement::Before
+            } else {
+                DragDropPlacement::After
+            }
         }
-        BrowserRowKind::Group => format!(
-            "{}/!{}",
-            target_row.full_path.trim_end_matches('/'),
-            indexed_leaf
-        ),
-        BrowserRowKind::Session => {
-            let base = target_row
-                .session_cwd
-                .clone()
-                .unwrap_or_else(|| "/workspace".to_string());
-            format!("{}/!{}", base.trim_end_matches('/'), indexed_leaf)
+        BrowserRowKind::Session | BrowserRowKind::Group => DragDropPlacement::After,
+    };
+    let target = DragDropTarget {
+        path: row.full_path.clone(),
+        placement,
+    };
+    resolve_workspace_drop_placement(rows, &target).map(|_| target)
+}
+
+fn resolve_workspace_drop_placement(
+    rows: &[BrowserRow],
+    target: &DragDropTarget,
+) -> Option<WorkspaceDropPlacement> {
+    let target_index = rows.iter().position(|row| row.full_path == target.path)?;
+    let target_row = rows.get(target_index)?;
+    match target.placement {
+        DragDropPlacement::Into => match target_row.kind {
+            BrowserRowKind::Group if is_drop_target_row(target_row) => {
+                Some(WorkspaceDropPlacement::TopOfGroup(target_row.full_path.clone()))
+            }
+            BrowserRowKind::Document | BrowserRowKind::Separator => {
+                Some(WorkspaceDropPlacement::AfterPath(target_row.full_path.clone()))
+            }
+            _ => None,
+        },
+        DragDropPlacement::After => Some(WorkspaceDropPlacement::AfterPath(target_row.full_path.clone())),
+        DragDropPlacement::Before => {
+            let parent = direct_workspace_parent_path(target_row)?;
+            let previous_sibling = rows[..target_index].iter().rev().find(|candidate| {
+                is_workspace_row(candidate)
+                    && candidate.depth == target_row.depth
+                    && direct_workspace_parent_path(candidate).as_deref() == Some(parent.as_str())
+            });
+            if let Some(previous) = previous_sibling {
+                Some(WorkspaceDropPlacement::AfterPath(previous.full_path.clone()))
+            } else {
+                Some(WorkspaceDropPlacement::TopOfGroup(parent))
+            }
         }
+    }
+}
+
+fn context_menu_drop_placement(row: &BrowserRow) -> Option<WorkspaceDropPlacement> {
+    match row.kind {
+        BrowserRowKind::Group if is_drop_target_row(row) => {
+            Some(WorkspaceDropPlacement::TopOfGroup(row.full_path.clone()))
+        }
+        BrowserRowKind::Document | BrowserRowKind::Separator => {
+            Some(WorkspaceDropPlacement::AfterPath(row.full_path.clone()))
+        }
+        BrowserRowKind::Group | BrowserRowKind::Session => None,
     }
 }
 
@@ -3694,7 +3816,15 @@ fn app() -> Element {
                         },
                         on_move_selected_document_here: {
                             let row = context_row.clone();
-                            move |_| queue_move_selected_items_to_group(state, row.clone())
+                            move |_| {
+                                if let Some(placement) = context_menu_drop_placement(&row) {
+                                    queue_move_selected_items_to_group(
+                                        state,
+                                        placement,
+                                        format!("near {}", row.label),
+                                    );
+                                }
+                            }
                         },
                         on_create_note: {
                             let row = row.clone();
@@ -4286,7 +4416,10 @@ fn Sidebar(
                                         snapshot.selected_tree_paths.is_empty()
                                             && snapshot.selected_path.as_deref() == Some(row.full_path.as_str())
                                     ),
-                                drop_hovered: snapshot.drag_hover_target.as_deref() == Some(row.full_path.as_str()),
+                                drop_hovered: snapshot
+                                    .drag_hover_target
+                                    .as_ref()
+                                    .is_some_and(|target| target.path == row.full_path),
                                 dragging: snapshot.drag_paths.iter().any(|path| path == &row.full_path),
                                 drag_active: !snapshot.drag_paths.is_empty(),
                                 renaming: snapshot.tree_rename_path.as_deref() == Some(row.full_path.as_str()),
@@ -4640,6 +4773,15 @@ fn DragGhost(snapshot: RenderSnapshot) -> Element {
         .map(|row| row.label.clone())
         .unwrap_or_else(|| "Move item".to_string());
     let extra_count = dragged_rows.len().saturating_sub(1);
+    let drop_target_hint = snapshot.drag_hover_target.as_ref().map(|target| {
+        let placement = match target.placement {
+            DragDropPlacement::Before => "before",
+            DragDropPlacement::Into => "inside",
+            DragDropPlacement::After => "after",
+        };
+        let leaf = workspace_leaf_name(&target.path).unwrap_or_else(|| "item".to_string());
+        format!("Drop {placement} {leaf}")
+    });
     rsx! {
         div {
             style: format!(
@@ -4674,13 +4816,13 @@ fn DragGhost(snapshot: RenderSnapshot) -> Element {
                     }
                 }
             }
-            if let Some(target) = snapshot.drag_hover_target.as_ref() {
+            if let Some(target_hint) = drop_target_hint {
                 div {
                     style: format!(
                         "font-size:10.5px; font-weight:700; letter-spacing:0.01em; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
                         snapshot.palette.muted
                     ),
-                    "Drop near {workspace_leaf_name(target).unwrap_or_else(|| \"item\".to_string())}"
+                    "{target_hint}"
                 }
             }
         }
@@ -6306,7 +6448,8 @@ fn SettingsRailBody(
                             label: "Drag Target",
                             value: snapshot
                                 .drag_hover_target
-                                .clone()
+                                .as_ref()
+                                .map(|target| format!("{}:{:?}", target.path, target.placement))
                                 .unwrap_or_else(|| "none".to_string()),
                         },
                         SessionMetadataEntry {
@@ -7450,10 +7593,70 @@ mod tests {
             session_id: Some("paper-a-id".to_string()),
             session_cwd: Some("/home/pi/gh/notes".to_string()),
         };
-        let target = BrowserRow {
+        let destination = moved_workspace_item_virtual_path_with_index(
+            &item,
+            &WorkspaceDropPlacement::AfterPath("/home/pi/gh/notes/paper-b".to_string()),
+            0,
+        );
+
+        assert_eq!(destination, "/home/pi/gh/notes/paper-b~0000-paper-a");
+    }
+
+    #[test]
+    fn before_target_resolves_after_previous_sibling() {
+        let rows = vec![
+            BrowserRow {
+                kind: BrowserRowKind::Document,
+                full_path: "/home/pi/gh/notes/paper-a".to_string(),
+                label: "paper-a".to_string(),
+                detail_label: String::new(),
+                document_kind: Some(WorkspaceDocumentKind::Note),
+                group_kind: None,
+                session_title: None,
+                depth: 3,
+                host_label: String::new(),
+                descendant_sessions: 0,
+                expanded: false,
+                session_id: Some("paper-a-id".to_string()),
+                session_cwd: Some("/home/pi/gh/notes".to_string()),
+            },
+            BrowserRow {
+                kind: BrowserRowKind::Document,
+                full_path: "/home/pi/gh/notes/paper-b".to_string(),
+                label: "paper-b".to_string(),
+                detail_label: String::new(),
+                document_kind: Some(WorkspaceDocumentKind::Note),
+                group_kind: None,
+                session_title: None,
+                depth: 3,
+                host_label: String::new(),
+                descendant_sessions: 0,
+                expanded: false,
+                session_id: Some("paper-b-id".to_string()),
+                session_cwd: Some("/home/pi/gh/notes".to_string()),
+            },
+        ];
+        let placement = resolve_workspace_drop_placement(
+            &rows,
+            &DragDropTarget {
+                path: "/home/pi/gh/notes/paper-b".to_string(),
+                placement: DragDropPlacement::Before,
+            },
+        );
+        assert_eq!(
+            placement,
+            Some(WorkspaceDropPlacement::AfterPath(
+                "/home/pi/gh/notes/paper-a".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn before_first_target_resolves_to_top_of_parent() {
+        let rows = vec![BrowserRow {
             kind: BrowserRowKind::Document,
-            full_path: "/home/pi/gh/notes/paper-b".to_string(),
-            label: "paper-b".to_string(),
+            full_path: "/home/pi/gh/notes/paper-a".to_string(),
+            label: "paper-a".to_string(),
             detail_label: String::new(),
             document_kind: Some(WorkspaceDocumentKind::Note),
             group_kind: None,
@@ -7462,13 +7665,22 @@ mod tests {
             host_label: String::new(),
             descendant_sessions: 0,
             expanded: false,
-            session_id: Some("paper-b-id".to_string()),
+            session_id: Some("paper-a-id".to_string()),
             session_cwd: Some("/home/pi/gh/notes".to_string()),
-        };
-
-        let destination = moved_workspace_item_virtual_path_with_index(&item, &target, 0);
-
-        assert_eq!(destination, "/home/pi/gh/notes/paper-b~0000-paper-a");
+        }];
+        let placement = resolve_workspace_drop_placement(
+            &rows,
+            &DragDropTarget {
+                path: "/home/pi/gh/notes/paper-a".to_string(),
+                placement: DragDropPlacement::Before,
+            },
+        );
+        assert_eq!(
+            placement,
+            Some(WorkspaceDropPlacement::TopOfGroup(
+                "/home/pi/gh/notes".to_string()
+            ))
+        );
     }
 
     #[test]
