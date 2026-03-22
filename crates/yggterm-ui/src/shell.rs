@@ -2594,14 +2594,14 @@ fn new_group_virtual_path_for_row(row: &BrowserRow) -> String {
         BrowserRowKind::Group if row.full_path.starts_with("__live_") => "/workspace".to_string(),
         BrowserRowKind::Group => row.full_path.clone(),
         BrowserRowKind::Separator => {
-            parent_virtual_path(&row.full_path).unwrap_or_else(|| "/workspace".to_string())
+            document_parent_base(row).unwrap_or_else(|| "/workspace".to_string())
         }
         BrowserRowKind::Session => row
             .session_cwd
             .clone()
             .unwrap_or_else(|| "/workspace".to_string()),
         BrowserRowKind::Document => {
-            parent_virtual_path(&row.full_path).unwrap_or_else(|| "/workspace".to_string())
+            document_parent_base(row).unwrap_or_else(|| "/workspace".to_string())
         }
     };
     format!(
@@ -2617,14 +2617,14 @@ fn new_separator_virtual_path_for_row(row: &BrowserRow) -> String {
         BrowserRowKind::Group if row.full_path.starts_with("__live_") => "/workspace".to_string(),
         BrowserRowKind::Group => row.full_path.clone(),
         BrowserRowKind::Separator => {
-            parent_virtual_path(&row.full_path).unwrap_or_else(|| "/workspace".to_string())
+            document_parent_base(row).unwrap_or_else(|| "/workspace".to_string())
         }
         BrowserRowKind::Session => row
             .session_cwd
             .clone()
             .unwrap_or_else(|| "/workspace".to_string()),
         BrowserRowKind::Document => {
-            parent_virtual_path(&row.full_path).unwrap_or_else(|| "/workspace".to_string())
+            document_parent_base(row).unwrap_or_else(|| "/workspace".to_string())
         }
     };
     format!(
@@ -2710,10 +2710,21 @@ fn group_session_title_hint(row: &BrowserRow, kind: SessionKind) -> String {
 }
 
 fn document_parent_base(row: &BrowserRow) -> Option<String> {
+    let normalize_legacy_notes_parent = |path: String| {
+        if path.ends_with("/notes") {
+            parent_virtual_path(&path).unwrap_or(path)
+        } else {
+            path
+        }
+    };
     match row.kind {
         BrowserRowKind::Session => row.session_cwd.clone(),
-        BrowserRowKind::Document => parent_virtual_path(&row.full_path),
-        BrowserRowKind::Separator => parent_virtual_path(&row.full_path),
+        BrowserRowKind::Document => {
+            parent_virtual_path(&row.full_path).map(normalize_legacy_notes_parent)
+        }
+        BrowserRowKind::Separator => {
+            parent_virtual_path(&row.full_path).map(normalize_legacy_notes_parent)
+        }
         BrowserRowKind::Group => {
             if row.full_path.starts_with("__live_") {
                 Some("/documents".to_string())
@@ -3988,9 +3999,9 @@ fn SidebarRow(
     let draggable = is_workspace_row(&row);
     if row.kind == BrowserRowKind::Separator {
         return rsx! {
-            button {
+            div {
                 style: format!(
-                    "width:100%; display:flex; align-items:center; gap:10px; border:none; background:transparent; \
+                    "width:100%; display:flex; align-items:center; gap:10px; border:none; background:transparent; cursor:default; \
                      padding:8px 9px 8px {}px; margin:4px 0; opacity:{}; border-radius:12px; background:{};",
                     indent
                     , if dragging { "0.58" } else { "1" },
@@ -4098,10 +4109,10 @@ fn SidebarRow(
     };
 
     rsx! {
-        button {
+        div {
             style: format!(
                 "width:100%; display:flex; flex-direction:column; align-items:stretch; gap:2px; \
-                 border:none; border-radius:12px; background:{}; padding:6px 9px 6px {}px; margin-bottom:2px; opacity:{};",
+                 border:none; border-radius:12px; background:{}; padding:6px 9px 6px {}px; margin-bottom:2px; opacity:{}; cursor:default;",
                 background, indent, if dragging { "0.58" } else { "1" }
             ),
             draggable: draggable,
@@ -6729,14 +6740,14 @@ fn context_menu_action_style_destructive(_palette: Palette) -> String {
 
 fn cancel_confirm_button_style(_palette: Palette) -> String {
     "height:34px; padding:0 16px; border:none; border-radius:12px; background:#5fa8ff; color:#ffffff; \
-     font-size:12px; font-weight:700;"
+     font-size:13px; font-weight:500;"
         .to_string()
 }
 
 fn delete_confirm_button_style(_palette: Palette, hard_delete: bool) -> String {
     format!(
         "height:34px; padding:0 16px; border:none; border-radius:12px; background:{}; color:#ffffff; \
-         font-size:12px; font-weight:700;",
+         font-size:13px; font-weight:500;",
         if hard_delete { "#b3263f" } else { "#c23f4d" }
     )
 }
