@@ -34,6 +34,8 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 
 ## Design philosophy
 
+- `DESIGN.md` at the repository root is the source of truth for UI language, interaction taste, visual polish, naming, and reusable styling preferences. Consult it before making UI wording or styling changes.
+- When durable design preferences emerge during collaboration, update `DESIGN.md` instead of leaving them implicit in chat history.
 - Upstream-first integration: prefer proven layout patterns from `../zed` and a thin adapter boundary around terminal/runtime dependencies instead of reimplementing behavior blindly.
 - Minimize forks: keep Yggterm-specific code as adapter layers around upstream crates/APIs so upstream pulls stay low-friction.
 - Keep Yggterm-owned shell chrome and session UI in local crates so the desktop frontend stays maintainable and Apache-licensed.
@@ -56,6 +58,7 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 - When adding code, include clear ownership boundaries between Rust app logic, PTY runtime, and any optional Ghostty FFI.
 - Prefer incremental, testable changes.
 - Document integration assumptions in `README.md` or module-level docs.
+- Treat `DESIGN.md` as reusable brand/design memory for this and future projects. Styling and naming rules should be captured there, not reinvented repeatedly.
 - The active shell is Dioxus-based. Keep steering it toward a polished Zed-shaped terminal workspace rather than rebuilding parallel frontend experiments.
 - Development and release workflow is server-first: builds happen in this server environment and release artifacts are pulled from `dist/` to a laptop for runtime testing.
 - The primary install channel is a direct GitHub-release installer with self-update on launch for direct installs; package-managed installs must stay notify-only.
