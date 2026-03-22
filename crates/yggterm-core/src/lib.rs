@@ -986,20 +986,13 @@ fn cmp_browser_child_node(left: &SessionNode, right: &SessionNode) -> std::cmp::
         .then_with(|| left.path.cmp(&right.path))
 }
 
-fn browser_child_sort_key(node: &SessionNode) -> (u8, String) {
-    let bucket = match (node.kind, node.group_kind) {
-        (SessionNodeKind::Group, Some(WorkspaceGroupKind::Separator)) => 1,
-        (SessionNodeKind::Document, _) => 1,
-        (SessionNodeKind::Group, _) => 0,
-        (SessionNodeKind::CodexSession, _) => 1,
-    };
-    let title = node
+fn browser_child_sort_key(node: &SessionNode) -> String {
+    node
         .path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(&node.name)
-        .to_ascii_lowercase();
-    (bucket, title)
+        .to_ascii_lowercase()
 }
 
 fn short_session_id(session_id: &str) -> String {
@@ -1019,14 +1012,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn browser_child_sort_places_separators_after_regular_children() {
+    fn browser_child_sort_respects_raw_virtual_path_order() {
         let folder = SessionNode {
             kind: SessionNodeKind::Group,
             name: "notes".to_string(),
             title: Some("Notes".to_string()),
             document_kind: None,
             group_kind: Some(WorkspaceGroupKind::Folder),
-            path: PathBuf::from("/workspace/notes"),
+            path: PathBuf::from("/workspace/notes~0001"),
             children: Vec::new(),
             session_id: None,
             cwd: None,
@@ -1037,7 +1030,7 @@ mod tests {
             title: Some("Paper".to_string()),
             document_kind: Some(WorkspaceDocumentKind::Note),
             group_kind: None,
-            path: PathBuf::from("/workspace/paper"),
+            path: PathBuf::from("/workspace/notes~0000-paper"),
             children: Vec::new(),
             session_id: Some("paper-id".to_string()),
             cwd: Some("/workspace/paper".to_string()),
@@ -1048,7 +1041,7 @@ mod tests {
             title: Some("Separator".to_string()),
             document_kind: None,
             group_kind: Some(WorkspaceGroupKind::Separator),
-            path: PathBuf::from("/workspace/separator-1"),
+            path: PathBuf::from("/workspace/!separator-1"),
             children: Vec::new(),
             session_id: None,
             cwd: None,
@@ -1057,8 +1050,8 @@ mod tests {
         let mut nodes = vec![separator, document, folder];
         nodes.sort_by(cmp_browser_child_node);
 
-        assert_eq!(nodes[0].path, PathBuf::from("/workspace/notes"));
-        assert_eq!(nodes[1].path, PathBuf::from("/workspace/paper"));
-        assert_eq!(nodes[2].path, PathBuf::from("/workspace/separator-1"));
+        assert_eq!(nodes[0].path, PathBuf::from("/workspace/!separator-1"));
+        assert_eq!(nodes[1].path, PathBuf::from("/workspace/notes~0000-paper"));
+        assert_eq!(nodes[2].path, PathBuf::from("/workspace/notes~0001"));
     }
 }
