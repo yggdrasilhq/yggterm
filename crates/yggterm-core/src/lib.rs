@@ -277,6 +277,47 @@ impl SessionStore {
         let resolver = SessionTitleResolver::new(&self.home)?;
         resolver.generate_for_session(settings, &identity.session_id, &identity.cwd, &path, force)
     }
+
+    pub fn resolve_precis_for_session_path(&self, session_path: &str) -> Result<Option<String>> {
+        let path = PathBuf::from(session_path);
+        if !path.exists() || !is_codex_session_file(&path) {
+            return Ok(None);
+        }
+
+        let Some(identity) = read_codex_session_identity(&path)? else {
+            return Ok(None);
+        };
+        let resolver = SessionTitleResolver::new(&self.home)?;
+        resolver.resolve_precis_for_session(&identity.session_id)
+    }
+
+    pub fn generate_precis_for_session_path(
+        &self,
+        settings: &AppSettings,
+        session_path: &str,
+        force: bool,
+    ) -> Result<Option<String>> {
+        if !litellm_settings_ready(settings) {
+            return Ok(None);
+        }
+
+        let path = PathBuf::from(session_path);
+        if !path.exists() || !is_codex_session_file(&path) {
+            return Ok(None);
+        }
+
+        let Some(identity) = read_codex_session_identity(&path)? else {
+            return Ok(None);
+        };
+        let resolver = SessionTitleResolver::new(&self.home)?;
+        resolver.generate_precis_for_session(
+            settings,
+            &identity.session_id,
+            &identity.cwd,
+            &path,
+            force,
+        )
+    }
 }
 
 pub fn save_settings_file(path: &Path, settings: &AppSettings) -> Result<()> {
