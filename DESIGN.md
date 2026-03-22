@@ -366,17 +366,37 @@ Folder context menu defaults:
 
 ### Header behavior
 
-Terminal mode should have a header area above the terminal that can contain:
+Preview mode and terminal mode should share the same header system.
+
+That shared header may contain:
 
 - the session title
-- a short precis
+- a short generated precis or preview summary
 - a session mode selector when relevant
+- refresh affordances for generated title/precis/summary copy
 
-It should not contain:
+Generated UI copy is not static decoration. It should be treated as refreshable state because long-running sessions drift over time.
+
+The refresh affordance should:
+
+- be lightweight and inline, not a loud primary button
+- sit at the end of the title or secondary line it refreshes
+- use the same visual language in preview and terminal mode
+
+The header should not contain:
 
 - literal markdown markers like `#`
 - noisy fake status cards
 - gratuitous terminal framing
+
+### Preview surfaces
+
+Session preview should move toward the quality bar of Open WebUI:
+
+- a clean chat-like message stack for the main reading mode
+- a strong graph/overview mode for branch or flow understanding
+- one calm shared header above both modes
+- generated summary text that helps users re-enter a long conversation quickly
 
 ### Paper surfaces
 
