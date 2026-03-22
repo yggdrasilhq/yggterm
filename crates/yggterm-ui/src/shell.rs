@@ -930,11 +930,16 @@ impl ShellState {
         }
     }
 
-    fn set_drag_hover_target(&mut self, row: &BrowserRow, pointer: (f64, f64)) {
+    fn set_drag_hover_target(
+        &mut self,
+        row: &BrowserRow,
+        pointer: (f64, f64),
+        local_pointer_y: f64,
+    ) {
         self.drag_pointer = Some(pointer);
         let rows = merged_sidebar_rows(self.browser.rows(), &self.server.live_sessions());
         self.drag_hover_target =
-            resolve_drag_drop_target(&rows, self.drag_paths.as_slice(), row, pointer.1);
+            resolve_drag_drop_target(&rows, self.drag_paths.as_slice(), row, local_pointer_y);
         self.optimistic_drag_target = self.drag_hover_target.clone();
         if cfg!(debug_assertions)
             && let Some(target) = self.drag_hover_target.as_ref()
@@ -3680,8 +3685,8 @@ fn app() -> Element {
                         on_start_drag: move |(row, pointer): (BrowserRow, (f64, f64))| {
                             state.with_mut(|shell| shell.begin_drag(&row, pointer))
                         },
-                        on_drag_hover: move |(row, pointer): (BrowserRow, (f64, f64))| {
-                            state.with_mut(|shell| shell.set_drag_hover_target(&row, pointer))
+                        on_drag_hover: move |(row, pointer, local_y): (BrowserRow, (f64, f64), f64)| {
+                            state.with_mut(|shell| shell.set_drag_hover_target(&row, pointer, local_y))
                         },
                         on_drag_move: move |pointer: (f64, f64)| {
                             state.with_mut(|shell| shell.update_drag_pointer(pointer))
@@ -4332,7 +4337,7 @@ fn Sidebar(
     on_delete_selected_items: EventHandler<bool>,
     on_open_context_menu: EventHandler<(BrowserRow, (f64, f64))>,
     on_start_drag: EventHandler<(BrowserRow, (f64, f64))>,
-    on_drag_hover: EventHandler<(BrowserRow, (f64, f64))>,
+    on_drag_hover: EventHandler<(BrowserRow, (f64, f64), f64)>,
     on_drag_move: EventHandler<(f64, f64)>,
     on_drag_leave: EventHandler<BrowserRow>,
     on_drop_into_row: EventHandler<()>,
@@ -4459,7 +4464,8 @@ fn Sidebar(
                                     let row = row.clone();
                                     move |evt: MouseEvent| {
                                         let coords = evt.client_coordinates();
-                                        on_drag_hover.call((row.clone(), (coords.x, coords.y)))
+                                        let local = evt.element_coordinates();
+                                        on_drag_hover.call((row.clone(), (coords.x, coords.y), local.y))
                                     }
                                 },
                                 on_drag_leave: {
