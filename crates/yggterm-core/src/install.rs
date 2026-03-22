@@ -201,7 +201,9 @@ fn notify_only_context(
     }
 }
 
-fn find_direct_install_state(executable_path: &Path) -> Result<Option<(PathBuf, DirectInstallState)>> {
+fn find_direct_install_state(
+    executable_path: &Path,
+) -> Result<Option<(PathBuf, DirectInstallState)>> {
     for ancestor in executable_path.ancestors() {
         let path = ancestor.join(INSTALL_STATE_FILENAME);
         if !path.is_file() {
@@ -291,14 +293,25 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
     let mut notes = Vec::new();
     let data_dir = dirs::data_local_dir().context("unable to resolve local data dir")?;
     let applications_dir = data_dir.join("applications");
-    let icons_dir = data_dir.join("icons").join("hicolor").join("512x512").join("apps");
-    let scalable_icons_dir = data_dir.join("icons").join("hicolor").join("scalable").join("apps");
+    let icons_dir = data_dir
+        .join("icons")
+        .join("hicolor")
+        .join("512x512")
+        .join("apps");
+    let scalable_icons_dir = data_dir
+        .join("icons")
+        .join("hicolor")
+        .join("scalable")
+        .join("apps");
     fs::create_dir_all(&applications_dir)?;
     fs::create_dir_all(&icons_dir)?;
     fs::create_dir_all(&scalable_icons_dir)?;
 
     let icon_path = icons_dir.join("yggterm.png");
-    write_if_changed(&icon_path, include_bytes!("../../../assets/brand/yggterm-icon-512.png"))?;
+    write_if_changed(
+        &icon_path,
+        include_bytes!("../../../assets/brand/yggterm-icon-512.png"),
+    )?;
     let scalable_icon_path = scalable_icons_dir.join("yggterm.svg");
     write_if_changed(
         &scalable_icon_path,
@@ -327,7 +340,10 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
         fs::create_dir_all(&bin_dir)?;
         let shim = bin_dir.join("yggterm");
         create_or_replace_symlink(&context.executable_path, &shim)?;
-        notes.push(format!("desktop entry refreshed at {}", desktop_path.display()));
+        notes.push(format!(
+            "desktop entry refreshed at {}",
+            desktop_path.display()
+        ));
     }
 
     Ok(notes)
@@ -386,7 +402,13 @@ fn refresh_windows_integration(context: &InstallContext) -> Result<Vec<String>> 
          $sc.IconLocation = '{}'; \
          $sc.Save();",
         powershell_escape(shortcut_path.as_os_str().to_string_lossy().as_ref()),
-        powershell_escape(context.executable_path.as_os_str().to_string_lossy().as_ref()),
+        powershell_escape(
+            context
+                .executable_path
+                .as_os_str()
+                .to_string_lossy()
+                .as_ref()
+        ),
         powershell_escape(
             context
                 .executable_path
@@ -396,7 +418,13 @@ fn refresh_windows_integration(context: &InstallContext) -> Result<Vec<String>> 
                 .to_string_lossy()
                 .as_ref()
         ),
-        powershell_escape(context.executable_path.as_os_str().to_string_lossy().as_ref()),
+        powershell_escape(
+            context
+                .executable_path
+                .as_os_str()
+                .to_string_lossy()
+                .as_ref()
+        ),
     );
     let status = std::process::Command::new("powershell")
         .arg("-NoProfile")
@@ -409,7 +437,10 @@ fn refresh_windows_integration(context: &InstallContext) -> Result<Vec<String>> 
     if !status.success() {
         anyhow::bail!("failed to create Windows shortcut");
     }
-    notes.push(format!("Start Menu shortcut refreshed at {}", shortcut_path.display()));
+    notes.push(format!(
+        "Start Menu shortcut refreshed at {}",
+        shortcut_path.display()
+    ));
     Ok(notes)
 }
 
@@ -570,12 +601,19 @@ fn verify_archive_checksum(archive: &[u8], checksum_url: &str) -> Result<()> {
     Ok(())
 }
 
-fn extract_binary_from_archive(archive_bytes: &[u8], entry_name: &str, out_path: &Path) -> Result<()> {
+fn extract_binary_from_archive(
+    archive_bytes: &[u8],
+    entry_name: &str,
+    out_path: &Path,
+) -> Result<()> {
     let cursor = Cursor::new(archive_bytes);
     let decoder = flate2::read::GzDecoder::new(cursor);
     let mut archive = tar::Archive::new(decoder);
     let mut found = false;
-    for entry in archive.entries().context("failed to iterate release archive")? {
+    for entry in archive
+        .entries()
+        .context("failed to iterate release archive")?
+    {
         let mut entry = entry.context("failed to read release archive entry")?;
         let path = entry.path().context("failed to read archive entry path")?;
         if path.as_ref() == Path::new(entry_name) {
@@ -646,8 +684,13 @@ fn create_or_replace_symlink(target: &Path, link: &Path) -> Result<()> {
         return Ok(());
     }
     let _ = fs::remove_file(link);
-    symlink(target, link)
-        .with_context(|| format!("failed to create symlink {} -> {}", link.display(), target.display()))?;
+    symlink(target, link).with_context(|| {
+        format!(
+            "failed to create symlink {} -> {}",
+            link.display(),
+            target.display()
+        )
+    })?;
     Ok(())
 }
 

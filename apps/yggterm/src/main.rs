@@ -66,16 +66,17 @@ fn main() -> Result<()> {
             match check_for_update(&install_context) {
                 Ok(Some(update)) => match install_release_update(&install_context, &update) {
                     Ok(next_exe) => {
-                        launch_install_context = detect_install_context(&next_exe).unwrap_or_else(|_| InstallContext {
-                            channel: install_context.channel,
-                            update_policy: install_context.update_policy,
-                            repo: install_context.repo.clone(),
-                            asset_label: install_context.asset_label.clone(),
-                            current_version: update.version.clone(),
-                            executable_path: next_exe.clone(),
-                            managed_root: install_context.managed_root.clone(),
-                            manager_hint: install_context.manager_hint.clone(),
-                        });
+                        launch_install_context =
+                            detect_install_context(&next_exe).unwrap_or_else(|_| InstallContext {
+                                channel: install_context.channel,
+                                update_policy: install_context.update_policy,
+                                repo: install_context.repo.clone(),
+                                asset_label: install_context.asset_label.clone(),
+                                current_version: update.version.clone(),
+                                executable_path: next_exe.clone(),
+                                managed_root: install_context.managed_root.clone(),
+                                manager_hint: install_context.manager_hint.clone(),
+                            });
                         pending_update_restart = Some(yggterm_ui::PendingUpdateRestart {
                             version: update.version,
                             executable: next_exe,
@@ -99,12 +100,21 @@ fn main() -> Result<()> {
     let prefer_ghostty_backend = settings.prefer_ghostty_backend;
     let endpoint = default_endpoint(store.home_dir());
     let host = detect_ghostty_host();
-    let daemon_connected = ping(&endpoint).is_ok();
-    let daemon_status = if daemon_connected {
+    let mut daemon_connected = ping(&endpoint).is_ok();
+    let mut daemon_status = if daemon_connected {
         status(&endpoint).ok()
     } else {
         None
     };
+    if daemon_status
+        .as_ref()
+        .map(|status| status.server_version.as_str() != env!("CARGO_PKG_VERSION"))
+        .unwrap_or(false)
+    {
+        let _ = shutdown(&endpoint);
+        daemon_connected = false;
+        daemon_status = None;
+    }
     if !daemon_connected {
         spawn_server_daemon()?;
     }

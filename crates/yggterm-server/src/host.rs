@@ -48,11 +48,7 @@ impl GhosttyHostKind {
 }
 
 impl GhosttyHostSupport {
-    pub fn shadow(
-        detail: String,
-        embedded_surface_supported: bool,
-        bridge_enabled: bool,
-    ) -> Self {
+    pub fn shadow(detail: String, embedded_surface_supported: bool, bridge_enabled: bool) -> Self {
         let kind = if cfg!(target_os = "macos") && embedded_surface_supported {
             GhosttyHostKind::MacosLibghostty
         } else if cfg!(target_os = "linux") {

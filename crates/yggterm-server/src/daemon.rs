@@ -17,7 +17,10 @@ pub const SERVER_PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub enum ServerEndpoint {
     #[cfg(unix)]
     UnixSocket(PathBuf),
-    Tcp { host: String, port: u16 },
+    Tcp {
+        host: String,
+        port: u16,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,7 +122,9 @@ pub enum ServerResponse {
     Ack {
         message: Option<String>,
     },
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 struct DaemonRuntime {
@@ -256,9 +261,11 @@ impl DaemonRuntime {
                 cwd,
                 title_hint,
             } => {
-                let key = self
-                    .server
-                    .start_local_session(session_kind, cwd.as_deref(), title_hint.as_deref());
+                let key = self.server.start_local_session(
+                    session_kind,
+                    cwd.as_deref(),
+                    title_hint.as_deref(),
+                );
                 self.persist()?;
                 self.snapshot_response(Some(format!("started {key}")))
             }
@@ -400,9 +407,19 @@ pub fn default_endpoint(home_dir: &Path) -> ServerEndpoint {
 #[cfg(not(unix))]
 fn versioned_tcp_port() -> u16 {
     let mut parts = SERVER_PROTOCOL_VERSION.split('.');
-    let major = parts.next().and_then(|value| value.parse::<u16>().ok()).unwrap_or(2);
-    let minor = parts.next().and_then(|value| value.parse::<u16>().ok()).unwrap_or(0);
-    let patch = parts.next().and_then(|value| value.parse::<u16>().ok()).unwrap_or(0).min(9);
+    let major = parts
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(2);
+    let minor = parts
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(0);
+    let patch = parts
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(0)
+        .min(9);
     58000 + major.saturating_mul(100) + minor.saturating_mul(10) + patch
 }
 
@@ -446,7 +463,10 @@ pub fn open_stored_session(
     )?)
 }
 
-pub fn connect_ssh(endpoint: &ServerEndpoint, target_ix: usize) -> Result<(ServerUiSnapshot, Option<String>)> {
+pub fn connect_ssh(
+    endpoint: &ServerEndpoint,
+    target_ix: usize,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
     expect_snapshot(send_request(
         endpoint,
         &ServerRequest::ConnectSsh { target_ix },
@@ -508,7 +528,10 @@ pub fn start_command_session(
     )?)
 }
 
-pub fn focus_live(endpoint: &ServerEndpoint, key: &str) -> Result<(ServerUiSnapshot, Option<String>)> {
+pub fn focus_live(
+    endpoint: &ServerEndpoint,
+    key: &str,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
     expect_snapshot(send_request(
         endpoint,
         &ServerRequest::FocusLive {
@@ -547,8 +570,13 @@ pub fn set_all_preview_blocks_folded(
     )?)
 }
 
-pub fn request_terminal_launch(endpoint: &ServerEndpoint) -> Result<(ServerUiSnapshot, Option<String>)> {
-    expect_snapshot(send_request(endpoint, &ServerRequest::RequestTerminalLaunch)?)
+pub fn request_terminal_launch(
+    endpoint: &ServerEndpoint,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
+    expect_snapshot(send_request(
+        endpoint,
+        &ServerRequest::RequestTerminalLaunch,
+    )?)
 }
 
 pub fn terminal_ensure(endpoint: &ServerEndpoint, path: &str) -> Result<Option<String>> {
@@ -604,11 +632,15 @@ pub fn terminal_resize(
     )?)
 }
 
-pub fn sync_external_window(endpoint: &ServerEndpoint) -> Result<(ServerUiSnapshot, Option<String>)> {
+pub fn sync_external_window(
+    endpoint: &ServerEndpoint,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
     expect_snapshot(send_request(endpoint, &ServerRequest::SyncExternalWindow)?)
 }
 
-pub fn raise_external_window(endpoint: &ServerEndpoint) -> Result<(ServerUiSnapshot, Option<String>)> {
+pub fn raise_external_window(
+    endpoint: &ServerEndpoint,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
     expect_snapshot(send_request(endpoint, &ServerRequest::RaiseExternalWindow)?)
 }
 
@@ -616,10 +648,7 @@ pub fn sync_theme(
     endpoint: &ServerEndpoint,
     theme: UiTheme,
 ) -> Result<(ServerUiSnapshot, Option<String>)> {
-    expect_snapshot(send_request(
-        endpoint,
-        &ServerRequest::SyncTheme { theme },
-    )?)
+    expect_snapshot(send_request(endpoint, &ServerRequest::SyncTheme { theme })?)
 }
 
 pub fn shutdown(endpoint: &ServerEndpoint) -> Result<Option<String>> {
@@ -634,7 +663,9 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
         if path.exists() {
             match fs::remove_file(path) {
                 Ok(()) => {}
-                Err(error) => warn!(path=%path.display(), error=%error, "failed to remove stale server socket"),
+                Err(error) => {
+                    warn!(path=%path.display(), error=%error, "failed to remove stale server socket")
+                }
             }
         }
         if let Some(parent) = path.parent() {
@@ -663,7 +694,10 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
     match endpoint {
         #[cfg(unix)]
         ServerEndpoint::UnixSocket(path) => {
-            bail!("unix sockets are unsupported on this platform: {}", path.display())
+            bail!(
+                "unix sockets are unsupported on this platform: {}",
+                path.display()
+            )
         }
         ServerEndpoint::Tcp { host, port } => {
             let listener = std::net::TcpListener::bind((host.as_str(), *port))
@@ -716,7 +750,9 @@ fn load_persisted_state(path: &Path) -> Result<Option<PersistedDaemonState>> {
 
 fn write_response<W: Write>(writer: &mut W, response: &ServerResponse) -> Result<()> {
     serde_json::to_writer(&mut *writer, response).context("serializing daemon response")?;
-    writer.write_all(b"\n").context("writing daemon response terminator")?;
+    writer
+        .write_all(b"\n")
+        .context("writing daemon response terminator")?;
     writer.flush().context("flushing daemon response")?;
     Ok(())
 }
@@ -724,7 +760,9 @@ fn write_response<W: Write>(writer: &mut W, response: &ServerResponse) -> Result
 fn read_request<R: std::io::Read>(reader: R) -> Result<ServerRequest> {
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
-    let bytes = reader.read_line(&mut line).context("reading daemon request")?;
+    let bytes = reader
+        .read_line(&mut line)
+        .context("reading daemon request")?;
     if bytes == 0 {
         bail!("daemon client closed connection before sending a request");
     }
@@ -773,7 +811,9 @@ fn send_request(endpoint: &ServerEndpoint, request: &ServerRequest) -> Result<Se
             stream.flush().context("flushing daemon request")?;
             let mut reader = BufReader::new(stream);
             let mut line = String::new();
-            reader.read_line(&mut line).context("reading daemon response")?;
+            reader
+                .read_line(&mut line)
+                .context("reading daemon response")?;
             serde_json::from_str(line.trim_end()).context("parsing daemon response")
         }
         ServerEndpoint::Tcp { host, port } => {
@@ -786,7 +826,9 @@ fn send_request(endpoint: &ServerEndpoint, request: &ServerRequest) -> Result<Se
             stream.flush().context("flushing daemon request")?;
             let mut reader = BufReader::new(stream);
             let mut line = String::new();
-            reader.read_line(&mut line).context("reading daemon response")?;
+            reader
+                .read_line(&mut line)
+                .context("reading daemon response")?;
             serde_json::from_str(line.trim_end()).context("parsing daemon response")
         }
     }
