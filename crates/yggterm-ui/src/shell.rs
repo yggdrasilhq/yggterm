@@ -1,5 +1,5 @@
 use crate::window_icon;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use dioxus::desktop::{
     Config, LogicalSize, WindowBuilder, WindowEvent as DesktopWindowEvent, use_window,
     use_wry_event_handler, window,
@@ -113,6 +113,8 @@ struct ShellState {
     drag_paths: Vec<String>,
     drag_hover_target: Option<String>,
     pending_delete: Option<PendingDeleteDialog>,
+    tree_rename_path: Option<String>,
+    tree_rename_value: String,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -206,6 +208,8 @@ struct RenderSnapshot {
     drag_paths: Vec<String>,
     drag_hover_target: Option<String>,
     pending_delete: Option<PendingDeleteDialog>,
+    tree_rename_path: Option<String>,
+    tree_rename_value: String,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -335,6 +339,8 @@ impl ShellState {
             drag_paths: Vec::new(),
             drag_hover_target: None,
             pending_delete: None,
+            tree_rename_path: None,
+            tree_rename_value: String::new(),
         };
         if let Some(path) = state.browser.selected_path().map(ToOwned::to_owned) {
             state.selected_tree_paths.insert(path.clone());
@@ -405,6 +411,8 @@ impl ShellState {
             drag_paths: self.drag_paths.clone(),
             drag_hover_target: self.drag_hover_target.clone(),
             pending_delete: self.pending_delete.clone(),
+            tree_rename_path: self.tree_rename_path.clone(),
+            tree_rename_value: self.tree_rename_value.clone(),
         }
     }
 
@@ -842,9 +850,31 @@ impl ShellState {
         self.refresh_tree_debug("cancel_delete_dialog");
     }
 
+    fn begin_tree_rename(&mut self, row: &BrowserRow) {
+        if !is_workspace_row(row) {
+            return;
+        }
+        self.select_tree_row(row, false);
+        self.tree_rename_path = Some(row.full_path.clone());
+        self.tree_rename_value = row.label.clone();
+        self.close_context_menu();
+        self.refresh_tree_debug("begin_tree_rename");
+    }
+
+    fn update_tree_rename_value(&mut self, value: String) {
+        self.tree_rename_value = value;
+        self.refresh_tree_debug("update_tree_rename");
+    }
+
+    fn cancel_tree_rename(&mut self) {
+        self.tree_rename_path = None;
+        self.tree_rename_value.clear();
+        self.refresh_tree_debug("cancel_tree_rename");
+    }
+
     fn refresh_tree_debug(&mut self, source: &str) {
         self.last_tree_debug = format!(
-            "{source} | selected={} [{}] | drag={} [{}] | hover={} | pending_delete={}",
+            "{source} | selected={} [{}] | drag={} [{}] | hover={} | pending_delete={} | rename={}",
             self.selected_tree_paths.len(),
             join_debug_paths(self.selected_tree_paths.iter().cloned().collect()),
             self.drag_paths.len(),
@@ -860,6 +890,9 @@ impl ShellState {
                     pending.group_paths.len(),
                     pending.hard_delete
                 ))
+                .unwrap_or_else(|| "none".to_string()),
+            self.tree_rename_path
+                .clone()
                 .unwrap_or_else(|| "none".to_string())
         );
     }
@@ -2020,6 +2053,97 @@ fn queue_new_separator_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
     });
 }
 
+fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: String) {
+    let trimmed = label.trim().to_string();
+    if trimmed.is_empty() {
+        state.with_mut(|shell| shell.cancel_tree_rename());
+        return;
+    }
+
+    state.with_mut(|shell| {
+        shell.server_busy = true;
+        shell.last_action = format!("renaming {}", row.label);
+    });
+
+    let settings = state.read().settings.clone();
+    spawn(async move {
+        let row_for_task = row.clone();
+        let trimmed_for_task = trimmed.clone();
+        let outcome = task::spawn_blocking(move || -> Result<SessionNode> {
+            let store = SessionStore::open_or_init()?;
+            match row_for_task.kind {
+                BrowserRowKind::Document => {
+                    let existing = store
+                        .load_document(&row_for_task.full_path)?
+                        .ok_or_else(|| anyhow!("paper not found: {}", row_for_task.full_path))?;
+                    store.save_document_input(
+                        &row_for_task.full_path,
+                        WorkspaceDocumentInput {
+                            title: Some(trimmed_for_task.clone()),
+                            kind: existing.kind,
+                            body: existing.body,
+                            source_session_path: existing.source_session_path,
+                            source_session_kind: existing.source_session_kind,
+                            source_session_cwd: existing.source_session_cwd,
+                            replay_commands: existing.replay_commands,
+                        },
+                    )?;
+                }
+                BrowserRowKind::Group | BrowserRowKind::Separator => {
+                    store.save_group_with_kind(
+                        &row_for_task.full_path,
+                        Some(&trimmed_for_task),
+                        row_for_task
+                            .group_kind
+                            .unwrap_or(WorkspaceGroupKind::Folder),
+                    )?;
+                }
+                BrowserRowKind::Session => {}
+            }
+            store.load_codex_tree(&settings)
+        })
+        .await;
+
+        state.with_mut(|shell| match outcome {
+            Ok(Ok(browser_tree)) => {
+                let expanded_paths = shell.browser.expanded_paths();
+                shell.browser = SessionBrowserState::new(browser_tree);
+                shell
+                    .browser
+                    .restore_ui_state(&expanded_paths, Some(&row.full_path));
+                shell.browser.select_path(row.full_path.clone());
+                shell.selected_tree_paths.clear();
+                shell.selected_tree_paths.insert(row.full_path.clone());
+                shell.selection_anchor = Some(row.full_path.clone());
+                shell.tree_rename_path = None;
+                shell.tree_rename_value.clear();
+                shell.sync_browser_settings();
+                shell.server_busy = false;
+                shell.last_action = format!("renamed {}", trimmed);
+                shell.refresh_tree_debug("commit_tree_rename");
+            }
+            Ok(Err(error)) => {
+                shell.server_busy = false;
+                shell.last_action = format!("rename failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "Rename Failed",
+                    error.to_string(),
+                );
+            }
+            Err(error) => {
+                shell.server_busy = false;
+                shell.last_action = format!("rename task failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "Rename Task Failed",
+                    error.to_string(),
+                );
+            }
+        });
+    });
+}
+
 fn queue_move_selected_items_to_group(mut state: Signal<ShellState>, target_group: BrowserRow) {
     if !valid_drop_target(&state.read().drag_paths, &target_group)
         && !is_drop_target_row(&target_group)
@@ -2447,21 +2571,21 @@ fn new_document_virtual_path(
     let base = selected_row
         .and_then(document_parent_base)
         .or_else(|| active_session.and_then(active_session_document_base))
-        .unwrap_or_else(|| "/documents".to_string());
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    format!("{}/notes/untitled-{}", base.trim_end_matches('/'), stamp)
+        .unwrap_or_else(|| "/papers".to_string());
+    format!(
+        "{}/paper-{}",
+        base.trim_end_matches('/'),
+        unique_workspace_leaf_suffix()
+    )
 }
 
 fn new_document_virtual_path_for_row(row: &BrowserRow) -> String {
-    let base = document_parent_base(row).unwrap_or_else(|| "/documents".to_string());
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    format!("{}/notes/untitled-{}", base.trim_end_matches('/'), stamp)
+    let base = document_parent_base(row).unwrap_or_else(|| "/papers".to_string());
+    format!(
+        "{}/paper-{}",
+        base.trim_end_matches('/'),
+        unique_workspace_leaf_suffix()
+    )
 }
 
 fn new_group_virtual_path_for_row(row: &BrowserRow) -> String {
@@ -2480,11 +2604,11 @@ fn new_group_virtual_path_for_row(row: &BrowserRow) -> String {
             parent_virtual_path(&row.full_path).unwrap_or_else(|| "/workspace".to_string())
         }
     };
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    format!("{}/folder-{}", base.trim_end_matches('/'), stamp)
+    format!(
+        "{}/folder-{}",
+        base.trim_end_matches('/'),
+        unique_workspace_leaf_suffix()
+    )
 }
 
 fn new_separator_virtual_path_for_row(row: &BrowserRow) -> String {
@@ -2503,11 +2627,18 @@ fn new_separator_virtual_path_for_row(row: &BrowserRow) -> String {
             parent_virtual_path(&row.full_path).unwrap_or_else(|| "/workspace".to_string())
         }
     };
-    let stamp = std::time::SystemTime::now()
+    format!(
+        "{}/separator-{}",
+        base.trim_end_matches('/'),
+        unique_workspace_leaf_suffix()
+    )
+}
+
+fn unique_workspace_leaf_suffix() -> String {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    format!("{}/separator-{}", base.trim_end_matches('/'), stamp)
+        .map(|duration| duration.as_nanos().to_string())
+        .unwrap_or_else(|_| "0".to_string())
 }
 
 fn moved_workspace_item_virtual_path(item_row: &BrowserRow, target_group: &BrowserRow) -> String {
@@ -3088,6 +3219,13 @@ fn app() -> Element {
                         }),
                         on_drop_into_row: move |row: BrowserRow| queue_move_selected_items_to_group(state, row),
                         on_end_drag: move |_| state.with_mut(|shell| shell.clear_drag_state()),
+                        on_begin_rename: move |row: BrowserRow| state.with_mut(|shell| shell.begin_tree_rename(&row)),
+                        on_update_rename: move |value: String| state.with_mut(|shell| shell.update_tree_rename_value(value)),
+                        on_commit_rename: move |row: BrowserRow| {
+                            let label = state.read().tree_rename_value.clone();
+                            queue_tree_rename(state, row, label);
+                        },
+                        on_cancel_rename: move |_| state.with_mut(|shell| shell.cancel_tree_rename()),
                     }
                     MainSurface {
                         snapshot: main_snapshot,
@@ -3714,6 +3852,10 @@ fn Sidebar(
     on_drag_leave: EventHandler<BrowserRow>,
     on_drop_into_row: EventHandler<BrowserRow>,
     on_end_drag: EventHandler<()>,
+    on_begin_rename: EventHandler<BrowserRow>,
+    on_update_rename: EventHandler<String>,
+    on_commit_rename: EventHandler<BrowserRow>,
+    on_cancel_rename: EventHandler<()>,
 ) -> Element {
     let width = if snapshot.sidebar_open {
         SIDE_RAIL_WIDTH
@@ -3777,12 +3919,24 @@ fn Sidebar(
                                     ),
                                 drop_hovered: snapshot.drag_hover_target.as_deref() == Some(row.full_path.as_str()),
                                 dragging: snapshot.drag_paths.iter().any(|path| path == &row.full_path),
+                                renaming: snapshot.tree_rename_path.as_deref() == Some(row.full_path.as_str()),
+                                rename_value: snapshot.tree_rename_value.clone(),
                                 palette: snapshot.palette,
                                 on_select: move |evt: MouseEvent| {
                                     let extend = evt.modifiers().contains(Modifiers::SHIFT);
                                     on_select_row.call((select_row.clone(), extend));
                                 },
                                 on_open_context_menu: move |coords: (f64, f64)| on_open_context_menu.call((context_row.clone(), coords)),
+                                on_begin_rename: {
+                                    let row = row.clone();
+                                    move |_| on_begin_rename.call(row.clone())
+                                },
+                                on_update_rename: move |value: String| on_update_rename.call(value),
+                                on_commit_rename: {
+                                    let row = row.clone();
+                                    move |_| on_commit_rename.call(row.clone())
+                                },
+                                on_cancel_rename: move |_| on_cancel_rename.call(()),
                                 on_start_drag: {
                                     let row = row.clone();
                                     move |_| on_start_drag.call(row.clone())
@@ -3815,9 +3969,15 @@ fn SidebarRow(
     selected: bool,
     drop_hovered: bool,
     dragging: bool,
+    renaming: bool,
+    rename_value: String,
     palette: Palette,
     on_select: EventHandler<MouseEvent>,
     on_open_context_menu: EventHandler<(f64, f64)>,
+    on_begin_rename: EventHandler<MouseEvent>,
+    on_update_rename: EventHandler<String>,
+    on_commit_rename: EventHandler<()>,
+    on_cancel_rename: EventHandler<()>,
     on_start_drag: EventHandler<DragEvent>,
     on_drag_hover: EventHandler<DragEvent>,
     on_drag_leave: EventHandler<DragEvent>,
@@ -3838,6 +3998,7 @@ fn SidebarRow(
                 ),
                 draggable: draggable,
                 onclick: move |evt| on_select.call(evt),
+                ondoubleclick: move |evt| on_begin_rename.call(evt),
                 oncontextmenu: move |evt| {
                     evt.prevent_default();
                     evt.stop_propagation();
@@ -3863,12 +4024,41 @@ fn SidebarRow(
                         if drop_hovered || selected { "0.96" } else { "0.72" }
                     ),
                 }
-                span {
-                    style: format!(
-                        "font-size:10px; font-weight:700; letter-spacing:0.08em; text-transform:uppercase; color:{};",
-                        if drop_hovered || selected { palette.accent } else { palette.muted }
-                    ),
-                    "{row.label}"
+                if renaming {
+                    input {
+                        style: format!(
+                            "width:140px; height:28px; border:none; border-radius:10px; background:rgba(255,255,255,0.92); \
+                             color:{}; font-size:11px; font-weight:600; padding:0 10px; box-shadow: inset 0 0 0 1px rgba(204,214,224,0.9);",
+                            palette.text
+                        ),
+                        value: rename_value,
+                        onmounted: move |evt| async move {
+                            let _ = evt.set_focus(true).await;
+                        },
+                        oninput: move |evt| on_update_rename.call(evt.value()),
+                        onkeydown: move |evt| {
+                            if evt.key() == Key::Enter {
+                                on_commit_rename.call(());
+                            } else if evt.key() == Key::Escape {
+                                on_cancel_rename.call(());
+                            }
+                        },
+                        onblur: move |_| on_commit_rename.call(()),
+                        onclick: |evt| evt.stop_propagation(),
+                        onmousedown: |evt| evt.stop_propagation(),
+                        oncontextmenu: |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                        },
+                    }
+                } else {
+                    span {
+                        style: format!(
+                            "font-size:10.5px; font-weight:700; letter-spacing:0.04em; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                            if drop_hovered || selected { palette.accent } else { palette.muted }
+                        ),
+                        "{row.label}"
+                    }
                 }
                 div {
                     style: format!(
@@ -3916,6 +4106,7 @@ fn SidebarRow(
             ),
             draggable: draggable,
             onclick: move |evt| on_select.call(evt),
+            ondoubleclick: move |evt| on_begin_rename.call(evt),
             oncontextmenu: move |evt| {
                 evt.prevent_default();
                 evt.stop_propagation();
@@ -3944,13 +4135,42 @@ fn SidebarRow(
                         ),
                         TreeIcon { row: row.clone() }
                     }
-                    span {
-                        style: format!(
-                            "font-size:11px; color:{}; font-weight:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
-                            label_color,
-                            if row.kind == BrowserRowKind::Group && row.depth == 0 { 600 } else { 500 }
-                        ),
-                        "{row.label}"
+                    if renaming {
+                        input {
+                            style: format!(
+                                "flex:1; min-width:0; height:28px; border:none; border-radius:10px; background:rgba(255,255,255,0.92); \
+                                 color:{}; font-size:11px; font-weight:600; padding:0 10px; box-shadow: inset 0 0 0 1px rgba(204,214,224,0.9);",
+                                palette.text
+                            ),
+                            value: rename_value,
+                            onmounted: move |evt| async move {
+                                let _ = evt.set_focus(true).await;
+                            },
+                            oninput: move |evt| on_update_rename.call(evt.value()),
+                            onkeydown: move |evt| {
+                                if evt.key() == Key::Enter {
+                                    on_commit_rename.call(());
+                                } else if evt.key() == Key::Escape {
+                                    on_cancel_rename.call(());
+                                }
+                            },
+                            onblur: move |_| on_commit_rename.call(()),
+                            onclick: |evt| evt.stop_propagation(),
+                            onmousedown: |evt| evt.stop_propagation(),
+                            oncontextmenu: |evt| {
+                                evt.prevent_default();
+                                evt.stop_propagation();
+                            },
+                        }
+                    } else {
+                        span {
+                            style: format!(
+                                "font-size:11px; color:{}; font-weight:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                                label_color,
+                                if row.kind == BrowserRowKind::Group && row.depth == 0 { 600 } else { 500 }
+                            ),
+                            "{row.label}"
+                        }
                     }
                 }
                 if row.kind == BrowserRowKind::Group {
