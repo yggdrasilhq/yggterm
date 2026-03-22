@@ -881,6 +881,12 @@ fn browser_tree_segments(cwd: &str) -> Vec<String> {
 }
 
 fn browser_tree_child_path(parent: &str, segment: &str) -> String {
+    if parent == "local" && segment == "/" {
+        return "/".to_string();
+    }
+    if parent == "local" {
+        return format!("/{}", segment.trim_matches('/'));
+    }
     if segment == "/" {
         return format!("{}/", parent.trim_end_matches('/'));
     }
