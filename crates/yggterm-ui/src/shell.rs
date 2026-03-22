@@ -50,6 +50,10 @@ const XTERM_JS: &str = include_str!("../../../assets/xterm/xterm.js");
 const XTERM_FIT_JS: &str = include_str!("../../../assets/xterm/addon-fit.js");
 static XTERM_ASSETS_BOOTSTRAPPED: OnceCell<()> = OnceCell::new();
 const TOAST_CSS: &str = r#"
+@keyframes yggterm-toast-stack-in {
+  0% { opacity: 0; transform: translateY(12px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
 @keyframes yggterm-toast-fade {
   0% { opacity: 0; transform: translateY(-4px); }
   8% { opacity: 1; transform: translateY(0); }
@@ -2879,15 +2883,18 @@ fn workspace_leaf_name(path: &str) -> Option<String> {
 
 fn canonical_workspace_leaf_name(path: &str) -> String {
     let leaf = workspace_leaf_name(path).unwrap_or_else(|| "item".to_string());
-    let unanchored = leaf
-        .rsplit('~')
-        .next()
-        .unwrap_or(leaf.as_str())
-        .trim_start_matches('!');
-    if unanchored.is_empty() {
+    let unanchored = leaf.rsplit('~').next().unwrap_or(leaf.as_str());
+    let mut stripped = unanchored.trim_start_matches('!');
+    while stripped.len() > 5
+        && stripped.as_bytes().get(4) == Some(&b'-')
+        && stripped.as_bytes()[0..4].iter().all(|byte| byte.is_ascii_digit())
+    {
+        stripped = &stripped[5..];
+    }
+    if stripped.is_empty() {
         "item".to_string()
     } else {
-        unanchored.to_string()
+        stripped.to_string()
     }
 }
 
@@ -6930,19 +6937,29 @@ fn ToastViewport(
         .filter(|notification| notification.tone != NotificationTone::Info)
         .take(3)
         .collect::<Vec<_>>();
+    let stack_key = items
+        .iter()
+        .map(|notification| notification.id.to_string())
+        .collect::<Vec<_>>()
+        .join("-");
     rsx! {
         div {
+            key: "{stack_key}",
             style: format!(
                 "position:fixed; top:56px; right:{}px; z-index:80; display:flex; flex-direction:column; gap:10px; width:280px; pointer-events:none;",
                 right_inset
             ),
             for notification in items {
                 div {
-                    style: "pointer-events:auto; animation:yggterm-toast-fade 7s ease forwards;",
-                    NotificationCard {
-                        notification: notification.clone(),
-                        palette,
-                        on_clear: move |_| on_clear_notification.call(notification.id),
+                    key: "{notification.id}",
+                    style: "pointer-events:auto; animation:yggterm-toast-stack-in 220ms ease both;",
+                    div {
+                        style: "animation:yggterm-toast-fade 7s ease forwards;",
+                        NotificationCard {
+                            notification: notification.clone(),
+                            palette,
+                            on_clear: move |_| on_clear_notification.call(notification.id),
+                        }
                     }
                 }
             }
