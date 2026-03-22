@@ -31,6 +31,44 @@ They provide:
 
 The current sidebar in `src/shell.rs` is the reference integration for both the engine and the visuals.
 
+## Reusable chrome
+
+The reusable titlebar and window-control primitives live in:
+
+- [src/chrome.rs](/home/pi/gh/yggterm/crates/yggterm-ui/src/chrome.rs)
+
+They provide:
+
+- `TitlebarChrome`
+- `WindowControlsStrip`
+- `search_input_style`
+
+## Reusable notifications
+
+The toast system lives in:
+
+- [src/notifications.rs](/home/pi/gh/yggterm/crates/yggterm-ui/src/notifications.rs)
+
+It provides:
+
+- `ToastViewport`
+- `ToastCard`
+- reusable `ToastTone` and `ToastPalette`
+- shared `TOAST_CSS`
+
+## Reusable rails
+
+The side-rail shell primitives live in:
+
+- [src/rails.rs](/home/pi/gh/yggterm/crates/yggterm-ui/src/rails.rs)
+
+They provide:
+
+- `SideRailShell`
+- `RailHeader`
+- `RailScrollBody`
+- `RailSectionTitle`
+
 ### Integration steps
 
 1. Adapt your tree rows into `TreeReorderItem<K>`.

@@ -53,6 +53,7 @@ The main workspace is the focus.
 - It should read like a calm sheet, canvas, or stage.
 - In light mode it should generally be white or near-white.
 - It may have a soft shadow and mild radius.
+- It should feel like it is floating slightly above the surrounding chrome rather than being boxed into it.
 - It should not be crowded by decorative headers, nested boxes, or redundant toolbars.
 - Whatever the app’s core artifact is, it should feel native to the main canvas rather than pasted inside a widget frame.
 
@@ -62,8 +63,10 @@ The surrounding chrome should feel supportive, not dominant.
 
 - Side rails should be lighter and quieter than the main canvas.
 - A faint blue-to-green fresh tint over a muted neutral base is desirable.
+- A light gradient plus blur system is preferred when the platform supports it.
 - Rails should avoid heavy borders.
 - The shell should feel visually unified rather than partitioned into harsh boxes.
+- Titlebar, side rails, and utility surfaces should feel like one seamless scaffold around the floating main canvas.
 
 #### Shape language
 
@@ -105,6 +108,10 @@ Avoid:
 
 Project overlays can define additional content fonts, such as terminal, code, map, or data fonts.
 
+#### Preferred monospace font
+
+- `JetBrains Mono` is the preferred monospace across all platforms unless a project explicitly overrides it.
+
 ### Control language
 
 #### Segmented controls
@@ -135,6 +142,12 @@ If a user says “this does not look like a button”, that is a design failure.
 - Avoid pill-shaped text fields unless there is a strong reason.
 - Inputs must remain visible against the supporting chrome.
 
+#### Search in chrome
+
+- If the product has a global or sidebar search, the default preference is a centered search field in the titlebar.
+- The search field should feel like part of the shell, not a floating badge.
+- Search should generally be the visual anchor of the center titlebar slot.
+
 #### Context menus
 
 Context menus should feel closer to modern Microsoft app menus than generic web popovers.
@@ -163,6 +176,25 @@ Motion should be functional, not decorative.
 - drag-and-drop should show clear make-way affordances
 - state changes should feel crisp, not rubbery
 
+### Notifications
+
+Notifications are reusable shell components, not one-off project afterthoughts.
+
+- In-app toast notifications should be supported by default.
+- Toasts should have clear tone coloring.
+- Toast stacks should animate upward when items leave.
+- Notification history panels are acceptable when the product benefits from persistent event history.
+- Clear-one and clear-all actions should be supported when a notification panel exists.
+
+### Debug telemetry
+
+Debug-only telemetry is a design-support component, not just an engineering detail.
+
+- Instrumentation should help explain interaction failures such as drag, selection, layout, or context-menu issues.
+- Debug telemetry should be local-first and easy to inspect.
+- It should be safe to remove or gate behind debug builds without affecting the product UI.
+- If a complex interaction is likely to be reused, the telemetry strategy should be reusable too.
+
 ### Drag and drop
 
 If a project has drag-and-drop tree or list reordering:
@@ -190,8 +222,25 @@ Preferred reusable boundaries:
 - drag/reorder engine
 - drag ghost / drop-zone visuals
 - titlebar primitives
+- window control primitives
 - rail/panel primitives
 - menu and toast primitives
+- telemetry hooks for interaction-heavy components
+
+### Window chrome specifics
+
+If a project owns its own titlebar/chrome:
+
+- the main viewport should sit visually above a seamless titlebar + rail scaffold
+- the preferred top-right control order is:
+  - always-on-top
+  - minimize
+  - maximize / restore
+  - close
+- these controls should use crisp simple line icons
+- minimize/maximize/always-on-top should stay neutral by default
+- close should gain a red background with a white `X` on hover
+- outer radii should disappear in maximized state
 
 ## Project Overlay Interface
 

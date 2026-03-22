@@ -1,3 +1,7 @@
+use crate::chrome::{
+    ChromePalette, HoveredChromeControl as HoveredControl, TitlebarChrome,
+    WindowControlsStrip, search_input_style,
+};
 use crate::drag_tree::{
     DragDropPlacement, DragDropTarget, TreeDropPlacement as WorkspaceDropPlacement,
     TreeReorderItem, TreeReorderPlanItem, build_tree_reorder_plan,
@@ -6,6 +10,11 @@ use crate::drag_tree::{
     valid_drop_target as valid_tree_drop_target,
 };
 use crate::drag_visuals::{DragGhostCard, DragGhostPalette, TreeDropZones};
+use crate::notifications::{
+    TOAST_CSS, ToastCard, ToastItem as ToastNotification, ToastPalette,
+    ToastTone as NotificationTone, ToastViewport,
+};
+use crate::rails::{RailHeader, RailScrollBody, RailSectionTitle, SideRailShell};
 use crate::window_icon;
 use anyhow::{Result, anyhow};
 use dioxus::desktop::{
@@ -58,18 +67,6 @@ const XTERM_JS: &str = include_str!("../../../assets/xterm/xterm.js");
 const XTERM_FIT_JS: &str = include_str!("../../../assets/xterm/addon-fit.js");
 static XTERM_ASSETS_BOOTSTRAPPED: OnceCell<()> = OnceCell::new();
 type WorkspaceReorderPlanItem = TreeReorderPlanItem<BrowserRowKind>;
-const TOAST_CSS: &str = r#"
-@keyframes yggterm-toast-stack-in {
-  0% { opacity: 0; transform: translateY(12px); }
-  100% { opacity: 1; transform: translateY(0); }
-}
-@keyframes yggterm-toast-fade {
-  0% { opacity: 0; transform: translateY(-4px); }
-  8% { opacity: 1; transform: translateY(0); }
-  78% { opacity: 1; transform: translateY(0); }
-  100% { opacity: 0; transform: translateY(-6px); }
-}
-"#;
 
 #[derive(Debug, Clone)]
 pub struct ShellBootstrap {
@@ -155,14 +152,6 @@ enum RightPanelMode {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum NotificationTone {
-    Info,
-    Success,
-    Warning,
-    Error,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
 enum PreviewLayoutMode {
     Chat,
     Graph,
@@ -173,15 +162,6 @@ enum NotificationDeliveryMode {
     InApp,
     Both,
     System,
-}
-
-#[derive(Clone, PartialEq)]
-struct ToastNotification {
-    id: u64,
-    tone: NotificationTone,
-    title: String,
-    message: String,
-    created_at_ms: u64,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -269,23 +249,6 @@ struct Palette {
     control_hover: &'static str,
     shadow: &'static str,
     panel_shadow: &'static str,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum HoveredControl {
-    AlwaysOnTop,
-    Minimize,
-    Maximize,
-    Close,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum WindowControlIcon {
-    AlwaysOnTop,
-    Minimize,
-    Maximize,
-    Restore,
-    Close,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3954,10 +3917,17 @@ fn app() -> Element {
                 }
                 if !snapshot.notifications.is_empty() {
                     ToastViewport {
-                        notifications: snapshot.notifications.clone(),
-                        palette: snapshot.palette,
+                        items: snapshot.notifications.clone(),
+                        palette: ToastPalette {
+                            text: snapshot.palette.text,
+                            muted: snapshot.palette.muted,
+                            accent: snapshot.palette.accent,
+                        },
                         right_inset: toast_right_inset(snapshot.right_panel_mode),
-                        on_clear_notification: move |id: u64| state.with_mut(|shell| shell.clear_notification(id)),
+                        max_age_ms: 7000,
+                        max_visible: 3,
+                        now_ms: current_millis(),
+                        on_clear: move |id: u64| state.with_mut(|shell| shell.clear_notification(id)),
                     }
                 }
                 if !snapshot.drag_paths.is_empty() {
@@ -3986,373 +3956,137 @@ fn Titlebar(
     on_toggle_always_on_top: EventHandler<()>,
     maximized: bool,
 ) -> Element {
-    let mut drag_armed = use_signal(|| false);
     rsx! {
-        div {
-            style: format!(
-                "display:flex; align-items:center; justify-content:space-between; height:44px; \
-                 padding:0 12px; background:{}; zoom:{}%; user-select:none; -webkit-user-select:none;",
-                snapshot.palette.titlebar,
-                zoom_percent_f32(snapshot.settings.ui_font_size, 14.0)
-            ),
-            onmousedown: move |_| drag_armed.set(true),
-            onmouseup: move |_| drag_armed.set(false),
-            onmouseleave: move |_| drag_armed.set(false),
-            onmousemove: move |_| {
-                if drag_armed() {
-                    drag_armed.set(false);
-                    window().drag();
-                }
-            },
-            ondoubleclick: move |_| {
-                drag_armed.set(false);
-                on_toggle_maximized.call(());
-            },
-            div {
-                style: "display:flex; align-items:center; gap:12px; width:340px; min-width:340px;",
-                button {
-                    style: icon_button_style(snapshot.palette),
-                    onmousedown: |evt| evt.stop_propagation(),
-                    ondoubleclick: |evt| evt.stop_propagation(),
-                    onclick: move |_| on_toggle_sidebar.call(()),
-                    "☰"
-                }
+        TitlebarChrome {
+            background: snapshot.palette.titlebar.to_string(),
+            zoom_percent: zoom_percent_f32(snapshot.settings.ui_font_size, 14.0),
+            on_toggle_maximized: on_toggle_maximized,
+            left: rsx! {
                 div {
-                    style: toggle_slider_style(snapshot.palette),
-                    onmousedown: |evt| evt.stop_propagation(),
+                    style: "display:flex; align-items:center; gap:12px; width:340px; min-width:340px;",
                     button {
-                        style: toggle_slider_end_style(
-                            snapshot.palette,
-                            snapshot.active_view_mode == WorkspaceViewMode::Rendered
-                        ),
+                        style: icon_button_style(snapshot.palette),
+                        onmousedown: |evt| evt.stop_propagation(),
                         ondoubleclick: |evt| evt.stop_propagation(),
-                        onclick: move |_| on_set_view_mode.call(WorkspaceViewMode::Rendered),
-                        "Preview"
+                        onclick: move |_| on_toggle_sidebar.call(()),
+                        "☰"
                     }
-                    button {
-                        style: toggle_slider_end_style(
-                            snapshot.palette,
-                            snapshot.active_view_mode == WorkspaceViewMode::Terminal
-                        ),
-                        ondoubleclick: |evt| evt.stop_propagation(),
-                        onclick: move |_| on_set_view_mode.call(WorkspaceViewMode::Terminal),
-                        "Terminal"
-                    }
-                }
-                div {
-                    style: "flex:1; min-width:56px; height:100%;",
-                    ondoubleclick: move |_| {
-                        drag_armed.set(false);
-                        on_toggle_maximized.call(());
-                    },
-                }
-            }
-            div {
-                style: "flex:1; display:flex; align-items:center; justify-content:center; gap:10px; padding:0 16px;",
-                div {
-                    style: "flex:1; min-width:84px; height:100%;",
-                    ondoubleclick: move |_| {
-                        drag_armed.set(false);
-                        on_toggle_maximized.call(());
-                    },
-                }
-                input {
-                    r#type: "text",
-                    value: "{snapshot.search_query}",
-                    placeholder: "Search sessions…",
-                    style: search_style(snapshot.palette),
-                    onmousedown: |evt| evt.stop_propagation(),
-                    ondoubleclick: |evt| evt.stop_propagation(),
-                    oninput: move |evt| on_search.call(evt.value()),
-                }
-                if let Some(update) = snapshot.pending_update_restart.clone() {
                     div {
-                        style: format!(
-                            "display:inline-flex; align-items:center; gap:6px; height:28px; padding:0 11px; border-radius:10px; \
-                             background:rgba(255,255,255,0.82); color:{}; font-size:11px; font-weight:700; \
-                             box-shadow: inset 0 0 0 1px rgba(170,190,212,0.24); white-space:nowrap;",
-                            snapshot.palette.accent
+                        style: toggle_slider_style(snapshot.palette),
+                        onmousedown: |evt| evt.stop_propagation(),
+                        button {
+                            style: toggle_slider_end_style(
+                                snapshot.palette,
+                                snapshot.active_view_mode == WorkspaceViewMode::Rendered
+                            ),
+                            ondoubleclick: |evt| evt.stop_propagation(),
+                            onclick: move |_| on_set_view_mode.call(WorkspaceViewMode::Rendered),
+                            "Preview"
+                        }
+                        button {
+                            style: toggle_slider_end_style(
+                                snapshot.palette,
+                                snapshot.active_view_mode == WorkspaceViewMode::Terminal
+                            ),
+                            ondoubleclick: |evt| evt.stop_propagation(),
+                            onclick: move |_| on_set_view_mode.call(WorkspaceViewMode::Terminal),
+                            "Terminal"
+                        }
+                    }
+                    div { style: "flex:1; min-width:56px; height:100%;" }
+                }
+            },
+            center: rsx! {
+                div {
+                    style: "flex:1; display:flex; align-items:center; justify-content:center; gap:10px; padding:0 16px;",
+                    div { style: "flex:1; min-width:84px; height:100%;" }
+                    input {
+                        r#type: "text",
+                        value: "{snapshot.search_query}",
+                        placeholder: "Search sessions…",
+                        style: search_input_style(snapshot.palette.text),
+                        onmousedown: |evt| evt.stop_propagation(),
+                        ondoubleclick: |evt| evt.stop_propagation(),
+                        oninput: move |evt| on_search.call(evt.value()),
+                    }
+                    if let Some(update) = snapshot.pending_update_restart.clone() {
+                        div {
+                            style: format!(
+                                "display:inline-flex; align-items:center; gap:6px; height:28px; padding:0 11px; border-radius:10px; \
+                                 background:rgba(255,255,255,0.82); color:{}; font-size:11px; font-weight:700; \
+                                 box-shadow: inset 0 0 0 1px rgba(170,190,212,0.24); white-space:nowrap;",
+                                snapshot.palette.accent
+                            ),
+                            "Updating to {update.version}…"
+                        }
+                    }
+                    div { style: "flex:1; min-width:84px; height:100%;" }
+                }
+            },
+            right: rsx! {
+                div {
+                    style: "display:flex; align-items:center; justify-content:flex-end; gap:10px; width:372px; min-width:372px;",
+                    button {
+                        style: connect_button_style(
+                            snapshot.palette,
+                            snapshot.right_panel_mode == RightPanelMode::Connect
                         ),
-                        "Updating to {update.version}…"
+                        onmousedown: |evt| evt.stop_propagation(),
+                        ondoubleclick: |evt| evt.stop_propagation(),
+                        onclick: move |_| on_toggle_connect.call(()),
+                        "Connect SSH"
+                    }
+                    button {
+                        style: utility_icon_style(
+                            snapshot.palette,
+                            snapshot.right_panel_mode == RightPanelMode::Notifications
+                        ),
+                        onmousedown: |evt| evt.stop_propagation(),
+                        ondoubleclick: |evt| evt.stop_propagation(),
+                        onclick: move |_| on_toggle_notifications.call(()),
+                        BellIcon {}
+                    }
+                    button {
+                        style: utility_icon_style_sized(
+                            snapshot.palette,
+                            snapshot.right_panel_mode == RightPanelMode::Settings,
+                            17
+                        ),
+                        onmousedown: |evt| evt.stop_propagation(),
+                        ondoubleclick: |evt| evt.stop_propagation(),
+                        onclick: move |_| on_toggle_settings.call(()),
+                        "⚙"
+                    }
+                    button {
+                        style: utility_icon_style(
+                            snapshot.palette,
+                            snapshot.right_panel_mode == RightPanelMode::Metadata
+                        ),
+                        onmousedown: |evt| evt.stop_propagation(),
+                        ondoubleclick: |evt| evt.stop_propagation(),
+                        onclick: move |_| on_toggle_meta.call(()),
+                        "ⓘ"
+                    }
+                    div { style: "flex:1; min-width:48px; height:100%;" }
+                    WindowControlsStrip {
+                        palette: ChromePalette {
+                            titlebar: snapshot.palette.titlebar,
+                            text: snapshot.palette.text,
+                            muted: snapshot.palette.muted,
+                            accent: snapshot.palette.accent,
+                            close_hover: snapshot.palette.close_hover,
+                            control_hover: snapshot.palette.control_hover,
+                        },
+                        hovered: hovered(),
+                        on_hover_control: on_hover_control,
+                        on_toggle_maximized: on_toggle_maximized,
+                        on_toggle_always_on_top: on_toggle_always_on_top,
+                        maximized: maximized,
+                        always_on_top: snapshot.always_on_top,
                     }
                 }
-                div {
-                    style: "flex:1; min-width:84px; height:100%;",
-                    ondoubleclick: move |_| {
-                        drag_armed.set(false);
-                        on_toggle_maximized.call(());
-                    },
-                }
-            }
-            div {
-                style: "display:flex; align-items:center; justify-content:flex-end; gap:10px; width:372px; min-width:372px;",
-                button {
-                    style: connect_button_style(
-                        snapshot.palette,
-                        snapshot.right_panel_mode == RightPanelMode::Connect
-                    ),
-                    onmousedown: |evt| evt.stop_propagation(),
-                    ondoubleclick: |evt| evt.stop_propagation(),
-                    onclick: move |_| on_toggle_connect.call(()),
-                    "Connect SSH"
-                }
-                button {
-                    style: utility_icon_style(
-                        snapshot.palette,
-                        snapshot.right_panel_mode == RightPanelMode::Notifications
-                    ),
-                    onmousedown: |evt| evt.stop_propagation(),
-                    ondoubleclick: |evt| evt.stop_propagation(),
-                    onclick: move |_| on_toggle_notifications.call(()),
-                    BellIcon {}
-                }
-                button {
-                    style: utility_icon_style_sized(
-                        snapshot.palette,
-                        snapshot.right_panel_mode == RightPanelMode::Settings,
-                        17
-                    ),
-                    onmousedown: |evt| evt.stop_propagation(),
-                    ondoubleclick: |evt| evt.stop_propagation(),
-                    onclick: move |_| on_toggle_settings.call(()),
-                    "⚙"
-                }
-                button {
-                    style: utility_icon_style(
-                        snapshot.palette,
-                        snapshot.right_panel_mode == RightPanelMode::Metadata
-                    ),
-                    onmousedown: |evt| evt.stop_propagation(),
-                    ondoubleclick: |evt| evt.stop_propagation(),
-                    onclick: move |_| on_toggle_meta.call(()),
-                    "ⓘ"
-                }
-                div {
-                    style: "flex:1; min-width:48px; height:100%;",
-                    ondoubleclick: move |_| {
-                        drag_armed.set(false);
-                        on_toggle_maximized.call(());
-                    },
-                }
-                WindowControls {
-                    palette: snapshot.palette,
-                    hovered: hovered(),
-                    on_hover_control: on_hover_control,
-                    on_toggle_maximized: on_toggle_maximized,
-                    on_toggle_always_on_top: on_toggle_always_on_top,
-                    maximized: maximized,
-                    always_on_top: snapshot.always_on_top,
-                }
-            }
+            },
         }
-    }
-}
-
-#[component]
-fn WindowControls(
-    palette: Palette,
-    hovered: Option<HoveredControl>,
-    on_hover_control: EventHandler<Option<HoveredControl>>,
-    on_toggle_maximized: EventHandler<()>,
-    on_toggle_always_on_top: EventHandler<()>,
-    maximized: bool,
-    always_on_top: bool,
-) -> Element {
-    rsx! {
-        div {
-            style: "display:flex; align-items:stretch; gap:0;",
-            WindowControl {
-                icon: WindowControlIcon::AlwaysOnTop,
-                hovered: hovered == Some(HoveredControl::AlwaysOnTop),
-                active: always_on_top,
-                hover_tone: HoveredControl::AlwaysOnTop,
-                palette,
-                on_hover_control,
-                on_press: move |_| on_toggle_always_on_top.call(()),
-            }
-            WindowControl {
-                icon: WindowControlIcon::Minimize,
-                hovered: hovered == Some(HoveredControl::Minimize),
-                active: false,
-                hover_tone: HoveredControl::Minimize,
-                palette,
-                on_hover_control,
-                on_press: move |_| window().set_minimized(true),
-            }
-            WindowControl {
-                icon: if maximized {
-                    WindowControlIcon::Restore
-                } else {
-                    WindowControlIcon::Maximize
-                },
-                hovered: hovered == Some(HoveredControl::Maximize),
-                active: false,
-                hover_tone: HoveredControl::Maximize,
-                palette,
-                on_hover_control,
-                on_press: move |_| on_toggle_maximized.call(()),
-            }
-            WindowControl {
-                icon: WindowControlIcon::Close,
-                hovered: hovered == Some(HoveredControl::Close),
-                active: false,
-                hover_tone: HoveredControl::Close,
-                palette,
-                on_hover_control,
-                on_press: move |_| window().close(),
-            }
-        }
-    }
-}
-
-#[component]
-fn WindowControl(
-    icon: WindowControlIcon,
-    hovered: bool,
-    active: bool,
-    hover_tone: HoveredControl,
-    palette: Palette,
-    on_hover_control: EventHandler<Option<HoveredControl>>,
-    on_press: EventHandler<MouseEvent>,
-) -> Element {
-    let is_close = hover_tone == HoveredControl::Close;
-    let background = if hovered {
-        if is_close {
-            palette.close_hover
-        } else {
-            palette.control_hover
-        }
-    } else if active {
-        "transparent"
-    } else {
-        "transparent"
-    };
-    let color = if hovered && is_close {
-        "#ffffff"
-    } else if active {
-        palette.accent
-    } else {
-        palette.text
-    };
-
-    rsx! {
-        button {
-            style: format!(
-                "width:34px; height:30px; border:none; border-radius:0; background:{}; color:{}; \
-                 display:flex; align-items:center; justify-content:center; font-size:13px; font-weight:600; \
-                 user-select:none; -webkit-user-select:none;",
-                background, color
-            ),
-            onmousedown: |evt| evt.stop_propagation(),
-            ondoubleclick: |evt| evt.stop_propagation(),
-            onmouseenter: move |_| on_hover_control.call(Some(hover_tone)),
-            onmouseleave: move |_| on_hover_control.call(None),
-            onclick: move |evt| on_press.call(evt),
-            WindowControlGlyph { icon: icon }
-        }
-    }
-}
-
-#[component]
-fn WindowControlGlyph(icon: WindowControlIcon) -> Element {
-    match icon {
-        WindowControlIcon::AlwaysOnTop => rsx! {
-            svg {
-                width: "12",
-                height: "12",
-                view_box: "0 0 12 12",
-                fill: "none",
-                xmlns: "http://www.w3.org/2000/svg",
-                path {
-                    d: "M3.1 5.2L6 2.4L8.9 5.2",
-                    stroke: "currentColor",
-                    stroke_width: "1.2",
-                    stroke_linecap: "round",
-                    stroke_linejoin: "round",
-                }
-                path {
-                    d: "M3.1 9.2L6 6.4L8.9 9.2",
-                    stroke: "currentColor",
-                    stroke_width: "1.2",
-                    stroke_linecap: "round",
-                    stroke_linejoin: "round",
-                }
-            }
-        },
-        WindowControlIcon::Minimize => rsx! {
-            svg {
-                width: "11",
-                height: "11",
-                view_box: "0 0 10 10",
-                fill: "none",
-                xmlns: "http://www.w3.org/2000/svg",
-                path {
-                    d: "M2 5.5H8",
-                    stroke: "currentColor",
-                    stroke_width: "1.1",
-                    stroke_linecap: "round",
-                }
-            }
-        },
-        WindowControlIcon::Maximize => rsx! {
-            svg {
-                width: "11",
-                height: "11",
-                view_box: "0 0 10 10",
-                fill: "none",
-                xmlns: "http://www.w3.org/2000/svg",
-                rect {
-                    x: "2.1",
-                    y: "2.1",
-                    width: "5.8",
-                    height: "5.8",
-                    stroke: "currentColor",
-                    stroke_width: "1.1",
-                }
-            }
-        },
-        WindowControlIcon::Restore => rsx! {
-            svg {
-                width: "11",
-                height: "11",
-                view_box: "0 0 10 10",
-                fill: "none",
-                xmlns: "http://www.w3.org/2000/svg",
-                path {
-                    d: "M3.2 2.1H7.7V6.6",
-                    stroke: "currentColor",
-                    stroke_width: "1.1",
-                    stroke_linejoin: "round",
-                }
-                path {
-                    d: "M2.3 3.4H6.8V7.9H2.3V3.4Z",
-                    stroke: "currentColor",
-                    stroke_width: "1.1",
-                    stroke_linejoin: "round",
-                }
-            }
-        },
-        WindowControlIcon::Close => rsx! {
-            svg {
-                width: "11",
-                height: "11",
-                view_box: "0 0 10 10",
-                fill: "none",
-                xmlns: "http://www.w3.org/2000/svg",
-                path {
-                    d: "M2.6 2.6L7.4 7.4",
-                    stroke: "currentColor",
-                    stroke_width: "1.1",
-                    stroke_linecap: "round",
-                }
-                path {
-                    d: "M7.4 2.6L2.6 7.4",
-                    stroke: "currentColor",
-                    stroke_width: "1.1",
-                    stroke_linecap: "round",
-                }
-            }
-        },
     }
 }
 
@@ -6293,25 +6027,12 @@ fn RightRail(
     on_clear_notifications: EventHandler<MouseEvent>,
 ) -> Element {
     let visible = snapshot.right_panel_mode != RightPanelMode::Hidden;
-    let width = if visible { SIDE_RAIL_WIDTH } else { 0 };
-    let opacity = if visible { "1" } else { "0" };
-    let translate = if visible {
-        "translateX(0)"
-    } else {
-        "translateX(14px)"
-    };
     rsx! {
-        div {
-            style: format!(
-                "width:{}px; min-width:{}px; max-width:{}px; display:flex; flex-direction:column; \
-                 background:transparent; overflow:hidden; text-rendering:optimizeLegibility; \
-                 -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale; \
-                 transition: opacity 180ms ease, transform 180ms ease; \
-                 opacity:{}; transform:{}; pointer-events:{}; zoom:{}%;",
-                width, width, width, opacity, translate,
-                if visible { "auto" } else { "none" },
-                zoom_percent_f32(snapshot.settings.ui_font_size, 14.0)
-            ),
+        SideRailShell {
+            visible: visible,
+            width_px: SIDE_RAIL_WIDTH,
+            zoom_percent: zoom_percent_f32(snapshot.settings.ui_font_size, 14.0),
+            body: rsx!{
             if snapshot.right_panel_mode == RightPanelMode::Metadata {
                 MetadataRailBody { snapshot: snapshot.clone() }
             } else if snapshot.right_panel_mode == RightPanelMode::Settings {
@@ -6340,6 +6061,7 @@ fn RightRail(
                     on_clear_notifications,
                 }
             }
+            }
         }
     }
 }
@@ -6349,17 +6071,9 @@ fn MetadataRailBody(snapshot: RenderSnapshot) -> Element {
     let session = snapshot.active_session;
 
     rsx! {
-        div {
-            style: format!(
-                "padding:16px 16px 10px 16px; font-size:12px; font-weight:700; letter-spacing:0.01em; color:{}; \
-                 text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
-                snapshot.palette.text
-            ),
-            "Session Metadata"
-        }
-        div {
-            style: "flex:1; overflow:auto; padding:10px 16px 14px 16px; display:flex; flex-direction:column; gap:16px; \
-             text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
+        RailHeader { title: "Session Metadata".to_string(), color: snapshot.palette.text.to_string() }
+        RailScrollBody {
+            content: rsx!{
             if let Some(session) = session {
                 MetadataGroup {
                     title: "Overview".to_string(),
@@ -6381,6 +6095,7 @@ fn MetadataRailBody(snapshot: RenderSnapshot) -> Element {
                     palette: snapshot.palette,
                 }
             }
+            }
         }
     }
 }
@@ -6398,17 +6113,9 @@ fn SettingsRailBody(
     on_adjust_main_zoom: EventHandler<i32>,
 ) -> Element {
     rsx! {
-        div {
-            style: format!(
-                "padding:16px 16px 10px 16px; font-size:12px; font-weight:700; letter-spacing:0.01em; color:{}; \
-                 text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
-                snapshot.palette.text
-            ),
-            "Interface Settings"
-        }
-        div {
-            style: "flex:1; overflow:auto; padding:10px 16px 14px 16px; display:flex; flex-direction:column; gap:14px; \
-             text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
+        RailHeader { title: "Interface Settings".to_string(), color: snapshot.palette.text.to_string() }
+        RailScrollBody {
+            content: rsx!{
             MetadataGroup {
                 title: "Install".to_string(),
                 entries: vec![
@@ -6554,6 +6261,7 @@ fn SettingsRailBody(
                 style: format!("font-size:11px; line-height:1.5; color:{};", snapshot.palette.muted),
                 "Yggterm caches generated titles under ~/.yggterm/session-titles.db and only refreshes them when you ask for it here."
             }
+            }
         }
     }
 }
@@ -6565,13 +6273,7 @@ fn NotificationsRailBody(
     on_clear_notifications: EventHandler<MouseEvent>,
 ) -> Element {
     rsx! {
-        div {
-            style: format!(
-                "padding:16px 16px 10px 16px; font-size:12px; font-weight:700; letter-spacing:0.01em; color:{};",
-                snapshot.palette.text
-            ),
-            "Notifications"
-        }
+        RailHeader { title: "Notifications".to_string(), color: snapshot.palette.text.to_string() }
         div {
             style: "padding:0 16px 8px 16px; display:flex; justify-content:flex-end;",
             button {
@@ -6580,8 +6282,8 @@ fn NotificationsRailBody(
                 "Clear All"
             }
         }
-        div {
-            style: "flex:1; overflow:auto; padding:10px 16px 14px 16px; display:flex; flex-direction:column; gap:10px;",
+        RailScrollBody {
+            content: rsx!{
             if snapshot.notifications.is_empty() {
                 div {
                     style: format!("font-size:12px; line-height:1.5; color:{};", snapshot.palette.muted),
@@ -6589,12 +6291,17 @@ fn NotificationsRailBody(
                 }
             } else {
                 for notification in snapshot.notifications.iter().cloned().rev() {
-                    NotificationCard {
-                        notification: notification.clone(),
-                        palette: snapshot.palette,
+                    ToastCard {
+                        item: notification.clone(),
+                        palette: ToastPalette {
+                            text: snapshot.palette.text,
+                            muted: snapshot.palette.muted,
+                            accent: snapshot.palette.accent,
+                        },
                         on_clear: move |_| on_clear_notification.call(notification.id),
                     }
                 }
+            }
             }
         }
     }
@@ -6608,16 +6315,9 @@ fn ConnectRailBody(
     on_ssh_prefix_change: EventHandler<String>,
 ) -> Element {
     rsx! {
-        div {
-            style: format!(
-                "padding:16px 16px 10px 16px; font-size:12px; font-weight:700; letter-spacing:0.01em; color:{};",
-                snapshot.palette.text
-            ),
-            "Connect SSH"
-        }
-        div {
-            style: "flex:1; overflow:auto; padding:10px 16px 14px 16px; display:flex; flex-direction:column; gap:14px; \
-             text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
+        RailHeader { title: "Connect SSH".to_string(), color: snapshot.palette.text.to_string() }
+        RailScrollBody {
+            content: rsx!{
             div {
                 style: "display:flex; flex-direction:column; gap:10px; padding-bottom:10px;",
                 div {
@@ -6721,59 +6421,6 @@ fn ConnectRailBody(
                     }
                 }
             }
-        }
-    }
-}
-
-#[component]
-fn NotificationCard(
-    notification: ToastNotification,
-    palette: Palette,
-    on_clear: EventHandler<MouseEvent>,
-) -> Element {
-    let (tone_accent, tone_fg) = notification_tone_colors(notification.tone, palette);
-    rsx! {
-        div {
-            style: format!(
-                "display:flex; flex-direction:column; gap:7px; padding:12px 12px 11px 12px; border-radius:14px; \
-                 background:rgba(249,250,252,0.86); backdrop-filter: blur(28px) saturate(165%); \
-                 -webkit-backdrop-filter: blur(28px) saturate(165%); box-shadow: 0 18px 38px rgba(49,67,82,0.14), inset 0 0 0 1px rgba(255,255,255,0.72);",
-            ),
-            div {
-                style: "display:flex; align-items:center; justify-content:space-between; gap:8px;",
-                div {
-                    style: "display:flex; align-items:center; gap:8px; min-width:0;",
-                    div {
-                        style: format!(
-                            "width:8px; height:8px; border-radius:999px; background:{}; flex:none;",
-                            tone_accent
-                        ),
-                    }
-                    div {
-                        style: format!(
-                            "font-size:12px; font-weight:700; color:{}; text-rendering:optimizeLegibility; \
-                             -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
-                            tone_fg
-                        ),
-                        "{notification.title}"
-                    }
-                }
-                button {
-                    style: format!(
-                        "width:22px; height:22px; border:none; border-radius:8px; background:rgba(241,244,247,0.92); color:{}; font-size:12px; font-weight:700;",
-                        tone_fg
-                    ),
-                    onclick: move |evt| on_clear.call(evt),
-                    "×"
-                }
-            }
-            div {
-                style: format!(
-                    "font-size:11px; line-height:1.45; color:{}; text-rendering:optimizeLegibility; \
-                     -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
-                    palette.text
-                ),
-                "{notification.message}"
             }
         }
     }
@@ -6984,51 +6631,6 @@ fn DeleteConfirmOverlay(
     }
 }
 
-#[component]
-fn ToastViewport(
-    notifications: Vec<ToastNotification>,
-    palette: Palette,
-    right_inset: usize,
-    on_clear_notification: EventHandler<u64>,
-) -> Element {
-    let now = current_millis();
-    let items = notifications
-        .into_iter()
-        .rev()
-        .filter(|notification| now.saturating_sub(notification.created_at_ms) <= 7000)
-        .filter(|notification| notification.tone != NotificationTone::Info)
-        .take(3)
-        .collect::<Vec<_>>();
-    let stack_key = items
-        .iter()
-        .map(|notification| notification.id.to_string())
-        .collect::<Vec<_>>()
-        .join("-");
-    rsx! {
-        div {
-            key: "{stack_key}",
-            style: format!(
-                "position:fixed; top:56px; right:{}px; z-index:80; display:flex; flex-direction:column; gap:10px; width:280px; pointer-events:none;",
-                right_inset
-            ),
-            for notification in items {
-                div {
-                    key: "{notification.id}",
-                    style: "pointer-events:auto; animation:yggterm-toast-stack-in 220ms ease both;",
-                    div {
-                        style: "animation:yggterm-toast-fade 7s ease forwards;",
-                        NotificationCard {
-                            notification: notification.clone(),
-                            palette,
-                            on_clear: move |_| on_clear_notification.call(notification.id),
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 fn toast_right_inset(right_panel_mode: RightPanelMode) -> usize {
     let _ = right_panel_mode;
     18
@@ -7183,14 +6785,7 @@ fn MetadataGroup(title: String, entries: Vec<SessionMetadataEntry>, palette: Pal
     rsx! {
         div {
             style: "display:flex; flex-direction:column; gap:8px; padding-bottom:10px;",
-            div {
-                style: format!(
-                    "font-size:11px; font-weight:700; letter-spacing:0.02em; color:{}; \
-                     text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
-                    palette.muted
-                ),
-                "{title}"
-            }
+            RailSectionTitle { title: title, muted_color: palette.muted.to_string() }
             for entry in entries.into_iter() {
                 div {
                     style: "display:flex; flex-direction:column; gap:4px;",
@@ -7267,15 +6862,6 @@ fn shell_style(palette: Palette, radius: u8) -> String {
         palette.gradient,
         palette.shadow,
         interface_font_family()
-    )
-}
-
-fn search_style(palette: Palette) -> String {
-    format!(
-        "width:min(560px, 100%); height:32px; padding:0 12px; border-radius:8px; \
-         border:none; background:rgba(255,255,255,0.66); color:{}; outline:none; font-size:12px; \
-         box-shadow: inset 0 0 0 1px rgba(255,255,255,0.36); user-select:text; -webkit-user-select:text;",
-        palette.text
     )
 }
 
@@ -7377,18 +6963,6 @@ fn settings_input_style(palette: Palette) -> String {
          color:{}; outline:none; font-size:11px; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.34);",
         palette.text
     )
-}
-
-fn notification_tone_colors(
-    tone: NotificationTone,
-    palette: Palette,
-) -> (&'static str, &'static str) {
-    match tone {
-        NotificationTone::Info => (palette.accent, "#315066"),
-        NotificationTone::Success => ("#2f9e62", "#315066"),
-        NotificationTone::Warning => ("#d79b24", "#315066"),
-        NotificationTone::Error => ("#d95c5c", "#315066"),
-    }
 }
 
 fn zoom_button_style(palette: Palette) -> String {
