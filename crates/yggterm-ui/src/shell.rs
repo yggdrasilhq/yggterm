@@ -123,6 +123,7 @@ struct ShellState {
     optimistic_drag_paths: Vec<String>,
     optimistic_drag_target: Option<DragDropTarget>,
     drag_pointer: Option<(f64, f64)>,
+    suppress_tree_click_until_ms: u64,
     pending_delete: Option<PendingDeleteDialog>,
     tree_rename_path: Option<String>,
     tree_rename_value: String,
@@ -398,6 +399,7 @@ impl ShellState {
             optimistic_drag_paths: Vec::new(),
             optimistic_drag_target: None,
             drag_pointer: None,
+            suppress_tree_click_until_ms: 0,
             pending_delete: None,
             tree_rename_path: None,
             tree_rename_value: String::new(),
@@ -970,12 +972,25 @@ impl ShellState {
     }
 
     fn clear_drag_state(&mut self) {
+        let had_drag = !self.drag_paths.is_empty();
         self.drag_paths.clear();
         self.drag_hover_target = None;
         self.optimistic_drag_paths.clear();
         self.optimistic_drag_target = None;
         self.drag_pointer = None;
+        if had_drag {
+            self.suppress_tree_click_until_ms = current_millis().saturating_add(220);
+        }
         self.refresh_tree_debug("clear_drag_state");
+    }
+
+    fn consume_suppressed_tree_click(&mut self) -> bool {
+        if current_millis() < self.suppress_tree_click_until_ms {
+            self.suppress_tree_click_until_ms = 0;
+            true
+        } else {
+            false
+        }
     }
 
     fn open_delete_dialog(&mut self, hard_delete: bool) {
@@ -3749,7 +3764,20 @@ fn app() -> Element {
                         ),
                         on_create_paper: move |_| queue_new_document(state),
                         on_select_row: move |(row, mode): (BrowserRow, TreeSelectionMode)| {
-                            state.with_mut(|shell| shell.select_tree_row(&row, mode));
+                            let should_continue = {
+                                let mut continue_open = true;
+                                state.with_mut(|shell| {
+                                    if shell.consume_suppressed_tree_click() {
+                                        continue_open = false;
+                                        return;
+                                    }
+                                    shell.select_tree_row(&row, mode);
+                                });
+                                continue_open
+                            };
+                            if !should_continue {
+                                return;
+                            }
                             if mode != TreeSelectionMode::Replace {
                                 return;
                             }
