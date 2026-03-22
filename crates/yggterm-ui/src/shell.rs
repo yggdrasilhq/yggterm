@@ -2738,25 +2738,28 @@ fn new_group_virtual_path_for_row(row: &BrowserRow) -> String {
 }
 
 fn new_separator_virtual_path_for_row(row: &BrowserRow) -> String {
-    let (base, anchor_leaf) = match row.kind {
-        BrowserRowKind::Group if row.full_path == "local" => ("/workspace".to_string(), None),
+    let (base, anchor_leaf, top_of_folder) = match row.kind {
+        BrowserRowKind::Group if row.full_path == "local" => ("/workspace".to_string(), None, true),
         BrowserRowKind::Group if row.full_path.starts_with("__live_") => {
-            ("/workspace".to_string(), None)
+            ("/workspace".to_string(), None, true)
         }
-        BrowserRowKind::Group => (row.full_path.clone(), None),
+        BrowserRowKind::Group => (row.full_path.clone(), None, true),
         BrowserRowKind::Separator => (
             document_parent_base(row).unwrap_or_else(|| "/workspace".to_string()),
             workspace_leaf_name(&row.full_path),
+            false,
         ),
         BrowserRowKind::Session => (
             row.session_cwd
                 .clone()
                 .unwrap_or_else(|| "/workspace".to_string()),
             None,
+            true,
         ),
         BrowserRowKind::Document => (
             document_parent_base(row).unwrap_or_else(|| "/workspace".to_string()),
             workspace_leaf_name(&row.full_path),
+            false,
         ),
     };
     let suffix = unique_workspace_leaf_suffix();
@@ -2767,6 +2770,8 @@ fn new_separator_virtual_path_for_row(row: &BrowserRow) -> String {
             anchor_leaf,
             suffix
         )
+    } else if top_of_folder {
+        format!("{}/!separator-{}", base.trim_end_matches('/'), suffix)
     } else {
         format!("{}/~separator-{}", base.trim_end_matches('/'), suffix)
     }
@@ -4153,6 +4158,7 @@ fn Sidebar(
                                     ),
                                 drop_hovered: snapshot.drag_hover_target.as_deref() == Some(row.full_path.as_str()),
                                 dragging: snapshot.drag_paths.iter().any(|path| path == &row.full_path),
+                                drag_active: !snapshot.drag_paths.is_empty(),
                                 renaming: snapshot.tree_rename_path.as_deref() == Some(row.full_path.as_str()),
                                 rename_value: snapshot.tree_rename_value.clone(),
                                 palette: snapshot.palette,
@@ -4211,6 +4217,7 @@ fn SidebarRow(
     selected: bool,
     drop_hovered: bool,
     dragging: bool,
+    drag_active: bool,
     renaming: bool,
     rename_value: String,
     palette: Palette,
@@ -4261,7 +4268,12 @@ fn SidebarRow(
                     on_open_context_menu.call((coords.x, coords.y));
                 },
                 onmousemove: move |evt| {
-                    if evt.held_buttons().contains(MouseButton::Primary) {
+                    if drag_active || evt.held_buttons().contains(MouseButton::Primary) {
+                        on_drag_hover.call(evt);
+                    }
+                },
+                onmouseenter: move |evt| {
+                    if drag_active {
                         on_drag_hover.call(evt);
                     }
                 },
@@ -4269,7 +4281,7 @@ fn SidebarRow(
                     on_drag_leave.call(evt);
                 },
                 onmouseup: move |evt| {
-                    if evt.trigger_button() == Some(MouseButton::Primary) {
+                    if drag_active || evt.trigger_button() == Some(MouseButton::Primary) {
                         if drag_started() {
                             on_drop_into_row.call(evt.clone());
                             on_end_drag.call(evt);
@@ -4389,7 +4401,12 @@ fn SidebarRow(
                 on_open_context_menu.call((coords.x, coords.y));
             },
             onmousemove: move |evt| {
-                if evt.held_buttons().contains(MouseButton::Primary) {
+                if drag_active || evt.held_buttons().contains(MouseButton::Primary) {
+                    on_drag_hover.call(evt);
+                }
+            },
+            onmouseenter: move |evt| {
+                if drag_active {
                     on_drag_hover.call(evt);
                 }
             },
@@ -4397,7 +4414,7 @@ fn SidebarRow(
                 on_drag_leave.call(evt);
             },
             onmouseup: move |evt| {
-                if evt.trigger_button() == Some(MouseButton::Primary) {
+                if drag_active || evt.trigger_button() == Some(MouseButton::Primary) {
                     if drag_started() {
                         on_drop_into_row.call(evt.clone());
                         on_end_drag.call(evt);
@@ -7290,7 +7307,7 @@ mod tests {
 
         let path = new_separator_virtual_path_for_row(&folder);
 
-        assert!(path.starts_with("/home/pi/gh/notes/~separator-"));
+        assert!(path.starts_with("/home/pi/gh/notes/!separator-"));
     }
 
     #[test]
