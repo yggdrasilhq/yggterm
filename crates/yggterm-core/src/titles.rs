@@ -39,6 +39,14 @@ impl SessionTitleStore {
                 source TEXT,
                 model TEXT,
                 updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS session_summaries (
+                session_id TEXT PRIMARY KEY,
+                summary TEXT NOT NULL,
+                cwd TEXT,
+                source TEXT,
+                model TEXT,
+                updated_at TEXT NOT NULL
             );",
         )
         .context("failed to initialize title db schema")?;
@@ -61,6 +69,18 @@ impl SessionTitleStore {
         let mut stmt = self
             .conn
             .prepare("SELECT precis FROM session_precis WHERE session_id = ?1")?;
+        let mut rows = stmt.query(params![session_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row.get(0)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_summary(&self, session_id: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT summary FROM session_summaries WHERE session_id = ?1")?;
         let mut rows = stmt.query(params![session_id])?;
         if let Some(row) = rows.next()? {
             Ok(Some(row.get(0)?))
@@ -117,6 +137,30 @@ impl SessionTitleStore {
         Ok(())
     }
 
+    pub fn put_summary(
+        &self,
+        session_id: &str,
+        cwd: &str,
+        summary: &str,
+        model: &str,
+        source: &str,
+    ) -> Result<()> {
+        let updated_at =
+            OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
+        self.conn.execute(
+            "INSERT INTO session_summaries (session_id, summary, cwd, source, model, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(session_id) DO UPDATE SET
+               summary = excluded.summary,
+               cwd = excluded.cwd,
+               source = excluded.source,
+               model = excluded.model,
+               updated_at = excluded.updated_at",
+            params![session_id, summary, cwd, source, model, updated_at],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_title(&self, session_id: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM session_titles WHERE session_id = ?1",
@@ -128,6 +172,14 @@ impl SessionTitleStore {
     pub fn delete_precis(&self, session_id: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM session_precis WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_summary(&self, session_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM session_summaries WHERE session_id = ?1",
             params![session_id],
         )?;
         Ok(())
@@ -147,6 +199,10 @@ impl SessionTitleResolver {
 
     pub fn resolve_precis_for_session(&self, session_id: &str) -> Result<Option<String>> {
         self.store.get_precis(session_id)
+    }
+
+    pub fn resolve_summary_for_session(&self, session_id: &str) -> Result<Option<String>> {
+        self.store.get_summary(session_id)
     }
 
     pub fn generate_for_session(
@@ -239,6 +295,44 @@ impl SessionTitleResolver {
             "litellm",
         )?;
         Ok(Some(precis))
+    }
+
+    pub fn generate_summary_for_session(
+        &self,
+        settings: &AppSettings,
+        session_id: &str,
+        cwd: &str,
+        file_path: &Path,
+        force: bool,
+    ) -> Result<Option<String>> {
+        if !force {
+            if let Some(summary) = self.store.get_summary(session_id)? {
+                return Ok(Some(summary));
+            }
+        } else {
+            let _ = self.store.delete_summary(session_id);
+        }
+
+        if !settings_ready(settings) {
+            return Ok(None);
+        }
+
+        let context = extract_tail_context(file_path)?;
+        if context.is_empty() {
+            return Ok(None);
+        }
+        let summary = request_litellm_summary(settings, &context)?;
+        let Some(summary) = sanitize_generated_summary(&summary) else {
+            return Ok(None);
+        };
+        self.store.put_summary(
+            session_id,
+            cwd,
+            &summary,
+            &settings.interface_llm_model,
+            "litellm",
+        )?;
+        Ok(Some(summary))
     }
 }
 
@@ -351,6 +445,47 @@ fn request_litellm_precis(settings: &AppSettings, context: &str) -> Result<Strin
     Ok(precis)
 }
 
+fn request_litellm_summary(settings: &AppSettings, context: &str) -> Result<String> {
+    let url = completions_url(&settings.litellm_endpoint);
+    let client = Client::builder()
+        .timeout(Duration::from_secs(12))
+        .build()
+        .context("failed to build LiteLLM client")?;
+    let body = serde_json::json!({
+        "model": settings.interface_llm_model,
+        "temperature": 0.2,
+        "max_tokens": 128,
+        "messages": [
+            {
+                "role": "system",
+                "content": "Generate a compact session summary for a desktop preview header. Return only 2 or 3 short sentences, no markdown, no bullets, no quotes. Focus on the current objective, active work, and likely next step."
+            },
+            {
+                "role": "user",
+                "content": format!("Create a concise preview summary from this recent session context:\n\n{context}")
+            }
+        ]
+    });
+
+    let response = client
+        .post(url)
+        .bearer_auth(settings.litellm_api_key.trim())
+        .json(&body)
+        .send()
+        .context("LiteLLM request failed")?
+        .error_for_status()
+        .context("LiteLLM returned an error status")?;
+
+    let value: Value = response
+        .json()
+        .context("failed to parse LiteLLM response")?;
+    let summary = extract_completion_text(&value)
+        .or_else(|| extract_reasoning_title(&value))
+        .or_else(|| heuristic_title_from_context(context))
+        .context("LiteLLM response did not contain a summary")?;
+    Ok(summary)
+}
+
 fn completions_url(endpoint: &str) -> String {
     let trimmed = endpoint.trim().trim_end_matches('/');
     if trimmed.ends_with("/chat/completions") {
@@ -393,9 +528,25 @@ fn sanitize_generated_precis(raw: &str) -> Option<String> {
     Some(sanitized.chars().take(180).collect::<String>())
 }
 
+fn sanitize_generated_summary(raw: &str) -> Option<String> {
+    let compact = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let sanitized = compact
+        .trim_matches(|ch| ch == '"' || ch == '\'' || ch == '`')
+        .trim();
+    if sanitized.is_empty() {
+        return None;
+    }
+    Some(sanitized.chars().take(280).collect::<String>())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::extract_tail_context;
+    use super::{extract_tail_context, sanitize_generated_summary};
     use anyhow::Result;
     use std::fs;
 
@@ -422,6 +573,13 @@ mod tests {
 
         let _ = fs::remove_file(path);
         Ok(())
+    }
+
+    #[test]
+    fn sanitize_generated_summary_compacts_lines() {
+        let summary = sanitize_generated_summary("\"First line.\n\nSecond line.\"\n")
+            .expect("summary");
+        assert_eq!(summary, "First line. Second line.");
     }
 }
 

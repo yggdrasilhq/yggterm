@@ -123,7 +123,9 @@ struct ShellState {
     last_terminal_debug: String,
     last_tree_debug: String,
     generated_precis: BTreeMap<String, String>,
+    generated_summaries: BTreeMap<String, String>,
     precis_requests_in_flight: HashSet<String>,
+    summary_requests_in_flight: HashSet<String>,
     drag_paths: Vec<String>,
     drag_hover_target: Option<DragDropTarget>,
     optimistic_drag_paths: Vec<String>,
@@ -206,6 +208,7 @@ struct RenderSnapshot {
     last_terminal_debug: String,
     last_tree_debug: String,
     active_precis: Option<String>,
+    active_summary: Option<String>,
     drag_paths: Vec<String>,
     drag_hover_target: Option<DragDropTarget>,
     optimistic_drag_paths: Vec<String>,
@@ -337,7 +340,9 @@ impl ShellState {
             last_terminal_debug: "terminal debug idle".to_string(),
             last_tree_debug: "tree debug idle".to_string(),
             generated_precis: BTreeMap::new(),
+            generated_summaries: BTreeMap::new(),
             precis_requests_in_flight: HashSet::new(),
+            summary_requests_in_flight: HashSet::new(),
             drag_paths: Vec::new(),
             drag_hover_target: None,
             optimistic_drag_paths: Vec::new(),
@@ -414,6 +419,10 @@ impl ShellState {
                 .server
                 .active_session()
                 .and_then(|session| self.generated_precis.get(&session.session_path).cloned()),
+            active_summary: self
+                .server
+                .active_session()
+                .and_then(|session| self.generated_summaries.get(&session.session_path).cloned()),
             drag_paths: self.drag_paths.clone(),
             drag_hover_target: self.drag_hover_target.clone(),
             optimistic_drag_paths: self.optimistic_drag_paths.clone(),
@@ -1250,7 +1259,32 @@ fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force:
     });
 }
 
-fn spawn_precis_generation(mut state: Signal<ShellState>, session: ManagedSessionView) {
+fn queue_active_session_title_generation(state: Signal<ShellState>, force: bool) {
+    let Some(session) = state.read().server.active_session().cloned() else {
+        return;
+    };
+    if !session.kind.is_agent() {
+        return;
+    }
+    let row = BrowserRow {
+        kind: BrowserRowKind::Session,
+        full_path: session.session_path.clone(),
+        label: session.title.clone(),
+        detail_label: String::new(),
+        document_kind: None,
+        group_kind: None,
+        session_title: Some(session.title.clone()),
+        depth: 0,
+        host_label: session.host_label.clone(),
+        descendant_sessions: 0,
+        expanded: false,
+        session_id: Some(session.id.clone()),
+        session_cwd: Some(metadata_value(&session, "Cwd")),
+    };
+    queue_title_generation(state, row, force);
+}
+
+fn spawn_precis_generation(mut state: Signal<ShellState>, session: ManagedSessionView, force: bool) {
     if !session.kind.is_agent() {
         return;
     }
@@ -1265,11 +1299,14 @@ fn spawn_precis_generation(mut state: Signal<ShellState>, session: ManagedSessio
     }
 
     let should_start = state.with_mut(|shell| {
-        if shell.generated_precis.contains_key(&session_path)
+        if !force && shell.generated_precis.contains_key(&session_path)
             || shell.precis_requests_in_flight.contains(&session_path)
         {
             false
         } else {
+            if force {
+                shell.generated_precis.remove(&session_path);
+            }
             shell.precis_requests_in_flight.insert(session_path.clone());
             true
         }
@@ -1283,10 +1320,12 @@ fn spawn_precis_generation(mut state: Signal<ShellState>, session: ManagedSessio
         let settings_for_task = settings.clone();
         let outcome = task::spawn_blocking(move || -> Result<Option<String>> {
             let store = SessionStore::open_or_init()?;
-            if let Some(precis) = store.resolve_precis_for_session_path(&path_for_task)? {
+            if !force
+                && let Some(precis) = store.resolve_precis_for_session_path(&path_for_task)?
+            {
                 return Ok(Some(precis));
             }
-            store.generate_precis_for_session_path(&settings_for_task, &path_for_task, false)
+            store.generate_precis_for_session_path(&settings_for_task, &path_for_task, force)
         })
         .await;
 
@@ -1295,13 +1334,118 @@ fn spawn_precis_generation(mut state: Signal<ShellState>, session: ManagedSessio
             match outcome {
                 Ok(Ok(Some(precis))) => {
                     shell.generated_precis.insert(session_path.clone(), precis);
+                    if force {
+                        shell.push_notification(
+                            NotificationTone::Success,
+                            "Precis Regenerated",
+                            "Updated the terminal header precis from recent session context.",
+                        );
+                    }
                 }
                 Ok(Ok(None)) => {}
                 Ok(Err(error)) => {
                     shell.last_action = format!("precis generation failed: {error}");
+                    if force {
+                        shell.push_notification(
+                            NotificationTone::Error,
+                            "Precis Generation Failed",
+                            error.to_string(),
+                        );
+                    }
                 }
                 Err(error) => {
                     shell.last_action = format!("precis task failed: {error}");
+                    if force {
+                        shell.push_notification(
+                            NotificationTone::Error,
+                            "Precis Task Failed",
+                            error.to_string(),
+                        );
+                    }
+                }
+            }
+        });
+    });
+}
+
+fn spawn_summary_generation(mut state: Signal<ShellState>, session: ManagedSessionView, force: bool) {
+    if !session.kind.is_agent() {
+        return;
+    }
+
+    let session_path = session.session_path.clone();
+    let settings = state.read().settings.clone();
+    if settings.litellm_endpoint.trim().is_empty()
+        || settings.litellm_api_key.trim().is_empty()
+        || settings.interface_llm_model.trim().is_empty()
+    {
+        return;
+    }
+
+    let should_start = state.with_mut(|shell| {
+        if !force && shell.generated_summaries.contains_key(&session_path)
+            || shell.summary_requests_in_flight.contains(&session_path)
+        {
+            false
+        } else {
+            if force {
+                shell.generated_summaries.remove(&session_path);
+            }
+            shell.summary_requests_in_flight.insert(session_path.clone());
+            true
+        }
+    });
+    if !should_start {
+        return;
+    }
+
+    spawn(async move {
+        let path_for_task = session_path.clone();
+        let settings_for_task = settings.clone();
+        let outcome = task::spawn_blocking(move || -> Result<Option<String>> {
+            let store = SessionStore::open_or_init()?;
+            if !force
+                && let Some(summary) = store.resolve_summary_for_session_path(&path_for_task)?
+            {
+                return Ok(Some(summary));
+            }
+            store.generate_summary_for_session_path(&settings_for_task, &path_for_task, force)
+        })
+        .await;
+
+        state.with_mut(|shell| {
+            shell.summary_requests_in_flight.remove(&session_path);
+            match outcome {
+                Ok(Ok(Some(summary))) => {
+                    shell.generated_summaries.insert(session_path.clone(), summary);
+                    if force {
+                        shell.push_notification(
+                            NotificationTone::Success,
+                            "Summary Regenerated",
+                            "Updated the preview summary from recent session context.",
+                        );
+                    }
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => {
+                    shell.last_action = format!("summary generation failed: {error}");
+                    if force {
+                        shell.push_notification(
+                            NotificationTone::Error,
+                            "Summary Generation Failed",
+                            error.to_string(),
+                        );
+                    }
+                }
+                Err(error) => {
+                    shell.last_action = format!("summary task failed: {error}");
+                    if force {
+                        shell.push_notification(
+                            NotificationTone::Error,
+                            "Summary Task Failed",
+                            error.to_string(),
+                        );
+                    }
                 }
             }
         });
@@ -3558,9 +3702,17 @@ fn app() -> Element {
             .generated_precis
             .contains_key(&session.session_path);
         if has_precis {
+        } else {
+            spawn_precis_generation(state, session.clone(), false);
+        }
+        let has_summary = state
+            .read()
+            .generated_summaries
+            .contains_key(&session.session_path);
+        if has_summary {
             return;
         }
-        spawn_precis_generation(state, session);
+        spawn_summary_generation(state, session, false);
     });
     use_effect(move || {
         if *dock_pulse_started.read() {
@@ -3804,6 +3956,17 @@ fn app() -> Element {
                                     });
                                     spawn_switch_agent_session_mode(state, active_path, kind);
                                 }
+                            }
+                        },
+                        on_refresh_title: move |_| queue_active_session_title_generation(state, true),
+                        on_refresh_precis: move |_| {
+                            if let Some(session) = state.read().server.active_session().cloned() {
+                                spawn_precis_generation(state, session, true);
+                            }
+                        },
+                        on_refresh_summary: move |_| {
+                            if let Some(session) = state.read().server.active_session().cloned() {
+                                spawn_summary_generation(state, session, true);
                             }
                         },
                     }
@@ -4850,6 +5013,9 @@ fn MainSurface(
     on_save_document: EventHandler<(String, WorkspaceDocumentInput)>,
     on_run_recipe_document: EventHandler<(String, WorkspaceDocumentInput, bool)>,
     on_switch_agent_mode: EventHandler<SessionKind>,
+    on_refresh_title: EventHandler<()>,
+    on_refresh_precis: EventHandler<()>,
+    on_refresh_summary: EventHandler<()>,
 ) -> Element {
     let body = if let Some(session) = snapshot.active_session.clone() {
         match snapshot.active_view_mode {
@@ -4871,7 +5037,22 @@ fn MainSurface(
                             style: "display:flex; flex-direction:column; gap:18px; min-width:0; width:min(980px, 100%); margin:0 auto;",
                             div {
                                 style: "display:flex; align-items:flex-start; justify-content:space-between; gap:16px; flex-wrap:wrap;",
-                                PreviewSummary { session: session.clone(), palette: snapshot.palette }
+                                SessionHeaderCopy {
+                                    title: session.title.clone(),
+                                    subtitle_label: "Summary".to_string(),
+                                    subtitle: snapshot
+                                        .active_summary
+                                        .clone()
+                                        .unwrap_or_else(|| preview_summary_text(&session)),
+                                    meta_line: format!(
+                                        "{} · {}",
+                                        session.host_label,
+                                        metadata_value(&session, "Started")
+                                    ),
+                                    palette: snapshot.palette,
+                                    on_refresh_title: move |_| on_refresh_title.call(()),
+                                    on_refresh_subtitle: move |_| on_refresh_summary.call(()),
+                                }
                                 PreviewToolbar {
                                     palette: snapshot.palette,
                                     preview_layout: snapshot.preview_layout,
@@ -4906,15 +5087,32 @@ fn MainSurface(
             WorkspaceViewMode::Terminal => rsx! {
                 div {
                     style: "display:flex; flex-direction:column; min-width:0; min-height:0; width:100%; height:100%;",
-                    TerminalHeader {
-                        session: session.clone(),
-                        precis: snapshot
-                            .active_precis
-                            .clone()
-                            .unwrap_or_else(|| terminal_precis(&session)),
-                        palette: snapshot.palette,
-                        server_busy: snapshot.server_busy,
-                        on_switch_agent_mode,
+                    div {
+                        style: "display:flex; align-items:flex-start; justify-content:space-between; gap:16px; padding:22px 26px 14px 26px; border-bottom:1px solid rgba(170,190,212,0.16);",
+                        SessionHeaderCopy {
+                            title: session.title.clone(),
+                            subtitle_label: "Precis".to_string(),
+                            subtitle: snapshot
+                                .active_precis
+                                .clone()
+                                .unwrap_or_else(|| terminal_precis(&session)),
+                            meta_line: format!(
+                                "{} · {}",
+                                session.host_label,
+                                metadata_value(&session, "Started")
+                            ),
+                            palette: snapshot.palette,
+                            on_refresh_title: move |_| on_refresh_title.call(()),
+                            on_refresh_subtitle: move |_| on_refresh_precis.call(()),
+                        }
+                        if session.kind.is_agent() {
+                            AgentModeSelector {
+                                selected: session.kind,
+                                palette: snapshot.palette,
+                                disabled: snapshot.server_busy,
+                                on_select: on_switch_agent_mode,
+                            }
+                        }
                     }
                     TerminalCanvas {
                         key: "{terminal_instance_key(&session.session_path, snapshot.settings.terminal_font_size)}",
@@ -4949,34 +5147,92 @@ fn MainSurface(
 }
 
 #[component]
-fn TerminalHeader(
-    session: ManagedSessionView,
-    precis: String,
+fn SessionHeaderCopy(
+    title: String,
+    subtitle_label: String,
+    subtitle: String,
+    meta_line: String,
     palette: Palette,
-    server_busy: bool,
-    on_switch_agent_mode: EventHandler<SessionKind>,
+    on_refresh_title: EventHandler<MouseEvent>,
+    on_refresh_subtitle: EventHandler<MouseEvent>,
 ) -> Element {
     rsx! {
         div {
-            style: "display:flex; align-items:flex-start; justify-content:space-between; gap:16px; padding:22px 26px 14px 26px; border-bottom:1px solid rgba(170,190,212,0.16);",
+            style: "display:flex; flex-direction:column; gap:8px; min-width:280px; flex:1;",
             div {
-                style: "display:flex; flex-direction:column; gap:6px; min-width:0;",
+                style: "display:flex; align-items:flex-start; justify-content:space-between; gap:12px;",
                 div {
-                    style: format!("font-size:22px; font-weight:700; color:{}; line-height:1.2;", palette.text),
-                    "{session.title}"
-                }
-                div {
-                    style: format!("font-size:12px; line-height:1.6; color:{}; max-width:720px; white-space:pre-wrap;", palette.muted),
-                    "{precis}"
+                    style: "display:flex; flex-direction:column; gap:4px; min-width:0;",
+                    div {
+                        style: "display:flex; align-items:center; gap:8px; min-width:0;",
+                        div {
+                            style: format!("font-size:22px; font-weight:700; color:{}; line-height:1.2; min-width:0;", palette.text),
+                            "{title}"
+                        }
+                        RefreshInlineButton {
+                            label: "Regenerate title".to_string(),
+                            palette,
+                            onclick: move |evt| on_refresh_title.call(evt),
+                        }
+                    }
+                    div {
+                        style: format!("font-size:12px; color:{};", palette.muted),
+                        "{meta_line}"
+                    }
                 }
             }
-            if session.kind.is_agent() {
-                AgentModeSelector {
-                    selected: session.kind,
-                    palette,
-                    disabled: server_busy,
-                    on_select: on_switch_agent_mode,
+            div {
+                style: "display:flex; align-items:flex-start; gap:8px; min-width:0;",
+                div {
+                    style: format!(
+                        "font-size:11px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:{}; padding-top:2px;",
+                        palette.muted
+                    ),
+                    "{subtitle_label}"
                 }
+                div {
+                    style: format!("font-size:12px; line-height:1.6; color:{}; max-width:720px; white-space:pre-wrap; min-width:0;", palette.muted),
+                    "{subtitle}"
+                }
+                RefreshInlineButton {
+                    label: format!("Regenerate {}", subtitle_label.to_lowercase()),
+                    palette,
+                    onclick: move |evt| on_refresh_subtitle.call(evt),
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn RefreshInlineButton(
+    label: String,
+    palette: Palette,
+    onclick: EventHandler<MouseEvent>,
+) -> Element {
+    rsx! {
+        button {
+            title: "{label}",
+            style: format!(
+                "display:inline-flex; align-items:center; justify-content:center; width:22px; height:22px; \
+                 border:none; border-radius:999px; background:rgba(255,255,255,0.72); color:{}; \
+                 box-shadow: inset 0 0 0 1px rgba(170,190,212,0.2); padding:0; flex:0 0 auto;",
+                palette.muted
+            ),
+            onclick: move |evt| onclick.call(evt),
+            svg {
+                width: "12",
+                height: "12",
+                view_box: "0 0 24 24",
+                fill: "none",
+                stroke: "currentColor",
+                stroke_width: "2",
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+                path { d: "M21 2v6h-6" }
+                path { d: "M3 12a9 9 0 0 1 15.55-6.36L21 8" }
+                path { d: "M3 22v-6h6" }
+                path { d: "M21 12a9 9 0 0 1-15.55 6.36L3 16" }
             }
         }
     }
@@ -5328,39 +5584,58 @@ fn PreviewGraph(session: ManagedSessionView, palette: Palette) -> Element {
     }
 }
 
-#[component]
-fn PreviewSummary(session: ManagedSessionView, palette: Palette) -> Element {
-    let started = metadata_value(&session, "Started");
-    let messages = metadata_value(&session, "Messages");
-    let preview_blocks = session.preview.blocks.len();
+fn preview_summary_text(session: &ManagedSessionView) -> String {
+    let mut candidates = session
+        .preview
+        .summary
+        .iter()
+        .filter_map(|entry| {
+            let value = entry.value.trim();
+            if value.is_empty()
+                || entry.label == "Session"
+                || entry.label == "Storage"
+                || entry.label == "Started"
+                || entry.label == "Updated"
+            {
+                None
+            } else {
+                Some(format!("{}: {}", entry.label, value))
+            }
+        })
+        .collect::<Vec<_>>();
 
-    rsx! {
-        div {
-            style: format!(
-                "display:flex; flex-direction:column; gap:8px; flex:1; min-width:280px; \
-                 background:linear-gradient(180deg, rgba(255,255,255,0.78) 0%, rgba(248,252,255,0.68) 100%); \
-                 border:none; border-radius:18px; padding:18px 20px; \
-                 box-shadow: inset 0 0 0 1px rgba(255,255,255,0.48);",
-            ),
-            div {
-                style: format!("font-size:11px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:{};", palette.muted),
-                "Session Preview"
+    if candidates.is_empty() {
+        for block in &session.preview.blocks {
+            let joined = block
+                .lines
+                .iter()
+                .map(|line| line.trim())
+                .filter(|line| !line.is_empty())
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !joined.is_empty() {
+                candidates.push(joined);
             }
-            div {
-                style: format!("font-size:22px; font-weight:700; color:{}; line-height:1.18;", palette.text),
-                "{session.title}"
-            }
-            div {
-                style: format!("font-size:12px; color:{};", palette.muted),
-                "{session.host_label} · {started}"
-            }
-            div {
-                style: "display:flex; flex-wrap:wrap; gap:8px;",
-                StatusPill { label: "Messages".to_string(), value: messages, palette }
-                StatusPill { label: "Blocks".to_string(), value: preview_blocks.to_string(), palette }
-                StatusPill { label: "Mode".to_string(), value: "Rendered".to_string(), palette }
+            if candidates.len() >= 2 {
+                break;
             }
         }
+    }
+
+    if candidates.is_empty() {
+        format!(
+            "{} · {} messages · {} blocks",
+            session.host_label,
+            metadata_value(session, "Messages"),
+            session.preview.blocks.len()
+        )
+    } else {
+        candidates
+            .into_iter()
+            .take(2)
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
