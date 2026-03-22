@@ -18,6 +18,19 @@ Use it when another app needs Yggterm-style tree reordering.
 - two-phase `temp -> final` rewrite planning for persistence layers
 - regression-tested handling for adjacent snap boundaries and dragged-anchor cases
 
+## Reusable drag visuals
+
+The drag UI primitives live in:
+
+- [src/drag_visuals.rs](/home/pi/gh/yggterm/crates/yggterm-ui/src/drag_visuals.rs)
+
+They provide:
+
+- `DragGhostCard` for the floating drag card
+- `TreeDropZones` for before/inside/after hover strips
+
+The current sidebar in `src/shell.rs` is the reference integration for both the engine and the visuals.
+
 ### Integration steps
 
 1. Adapt your tree rows into `TreeReorderItem<K>`.
