@@ -958,12 +958,13 @@ fn codex_browser_tree_to_session_node(node: &CodexBrowserTreeNode) -> SessionNod
         }));
     }
 
-    children.extend(
-        node.children
-            .values()
-            .map(codex_browser_tree_to_session_node)
-            .collect::<Vec<_>>(),
-    );
+    let mut nested_children = node
+        .children
+        .values()
+        .map(codex_browser_tree_to_session_node)
+        .collect::<Vec<_>>();
+    nested_children.sort_by(cmp_browser_child_node);
+    children.extend(nested_children);
 
     SessionNode {
         kind: SessionNodeKind::Group,
@@ -978,6 +979,28 @@ fn codex_browser_tree_to_session_node(node: &CodexBrowserTreeNode) -> SessionNod
     }
 }
 
+fn cmp_browser_child_node(left: &SessionNode, right: &SessionNode) -> std::cmp::Ordering {
+    browser_child_sort_key(left)
+        .cmp(&browser_child_sort_key(right))
+        .then_with(|| left.name.cmp(&right.name))
+        .then_with(|| left.path.cmp(&right.path))
+}
+
+fn browser_child_sort_key(node: &SessionNode) -> (u8, String) {
+    let bucket = match (node.kind, node.group_kind) {
+        (SessionNodeKind::Group, Some(WorkspaceGroupKind::Separator)) => 2,
+        (SessionNodeKind::Document, _) => 1,
+        (SessionNodeKind::Group, _) => 0,
+        (SessionNodeKind::CodexSession, _) => 1,
+    };
+    let title = node
+        .title
+        .as_deref()
+        .unwrap_or(&node.name)
+        .to_ascii_lowercase();
+    (bucket, title)
+}
+
 fn short_session_id(session_id: &str) -> String {
     let compact = session_id
         .chars()
@@ -987,5 +1010,54 @@ fn short_session_id(session_id: &str) -> String {
         format!("Q{}", &compact[compact.len() - 7..])
     } else {
         session_id.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_child_sort_places_separators_after_regular_children() {
+        let folder = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "notes".to_string(),
+            title: Some("Notes".to_string()),
+            document_kind: None,
+            group_kind: Some(WorkspaceGroupKind::Folder),
+            path: PathBuf::from("/workspace/notes"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let document = SessionNode {
+            kind: SessionNodeKind::Document,
+            name: "paper".to_string(),
+            title: Some("Paper".to_string()),
+            document_kind: Some(WorkspaceDocumentKind::Note),
+            group_kind: None,
+            path: PathBuf::from("/workspace/paper"),
+            children: Vec::new(),
+            session_id: Some("paper-id".to_string()),
+            cwd: Some("/workspace/paper".to_string()),
+        };
+        let separator = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "separator-1".to_string(),
+            title: Some("Separator".to_string()),
+            document_kind: None,
+            group_kind: Some(WorkspaceGroupKind::Separator),
+            path: PathBuf::from("/workspace/separator-1"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+
+        let mut nodes = vec![separator, document, folder];
+        nodes.sort_by(cmp_browser_child_node);
+
+        assert_eq!(nodes[0].path, PathBuf::from("/workspace/notes"));
+        assert_eq!(nodes[1].path, PathBuf::from("/workspace/paper"));
+        assert_eq!(nodes[2].path, PathBuf::from("/workspace/separator-1"));
     }
 }

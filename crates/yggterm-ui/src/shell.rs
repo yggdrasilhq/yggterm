@@ -213,6 +213,13 @@ struct RenderSnapshot {
     tree_rename_value: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreeSelectionMode {
+    Replace,
+    ExtendRange,
+    Toggle,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 struct Palette {
     shell: &'static str,
@@ -682,9 +689,31 @@ impl ShellState {
         self.notifications.clear();
     }
 
-    fn select_tree_row(&mut self, row: &BrowserRow, extend_range: bool) {
-        if extend_range && is_workspace_row(row) {
+    fn select_tree_row(&mut self, row: &BrowserRow, mode: TreeSelectionMode) {
+        if mode == TreeSelectionMode::ExtendRange && is_workspace_row(row) {
             self.extend_tree_selection(row);
+            return;
+        }
+        if mode == TreeSelectionMode::Toggle && is_workspace_row(row) {
+            if self.selected_tree_paths.contains(&row.full_path) {
+                self.selected_tree_paths.remove(&row.full_path);
+            } else {
+                self.selected_tree_paths.insert(row.full_path.clone());
+                self.selection_anchor = Some(row.full_path.clone());
+            }
+            if self.selected_tree_paths.is_empty() {
+                self.selected_tree_paths.insert(row.full_path.clone());
+                self.selection_anchor = Some(row.full_path.clone());
+            }
+            self.browser.select_path(row.full_path.clone());
+            if cfg!(debug_assertions) {
+                info!(
+                    path=%row.full_path,
+                    selected=%self.selected_tree_paths.len(),
+                    "tree row toggled"
+                );
+            }
+            self.refresh_tree_debug("toggle_tree_row");
             return;
         }
         self.selected_tree_paths.clear();
@@ -692,7 +721,7 @@ impl ShellState {
         self.selection_anchor = Some(row.full_path.clone());
         self.browser.select_path(row.full_path.clone());
         if cfg!(debug_assertions) {
-            info!(path=%row.full_path, extend_range, "tree row selected");
+            info!(path=%row.full_path, mode=?mode, "tree row selected");
         }
         self.refresh_tree_debug("select_tree_row");
     }
@@ -708,14 +737,14 @@ impl ShellState {
             .iter()
             .position(|candidate| candidate.full_path == anchor)
         else {
-            self.select_tree_row(row, false);
+            self.select_tree_row(row, TreeSelectionMode::Replace);
             return;
         };
         let Some(target_ix) = rows
             .iter()
             .position(|candidate| candidate.full_path == row.full_path)
         else {
-            self.select_tree_row(row, false);
+            self.select_tree_row(row, TreeSelectionMode::Replace);
             return;
         };
         let (start, end) = if anchor_ix <= target_ix {
@@ -855,7 +884,7 @@ impl ShellState {
         if !is_workspace_row(row) {
             return;
         }
-        self.select_tree_row(row, false);
+        self.select_tree_row(row, TreeSelectionMode::Replace);
         self.tree_rename_path = Some(row.full_path.clone());
         self.tree_rename_value = row.label.clone();
         self.close_context_menu();
@@ -1989,11 +2018,6 @@ fn queue_new_group_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
 }
 
 fn queue_new_separator_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
-    if row.kind == BrowserRowKind::Separator
-        || row.group_kind == Some(WorkspaceGroupKind::Separator)
-    {
-        return;
-    }
     state.with_mut(|shell| {
         shell.server_busy = true;
         shell.last_action = format!("adding separator in {}", row.label);
@@ -2632,7 +2656,7 @@ fn new_separator_virtual_path_for_row(row: &BrowserRow) -> String {
         }
     };
     format!(
-        "{}/separator-{}",
+        "{}/~separator-{}",
         base.trim_end_matches('/'),
         unique_workspace_leaf_suffix()
     )
@@ -2690,6 +2714,21 @@ fn valid_drop_target(drag_paths: &[String], target_row: &BrowserRow) -> bool {
             && !workspace_path_contains(path, &target_row.full_path)
             && parent_virtual_path(path).as_deref() != Some(target_row.full_path.as_str())
     })
+}
+
+fn clamp_context_menu_position(
+    position: (f64, f64),
+    window_size: (f64, f64),
+    menu_size: (f64, f64),
+) -> (f64, f64) {
+    let margin = 12.0;
+    let min_top = 44.0;
+    let max_left = (window_size.0 - menu_size.0 - margin).max(margin);
+    let max_top = (window_size.1 - menu_size.1 - margin).max(min_top);
+    (
+        position.0.clamp(margin, max_left),
+        position.1.clamp(min_top, max_top),
+    )
 }
 
 fn group_session_cwd(row: &BrowserRow) -> Option<String> {
@@ -3140,10 +3179,11 @@ fn app() -> Element {
             }
         });
     });
+    let dock_desktop = desktop.clone();
     use_effect(move || {
         let _ = *window_epoch.read();
         let snapshot = state.read().snapshot();
-        let request = ghostty_dock_request(&desktop, &snapshot);
+        let request = ghostty_dock_request(&dock_desktop, &snapshot);
         let (should_sync, window_to_hide) = {
             let shell = state.read();
             let should_sync = request.as_ref().is_some_and(|request| {
@@ -3174,6 +3214,8 @@ fn app() -> Element {
         }
     });
     let snapshot = state.read().snapshot();
+    let inner = desktop.inner_size();
+    let context_menu_window_size = (inner.width as f64, inner.height as f64);
     let titlebar_snapshot = snapshot.clone();
     let sidebar_snapshot = snapshot.clone();
     let main_snapshot = snapshot.clone();
@@ -3232,9 +3274,9 @@ fn app() -> Element {
                             move |endpoint| start_local_session(&endpoint, SessionKind::Shell),
                         ),
                         on_create_paper: move |_| queue_new_document(state),
-                        on_select_row: move |(row, extend_range): (BrowserRow, bool)| {
-                            state.with_mut(|shell| shell.select_tree_row(&row, extend_range));
-                            if extend_range && is_workspace_row(&row) {
+                        on_select_row: move |(row, mode): (BrowserRow, TreeSelectionMode)| {
+                            state.with_mut(|shell| shell.select_tree_row(&row, mode));
+                            if mode == TreeSelectionMode::ExtendRange && is_workspace_row(&row) {
                                 return;
                             }
                             if is_live_sidebar_row(&row) {
@@ -3258,7 +3300,7 @@ fn app() -> Element {
                         on_open_context_menu: move |(row, position): (BrowserRow, (f64, f64))| {
                             state.with_mut(|shell| {
                                 if !shell.selected_tree_paths.contains(&row.full_path) {
-                                    shell.select_tree_row(&row, false);
+                                    shell.select_tree_row(&row, TreeSelectionMode::Replace);
                                 }
                                 shell.open_context_menu(row, position)
                             })
@@ -3369,6 +3411,7 @@ fn app() -> Element {
                     ContextMenuOverlay {
                         row: row.clone(),
                         position: snapshot.context_menu_position.unwrap_or((18.0, 60.0)),
+                        window_size: context_menu_window_size,
                         selected_row: snapshot.selected_row.clone(),
                         selected_tree_paths: snapshot.selected_tree_paths.clone(),
                         palette: snapshot.palette,
@@ -3425,7 +3468,7 @@ fn app() -> Element {
                             let row = row.clone();
                             move |_| {
                                 state.with_mut(|shell| {
-                                    shell.select_tree_row(&row, false);
+                                    shell.select_tree_row(&row, TreeSelectionMode::Replace);
                                     shell.open_delete_dialog(false);
                                 });
                             }
@@ -3897,7 +3940,7 @@ fn Sidebar(
     on_start_session: EventHandler<MouseEvent>,
     on_start_terminal: EventHandler<MouseEvent>,
     on_create_paper: EventHandler<MouseEvent>,
-    on_select_row: EventHandler<(BrowserRow, bool)>,
+    on_select_row: EventHandler<(BrowserRow, TreeSelectionMode)>,
     on_delete_selected_items: EventHandler<bool>,
     on_open_context_menu: EventHandler<(BrowserRow, (f64, f64))>,
     on_start_drag: EventHandler<BrowserRow>,
@@ -3977,8 +4020,16 @@ fn Sidebar(
                                 rename_value: snapshot.tree_rename_value.clone(),
                                 palette: snapshot.palette,
                                 on_select: move |evt: MouseEvent| {
-                                    let extend = evt.modifiers().contains(Modifiers::SHIFT);
-                                    on_select_row.call((select_row.clone(), extend));
+                                    let mode = if evt.modifiers().contains(Modifiers::SHIFT) {
+                                        TreeSelectionMode::ExtendRange
+                                    } else if evt.modifiers().contains(Modifiers::CONTROL)
+                                        || evt.modifiers().contains(Modifiers::META)
+                                    {
+                                        TreeSelectionMode::Toggle
+                                    } else {
+                                        TreeSelectionMode::Replace
+                                    };
+                                    on_select_row.call((select_row.clone(), mode));
                                 },
                                 on_open_context_menu: move |coords: (f64, f64)| on_open_context_menu.call((context_row.clone(), coords)),
                                 on_begin_rename: {
@@ -4044,8 +4095,9 @@ fn SidebarRow(
         return rsx! {
             div {
                 style: format!(
-                    "width:100%; display:flex; align-items:center; gap:10px; border:none; background:transparent; cursor:default; \
+                    "width:100%; display:flex; align-items:center; gap:10px; border:none; background:transparent; cursor:{}; \
                      padding:8px 9px 8px {}px; margin:4px 0; opacity:{}; border-radius:12px; background:{}; box-sizing:border-box; min-width:0; overflow:hidden;",
+                    if dragging { "grabbing" } else if draggable { "grab" } else { "default" },
                     indent
                     , if dragging { "0.58" } else { "1" },
                     if selected { palette.accent_soft } else { "transparent" }
@@ -4161,8 +4213,11 @@ fn SidebarRow(
         div {
             style: format!(
                 "width:100%; display:flex; flex-direction:column; align-items:stretch; gap:2px; \
-                 border:none; border-radius:12px; background:{}; padding:6px 9px 6px {}px; margin-bottom:2px; opacity:{}; cursor:default; box-sizing:border-box; min-width:0; overflow:hidden;",
-                background, indent, if dragging { "0.58" } else { "1" }
+                 border:none; border-radius:12px; background:{}; padding:6px 9px 6px {}px; margin-bottom:2px; opacity:{}; cursor:{}; box-sizing:border-box; min-width:0; overflow:hidden;",
+                background,
+                indent,
+                if dragging { "0.58" } else { "1" },
+                if dragging { "grabbing" } else if draggable { "grab" } else { "default" }
             ),
             draggable: false,
             onclick: move |evt| on_select.call(evt),
@@ -6139,6 +6194,7 @@ fn NotificationCard(
 fn ContextMenuOverlay(
     row: BrowserRow,
     position: (f64, f64),
+    window_size: (f64, f64),
     selected_row: Option<BrowserRow>,
     selected_tree_paths: Vec<String>,
     palette: Palette,
@@ -6154,8 +6210,8 @@ fn ContextMenuOverlay(
     on_regenerate: EventHandler<MouseEvent>,
     on_delete_item: EventHandler<MouseEvent>,
 ) -> Element {
-    let menu_left = position.0.clamp(10.0, 1400.0);
-    let menu_top = position.1.clamp(48.0, 980.0);
+    let (menu_left, menu_top) =
+        clamp_context_menu_position(position, window_size, (224.0, 420.0));
     let drag_paths = if selected_tree_paths.is_empty() {
         selected_row
             .as_ref()
@@ -7052,6 +7108,36 @@ mod tests {
         let resolved =
             resolve_creation_context_row(&[folder.clone(), separator.clone()], &separator);
         assert_eq!(resolved.full_path, folder.full_path);
+    }
+
+    #[test]
+    fn new_separator_virtual_path_sorts_after_regular_children() {
+        let folder = BrowserRow {
+            kind: BrowserRowKind::Group,
+            full_path: "/home/pi/gh/notes".to_string(),
+            label: "notes".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: Some(WorkspaceGroupKind::Folder),
+            session_title: None,
+            depth: 3,
+            host_label: String::new(),
+            descendant_sessions: 0,
+            expanded: true,
+            session_id: None,
+            session_cwd: None,
+        };
+
+        let path = new_separator_virtual_path_for_row(&folder);
+
+        assert!(path.starts_with("/home/pi/gh/notes/~separator-"));
+    }
+
+    #[test]
+    fn context_menu_position_clamps_inside_window_bounds() {
+        let position = clamp_context_menu_position((1010.0, 770.0), (1100.0, 820.0), (224.0, 420.0));
+
+        assert_eq!(position, (864.0, 388.0));
     }
 }
 
