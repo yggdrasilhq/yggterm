@@ -5880,6 +5880,11 @@ fn ContextMenuOverlay(
         selected_tree_paths
     };
     let can_move_selected_document = valid_drop_target(&drag_paths, &row);
+    let can_create_in_context = !row.full_path.starts_with("__live_")
+        && matches!(
+            row.kind,
+            BrowserRowKind::Group | BrowserRowKind::Document | BrowserRowKind::Separator
+        );
     let selected_count = drag_paths.len().max(1);
     let menu_title = if selected_count > 1 && drag_paths.iter().any(|path| path == &row.full_path) {
         format!("{selected_count} selected items")
@@ -5903,10 +5908,7 @@ fn ContextMenuOverlay(
                     style: format!("padding:6px 12px 8px 12px; font-size:11px; font-weight:700; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.muted),
                     "{menu_title}"
                 }
-                if (row.kind == BrowserRowKind::Group || row.kind == BrowserRowKind::Separator)
-                    && !row.full_path.starts_with("__live_")
-                    && row.group_kind != Some(WorkspaceGroupKind::Separator)
-                {
+                if can_create_in_context {
                     if can_move_selected_document {
                         button {
                             style: context_menu_action_style(palette, true),
@@ -6003,7 +6005,10 @@ fn DeleteConfirmOverlay(
                 div {
                     style: "display:flex; flex-direction:column; gap:6px;",
                     div {
-                        style: "font-size:19px; font-weight:760; letter-spacing:-0.01em; color:#b3263f;",
+                        style: format!(
+                            "font-size:18px; font-weight:700; letter-spacing:-0.01em; color:{};",
+                            palette.text
+                        ),
                         if pending.hard_delete { "Delete Permanently?" } else { "Delete Selected Items?" }
                     }
                     div {
@@ -6033,7 +6038,7 @@ fn DeleteConfirmOverlay(
                 div {
                     style: "display:flex; justify-content:flex-end; gap:10px;",
                     button {
-                        style: chip_style(palette, false),
+                        style: cancel_confirm_button_style(palette),
                         onclick: move |evt| on_cancel.call(evt),
                         "Cancel"
                     }
@@ -6500,6 +6505,12 @@ fn context_menu_action_style_destructive(_palette: Palette) -> String {
          font-size:12px; font-weight:700; text-align:left; padding:0 12px; margin-bottom:4px;",
         "#c23f4d"
     )
+}
+
+fn cancel_confirm_button_style(_palette: Palette) -> String {
+    "height:34px; padding:0 16px; border:none; border-radius:12px; background:#5fa8ff; color:#ffffff; \
+     font-size:12px; font-weight:700;"
+        .to_string()
 }
 
 fn delete_confirm_button_style(_palette: Palette, hard_delete: bool) -> String {
