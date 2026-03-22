@@ -1,4 +1,4 @@
-use crate::{SessionNode, SessionNodeKind, WorkspaceDocumentKind};
+use crate::{SessionNode, SessionNodeKind, WorkspaceDocumentKind, WorkspaceGroupKind};
 use dirs::home_dir;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -7,6 +7,7 @@ use std::time::Instant;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowserRowKind {
     Group,
+    Separator,
     Session,
     Document,
 }
@@ -18,6 +19,7 @@ pub struct BrowserRow {
     pub label: String,
     pub detail_label: String,
     pub document_kind: Option<WorkspaceDocumentKind>,
+    pub group_kind: Option<WorkspaceGroupKind>,
     pub session_title: Option<String>,
     pub depth: usize,
     pub host_label: String,
@@ -248,7 +250,11 @@ fn flatten_rows(
     }
 
     let descendant_sessions = count_leaf_sessions(node);
-    if !is_leaf && descendant_sessions == 0 && node.title.is_none() {
+    if !is_leaf
+        && node.group_kind != Some(WorkspaceGroupKind::Separator)
+        && descendant_sessions == 0
+        && node.title.is_none()
+    {
         return false;
     }
     let expanded = is_leaf || !filter.is_empty() || expanded_paths.contains(&full_path);
@@ -261,6 +267,8 @@ fn flatten_rows(
                     SessionNodeKind::Document => BrowserRowKind::Document,
                     SessionNodeKind::Group => BrowserRowKind::Group,
                 }
+            } else if node.group_kind == Some(WorkspaceGroupKind::Separator) {
+                BrowserRowKind::Separator
             } else {
                 BrowserRowKind::Group
             },
@@ -268,6 +276,7 @@ fn flatten_rows(
             detail_label: detail_label_for_row(node, &full_path, is_leaf),
             session_title: if is_leaf { node.title.clone() } else { None },
             document_kind: node.document_kind,
+            group_kind: node.group_kind,
             full_path: full_path.clone(),
             depth,
             host_label: host_label_for_row(node, depth),

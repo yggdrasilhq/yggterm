@@ -14,6 +14,14 @@ pub enum WorkspaceDocumentKind {
     TerminalRecipe,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceGroupKind {
+    #[default]
+    Folder,
+    Separator,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceDocument {
     pub id: String,
@@ -43,6 +51,7 @@ pub struct WorkspaceGroup {
     pub id: String,
     pub virtual_path: String,
     pub title: String,
+    pub kind: WorkspaceGroupKind,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -86,6 +95,7 @@ impl WorkspaceStore {
                 id TEXT PRIMARY KEY,
                 virtual_path TEXT NOT NULL UNIQUE,
                 title TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'folder',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -97,6 +107,12 @@ impl WorkspaceStore {
         ensure_optional_column(&conn, "documents", "source_session_kind", "TEXT")?;
         ensure_optional_column(&conn, "documents", "source_session_cwd", "TEXT")?;
         ensure_optional_column(&conn, "documents", "replay_commands", "TEXT")?;
+        ensure_optional_column(
+            &conn,
+            "workspace_groups",
+            "kind",
+            "TEXT NOT NULL DEFAULT 'folder'",
+        )?;
         Ok(Self { conn })
     }
 
@@ -121,7 +137,7 @@ impl WorkspaceStore {
 
     pub fn list_groups(&self) -> Result<Vec<WorkspaceGroup>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, virtual_path, title, created_at, updated_at
+            "SELECT id, virtual_path, title, kind, created_at, updated_at
              FROM workspace_groups
              ORDER BY virtual_path ASC",
         )?;
@@ -130,8 +146,9 @@ impl WorkspaceStore {
                 id: row.get(0)?,
                 virtual_path: row.get(1)?,
                 title: row.get(2)?,
-                created_at: row.get(3)?,
-                updated_at: row.get(4)?,
+                kind: parse_group_kind(row.get::<_, String>(3)?),
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -248,6 +265,15 @@ impl WorkspaceStore {
     }
 
     pub fn put_group(&self, virtual_path: &str, title: Option<&str>) -> Result<WorkspaceGroup> {
+        self.put_group_with_kind(virtual_path, title, WorkspaceGroupKind::Folder)
+    }
+
+    pub fn put_group_with_kind(
+        &self,
+        virtual_path: &str,
+        title: Option<&str>,
+        kind: WorkspaceGroupKind,
+    ) -> Result<WorkspaceGroup> {
         let normalized = normalize_virtual_group_path(virtual_path);
         let now =
             OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
@@ -272,20 +298,28 @@ impl WorkspaceStore {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
-            .unwrap_or_else(|| default_group_title(&normalized));
+            .unwrap_or_else(|| default_group_title(&normalized, kind));
 
         self.conn.execute(
-            "INSERT INTO workspace_groups (id, virtual_path, title, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO workspace_groups (id, virtual_path, title, kind, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(virtual_path) DO UPDATE SET
                title = excluded.title,
+               kind = excluded.kind,
                updated_at = excluded.updated_at",
-            params![id, normalized, resolved_title, created_at, now],
+            params![
+                id,
+                normalized,
+                resolved_title,
+                group_kind_name(kind),
+                created_at,
+                now
+            ],
         )?;
 
         self.conn
             .query_row(
-                "SELECT id, virtual_path, title, created_at, updated_at
+                "SELECT id, virtual_path, title, kind, created_at, updated_at
                  FROM workspace_groups WHERE virtual_path = ?1",
                 params![normalize_virtual_group_path(virtual_path)],
                 |row| {
@@ -293,8 +327,9 @@ impl WorkspaceStore {
                         id: row.get(0)?,
                         virtual_path: row.get(1)?,
                         title: row.get(2)?,
-                        created_at: row.get(3)?,
-                        updated_at: row.get(4)?,
+                        kind: parse_group_kind(row.get::<_, String>(3)?),
+                        created_at: row.get(4)?,
+                        updated_at: row.get(5)?,
                     })
                 },
             )
@@ -387,6 +422,20 @@ fn parse_document_kind(raw: String) -> WorkspaceDocumentKind {
     }
 }
 
+fn group_kind_name(kind: WorkspaceGroupKind) -> &'static str {
+    match kind {
+        WorkspaceGroupKind::Folder => "folder",
+        WorkspaceGroupKind::Separator => "separator",
+    }
+}
+
+fn parse_group_kind(raw: String) -> WorkspaceGroupKind {
+    match raw.as_str() {
+        "separator" => WorkspaceGroupKind::Separator,
+        _ => WorkspaceGroupKind::Folder,
+    }
+}
+
 fn serialize_replay_commands(commands: &[String]) -> Result<String> {
     serde_json::to_string(commands).context("failed to serialize replay commands")
 }
@@ -423,12 +472,15 @@ pub fn default_document_title(virtual_path: &str) -> String {
         .unwrap_or_else(|| "document".to_string())
 }
 
-pub fn default_group_title(virtual_path: &str) -> String {
-    virtual_path
-        .rsplit('/')
-        .find(|segment| !segment.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| "group".to_string())
+pub fn default_group_title(virtual_path: &str, kind: WorkspaceGroupKind) -> String {
+    match kind {
+        WorkspaceGroupKind::Folder => virtual_path
+            .rsplit('/')
+            .find(|segment| !segment.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| "folder".to_string()),
+        WorkspaceGroupKind::Separator => "separator".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -455,6 +507,7 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].virtual_path, "/projects/alpha/ideas");
         assert_eq!(groups[0].title, "Ideas");
+        assert_eq!(groups[0].kind, WorkspaceGroupKind::Folder);
         assert_eq!(group.title, "Ideas");
 
         let _ = fs::remove_dir_all(home);
