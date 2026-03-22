@@ -6,22 +6,15 @@ mod terminal;
 pub use attach::{AttachMetadata, run_attach};
 pub use daemon::{
     ServerEndpoint, ServerRequest, ServerResponse, ServerRuntimeStatus, TerminalStreamChunk,
-    connect_ssh, connect_ssh_custom,
-    default_endpoint, focus_live, open_stored_session, ping, raise_external_window, run_daemon,
-    request_terminal_launch, set_all_preview_blocks_folded, set_view_mode, snapshot,
-    start_command_session, start_local_session, start_local_session_at, status,
-    shutdown, sync_external_window, sync_theme, terminal_ensure, terminal_read, terminal_resize,
-    terminal_write, toggle_preview_block,
+    connect_ssh, connect_ssh_custom, default_endpoint, focus_live, open_stored_session, ping,
+    raise_external_window, request_terminal_launch, run_daemon, set_all_preview_blocks_folded,
+    set_view_mode, shutdown, snapshot, start_command_session, start_local_session,
+    start_local_session_at, status, sync_external_window, sync_theme, terminal_ensure,
+    terminal_read, terminal_resize, terminal_write, toggle_preview_block,
 };
-pub use host::{
-    GhosttyHostKind, GhosttyHostSupport, GhosttyTerminalHostMode, detect_ghostty_host,
-};
+pub use host::{GhosttyHostKind, GhosttyHostSupport, GhosttyTerminalHostMode, detect_ghostty_host};
 pub use terminal::{TerminalChunk, TerminalManager, TerminalReadResult};
 
-use yggterm_core::{
-    SessionNode, SessionNodeKind, SessionStore, TranscriptRole, UiTheme, WorkspaceDocument,
-    WorkspaceDocumentKind, read_codex_transcript_messages,
-};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -29,6 +22,10 @@ use std::fs;
 use std::time::SystemTime;
 use time::{OffsetDateTime, UtcOffset, macros::format_description};
 use uuid::Uuid;
+use yggterm_core::{
+    SessionNode, SessionNodeKind, SessionStore, TranscriptRole, UiTheme, WorkspaceDocument,
+    WorkspaceDocumentKind, read_codex_transcript_messages,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkspaceViewMode {
@@ -272,36 +269,7 @@ impl YggtermServer {
             backend,
             theme,
             ghostty_host,
-            ssh_targets: vec![
-                SshConnectTarget {
-                    label: "prod-app-01".to_string(),
-                    kind: SessionKind::SshShell,
-                    ssh_target: "prod-app-01".to_string(),
-                    prefix: Some("sudo machinectl shell prod".to_string()),
-                    cwd: None,
-                },
-                SshConnectTarget {
-                    label: "design-01".to_string(),
-                    kind: SessionKind::SshShell,
-                    ssh_target: "design-01".to_string(),
-                    prefix: None,
-                    cwd: None,
-                },
-                SshConnectTarget {
-                    label: "ghostty-admin".to_string(),
-                    kind: SessionKind::SshShell,
-                    ssh_target: "ghostty-admin".to_string(),
-                    prefix: Some("tmux new-session -A -s yggterm".to_string()),
-                    cwd: None,
-                },
-                SshConnectTarget {
-                    label: "local-shell".to_string(),
-                    kind: SessionKind::Shell,
-                    ssh_target: "localhost".to_string(),
-                    prefix: None,
-                    cwd: dirs::home_dir().map(|path| path.display().to_string()),
-                },
-            ],
+            ssh_targets: Vec::new(),
             live_session_order: Vec::new(),
         };
 
@@ -487,11 +455,13 @@ impl YggtermServer {
         self.sessions.clear();
         if let Some(active) = snapshot.active_session {
             let key = active.session_path.clone();
-            self.sessions.insert(key, managed_session_from_snapshot(active));
+            self.sessions
+                .insert(key, managed_session_from_snapshot(active));
         }
         for live in snapshot.live_sessions {
             let key = live.session_path.clone();
-            self.sessions.insert(key, managed_session_from_snapshot(live));
+            self.sessions
+                .insert(key, managed_session_from_snapshot(live));
         }
     }
 
@@ -518,19 +488,22 @@ impl YggtermServer {
             .iter()
             .filter_map(|key| self.sessions.get(key).map(|session| (key, session)))
             .filter_map(|(key, session)| {
-                session.ssh_target.as_ref().map(|ssh_target| PersistedLiveSession {
-                    key: key.clone(),
-                    id: session.id.clone(),
-                    title: session.title.clone(),
-                    kind: session.kind,
-                    ssh_target: ssh_target.clone(),
-                    prefix: session.ssh_prefix.clone(),
-                    cwd: session
-                        .metadata
-                        .iter()
-                        .find(|entry| entry.label == "Cwd")
-                        .map(|entry| entry.value.clone()),
-                })
+                session
+                    .ssh_target
+                    .as_ref()
+                    .map(|ssh_target| PersistedLiveSession {
+                        key: key.clone(),
+                        id: session.id.clone(),
+                        title: session.title.clone(),
+                        kind: session.kind,
+                        ssh_target: ssh_target.clone(),
+                        prefix: session.ssh_prefix.clone(),
+                        cwd: session
+                            .metadata
+                            .iter()
+                            .find(|entry| entry.label == "Cwd")
+                            .map(|entry| entry.value.clone()),
+                    })
             })
             .collect();
 
@@ -542,7 +515,11 @@ impl YggtermServer {
         }
     }
 
-    pub fn restore_persisted_state(&mut self, state: PersistedDaemonState, store: Option<&SessionStore>) {
+    pub fn restore_persisted_state(
+        &mut self,
+        state: PersistedDaemonState,
+        store: Option<&SessionStore>,
+    ) {
         for session in state.stored_sessions {
             let document = if session.kind == SessionKind::Document {
                 store.and_then(|store| store.load_document(&session.path).ok().flatten())
@@ -558,7 +535,16 @@ impl YggtermServer {
                 document.as_ref(),
             );
         }
+        let mut restored_live_fingerprints = Vec::<(SessionKind, String, Option<String>)>::new();
         for live in state.live_sessions {
+            if is_legacy_demo_live_session(&live) {
+                continue;
+            }
+            let fingerprint = (live.kind, live.ssh_target.clone(), live.prefix.clone());
+            if restored_live_fingerprints.iter().any(|existing| existing == &fingerprint) {
+                continue;
+            }
+            restored_live_fingerprints.push(fingerprint);
             self.restore_live_session(live);
         }
         self.active_view_mode = state.active_view_mode;
@@ -575,7 +561,9 @@ impl YggtermServer {
         } else {
             self.sessions
                 .iter()
-                .find(|(_, session)| session.source == SessionSource::LiveSsh && session.session_path == key)
+                .find(|(_, session)| {
+                    session.source == SessionSource::LiveSsh && session.session_path == key
+                })
                 .map(|(session_key, _)| session_key.clone())
         };
         if let Some(resolved_key) = resolved_key {
@@ -657,7 +645,13 @@ impl YggtermServer {
         let title = title_hint
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| "recipe shell".to_string());
-        self.insert_live_session(&key, &uuid, SessionKind::Shell, &target, Some(title.clone()));
+        self.insert_live_session(
+            &key,
+            &uuid,
+            SessionKind::Shell,
+            &target,
+            Some(title.clone()),
+        );
         if let Some(session) = self.sessions.get_mut(&key) {
             session.title = title.clone();
             session.launch_command = launch_command.to_string();
@@ -753,19 +747,39 @@ impl YggtermServer {
                     "Switch back to Preview to edit the recipe document without losing the running terminal.".to_string(),
                 ];
                 upsert_session_metadata(&mut session.metadata, "Backend", "xterm.js".to_string());
-                upsert_session_metadata(&mut session.metadata, "Launch PID", "daemon pty".to_string());
+                upsert_session_metadata(
+                    &mut session.metadata,
+                    "Launch PID",
+                    "daemon pty".to_string(),
+                );
                 upsert_session_metadata(&mut session.metadata, "Launch Error", "none".to_string());
-                upsert_session_metadata(&mut session.metadata, "Ghostty Window", "not used".to_string());
+                upsert_session_metadata(
+                    &mut session.metadata,
+                    "Ghostty Window",
+                    "not used".to_string(),
+                );
                 upsert_session_metadata(
                     &mut session.metadata,
                     "Host Mode",
                     "embedded xterm.js".to_string(),
                 );
                 upsert_session_metadata(&mut session.metadata, "Host Token", "daemon".to_string());
-                upsert_session_metadata(&mut session.metadata, "Embedded Surface", "webview".to_string());
-                upsert_session_metadata(&mut session.metadata, "Embedded Host", "xterm.js".to_string());
+                upsert_session_metadata(
+                    &mut session.metadata,
+                    "Embedded Surface",
+                    "webview".to_string(),
+                );
+                upsert_session_metadata(
+                    &mut session.metadata,
+                    "Embedded Host",
+                    "xterm.js".to_string(),
+                );
                 upsert_session_metadata(&mut session.metadata, "Window Error", "none".to_string());
-                upsert_session_metadata(&mut session.metadata, "Status", "recipe running".to_string());
+                upsert_session_metadata(
+                    &mut session.metadata,
+                    "Status",
+                    "recipe running".to_string(),
+                );
                 session.status_line = "xterm.js · recipe runtime attached".to_string();
                 return;
             }
@@ -807,11 +821,7 @@ impl YggtermServer {
                     "Launch PID",
                     "daemon pty".to_string(),
                 );
-                upsert_session_metadata(
-                    &mut session.metadata,
-                    "Launch Error",
-                    "none".to_string(),
-                );
+                upsert_session_metadata(&mut session.metadata, "Launch Error", "none".to_string());
                 upsert_session_metadata(
                     &mut session.metadata,
                     "Ghostty Window",
@@ -822,11 +832,7 @@ impl YggtermServer {
                     "Host Mode",
                     "embedded xterm.js".to_string(),
                 );
-                upsert_session_metadata(
-                    &mut session.metadata,
-                    "Host Token",
-                    "daemon".to_string(),
-                );
+                upsert_session_metadata(&mut session.metadata, "Host Token", "daemon".to_string());
                 upsert_session_metadata(
                     &mut session.metadata,
                     "Embedded Surface",
@@ -837,16 +843,8 @@ impl YggtermServer {
                     "Embedded Host",
                     "xterm.js".to_string(),
                 );
-                upsert_session_metadata(
-                    &mut session.metadata,
-                    "Window Error",
-                    "none".to_string(),
-                );
-                upsert_session_metadata(
-                    &mut session.metadata,
-                    "Status",
-                    "running".to_string(),
-                );
+                upsert_session_metadata(&mut session.metadata, "Window Error", "none".to_string());
+                upsert_session_metadata(&mut session.metadata, "Status", "running".to_string());
                 session.status_line = describe_status_line(
                     session.backend,
                     self.theme,
@@ -945,6 +943,22 @@ impl YggtermServer {
         self.insert_live_session(&key, &uuid, target.kind, target, Some(target.label.clone()));
         (Some(key), false)
     }
+}
+
+fn is_legacy_demo_live_session(live: &PersistedLiveSession) -> bool {
+    matches!(
+        (live.kind, live.ssh_target.as_str(), live.prefix.as_deref()),
+        (
+            SessionKind::SshShell,
+            "prod-app-01",
+            Some("sudo machinectl shell prod")
+        ) | (SessionKind::SshShell, "design-01", None)
+            | (
+                SessionKind::SshShell,
+                "ghostty-admin",
+                Some("tmux new-session -A -s yggterm")
+            )
+    )
 }
 
 fn snapshot_metadata_entries(entries: &[SessionMetadataEntry]) -> Vec<SnapshotMetadataEntry> {
@@ -1197,7 +1211,11 @@ fn build_session(
         .unwrap_or(0);
     let mut preview_summary = vec![
         SessionMetadataEntry {
-            label: if kind == SessionKind::Document { "Document" } else { "Session" },
+            label: if kind == SessionKind::Document {
+                "Document"
+            } else {
+                "Session"
+            },
             value: session_id.clone(),
         },
         SessionMetadataEntry {
@@ -1304,7 +1322,11 @@ fn build_session(
             value: host_label.clone(),
         },
         SessionMetadataEntry {
-            label: if kind == SessionKind::Document { "Document" } else { "Session" },
+            label: if kind == SessionKind::Document {
+                "Document"
+            } else {
+                "Session"
+            },
             value: session_id.clone(),
         },
         SessionMetadataEntry {
@@ -1474,8 +1496,7 @@ fn build_live_session(
 ) -> ManagedSessionView {
     let started_at = format_display_datetime(OffsetDateTime::now_utc());
     let shell_program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-    let default_cwd =
-        target.cwd.clone().unwrap_or_else(|| local_default_cwd());
+    let default_cwd = target.cwd.clone().unwrap_or_else(|| local_default_cwd());
     let remote_command = match &target.prefix {
         Some(prefix) => format!("{prefix} && yggterm server attach {uuid}"),
         None => format!("yggterm server attach {uuid}"),
@@ -1483,7 +1504,11 @@ fn build_live_session(
     let (launch_command, session_path, source_value, target_value, prefix_value, deploy_state) =
         match kind {
             SessionKind::Shell => (
-                format!("cd {} && {} -l", shell_single_quote(&default_cwd), shell_program),
+                format!(
+                    "cd {} && {} -l",
+                    shell_single_quote(&default_cwd),
+                    shell_program
+                ),
                 format!("local://{uuid}"),
                 "local-shell".to_string(),
                 default_cwd.clone(),
@@ -1510,7 +1535,11 @@ fn build_live_session(
                 RemoteDeployState::NotRequired,
             ),
             SessionKind::SshShell => (
-                format!("ssh {} {}", target.ssh_target, shell_single_quote(&remote_command)),
+                format!(
+                    "ssh {} {}",
+                    target.ssh_target,
+                    shell_single_quote(&remote_command)
+                ),
                 format!("ssh://{}/{}", target.ssh_target, uuid),
                 "live-ssh".to_string(),
                 target.ssh_target.clone(),
@@ -1788,8 +1817,16 @@ fn hydrate_document_session(session: &mut ManagedSessionView, document: &Workspa
     upsert_session_metadata(&mut session.metadata, "Source", "document".to_string());
     upsert_session_metadata(&mut session.metadata, "Document", document.title.clone());
     upsert_session_metadata(&mut session.metadata, "Kind", kind_label.to_string());
-    upsert_session_metadata(&mut session.metadata, "Storage", document.virtual_path.clone());
-    upsert_session_metadata(&mut session.metadata, "Updated", document.updated_at.clone());
+    upsert_session_metadata(
+        &mut session.metadata,
+        "Storage",
+        document.virtual_path.clone(),
+    );
+    upsert_session_metadata(
+        &mut session.metadata,
+        "Updated",
+        document.updated_at.clone(),
+    );
     if let Some(source_session_path) = document.source_session_path.clone() {
         upsert_session_metadata(&mut session.metadata, "Source Session", source_session_path);
     }
@@ -1974,10 +2011,7 @@ fn local_default_cwd() -> String {
 }
 
 fn local_session_target(kind: SessionKind, cwd: Option<&str>) -> SshConnectTarget {
-    let cwd = Some(
-        cwd.map(ToOwned::to_owned)
-            .unwrap_or_else(local_default_cwd),
-    );
+    let cwd = Some(cwd.map(ToOwned::to_owned).unwrap_or_else(local_default_cwd));
     match kind {
         SessionKind::Codex => SshConnectTarget {
             label: "codex".to_string(),
@@ -2151,7 +2185,10 @@ fn push_preview_block(
     if lines.is_empty() {
         return;
     }
-    if role == TranscriptRole::Assistant && blocks.is_empty() && looks_like_session_metadata_block(&lines) {
+    if role == TranscriptRole::Assistant
+        && blocks.is_empty()
+        && looks_like_session_metadata_block(&lines)
+    {
         *metadata_entries = parse_session_metadata_lines(&lines);
         return;
     }

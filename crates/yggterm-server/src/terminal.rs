@@ -40,7 +40,12 @@ impl TerminalManager {
         }
     }
 
-    pub fn ensure_session(&mut self, key: &str, launch_command: &str, cwd: Option<&str>) -> Result<()> {
+    pub fn ensure_session(
+        &mut self,
+        key: &str,
+        launch_command: &str,
+        cwd: Option<&str>,
+    ) -> Result<()> {
         if self.sessions.contains_key(key) {
             return Ok(());
         }
@@ -228,7 +233,11 @@ impl PtySessionRuntime {
         {
             let _ = self.write(command);
             for _ in 0..12 {
-                if child.try_wait().context("checking terminal exit state")?.is_some() {
+                if child
+                    .try_wait()
+                    .context("checking terminal exit state")?
+                    .is_some()
+                {
                     return Ok(());
                 }
                 thread::sleep(Duration::from_millis(120));
