@@ -5,6 +5,7 @@ use crate::drag_tree::{
     resolve_tree_drop_placement, tree_parent_path, tree_path_contains,
     valid_drop_target as valid_tree_drop_target,
 };
+use crate::drag_visuals::{DragGhostCard, DragGhostPalette, TreeDropZones};
 use crate::window_icon;
 use anyhow::{Result, anyhow};
 use dioxus::desktop::{
@@ -4643,25 +4644,12 @@ fn SidebarRow(
                         on_end_drag.call(());
                     }
                 },
-                if drag_active {
-                    div {
-                        style: "position:absolute; left:0; right:0; top:0; height:12px; z-index:2;",
-                        onmouseenter: move |evt| on_drag_hover.call((DragDropPlacement::Before, evt)),
-                        onmousemove: move |evt| on_drag_hover.call((DragDropPlacement::Before, evt)),
-                        onmouseup: move |_| {
-                            on_drop_into_row.call(());
-                            on_end_drag.call(());
-                        },
-                    }
-                    div {
-                        style: "position:absolute; left:0; right:0; bottom:0; height:12px; z-index:2;",
-                        onmouseenter: move |evt| on_drag_hover.call((DragDropPlacement::After, evt)),
-                        onmousemove: move |evt| on_drag_hover.call((DragDropPlacement::After, evt)),
-                        onmouseup: move |_| {
-                            on_drop_into_row.call(());
-                            on_end_drag.call(());
-                        },
-                    }
+                TreeDropZones {
+                    drag_active: drag_active,
+                    can_drop_inside: false,
+                    on_drag_hover: on_drag_hover,
+                    on_drop: on_drop_into_row,
+                    on_end_drag: on_end_drag,
                 }
                 div {
                     style: format!(
@@ -4793,36 +4781,12 @@ fn SidebarRow(
                     on_end_drag.call(());
                 }
             },
-            if drag_active {
-                div {
-                    style: "position:absolute; left:0; right:0; top:0; height:12px; z-index:2;",
-                    onmouseenter: move |evt| on_drag_hover.call((DragDropPlacement::Before, evt)),
-                    onmousemove: move |evt| on_drag_hover.call((DragDropPlacement::Before, evt)),
-                    onmouseup: move |_| {
-                        on_drop_into_row.call(());
-                        on_end_drag.call(());
-                    },
-                }
-                if can_drop_inside {
-                    div {
-                        style: "position:absolute; left:0; right:0; top:12px; bottom:12px; z-index:2;",
-                        onmouseenter: move |evt| on_drag_hover.call((DragDropPlacement::Into, evt)),
-                        onmousemove: move |evt| on_drag_hover.call((DragDropPlacement::Into, evt)),
-                        onmouseup: move |_| {
-                            on_drop_into_row.call(());
-                            on_end_drag.call(());
-                        },
-                    }
-                }
-                div {
-                    style: "position:absolute; left:0; right:0; bottom:0; height:12px; z-index:2;",
-                    onmouseenter: move |evt| on_drag_hover.call((DragDropPlacement::After, evt)),
-                    onmousemove: move |evt| on_drag_hover.call((DragDropPlacement::After, evt)),
-                    onmouseup: move |_| {
-                        on_drop_into_row.call(());
-                        on_end_drag.call(());
-                    },
-                }
+            TreeDropZones {
+                drag_active: drag_active,
+                can_drop_inside: can_drop_inside,
+                on_drag_hover: on_drag_hover,
+                on_drop: on_drop_into_row,
+                on_end_drag: on_end_drag,
             }
             div {
                 style: "display:flex; align-items:center; justify-content:space-between; gap:8px;",
@@ -4922,48 +4886,18 @@ fn DragGhost(snapshot: RenderSnapshot) -> Element {
         format!("Drop {placement} {leaf}")
     });
     rsx! {
-        div {
-            style: format!(
-                "position:fixed; left:{}px; top:{}px; z-index:1600; pointer-events:none; \
-                 transform:translate(16px, 10px); display:flex; flex-direction:column; gap:4px; \
-                 min-width:150px; max-width:260px; padding:10px 12px; border-radius:12px; \
-                 background:rgba(255,255,255,0.92); color:{}; box-shadow:0 18px 42px rgba(72, 101, 128, 0.22), \
-                 inset 0 0 0 1px rgba(201, 216, 230, 0.92); backdrop-filter: blur(12px); \
-                 -webkit-backdrop-filter: blur(12px);",
-                x, y, snapshot.palette.text
-            ),
-            div {
-                style: "display:flex; align-items:center; gap:8px;",
-                div {
-                    style: format!(
-                        "width:9px; height:9px; border-radius:999px; background:{}; flex:none;",
-                        snapshot.palette.accent
-                    ),
-                }
-                span {
-                    style: "font-size:12px; font-weight:800; letter-spacing:0.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
-                    "{primary_label}"
-                }
-                if extra_count > 0 {
-                    span {
-                        style: format!(
-                            "margin-left:auto; padding:2px 7px; border-radius:999px; font-size:10px; font-weight:800; \
-                             color:{}; background:{};",
-                            snapshot.palette.accent, snapshot.palette.accent_soft
-                        ),
-                        "+{extra_count}"
-                    }
-                }
-            }
-            if let Some(target_hint) = drop_target_hint {
-                div {
-                    style: format!(
-                        "font-size:10.5px; font-weight:700; letter-spacing:0.01em; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
-                        snapshot.palette.muted
-                    ),
-                    "{target_hint}"
-                }
-            }
+        DragGhostCard {
+            x: x,
+            y: y,
+            primary_label: primary_label,
+            extra_count: extra_count,
+            target_hint: drop_target_hint,
+            palette: DragGhostPalette {
+                text: snapshot.palette.text,
+                muted: snapshot.palette.muted,
+                accent: snapshot.palette.accent,
+                accent_soft: snapshot.palette.accent_soft,
+            },
         }
     }
 }
