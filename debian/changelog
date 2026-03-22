@@ -1,3 +1,11 @@
+yggterm (2.0.9-1) unstable; urgency=medium
+
+  * Move Codex mode switching into the terminal header and guard live mode swaps.
+  * Remove the separate LiteLLM creation action and simplify settings into configuration and delivery controls.
+  * Add a segmented notification delivery control and cleaner terminal session header copy.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sun, 22 Mar 2026 11:05:00 +0530
+
 yggterm (2.0.8-1) unstable; urgency=medium
 
   * Fix live terminal zoom updates in the embedded xterm viewport.

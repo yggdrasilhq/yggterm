@@ -63,6 +63,10 @@ pub enum ServerRequest {
         cwd: Option<String>,
         title_hint: Option<String>,
     },
+    SwitchAgentSessionMode {
+        path: String,
+        session_kind: SessionKind,
+    },
     StartCommandSession {
         cwd: Option<String>,
         title_hint: Option<String>,
@@ -268,6 +272,34 @@ impl DaemonRuntime {
                 );
                 self.persist()?;
                 self.snapshot_response(Some(format!("started {key}")))
+            }
+            ServerRequest::SwitchAgentSessionMode { path, session_kind } => {
+                if self.terminals.recent_activity(&path, std::time::Duration::from_secs(4)) {
+                    bail!("session is still active; wait for it to settle before switching modes");
+                }
+                let stop_command = self.server.terminal_stop_command(&path);
+                self.server.switch_agent_session_mode(&path, session_kind)?;
+                if let Some((launch_command, cwd)) = self.server.terminal_spec(&path) {
+                    if self.terminals.has_session(&path) {
+                        self.terminals.restart_session(
+                            &path,
+                            &launch_command,
+                            cwd.as_deref(),
+                            stop_command.as_deref(),
+                        )?;
+                    }
+                }
+                self.persist()?;
+                self.snapshot_response(Some(format!(
+                    "switched to {}",
+                    match session_kind {
+                        SessionKind::Codex => "codex",
+                        SessionKind::CodexLiteLlm => "codex-litellm",
+                        SessionKind::Shell => "shell",
+                        SessionKind::SshShell => "ssh",
+                        SessionKind::Document => "document",
+                    }
+                )))
             }
             ServerRequest::StartCommandSession {
                 cwd,
@@ -536,6 +568,20 @@ pub fn focus_live(
         endpoint,
         &ServerRequest::FocusLive {
             key: key.to_string(),
+        },
+    )?)
+}
+
+pub fn switch_agent_session_mode(
+    endpoint: &ServerEndpoint,
+    path: &str,
+    kind: SessionKind,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
+    expect_snapshot(send_request(
+        endpoint,
+        &ServerRequest::SwitchAgentSessionMode {
+            path: path.to_string(),
+            session_kind: kind,
         },
     )?)
 }
