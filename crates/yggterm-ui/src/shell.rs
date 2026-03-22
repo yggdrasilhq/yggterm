@@ -4293,7 +4293,6 @@ fn SidebarRow(
 ) -> Element {
     let indent = row.depth * 12 + 12;
     let draggable = is_workspace_row(&row);
-    let mut drag_started = use_signal(|| false);
     if row.kind == BrowserRowKind::Separator {
         return rsx! {
             div {
@@ -4312,11 +4311,10 @@ fn SidebarRow(
                     if draggable
                         && evt.trigger_button() == Some(MouseButton::Primary)
                         && !evt.modifiers().contains(Modifiers::SHIFT)
-                        && !evt.modifiers().contains(Modifiers::CONTROL)
-                        && !evt.modifiers().contains(Modifiers::META)
+                    && !evt.modifiers().contains(Modifiers::CONTROL)
+                    && !evt.modifiers().contains(Modifiers::META)
                     {
                         evt.prevent_default();
-                        drag_started.set(true);
                         on_start_drag.call(evt);
                     }
                 },
@@ -4341,12 +4339,9 @@ fn SidebarRow(
                     on_drag_leave.call(evt);
                 },
                 onmouseup: move |evt| {
-                    if drag_active || evt.trigger_button() == Some(MouseButton::Primary) {
-                        if drag_started() {
-                            on_drop_into_row.call(evt.clone());
-                            on_end_drag.call(evt);
-                        }
-                        drag_started.set(false);
+                    if drag_active {
+                        on_drop_into_row.call(evt.clone());
+                        on_end_drag.call(evt);
                     }
                 },
                 div {
@@ -4450,7 +4445,6 @@ fn SidebarRow(
                     && !evt.modifiers().contains(Modifiers::META)
                 {
                     evt.prevent_default();
-                    drag_started.set(true);
                     on_start_drag.call(evt);
                 }
             },
@@ -4475,12 +4469,9 @@ fn SidebarRow(
                 on_drag_leave.call(evt);
             },
             onmouseup: move |evt| {
-                if drag_active || evt.trigger_button() == Some(MouseButton::Primary) {
-                    if drag_started() {
-                        on_drop_into_row.call(evt.clone());
-                        on_end_drag.call(evt);
-                    }
-                    drag_started.set(false);
+                if drag_active {
+                    on_drop_into_row.call(evt.clone());
+                    on_end_drag.call(evt);
                 }
             },
             div {
