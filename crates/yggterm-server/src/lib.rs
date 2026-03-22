@@ -9,9 +9,8 @@ pub use daemon::{
     connect_ssh, connect_ssh_custom, default_endpoint, focus_live, open_stored_session, ping,
     raise_external_window, request_terminal_launch, run_daemon, set_all_preview_blocks_folded,
     set_view_mode, shutdown, snapshot, start_command_session, start_local_session,
-    start_local_session_at, status, sync_external_window, sync_theme, terminal_ensure,
-    terminal_read, terminal_resize, terminal_write, toggle_preview_block,
-    switch_agent_session_mode,
+    start_local_session_at, status, switch_agent_session_mode, sync_external_window, sync_theme,
+    terminal_ensure, terminal_read, terminal_resize, terminal_write, toggle_preview_block,
 };
 pub use host::{GhosttyHostKind, GhosttyHostSupport, GhosttyTerminalHostMode, detect_ghostty_host};
 pub use terminal::{TerminalChunk, TerminalManager, TerminalReadResult};
@@ -392,7 +391,11 @@ impl YggtermServer {
         self.active_session_path.as_deref()
     }
 
-    pub fn switch_agent_session_mode(&mut self, path: &str, target_kind: SessionKind) -> anyhow::Result<()> {
+    pub fn switch_agent_session_mode(
+        &mut self,
+        path: &str,
+        target_kind: SessionKind,
+    ) -> anyhow::Result<()> {
         if !target_kind.is_agent() {
             anyhow::bail!("target mode is not an agent session")
         }
@@ -423,7 +426,8 @@ impl YggtermServer {
             )
         } else {
             let cwd = metadata_value(&existing, "Cwd");
-            let target = local_session_target(target_kind, (!cwd.is_empty()).then_some(cwd.as_str()));
+            let target =
+                local_session_target(target_kind, (!cwd.is_empty()).then_some(cwd.as_str()));
             let mut session = build_live_session(
                 &existing.id,
                 target_kind,
@@ -599,7 +603,10 @@ impl YggtermServer {
                 continue;
             }
             let fingerprint = (live.kind, live.ssh_target.clone(), live.prefix.clone());
-            if restored_live_fingerprints.iter().any(|existing| existing == &fingerprint) {
+            if restored_live_fingerprints
+                .iter()
+                .any(|existing| existing == &fingerprint)
+            {
                 continue;
             }
             restored_live_fingerprints.push(fingerprint);

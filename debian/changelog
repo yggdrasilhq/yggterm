@@ -1,3 +1,12 @@
+yggterm (2.0.10-1) unstable; urgency=medium
+
+  * Extract reusable drag, chrome, rail, and notification primitives into yggterm-ui.
+  * Stabilize sidebar drag-and-drop reordering for single and multi-selection workflows.
+  * Keep adjacent snap boundaries and dragged-row selection consistent after drop.
+  * Fold in formatting-only yggterm-server cleanup from prior terminal mode switching work.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sun, 22 Mar 2026 22:55:00 +0530
+
 yggterm (2.0.9-1) unstable; urgency=medium
 
   * Move Codex mode switching into the terminal header and guard live mode swaps.
