@@ -31,8 +31,9 @@ use yggterm_server::{
     TerminalBackend, WorkspaceViewMode, YggtermServer, connect_ssh_custom, focus_live,
     open_stored_session, ping, request_terminal_launch, set_all_preview_blocks_folded,
     set_view_mode as daemon_set_view_mode, snapshot as daemon_snapshot, start_command_session,
-    start_local_session, start_local_session_at, status, terminal_ensure, terminal_read,
-    terminal_resize, terminal_write, toggle_preview_block as daemon_toggle_preview_block,
+    start_local_session, start_local_session_at, status, switch_agent_session_mode,
+    terminal_ensure, terminal_read, terminal_resize, terminal_write,
+    toggle_preview_block as daemon_toggle_preview_block,
 };
 
 static BOOTSTRAP: OnceCell<ShellBootstrap> = OnceCell::new();
@@ -134,6 +135,13 @@ enum NotificationTone {
 enum PreviewLayoutMode {
     Chat,
     Graph,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NotificationDeliveryMode {
+    InApp,
+    Both,
+    System,
 }
 
 #[derive(Clone, PartialEq)]
@@ -530,34 +538,13 @@ impl ShellState {
         self.last_action = "updated interface llm".to_string();
     }
 
-    fn update_default_agent_profile(&mut self, profile: AgentSessionProfile) {
-        self.settings.default_agent_profile = profile;
+    fn update_notification_delivery(&mut self, mode: NotificationDeliveryMode) {
+        apply_notification_delivery_mode(&mut self.settings, mode);
         self.persist_settings();
-        self.last_action = match profile {
-            AgentSessionProfile::Codex => "new sessions now default to codex".to_string(),
-            AgentSessionProfile::CodexLiteLlm => {
-                "new sessions now default to codex-litellm".to_string()
-            }
-        };
-    }
-
-    fn update_in_app_notifications(&mut self, enabled: bool) {
-        self.settings.in_app_notifications = enabled;
-        self.persist_settings();
-        self.last_action = if enabled {
-            "in-app notifications enabled".to_string()
-        } else {
-            "in-app notifications disabled".to_string()
-        };
-    }
-
-    fn update_system_notifications(&mut self, enabled: bool) {
-        self.settings.system_notifications = enabled;
-        self.persist_settings();
-        self.last_action = if enabled {
-            "system notifications enabled".to_string()
-        } else {
-            "system notifications disabled".to_string()
+        self.last_action = match mode {
+            NotificationDeliveryMode::InApp => "in-app notifications enabled".to_string(),
+            NotificationDeliveryMode::Both => "in-app and system notifications enabled".to_string(),
+            NotificationDeliveryMode::System => "system notifications enabled".to_string(),
         };
     }
 
@@ -1147,6 +1134,23 @@ fn spawn_connect_ssh_custom(mut state: Signal<ShellState>) {
                 );
             }
         });
+    });
+}
+
+fn spawn_switch_agent_session_mode(mut state: Signal<ShellState>, path: String, target_kind: SessionKind) {
+    state.with_mut(|shell| {
+        shell.server_busy = true;
+        shell.last_action = format!(
+            "switching to {}",
+            match target_kind {
+                SessionKind::Codex => "codex",
+                SessionKind::CodexLiteLlm => "codex-litellm",
+                _ => "session",
+            }
+        );
+    });
+    spawn_server_snapshot_action(state, "switching agent mode".to_string(), move |endpoint| {
+        switch_agent_session_mode(&endpoint, &path, target_kind)
     });
 }
 
@@ -2583,11 +2587,6 @@ fn app() -> Element {
                             "starting codex session".to_string(),
                             move |endpoint| start_local_session(&endpoint, SessionKind::Codex),
                         ),
-                        on_start_codex_litellm: move |_| spawn_server_snapshot_action(
-                            state,
-                            "starting codex-litellm session".to_string(),
-                            move |endpoint| start_local_session(&endpoint, SessionKind::CodexLiteLlm),
-                        ),
                         on_start_shell: move |_| spawn_server_snapshot_action(
                             state,
                             "starting local shell".to_string(),
@@ -2658,25 +2657,39 @@ fn app() -> Element {
                                 },
                             )
                         },
+                        on_switch_agent_mode: move |kind: SessionKind| {
+                            let (active_session, active_path) = {
+                                let shell = state.read();
+                                (
+                                    shell.server.active_session().cloned(),
+                                    shell.server.active_session_path().map(ToOwned::to_owned),
+                                )
+                            };
+                            if let (Some(session), Some(active_path)) = (active_session, active_path) {
+                                if session.kind != kind {
+                                    state.with_mut(|shell| {
+                                        shell.settings.default_agent_profile = match kind {
+                                            SessionKind::CodexLiteLlm => AgentSessionProfile::CodexLiteLlm,
+                                            _ => AgentSessionProfile::Codex,
+                                        };
+                                        shell.persist_settings();
+                                    });
+                                    spawn_switch_agent_session_mode(state, active_path, kind);
+                                }
+                            }
+                        },
                     }
                     RightRail {
                         snapshot: metadata_snapshot,
                         on_endpoint_change: move |value: String| state.with_mut(|shell| shell.update_litellm_endpoint(value)),
                         on_api_key_change: move |value: String| state.with_mut(|shell| shell.update_litellm_api_key(value)),
                         on_model_change: move |value: String| state.with_mut(|shell| shell.update_interface_llm_model(value)),
-                        on_set_agent_profile: move |profile: AgentSessionProfile| {
-                            state.with_mut(|shell| shell.update_default_agent_profile(profile))
-                        },
-                        on_set_in_app_notifications: move |enabled: bool| {
-                            state.with_mut(|shell| shell.update_in_app_notifications(enabled))
-                        },
-                        on_set_system_notifications: move |enabled: bool| {
-                            state.with_mut(|shell| shell.update_system_notifications(enabled))
+                        on_set_notification_delivery: move |mode: NotificationDeliveryMode| {
+                            state.with_mut(|shell| shell.update_notification_delivery(mode))
                         },
                         on_set_notification_sound: move |enabled: bool| {
                             state.with_mut(|shell| shell.update_notification_sound(enabled))
                         },
-                        on_create_document: move |_| queue_new_document(state),
                         on_generate_titles: move |_| state.with_mut(|shell| shell.generate_session_titles()),
                         on_adjust_ui_zoom: move |delta: i32| state.with_mut(|shell| shell.adjust_ui_zoom(delta)),
                         on_adjust_main_zoom: move |delta: i32| {
@@ -2703,10 +2716,6 @@ fn app() -> Element {
                         on_create_group: {
                             let row = row.clone();
                             move |_| queue_new_group_for_row(state, row.clone())
-                        },
-                        on_create_group_codex_litellm: {
-                            let row = row.clone();
-                            move |_| spawn_start_group_session(state, row.clone(), SessionKind::CodexLiteLlm)
                         },
                         on_create_group_shell: {
                             let row = row.clone();
@@ -3202,7 +3211,6 @@ fn ResizeHandle(style: String, direction: ResizeDirection) -> Element {
 fn Sidebar(
     snapshot: RenderSnapshot,
     on_start_codex: EventHandler<MouseEvent>,
-    on_start_codex_litellm: EventHandler<MouseEvent>,
     on_start_shell: EventHandler<MouseEvent>,
     on_create_document: EventHandler<MouseEvent>,
     on_select_row: EventHandler<(BrowserRow, bool)>,
@@ -3242,11 +3250,6 @@ fn Sidebar(
                     label: "+Codex".to_string(),
                     palette: snapshot.palette,
                     onclick: on_start_codex,
-                }
-                SidebarQuickAction {
-                    label: "+LiteLLM".to_string(),
-                    palette: snapshot.palette,
-                    onclick: on_start_codex_litellm,
                 }
                 SidebarQuickAction {
                     label: "+Shell".to_string(),
@@ -3577,6 +3580,7 @@ fn MainSurface(
     on_set_preview_layout: EventHandler<PreviewLayoutMode>,
     on_save_document: EventHandler<(String, WorkspaceDocumentInput)>,
     on_run_recipe_document: EventHandler<(String, WorkspaceDocumentInput, bool)>,
+    on_switch_agent_mode: EventHandler<SessionKind>,
 ) -> Element {
     let body = if let Some(session) = snapshot.active_session.clone() {
         match snapshot.active_view_mode {
@@ -3633,6 +3637,12 @@ fn MainSurface(
             WorkspaceViewMode::Terminal => rsx! {
                 div {
                     style: "display:flex; flex-direction:column; min-width:0; min-height:0; width:100%; height:100%;",
+                    TerminalHeader {
+                        session: session.clone(),
+                        palette: snapshot.palette,
+                        server_busy: snapshot.server_busy,
+                        on_switch_agent_mode,
+                    }
                     TerminalCanvas {
                         key: "{terminal_instance_key(&session.session_path, snapshot.settings.terminal_font_size)}",
                         session: session.clone(),
@@ -3660,6 +3670,40 @@ fn MainSurface(
                     snapshot.palette.panel, snapshot.palette.panel_shadow
                 ),
                 {body}
+            }
+        }
+    }
+}
+
+#[component]
+fn TerminalHeader(
+    session: ManagedSessionView,
+    palette: Palette,
+    server_busy: bool,
+    on_switch_agent_mode: EventHandler<SessionKind>,
+) -> Element {
+    let precis = terminal_precis(&session);
+    rsx! {
+        div {
+            style: "display:flex; align-items:flex-start; justify-content:space-between; gap:16px; padding:22px 26px 14px 26px; border-bottom:1px solid rgba(170,190,212,0.16);",
+            div {
+                style: "display:flex; flex-direction:column; gap:6px; min-width:0;",
+                div {
+                    style: format!("font-size:22px; font-weight:700; color:{}; line-height:1.2;", palette.text),
+                    "#{session.title}"
+                }
+                div {
+                    style: format!("font-size:12px; line-height:1.6; color:{}; max-width:720px; white-space:pre-wrap;", palette.muted),
+                    "{precis}"
+                }
+            }
+            if session.kind.is_agent() {
+                AgentModeSelector {
+                    selected: session.kind,
+                    palette,
+                    disabled: server_busy,
+                    on_select: on_switch_agent_mode,
+                }
             }
         }
     }
@@ -4047,6 +4091,62 @@ fn PreviewSummary(session: ManagedSessionView, palette: Palette) -> Element {
     }
 }
 
+fn terminal_precis(session: &ManagedSessionView) -> String {
+    let mut candidates = Vec::new();
+    for block in &session.preview.blocks {
+        for line in &block.lines {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                candidates.push(trimmed.to_string());
+            }
+        }
+    }
+    for section in &session.rendered_sections {
+        for line in &section.lines {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                candidates.push(trimmed.to_string());
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|line| {
+            !line.starts_with("Resume Codex session")
+                && !line.starts_with("Open live terminal")
+                && !line.starts_with("Preview mode renders")
+                && !line.starts_with("GUI selection asks")
+                && !line.starts_with("Launch command prepared")
+        })
+        .unwrap_or_else(|| session.status_line.clone())
+}
+
+#[component]
+fn AgentModeSelector(
+    selected: SessionKind,
+    palette: Palette,
+    disabled: bool,
+    on_select: EventHandler<SessionKind>,
+) -> Element {
+    rsx! {
+        div {
+            style: toggle_slider_style(palette),
+            button {
+                style: toggle_slider_end_style(palette, selected == SessionKind::Codex),
+                disabled: disabled,
+                onclick: move |_| on_select.call(SessionKind::Codex),
+                "Codex"
+            }
+            button {
+                style: toggle_slider_end_style(palette, selected == SessionKind::CodexLiteLlm),
+                disabled: disabled,
+                onclick: move |_| on_select.call(SessionKind::CodexLiteLlm),
+                "Codex LiteLLM"
+            }
+        }
+    }
+}
+
 #[component]
 fn PreviewBlock(
     block_ix: usize,
@@ -4298,6 +4398,31 @@ fn current_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn notification_delivery_mode(settings: &AppSettings) -> NotificationDeliveryMode {
+    match (settings.in_app_notifications, settings.system_notifications) {
+        (true, true) => NotificationDeliveryMode::Both,
+        (false, true) => NotificationDeliveryMode::System,
+        _ => NotificationDeliveryMode::InApp,
+    }
+}
+
+fn apply_notification_delivery_mode(settings: &mut AppSettings, mode: NotificationDeliveryMode) {
+    match mode {
+        NotificationDeliveryMode::InApp => {
+            settings.in_app_notifications = true;
+            settings.system_notifications = false;
+        }
+        NotificationDeliveryMode::Both => {
+            settings.in_app_notifications = true;
+            settings.system_notifications = true;
+        }
+        NotificationDeliveryMode::System => {
+            settings.in_app_notifications = false;
+            settings.system_notifications = true;
+        }
+    }
 }
 
 fn emit_notification_chime() {
@@ -4617,11 +4742,8 @@ fn RightRail(
     on_endpoint_change: EventHandler<String>,
     on_api_key_change: EventHandler<String>,
     on_model_change: EventHandler<String>,
-    on_set_agent_profile: EventHandler<AgentSessionProfile>,
-    on_set_in_app_notifications: EventHandler<bool>,
-    on_set_system_notifications: EventHandler<bool>,
+    on_set_notification_delivery: EventHandler<NotificationDeliveryMode>,
     on_set_notification_sound: EventHandler<bool>,
-    on_create_document: EventHandler<MouseEvent>,
     on_generate_titles: EventHandler<MouseEvent>,
     on_adjust_ui_zoom: EventHandler<i32>,
     on_adjust_main_zoom: EventHandler<i32>,
@@ -4659,11 +4781,8 @@ fn RightRail(
                     on_endpoint_change,
                     on_api_key_change,
                     on_model_change,
-                    on_set_agent_profile,
-                    on_set_in_app_notifications,
-                    on_set_system_notifications,
+                    on_set_notification_delivery,
                     on_set_notification_sound,
-                    on_create_document,
                     on_generate_titles,
                     on_adjust_ui_zoom,
                     on_adjust_main_zoom,
@@ -4733,11 +4852,8 @@ fn SettingsRailBody(
     on_endpoint_change: EventHandler<String>,
     on_api_key_change: EventHandler<String>,
     on_model_change: EventHandler<String>,
-    on_set_agent_profile: EventHandler<AgentSessionProfile>,
-    on_set_in_app_notifications: EventHandler<bool>,
-    on_set_system_notifications: EventHandler<bool>,
+    on_set_notification_delivery: EventHandler<NotificationDeliveryMode>,
     on_set_notification_sound: EventHandler<bool>,
-    on_create_document: EventHandler<MouseEvent>,
     on_generate_titles: EventHandler<MouseEvent>,
     on_adjust_ui_zoom: EventHandler<i32>,
     on_adjust_main_zoom: EventHandler<i32>,
@@ -4803,25 +4919,10 @@ fn SettingsRailBody(
                 palette: snapshot.palette,
                 on_change: on_model_change,
             }
-            ProfileToggleRow {
-                label: "Agent Session".to_string(),
+            NotificationDeliveryRow {
                 palette: snapshot.palette,
-                selected: snapshot.settings.default_agent_profile,
-                on_select: on_set_agent_profile,
-            }
-            BooleanSettingRow {
-                label: "In-App Notifications".to_string(),
-                value: snapshot.settings.in_app_notifications,
-                palette: snapshot.palette,
-                recommended_label: Some("Recommended".to_string()),
-                on_change: on_set_in_app_notifications,
-            }
-            BooleanSettingRow {
-                label: "System Notifications".to_string(),
-                value: snapshot.settings.system_notifications,
-                palette: snapshot.palette,
-                recommended_label: None,
-                on_change: on_set_system_notifications,
+                selected: notification_delivery_mode(&snapshot.settings),
+                on_select: on_set_notification_delivery,
             }
             BooleanSettingRow {
                 label: "Notification Sound".to_string(),
@@ -4829,15 +4930,6 @@ fn SettingsRailBody(
                 palette: snapshot.palette,
                 recommended_label: None,
                 on_change: on_set_notification_sound,
-            }
-            button {
-                style: format!(
-                    "height:32px; border:none; border-radius:10px; background:{}; color:{}; \
-                     font-size:11px; font-weight:700; text-align:center;",
-                    snapshot.palette.panel_alt, snapshot.palette.text
-                ),
-                onclick: move |evt| on_create_document.call(evt),
-                "New Document"
             }
             ZoomSettingRow {
                 label: "Interface Zoom".to_string(),
@@ -5124,7 +5216,6 @@ fn ContextMenuOverlay(
     on_close: EventHandler<MouseEvent>,
     on_create_group: EventHandler<MouseEvent>,
     on_create_group_codex: EventHandler<MouseEvent>,
-    on_create_group_codex_litellm: EventHandler<MouseEvent>,
     on_create_group_shell: EventHandler<MouseEvent>,
     on_create_group_document: EventHandler<MouseEvent>,
     on_create_group_recipe: EventHandler<MouseEvent>,
@@ -5182,15 +5273,6 @@ fn ContextMenuOverlay(
                         ),
                         onclick: move |evt| on_create_group_codex.call(evt),
                         "New Codex Session"
-                    }
-                    button {
-                        style: format!(
-                            "width:100%; height:30px; border:none; border-radius:10px; background:{}; color:{}; \
-                             font-size:12px; font-weight:600; text-align:left; padding:0 10px; margin-bottom:6px;",
-                            palette.panel_alt, palette.text
-                        ),
-                        onclick: move |evt| on_create_group_codex_litellm.call(evt),
-                        "New Codex LiteLLM"
                     }
                     button {
                         style: format!(
@@ -5323,39 +5405,44 @@ fn SettingsField(
 }
 
 #[component]
-fn ProfileToggleRow(
-    label: String,
-    selected: AgentSessionProfile,
+fn NotificationDeliveryRow(
     palette: Palette,
-    on_select: EventHandler<AgentSessionProfile>,
+    selected: NotificationDeliveryMode,
+    on_select: EventHandler<NotificationDeliveryMode>,
 ) -> Element {
     rsx! {
         div {
             style: "display:flex; flex-direction:column; gap:6px;",
             div {
-                style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", palette.muted),
-                "{label}"
+                style: "display:flex; align-items:center; justify-content:space-between; gap:8px;",
+                div {
+                    style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", palette.muted),
+                    "Notifications"
+                }
+                span {
+                    style: format!("font-size:10px; font-weight:700; color:{};", palette.accent),
+                    "In-App Recommended"
+                }
             }
             div {
                 style: format!(
-                    "display:flex; align-items:center; gap:6px; height:32px; padding:4px; border:none; border-radius:10px; \
+                    "display:flex; align-items:center; gap:6px; height:32px; padding:4px; border:none; border-radius:999px; \
                      background:rgba(255,255,255,0.58); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.34);"
                 ),
                 button {
-                    style: profile_toggle_button_style(
-                        palette,
-                        selected == AgentSessionProfile::Codex,
-                    ),
-                    onclick: move |_| on_select.call(AgentSessionProfile::Codex),
-                    "Codex"
+                    style: segmented_pill_button_style(palette, selected == NotificationDeliveryMode::InApp),
+                    onclick: move |_| on_select.call(NotificationDeliveryMode::InApp),
+                    "App"
                 }
                 button {
-                    style: profile_toggle_button_style(
-                        palette,
-                        selected == AgentSessionProfile::CodexLiteLlm,
-                    ),
-                    onclick: move |_| on_select.call(AgentSessionProfile::CodexLiteLlm),
-                    "Codex LiteLLM"
+                    style: segmented_pill_button_style(palette, selected == NotificationDeliveryMode::Both),
+                    onclick: move |_| on_select.call(NotificationDeliveryMode::Both),
+                    "Both"
+                }
+                button {
+                    style: segmented_pill_button_style(palette, selected == NotificationDeliveryMode::System),
+                    onclick: move |_| on_select.call(NotificationDeliveryMode::System),
+                    "System"
                 }
             }
         }
@@ -5669,12 +5756,12 @@ fn zoom_button_style(palette: Palette) -> String {
     )
 }
 
-fn profile_toggle_button_style(palette: Palette, selected: bool) -> String {
+fn segmented_pill_button_style(palette: Palette, selected: bool) -> String {
     format!(
-        "flex:1; height:24px; border:none; border-radius:8px; background:{}; color:{}; font-size:11px; font-weight:{}; \
+        "flex:1; height:24px; border:none; border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:{}; \
          display:inline-flex; align-items:center; justify-content:center;",
         if selected {
-            "rgba(255,255,255,0.78)"
+            palette.panel
         } else {
             "transparent"
         },

@@ -11,6 +11,7 @@ pub use daemon::{
     set_view_mode, shutdown, snapshot, start_command_session, start_local_session,
     start_local_session_at, status, sync_external_window, sync_theme, terminal_ensure,
     terminal_read, terminal_resize, terminal_write, toggle_preview_block,
+    switch_agent_session_mode,
 };
 pub use host::{GhosttyHostKind, GhosttyHostSupport, GhosttyTerminalHostMode, detect_ghostty_host};
 pub use terminal::{TerminalChunk, TerminalManager, TerminalReadResult};
@@ -87,6 +88,12 @@ pub enum SessionKind {
     Shell,
     SshShell,
     Document,
+}
+
+impl SessionKind {
+    pub fn is_agent(self) -> bool {
+        matches!(self, SessionKind::Codex | SessionKind::CodexLiteLlm)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -383,6 +390,57 @@ impl YggtermServer {
 
     pub fn active_session_path(&self) -> Option<&str> {
         self.active_session_path.as_deref()
+    }
+
+    pub fn switch_agent_session_mode(&mut self, path: &str, target_kind: SessionKind) -> anyhow::Result<()> {
+        if !target_kind.is_agent() {
+            anyhow::bail!("target mode is not an agent session")
+        }
+        let existing = self
+            .sessions
+            .get(path)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("session not found: {path}"))?;
+        if !existing.kind.is_agent() {
+            anyhow::bail!("only codex sessions can switch mode")
+        }
+        if existing.kind == target_kind {
+            return Ok(());
+        }
+
+        let replacement = if existing.source == SessionSource::Stored {
+            let cwd = metadata_value(&existing, "Cwd");
+            build_session(
+                target_kind,
+                path,
+                Some(&existing.id),
+                (!cwd.is_empty()).then_some(cwd.as_str()),
+                Some(&existing.title),
+                None,
+                self.backend,
+                self.theme,
+                self.ghostty_host.bridge_enabled,
+            )
+        } else {
+            let cwd = metadata_value(&existing, "Cwd");
+            let target = local_session_target(target_kind, (!cwd.is_empty()).then_some(cwd.as_str()));
+            let mut session = build_live_session(
+                &existing.id,
+                target_kind,
+                &target,
+                self.backend,
+                self.theme,
+                self.ghostty_host.bridge_enabled,
+            );
+            session.title = existing.title.clone();
+            session
+        };
+
+        self.sessions.insert(path.to_string(), replacement);
+        self.active_session_path = Some(path.to_string());
+        self.active_view_mode = WorkspaceViewMode::Terminal;
+        self.request_terminal_launch_for_path(path);
+        Ok(())
     }
 
     pub fn request_terminal_launch_for_path(&mut self, path: &str) {
@@ -1176,14 +1234,7 @@ fn build_session(
     let cwd = cwd
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| session_preview_cwd(path));
-    let launch_command = match kind {
-        SessionKind::Document => "document preview".to_string(),
-        _ => format!(
-            "cd '{}' && codex resume {}",
-            cwd.replace('\'', "'\\''"),
-            session_id
-        ),
-    };
+    let launch_command = stored_session_launch_command(kind, &cwd, &session_id);
     let transcript = if kind == SessionKind::Document {
         None
     } else {
@@ -1300,7 +1351,7 @@ fn build_session(
                             if kind == SessionKind::Document {
                                 format!("Document path: {path}")
                             } else {
-                                format!("Terminal launch command: {launch_command}")
+                format!("Terminal launch command: {launch_command}")
                             },
                         ],
                     },
@@ -1427,7 +1478,7 @@ fn build_session(
             if kind == SessionKind::Document {
                 format!("Open {title} in preview mode.")
             } else {
-                format!("$ codex resume {session_id}")
+                format!("$ {launch_command}")
             },
             format!("Terminal host: {backend_label}"),
             if kind == SessionKind::Document {
@@ -2004,6 +2055,27 @@ fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn stored_session_launch_command(kind: SessionKind, cwd: &str, session_id: &str) -> String {
+    match kind {
+        SessionKind::Codex => format!(
+            "cd {} && codex resume {}",
+            shell_single_quote(cwd),
+            session_id
+        ),
+        SessionKind::CodexLiteLlm => format!(
+            "cd {} && CODEX_HOME=\"$HOME/.codex-litellm\" codex-litellm resume {}",
+            shell_single_quote(cwd),
+            session_id
+        ),
+        SessionKind::Document => "document preview".to_string(),
+        SessionKind::Shell | SessionKind::SshShell => format!(
+            "cd {} && codex resume {}",
+            shell_single_quote(cwd),
+            session_id
+        ),
+    }
+}
+
 fn local_default_cwd() -> String {
     dirs::home_dir()
         .map(|path| path.display().to_string())
@@ -2396,7 +2468,7 @@ fn short_session_id(session_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_stored_transcript;
+    use super::{SessionKind, parse_stored_transcript, stored_session_launch_command};
     use anyhow::Result;
     use std::fs;
 
@@ -2427,5 +2499,16 @@ mod tests {
 
         let _ = fs::remove_file(path);
         Ok(())
+    }
+
+    #[test]
+    fn stored_codex_litellm_sessions_use_litellm_resume_command() {
+        let command = stored_session_launch_command(
+            SessionKind::CodexLiteLlm,
+            "/tmp/workspace",
+            "019caa6f-b32c-7a73-b4d3-db83225663dc",
+        );
+        assert!(command.contains("CODEX_HOME=\"$HOME/.codex-litellm\""));
+        assert!(command.contains("codex-litellm resume"));
     }
 }

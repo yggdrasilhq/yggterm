@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_COLS: u16 = 120;
 const DEFAULT_ROWS: u16 = 36;
@@ -82,6 +82,27 @@ impl TerminalManager {
         self.sessions.contains_key(key)
     }
 
+    pub fn recent_activity(&self, key: &str, within: Duration) -> bool {
+        self.sessions
+            .get(key)
+            .is_some_and(|session| session.recent_activity(within))
+    }
+
+    pub fn restart_session(
+        &mut self,
+        key: &str,
+        launch_command: &str,
+        cwd: Option<&str>,
+        stop_command: Option<&str>,
+    ) -> Result<()> {
+        if let Some(runtime) = self.sessions.remove(key) {
+            runtime.shutdown(stop_command)?;
+        }
+        let runtime = PtySessionRuntime::spawn(key, launch_command, cwd)?;
+        self.sessions.insert(key.to_string(), runtime);
+        Ok(())
+    }
+
     pub fn shutdown_all<F>(&mut self, stop_command: F) -> TerminalShutdownSummary
     where
         F: Fn(&str) -> Option<String>,
@@ -108,6 +129,7 @@ struct PtySessionRuntime {
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     chunks: Arc<Mutex<VecDeque<TerminalChunk>>>,
     seq: Arc<AtomicU64>,
+    last_activity_ms: Arc<AtomicU64>,
 }
 
 impl PtySessionRuntime {
@@ -135,8 +157,10 @@ impl PtySessionRuntime {
         let writer = pair.master.take_writer().context("taking pty writer")?;
         let chunks = Arc::new(Mutex::new(VecDeque::new()));
         let seq = Arc::new(AtomicU64::new(0));
+        let last_activity_ms = Arc::new(AtomicU64::new(now_millis()));
         let reader_chunks = Arc::clone(&chunks);
         let reader_seq = Arc::clone(&seq);
+        let reader_activity = Arc::clone(&last_activity_ms);
         let key_label = key.to_string();
 
         thread::Builder::new()
@@ -151,6 +175,7 @@ impl PtySessionRuntime {
                             if data.is_empty() {
                                 continue;
                             }
+                            reader_activity.store(now_millis(), Ordering::SeqCst);
                             let seq_value = reader_seq.fetch_add(1, Ordering::SeqCst) + 1;
                             let mut chunks = reader_chunks.lock().expect("pty chunk lock poisoned");
                             chunks.push_back(TerminalChunk {
@@ -162,6 +187,7 @@ impl PtySessionRuntime {
                             }
                         }
                         Err(error) => {
+                            reader_activity.store(now_millis(), Ordering::SeqCst);
                             let seq_value = reader_seq.fetch_add(1, Ordering::SeqCst) + 1;
                             let mut chunks = reader_chunks.lock().expect("pty chunk lock poisoned");
                             chunks.push_back(TerminalChunk {
@@ -184,6 +210,7 @@ impl PtySessionRuntime {
             child: Arc::new(Mutex::new(child)),
             chunks,
             seq,
+            last_activity_ms,
         })
     }
 
@@ -203,11 +230,18 @@ impl PtySessionRuntime {
 
     fn write(&self, data: &str) -> Result<()> {
         let mut writer = self.writer.lock().expect("pty writer lock poisoned");
+        self.last_activity_ms.store(now_millis(), Ordering::SeqCst);
         writer
             .write_all(data.as_bytes())
             .context("writing to pty")?;
         writer.flush().context("flushing pty writer")?;
         Ok(())
+    }
+
+    fn recent_activity(&self, within: Duration) -> bool {
+        let now = now_millis();
+        let last = self.last_activity_ms.load(Ordering::SeqCst);
+        now.saturating_sub(last) <= within.as_millis() as u64
     }
 
     fn resize(&self, cols: u16, rows: u16) -> Result<()> {
@@ -248,6 +282,13 @@ impl PtySessionRuntime {
         let _ = child.wait();
         Ok(())
     }
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn shell_command(launch_command: &str, cwd: Option<&str>) -> CommandBuilder {

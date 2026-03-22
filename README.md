@@ -83,6 +83,7 @@ That means the current app already supports:
 - rendered preview mode for stored sessions and documents
 - daemon-owned live sessions that survive switching between items
 - local shell sessions, SSH-backed sessions, and Codex-style agent sessions
+- an in-terminal Codex/Codex LiteLLM mode switch with server-side guardrails
 - workspace notes stored in `~/.yggterm/workspace.db`
 - recipe documents that can be edited in preview mode and executed in terminal mode
 - generated session titles through a configured LiteLLM endpoint
@@ -137,6 +138,12 @@ The SSH connect rail is guided on purpose:
 - type `user@ip`, `user@host`, or a shortcut from your `~/.ssh/config` such as `dev`
 - optionally add a remote prefix if you want the session to start inside `machinectl`, `tmux`, or another remote wrapper
 - reconnecting to the same SSH target focuses the existing live session instead of spawning a duplicate
+
+Agent mode switching is handled inside the terminal header, not in global settings:
+
+- a live Codex session can be switched into Codex LiteLLM mode in place
+- Yggterm asks the daemon to stop and relaunch that same session cleanly
+- if the terminal still looks active, the switch is refused and the user gets a notification instead of a corrupted session
 
 ## Documents and recipes
 
