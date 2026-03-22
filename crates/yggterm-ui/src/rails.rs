@@ -1,0 +1,77 @@
+use dioxus::prelude::*;
+
+#[component]
+pub fn SideRailShell(
+    visible: bool,
+    width_px: usize,
+    zoom_percent: f32,
+    body: Element,
+) -> Element {
+    let opacity = if visible { "1" } else { "0" };
+    let translate = if visible {
+        "translateX(0)"
+    } else {
+        "translateX(14px)"
+    };
+    let pointer_events = if visible { "auto" } else { "none" };
+    rsx! {
+        div {
+            style: format!(
+                "width:{}px; min-width:{}px; max-width:{}px; display:flex; flex-direction:column; \
+                 background:transparent; overflow:hidden; text-rendering:optimizeLegibility; \
+                 -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale; \
+                 transition: opacity 180ms ease, transform 180ms ease; opacity:{}; transform:{}; \
+                 pointer-events:{}; zoom:{}%;",
+                width_px, width_px, width_px, opacity, translate, pointer_events, zoom_percent
+            ),
+            {body}
+        }
+    }
+}
+
+#[component]
+pub fn RailHeader(
+    title: String,
+    color: String,
+) -> Element {
+    rsx! {
+        div {
+            style: format!(
+                "padding:16px 16px 10px 16px; font-size:12px; font-weight:700; letter-spacing:0.01em; color:{}; \
+                 text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
+                color
+            ),
+            "{title}"
+        }
+    }
+}
+
+#[component]
+pub fn RailScrollBody(
+    content: Element,
+) -> Element {
+    rsx! {
+        div {
+            style: "flex:1; overflow:auto; padding:10px 16px 14px 16px; display:flex; flex-direction:column; gap:14px; \
+             text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
+            {content}
+        }
+    }
+}
+
+#[component]
+pub fn RailSectionTitle(
+    title: String,
+    muted_color: String,
+) -> Element {
+    rsx! {
+        div {
+            style: format!(
+                "font-size:11px; font-weight:700; letter-spacing:0.02em; color:{}; \
+                 text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
+                muted_color
+            ),
+            "{title}"
+        }
+    }
+}
