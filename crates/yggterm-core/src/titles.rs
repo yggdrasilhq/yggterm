@@ -31,6 +31,14 @@ impl SessionTitleStore {
                 source TEXT,
                 model TEXT,
                 updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS session_precis (
+                session_id TEXT PRIMARY KEY,
+                precis TEXT NOT NULL,
+                cwd TEXT,
+                source TEXT,
+                model TEXT,
+                updated_at TEXT NOT NULL
             );",
         )
         .context("failed to initialize title db schema")?;
@@ -41,6 +49,18 @@ impl SessionTitleStore {
         let mut stmt = self
             .conn
             .prepare("SELECT title FROM session_titles WHERE session_id = ?1")?;
+        let mut rows = stmt.query(params![session_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row.get(0)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_precis(&self, session_id: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT precis FROM session_precis WHERE session_id = ?1")?;
         let mut rows = stmt.query(params![session_id])?;
         if let Some(row) = rows.next()? {
             Ok(Some(row.get(0)?))
@@ -73,9 +93,41 @@ impl SessionTitleStore {
         Ok(())
     }
 
+    pub fn put_precis(
+        &self,
+        session_id: &str,
+        cwd: &str,
+        precis: &str,
+        model: &str,
+        source: &str,
+    ) -> Result<()> {
+        let updated_at =
+            OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
+        self.conn.execute(
+            "INSERT INTO session_precis (session_id, precis, cwd, source, model, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(session_id) DO UPDATE SET
+               precis = excluded.precis,
+               cwd = excluded.cwd,
+               source = excluded.source,
+               model = excluded.model,
+               updated_at = excluded.updated_at",
+            params![session_id, precis, cwd, source, model, updated_at],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_title(&self, session_id: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM session_titles WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_precis(&self, session_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM session_precis WHERE session_id = ?1",
             params![session_id],
         )?;
         Ok(())
@@ -91,6 +143,10 @@ impl SessionTitleResolver {
 
     pub fn resolve_for_session(&self, session_id: &str) -> Result<Option<String>> {
         self.store.get_title(session_id)
+    }
+
+    pub fn resolve_precis_for_session(&self, session_id: &str) -> Result<Option<String>> {
+        self.store.get_precis(session_id)
     }
 
     pub fn generate_for_session(
@@ -145,6 +201,44 @@ impl SessionTitleResolver {
             "litellm",
         )?;
         Ok(Some(title))
+    }
+
+    pub fn generate_precis_for_session(
+        &self,
+        settings: &AppSettings,
+        session_id: &str,
+        cwd: &str,
+        file_path: &Path,
+        force: bool,
+    ) -> Result<Option<String>> {
+        if !force {
+            if let Some(precis) = self.store.get_precis(session_id)? {
+                return Ok(Some(precis));
+            }
+        } else {
+            let _ = self.store.delete_precis(session_id);
+        }
+
+        if !settings_ready(settings) {
+            return Ok(None);
+        }
+
+        let context = extract_tail_context(file_path)?;
+        if context.is_empty() {
+            return Ok(None);
+        }
+        let precis = request_litellm_precis(settings, &context)?;
+        let Some(precis) = sanitize_generated_precis(&precis) else {
+            return Ok(None);
+        };
+        self.store.put_precis(
+            session_id,
+            cwd,
+            &precis,
+            &settings.interface_llm_model,
+            "litellm",
+        )?;
+        Ok(Some(precis))
     }
 }
 
@@ -216,6 +310,47 @@ fn request_litellm_title(settings: &AppSettings, context: &str) -> Result<String
     Ok(title)
 }
 
+fn request_litellm_precis(settings: &AppSettings, context: &str) -> Result<String> {
+    let url = completions_url(&settings.litellm_endpoint);
+    let client = Client::builder()
+        .timeout(Duration::from_secs(12))
+        .build()
+        .context("failed to build LiteLLM client")?;
+    let body = serde_json::json!({
+        "model": settings.interface_llm_model,
+        "temperature": 0.2,
+        "max_tokens": 96,
+        "messages": [
+            {
+                "role": "system",
+                "content": "Generate a short terminal-session precis for a desktop header. Return only one concise sentence or two very short sentences, no markdown, no bullets, no quotes."
+            },
+            {
+                "role": "user",
+                "content": format!("Create a concise UI precis from this recent session context:\n\n{context}")
+            }
+        ]
+    });
+
+    let response = client
+        .post(url)
+        .bearer_auth(settings.litellm_api_key.trim())
+        .json(&body)
+        .send()
+        .context("LiteLLM request failed")?
+        .error_for_status()
+        .context("LiteLLM returned an error status")?;
+
+    let value: Value = response
+        .json()
+        .context("failed to parse LiteLLM response")?;
+    let precis = extract_completion_text(&value)
+        .or_else(|| extract_reasoning_title(&value))
+        .or_else(|| heuristic_title_from_context(context))
+        .context("LiteLLM response did not contain a precis")?;
+    Ok(precis)
+}
+
 fn completions_url(endpoint: &str) -> String {
     let trimmed = endpoint.trim().trim_end_matches('/');
     if trimmed.ends_with("/chat/completions") {
@@ -240,6 +375,22 @@ fn sanitize_generated_title(raw: &str) -> Option<String> {
     }
     let shortened = sanitized.chars().take(72).collect::<String>();
     Some(shortened)
+}
+
+fn sanitize_generated_precis(raw: &str) -> Option<String> {
+    let compact = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let sanitized = compact
+        .trim_matches(|ch| ch == '"' || ch == '\'' || ch == '`')
+        .trim();
+    if sanitized.is_empty() {
+        return None;
+    }
+    Some(sanitized.chars().take(180).collect::<String>())
 }
 
 #[cfg(test)]
