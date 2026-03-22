@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
-use tao::event::Event as TaoEvent;
+use tao::event::{ElementState, Event as TaoEvent, MouseButton as TaoMouseButton};
 use tao::window::ResizeDirection;
 use tokio::task;
 use tokio::time::sleep;
@@ -3546,6 +3546,16 @@ fn app() -> Element {
                 | DesktopWindowEvent::ScaleFactorChanged { .. } => {
                     window_epoch.with_mut(|epoch| *epoch += 1);
                 }
+                DesktopWindowEvent::MouseInput {
+                    state: ElementState::Released,
+                    button: TaoMouseButton::Left,
+                    ..
+                } => {
+                    if !state.read().drag_paths.is_empty() {
+                        queue_drop_current_drag_target(state);
+                        state.with_mut(|shell| shell.clear_drag_state());
+                    }
+                }
                 _ => {}
             }
         }
@@ -4493,12 +4503,6 @@ fn Sidebar(
                         let coords = evt.client_coordinates();
                         on_drag_move.call((coords.x, coords.y));
                     }
-                },
-                onmouseup: move |_| {
-                    if drag_active {
-                        on_drop_into_row.call(());
-                    }
-                    on_end_drag.call(());
                 },
                 for row in snapshot.rows.iter().cloned() {
                     {
