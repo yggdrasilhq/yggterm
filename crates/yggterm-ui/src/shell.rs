@@ -387,17 +387,7 @@ impl ShellState {
 
     fn snapshot(&self) -> RenderSnapshot {
         let live_sessions = self.server.live_sessions();
-        let merged_rows = merged_sidebar_rows(self.browser.rows(), &live_sessions);
-        let preview_drag_paths = if self.optimistic_drag_paths.is_empty() {
-            &self.drag_paths
-        } else {
-            &self.optimistic_drag_paths
-        };
-        let preview_drag_target = self
-            .optimistic_drag_target
-            .as_deref()
-            .or(self.drag_hover_target.as_deref());
-        let rows = preview_sidebar_rows(&merged_rows, preview_drag_paths, preview_drag_target);
+        let rows = merged_sidebar_rows(self.browser.rows(), &live_sessions);
         let selected_path = if let Some(active) = self.server.active_session() {
             if active.source == yggterm_server::SessionSource::LiveSsh {
                 Some(active.session_path.clone())
@@ -1675,59 +1665,6 @@ fn merged_sidebar_rows(
     );
     rows.extend_from_slice(stored_rows);
     rows
-}
-
-fn preview_sidebar_rows(
-    rows: &[BrowserRow],
-    drag_paths: &[String],
-    hover_target: Option<&str>,
-) -> Vec<BrowserRow> {
-    let Some(target_path) = hover_target else {
-        return rows.to_vec();
-    };
-    if drag_paths.is_empty() {
-        return rows.to_vec();
-    }
-    let Some(target_row) = rows.iter().find(|row| row.full_path == target_path) else {
-        return rows.to_vec();
-    };
-
-    let mut dragged_block = Vec::new();
-    let mut remaining = Vec::new();
-    for row in rows {
-        if drag_paths
-            .iter()
-            .any(|path| row.full_path == *path || workspace_path_contains(path, &row.full_path))
-        {
-            dragged_block.push(row.clone());
-        } else {
-            remaining.push(row.clone());
-        }
-    }
-    if dragged_block.is_empty() {
-        return rows.to_vec();
-    }
-
-    let insert_at = match target_row.kind {
-        BrowserRowKind::Group => remaining
-            .iter()
-            .position(|row| row.full_path == target_row.full_path)
-            .map(|ix| ix + 1),
-        BrowserRowKind::Document | BrowserRowKind::Separator => remaining
-            .iter()
-            .position(|row| row.full_path == target_row.full_path)
-            .map(|ix| ix + 1),
-        BrowserRowKind::Session => None,
-    };
-    let Some(insert_at) = insert_at else {
-        return rows.to_vec();
-    };
-
-    let mut preview = Vec::with_capacity(rows.len());
-    preview.extend(remaining[..insert_at].iter().cloned());
-    preview.extend(dragged_block);
-    preview.extend(remaining[insert_at..].iter().cloned());
-    preview
 }
 
 fn push_live_group_rows<'a, I>(
@@ -4399,13 +4336,18 @@ fn SidebarRow(
                     "width:100%; display:flex; align-items:center; gap:10px; border:none; background:transparent; cursor:{}; \
                      padding:8px 9px 8px {}px; margin:4px 0; opacity:{}; border-radius:12px; background:{}; \
                      box-sizing:border-box; min-width:0; overflow:hidden; user-select:none; -webkit-user-select:none; \
-                     transition: margin 140ms ease, transform 140ms ease, background 140ms ease, opacity 140ms ease; \
-                     margin-top:{}px;",
+                     transition: transform 140ms ease, background 140ms ease, opacity 140ms ease, box-shadow 140ms ease; \
+                     transform:translateY({}px); box-shadow:{};",
                     if dragging { "grabbing" } else if draggable { "grab" } else { "default" },
                     indent
                     , if dragging { "0.58" } else { "1" },
                     if selected { palette.accent_soft } else { "transparent" },
-                    if drop_hovered && drag_active { 18 } else { 4 }
+                    if drop_hovered && drag_active { 10 } else { 0 },
+                    if drop_hovered && drag_active {
+                        format!("inset 0 2px 0 {}", palette.accent)
+                    } else {
+                        "none".to_string()
+                    }
                 ),
                 draggable: false,
                 onclick: move |evt| on_select.call(evt),
@@ -4429,6 +4371,7 @@ fn SidebarRow(
                 },
                 onmousemove: move |evt| {
                     if drag_active || evt.held_buttons().contains(MouseButton::Primary) {
+                        evt.prevent_default();
                         on_drag_hover.call(evt);
                     }
                 },
@@ -4531,14 +4474,20 @@ fn SidebarRow(
         div {
             style: format!(
                 "width:100%; display:flex; flex-direction:column; align-items:stretch; gap:2px; \
-                 border:none; border-radius:12px; background:{}; padding:6px 9px 6px {}px; margin-bottom:{}px; opacity:{}; cursor:{}; \
+                 border:none; border-radius:12px; background:{}; padding:6px 9px 6px {}px; margin-bottom:2px; opacity:{}; cursor:{}; \
                  box-sizing:border-box; min-width:0; overflow:hidden; user-select:none; -webkit-user-select:none; \
-                 transition: margin 140ms ease, transform 140ms ease, background 140ms ease, opacity 140ms ease;",
+                 transition: transform 140ms ease, background 140ms ease, opacity 140ms ease, box-shadow 140ms ease; \
+                 transform:translateY({}px); box-shadow:{};",
                 background,
                 indent,
-                if drop_hovered && drag_active { 18 } else { 2 },
                 if dragging { "0.58" } else { "1" },
-                if dragging { "grabbing" } else if draggable { "grab" } else { "default" }
+                if dragging { "grabbing" } else if draggable { "grab" } else { "default" },
+                if drop_hovered && drag_active { 10 } else { 0 },
+                if drop_hovered && drag_active {
+                    format!("inset 0 2px 0 {}", palette.accent)
+                } else {
+                    "none".to_string()
+                }
             ),
             draggable: false,
             onclick: move |evt| on_select.call(evt),
@@ -4562,6 +4511,7 @@ fn SidebarRow(
             },
             onmousemove: move |evt| {
                 if drag_active || evt.held_buttons().contains(MouseButton::Primary) {
+                    evt.prevent_default();
                     on_drag_hover.call(evt);
                 }
             },
@@ -7430,64 +7380,6 @@ mod tests {
         let destination = moved_workspace_item_virtual_path_with_index(&item, &target, 0);
 
         assert_eq!(destination, "/home/pi/gh/notes/paper-b~0000-paper-a");
-    }
-
-    #[test]
-    fn preview_sidebar_rows_reorders_immediately_while_dragging() {
-        let folder = BrowserRow {
-            kind: BrowserRowKind::Group,
-            full_path: "/home/pi/gh/notes".to_string(),
-            label: "notes".to_string(),
-            detail_label: String::new(),
-            document_kind: None,
-            group_kind: Some(WorkspaceGroupKind::Folder),
-            session_title: None,
-            depth: 1,
-            host_label: String::new(),
-            descendant_sessions: 0,
-            expanded: true,
-            session_id: None,
-            session_cwd: None,
-        };
-        let paper_a = BrowserRow {
-            kind: BrowserRowKind::Document,
-            full_path: "/home/pi/gh/notes/paper-a".to_string(),
-            label: "paper-a".to_string(),
-            detail_label: String::new(),
-            document_kind: Some(WorkspaceDocumentKind::Note),
-            group_kind: None,
-            session_title: None,
-            depth: 2,
-            host_label: String::new(),
-            descendant_sessions: 0,
-            expanded: false,
-            session_id: Some("paper-a".to_string()),
-            session_cwd: Some("/home/pi/gh/notes".to_string()),
-        };
-        let paper_b = BrowserRow {
-            kind: BrowserRowKind::Document,
-            full_path: "/home/pi/gh/notes/paper-b".to_string(),
-            label: "paper-b".to_string(),
-            detail_label: String::new(),
-            document_kind: Some(WorkspaceDocumentKind::Note),
-            group_kind: None,
-            session_title: None,
-            depth: 2,
-            host_label: String::new(),
-            descendant_sessions: 0,
-            expanded: false,
-            session_id: Some("paper-b".to_string()),
-            session_cwd: Some("/home/pi/gh/notes".to_string()),
-        };
-
-        let preview = preview_sidebar_rows(
-            &[folder, paper_a.clone(), paper_b.clone()],
-            &[paper_a.full_path.clone()],
-            Some(&paper_b.full_path),
-        );
-
-        assert_eq!(preview[1].full_path, paper_b.full_path);
-        assert_eq!(preview[2].full_path, paper_a.full_path);
     }
 
     #[test]
