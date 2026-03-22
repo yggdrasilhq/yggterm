@@ -105,11 +105,7 @@ impl SessionBrowserState {
         }
     }
 
-    pub fn restore_ui_state(
-        &mut self,
-        expanded_paths: &[String],
-        selected_path: Option<&str>,
-    ) {
+    pub fn restore_ui_state(&mut self, expanded_paths: &[String], selected_path: Option<&str>) {
         self.expanded_paths = expanded_paths.iter().cloned().collect();
         if !self.root.children.is_empty() {
             self.expanded_paths
@@ -148,9 +144,10 @@ impl SessionBrowserState {
 
     pub fn selected_session_index(&self) -> Option<usize> {
         self.selected_path.as_deref().and_then(|path| {
-            self.rows
-                .iter()
-                .position(|row| matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document) && row.full_path == path)
+            self.rows.iter().position(|row| {
+                matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document)
+                    && row.full_path == path
+            })
         })
     }
 
@@ -200,7 +197,9 @@ impl SessionBrowserState {
             .rows
             .iter()
             .enumerate()
-            .filter_map(|(ix, row)| matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document).then_some(ix))
+            .filter_map(|(ix, row)| {
+                matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document).then_some(ix)
+            })
             .collect::<Vec<_>>();
         if session_indexes.is_empty() {
             return None;
@@ -267,11 +266,7 @@ fn flatten_rows(
             },
             label: format_row_label(node, short_ids, &full_path, is_leaf),
             detail_label: detail_label_for_row(node, &full_path, is_leaf),
-            session_title: if is_leaf {
-                node.title.clone()
-            } else {
-                None
-            },
+            session_title: if is_leaf { node.title.clone() } else { None },
             document_kind: node.document_kind,
             full_path: full_path.clone(),
             depth,
@@ -313,7 +308,11 @@ fn format_row_label(
                 short_ids
                     .get(full_path)
                     .cloned()
-                    .or_else(|| node.session_id.as_deref().map(|id| session_id_suffix(id, 7)))
+                    .or_else(|| {
+                        node.session_id
+                            .as_deref()
+                            .map(|id| session_id_suffix(id, 7))
+                    })
                     .unwrap_or_else(|| node.name.clone())
             }),
             SessionNodeKind::Group => node.title.clone().unwrap_or_else(|| node.name.clone()),

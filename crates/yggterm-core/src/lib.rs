@@ -1,7 +1,7 @@
 mod browser;
 mod install;
-mod transcript;
 mod titles;
+mod transcript;
 mod workspace;
 
 use anyhow::{Context, Result};
@@ -18,10 +18,12 @@ pub use browser::{BrowserMetrics, BrowserRow, BrowserRowKind, SessionBrowserStat
 pub use install::{
     InstallChannel, InstallContext, ReleaseUpdate, UpdatePolicy, check_for_update,
     current_asset_label, current_version, detect_install_context, direct_install_root,
-    install_mode_summary, install_release_update, refresh_desktop_integration,
-    update_command_hint, write_direct_install_state,
+    install_mode_summary, install_release_update, refresh_desktop_integration, update_command_hint,
+    write_direct_install_state,
 };
-pub use transcript::{TranscriptMessage, TranscriptRole, message_lines_from_payload, read_codex_transcript_messages};
+pub use transcript::{
+    TranscriptMessage, TranscriptRole, message_lines_from_payload, read_codex_transcript_messages,
+};
 pub use workspace::{
     WorkspaceDocument, WorkspaceDocumentInput, WorkspaceDocumentKind, WorkspaceDocumentSummary,
     WorkspaceGroup, WorkspaceStore, default_document_title, normalize_virtual_document_path,
@@ -89,6 +91,9 @@ pub struct AppSettings {
     pub litellm_api_key: String,
     pub interface_llm_model: String,
     pub default_agent_profile: AgentSessionProfile,
+    pub in_app_notifications: bool,
+    pub system_notifications: bool,
+    pub notification_sound: bool,
     pub selected_browser_path: Option<String>,
     pub expanded_browser_paths: Vec<String>,
 }
@@ -107,6 +112,9 @@ impl Default for AppSettings {
             litellm_api_key: String::new(),
             interface_llm_model: String::new(),
             default_agent_profile: AgentSessionProfile::Codex,
+            in_app_notifications: true,
+            system_notifications: false,
+            notification_sound: false,
             selected_browser_path: None,
             expanded_browser_paths: Vec::new(),
         }
@@ -194,8 +202,16 @@ impl SessionStore {
         WorkspaceStore::open(&self.home)?.put_group(virtual_path, title)
     }
 
-    pub fn move_document(&self, from_virtual_path: &str, to_virtual_path: &str) -> Result<WorkspaceDocument> {
+    pub fn move_document(
+        &self,
+        from_virtual_path: &str,
+        to_virtual_path: &str,
+    ) -> Result<WorkspaceDocument> {
         WorkspaceStore::open(&self.home)?.move_document(from_virtual_path, to_virtual_path)
+    }
+
+    pub fn delete_documents(&self, virtual_paths: &[String]) -> Result<usize> {
+        WorkspaceStore::open(&self.home)?.delete_documents(virtual_paths)
     }
 
     pub fn save_document(
@@ -259,13 +275,7 @@ impl SessionStore {
             return Ok(None);
         };
         let resolver = SessionTitleResolver::new(&self.home)?;
-        resolver.generate_for_session(
-            settings,
-            &identity.session_id,
-            &identity.cwd,
-            &path,
-            force,
-        )
+        resolver.generate_for_session(settings, &identity.session_id, &identity.cwd, &path, force)
     }
 }
 
@@ -543,16 +553,20 @@ fn read_codex_session_summary(
 
     Ok(Some(CodexSessionSummary {
         file_path: path.to_path_buf(),
-        generated_title: title_resolver
-            .and_then(|resolver| resolver.resolve_for_session(&identity.session_id).ok().flatten()),
+        generated_title: title_resolver.and_then(|resolver| {
+            resolver
+                .resolve_for_session(&identity.session_id)
+                .ok()
+                .flatten()
+        }),
         session_id: identity.session_id,
         cwd: identity.cwd,
     }))
 }
 
 fn read_codex_session_identity(path: &Path) -> Result<Option<CodexSessionIdentity>> {
-    let file =
-        fs::File::open(path).with_context(|| format!("failed to read codex session {}", path.display()))?;
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to read codex session {}", path.display()))?;
     let reader = BufReader::new(file);
 
     let fallback_id = path
@@ -623,7 +637,10 @@ fn generate_missing_codex_titles_recursive(
         let Some(identity) = read_codex_session_identity(&path)? else {
             continue;
         };
-        if resolver.resolve_for_session(&identity.session_id)?.is_some() {
+        if resolver
+            .resolve_for_session(&identity.session_id)?
+            .is_some()
+        {
             continue;
         }
         if resolver
