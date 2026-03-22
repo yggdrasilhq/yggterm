@@ -2,15 +2,25 @@
 
 ## Purpose
 
-This file is the visual and interaction source of truth for Yggterm.
+This file is the reusable visual and interaction source of truth for Yggdrasil applications.
 
-When UI work, wording, spacing, colors, controls, or interaction polish are in question, prefer this file over ad hoc invention. `AGENTS.md` defines the engineering/product mission; `DESIGN.md` defines how the app should feel, read, and look.
+Use it in two layers:
 
-This file is intentionally reusable across projects. It should capture stable brand and taste preferences, not one-off bug notes.
+1. `Core System`: reusable design rules that should transfer cleanly across projects.
+2. `Project Overlay`: product-specific vocabulary, workflows, and UI emphasis.
 
-## Brand intent
+When this file is copied into another repo, the default move is:
 
-Yggterm should feel:
+- keep `Core System`
+- replace or trim `Project Overlay`
+
+Do not bury project-only nouns in the reusable sections.
+
+## Core System
+
+### Brand intent
+
+Yggdrasil apps should feel:
 
 - calm
 - modern
@@ -19,105 +29,96 @@ Yggterm should feel:
 - crisp rather than ornamental
 - soft around the edges, but not soft-headed
 
-The app should not feel like:
+They should not feel like:
 
 - a Linux utility panel
 - a web admin dashboard
 - a noisy IDE clone
-- a skeuomorphic terminal toy
+- a skeuomorphic toy
 - a stack of nested cards inside more cards
 
-The core impression should be:
+The target impression is:
 
 - one clear main workspace
 - supportive chrome around it
 - low-friction controls
 - light, breathable, polished surfaces
 
-## Visual structure
+### Visual structure
 
-### Main workspace
+#### Main workspace
 
-The main viewport is the focus of the product.
+The main workspace is the focus.
 
-- It should read like a calm sheet or canvas.
-- It should generally be white or near-white in light mode.
+- It should read like a calm sheet, canvas, or stage.
+- In light mode it should generally be white or near-white.
 - It may have a soft shadow and mild radius.
 - It should not be crowded by decorative headers, nested boxes, or redundant toolbars.
-- Terminal mode should feel like the terminal is part of the main canvas, not a foreign widget pasted inside a card.
+- Whatever the app’s core artifact is, it should feel native to the main canvas rather than pasted inside a widget frame.
 
-### Supporting chrome
+#### Supporting chrome
 
 The surrounding chrome should feel supportive, not dominant.
 
 - Side rails should be lighter and quieter than the main canvas.
 - A faint blue-to-green fresh tint over a muted neutral base is desirable.
-- The rails should avoid heavy borders.
-- The shell should feel visually unified, not partitioned into many harsh boxes.
+- Rails should avoid heavy borders.
+- The shell should feel visually unified rather than partitioned into harsh boxes.
 
-### Shape language
+#### Shape language
 
 - Rounded corners are welcome, but should stay restrained and OS-friendly.
-- The shell should feel closer to modern KDE/Windows rounding than exaggerated mobile rounding.
+- Outer shell rounding should feel closer to modern KDE/Windows than to exaggerated mobile UI.
 - In maximized state, outer window corner radius should collapse to zero.
 - Inner radii should be smaller than outer shell radii.
 
-## Color direction
+### Color direction
 
-Light mode is the primary reference.
+Light mode is the primary reference unless a project explicitly says otherwise.
 
 - Prefer white and pale blue-grey foundations.
 - Accent color can lean clean blue.
 - Background tint may gently lean sky-blue to green.
 - Use contrast carefully; avoid washed-out unreadable controls.
-- The main canvas and terminal surface should visually cohere.
+- Keep the main canvas and supporting chrome visually coherent.
 
 Avoid:
 
 - muddy greys
 - purple-heavy defaults
-- over-opaque frosted layers that bury hierarchy
+- overly opaque frosted layers that bury hierarchy
 - gratuitous gradients inside the main content region
 
-## Typography
+### Typography
 
-### Interface font
+#### Interface font
 
 - Linux: `Inter Variable`
 - macOS/Windows: default platform system UI font
 
-### Terminal font
-
-- `JetBrains Mono`
-- terminal zoom should be explicit, predictable, and visually obvious
-
-### General text guidance
+#### General text guidance
 
 - small text must still feel antialiased and intentional
-- avoid overly thin right-rail typography
+- avoid overly thin utility-rail typography
 - headings should feel clean and editorial, not shouty
 - labels should be concise and legible
 
-## Control language
+Project overlays can define additional content fonts, such as terminal, code, map, or data fonts.
 
-### Segmented pills
+### Control language
 
-Segmented pill controls are preferred for small mode switches.
+#### Segmented controls
 
-Examples:
-
-- `Preview / Terminal`
-- `Codex / Codex LiteLLM`
-- notification delivery modes
+Segmented pills are preferred for compact mode switches.
 
 They should:
 
 - clearly show the active segment
-- have a clean outer pill
-- avoid awkward double-border or muddy selected states
+- have a clean outer shell
+- avoid muddy selected states
 - feel stable and precise
 
-### Primary buttons
+#### Primary buttons
 
 Primary actions should look unmistakably clickable.
 
@@ -126,17 +127,17 @@ Primary actions should look unmistakably clickable.
 - clear contrast
 - enough padding to feel intentional
 
-If a user says “this does not look like a button”, that is a design failure, not a user error.
+If a user says “this does not look like a button”, that is a design failure.
 
-### Inputs
+#### Inputs
 
 - Prefer clean rectangular or softly rounded input boxes.
-- Avoid pill-shaped text fields unless there is a very strong reason.
+- Avoid pill-shaped text fields unless there is a strong reason.
 - Inputs must remain visible against the supporting chrome.
 
-### Context menus
+#### Context menus
 
-Context menus should feel closer to modern Microsoft app context menus than generic web popovers.
+Context menus should feel closer to modern Microsoft app menus than generic web popovers.
 
 That means:
 
@@ -153,86 +154,174 @@ Avoid:
 - top-left fallback placement
 - labels that invent confusing product language
 
-## Terminology
+### Motion and interaction
 
-Do not invent new nouns casually.
+Motion should be functional, not decorative.
 
-Current preferred user-facing terms:
+- side panels can ease in and out
+- notifications should stack and reflow smoothly
+- drag-and-drop should show clear make-way affordances
+- state changes should feel crisp, not rubbery
 
-- `Session`: an agent-oriented live or stored context
-- `Terminal`: a generic daemon-owned shell/process context
-- `Paper`: a rich canvas surface for thinking and organizing work
-- `Folder`: a virtual organizational node, often tied to a cwd or project context
-- `Separator`: a lightweight visual divider in the tree
+### Drag and drop
 
-Terms to avoid unless deliberately revisited:
+If a project has drag-and-drop tree or list reordering:
+
+- explicit `before / inside / after` snap zones are preferred
+- a floating drag card is preferred over invisible drags
+- hover affordances should show where the item will land
+- adjacent snap boundaries must behave predictably
+- multi-select drag can use stacked-card visuals
+- the final placement must match the visible snap indicator exactly
+
+### Reusable shell guidance
+
+If a project has:
+
+- a main canvas
+- left or right rails
+- titlebar actions
+- reorderable tree/list structures
+
+then the shell should be designed as reusable primitives rather than one-off page markup.
+
+Preferred reusable boundaries:
+
+- drag/reorder engine
+- drag ghost / drop-zone visuals
+- titlebar primitives
+- rail/panel primitives
+- menu and toast primitives
+
+## Project Overlay Interface
+
+Each project should define the following explicitly.
+
+### 1. Main artifact
+
+What is the main canvas actually for?
+
+Examples:
+
+- terminal
+- map
+- graph
+- document
+- dashboard
+
+### 2. Navigation model
+
+What lives in the left rail?
+
+Examples:
+
+- sessions
+- folders
+- machines
+- topology nodes
+- boards
+
+### 3. Right rail modes
+
+What modes can the right rail switch between?
+
+Examples:
+
+- metadata
+- settings
+- notifications
+- inspector
+- filters
+
+### 4. Vocabulary
+
+Define the user-facing nouns here, not in the reusable sections.
+
+Examples:
+
+- session
+- terminal
+- paper
+- folder
+- separator
+
+### 5. Domain-specific control rules
+
+Document:
+
+- quick action labels
+- context menu labels
+- titlebar actions
+- view toggles
+
+### 6. Domain content typography
+
+If the main artifact needs a special font, define it here.
+
+Examples:
+
+- terminal font
+- map label font
+- monospace editor font
+
+## Project Overlay: Yggterm
+
+This section is intentionally project-specific.
+
+### Main artifact
+
+- daemon-owned terminal and session canvas
+
+### Navigation model
+
+- vertical sidebar of sessions, papers, folders, separators, and related terminal workflows
+
+### Preferred user-facing terms
+
+- `Session`
+- `Terminal`
+- `Paper`
+- `Folder`
+- `Separator`
+
+Avoid by default:
 
 - `Space`
 - `Group` as the primary tree noun
-- `Runbook` as the primary executable-document noun
-- `Workspace` as a tree-item label
+- `Runbook` as the main executable-document noun
+- `Workspace` as a tree item label
 
-Reason:
+### Tree behavior
 
-- `Session` clearly means the agent-led flow
-- `Terminal` clearly means the generic shell/automation flow
-- `Paper` is softer and more intentional than `Document`
-- `Folder` is more familiar than `Group`
-- `Separator` communicates visual organization without overexplaining
-- `Space` is vague and overloaded
-
-### “New” vs “Create”
-
-Do not mix them arbitrarily.
-
-Preferred rule:
-
-- use `New ...` in menus and context menus for object creation
-- reserve `Create ...` only for future cases where something is explicitly derived from another thing and the derivation matters
-
-Default recommendation:
-
-- standardize on `New`
-
-## Tree and sidebar behavior
-
-The left sidebar is a real workspace organizer, not a file browser clone.
-
-- It should be dense but calm.
-- Icons should be grayscale by default.
-- Expanded root emphasis may use blue subtly.
-- The tree should support right-click as a first-class workflow.
-- Sessions, terminals, folders, separators, and papers should be visually distinguishable.
-- Session rows should not drown users in hashes or duplicate metadata lines.
+- the tree is a real workspace organizer, not a filesystem browser clone
+- it should be dense but calm
+- icons should be grayscale by default
+- expanded root emphasis may use blue subtly
+- sessions should not drown users in hashes or duplicate metadata lines
 
 ### Tree creation language
 
-The primary quick actions should read like:
+Primary quick actions:
 
 - `+Session`
 - `+Terminal`
 - `+Paper`
 
-And right-click folder context menus should prefer:
+Folder context menu defaults:
 
 - `New Session`
 - `New Terminal`
 - `New Paper`
-- separator
 - `Add Folder`
 - `Add Separator`
 
-Avoid exposing internal implementation nouns in the tree unless they are truly user-facing product concepts.
+### Header behavior
 
-## Header behavior
-
-Terminal mode should have a header area above the terminal.
-
-That header should contain:
+Terminal mode should have a header area above the terminal that can contain:
 
 - the session title
 - a short precis
-- the session mode selector on the right when relevant
+- a session mode selector when relevant
 
 It should not contain:
 
@@ -240,13 +329,11 @@ It should not contain:
 - noisy fake status cards
 - gratuitous terminal framing
 
-The precis should ideally come from the interface model when available, with a sensible local fallback.
-
-## Paper surfaces
+### Paper surfaces
 
 `Paper` is not just a note blob.
 
-It should grow toward a canvas surface that can host multiple richer modes over time, such as:
+It should be able to grow toward richer canvas modes such as:
 
 - writing
 - checklist/planning
@@ -254,49 +341,4 @@ It should grow toward a canvas surface that can host multiple richer modes over 
 - kanban-style organization
 - spreadsheet-like surfaces
 
-If a paper surface gains structured tools, it should use a ribbon-like action strip beneath the titlebar rather than scattering controls around the canvas.
-
-This is closer to a calm Office/Notion hybrid than a markdown editor with a toolbar.
-
-## Notifications
-
-Notifications should reduce anxiety, not create it.
-
-- transient in-app toasts should fade away
-- notification backlog can exist in a dedicated panel
-- sound should be optional
-- in-app notifications are the recommended default
-- system notifications should be optional, not forced
-
-For fast-moving operations like self-update:
-
-- silent success is not enough
-- users should get calm but explicit update feedback
-
-## Motion
-
-- sidebar and right-rail open/close transitions should be modern and restrained
-- no flashy animation for its own sake
-- state changes should feel smooth, not theatrical
-
-## Debug-only telemetry
-
-Debug-only UI telemetry is encouraged when a UI bug is hard to communicate or verify.
-
-Examples:
-
-- terminal host/font/debug state
-- live zoom/debug values
-- render/runtime state summaries
-
-Rules:
-
-- telemetry should exist only in debug builds
-- it should help reason about the UI without needing screenshots every time
-- it must never leak into release builds
-
-## Design workflow rule
-
-Whenever a user corrects visual taste, naming, control behavior, or interaction style in a way that seems durable rather than one-off, update this file.
-
-The goal is that future projects can reuse this document and get the same visual/design interpretation without retraining from scratch.
+If a paper surface gains structured tools, prefer a ribbon-like strip beneath the titlebar over scattered floating controls.
