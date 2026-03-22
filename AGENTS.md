@@ -25,7 +25,7 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 
 - Dioxus desktop is the active application shell. Match the basic shape and chrome of Zed first, then replace editor-specific behaviors with terminal-specific ones.
 - The primary navigation model is a vertical sidebar of virtual folders and sessions, not a filesystem browser.
-- Tree nodes represent persisted session metadata for local shells, SSH targets, Codex sessions, and other terminal workflows.
+- Tree nodes represent persisted metadata for sessions, generic terminals, papers, folders, separators, SSH targets, and other terminal workflows.
 - Example sidebar entries should feel like `remote/prod/codex-session-tui`, `machines/pi/ghostty-admin`, or other metadata-derived paths, not just on-disk folders.
 - Fast startup and interactive responsiveness.
 - Cross-platform support (Linux/macOS/Windows where feasible).
@@ -43,6 +43,7 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 - Replace editor-centric open flows with terminal-centric behavior: selecting a tree node should open, restore, or focus Yggterm PTY sessions rather than text buffers.
 - The central viewport should host embedded xterm.js terminal views in place of file editors.
 - Keep the active desktop shell centered on real server-owned terminals rather than reviving temporary mock terminal bodies.
+- Treat `Session`, `Terminal`, `Paper`, `Folder`, and `Separator` as the active user-facing vocabulary unless explicitly revisited.
 - Session state is local-first under `~/.yggterm`, but the tree model is metadata-first rather than a direct filesystem mirror.
 - Use `~/gh/codex-session-tui` and, when helpful, the local `../zed` checkout as reference material when refining shell shape, chrome, and interaction patterns.
 - Use the running X11 session and screenshots of a live Zed window when validating visual changes to the scaffold.

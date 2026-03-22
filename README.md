@@ -26,10 +26,10 @@ The product target is not “an editor with a terminal panel.” The terminal is
 
 That means:
 
-- one desktop shell for sessions, notes, recipes, and metadata
+- one desktop shell for sessions, terminals, papers, folders, separators, and metadata
 - a daemon-owned PTY runtime so terminals survive view switches cleanly
-- a virtual tree of sessions and documents, not a raw filesystem browser
-- first-class support for Codex sessions, local shells, SSH sessions, and workspace notes
+- a virtual tree of work surfaces, not a raw filesystem browser
+- first-class support for agent sessions, generic terminals, SSH sessions, papers, and virtual folders
 - fast startup from local metadata under `~/.yggterm`
 
 ## Why use it
@@ -40,10 +40,22 @@ Yggterm keeps those things nearby:
 
 - the live terminal
 - the recovered Codex session or other session preview
-- notes and executable recipe documents
+- papers and future structured canvases
 - session metadata and restore state
 
 The left tree is not just a launcher. It is the workspace memory.
+
+## Core nouns
+
+Yggterm is converging on a small set of user-facing concepts:
+
+- `Session`: an agent-oriented context. Today that usually means Codex, with `Codex` and `Codex LiteLLM` treated as two modes of the same session model.
+- `Terminal`: a generic daemon-owned shell/process context. This is where plain shells, SSH terminals, and future low-friction automation live.
+- `Paper`: a canvas surface for thinking, planning, and organizing work near the terminal. Over time it can grow beyond plain text into richer surfaces like kanban, calendar, and spreadsheet-like modes.
+- `Folder`: a virtual organizational node in the tree, often tied to a cwd or project context.
+- `Separator`: a visual divider for compartmentalization in the tree.
+
+This vocabulary matters. Yggterm is not trying to become “documents plus recipes plus tabs.” It is trying to become a calm workspace where sessions, terminals, papers, and folders stay near each other and stay understandable.
 
 ## Install and update model
 
@@ -75,7 +87,7 @@ Today the active stack is:
 - Dioxus desktop shell for the app surface
 - xterm.js embedded in the main viewport for terminal mode
 - `yggterm-server` as the daemon-owned PTY/runtime layer
-- SQLite-backed local metadata for workspace documents and generated titles
+- SQLite-backed local metadata for papers, folders, separators, and generated labels
 
 That means the current app already supports:
 
@@ -84,8 +96,8 @@ That means the current app already supports:
 - daemon-owned live sessions that survive switching between items
 - local shell sessions, SSH-backed sessions, and Codex-style agent sessions
 - an in-terminal Codex/Codex LiteLLM mode switch with server-side guardrails
-- workspace notes stored in `~/.yggterm/workspace.db`
-- recipe documents that can be edited in preview mode and executed in terminal mode
+- lightweight papers stored in `~/.yggterm/workspace.db`
+- executable terminal recipes as an intermediate step toward richer terminal automation
 - generated session titles through a configured LiteLLM endpoint
 - direct install with self-update and package-manager-aware notify-only mode
 
@@ -95,22 +107,23 @@ That means the current app already supports:
 
 The long-term model is metadata-first. The tree should describe work, not just folders on disk. A path in Yggterm is allowed to mean:
 
-- a Codex workspace
-- a local shell area
-- an SSH target or machine group
-- a session-derived document cluster
-- a restore grouping
-- a future recipe or automation bucket
+- a Session
+- a Terminal
+- a Paper
+- a Folder
+- a Separator
+- an SSH target or machine context
+- a future automation surface
 
-Documents are first-class workspace items, not a bolted-on notes tab. They live in `~/.yggterm/workspace.db` and appear in the same tree as sessions.
+Papers are first-class workspace items, not a bolted-on notes tab. They live in `~/.yggterm/workspace.db` and appear in the same tree as sessions and terminals.
 
 This is the direction:
 
 - terminals stay alive in the daemon while you switch views
 - preview and terminal are two lenses on the same workspace item
-- notes live beside the sessions they explain
-- recipes carry replay commands and source-session metadata
-- local shells, Codex sessions, and SSH sessions share one runtime model
+- papers live beside the sessions and terminals they explain
+- generic terminals should gradually absorb low-friction automation behavior instead of making users “manage scripts”
+- local shells, agent sessions, and SSH terminals share one runtime model
 - fast local metadata keeps startup cheap even when the tree gets large
 
 ## Tree workflow
@@ -119,19 +132,19 @@ The sidebar is now an active workspace surface.
 
 Examples of what you can do:
 
-- right-click a folder or group and create a new virtual group there
-- right-click a folder or group and create a new Codex session there
-- right-click a folder or group and create a local shell in that context
-- right-click a folder or group and create a nearby document
-- right-click a folder or group and create a nearby recipe
-- right-click a folder or group and move the selected document there
-- right-click a stored session and create a note beside it
-- right-click a stored session and create a recipe derived from it
+- use `+Session`, `+Terminal`, and `+Paper` as the primary quick-create actions
+- right-click a folder and create a new session there
+- right-click a folder and create a new terminal there
+- right-click a folder and create a nearby paper
+- right-click a folder and add another folder for compartmentalization
+- right-click a folder and add a separator for visual grouping
+- right-click a stored session and create a paper beside it
+- right-click a stored session and create an executable terminal recipe derived from it
 - regenerate generated titles for a session when needed
 
 The intent is simple: organizing the tree should naturally create the right place to work next.
 
-Virtual groups are stored under `~/.yggterm/workspace.db`, so they load quickly and do not depend on walking a large on-disk workspace before the UI becomes useful.
+Virtual folders and separators are stored under `~/.yggterm/workspace.db`, so they load quickly and do not depend on walking a large on-disk workspace before the UI becomes useful.
 
 The SSH connect rail is guided on purpose:
 
@@ -145,9 +158,9 @@ Agent mode switching is handled inside the terminal header, not in global settin
 - Yggterm asks the daemon to stop and relaunch that same session cleanly
 - if the terminal still looks active, the switch is refused and the user gets a notification instead of a corrupted session
 
-## Documents and recipes
+## Papers and automation
 
-Yggterm documents already have a CLI path so notes can be created or updated outside the UI.
+Yggterm already has a CLI path for lightweight paper content, so notes can be created or updated outside the UI while the richer paper surface keeps evolving.
 
 List documents:
 
@@ -172,12 +185,14 @@ The path is virtual. It controls where the item appears in the Yggterm tree; it 
 
 Inside the desktop shell:
 
-- notes open in preview mode for editing
-- recipes can store replay commands and source cwd metadata
-- `Run Here` saves the recipe and reuses the current document-backed terminal view
-- `Run In New Session` saves the recipe and starts a fresh daemon-owned shell session from the recipe cwd and replay commands
+- papers open in preview mode for editing
+- the long-term direction for paper is a richer canvas surface, not just a note blob
+- paper-oriented tools should eventually live in a ribbon-like strip beneath the titlebar, closer to Office-style task organization than a markdown toolbar
+- the current executable “recipe” layer is an intermediate step toward a more natural terminal automation model
+- `Run Here` saves the current automation content and reuses the current document-backed terminal view
+- `Run In New Session` saves it and starts a fresh daemon-owned shell session from the saved cwd and commands
 
-That is the beginning of a bigger idea: a workspace can hold the terminal, the explanation, and the repeatable command flow together.
+That is the beginning of a bigger idea: a workspace can hold the terminal, the explanation, the planning surface, and the repeatable command flow together.
 
 ## Daemon lifecycle
 
