@@ -118,6 +118,7 @@ struct ShellState {
     drag_hover_target: Option<String>,
     optimistic_drag_paths: Vec<String>,
     optimistic_drag_target: Option<String>,
+    drag_pointer: Option<(f64, f64)>,
     pending_delete: Option<PendingDeleteDialog>,
     tree_rename_path: Option<String>,
     tree_rename_value: String,
@@ -215,6 +216,7 @@ struct RenderSnapshot {
     drag_hover_target: Option<String>,
     optimistic_drag_paths: Vec<String>,
     optimistic_drag_target: Option<String>,
+    drag_pointer: Option<(f64, f64)>,
     pending_delete: Option<PendingDeleteDialog>,
     tree_rename_path: Option<String>,
     tree_rename_value: String,
@@ -363,6 +365,7 @@ impl ShellState {
             drag_hover_target: None,
             optimistic_drag_paths: Vec::new(),
             optimistic_drag_target: None,
+            drag_pointer: None,
             pending_delete: None,
             tree_rename_path: None,
             tree_rename_value: String::new(),
@@ -437,6 +440,7 @@ impl ShellState {
             drag_hover_target: self.drag_hover_target.clone(),
             optimistic_drag_paths: self.optimistic_drag_paths.clone(),
             optimistic_drag_target: self.optimistic_drag_target.clone(),
+            drag_pointer: self.drag_pointer,
             pending_delete: self.pending_delete.clone(),
             tree_rename_path: self.tree_rename_path.clone(),
             tree_rename_value: self.tree_rename_value.clone(),
@@ -864,10 +868,11 @@ impl ShellState {
         (document_paths, group_paths, labels)
     }
 
-    fn begin_drag(&mut self, row: &BrowserRow) {
+    fn begin_drag(&mut self, row: &BrowserRow, pointer: (f64, f64)) {
         if !is_workspace_row(row) {
             self.drag_paths.clear();
             self.drag_hover_target = None;
+            self.drag_pointer = None;
             self.refresh_tree_debug("begin_drag_ignored");
             return;
         }
@@ -885,6 +890,7 @@ impl ShellState {
         self.drag_hover_target = None;
         self.optimistic_drag_paths.clear();
         self.optimistic_drag_target = None;
+        self.drag_pointer = Some(pointer);
         if cfg!(debug_assertions) {
             info!(drag_count=%self.drag_paths.len(), anchor=%row.full_path, "tree drag started");
         }
@@ -898,7 +904,14 @@ impl ShellState {
         self.refresh_tree_debug("begin_drag");
     }
 
-    fn set_drag_hover_target(&mut self, row: &BrowserRow) {
+    fn update_drag_pointer(&mut self, pointer: (f64, f64)) {
+        if !self.drag_paths.is_empty() {
+            self.drag_pointer = Some(pointer);
+        }
+    }
+
+    fn set_drag_hover_target(&mut self, row: &BrowserRow, pointer: (f64, f64)) {
+        self.drag_pointer = Some(pointer);
         self.drag_hover_target =
             valid_drop_target(self.drag_paths.as_slice(), row).then(|| row.full_path.clone());
         self.optimistic_drag_target = self.drag_hover_target.clone();
@@ -922,6 +935,7 @@ impl ShellState {
         self.drag_hover_target = None;
         self.optimistic_drag_paths.clear();
         self.optimistic_drag_target = None;
+        self.drag_pointer = None;
         self.refresh_tree_debug("clear_drag_state");
     }
 
@@ -3541,13 +3555,16 @@ fn app() -> Element {
                                 shell.open_context_menu(row, position)
                             })
                         },
-                        on_start_drag: move |row: BrowserRow| state.with_mut(|shell| shell.begin_drag(&row)),
-                        on_drag_hover: move |row: BrowserRow| state.with_mut(|shell| shell.set_drag_hover_target(&row)),
-                        on_drag_leave: move |row: BrowserRow| state.with_mut(|shell| {
-                            if shell.drag_hover_target.as_deref() == Some(row.full_path.as_str()) {
-                                shell.drag_hover_target = None;
-                            }
-                        }),
+                        on_start_drag: move |(row, pointer): (BrowserRow, (f64, f64))| {
+                            state.with_mut(|shell| shell.begin_drag(&row, pointer))
+                        },
+                        on_drag_hover: move |(row, pointer): (BrowserRow, (f64, f64))| {
+                            state.with_mut(|shell| shell.set_drag_hover_target(&row, pointer))
+                        },
+                        on_drag_move: move |pointer: (f64, f64)| {
+                            state.with_mut(|shell| shell.update_drag_pointer(pointer))
+                        },
+                        on_drag_leave: move |_row: BrowserRow| {},
                         on_drop_into_row: move |_| queue_drop_current_drag_target(state),
                         on_end_drag: move |_| state.with_mut(|shell| shell.clear_drag_state()),
                         on_begin_rename: move |row: BrowserRow| state.with_mut(|shell| shell.begin_tree_rename(&row)),
@@ -3725,6 +3742,11 @@ fn app() -> Element {
                         palette: snapshot.palette,
                         right_inset: toast_right_inset(snapshot.right_panel_mode),
                         on_clear_notification: move |id: u64| state.with_mut(|shell| shell.clear_notification(id)),
+                    }
+                }
+                if !snapshot.drag_paths.is_empty() {
+                    DragGhost {
+                        snapshot: snapshot.clone(),
                     }
                 }
             }
@@ -4179,8 +4201,9 @@ fn Sidebar(
     on_select_row: EventHandler<(BrowserRow, TreeSelectionMode)>,
     on_delete_selected_items: EventHandler<bool>,
     on_open_context_menu: EventHandler<(BrowserRow, (f64, f64))>,
-    on_start_drag: EventHandler<BrowserRow>,
-    on_drag_hover: EventHandler<BrowserRow>,
+    on_start_drag: EventHandler<(BrowserRow, (f64, f64))>,
+    on_drag_hover: EventHandler<(BrowserRow, (f64, f64))>,
+    on_drag_move: EventHandler<(f64, f64)>,
     on_drag_leave: EventHandler<BrowserRow>,
     on_drop_into_row: EventHandler<()>,
     on_end_drag: EventHandler<()>,
@@ -4200,6 +4223,7 @@ fn Sidebar(
     } else {
         "translateX(-14px)"
     };
+    let drag_active = !snapshot.drag_paths.is_empty();
     rsx! {
         div {
             style: format!(
@@ -4238,7 +4262,18 @@ fn Sidebar(
             }
             div {
                 style: "flex:1; min-height:0; overflow:auto; padding:12px 12px 12px 12px;",
-                onmouseup: move |_| on_end_drag.call(()),
+                onmousemove: move |evt| {
+                    if drag_active {
+                        let coords = evt.client_coordinates();
+                        on_drag_move.call((coords.x, coords.y));
+                    }
+                },
+                onmouseup: move |_| {
+                    if drag_active {
+                        on_drop_into_row.call(());
+                    }
+                    on_end_drag.call(());
+                },
                 for row in snapshot.rows.iter().cloned() {
                     {
                         let select_row = row.clone();
@@ -4282,20 +4317,22 @@ fn Sidebar(
                                 on_cancel_rename: move |_| on_cancel_rename.call(()),
                                 on_start_drag: {
                                     let row = row.clone();
-                                    move |_| on_start_drag.call(row.clone())
+                                    move |evt: MouseEvent| {
+                                        let coords = evt.client_coordinates();
+                                        on_start_drag.call((row.clone(), (coords.x, coords.y)))
+                                    }
                                 },
                                 on_drag_hover: {
                                     let row = row.clone();
-                                    move |_| on_drag_hover.call(row.clone())
+                                    move |evt: MouseEvent| {
+                                        let coords = evt.client_coordinates();
+                                        on_drag_hover.call((row.clone(), (coords.x, coords.y)))
+                                    }
                                 },
                                 on_drag_leave: {
                                     let row = row.clone();
                                     move |_| on_drag_leave.call(row.clone())
                                 },
-                                on_drop_into_row: {
-                                    move |_| on_drop_into_row.call(())
-                                },
-                                on_end_drag: move |_| on_end_drag.call(()),
                             }
                         }
                     }
@@ -4324,8 +4361,6 @@ fn SidebarRow(
     on_start_drag: EventHandler<MouseEvent>,
     on_drag_hover: EventHandler<MouseEvent>,
     on_drag_leave: EventHandler<MouseEvent>,
-    on_drop_into_row: EventHandler<()>,
-    on_end_drag: EventHandler<MouseEvent>,
 ) -> Element {
     let indent = row.depth * 12 + 12;
     let draggable = is_workspace_row(&row);
@@ -4334,7 +4369,7 @@ fn SidebarRow(
             div {
                 style: format!(
                     "width:100%; display:flex; align-items:center; gap:10px; border:none; background:transparent; cursor:{}; \
-                     padding:8px 9px 8px {}px; margin:4px 0; opacity:{}; border-radius:12px; background:{}; \
+                     padding:8px 9px 8px {}px; margin:0; opacity:{}; border-radius:12px; background:{}; \
                      box-sizing:border-box; min-width:0; overflow:hidden; user-select:none; -webkit-user-select:none; \
                      transition: transform 140ms ease, background 140ms ease, opacity 140ms ease, box-shadow 140ms ease; \
                      transform:translateY({}px); box-shadow:{};",
@@ -4382,12 +4417,6 @@ fn SidebarRow(
                 },
                 onmouseleave: move |evt| {
                     on_drag_leave.call(evt);
-                },
-                onmouseup: move |evt| {
-                    if drag_active {
-                        on_drop_into_row.call(());
-                        on_end_drag.call(evt);
-                    }
                 },
                 div {
                     style: format!(
@@ -4474,7 +4503,7 @@ fn SidebarRow(
         div {
             style: format!(
                 "width:100%; display:flex; flex-direction:column; align-items:stretch; gap:2px; \
-                 border:none; border-radius:12px; background:{}; padding:6px 9px 6px {}px; margin-bottom:2px; opacity:{}; cursor:{}; \
+                 border:none; border-radius:12px; background:{}; padding:6px 9px 6px {}px; margin:0; opacity:{}; cursor:{}; \
                  box-sizing:border-box; min-width:0; overflow:hidden; user-select:none; -webkit-user-select:none; \
                  transition: transform 140ms ease, background 140ms ease, opacity 140ms ease, box-shadow 140ms ease; \
                  transform:translateY({}px); box-shadow:{};",
@@ -4522,12 +4551,6 @@ fn SidebarRow(
             },
             onmouseleave: move |evt| {
                 on_drag_leave.call(evt);
-            },
-            onmouseup: move |evt| {
-                if drag_active {
-                        on_drop_into_row.call(());
-                        on_end_drag.call(evt);
-                }
             },
             div {
                 style: "display:flex; align-items:center; justify-content:space-between; gap:8px;",
@@ -4592,6 +4615,72 @@ fn SidebarRow(
                         palette.muted
                     ),
                     "{row.detail_label}"
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn DragGhost(snapshot: RenderSnapshot) -> Element {
+    let Some((x, y)) = snapshot.drag_pointer else {
+        return rsx! {};
+    };
+    let dragged_rows = snapshot
+        .rows
+        .iter()
+        .filter(|row| snapshot.drag_paths.iter().any(|path| path == &row.full_path))
+        .cloned()
+        .collect::<Vec<_>>();
+    if dragged_rows.is_empty() {
+        return rsx! {};
+    }
+    let primary_label = dragged_rows
+        .first()
+        .map(|row| row.label.clone())
+        .unwrap_or_else(|| "Move item".to_string());
+    let extra_count = dragged_rows.len().saturating_sub(1);
+    rsx! {
+        div {
+            style: format!(
+                "position:fixed; left:{}px; top:{}px; z-index:1600; pointer-events:none; \
+                 transform:translate(16px, 10px); display:flex; flex-direction:column; gap:4px; \
+                 min-width:150px; max-width:260px; padding:10px 12px; border-radius:12px; \
+                 background:rgba(255,255,255,0.92); color:{}; box-shadow:0 18px 42px rgba(72, 101, 128, 0.22), \
+                 inset 0 0 0 1px rgba(201, 216, 230, 0.92); backdrop-filter: blur(12px); \
+                 -webkit-backdrop-filter: blur(12px);",
+                x, y, snapshot.palette.text
+            ),
+            div {
+                style: "display:flex; align-items:center; gap:8px;",
+                div {
+                    style: format!(
+                        "width:9px; height:9px; border-radius:999px; background:{}; flex:none;",
+                        snapshot.palette.accent
+                    ),
+                }
+                span {
+                    style: "font-size:12px; font-weight:800; letter-spacing:0.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                    "{primary_label}"
+                }
+                if extra_count > 0 {
+                    span {
+                        style: format!(
+                            "margin-left:auto; padding:2px 7px; border-radius:999px; font-size:10px; font-weight:800; \
+                             color:{}; background:{};",
+                            snapshot.palette.accent, snapshot.palette.accent_soft
+                        ),
+                        "+{extra_count}"
+                    }
+                }
+            }
+            if let Some(target) = snapshot.drag_hover_target.as_ref() {
+                div {
+                    style: format!(
+                        "font-size:10.5px; font-weight:700; letter-spacing:0.01em; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                        snapshot.palette.muted
+                    ),
+                    "Drop near {workspace_leaf_name(target).unwrap_or_else(|| \"item\".to_string())}"
                 }
             }
         }
