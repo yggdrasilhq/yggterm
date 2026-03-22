@@ -3145,6 +3145,11 @@ fn build_workspace_reorder_plan(
         }
     }
 
+    let original_target_siblings = siblings_by_parent
+        .get(&target_parent)
+        .cloned()
+        .unwrap_or_default();
+
     for siblings in siblings_by_parent.values_mut() {
         siblings.retain(|row| !moved_set.contains(&row.full_path));
     }
@@ -3153,11 +3158,12 @@ fn build_workspace_reorder_plan(
     let target_siblings = siblings_by_parent.entry(target_parent.clone()).or_default();
     let insert_at = match placement {
         WorkspaceDropPlacement::TopOfGroup(_) => 0,
-        WorkspaceDropPlacement::AfterPath(anchor) => target_siblings
+        WorkspaceDropPlacement::AfterPath(anchor) => original_target_siblings
             .iter()
-            .position(|row| row.full_path == *anchor)
-            .map(|index| index + 1)
-            .unwrap_or(target_siblings.len()),
+            .take_while(|row| row.full_path != *anchor)
+            .filter(|row| !moved_set.contains(&row.full_path))
+            .count()
+            + usize::from(!moved_set.contains(anchor)),
     };
     for (offset, row) in moved_rows.iter().cloned().enumerate() {
         target_siblings.insert(insert_at + offset, row);
@@ -7976,6 +7982,77 @@ mod tests {
                 "/home/pi/gh/notes".to_string()
             ))
         );
+    }
+
+    #[test]
+    fn reorder_plan_keeps_position_when_anchor_is_dragged_row_boundary() {
+        let gg = BrowserRow {
+            kind: BrowserRowKind::Document,
+            full_path: "/home/pi/gh/notes/untitled-gg".to_string(),
+            label: "gg".to_string(),
+            detail_label: String::new(),
+            document_kind: Some(WorkspaceDocumentKind::Note),
+            group_kind: None,
+            session_title: None,
+            depth: 3,
+            host_label: String::new(),
+            descendant_sessions: 0,
+            expanded: false,
+            session_id: Some("gg-id".to_string()),
+            session_cwd: Some("/home/pi/gh/notes".to_string()),
+        };
+        let separator = BrowserRow {
+            kind: BrowserRowKind::Separator,
+            full_path: "/home/pi/gh/notes/separator-a".to_string(),
+            label: "Separator".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: Some(WorkspaceGroupKind::Separator),
+            session_title: None,
+            depth: 3,
+            host_label: String::new(),
+            descendant_sessions: 0,
+            expanded: false,
+            session_id: None,
+            session_cwd: None,
+        };
+        let rows = vec![
+            BrowserRow {
+                kind: BrowserRowKind::Document,
+                full_path: "/home/pi/gh/notes/paper-a".to_string(),
+                label: "paper-a".to_string(),
+                detail_label: String::new(),
+                document_kind: Some(WorkspaceDocumentKind::Note),
+                group_kind: None,
+                session_title: None,
+                depth: 3,
+                host_label: String::new(),
+                descendant_sessions: 0,
+                expanded: false,
+                session_id: Some("paper-a-id".to_string()),
+                session_cwd: Some("/home/pi/gh/notes".to_string()),
+            },
+            gg.clone(),
+            separator.clone(),
+        ];
+
+        let placement = resolve_workspace_drop_placement(
+            &rows,
+            &DragDropTarget {
+                path: separator.full_path.clone(),
+                placement: DragDropPlacement::Before,
+            },
+        )
+        .expect("placement");
+
+        let plan = build_workspace_reorder_plan(&rows, std::slice::from_ref(&gg), &placement)
+            .expect("plan");
+
+        let gg_plan = plan
+            .iter()
+            .find(|item| item.from_path == gg.full_path)
+            .expect("gg plan item");
+        assert_eq!(gg_plan.final_path, "/home/pi/gh/notes/0001-untitled-gg");
     }
 
     #[test]
