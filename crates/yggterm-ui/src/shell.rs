@@ -2365,11 +2365,44 @@ fn queue_move_selected_items_to_group(
         (selected_rows, reorder_plan)
     };
     if selected_rows.is_empty() {
+        state.with_mut(|shell| {
+            shell.record_ui_telemetry(
+                "tree_drop_ignored",
+                json!({
+                    "reason": "selected_rows_empty",
+                    "target_label": target_label,
+                }),
+            );
+        });
         return;
     }
     let Some(reorder_plan) = reorder_plan else {
+        state.with_mut(|shell| {
+            shell.record_ui_telemetry(
+                "tree_drop_ignored",
+                json!({
+                    "reason": "reorder_plan_none",
+                    "target_label": target_label,
+                    "selected_rows": selected_rows.iter().map(|row| row.full_path.clone()).collect::<Vec<_>>(),
+                }),
+            );
+        });
         return;
     };
+    state.with_mut(|shell| {
+        shell.record_ui_telemetry(
+            "tree_drop_requested",
+            json!({
+                "target_label": target_label,
+                "selected_rows": selected_rows.iter().map(|row| row.full_path.clone()).collect::<Vec<_>>(),
+                "plan_len": reorder_plan.len(),
+                "plan_preview": reorder_plan.iter().take(8).map(|item| json!({
+                    "from": item.from_path,
+                    "final": item.final_path,
+                })).collect::<Vec<_>>(),
+            }),
+        );
+    });
 
     state.with_mut(|shell| {
         shell.server_busy = true;
@@ -2402,6 +2435,13 @@ fn queue_move_selected_items_to_group(
 
         state.with_mut(|shell| match outcome {
             Ok(Ok((moved_paths, browser_tree))) => {
+                shell.record_ui_telemetry(
+                    "tree_drop_succeeded",
+                    json!({
+                        "moved_paths": moved_paths,
+                        "target_label": target_label,
+                    }),
+                );
                 let expanded_paths = shell.browser.expanded_paths();
                 shell.browser = SessionBrowserState::new(browser_tree);
                 shell
@@ -2431,6 +2471,13 @@ fn queue_move_selected_items_to_group(
                 );
             }
             Ok(Err(error)) => {
+                shell.record_ui_telemetry(
+                    "tree_drop_failed",
+                    json!({
+                        "target_label": target_label,
+                        "error": error.to_string(),
+                    }),
+                );
                 shell.server_busy = false;
                 shell.optimistic_drag_paths.clear();
                 shell.optimistic_drag_target = None;
@@ -2439,6 +2486,14 @@ fn queue_move_selected_items_to_group(
                 shell.push_notification(NotificationTone::Error, "Move Failed", error.to_string());
             }
             Err(error) => {
+                shell.record_ui_telemetry(
+                    "tree_drop_failed",
+                    json!({
+                        "target_label": target_label,
+                        "error": error.to_string(),
+                        "task": true,
+                    }),
+                );
                 shell.server_busy = false;
                 shell.optimistic_drag_paths.clear();
                 shell.optimistic_drag_target = None;
@@ -2454,17 +2509,47 @@ fn queue_move_selected_items_to_group(
     });
 }
 
-fn queue_drop_current_drag_target(state: Signal<ShellState>) {
+fn queue_drop_current_drag_target(mut state: Signal<ShellState>) {
     let (placement, target_label) = {
         let shell = state.read();
         let Some(target) = shell.drag_hover_target.clone() else {
+            drop(shell);
+            state.with_mut(|shell| {
+                shell.record_ui_telemetry(
+                    "tree_drop_ignored",
+                    json!({
+                        "reason": "no_drag_hover_target",
+                    }),
+                );
+            });
             return;
         };
         let rows = merged_sidebar_rows(shell.browser.rows(), &shell.server.live_sessions());
         let Some(row) = rows.iter().find(|row| row.full_path == target.path).cloned() else {
+            drop(shell);
+            state.with_mut(|shell| {
+                shell.record_ui_telemetry(
+                    "tree_drop_ignored",
+                    json!({
+                        "reason": "target_row_not_found",
+                        "target": target.path,
+                    }),
+                );
+            });
             return;
         };
         let Some(placement) = resolve_workspace_drop_placement(&rows, &target) else {
+            drop(shell);
+            state.with_mut(|shell| {
+                shell.record_ui_telemetry(
+                    "tree_drop_ignored",
+                    json!({
+                        "reason": "drop_placement_unresolved",
+                        "target": target.path,
+                        "placement": format!("{:?}", target.placement).to_ascii_lowercase(),
+                    }),
+                );
+            });
             return;
         };
         let target_label = match target.placement {
@@ -4528,6 +4613,12 @@ fn Sidebar(
                         on_drag_move.call((coords.x, coords.y));
                     }
                 },
+                onmouseup: move |_| {
+                    if drag_active {
+                        on_drop_into_row.call(());
+                        on_end_drag.call(());
+                    }
+                },
                 for row in snapshot.rows.iter().cloned() {
                     {
                         let select_row = row.clone();
@@ -4591,6 +4682,8 @@ fn Sidebar(
                                     let row = row.clone();
                                     move |_| on_drag_leave.call(row.clone())
                                 },
+                                on_drop_into_row: move |_| on_drop_into_row.call(()),
+                                on_end_drag: move |_| on_end_drag.call(()),
                             }
                         }
                     }
@@ -4619,6 +4712,8 @@ fn SidebarRow(
     on_start_drag: EventHandler<MouseEvent>,
     on_drag_hover: EventHandler<(DragDropPlacement, MouseEvent)>,
     on_drag_leave: EventHandler<MouseEvent>,
+    on_drop_into_row: EventHandler<()>,
+    on_end_drag: EventHandler<()>,
 ) -> Element {
     let indent = row.depth * 12 + 12;
     let draggable = is_workspace_row(&row);
@@ -4672,16 +4767,30 @@ fn SidebarRow(
                 onmouseleave: move |evt| {
                     on_drag_leave.call(evt);
                 },
+                onmouseup: move |_| {
+                    if drag_active {
+                        on_drop_into_row.call(());
+                        on_end_drag.call(());
+                    }
+                },
                 if drag_active {
                     div {
                         style: "position:absolute; left:0; right:0; top:0; height:12px; z-index:2;",
                         onmouseenter: move |evt| on_drag_hover.call((DragDropPlacement::Before, evt)),
                         onmousemove: move |evt| on_drag_hover.call((DragDropPlacement::Before, evt)),
+                        onmouseup: move |_| {
+                            on_drop_into_row.call(());
+                            on_end_drag.call(());
+                        },
                     }
                     div {
                         style: "position:absolute; left:0; right:0; bottom:0; height:12px; z-index:2;",
                         onmouseenter: move |evt| on_drag_hover.call((DragDropPlacement::After, evt)),
                         onmousemove: move |evt| on_drag_hover.call((DragDropPlacement::After, evt)),
+                        onmouseup: move |_| {
+                            on_drop_into_row.call(());
+                            on_end_drag.call(());
+                        },
                     }
                 }
                 div {
@@ -4808,23 +4917,41 @@ fn SidebarRow(
             onmouseleave: move |evt| {
                 on_drag_leave.call(evt);
             },
+            onmouseup: move |_| {
+                if drag_active {
+                    on_drop_into_row.call(());
+                    on_end_drag.call(());
+                }
+            },
             if drag_active {
                 div {
                     style: "position:absolute; left:0; right:0; top:0; height:12px; z-index:2;",
                     onmouseenter: move |evt| on_drag_hover.call((DragDropPlacement::Before, evt)),
                     onmousemove: move |evt| on_drag_hover.call((DragDropPlacement::Before, evt)),
+                    onmouseup: move |_| {
+                        on_drop_into_row.call(());
+                        on_end_drag.call(());
+                    },
                 }
                 if can_drop_inside {
                     div {
                         style: "position:absolute; left:0; right:0; top:12px; bottom:12px; z-index:2;",
                         onmouseenter: move |evt| on_drag_hover.call((DragDropPlacement::Into, evt)),
                         onmousemove: move |evt| on_drag_hover.call((DragDropPlacement::Into, evt)),
+                        onmouseup: move |_| {
+                            on_drop_into_row.call(());
+                            on_end_drag.call(());
+                        },
                     }
                 }
                 div {
                     style: "position:absolute; left:0; right:0; bottom:0; height:12px; z-index:2;",
                     onmouseenter: move |evt| on_drag_hover.call((DragDropPlacement::After, evt)),
                     onmousemove: move |evt| on_drag_hover.call((DragDropPlacement::After, evt)),
+                    onmouseup: move |_| {
+                        on_drop_into_row.call(());
+                        on_end_drag.call(());
+                    },
                 }
             }
             div {
