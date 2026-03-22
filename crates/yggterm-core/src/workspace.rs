@@ -113,6 +113,7 @@ impl WorkspaceStore {
             "kind",
             "TEXT NOT NULL DEFAULT 'folder'",
         )?;
+        migrate_legacy_workspace_paths(&conn)?;
         Ok(Self { conn })
     }
 
@@ -387,7 +388,11 @@ impl WorkspaceStore {
         Ok(deleted)
     }
 
-    pub fn move_group(&self, from_virtual_path: &str, to_virtual_path: &str) -> Result<WorkspaceGroup> {
+    pub fn move_group(
+        &self,
+        from_virtual_path: &str,
+        to_virtual_path: &str,
+    ) -> Result<WorkspaceGroup> {
         let from_normalized = normalize_virtual_group_path(from_virtual_path);
         let to_normalized = normalize_virtual_group_path(to_virtual_path);
         if from_normalized == to_normalized {
@@ -411,11 +416,11 @@ impl WorkspaceStore {
 
         let descendant_groups = self.list_groups()?;
         let descendant_documents = self.list_documents()?;
-        for candidate in descendant_groups
-            .iter()
-            .filter(|candidate| is_same_or_descendant_path(&candidate.virtual_path, &from_normalized))
-        {
-            let rewritten = rewrite_virtual_prefix(&candidate.virtual_path, &from_normalized, &to_normalized);
+        for candidate in descendant_groups.iter().filter(|candidate| {
+            is_same_or_descendant_path(&candidate.virtual_path, &from_normalized)
+        }) {
+            let rewritten =
+                rewrite_virtual_prefix(&candidate.virtual_path, &from_normalized, &to_normalized);
             if rewritten != candidate.virtual_path
                 && self.get_group(&rewritten)?.is_some()
                 && !is_same_or_descendant_path(&rewritten, &from_normalized)
@@ -423,11 +428,11 @@ impl WorkspaceStore {
                 bail!("destination group path already exists: {rewritten}");
             }
         }
-        for candidate in descendant_documents
-            .iter()
-            .filter(|candidate| is_same_or_descendant_path(&candidate.virtual_path, &from_normalized))
-        {
-            let rewritten = rewrite_virtual_prefix(&candidate.virtual_path, &from_normalized, &to_normalized);
+        for candidate in descendant_documents.iter().filter(|candidate| {
+            is_same_or_descendant_path(&candidate.virtual_path, &from_normalized)
+        }) {
+            let rewritten =
+                rewrite_virtual_prefix(&candidate.virtual_path, &from_normalized, &to_normalized);
             if rewritten != candidate.virtual_path && self.get_document(&rewritten)?.is_some() {
                 bail!("destination paper path already exists: {rewritten}");
             }
@@ -551,6 +556,104 @@ fn ensure_optional_column(
     )
     .with_context(|| format!("failed to add column {table}.{column}"))?;
     Ok(())
+}
+
+fn migrate_legacy_workspace_paths(conn: &Connection) -> Result<()> {
+    let document_paths = {
+        let mut stmt =
+            conn.prepare("SELECT virtual_path FROM documents ORDER BY virtual_path ASC")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let group_paths = {
+        let mut stmt =
+            conn.prepare("SELECT virtual_path FROM workspace_groups ORDER BY virtual_path ASC")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    conn.execute_batch("BEGIN IMMEDIATE TRANSACTION;")?;
+    let result: Result<()> = (|| {
+        for path in document_paths {
+            let rewritten = rewrite_legacy_workspace_path(&path);
+            if rewritten == path {
+                continue;
+            }
+            let target = normalize_virtual_document_path(&rewritten);
+            let target_exists = conn
+                .query_row(
+                    "SELECT 1 FROM documents WHERE virtual_path = ?1",
+                    params![target],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if target_exists {
+                conn.execute(
+                    "DELETE FROM documents WHERE virtual_path = ?1",
+                    params![path],
+                )?;
+            } else {
+                conn.execute(
+                    "UPDATE documents SET virtual_path = ?1 WHERE virtual_path = ?2",
+                    params![target, path],
+                )?;
+            }
+        }
+
+        for path in group_paths {
+            let rewritten = rewrite_legacy_workspace_path(&path);
+            if rewritten == path {
+                continue;
+            }
+            let target = normalize_virtual_group_path(&rewritten);
+            let target_exists = conn
+                .query_row(
+                    "SELECT 1 FROM workspace_groups WHERE virtual_path = ?1",
+                    params![target],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if target_exists {
+                conn.execute(
+                    "DELETE FROM workspace_groups WHERE virtual_path = ?1",
+                    params![path],
+                )?;
+            } else {
+                conn.execute(
+                    "UPDATE workspace_groups SET virtual_path = ?1 WHERE virtual_path = ?2",
+                    params![target, path],
+                )?;
+            }
+        }
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT;")?,
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            return Err(error);
+        }
+    }
+
+    Ok(())
+}
+
+fn rewrite_legacy_workspace_path(path: &str) -> String {
+    let mut rewritten = path.to_string();
+    if let Some(rest) = rewritten.strip_prefix("/local") {
+        rewritten = if rest.is_empty() {
+            "/".to_string()
+        } else {
+            rest.to_string()
+        };
+    }
+    while rewritten.contains("/notes/notes/") {
+        rewritten = rewritten.replace("/notes/notes/", "/notes/");
+    }
+    rewritten
 }
 
 fn document_kind_name(kind: WorkspaceDocumentKind) -> &'static str {
@@ -710,10 +813,18 @@ mod tests {
         let home = temp_home();
         let store = WorkspaceStore::open(&home).expect("open workspace");
         store
-            .put_group_with_kind("/projects/alpha/folder-a", Some("Folder A"), WorkspaceGroupKind::Folder)
+            .put_group_with_kind(
+                "/projects/alpha/folder-a",
+                Some("Folder A"),
+                WorkspaceGroupKind::Folder,
+            )
             .expect("save folder");
         store
-            .put_group_with_kind("/projects/alpha/folder-a/divider", Some("Divider"), WorkspaceGroupKind::Separator)
+            .put_group_with_kind(
+                "/projects/alpha/folder-a/divider",
+                Some("Divider"),
+                WorkspaceGroupKind::Separator,
+            )
             .expect("save separator");
         store
             .put_document("/projects/alpha/folder-a/notes/todo", Some("Todo"), "body")
@@ -745,13 +856,21 @@ mod tests {
         let home = temp_home();
         let store = WorkspaceStore::open(&home).expect("open workspace");
         store
-            .put_group_with_kind("/projects/alpha/folder-a", Some("Folder A"), WorkspaceGroupKind::Folder)
+            .put_group_with_kind(
+                "/projects/alpha/folder-a",
+                Some("Folder A"),
+                WorkspaceGroupKind::Folder,
+            )
             .expect("save folder");
         store
             .put_document("/projects/alpha/folder-a/notes/todo", Some("Todo"), "body")
             .expect("save paper");
         store
-            .put_document("/projects/alpha/notes/standalone", Some("Standalone"), "body")
+            .put_document(
+                "/projects/alpha/notes/standalone",
+                Some("Standalone"),
+                "body",
+            )
             .expect("save standalone paper");
 
         let deleted = store
@@ -776,5 +895,17 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn rewrites_legacy_workspace_paths() {
+        assert_eq!(
+            rewrite_legacy_workspace_path("/local/home/pi/gh/notes/separator-1"),
+            "/home/pi/gh/notes/separator-1"
+        );
+        assert_eq!(
+            rewrite_legacy_workspace_path("/home/pi/gh/notes/notes/untitled-1"),
+            "/home/pi/gh/notes/untitled-1"
+        );
     }
 }

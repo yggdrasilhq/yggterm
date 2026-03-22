@@ -27,8 +27,7 @@ pub use transcript::{
 pub use workspace::{
     WorkspaceDocument, WorkspaceDocumentInput, WorkspaceDocumentKind, WorkspaceDocumentSummary,
     WorkspaceGroup, WorkspaceGroupKind, WorkspaceStore, default_document_title,
-    normalize_virtual_document_path,
-    normalize_virtual_group_path,
+    normalize_virtual_document_path, normalize_virtual_group_path,
 };
 
 pub const ENV_YGGTERM_HOME: &str = "YGGTERM_HOME";
@@ -523,7 +522,6 @@ struct CodexSessionIdentity {
 struct CodexProjectBucket {
     cwd: String,
     sessions: Vec<CodexSessionSummary>,
-    documents: Vec<WorkspaceDocumentSummary>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -531,6 +529,7 @@ struct CodexBrowserTreeNode {
     name: String,
     full_path: String,
     explicit_title: Option<String>,
+    document: Option<WorkspaceDocumentSummary>,
     group_kind: Option<WorkspaceGroupKind>,
     project: Option<CodexProjectBucket>,
     children: BTreeMap<String, CodexBrowserTreeNode>,
@@ -562,7 +561,6 @@ fn build_codex_browser_tree(
         buckets.push(CodexProjectBucket {
             cwd,
             sessions: project_sessions,
-            documents: Vec::new(),
         });
     }
 
@@ -570,6 +568,7 @@ fn build_codex_browser_tree(
         name: String::from("local [ok]"),
         full_path: String::from("local"),
         explicit_title: None,
+        document: None,
         group_kind: Some(WorkspaceGroupKind::Folder),
         project: None,
         children: BTreeMap::new(),
@@ -577,7 +576,7 @@ fn build_codex_browser_tree(
 
     if let Ok(workspace) = WorkspaceStore::open(home) {
         for document in workspace.list_documents().unwrap_or_default() {
-            insert_document_into_projects(&mut buckets, document);
+            insert_workspace_document(&mut root, &document);
         }
 
         for group in workspace.list_groups().unwrap_or_default() {
@@ -787,6 +786,7 @@ fn insert_codex_browser_path(
             name: segment.clone(),
             full_path: child_path,
             explicit_title: None,
+            document: None,
             group_kind: None,
             ..Default::default()
         });
@@ -818,10 +818,43 @@ fn insert_workspace_group_path(
             name: segment.clone(),
             full_path: child_path,
             explicit_title: None,
+            document: None,
             group_kind: None,
             ..Default::default()
         });
     insert_workspace_group_path(child, &segments[1..], group);
+}
+
+fn insert_workspace_document(root: &mut CodexBrowserTreeNode, document: &WorkspaceDocumentSummary) {
+    let segments = browser_tree_segments(&document.virtual_path);
+    insert_workspace_document_path(root, &segments, document);
+}
+
+fn insert_workspace_document_path(
+    node: &mut CodexBrowserTreeNode,
+    segments: &[String],
+    document: &WorkspaceDocumentSummary,
+) {
+    if segments.is_empty() {
+        node.explicit_title = Some(document.title.clone());
+        node.document = Some(document.clone());
+        return;
+    }
+
+    let segment = &segments[0];
+    let child_path = browser_tree_child_path(&node.full_path, segment);
+    let child = node
+        .children
+        .entry(segment.clone())
+        .or_insert_with(|| CodexBrowserTreeNode {
+            name: segment.clone(),
+            full_path: child_path,
+            explicit_title: None,
+            document: None,
+            group_kind: None,
+            ..Default::default()
+        });
+    insert_workspace_document_path(child, &segments[1..], document);
 }
 
 fn browser_tree_segments(cwd: &str) -> Vec<String> {
@@ -870,20 +903,39 @@ fn compress_codex_browser_tree(node: &mut CodexBrowserTreeNode, can_compress_sel
         return;
     }
 
-    while node.project.is_none() && node.explicit_title.is_none() && node.children.len() == 1 {
+    while node.project.is_none()
+        && node.explicit_title.is_none()
+        && node.document.is_none()
+        && node.children.len() == 1
+    {
         let (_, child) = node.children.pop_first().expect("single child exists");
-        if child.explicit_title.is_some() {
+        if child.explicit_title.is_some() || child.document.is_some() {
             node.children.insert(child.name.clone(), child);
             break;
         }
         node.name = join_session_label(&node.name, &child.name);
         node.full_path = child.full_path;
+        node.document = child.document;
         node.project = child.project;
         node.children = child.children;
     }
 }
 
 fn codex_browser_tree_to_session_node(node: &CodexBrowserTreeNode) -> SessionNode {
+    if let Some(document) = &node.document {
+        return SessionNode {
+            kind: SessionNodeKind::Document,
+            name: document.title.clone(),
+            title: Some(document.title.clone()),
+            document_kind: Some(document.kind),
+            group_kind: None,
+            path: PathBuf::from(document.virtual_path.clone()),
+            children: Vec::new(),
+            session_id: Some(document.id.clone()),
+            cwd: Some(document.virtual_path.clone()),
+        };
+    }
+
     let mut children = Vec::new();
 
     if let Some(project) = &node.project {
@@ -897,17 +949,6 @@ fn codex_browser_tree_to_session_node(node: &CodexBrowserTreeNode) -> SessionNod
             children: Vec::new(),
             session_id: Some(session.session_id.clone()),
             cwd: Some(project.cwd.clone()),
-        }));
-        children.extend(project.documents.iter().map(|document| SessionNode {
-            kind: SessionNodeKind::Document,
-            name: document.title.clone(),
-            title: Some(document.title.clone()),
-            document_kind: Some(document.kind),
-            group_kind: None,
-            path: PathBuf::from(document.virtual_path.clone()),
-            children: Vec::new(),
-            session_id: Some(document.id.clone()),
-            cwd: Some(document.virtual_path.clone()),
         }));
     }
 
@@ -940,42 +981,5 @@ fn short_session_id(session_id: &str) -> String {
         format!("Q{}", &compact[compact.len() - 7..])
     } else {
         session_id.to_string()
-    }
-}
-
-fn insert_document_into_projects(
-    buckets: &mut Vec<CodexProjectBucket>,
-    document: WorkspaceDocumentSummary,
-) {
-    let parent_path = document_parent_path(&document.virtual_path);
-    if let Some(bucket) = buckets.iter_mut().find(|bucket| bucket.cwd == parent_path) {
-        bucket.documents.push(document);
-        bucket
-            .documents
-            .sort_by(|left, right| left.title.cmp(&right.title));
-        return;
-    }
-
-    buckets.push(CodexProjectBucket {
-        cwd: parent_path,
-        sessions: Vec::new(),
-        documents: vec![document],
-    });
-}
-
-fn document_parent_path(path: &str) -> String {
-    let normalized = normalize_virtual_document_path(path);
-    let mut segments = normalized
-        .trim_matches('/')
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    if !segments.is_empty() {
-        segments.pop();
-    }
-    if segments.is_empty() {
-        "/".to_string()
-    } else {
-        format!("/{}", segments.join("/"))
     }
 }
