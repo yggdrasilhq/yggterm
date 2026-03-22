@@ -1599,6 +1599,11 @@ fn queue_session_note_creation(mut state: Signal<ShellState>, row: BrowserRow) {
                     .browser
                     .restore_ui_state(&expanded_paths, Some(&document.virtual_path));
                 shell.browser.select_path(document.virtual_path.clone());
+                shell.selected_tree_paths.clear();
+                shell
+                    .selected_tree_paths
+                    .insert(document.virtual_path.clone());
+                shell.selection_anchor = Some(document.virtual_path.clone());
                 shell.sync_browser_settings();
                 shell.apply_daemon_snapshot_result(open_stored_session(
                     &shell.bootstrap.server_endpoint,
@@ -1764,11 +1769,7 @@ fn queue_new_document(mut state: Signal<ShellState>) {
                     Some(&document.title),
                 ));
                 shell.last_action = format!("created {}", document.title);
-                shell.push_notification(
-                    NotificationTone::Success,
-                    "Document Created",
-                    format!("Opened {}.", document.title),
-                );
+                shell.refresh_tree_debug("created_document");
             }
             Ok(Err(error)) => {
                 shell.server_busy = false;
@@ -1815,11 +1816,6 @@ fn queue_new_workspace_document_for_row(
         WorkspaceDocumentKind::Note => "document",
         WorkspaceDocumentKind::TerminalRecipe => "recipe",
     };
-    let created_label = match kind {
-        WorkspaceDocumentKind::Note => "Document Created",
-        WorkspaceDocumentKind::TerminalRecipe => "Recipe Created",
-    };
-
     state.with_mut(|shell| {
         shell.server_busy = true;
         shell.last_action = format!("creating {action_label} in {}", row.label);
@@ -1858,6 +1854,11 @@ fn queue_new_workspace_document_for_row(
                     .browser
                     .restore_ui_state(&expanded_paths, Some(&document.virtual_path));
                 shell.browser.select_path(document.virtual_path.clone());
+                shell.selected_tree_paths.clear();
+                shell
+                    .selected_tree_paths
+                    .insert(document.virtual_path.clone());
+                shell.selection_anchor = Some(document.virtual_path.clone());
                 shell.sync_browser_settings();
                 shell.apply_daemon_snapshot_result(open_stored_session(
                     &shell.bootstrap.server_endpoint,
@@ -1868,11 +1869,7 @@ fn queue_new_workspace_document_for_row(
                     Some(&document.title),
                 ));
                 shell.last_action = format!("created {}", document.title);
-                shell.push_notification(
-                    NotificationTone::Success,
-                    created_label,
-                    format!("Opened {}.", document.title),
-                );
+                shell.refresh_tree_debug("created_workspace_document");
             }
             Ok(Err(error)) => {
                 shell.server_busy = false;
@@ -1927,14 +1924,13 @@ fn queue_new_group_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
                     .browser
                     .restore_ui_state(&expanded_paths, Some(&selected_path));
                 shell.browser.select_path(selected_path.clone());
+                shell.selected_tree_paths.clear();
+                shell.selected_tree_paths.insert(selected_path.clone());
+                shell.selection_anchor = Some(selected_path.clone());
                 shell.sync_browser_settings();
                 shell.server_busy = false;
                 shell.last_action = format!("added folder in {}", row.label);
-                shell.push_notification(
-                    NotificationTone::Success,
-                    "Folder Added",
-                    format!("Added a new folder under {}.", row.label),
-                );
+                shell.refresh_tree_debug("added_folder");
             }
             Ok(Err(error)) => {
                 shell.server_busy = false;
@@ -1994,14 +1990,13 @@ fn queue_new_separator_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
                     .browser
                     .restore_ui_state(&expanded_paths, Some(&selected_path));
                 shell.browser.select_path(selected_path.clone());
+                shell.selected_tree_paths.clear();
+                shell.selected_tree_paths.insert(selected_path.clone());
+                shell.selection_anchor = Some(selected_path.clone());
                 shell.sync_browser_settings();
                 shell.server_busy = false;
                 shell.last_action = format!("added separator in {}", row.label);
-                shell.push_notification(
-                    NotificationTone::Success,
-                    "Separator Added",
-                    format!("Added a separator under {}.", row.label),
-                );
+                shell.refresh_tree_debug("added_separator");
             }
             Ok(Err(error)) => {
                 shell.server_busy = false;
@@ -3015,6 +3010,10 @@ fn app() -> Element {
                  -webkit-backdrop-filter: blur(30px) saturate(165%);",
                 shell_radius, snapshot.palette.shell, snapshot.palette.gradient
             ),
+            oncontextmenu: |evt| {
+                evt.prevent_default();
+                evt.stop_propagation();
+            },
             style { "{TOAST_CSS}" }
             div {
                 style: shell_style(snapshot.palette, shell_radius),
@@ -3832,14 +3831,16 @@ fn SidebarRow(
             button {
                 style: format!(
                     "width:100%; display:flex; align-items:center; gap:10px; border:none; background:transparent; \
-                     padding:8px 9px 8px {}px; margin:4px 0; opacity:{};",
+                     padding:8px 9px 8px {}px; margin:4px 0; opacity:{}; border-radius:12px; background:{};",
                     indent
-                    , if dragging { "0.58" } else { "1" }
+                    , if dragging { "0.58" } else { "1" },
+                    if selected { palette.accent_soft } else { "transparent" }
                 ),
                 draggable: draggable,
                 onclick: move |evt| on_select.call(evt),
                 oncontextmenu: move |evt| {
                     evt.prevent_default();
+                    evt.stop_propagation();
                     let coords = evt.client_coordinates();
                     on_open_context_menu.call((coords.x, coords.y));
                 },
@@ -3858,14 +3859,14 @@ fn SidebarRow(
                     style: format!(
                         "flex:1; height:{}px; background:{}; opacity:{};",
                         if drop_hovered { 2 } else { 1 },
-                        if drop_hovered { palette.accent } else { palette.border },
-                        if drop_hovered { "0.96" } else { "0.72" }
+                        if drop_hovered || selected { palette.accent } else { palette.border },
+                        if drop_hovered || selected { "0.96" } else { "0.72" }
                     ),
                 }
                 span {
                     style: format!(
                         "font-size:10px; font-weight:700; letter-spacing:0.08em; text-transform:uppercase; color:{};",
-                        if drop_hovered { palette.accent } else { palette.muted }
+                        if drop_hovered || selected { palette.accent } else { palette.muted }
                     ),
                     "{row.label}"
                 }
@@ -3873,8 +3874,8 @@ fn SidebarRow(
                     style: format!(
                         "flex:1; height:{}px; background:{}; opacity:{};",
                         if drop_hovered { 2 } else { 1 },
-                        if drop_hovered { palette.accent } else { palette.border },
-                        if drop_hovered { "0.96" } else { "0.72" }
+                        if drop_hovered || selected { palette.accent } else { palette.border },
+                        if drop_hovered || selected { "0.96" } else { "0.72" }
                     ),
                 }
             }
@@ -3917,6 +3918,7 @@ fn SidebarRow(
             onclick: move |evt| on_select.call(evt),
             oncontextmenu: move |evt| {
                 evt.prevent_default();
+                evt.stop_propagation();
                 let coords = evt.client_coordinates();
                 on_open_context_menu.call((coords.x, coords.y));
             },
@@ -5588,38 +5590,6 @@ fn SettingsRailBody(
                         },
                         SessionMetadataEntry {
                             label: "Drag Target",
-                            value: snapshot.drag_hover_target.clone().unwrap_or_else(|| "none".to_string()),
-                        },
-                        SessionMetadataEntry {
-                            label: "Pending Delete",
-                            value: snapshot.pending_delete.as_ref().map(|pending| {
-                                format!(
-                                    "{} item(s), hard={}",
-                                    pending.document_paths.len() + pending.group_paths.len(),
-                                    pending.hard_delete
-                                )
-                            }).unwrap_or_else(|| "none".to_string()),
-                        },
-                    ],
-                    palette: snapshot.palette,
-                }
-                MetadataGroup {
-                    title: "Tree Debug".to_string(),
-                    entries: vec![
-                        SessionMetadataEntry {
-                            label: "State",
-                            value: snapshot.last_tree_debug.clone(),
-                        },
-                        SessionMetadataEntry {
-                            label: "Selected",
-                            value: if snapshot.selected_tree_paths.is_empty() {
-                                "none".to_string()
-                            } else {
-                                snapshot.selected_tree_paths.join(", ")
-                            },
-                        },
-                        SessionMetadataEntry {
-                            label: "Drag Target",
                             value: snapshot
                                 .drag_hover_target
                                 .clone()
@@ -5837,8 +5807,7 @@ fn NotificationCard(
             style: format!(
                 "display:flex; flex-direction:column; gap:7px; padding:12px 12px 11px 12px; border-radius:14px; \
                  background:rgba(249,250,252,0.86); backdrop-filter: blur(28px) saturate(165%); \
-                 -webkit-backdrop-filter: blur(28px) saturate(165%); box-shadow: 0 18px 38px rgba(49,67,82,0.14), inset 0 0 0 1px rgba(255,255,255,0.72); \
-                 animation:yggterm-toast-fade 7s ease forwards;",
+                 -webkit-backdrop-filter: blur(28px) saturate(165%); box-shadow: 0 18px 38px rgba(49,67,82,0.14), inset 0 0 0 1px rgba(255,255,255,0.72);",
             ),
             div {
                 style: "display:flex; align-items:center; justify-content:space-between; gap:8px;",
@@ -5911,13 +5880,19 @@ fn ContextMenuOverlay(
         selected_tree_paths
     };
     let can_move_selected_document = valid_drop_target(&drag_paths, &row);
+    let selected_count = drag_paths.len().max(1);
+    let menu_title = if selected_count > 1 && drag_paths.iter().any(|path| path == &row.full_path) {
+        format!("{selected_count} selected items")
+    } else {
+        row.label.clone()
+    };
     rsx! {
         div {
             style: "position:fixed; inset:0; z-index:90; background:transparent;",
             onclick: move |evt| on_close.call(evt),
             div {
                 style: format!(
-                    "position:absolute; top:{}px; left:{}px; min-width:220px; padding:6px; border-radius:10px; \
+                    "position:absolute; top:{}px; left:{}px; min-width:188px; max-width:220px; padding:6px; border-radius:10px; \
                      background:rgba(248,249,252,0.98); box-shadow: 0 18px 38px rgba(57,78,98,0.18), inset 0 0 0 1px rgba(214,220,228,0.9); \
                      backdrop-filter: blur(20px) saturate(150%); -webkit-backdrop-filter: blur(20px) saturate(150%);",
                     menu_top, menu_left
@@ -5926,7 +5901,7 @@ fn ContextMenuOverlay(
                 onclick: |evt| evt.stop_propagation(),
                 div {
                     style: format!("padding:6px 12px 8px 12px; font-size:11px; font-weight:700; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.muted),
-                    "{row.label}"
+                    "{menu_title}"
                 }
                 if (row.kind == BrowserRowKind::Group || row.kind == BrowserRowKind::Separator)
                     && !row.full_path.starts_with("__live_")
@@ -6018,19 +5993,21 @@ fn DeleteConfirmOverlay(
                 style: format!(
                     "width:min(460px, calc(100vw - 40px)); display:flex; flex-direction:column; gap:14px; \
                      padding:22px; border-radius:18px; background:rgba(250,252,255,0.96); color:{}; \
-                     box-shadow:0 24px 54px rgba(55,83,112,0.18), inset 0 0 0 1px rgba(214,223,232,0.9);",
-                    palette.text
+                     box-shadow:0 24px 54px rgba(55,83,112,0.18), inset 0 0 0 1px rgba(214,223,232,0.9); \
+                     font-family:{};",
+                    palette.text,
+                    interface_font_family()
                 ),
                 onmousedown: |evt| evt.stop_propagation(),
                 onclick: |evt| evt.stop_propagation(),
                 div {
                     style: "display:flex; flex-direction:column; gap:6px;",
                     div {
-                        style: format!("font-size:18px; font-weight:700; color:{};", palette.text),
+                        style: "font-size:19px; font-weight:760; letter-spacing:-0.01em; color:#b3263f;",
                         if pending.hard_delete { "Delete Permanently?" } else { "Delete Selected Items?" }
                     }
                     div {
-                        style: format!("font-size:12px; line-height:1.55; color:{};", palette.muted),
+                        style: format!("font-size:12px; line-height:1.6; color:{};", palette.muted),
                         if pending.hard_delete {
                             "This will permanently remove the selected items from the workspace tree."
                         } else {
@@ -6042,7 +6019,7 @@ fn DeleteConfirmOverlay(
                     style: "display:flex; flex-direction:column; gap:6px; max-height:180px; overflow:auto; padding-right:4px;",
                     for label in preview {
                         div {
-                            style: format!("font-size:12px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.text),
+                            style: format!("font-size:12px; line-height:1.5; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.text),
                             "• {label}"
                         }
                     }
@@ -6094,7 +6071,7 @@ fn ToastViewport(
             ),
             for notification in items {
                 div {
-                    style: "pointer-events:auto;",
+                    style: "pointer-events:auto; animation:yggterm-toast-fade 7s ease forwards;",
                     NotificationCard {
                         notification: notification.clone(),
                         palette,
@@ -6529,7 +6506,7 @@ fn delete_confirm_button_style(_palette: Palette, hard_delete: bool) -> String {
     format!(
         "height:34px; padding:0 16px; border:none; border-radius:12px; background:{}; color:#ffffff; \
          font-size:12px; font-weight:700;",
-        if hard_delete { "#c23f4d" } else { "#5fa8ff" }
+        if hard_delete { "#b3263f" } else { "#c23f4d" }
     )
 }
 
