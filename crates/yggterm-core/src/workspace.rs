@@ -738,13 +738,21 @@ fn simplify_workspace_order_part(part: &str) -> String {
     } else {
         ("", part)
     };
+    let mut kept_order_prefix = None;
     while rest.len() > 5
         && rest.as_bytes().get(4) == Some(&b'-')
         && rest.as_bytes()[0..4].iter().all(|byte| byte.is_ascii_digit())
     {
+        let candidate = &rest[..5];
+        if kept_order_prefix.is_none() {
+            kept_order_prefix = Some(candidate);
+        }
         rest = &rest[5..];
     }
-    format!("{prefix}{rest}")
+    match kept_order_prefix {
+        Some(order_prefix) => format!("{prefix}{order_prefix}{rest}"),
+        None => format!("{prefix}{rest}"),
+    }
 }
 
 fn rewrite_legacy_workspace_path(path: &str) -> String {
@@ -1021,13 +1029,13 @@ mod tests {
             simplify_workspace_order_path(
                 "/home/pi/gh/notes/0000-0008-0000-untitled-1774119990~0002-0002-0001-note"
             ),
-            "/home/pi/gh/notes/untitled-1774119990~note"
+            "/home/pi/gh/notes/0000-untitled-1774119990~0002-note"
         );
         assert_eq!(
             simplify_workspace_order_path(
                 "/home/pi/gh/notes/!0000-0000-separator-1774185969049440371"
             ),
-            "/home/pi/gh/notes/!separator-1774185969049440371"
+            "/home/pi/gh/notes/!0000-separator-1774185969049440371"
         );
     }
 }
