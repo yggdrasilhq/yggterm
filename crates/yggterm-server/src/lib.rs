@@ -652,7 +652,7 @@ impl YggtermServer {
     ) -> anyhow::Result<(String, bool)> {
         let ssh_target = target.trim();
         if ssh_target.is_empty() {
-            anyhow::bail!("enter an SSH target such as dev, pi@jojo, or user@ip");
+            anyhow::bail!("enter an SSH target such as dev, pi@raspberry, or user@ip");
         }
         let prefix = prefix
             .map(str::trim)
