@@ -7,11 +7,11 @@ pub use attach::{AttachMetadata, run_attach};
 pub use daemon::{
     ServerEndpoint, ServerRequest, ServerResponse, ServerRuntimeStatus, TerminalStreamChunk,
     connect_ssh, connect_ssh_custom, default_endpoint, focus_live, open_remote_session,
-    open_stored_session, ping, raise_external_window, request_terminal_launch, run_daemon,
-    set_all_preview_blocks_folded, set_view_mode, shutdown, snapshot, start_command_session,
-    start_local_session, start_local_session_at, status, switch_agent_session_mode,
-    sync_external_window, sync_theme, terminal_ensure, terminal_read, terminal_resize,
-    terminal_write, toggle_preview_block,
+    open_stored_session, ping, raise_external_window, refresh_remote_machine,
+    request_terminal_launch, run_daemon, set_all_preview_blocks_folded, set_view_mode, shutdown,
+    snapshot, start_command_session, start_local_session, start_local_session_at, status,
+    switch_agent_session_mode, sync_external_window, sync_theme, terminal_ensure, terminal_read,
+    terminal_resize, terminal_write, toggle_preview_block,
 };
 pub use host::{GhosttyHostKind, GhosttyHostSupport, GhosttyTerminalHostMode, detect_ghostty_host};
 pub use terminal::{TerminalChunk, TerminalManager, TerminalReadResult};
@@ -779,6 +779,28 @@ impl YggtermServer {
                 Err(error)
             }
         }
+    }
+
+    pub fn refresh_remote_machine_by_key(&mut self, machine_key: &str) -> anyhow::Result<()> {
+        let target = self
+            .ssh_targets
+            .iter()
+            .find(|target| machine_key_from_ssh_target(&target.ssh_target) == machine_key)
+            .cloned()
+            .or_else(|| {
+                self.remote_machines
+                    .iter()
+                    .find(|machine| machine.machine_key == machine_key)
+                    .map(|machine| SshConnectTarget {
+                        label: machine.label.clone(),
+                        kind: SessionKind::SshShell,
+                        ssh_target: machine.ssh_target.clone(),
+                        prefix: machine.prefix.clone(),
+                        cwd: None,
+                    })
+            })
+            .ok_or_else(|| anyhow::anyhow!("remote machine not found: {machine_key}"))?;
+        self.refresh_remote_machine_for_ssh_target(&target)
     }
 
     pub fn open_remote_scanned_session(

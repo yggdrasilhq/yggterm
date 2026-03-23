@@ -64,6 +64,9 @@ pub enum ServerRequest {
         cwd: Option<String>,
         title_hint: Option<String>,
     },
+    RefreshRemoteMachine {
+        machine_key: String,
+    },
     StartLocalSession {
         session_kind: SessionKind,
         cwd: Option<String>,
@@ -293,6 +296,11 @@ impl DaemonRuntime {
                 )?;
                 self.persist()?;
                 self.snapshot_response(Some(format!("opened {key}")))
+            }
+            ServerRequest::RefreshRemoteMachine { machine_key } => {
+                self.server.refresh_remote_machine_by_key(&machine_key)?;
+                self.persist()?;
+                self.snapshot_response(Some(format!("refreshed {machine_key}")))
             }
             ServerRequest::StartLocalSession {
                 session_kind,
@@ -570,6 +578,18 @@ pub fn open_remote_session(
             session_id: session_id.to_string(),
             cwd: cwd.map(ToOwned::to_owned),
             title_hint: title_hint.map(ToOwned::to_owned),
+        },
+    )?)
+}
+
+pub fn refresh_remote_machine(
+    endpoint: &ServerEndpoint,
+    machine_key: &str,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
+    expect_snapshot(send_request(
+        endpoint,
+        &ServerRequest::RefreshRemoteMachine {
+            machine_key: machine_key.to_string(),
         },
     )?)
 }
