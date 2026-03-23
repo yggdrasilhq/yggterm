@@ -58,6 +58,12 @@ pub enum ServerRequest {
         target: String,
         prefix: Option<String>,
     },
+    OpenRemoteSession {
+        machine_key: String,
+        session_id: String,
+        cwd: Option<String>,
+        title_hint: Option<String>,
+    },
     StartLocalSession {
         session_kind: SessionKind,
         cwd: Option<String>,
@@ -241,7 +247,11 @@ impl DaemonRuntime {
                 self.snapshot_response(Some(format!("opened {path}")))
             }
             ServerRequest::ConnectSsh { target_ix } => {
+                let target = self.server.ssh_targets().get(target_ix).cloned();
                 let (key, reused) = self.server.connect_ssh_target(target_ix);
+                if let Some(target) = target.as_ref() {
+                    let _ = self.server.refresh_remote_machine_for_ssh_target(target);
+                }
                 self.persist()?;
                 self.snapshot_response(key.map(|key| {
                     if reused {
@@ -253,12 +263,36 @@ impl DaemonRuntime {
             }
             ServerRequest::ConnectSshCustom { target, prefix } => {
                 let (key, reused) = self.server.connect_ssh_custom(&target, prefix.as_deref())?;
+                if let Some(target) = self
+                    .server
+                    .ssh_targets()
+                    .iter()
+                    .find(|candidate| candidate.ssh_target == target && candidate.prefix.as_deref() == prefix.as_deref())
+                    .cloned()
+                {
+                    let _ = self.server.refresh_remote_machine_for_ssh_target(&target);
+                }
                 self.persist()?;
                 self.snapshot_response(Some(if reused {
                     format!("focused existing {key}")
                 } else {
                     format!("connected {key}")
                 }))
+            }
+            ServerRequest::OpenRemoteSession {
+                machine_key,
+                session_id,
+                cwd,
+                title_hint,
+            } => {
+                let key = self.server.open_remote_scanned_session(
+                    &machine_key,
+                    &session_id,
+                    cwd.as_deref(),
+                    title_hint.as_deref(),
+                )?;
+                self.persist()?;
+                self.snapshot_response(Some(format!("opened {key}")))
             }
             ServerRequest::StartLocalSession {
                 session_kind,
@@ -518,6 +552,24 @@ pub fn connect_ssh_custom(
         &ServerRequest::ConnectSshCustom {
             target: target.to_string(),
             prefix: prefix.map(ToOwned::to_owned),
+        },
+    )?)
+}
+
+pub fn open_remote_session(
+    endpoint: &ServerEndpoint,
+    machine_key: &str,
+    session_id: &str,
+    cwd: Option<&str>,
+    title_hint: Option<&str>,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
+    expect_snapshot(send_request(
+        endpoint,
+        &ServerRequest::OpenRemoteSession {
+            machine_key: machine_key.to_string(),
+            session_id: session_id.to_string(),
+            cwd: cwd.map(ToOwned::to_owned),
+            title_hint: title_hint.map(ToOwned::to_owned),
         },
     )?)
 }
