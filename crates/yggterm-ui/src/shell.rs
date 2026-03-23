@@ -291,6 +291,13 @@ enum PreviewContentBlock {
     Code { language: Option<String>, code: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MachineHealth {
+    Healthy,
+    Cached,
+    Offline,
+}
+
 impl ShellState {
     fn new(bootstrap: ShellBootstrap) -> Self {
         let settings = bootstrap.settings.clone();
@@ -1650,7 +1657,7 @@ fn spawn_connect_ssh_custom(mut state: Signal<ShellState>) {
             shell.push_notification(
                 NotificationTone::Warning,
                 "SSH Target Needed",
-                "Enter an SSH target such as dev, pi@jojo, or user@ip.",
+                "Enter an SSH target such as dev, pi@raspberry, or user@ip.",
             );
         });
         return;
@@ -1789,51 +1796,137 @@ fn merged_sidebar_rows(
         return stored_rows.to_vec();
     }
 
-    let mut rows = Vec::with_capacity(stored_rows.len() + live_sessions.len() + 1);
+    let mut rows = Vec::with_capacity(stored_rows.len() + live_sessions.len() + 8);
+    let non_ssh_sessions = live_sessions
+        .iter()
+        .filter(|session| session.kind != SessionKind::SshShell)
+        .collect::<Vec<_>>();
+    if !non_ssh_sessions.is_empty() {
+        rows.push(BrowserRow {
+            kind: BrowserRowKind::Group,
+            full_path: "__live_sessions__".to_string(),
+            label: "live".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: None,
+            depth: 0,
+            host_label: String::new(),
+            descendant_sessions: non_ssh_sessions.len(),
+            expanded: true,
+            session_id: None,
+            session_cwd: None,
+        });
+        push_live_group_rows(
+            &mut rows,
+            "agent sessions",
+            "__live_agents__",
+            1,
+            non_ssh_sessions.iter().copied().filter(|session| {
+                matches!(session.kind, SessionKind::Codex | SessionKind::CodexLiteLlm)
+            }),
+        );
+        push_live_group_rows(
+            &mut rows,
+            "shell sessions",
+            "__live_shells__",
+            1,
+            non_ssh_sessions
+                .iter()
+                .copied()
+                .filter(|session| session.kind == SessionKind::Shell),
+        );
+    }
+
+    let mut ssh_machine_sessions = BTreeMap::<String, Vec<&ManagedSessionView>>::new();
+    for session in live_sessions
+        .iter()
+        .filter(|session| session.kind == SessionKind::SshShell)
+    {
+        ssh_machine_sessions
+            .entry(live_machine_label(session))
+            .or_default()
+            .push(session);
+    }
+    for (machine_label, sessions) in ssh_machine_sessions {
+        push_live_machine_rows(&mut rows, &machine_label, sessions);
+    }
+    rows.extend_from_slice(stored_rows);
+    rows
+}
+
+fn live_machine_label(session: &ManagedSessionView) -> String {
+    let raw = if !session.host_label.trim().is_empty() {
+        session.host_label.trim()
+    } else if let Some(target) = session.ssh_target.as_deref() {
+        target.trim()
+    } else {
+        "remote"
+    };
+    format!("{raw} [ok]")
+}
+
+fn push_live_machine_rows(
+    rows: &mut Vec<BrowserRow>,
+    machine_label: &str,
+    sessions: Vec<&ManagedSessionView>,
+) {
+    if sessions.is_empty() {
+        return;
+    }
+    let machine_key = machine_label
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
     rows.push(BrowserRow {
         kind: BrowserRowKind::Group,
-        full_path: "__live_sessions__".to_string(),
-        label: "live".to_string(),
+        full_path: format!("__live_machine__/{machine_key}"),
+        label: machine_label.to_string(),
         detail_label: String::new(),
         document_kind: None,
         group_kind: None,
         session_title: None,
         depth: 0,
-        host_label: String::new(),
-        descendant_sessions: live_sessions.len(),
+        host_label: "live".to_string(),
+        descendant_sessions: sessions.len(),
         expanded: true,
         session_id: None,
         session_cwd: None,
     });
-    push_live_group_rows(
-        &mut rows,
-        "agent sessions",
-        "__live_agents__",
-        1,
-        live_sessions.iter().filter(|session| {
-            matches!(session.kind, SessionKind::Codex | SessionKind::CodexLiteLlm)
-        }),
-    );
-    push_live_group_rows(
-        &mut rows,
-        "shell sessions",
-        "__live_shells__",
-        1,
-        live_sessions
-            .iter()
-            .filter(|session| session.kind == SessionKind::Shell),
-    );
-    push_live_group_rows(
-        &mut rows,
-        "ssh sessions",
-        "__live_ssh__",
-        1,
-        live_sessions
-            .iter()
-            .filter(|session| session.kind == SessionKind::SshShell),
-    );
-    rows.extend_from_slice(stored_rows);
-    rows
+
+    let machine_name = machine_label.split(" [").next().unwrap_or(machine_label);
+    for session in sessions {
+        let label = if session.title.trim().is_empty() || session.title.trim() == machine_name {
+            "terminal".to_string()
+        } else {
+            session.title.clone()
+        };
+        rows.push(BrowserRow {
+            kind: BrowserRowKind::Session,
+            full_path: session.session_path.clone(),
+            label,
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: Some(session.title.clone()),
+            depth: 1,
+            host_label: machine_name.to_string(),
+            descendant_sessions: 1,
+            expanded: true,
+            session_id: Some(session.id.clone()),
+            session_cwd: session
+                .metadata
+                .iter()
+                .find(|entry| entry.label == "Cwd")
+                .map(|entry| entry.value.clone()),
+        });
+    }
 }
 
 fn push_live_group_rows<'a, I>(
@@ -1874,7 +1967,7 @@ fn push_live_group_rows<'a, I>(
             kind: BrowserRowKind::Session,
             full_path: session.session_path.clone(),
             label,
-            detail_label: session.status_line.clone(),
+            detail_label: String::new(),
             document_kind: None,
             group_kind: None,
             session_title: Some(session.title.clone()),
@@ -4631,6 +4724,8 @@ fn SidebarRow(
     } else {
         palette.muted
     };
+    let machine_label = machine_label_text(&row.label);
+    let machine_health = machine_health_from_label(&row.label);
     let label_color = if row.kind == BrowserRowKind::Group && row.depth == 0 && row.expanded {
         palette.accent
     } else if selected {
@@ -4742,7 +4837,19 @@ fn SidebarRow(
                                 label_color,
                                 if row.kind == BrowserRowKind::Group && row.depth == 0 { 600 } else { 500 }
                             ),
-                            "{row.label}"
+                            "{machine_label.clone().unwrap_or_else(|| row.label.clone())}"
+                        }
+                    }
+                    if let Some(health) = machine_health {
+                        span {
+                            style: format!(
+                                "display:inline-flex; width:8px; min-width:8px; height:8px; border-radius:999px; background:{}; box-shadow:0 0 0 2px rgba(255,255,255,0.72);",
+                                match health {
+                                    MachineHealth::Healthy => "#16a34a",
+                                    MachineHealth::Cached => "#f59e0b",
+                                    MachineHealth::Offline => "#ef4444",
+                                }
+                            ),
                         }
                     }
                 }
@@ -4764,6 +4871,26 @@ fn SidebarRow(
             }
         }
     }
+}
+
+fn machine_health_from_label(label: &str) -> Option<MachineHealth> {
+    if label.ends_with("[ok]") {
+        Some(MachineHealth::Healthy)
+    } else if label.ends_with("[cached]") {
+        Some(MachineHealth::Cached)
+    } else if label.ends_with("[offline]") {
+        Some(MachineHealth::Offline)
+    } else {
+        None
+    }
+}
+
+fn machine_label_text(label: &str) -> Option<String> {
+    machine_health_from_label(label).map(|_| {
+        label.rsplit_once(" [")
+            .map(|(base, _)| base.to_string())
+            .unwrap_or_else(|| label.to_string())
+    })
 }
 
 #[component]
@@ -7116,6 +7243,14 @@ fn ConnectRailBody(
                 }
                 div {
                     style: format!(
+                        "font-size:11px; font-weight:700; letter-spacing:0.02em; color:{}; \
+                         text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
+                        snapshot.palette.muted
+                    ),
+                    "Example"
+                }
+                div {
+                    style: format!(
                         "font-size:12px; line-height:1.55; color:{}; white-space:pre-wrap;",
                         snapshot.palette.text
                     ),
@@ -7144,7 +7279,7 @@ fn ConnectRailBody(
                 input {
                     r#type: "text",
                     value: "{snapshot.ssh_connect_target}",
-                    placeholder: "dev or pi@jojo or user@192.168.1.15",
+                    placeholder: "dev or pi@raspberry or user@192.168.1.15",
                     style: format!(
                         "height:36px; padding:0 12px; border:1px solid {}; border-radius:10px; background:{}; color:{}; \
                          font-size:12px; outline:none; box-shadow: inset 0 1px 0 rgba(255,255,255,0.55);",
