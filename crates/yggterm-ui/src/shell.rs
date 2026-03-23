@@ -392,7 +392,7 @@ impl ShellState {
 
     fn snapshot(&self) -> RenderSnapshot {
         let live_sessions = self.server.live_sessions();
-        let rows = merged_sidebar_rows(self.browser.rows(), &live_sessions);
+        let rows = merged_sidebar_rows(self.browser.rows(), self.server.ssh_targets(), &live_sessions);
         let selected_path = if let Some(active) = self.server.active_session() {
             if active.source == yggterm_server::SessionSource::LiveSsh {
                 Some(active.session_path.clone())
@@ -788,7 +788,11 @@ impl ShellState {
     }
 
     fn extend_tree_selection(&mut self, row: &BrowserRow) {
-        let rows = merged_sidebar_rows(self.browser.rows(), &self.server.live_sessions());
+        let rows = merged_sidebar_rows(
+            self.browser.rows(),
+            self.server.ssh_targets(),
+            &self.server.live_sessions(),
+        );
         let anchor = self
             .selection_anchor
             .clone()
@@ -838,7 +842,11 @@ impl ShellState {
     }
 
     fn selected_workspace_rows(&self) -> Vec<BrowserRow> {
-        let rows = merged_sidebar_rows(self.browser.rows(), &self.server.live_sessions());
+        let rows = merged_sidebar_rows(
+            self.browser.rows(),
+            self.server.ssh_targets(),
+            &self.server.live_sessions(),
+        );
         let selected = rows
             .into_iter()
             .filter(|row| self.selected_tree_paths.contains(&row.full_path))
@@ -923,7 +931,11 @@ impl ShellState {
         placement: DragDropPlacement,
     ) {
         self.drag_pointer = Some(pointer);
-        let rows = merged_sidebar_rows(self.browser.rows(), &self.server.live_sessions());
+        let rows = merged_sidebar_rows(
+            self.browser.rows(),
+            self.server.ssh_targets(),
+            &self.server.live_sessions(),
+        );
         self.drag_hover_target =
             resolve_drag_drop_target(&rows, self.drag_paths.as_slice(), row, placement);
         self.optimistic_drag_target = self.drag_hover_target.clone();
@@ -1790,9 +1802,10 @@ fn is_live_sidebar_row(row: &BrowserRow) -> bool {
 
 fn merged_sidebar_rows(
     stored_rows: &[BrowserRow],
+    ssh_targets: &[SshConnectTarget],
     live_sessions: &[ManagedSessionView],
 ) -> Vec<BrowserRow> {
-    if live_sessions.is_empty() {
+    if live_sessions.is_empty() && ssh_targets.is_empty() {
         return stored_rows.to_vec();
     }
 
@@ -1839,6 +1852,11 @@ fn merged_sidebar_rows(
     }
 
     let mut ssh_machine_sessions = BTreeMap::<String, Vec<&ManagedSessionView>>::new();
+    for target in ssh_targets {
+        ssh_machine_sessions
+            .entry(ssh_target_machine_label(target))
+            .or_default();
+    }
     for session in live_sessions
         .iter()
         .filter(|session| session.kind == SessionKind::SshShell)
@@ -1866,14 +1884,25 @@ fn live_machine_label(session: &ManagedSessionView) -> String {
     format!("{raw} [ok]")
 }
 
+fn ssh_target_machine_label(target: &SshConnectTarget) -> String {
+    let raw = if !target.label.trim().is_empty() {
+        target.label.trim()
+    } else {
+        target
+            .ssh_target
+            .rsplit('@')
+            .next()
+            .unwrap_or(target.ssh_target.as_str())
+            .trim()
+    };
+    format!("{raw} [ok]")
+}
+
 fn push_live_machine_rows(
     rows: &mut Vec<BrowserRow>,
     machine_label: &str,
     sessions: Vec<&ManagedSessionView>,
 ) {
-    if sessions.is_empty() {
-        return;
-    }
     let machine_key = machine_label
         .chars()
         .map(|ch| {
@@ -2553,7 +2582,11 @@ fn queue_move_selected_items_to_group(
     let (selected_rows, selected_source_paths, selected_final_paths, reorder_plan) = {
         let shell = state.read();
         let selected_rows = shell.selected_workspace_rows();
-        let rows = merged_sidebar_rows(shell.browser.rows(), &shell.server.live_sessions());
+        let rows = merged_sidebar_rows(
+            shell.browser.rows(),
+            shell.server.ssh_targets(),
+            &shell.server.live_sessions(),
+        );
         let reorder_plan = build_workspace_reorder_plan(&rows, &selected_rows, &placement);
         let selected_source_paths = selected_rows
             .iter()
@@ -2737,7 +2770,11 @@ fn queue_drop_current_drag_target(mut state: Signal<ShellState>) {
             });
             return;
         };
-        let rows = merged_sidebar_rows(shell.browser.rows(), &shell.server.live_sessions());
+        let rows = merged_sidebar_rows(
+            shell.browser.rows(),
+            shell.server.ssh_targets(),
+            &shell.server.live_sessions(),
+        );
         let Some(row) = rows.iter().find(|row| row.full_path == target.path).cloned() else {
             drop(shell);
             state.with_mut(|shell| {
@@ -4843,7 +4880,7 @@ fn SidebarRow(
                     if let Some(health) = machine_health {
                         span {
                             style: format!(
-                                "display:inline-flex; width:8px; min-width:8px; height:8px; border-radius:999px; background:{}; box-shadow:0 0 0 2px rgba(255,255,255,0.72);",
+                                "display:inline-flex; width:6px; min-width:6px; height:6px; border-radius:999px; background:{}; box-shadow:0 0 0 1.5px rgba(255,255,255,0.74); opacity:0.96;",
                                 match health {
                                     MachineHealth::Healthy => "#16a34a",
                                     MachineHealth::Cached => "#f59e0b",
@@ -8488,6 +8525,27 @@ mod tests {
             preview_block_excerpt(&block, 120).as_deref(),
             Some("cargo test Runs the focused regression suite.")
         );
+    }
+
+    #[test]
+    fn merged_sidebar_rows_include_saved_ssh_machine_roots() {
+        let rows = merged_sidebar_rows(
+            &[],
+            &[SshConnectTarget {
+                label: "raspberry".to_string(),
+                kind: SessionKind::SshShell,
+                ssh_target: "pi@raspberry".to_string(),
+                prefix: None,
+                cwd: None,
+            }],
+            &[],
+        );
+
+        assert!(rows.iter().any(|row| {
+            row.kind == BrowserRowKind::Group
+                && row.depth == 0
+                && row.label == "raspberry [ok]"
+        }));
     }
 }
 
