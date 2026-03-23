@@ -28,7 +28,7 @@ use keyboard_types::{Key, Modifiers};
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
@@ -48,14 +48,15 @@ use yggterm_core::{
 };
 use yggterm_platform::DockRect;
 use yggterm_server::{
-    GhosttyTerminalHostMode, ManagedSessionView, PreviewTone, ServerEndpoint, ServerRuntimeStatus,
+    GhosttyTerminalHostMode, ManagedSessionView, PreviewTone, RemoteMachineHealth,
+    RemoteMachineSnapshot, RemoteScannedSession, ServerEndpoint, ServerRuntimeStatus,
     ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionPreviewBlock,
     SessionRenderedSection, SshConnectTarget, TerminalBackend, WorkspaceViewMode, YggtermServer,
-    connect_ssh_custom, focus_live, open_stored_session, ping, request_terminal_launch,
-    set_all_preview_blocks_folded, set_view_mode as daemon_set_view_mode,
-    snapshot as daemon_snapshot, start_command_session, start_local_session,
-    start_local_session_at, status, switch_agent_session_mode, terminal_ensure, terminal_read,
-    terminal_resize, terminal_write,
+    connect_ssh_custom, focus_live, open_remote_session, open_stored_session, ping,
+    request_terminal_launch, set_all_preview_blocks_folded,
+    set_view_mode as daemon_set_view_mode, snapshot as daemon_snapshot, start_command_session,
+    start_local_session, start_local_session_at, status, switch_agent_session_mode,
+    terminal_ensure, terminal_read, terminal_resize, terminal_write,
     toggle_preview_block as daemon_toggle_preview_block,
 };
 
@@ -392,7 +393,12 @@ impl ShellState {
 
     fn snapshot(&self) -> RenderSnapshot {
         let live_sessions = self.server.live_sessions();
-        let rows = merged_sidebar_rows(self.browser.rows(), self.server.ssh_targets(), &live_sessions);
+        let rows = merged_sidebar_rows(
+            self.browser.rows(),
+            self.server.remote_machines(),
+            self.server.ssh_targets(),
+            &live_sessions,
+        );
         let selected_path = if let Some(active) = self.server.active_session() {
             if active.source == yggterm_server::SessionSource::LiveSsh {
                 Some(active.session_path.clone())
@@ -790,6 +796,7 @@ impl ShellState {
     fn extend_tree_selection(&mut self, row: &BrowserRow) {
         let rows = merged_sidebar_rows(
             self.browser.rows(),
+            self.server.remote_machines(),
             self.server.ssh_targets(),
             &self.server.live_sessions(),
         );
@@ -844,6 +851,7 @@ impl ShellState {
     fn selected_workspace_rows(&self) -> Vec<BrowserRow> {
         let rows = merged_sidebar_rows(
             self.browser.rows(),
+            self.server.remote_machines(),
             self.server.ssh_targets(),
             &self.server.live_sessions(),
         );
@@ -933,6 +941,7 @@ impl ShellState {
         self.drag_pointer = Some(pointer);
         let rows = merged_sidebar_rows(
             self.browser.rows(),
+            self.server.remote_machines(),
             self.server.ssh_targets(),
             &self.server.live_sessions(),
         );
@@ -1177,7 +1186,7 @@ impl ShellState {
 }
 
 fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force: bool) {
-    if row.kind != BrowserRowKind::Session {
+    if !is_local_stored_session_row(&row) {
         return;
     }
 
@@ -1650,14 +1659,24 @@ fn spawn_open_session_row(mut state: Signal<ShellState>, row: BrowserRow) {
         shell.last_action = format!("opening {}", row.label);
     });
     spawn_server_snapshot_action(state, format!("opening {}", row.label), move |endpoint| {
-        open_stored_session(
-            &endpoint,
-            session_kind_for_row(row.kind),
-            &row.full_path,
-            row.session_id.as_deref(),
-            row.session_cwd.as_deref(),
-            Some(row.label.as_str()),
-        )
+        if let Some((machine_key, session_id)) = parse_remote_scanned_session_path(&row.full_path) {
+            open_remote_session(
+                &endpoint,
+                machine_key,
+                session_id,
+                row.session_cwd.as_deref(),
+                Some(row.label.as_str()),
+            )
+        } else {
+            open_stored_session(
+                &endpoint,
+                session_kind_for_row(row.kind),
+                &row.full_path,
+                row.session_id.as_deref(),
+                row.session_cwd.as_deref(),
+                Some(row.label.as_str()),
+            )
+        }
     });
 }
 
@@ -1800,12 +1819,27 @@ fn is_live_sidebar_row(row: &BrowserRow) -> bool {
         || row.full_path.starts_with("codex-litellm://")
 }
 
+fn is_remote_scanned_sidebar_row(row: &BrowserRow) -> bool {
+    row.full_path.starts_with("remote-session://")
+}
+
+fn is_local_stored_session_row(row: &BrowserRow) -> bool {
+    row.kind == BrowserRowKind::Session && !is_live_sidebar_row(row) && !is_remote_scanned_sidebar_row(row)
+}
+
+fn parse_remote_scanned_session_path(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix("remote-session://")?;
+    let (machine_key, session_id) = rest.split_once('/')?;
+    Some((machine_key, session_id))
+}
+
 fn merged_sidebar_rows(
     stored_rows: &[BrowserRow],
+    remote_machines: &[RemoteMachineSnapshot],
     ssh_targets: &[SshConnectTarget],
     live_sessions: &[ManagedSessionView],
 ) -> Vec<BrowserRow> {
-    if live_sessions.is_empty() && ssh_targets.is_empty() {
+    if live_sessions.is_empty() && ssh_targets.is_empty() && remote_machines.is_empty() {
         return stored_rows.to_vec();
     }
 
@@ -1851,26 +1885,73 @@ fn merged_sidebar_rows(
         );
     }
 
-    let mut ssh_machine_sessions = BTreeMap::<String, Vec<&ManagedSessionView>>::new();
+    let mut machine_rows = BTreeMap::<String, SidebarRemoteMachine>::new();
     for target in ssh_targets {
-        ssh_machine_sessions
-            .entry(ssh_target_machine_label(target))
-            .or_default();
+        let machine_key = machine_key_from_labelish(&target.ssh_target);
+        machine_rows
+            .entry(machine_key.clone())
+            .or_insert_with(|| SidebarRemoteMachine {
+                key: machine_key.clone(),
+                label: ssh_target_machine_label(target),
+                health: MachineHealth::Cached,
+                scanned_sessions: Vec::new(),
+                live_sessions: Vec::new(),
+            });
+    }
+    for machine in remote_machines {
+        machine_rows.insert(
+            machine.machine_key.clone(),
+            SidebarRemoteMachine {
+                key: machine.machine_key.clone(),
+                label: machine.label.clone(),
+                health: match machine.health {
+                    RemoteMachineHealth::Healthy => MachineHealth::Healthy,
+                    RemoteMachineHealth::Cached => MachineHealth::Cached,
+                    RemoteMachineHealth::Offline => MachineHealth::Offline,
+                },
+                scanned_sessions: machine.sessions.clone(),
+                live_sessions: Vec::new(),
+            },
+        );
     }
     for session in live_sessions
         .iter()
         .filter(|session| session.kind == SessionKind::SshShell)
     {
-        ssh_machine_sessions
-            .entry(live_machine_label(session))
-            .or_default()
-            .push(session);
+        let machine_key = session
+            .ssh_target
+            .as_deref()
+            .map(machine_key_from_labelish)
+            .unwrap_or_else(|| machine_key_from_labelish(&session.host_label));
+        let entry = machine_rows
+            .entry(machine_key.clone())
+            .or_insert_with(|| SidebarRemoteMachine {
+                key: machine_key.clone(),
+                label: machine_label_text(&live_machine_label(session))
+                    .unwrap_or_else(|| live_machine_label(session)),
+                health: MachineHealth::Healthy,
+                scanned_sessions: Vec::new(),
+                live_sessions: Vec::new(),
+            });
+        entry.label = machine_label_text(&live_machine_label(session))
+            .unwrap_or_else(|| live_machine_label(session));
+        entry.health = MachineHealth::Healthy;
+        entry.live_sessions.push(session);
     }
-    for (machine_label, sessions) in ssh_machine_sessions {
-        push_live_machine_rows(&mut rows, &machine_label, sessions);
+    for machine in machine_rows.into_values() {
+        push_remote_machine_rows(&mut rows, &machine);
     }
     rows.extend_from_slice(stored_rows);
     rows
+}
+
+#[derive(Debug)]
+struct SidebarRemoteMachine<'a> {
+    key: String,
+    label: String,
+    health: MachineHealth,
+    scanned_sessions: Vec<RemoteScannedSession>,
+    live_sessions: Vec<&'a ManagedSessionView>,
 }
 
 fn live_machine_label(session: &ManagedSessionView) -> String {
@@ -1898,39 +1979,63 @@ fn ssh_target_machine_label(target: &SshConnectTarget) -> String {
     format!("{raw} [ok]")
 }
 
-fn push_live_machine_rows(
-    rows: &mut Vec<BrowserRow>,
-    machine_label: &str,
-    sessions: Vec<&ManagedSessionView>,
-) {
-    let machine_key = machine_label
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
+fn push_remote_machine_rows(rows: &mut Vec<BrowserRow>, machine: &SidebarRemoteMachine<'_>) {
+    let machine_label = apply_machine_health_suffix(&machine.label, machine.health);
     rows.push(BrowserRow {
         kind: BrowserRowKind::Group,
-        full_path: format!("__live_machine__/{machine_key}"),
-        label: machine_label.to_string(),
+        full_path: format!("__remote_machine__/{}", machine.key),
+        label: machine_label.clone(),
         detail_label: String::new(),
         document_kind: None,
         group_kind: None,
         session_title: None,
         depth: 0,
         host_label: "live".to_string(),
-        descendant_sessions: sessions.len(),
+        descendant_sessions: machine.live_sessions.len() + machine.scanned_sessions.len(),
         expanded: true,
         session_id: None,
         session_cwd: None,
     });
 
-    let machine_name = machine_label.split(" [").next().unwrap_or(machine_label);
-    for session in sessions {
+    let live_paths = machine
+        .live_sessions
+        .iter()
+        .map(|session| session.session_path.clone())
+        .collect::<HashSet<_>>();
+    let mut emitted = HashMap::<String, usize>::new();
+
+    for scanned in &machine.scanned_sessions {
+        push_remote_folder_rows(rows, &machine.key, &scanned.cwd, &mut emitted);
+        if live_paths.contains(&scanned.session_path) {
+            continue;
+        }
+        rows.push(BrowserRow {
+            kind: BrowserRowKind::Session,
+            full_path: scanned.session_path.clone(),
+            label: scanned.title_hint.clone(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: Some(scanned.title_hint.clone()),
+            depth: remote_session_depth(&scanned.cwd),
+            host_label: machine.key.clone(),
+            descendant_sessions: 1,
+            expanded: true,
+            session_id: Some(scanned.session_id.clone()),
+            session_cwd: Some(scanned.cwd.clone()),
+        });
+    }
+
+    let machine_name = machine_label_text(&machine_label).unwrap_or(machine.label.clone());
+    for session in &machine.live_sessions {
+        let cwd = session
+            .metadata
+            .iter()
+            .find(|entry| entry.label == "Cwd")
+            .map(|entry| entry.value.clone());
+        if let Some(cwd) = cwd.as_deref() {
+            push_remote_folder_rows(rows, &machine.key, cwd, &mut emitted);
+        }
         let label = if session.title.trim().is_empty() || session.title.trim() == machine_name {
             "terminal".to_string()
         } else {
@@ -1944,18 +2049,89 @@ fn push_live_machine_rows(
             document_kind: None,
             group_kind: None,
             session_title: Some(session.title.clone()),
-            depth: 1,
-            host_label: machine_name.to_string(),
+            depth: cwd.as_deref().map(remote_session_depth).unwrap_or(1),
+            host_label: machine_name.clone(),
             descendant_sessions: 1,
             expanded: true,
             session_id: Some(session.id.clone()),
-            session_cwd: session
-                .metadata
-                .iter()
-                .find(|entry| entry.label == "Cwd")
-                .map(|entry| entry.value.clone()),
+            session_cwd: cwd,
         });
     }
+}
+
+fn push_remote_folder_rows(
+    rows: &mut Vec<BrowserRow>,
+    machine_key: &str,
+    cwd: &str,
+    emitted: &mut HashMap<String, usize>,
+) {
+    let segments = cwd
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.is_empty() {
+        return;
+    }
+
+    let mut current = String::new();
+    for (ix, segment) in segments.iter().enumerate() {
+        current.push('/');
+        current.push_str(segment);
+        if emitted.contains_key(&current) {
+            continue;
+        }
+        emitted.insert(current.clone(), ix + 1);
+        rows.push(BrowserRow {
+            kind: BrowserRowKind::Group,
+            full_path: format!("__remote_folder__/{machine_key}{}", current),
+            label: if ix == 0 && cwd.starts_with('/') {
+                format!("/{segment}")
+            } else {
+                (*segment).to_string()
+            },
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: None,
+            depth: ix + 1,
+            host_label: machine_key.to_string(),
+            descendant_sessions: 0,
+            expanded: true,
+            session_id: None,
+            session_cwd: Some(current.clone()),
+        });
+    }
+}
+
+fn remote_session_depth(cwd: &str) -> usize {
+    cwd.split('/').filter(|segment| !segment.is_empty()).count() + 1
+}
+
+fn machine_key_from_labelish(value: &str) -> String {
+    value.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+fn apply_machine_health_suffix(label: &str, health: MachineHealth) -> String {
+    let base = machine_label_text(label).unwrap_or_else(|| label.to_string());
+    format!(
+        "{} {}",
+        base,
+        match health {
+            MachineHealth::Healthy => "[ok]",
+            MachineHealth::Cached => "[cached]",
+            MachineHealth::Offline => "[offline]",
+        }
+    )
 }
 
 fn push_live_group_rows<'a, I>(
@@ -2584,6 +2760,7 @@ fn queue_move_selected_items_to_group(
         let selected_rows = shell.selected_workspace_rows();
         let rows = merged_sidebar_rows(
             shell.browser.rows(),
+            shell.server.remote_machines(),
             shell.server.ssh_targets(),
             &shell.server.live_sessions(),
         );
@@ -2772,6 +2949,7 @@ fn queue_drop_current_drag_target(mut state: Signal<ShellState>) {
         };
         let rows = merged_sidebar_rows(
             shell.browser.rows(),
+            shell.server.remote_machines(),
             shell.server.ssh_targets(),
             &shell.server.live_sessions(),
         );
@@ -4002,7 +4180,8 @@ fn app() -> Element {
                                 );
                                 return;
                             }
-                            let should_generate = row.kind == BrowserRowKind::Session && row.session_title.is_none();
+                            let should_generate =
+                                is_local_stored_session_row(&row) && row.session_title.is_none();
                             match row.kind {
                                 BrowserRowKind::Group | BrowserRowKind::Separator => state.with_mut(|shell| shell.select_row(&row)),
                                 BrowserRowKind::Session | BrowserRowKind::Document => spawn_open_session_row(state, row.clone()),
@@ -7478,7 +7657,7 @@ fn ContextMenuOverlay(
                         "New Terminal Plan"
                     }
                 }
-                if row.kind == BrowserRowKind::Session {
+                if is_local_stored_session_row(&row) {
                     button {
                         style: context_menu_action_style(palette, true),
                         onclick: move |evt| on_regenerate.call(evt),
@@ -8531,6 +8710,7 @@ mod tests {
     fn merged_sidebar_rows_include_saved_ssh_machine_roots() {
         let rows = merged_sidebar_rows(
             &[],
+            &[],
             &[SshConnectTarget {
                 label: "raspberry".to_string(),
                 kind: SessionKind::SshShell,
@@ -8544,8 +8724,40 @@ mod tests {
         assert!(rows.iter().any(|row| {
             row.kind == BrowserRowKind::Group
                 && row.depth == 0
-                && row.label == "raspberry [ok]"
+                && row.label == "raspberry [cached]"
         }));
+    }
+
+    #[test]
+    fn merged_sidebar_rows_include_scanned_remote_sessions_under_machine_root() {
+        let rows = merged_sidebar_rows(
+            &[],
+            &[RemoteMachineSnapshot {
+                machine_key: "pi-raspberry".to_string(),
+                label: "raspberry".to_string(),
+                ssh_target: "pi@raspberry".to_string(),
+                prefix: None,
+                health: RemoteMachineHealth::Healthy,
+                sessions: vec![RemoteScannedSession {
+                    session_path: "remote-session://pi-raspberry/019caa6f".to_string(),
+                    session_id: "019caa6f".to_string(),
+                    cwd: "/srv/app".to_string(),
+                    started_at: "2026-03-23T10:00:00Z".to_string(),
+                    modified_epoch: 123,
+                    event_count: 22,
+                    user_message_count: 11,
+                    assistant_message_count: 10,
+                    title_hint: "019caa6f".to_string(),
+                    storage_path: "/home/pi/.codex/sessions/a.jsonl".to_string(),
+                }],
+            }],
+            &[],
+            &[],
+        );
+
+        assert!(rows.iter().any(|row| row.kind == BrowserRowKind::Group && row.label == "raspberry [ok]"));
+        assert!(rows.iter().any(|row| row.kind == BrowserRowKind::Group && row.full_path == "__remote_folder__/pi-raspberry/srv"));
+        assert!(rows.iter().any(|row| row.kind == BrowserRowKind::Session && row.full_path == "remote-session://pi-raspberry/019caa6f"));
     }
 }
 

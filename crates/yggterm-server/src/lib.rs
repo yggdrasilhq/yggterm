@@ -6,19 +6,23 @@ mod terminal;
 pub use attach::{AttachMetadata, run_attach};
 pub use daemon::{
     ServerEndpoint, ServerRequest, ServerResponse, ServerRuntimeStatus, TerminalStreamChunk,
-    connect_ssh, connect_ssh_custom, default_endpoint, focus_live, open_stored_session, ping,
-    raise_external_window, request_terminal_launch, run_daemon, set_all_preview_blocks_folded,
-    set_view_mode, shutdown, snapshot, start_command_session, start_local_session,
-    start_local_session_at, status, switch_agent_session_mode, sync_external_window, sync_theme,
-    terminal_ensure, terminal_read, terminal_resize, terminal_write, toggle_preview_block,
+    connect_ssh, connect_ssh_custom, default_endpoint, focus_live, open_remote_session,
+    open_stored_session, ping, raise_external_window, request_terminal_launch, run_daemon,
+    set_all_preview_blocks_folded, set_view_mode, shutdown, snapshot, start_command_session,
+    start_local_session, start_local_session_at, status, switch_agent_session_mode,
+    sync_external_window, sync_theme, terminal_ensure, terminal_read, terminal_resize,
+    terminal_write, toggle_preview_block,
 };
 pub use host::{GhosttyHostKind, GhosttyHostSupport, GhosttyTerminalHostMode, detect_ghostty_host};
 pub use terminal::{TerminalChunk, TerminalManager, TerminalReadResult};
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::time::SystemTime;
 use time::{OffsetDateTime, UtcOffset, macros::format_description};
 use uuid::Uuid;
@@ -120,6 +124,38 @@ pub struct SshConnectTarget {
     pub cwd: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteMachineHealth {
+    Healthy,
+    Cached,
+    Offline,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteScannedSession {
+    pub session_path: String,
+    pub session_id: String,
+    pub cwd: String,
+    pub started_at: String,
+    pub modified_epoch: i64,
+    pub event_count: usize,
+    pub user_message_count: usize,
+    pub assistant_message_count: usize,
+    pub title_hint: String,
+    pub storage_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteMachineSnapshot {
+    pub machine_key: String,
+    pub label: String,
+    pub ssh_target: String,
+    pub prefix: Option<String>,
+    pub health: RemoteMachineHealth,
+    pub sessions: Vec<RemoteScannedSession>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotMetadataEntry {
     pub label: String,
@@ -182,6 +218,7 @@ pub struct ServerUiSnapshot {
     pub active_session_path: Option<String>,
     pub active_session: Option<SnapshotSessionView>,
     pub active_view_mode: WorkspaceViewMode,
+    pub remote_machines: Vec<RemoteMachineSnapshot>,
     pub ssh_targets: Vec<SshConnectTarget>,
     pub live_sessions: Vec<SnapshotSessionView>,
 }
@@ -212,6 +249,10 @@ pub struct PersistedLiveSession {
 pub struct PersistedDaemonState {
     pub active_session_path: Option<String>,
     pub active_view_mode: WorkspaceViewMode,
+    #[serde(default)]
+    pub ssh_targets: Vec<SshConnectTarget>,
+    #[serde(default)]
+    pub remote_machines: Vec<RemoteMachineSnapshot>,
     pub stored_sessions: Vec<PersistedStoredSession>,
     pub live_sessions: Vec<PersistedLiveSession>,
 }
@@ -255,6 +296,7 @@ pub struct YggtermServer {
     theme: UiTheme,
     ghostty_host: GhosttyHostSupport,
     ssh_targets: Vec<SshConnectTarget>,
+    remote_machines: Vec<RemoteMachineSnapshot>,
     live_session_order: Vec<String>,
 }
 
@@ -276,6 +318,7 @@ impl YggtermServer {
             theme,
             ghostty_host,
             ssh_targets: Vec::new(),
+            remote_machines: Vec::new(),
             live_session_order: Vec::new(),
         };
 
@@ -482,6 +525,10 @@ impl YggtermServer {
         &self.ssh_targets
     }
 
+    pub fn remote_machines(&self) -> &[RemoteMachineSnapshot] {
+        &self.remote_machines
+    }
+
     pub fn live_sessions(&self) -> Vec<ManagedSessionView> {
         self.live_session_order
             .iter()
@@ -494,6 +541,7 @@ impl YggtermServer {
             active_session_path: self.active_session_path.clone(),
             active_session: self.active_session().cloned().map(snapshot_session_view),
             active_view_mode: self.active_view_mode,
+            remote_machines: self.remote_machines.clone(),
             ssh_targets: self.ssh_targets.clone(),
             live_sessions: self
                 .live_session_order
@@ -508,6 +556,7 @@ impl YggtermServer {
     pub fn apply_snapshot(&mut self, snapshot: ServerUiSnapshot) {
         self.active_view_mode = snapshot.active_view_mode;
         self.active_session_path = snapshot.active_session_path.clone();
+        self.remote_machines = snapshot.remote_machines;
         self.ssh_targets = snapshot.ssh_targets;
         self.live_session_order = snapshot
             .live_sessions
@@ -572,6 +621,8 @@ impl YggtermServer {
         PersistedDaemonState {
             active_session_path: self.active_session_path.clone(),
             active_view_mode: self.active_view_mode,
+            ssh_targets: self.ssh_targets.clone(),
+            remote_machines: self.remote_machines.clone(),
             stored_sessions,
             live_sessions,
         }
@@ -582,6 +633,17 @@ impl YggtermServer {
         state: PersistedDaemonState,
         store: Option<&SessionStore>,
     ) {
+        self.ssh_targets = state.ssh_targets;
+        self.remote_machines = state
+            .remote_machines
+            .into_iter()
+            .map(|mut machine| {
+                if machine.health == RemoteMachineHealth::Healthy {
+                    machine.health = RemoteMachineHealth::Cached;
+                }
+                machine
+            })
+            .collect();
         for session in state.stored_sessions {
             let document = if session.kind == SessionKind::Document {
                 store.and_then(|store| store.load_document(&session.path).ok().flatten())
@@ -673,6 +735,130 @@ impl YggtermServer {
         let (key, reused) = self.connect_ssh_like_target(&target);
         key.map(|key| (key, reused))
             .ok_or_else(|| anyhow::anyhow!("failed to create ssh session"))
+    }
+
+    pub fn refresh_remote_machine_for_ssh_target(
+        &mut self,
+        target: &SshConnectTarget,
+    ) -> anyhow::Result<()> {
+        let machine_key = machine_key_from_ssh_target(&target.ssh_target);
+        let label = ssh_machine_label(target);
+        let entry_ix = self.ensure_remote_machine_stub(target);
+        match scan_remote_machine_sessions(target) {
+            Ok(mut sessions) => {
+                sessions.sort_by(|left, right| {
+                    right
+                        .modified_epoch
+                        .cmp(&left.modified_epoch)
+                        .then_with(|| right.started_at.cmp(&left.started_at))
+                });
+                self.remote_machines[entry_ix] = RemoteMachineSnapshot {
+                    machine_key,
+                    label,
+                    ssh_target: target.ssh_target.clone(),
+                    prefix: target.prefix.clone(),
+                    health: RemoteMachineHealth::Healthy,
+                    sessions,
+                };
+                Ok(())
+            }
+            Err(error) => {
+                let existing_sessions = self.remote_machines[entry_ix].sessions.clone();
+                self.remote_machines[entry_ix] = RemoteMachineSnapshot {
+                    machine_key,
+                    label,
+                    ssh_target: target.ssh_target.clone(),
+                    prefix: target.prefix.clone(),
+                    health: if existing_sessions.is_empty() {
+                        RemoteMachineHealth::Offline
+                    } else {
+                        RemoteMachineHealth::Cached
+                    },
+                    sessions: existing_sessions,
+                };
+                Err(error)
+            }
+        }
+    }
+
+    pub fn open_remote_scanned_session(
+        &mut self,
+        machine_key: &str,
+        session_id: &str,
+        cwd: Option<&str>,
+        title_hint: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let machine = self
+            .remote_machines
+            .iter()
+            .find(|machine| machine.machine_key == machine_key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("remote machine not found: {machine_key}"))?;
+        let session_path = remote_scanned_session_path(machine_key, session_id);
+        if self.sessions.contains_key(&session_path) {
+            self.focus_live_session(&session_path);
+            return Ok(session_path);
+        }
+
+        let target = SshConnectTarget {
+            label: machine.label.clone(),
+            kind: SessionKind::SshShell,
+            ssh_target: machine.ssh_target.clone(),
+            prefix: machine.prefix.clone(),
+            cwd: cwd.map(ToOwned::to_owned),
+        };
+        self.insert_live_session(
+            &session_path,
+            session_id,
+            SessionKind::SshShell,
+            &target,
+            Some(
+                title_hint
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| short_session_id(session_id)),
+            ),
+        );
+        if let Some(session) = self.sessions.get_mut(&session_path) {
+            let remote_command = remote_resume_command(session_id, cwd, target.prefix.as_deref());
+            session.session_path = session_path.clone();
+            session.title = title_hint
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| short_session_id(session_id));
+            session.host_label = machine.label.clone();
+            session.launch_command =
+                format!("ssh {} {}", target.ssh_target, shell_single_quote(&remote_command));
+            session.terminal_lines = vec![
+                format!("$ {}", session.launch_command),
+                format!("Queue remote Codex resume {session_id}"),
+                format!("Target host: {}", target.ssh_target),
+                format!(
+                    "Workspace: {}",
+                    cwd.unwrap_or("<unknown>")
+                ),
+                "Daemon PTY: request main viewport terminal stream".to_string(),
+            ];
+            upsert_session_metadata(&mut session.metadata, "Source", "remote-codex".to_string());
+            upsert_session_metadata(
+                &mut session.metadata,
+                "Host",
+                target.ssh_target.clone(),
+            );
+            upsert_session_metadata(
+                &mut session.metadata,
+                "Restore",
+                format!("codex resume {session_id}"),
+            );
+            if let Some(cwd) = cwd {
+                upsert_session_metadata(&mut session.metadata, "Cwd", cwd.to_string());
+            }
+            upsert_session_metadata(
+                &mut session.metadata,
+                "Status",
+                "remote resume queued".to_string(),
+            );
+        }
+        self.request_terminal_launch_for_path(&session_path);
+        Ok(session_path)
     }
 
     pub fn start_local_session(
@@ -1018,11 +1204,45 @@ impl YggtermServer {
         }) {
             existing.label = target.label.clone();
             existing.cwd = target.cwd.clone();
+            self.ensure_remote_machine_stub(target);
             return;
         }
         self.ssh_targets.push(target.clone());
         self.ssh_targets
             .sort_by(|left, right| left.label.cmp(&right.label).then_with(|| left.ssh_target.cmp(&right.ssh_target)));
+        self.ensure_remote_machine_stub(target);
+    }
+
+    fn ensure_remote_machine_stub(&mut self, target: &SshConnectTarget) -> usize {
+        let machine_key = machine_key_from_ssh_target(&target.ssh_target);
+        if let Some(existing_ix) = self
+            .remote_machines
+            .iter()
+            .position(|machine| machine.machine_key == machine_key)
+        {
+            let existing = &mut self.remote_machines[existing_ix];
+            existing.label = ssh_machine_label(target);
+            existing.ssh_target = target.ssh_target.clone();
+            existing.prefix = target.prefix.clone();
+            if existing.health == RemoteMachineHealth::Offline && !existing.sessions.is_empty() {
+                existing.health = RemoteMachineHealth::Cached;
+            }
+            return existing_ix;
+        }
+        self.remote_machines.push(RemoteMachineSnapshot {
+            machine_key: machine_key.clone(),
+            label: ssh_machine_label(target),
+            ssh_target: target.ssh_target.clone(),
+            prefix: target.prefix.clone(),
+            health: RemoteMachineHealth::Cached,
+            sessions: Vec::new(),
+        });
+        self.remote_machines
+            .sort_by(|left, right| left.label.cmp(&right.label).then_with(|| left.machine_key.cmp(&right.machine_key)));
+        self.remote_machines
+            .iter()
+            .position(|machine| machine.machine_key == machine_key)
+            .unwrap_or(0)
     }
 }
 
@@ -1050,6 +1270,229 @@ fn snapshot_metadata_entries(entries: &[SessionMetadataEntry]) -> Vec<SnapshotMe
             value: entry.value.clone(),
         })
         .collect()
+}
+
+fn ssh_machine_label(target: &SshConnectTarget) -> String {
+    if !target.label.trim().is_empty() {
+        target.label.trim().to_string()
+    } else {
+        target
+            .ssh_target
+            .rsplit('@')
+            .next()
+            .unwrap_or(target.ssh_target.as_str())
+            .trim()
+            .to_string()
+    }
+}
+
+fn machine_key_from_ssh_target(ssh_target: &str) -> String {
+    ssh_target
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+fn remote_scanned_session_path(machine_key: &str, session_id: &str) -> String {
+    format!("remote-session://{machine_key}/{session_id}")
+}
+
+fn remote_resume_command(session_id: &str, cwd: Option<&str>, prefix: Option<&str>) -> String {
+    let base = match cwd.filter(|cwd| !cwd.trim().is_empty()) {
+        Some(cwd) => format!("cd {} && codex resume {}", shell_single_quote(cwd), shell_single_quote(session_id)),
+        None => format!("codex resume {}", shell_single_quote(session_id)),
+    };
+    match prefix
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(prefix) => format!("{prefix} && {base}"),
+        None => base,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoteSummaryLine {
+    rollout_path: String,
+    #[serde(default = "default_unknown")]
+    id: String,
+    #[serde(default = "default_unknown_cwd")]
+    cwd: String,
+    #[serde(default = "default_unknown")]
+    started_at: String,
+    #[serde(default)]
+    modified_epoch: i64,
+    #[serde(default)]
+    event_count: usize,
+    #[serde(default)]
+    user_message_count: usize,
+    #[serde(default)]
+    assistant_message_count: usize,
+}
+
+fn default_unknown() -> String {
+    "unknown".to_string()
+}
+
+fn default_unknown_cwd() -> String {
+    "<unknown>".to_string()
+}
+
+const REMOTE_SCAN_SCRIPT: &str = r#"
+import json, os, sys
+from pathlib import Path
+
+def summarize(path):
+    session_id = "unknown"
+    cwd = "<unknown>"
+    started_at = "unknown"
+    event_count = 0
+    user_count = 0
+    assistant_count = 0
+    try:
+        stat = path.stat()
+        modified_epoch = int(stat.st_mtime)
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                event_count += 1
+                try:
+                    value = json.loads(raw)
+                except Exception:
+                    continue
+                ty = value.get("type")
+                if ty == "session_meta":
+                    payload = value.get("payload") or {}
+                    session_id = payload.get("id") or session_id
+                    cwd = payload.get("cwd") or cwd
+                    started_at = payload.get("timestamp") or started_at
+                elif ty == "response_item":
+                    payload = value.get("payload") or {}
+                    if payload.get("type") == "message":
+                        role = payload.get("role")
+                        if role in ("user", "developer"):
+                            user_count += 1
+                        elif role == "assistant":
+                            assistant_count += 1
+                elif ty == "compacted":
+                    payload = value.get("payload") or {}
+                    for msg in payload.get("replacement_history") or []:
+                        if (msg or {}).get("type") != "message":
+                            continue
+                        role = msg.get("role")
+                        if role in ("user", "developer"):
+                            user_count += 1
+                        elif role == "assistant":
+                            assistant_count += 1
+    except Exception:
+        return None
+    return {
+        "rollout_path": str(path),
+        "id": session_id,
+        "cwd": cwd,
+        "started_at": started_at,
+        "modified_epoch": modified_epoch,
+        "event_count": event_count,
+        "user_message_count": user_count,
+        "assistant_message_count": assistant_count,
+    }
+
+codex_home = os.path.expanduser(sys.argv[1] if len(sys.argv) > 1 else "~/.codex")
+root = Path(codex_home) / "sessions"
+if root.exists():
+    for path in root.rglob("*.jsonl"):
+        data = summarize(path)
+        if data:
+            print(json.dumps(data, ensure_ascii=False))
+"#;
+
+fn run_remote_python_lines(
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+    script: &str,
+    args: &[String],
+) -> anyhow::Result<Vec<String>> {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o").arg("ConnectTimeout=5");
+    cmd.arg("-o").arg("BatchMode=yes");
+    let mut inner = String::from("python3 -");
+    for arg in args {
+        inner.push(' ');
+        inner.push_str(&shell_single_quote(arg));
+    }
+    let remote = match exec_prefix
+        .map(str::trim)
+        .filter(|prefix| !prefix.is_empty())
+    {
+        Some(prefix) => format!("{prefix} sh -c {}", shell_single_quote(&inner)),
+        None => inner,
+    };
+    cmd.arg(ssh_target).arg(remote);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("failed to start ssh python for {ssh_target}"))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(script.as_bytes())
+            .with_context(|| format!("failed to send script to {ssh_target}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("failed waiting for ssh python on {ssh_target}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "remote command failed for {}: {}",
+            ssh_target,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect())
+}
+
+fn scan_remote_machine_sessions(
+    target: &SshConnectTarget,
+) -> anyhow::Result<Vec<RemoteScannedSession>> {
+    let lines = run_remote_python_lines(
+        &target.ssh_target,
+        target.prefix.as_deref(),
+        REMOTE_SCAN_SCRIPT,
+        &[String::from("~/.codex")],
+    )?;
+    let machine_key = machine_key_from_ssh_target(&target.ssh_target);
+    let mut sessions = Vec::new();
+    for line in lines {
+        let summary: RemoteSummaryLine =
+            serde_json::from_str(&line).context("invalid remote summary line")?;
+        sessions.push(RemoteScannedSession {
+            session_path: remote_scanned_session_path(&machine_key, &summary.id),
+            session_id: summary.id.clone(),
+            cwd: summary.cwd,
+            started_at: summary.started_at,
+            modified_epoch: summary.modified_epoch,
+            event_count: summary.event_count,
+            user_message_count: summary.user_message_count,
+            assistant_message_count: summary.assistant_message_count,
+            title_hint: short_session_id(&summary.id),
+            storage_path: summary.rollout_path,
+        });
+    }
+    Ok(sessions)
 }
 
 fn snapshot_preview_block(block: SessionPreviewBlock) -> SnapshotPreviewBlock {
@@ -2491,7 +2934,10 @@ fn short_session_id(session_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionKind, parse_stored_transcript, stored_session_launch_command};
+    use super::{
+        SessionKind, parse_stored_transcript, remote_resume_command,
+        stored_session_launch_command,
+    };
     use anyhow::Result;
     use std::fs;
 
@@ -2533,5 +2979,17 @@ mod tests {
         );
         assert!(command.contains("CODEX_HOME=\"$HOME/.codex-litellm\""));
         assert!(command.contains("codex-litellm resume"));
+    }
+
+    #[test]
+    fn remote_resume_command_wraps_prefix_and_cwd() {
+        let command = remote_resume_command(
+            "019caa6f-b32c-7a73-b4d3-db83225663dc",
+            Some("/srv/workspace"),
+            Some("tmux new-session -A -s yggterm"),
+        );
+        assert!(command.contains("tmux new-session -A -s yggterm &&"));
+        assert!(command.contains("cd '/srv/workspace' && codex resume"));
+        assert!(command.contains("'019caa6f-b32c-7a73-b4d3-db83225663dc'"));
     }
 }
