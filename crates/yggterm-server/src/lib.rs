@@ -985,6 +985,7 @@ impl YggtermServer {
     }
 
     fn connect_ssh_like_target(&mut self, target: &SshConnectTarget) -> (Option<String>, bool) {
+        self.upsert_ssh_target(target);
         if let Some(existing_key) = self
             .sessions
             .iter()
@@ -1007,6 +1008,21 @@ impl YggtermServer {
         };
         self.insert_live_session(&key, &uuid, target.kind, target, Some(target.label.clone()));
         (Some(key), false)
+    }
+
+    fn upsert_ssh_target(&mut self, target: &SshConnectTarget) {
+        if let Some(existing) = self.ssh_targets.iter_mut().find(|existing| {
+            existing.kind == target.kind
+                && existing.ssh_target == target.ssh_target
+                && existing.prefix == target.prefix
+        }) {
+            existing.label = target.label.clone();
+            existing.cwd = target.cwd.clone();
+            return;
+        }
+        self.ssh_targets.push(target.clone());
+        self.ssh_targets
+            .sort_by(|left, right| left.label.cmp(&right.label).then_with(|| left.ssh_target.cmp(&right.ssh_target)));
     }
 }
 
