@@ -53,6 +53,7 @@ use yggterm_server::{
     ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionPreviewBlock,
     SessionRenderedSection, SshConnectTarget, TerminalBackend, WorkspaceViewMode, YggtermServer,
     connect_ssh_custom, focus_live, open_remote_session, open_stored_session, ping,
+    refresh_remote_machine,
     request_terminal_launch, set_all_preview_blocks_folded,
     set_view_mode as daemon_set_view_mode, snapshot as daemon_snapshot, start_command_session,
     start_local_session, start_local_session_at, status, switch_agent_session_mode,
@@ -1821,6 +1822,10 @@ fn is_live_sidebar_row(row: &BrowserRow) -> bool {
 
 fn is_remote_scanned_sidebar_row(row: &BrowserRow) -> bool {
     row.full_path.starts_with("remote-session://")
+}
+
+fn is_remote_machine_group_row(row: &BrowserRow) -> bool {
+    row.kind == BrowserRowKind::Group && row.full_path.starts_with("__remote_machine__/")
 }
 
 fn is_local_stored_session_row(row: &BrowserRow) -> bool {
@@ -4378,6 +4383,24 @@ fn app() -> Element {
                             move |_| {
                                 state.with_mut(|shell| shell.regenerate_title_for_row(&row));
                                 queue_title_generation(state, row.clone(), true);
+                            }
+                        },
+                        on_refresh_remote_machine: {
+                            let row = row.clone();
+                            let machine_key = row
+                                .full_path
+                                .strip_prefix("__remote_machine__/")
+                                .map(ToOwned::to_owned);
+                            move |_| {
+                                if let Some(machine_key) = machine_key.clone() {
+                                    spawn_server_snapshot_action(
+                                        state,
+                                        format!("refreshing {}", row.label),
+                                        move |endpoint| {
+                                            refresh_remote_machine(&endpoint, &machine_key)
+                                        },
+                                    );
+                                }
                             }
                         },
                         on_delete_item: {
@@ -7567,6 +7590,7 @@ fn ContextMenuOverlay(
     on_create_note: EventHandler<MouseEvent>,
     on_create_recipe: EventHandler<MouseEvent>,
     on_regenerate: EventHandler<MouseEvent>,
+    on_refresh_remote_machine: EventHandler<MouseEvent>,
     on_delete_item: EventHandler<MouseEvent>,
 ) -> Element {
     let placement = context_menu_placement(position, window_size, (224.0, 420.0));
@@ -7655,6 +7679,12 @@ fn ContextMenuOverlay(
                         style: context_menu_action_style(palette, false),
                         onclick: move |evt| on_create_recipe.call(evt),
                         "New Terminal Plan"
+                    }
+                } else if is_remote_machine_group_row(&row) {
+                    button {
+                        style: context_menu_action_style(palette, false),
+                        onclick: move |evt| on_refresh_remote_machine.call(evt),
+                        "Refresh Remote Sessions"
                     }
                 }
                 if is_local_stored_session_row(&row) {
