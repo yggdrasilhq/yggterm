@@ -29,8 +29,9 @@ use time::{OffsetDateTime, UtcOffset, macros::format_description};
 use tracing::warn;
 use uuid::Uuid;
 use yggterm_core::{
-    SessionNode, SessionNodeKind, SessionStore, TranscriptRole, UiTheme, WorkspaceDocument,
-    WorkspaceDocumentKind, read_codex_transcript_messages, resolve_yggterm_home,
+    SessionNode, SessionNodeKind, SessionStore, SessionTitleStore, TranscriptRole, UiTheme,
+    WorkspaceDocument, WorkspaceDocumentKind, read_codex_session_identity_fields,
+    read_codex_transcript_messages, resolve_yggterm_home,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1511,7 +1512,7 @@ fn remote_resume_command(session_id: &str, cwd: Option<&str>, prefix: Option<&st
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct RemoteSummaryLine {
     rollout_path: String,
     #[serde(default = "default_unknown")]
@@ -1551,6 +1552,91 @@ fn current_millis_u64() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or_default()
+}
+
+fn summarize_recent_context(messages: &[yggterm_core::TranscriptMessage]) -> String {
+    messages
+        .iter()
+        .rev()
+        .take(6)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|message| {
+            format!(
+                "{}: {}",
+                message.role.display_label(),
+                message.lines.join(" ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn collect_codex_session_files(
+    root: &std::path::Path,
+    out: &mut Vec<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root).with_context(|| format!("reading codex session dir {}", root.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_codex_session_files(&path, out)?;
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn remote_summary_for_path(
+    path: &std::path::Path,
+    title_store: &SessionTitleStore,
+) -> anyhow::Result<Option<RemoteSummaryLine>> {
+    let Some((session_id, cwd)) = read_codex_session_identity_fields(path)? else {
+        return Ok(None);
+    };
+    let stat = fs::metadata(path)
+        .with_context(|| format!("reading metadata for {}", path.display()))?;
+    let modified_epoch = stat
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
+    let messages = read_codex_transcript_messages(path).unwrap_or_default();
+    let user_message_count = messages
+        .iter()
+        .filter(|message| message.role == TranscriptRole::User)
+        .count();
+    let assistant_message_count = messages
+        .iter()
+        .filter(|message| message.role == TranscriptRole::Assistant)
+        .count();
+    let started_at = messages
+        .iter()
+        .find_map(|message| message.timestamp.clone())
+        .unwrap_or_else(default_unknown);
+    Ok(Some(RemoteSummaryLine {
+        rollout_path: path.display().to_string(),
+        id: session_id.clone(),
+        cwd,
+        started_at,
+        modified_epoch,
+        event_count: messages.len(),
+        user_message_count,
+        assistant_message_count,
+        recent_context: summarize_recent_context(&messages),
+        title_hint: title_store.get_title(&session_id)?,
+        cached_precis: title_store.get_precis(&session_id)?,
+        cached_summary: title_store.get_summary(&session_id)?,
+    }))
 }
 
 const REMOTE_SCAN_SCRIPT: &str = r#"
@@ -2192,12 +2278,21 @@ print(path)
 fn scan_remote_machine_sessions(
     target: &SshConnectTarget,
 ) -> anyhow::Result<Vec<RemoteScannedSession>> {
-    let lines = run_remote_python_lines(
+    let lines = match run_remote_yggterm_command(
         &target.ssh_target,
         target.prefix.as_deref(),
-        REMOTE_SCAN_SCRIPT,
-        &[String::from("~/.codex")],
-    )?;
+        &["server", "remote", "scan", "~/.codex"],
+        None,
+    ) {
+        Ok(output) => output.lines().map(str::to_string).collect::<Vec<_>>(),
+        Err(error) if !should_fallback_to_python(&error) => return Err(error),
+        Err(_) => run_remote_python_lines(
+            &target.ssh_target,
+            target.prefix.as_deref(),
+            REMOTE_SCAN_SCRIPT,
+            &[String::from("~/.codex")],
+        )?,
+    };
     let machine_key = machine_key_from_ssh_target(&target.ssh_target);
     let mut sessions = Vec::new();
     for line in lines {
@@ -2246,6 +2341,40 @@ pub fn run_remote_stage_clipboard_png() -> anyhow::Result<()> {
     fs::write(&path, payload)
         .with_context(|| format!("writing remote clipboard image {}", path.display()))?;
     println!("{}", path.display());
+    Ok(())
+}
+
+pub fn run_remote_scan(codex_home: Option<&str>) -> anyhow::Result<()> {
+    let home = codex_home
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            if value.starts_with("~/") {
+                std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join(value.trim_start_matches("~/"))
+            } else {
+                std::path::PathBuf::from(value)
+            }
+        })
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(".codex")
+        });
+    let root = home.join("sessions");
+    let yggterm_home = resolve_yggterm_home()?;
+    let title_store = SessionTitleStore::open(&yggterm_home)?;
+    let mut files = Vec::new();
+    collect_codex_session_files(&root, &mut files)?;
+    files.sort();
+    for path in files {
+        if let Some(summary) = remote_summary_for_path(&path, &title_store)? {
+            println!("{}", serde_json::to_string(&summary)?);
+        }
+    }
     Ok(())
 }
 
