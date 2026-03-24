@@ -21,6 +21,8 @@ use crate::theme::{
 };
 use crate::window_icon;
 use anyhow::{Result, anyhow};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use dioxus::desktop::{
     Config, LogicalSize, WindowBuilder, WindowEvent as DesktopWindowEvent, use_window,
     use_wry_event_handler, window,
@@ -33,7 +35,7 @@ use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -65,6 +67,7 @@ use yggterm_server::{
     refresh_remote_machine,
     remove_ssh_target,
     request_terminal_launch, set_all_preview_blocks_folded,
+    stage_remote_clipboard_png,
     set_view_mode as daemon_set_view_mode, snapshot as daemon_snapshot, start_command_session,
     shutdown as daemon_shutdown, start_local_session, start_local_session_at, status,
     switch_agent_session_mode,
@@ -366,6 +369,8 @@ enum TerminalJsEvent {
     Input { data: String },
     Resize { cols: u16, rows: u16 },
     Clipboard { action: String, chars: usize },
+    ClipboardImageRequest,
+    ClipboardImage { mime: String, data_url: String },
     ClipboardError { action: String, message: String },
     Debug { message: String },
 }
@@ -2750,12 +2755,14 @@ fn copy_generation_target_for_session(
     if !supports_generated_session_copy(session) {
         return None;
     }
+    let preview_context = preview_context_from_session(session);
     Some(CopyGenerationTarget {
         session_path: session.session_path.clone(),
         session_id: session.id.clone(),
         cwd: metadata_value(session, "Cwd"),
         title: session.title.clone(),
-        remote_context: remote_scanned_session_context(server, &session.session_path),
+        remote_context: remote_scanned_session_context(server, &session.session_path)
+            .or(preview_context),
         remote_machine: remote_machine_for_session_path(server, &session.session_path),
     })
 }
@@ -2836,10 +2843,87 @@ fn collect_local_copy_targets(node: &SessionNode, targets: &mut Vec<CopyGenerati
     }
 }
 
+fn background_copy_job_for_target(
+    store: &SessionStore,
+    target: &CopyGenerationTarget,
+    copy_retry_after_ms: &HashMap<String, u64>,
+    now: u64,
+) -> Option<BackgroundCopyJob> {
+    let stored_title = store.resolve_title_for_session_id(&target.session_id).ok().flatten();
+    let title_missing = looks_like_generated_fallback_title(&target.title)
+        && stored_title
+            .as_deref()
+            .is_none_or(looks_like_generated_fallback_title);
+    if title_missing {
+        let retry_key = background_copy_retry_key("title", &target.session_path);
+        if copy_retry_after_ms
+            .get(&retry_key)
+            .copied()
+            .is_none_or(|retry_after| retry_after <= now)
+        {
+            return Some(BackgroundCopyJob::Title(target.clone()));
+        }
+    }
+    let stored_precis = store
+        .resolve_precis_for_session_id(&target.session_id)
+        .ok()
+        .flatten();
+    let precis_missing = stored_precis.is_none()
+        && target
+            .remote_machine
+            .as_ref()
+            .and_then(|machine| {
+                machine
+                    .sessions
+                    .iter()
+                    .find(|session| session.session_path == target.session_path)
+                    .and_then(|session| session.cached_precis.clone())
+            })
+            .is_none();
+    if precis_missing {
+        let retry_key = background_copy_retry_key("precis", &target.session_path);
+        if copy_retry_after_ms
+            .get(&retry_key)
+            .copied()
+            .is_none_or(|retry_after| retry_after <= now)
+        {
+            return Some(BackgroundCopyJob::Precis(target.clone()));
+        }
+    }
+    let stored_summary = store
+        .resolve_summary_for_session_id(&target.session_id)
+        .ok()
+        .flatten();
+    let summary_missing = stored_summary.is_none()
+        && target
+            .remote_machine
+            .as_ref()
+            .and_then(|machine| {
+                machine
+                    .sessions
+                    .iter()
+                    .find(|session| session.session_path == target.session_path)
+                    .and_then(|session| session.cached_summary.clone())
+            })
+            .is_none();
+    if summary_missing {
+        let retry_key = background_copy_retry_key("summary", &target.session_path);
+        if copy_retry_after_ms
+            .get(&retry_key)
+            .copied()
+            .is_none_or(|retry_after| retry_after <= now)
+        {
+            return Some(BackgroundCopyJob::Summary(target.clone()));
+        }
+    }
+    None
+}
+
 fn next_background_copy_job(
     settings: &AppSettings,
     local_root: &SessionNode,
     remote_machines: &[RemoteMachineSnapshot],
+    active_target: Option<CopyGenerationTarget>,
     copy_retry_after_ms: &HashMap<String, u64>,
 ) -> Option<BackgroundCopyJob> {
     if !copy_generation_settings_ready(settings) {
@@ -2861,76 +2945,24 @@ fn next_background_copy_job(
         }
     }
     let now = current_millis();
+    if let Some(active_target) = active_target
+        && let Some(job) = background_copy_job_for_target(
+            &store,
+            &active_target,
+            copy_retry_after_ms,
+            now,
+        )
+    {
+        return Some(job);
+    }
     for target in targets {
-        let stored_title = store
-            .resolve_title_for_session_id(&target.session_id)
-            .ok()
-            .flatten();
-        let title_missing = looks_like_generated_fallback_title(&target.title)
-            && stored_title
-                .as_deref()
-                .is_none_or(looks_like_generated_fallback_title);
-        if title_missing {
-            let retry_key = background_copy_retry_key("title", &target.session_path);
-            if copy_retry_after_ms
-                .get(&retry_key)
-                .copied()
-                .is_none_or(|retry_after| retry_after <= now)
-            {
-                return Some(BackgroundCopyJob::Title(target));
-            }
-        }
-        let stored_precis = store
-            .resolve_precis_for_session_id(&target.session_id)
-            .ok()
-            .flatten();
-        let precis_missing = stored_precis.is_none()
-            && target
-                .remote_machine
-                .as_ref()
-                .and_then(|machine| {
-                    machine
-                        .sessions
-                        .iter()
-                        .find(|session| session.session_path == target.session_path)
-                        .and_then(|session| session.cached_precis.clone())
-                })
-                .is_none();
-        if precis_missing {
-            let retry_key = background_copy_retry_key("precis", &target.session_path);
-            if copy_retry_after_ms
-                .get(&retry_key)
-                .copied()
-                .is_none_or(|retry_after| retry_after <= now)
-            {
-                return Some(BackgroundCopyJob::Precis(target));
-            }
-        }
-        let stored_summary = store
-            .resolve_summary_for_session_id(&target.session_id)
-            .ok()
-            .flatten();
-        let summary_missing = stored_summary.is_none()
-            && target
-                .remote_machine
-                .as_ref()
-                .and_then(|machine| {
-                    machine
-                        .sessions
-                        .iter()
-                        .find(|session| session.session_path == target.session_path)
-                        .and_then(|session| session.cached_summary.clone())
-                })
-                .is_none();
-        if summary_missing {
-            let retry_key = background_copy_retry_key("summary", &target.session_path);
-            if copy_retry_after_ms
-                .get(&retry_key)
-                .copied()
-                .is_none_or(|retry_after| retry_after <= now)
-            {
-                return Some(BackgroundCopyJob::Summary(target));
-            }
+        if let Some(job) = background_copy_job_for_target(
+            &store,
+            &target,
+            copy_retry_after_ms,
+            now,
+        ) {
+            return Some(job);
         }
     }
     None
@@ -2942,6 +2974,8 @@ fn maybe_spawn_background_copy_generation(mut state: Signal<ShellState>) {
         let now = current_millis();
         if shell.background_copy_scan_in_flight
             || shell.needs_initial_server_sync
+            || PASSIVE_COPY_SUSPENDED.load(Ordering::Relaxed)
+            || shell.passive_copy_suspended
             || !copy_generation_settings_ready(&shell.settings)
             || !shell.title_requests_in_flight.is_empty()
             || !shell.precis_requests_in_flight.is_empty()
@@ -2954,12 +2988,16 @@ fn maybe_spawn_background_copy_generation(mut state: Signal<ShellState>) {
                 shell.settings.clone(),
                 shell.browser.root().clone(),
                 shell.server.remote_machines().to_vec(),
+                shell
+                    .server
+                    .active_session()
+                    .and_then(|session| copy_generation_target_for_session(&shell.server, session)),
                 shell.copy_retry_after_ms.clone(),
                 perf_home_dir(&shell.bootstrap.settings_path),
             ))
         }
     };
-    let Some((settings, local_root, remote_machines, copy_retry_after_ms, perf_home)) = scan else {
+    let Some((settings, local_root, remote_machines, active_target, copy_retry_after_ms, perf_home)) = scan else {
         return;
     };
     state.with_mut(|shell| shell.background_copy_scan_in_flight = true);
@@ -2970,6 +3008,7 @@ fn maybe_spawn_background_copy_generation(mut state: Signal<ShellState>) {
                 &settings,
                 &local_root,
                 &remote_machines,
+                active_target,
                 &copy_retry_after_ms,
             )
         })
@@ -3118,6 +3157,33 @@ fn spawn_active_session_copy_hydration(mut state: Signal<ShellState>, session: M
     });
 }
 
+fn preview_context_from_session(session: &ManagedSessionView) -> Option<String> {
+    let lines = session
+        .preview
+        .blocks
+        .iter()
+        .rev()
+        .take(6)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .flat_map(|block| {
+            let role = block.role.trim();
+            block.lines.iter().filter_map(move |line| {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    None
+                } else if role.is_empty() {
+                    Some(trimmed.to_string())
+                } else {
+                    Some(format!("{role}: {trimmed}"))
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
 fn looks_like_generated_fallback_title(title: &str) -> bool {
     let compact = title.trim();
     compact.len() == 8
@@ -3132,6 +3198,87 @@ fn parse_remote_scanned_session_path(path: &str) -> Option<(&str, &str)> {
     let rest = path.strip_prefix("remote-session://")?;
     let (machine_key, session_id) = rest.split_once('/')?;
     Some((machine_key, session_id))
+}
+
+fn stage_local_clipboard_png(home: &PathBuf, png_bytes: &[u8]) -> Result<String> {
+    let clipboard_dir = home.join("clipboard");
+    fs::create_dir_all(&clipboard_dir)?;
+    let filename = format!("clipboard-{}.png", current_millis());
+    let path = clipboard_dir.join(filename);
+    fs::write(&path, png_bytes)?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+fn read_native_clipboard_png() -> Result<Vec<u8>> {
+    #[cfg(target_os = "linux")]
+    {
+        let output = Command::new("xclip")
+            .args(["-selection", "clipboard", "-t", "image/png", "-o"])
+            .output()
+            .map_err(|error| anyhow!("failed to launch xclip for clipboard image paste: {error}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(anyhow!(
+                "clipboard unavailable: {}",
+                if stderr.is_empty() {
+                    "xclip could not read image/png from the clipboard".to_string()
+                } else {
+                    stderr
+                }
+            ));
+        }
+        let png_bytes = output.stdout;
+        if png_bytes.len() < 8 || &png_bytes[..8] != b"\x89PNG\r\n\x1a\n" {
+            return Err(anyhow!(
+                "clipboard does not currently contain a PNG image"
+            ));
+        }
+        return Ok(png_bytes);
+    }
+
+    #[allow(unreachable_code)]
+    Err(anyhow!(
+        "native clipboard image paste is not implemented on this platform yet"
+    ))
+}
+
+fn parse_png_data_url(data_url: &str) -> Result<Vec<u8>> {
+    let Some(encoded) = data_url.strip_prefix("data:image/") else {
+        return Err(anyhow!("clipboard data is not an image"));
+    };
+    let Some((_, payload)) = encoded.split_once(";base64,") else {
+        return Err(anyhow!("clipboard image was not base64 encoded"));
+    };
+    BASE64_STANDARD
+        .decode(payload)
+        .map_err(|error| anyhow!("failed to decode clipboard image: {error}"))
+}
+
+fn stage_terminal_clipboard_image(
+    state: Signal<ShellState>,
+    session_path: &str,
+    png_bytes: &[u8],
+) -> Result<String> {
+    let bootstrap = BOOTSTRAP.get().expect("shell bootstrap initialized");
+    if let Some(machine) = remote_machine_for_session_path(&state.read().server, session_path) {
+        return stage_remote_clipboard_png(
+            &machine.ssh_target,
+            machine.prefix.as_deref(),
+            png_bytes,
+        );
+    }
+    if let Some(session) = state.read().server.active_session().cloned()
+        && session.session_path == session_path
+        && let Some(ssh_target) = session.ssh_target
+    {
+        return stage_remote_clipboard_png(&ssh_target, session.ssh_prefix.as_deref(), png_bytes);
+    }
+    let home = bootstrap
+        .settings_path
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    stage_local_clipboard_png(&home, png_bytes)
 }
 
 fn merged_sidebar_rows(
@@ -5164,6 +5311,8 @@ fn app() -> Element {
     let mut desktop_refresh_started = use_signal(|| false);
     let mut dock_pulse_started = use_signal(|| false);
     let mut window_epoch = use_signal(|| 0_u64);
+    let mut terminal_mount_epoch = use_signal(|| 0_u64);
+    let mut last_terminal_session_path = use_signal(|| None::<String>);
     use_effect(move || {
         if XTERM_ASSETS_BOOTSTRAPPED.get().is_none() {
             let _ = XTERM_ASSETS_BOOTSTRAPPED.set(());
@@ -5241,6 +5390,21 @@ fn app() -> Element {
         }
     });
     use_effect(move || {
+        let snapshot = state.read().snapshot();
+        let current_terminal_session = if snapshot.active_view_mode == WorkspaceViewMode::Terminal {
+            snapshot
+                .active_session
+                .as_ref()
+                .map(|session| session.session_path.clone())
+        } else {
+            None
+        };
+        if *last_terminal_session_path.read() != current_terminal_session {
+            last_terminal_session_path.set(current_terminal_session);
+            terminal_mount_epoch.with_mut(|epoch| *epoch += 1);
+        }
+    });
+    use_effect(move || {
         let active = state.read().server.active_session().cloned();
         let Some(session) = active else {
             return;
@@ -5281,12 +5445,18 @@ fn app() -> Element {
             spawn_precis_generation(state, session.clone(), false);
         }
         if has_summary {
+            state.with_mut(|shell| shell.next_background_copy_scan_after_ms = current_millis());
+            maybe_spawn_background_copy_generation(state);
             return;
         }
         if session.session_path.starts_with("remote-session://") && !has_remote_title_context {
+            state.with_mut(|shell| shell.next_background_copy_scan_after_ms = current_millis());
+            maybe_spawn_background_copy_generation(state);
             return;
         }
         spawn_summary_generation(state, session, false);
+        state.with_mut(|shell| shell.next_background_copy_scan_after_ms = current_millis());
+        maybe_spawn_background_copy_generation(state);
     });
     use_effect(move || {
         let shell = state.read();
@@ -5534,6 +5704,7 @@ fn app() -> Element {
                     MainSurface {
                         state,
                         snapshot: main_snapshot,
+                        terminal_mount_epoch: *terminal_mount_epoch.read(),
                         on_expand_preview: move || spawn_server_snapshot_action(
                             state,
                             "expanding preview".to_string(),
@@ -6758,6 +6929,7 @@ fn BellIcon() -> Element {
 fn MainSurface(
     state: Signal<ShellState>,
     snapshot: RenderSnapshot,
+    terminal_mount_epoch: u64,
     on_expand_preview: EventHandler<()>,
     on_collapse_preview: EventHandler<()>,
     on_toggle_preview_block: EventHandler<usize>,
@@ -6847,6 +7019,7 @@ fn MainSurface(
             }
             WorkspaceViewMode::Terminal => rsx! {
                 div {
+                    key: "{session.session_path}:{snapshot.settings.terminal_font_size}:{snapshot.active_view_mode as u8}:{terminal_mount_epoch}",
                     style: "display:flex; flex-direction:column; min-width:0; min-height:0; width:100%; height:100%;",
                     div {
                         style: "display:flex; align-items:flex-start; justify-content:space-between; gap:16px; padding:22px 26px 14px 26px; border-bottom:1px solid rgba(170,190,212,0.16);",
@@ -6870,10 +7043,11 @@ fn MainSurface(
                         }
                     }
                     TerminalCanvas {
-                        key: "{terminal_instance_key(&session.session_path, snapshot.settings.terminal_font_size)}",
+                        key: "{terminal_instance_key(&session.session_path, snapshot.settings.terminal_font_size)}:{terminal_mount_epoch}",
                         session: session.clone(),
                         snapshot: snapshot.clone(),
                         state,
+                        mount_epoch: terminal_mount_epoch,
                     }
                 }
             },
@@ -7998,6 +8172,7 @@ fn TerminalCanvas(
     session: ManagedSessionView,
     snapshot: RenderSnapshot,
     state: Signal<ShellState>,
+    mount_epoch: u64,
 ) -> Element {
     let endpoint = BOOTSTRAP
         .get()
@@ -8006,7 +8181,11 @@ fn TerminalCanvas(
         .clone();
     let session_path = session.session_path.clone();
     let host_id = terminal_host_id(&session_path);
-    let instance_key = terminal_instance_key(&session_path, snapshot.settings.terminal_font_size);
+    let instance_key = format!(
+        "{}:{}",
+        terminal_instance_key(&session_path, snapshot.settings.terminal_font_size),
+        mount_epoch
+    );
     let terminal_title = session.title.clone();
     let future_host_id = host_id.clone();
     let theme = terminal_theme(
@@ -8112,9 +8291,61 @@ fn TerminalCanvas(
                                     message,
                                 );
                             }
+                            Ok(TerminalJsEvent::ClipboardImageRequest) => {
+                                match read_native_clipboard_png()
+                                    .and_then(|png_bytes| stage_terminal_clipboard_image(state, &session_path, &png_bytes))
+                                {
+                                    Ok(path) => {
+                                        let _ = terminal_write(&endpoint, &session_path, &format!("@{} ", path));
+                                        safe_push_notification(
+                                            state,
+                                            NotificationTone::Success,
+                                            "Image Staged",
+                                            format!("Staged clipboard image at {path} and pasted its path into the terminal."),
+                                        );
+                                    }
+                                    Err(error) => {
+                                        let message = format!("Failed to paste image: {error}");
+                                        let _ = terminal_write(&endpoint, &session_path, &format!("{message}\r\n"));
+                                        safe_push_notification(
+                                            state,
+                                            NotificationTone::Error,
+                                            "Image Paste Failed",
+                                            error.to_string(),
+                                        );
+                                    }
+                                }
+                            }
+                            Ok(TerminalJsEvent::ClipboardImage { mime, data_url }) => {
+                                match parse_png_data_url(&data_url)
+                                    .and_then(|png_bytes| stage_terminal_clipboard_image(state, &session_path, &png_bytes))
+                                {
+                                    Ok(path) => {
+                                        let _ = terminal_write(&endpoint, &session_path, &format!("@{} ", path));
+                                        safe_push_notification(
+                                            state,
+                                            NotificationTone::Success,
+                                            "Image Staged",
+                                            format!("Staged {mime} clipboard image at {path} and pasted its path into the terminal."),
+                                        );
+                                    }
+                                    Err(error) => {
+                                        let message = format!("Failed to paste image: {error}");
+                                        let _ = terminal_write(&endpoint, &session_path, &format!("{message}\r\n"));
+                                        safe_push_notification(
+                                            state,
+                                            NotificationTone::Error,
+                                            "Image Paste Failed",
+                                            error.to_string(),
+                                        );
+                                    }
+                                }
+                            }
                             Ok(TerminalJsEvent::ClipboardError { action, message }) => {
                                 let title = if action == "cut" {
                                     "Cut Failed"
+                                } else if action == "paste_image" {
+                                    "Image Paste Failed"
                                 } else {
                                     "Copy Failed"
                                 };
@@ -8154,6 +8385,7 @@ fn TerminalCanvas(
     });
     rsx! {
         div {
+            key: "{instance_key}",
             style: "display:flex; flex-direction:column; min-height:0; height:100%;",
             div {
                 style: format!(
@@ -8162,6 +8394,7 @@ fn TerminalCanvas(
                     theme.background
                 ),
                 div {
+                    key: "{host_id}",
                     id: "{host_id}",
                     style: format!(
                         "flex:1; min-height:0; width:100%; height:100%; background:{}; overflow:hidden;",
@@ -8495,7 +8728,14 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
         term.attachCustomKeyEventHandler((event) => {{
             const accel = event.ctrlKey || event.metaKey;
             const key = (event.key || '').toLowerCase();
-            if (!accel || !event.shiftKey || (key !== 'c' && key !== 'x')) {{
+            if (!accel) {{
+                return true;
+            }}
+            if (!event.shiftKey && key === 'v') {{
+                dioxus.send({{ kind: "clipboard_image_request" }});
+                return false;
+            }}
+            if (!event.shiftKey || (key !== 'c' && key !== 'x')) {{
                 return true;
             }}
             const selection = term.getSelection ? term.getSelection() : "";
@@ -9493,18 +9733,35 @@ fn ThemeEditorOverlay(
     let grain_percent = (snapshot.theme_editor_draft.grain * 100.0).round() as i32;
     let accent = snapshot.theme_accent.clone();
     let preview_has_stops = !snapshot.theme_editor_draft.colors.is_empty();
+    let overlay_wash = match snapshot.settings.theme {
+        UiTheme::ZedLight => "rgba(228,237,245,0.16)",
+        UiTheme::ZedDark => "rgba(10,14,18,0.18)",
+    };
+    let editor_surface = match snapshot.settings.theme {
+        UiTheme::ZedLight => "rgba(250,252,255,0.96)",
+        UiTheme::ZedDark => "rgba(28,34,41,0.96)",
+    };
+    let editor_shadow = match snapshot.settings.theme {
+        UiTheme::ZedLight => "0 0 0 1px rgba(215,229,243,0.96), 0 0 0 10px rgba(129,188,255,0.18), 0 26px 60px rgba(55,83,112,0.20), inset 0 0 0 1px rgba(214,223,232,0.92)",
+        UiTheme::ZedDark => "0 0 0 1px rgba(59,87,112,0.90), 0 0 0 10px rgba(124,200,255,0.16), 0 26px 60px rgba(0,0,0,0.42), inset 0 0 0 1px rgba(68,84,99,0.94)",
+    };
 
     rsx! {
         div {
-            style: "position:fixed; inset:0; z-index:98; display:flex; align-items:center; justify-content:center; background:rgba(228,237,245,0.16);",
+            style: format!(
+                "position:fixed; inset:0; z-index:98; display:flex; align-items:center; justify-content:center; background:{};",
+                overlay_wash
+            ),
             onclick: move |evt| on_close.call(evt),
             div {
                 style: format!(
                     "width:min(460px, calc(100vw - 44px)); display:flex; flex-direction:column; gap:14px; padding:14px; \
-                     border-radius:22px; background:rgba(250,252,255,0.96); color:{}; \
-                     box-shadow:0 0 0 1px rgba(215,229,243,0.96), 0 0 0 10px rgba(129,188,255,0.18), 0 26px 60px rgba(55,83,112,0.20), inset 0 0 0 1px rgba(214,223,232,0.92); \
+                     border-radius:22px; background:{}; color:{}; \
+                     box-shadow:{}; \
                      font-family:{};",
+                    editor_surface,
                     snapshot.palette.text,
+                    editor_shadow,
                     interface_font_family()
                 ),
                 onmousedown: |evt| evt.stop_propagation(),
@@ -9527,7 +9784,7 @@ fn ThemeEditorOverlay(
                             }
                             div {
                                 style: format!("font-size:11px; line-height:1.45; color:{};", snapshot.palette.muted),
-                                "Shape the shell gradient, brightness, and grain for Yggui. The active theme is saved in `~/.yggterm/settings.json` under the `theme` object."
+                                "Shape the shell gradient, brightness, and grain for Yggui. The active theme is saved in ~/.yggterm/settings.json under the theme object."
                             }
                         }
                     }
@@ -9646,35 +9903,23 @@ fn ThemeEditorOverlay(
                             }
                             div {
                                 style: "display:flex; align-items:center; gap:8px;",
-                                button {
-                                    style: theme_editor_action_button_style(snapshot.palette, &accent, false, true),
+                                ThemeDialogButton {
+                                    primary: false,
+                                    enabled: true,
+                                    palette: snapshot.palette,
+                                    accent: accent.clone(),
                                     onclick: move |evt| on_add_stop.call(evt),
-                                    span {
-                                        style: format!("font-size:14px; font-weight:800; color:{};", accent),
-                                        "+"
-                                    }
-                                    span { "Add Stop" }
+                                    prefix: Some("+".to_string()),
+                                    "Add Stop"
                                 }
-                                button {
-                                    style: theme_editor_action_button_style(
-                                        snapshot.palette,
-                                        &accent,
-                                        snapshot.theme_editor_selected_stop.is_some(),
-                                        false,
-                                    ),
+                                ThemeDialogButton {
+                                    primary: false,
+                                    enabled: snapshot.theme_editor_selected_stop.is_some(),
+                                    palette: snapshot.palette,
+                                    accent: accent.clone(),
                                     onclick: move |evt| on_remove_stop.call(evt),
-                                    span {
-                                        style: format!(
-                                            "font-size:14px; font-weight:800; color:{};",
-                                            if snapshot.theme_editor_selected_stop.is_some() {
-                                                snapshot.palette.text
-                                            } else {
-                                                snapshot.palette.muted
-                                            }
-                                        ),
-                                        "−"
-                                    }
-                                    span { "Remove" }
+                                    prefix: Some("−".to_string()),
+                                    "Remove"
                                 }
                             }
                         }
@@ -9850,25 +10095,75 @@ fn ThemeEditorOverlay(
                     div {
                         style: "display:flex; align-items:center; gap:8px;",
                         if !preview_has_stops {
-                            button {
-                                style: chip_style(snapshot.palette, false),
+                            ThemeDialogButton {
+                                primary: false,
+                                enabled: true,
+                                palette: snapshot.palette,
+                                accent: accent.clone(),
                                 onclick: move |evt| on_seed.call(evt),
+                                prefix: None,
                                 "Use Starter"
                             }
                         }
-                        button {
-                            style: chip_style(snapshot.palette, false),
+                        ThemeDialogButton {
+                            primary: false,
+                            enabled: true,
+                            palette: snapshot.palette,
+                            accent: accent.clone(),
                             onclick: move |evt| on_reset.call(evt),
+                            prefix: None,
                             "Reset to Base"
                         }
-                        button {
-                            style: primary_action_style(snapshot.palette),
+                        ThemeDialogButton {
+                            primary: true,
+                            enabled: true,
+                            palette: snapshot.palette,
+                            accent: accent.clone(),
                             onclick: move |evt| on_save.call(evt),
+                            prefix: None,
                             "Apply Theme"
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+#[component]
+fn ThemeDialogButton(
+    primary: bool,
+    enabled: bool,
+    palette: Palette,
+    accent: String,
+    prefix: Option<String>,
+    onclick: EventHandler<MouseEvent>,
+    children: Element,
+) -> Element {
+    let style = if primary {
+        primary_action_style(palette)
+    } else {
+        theme_editor_action_button_style(palette, &accent, enabled, false)
+    };
+    rsx! {
+        button {
+            disabled: !enabled,
+            style: style,
+            onclick: move |evt| {
+                if enabled {
+                    onclick.call(evt);
+                }
+            },
+            if let Some(prefix) = prefix {
+                span {
+                    style: format!(
+                        "font-size:14px; font-weight:800; color:{};",
+                        if enabled { accent.clone() } else { palette.muted.to_string() }
+                    ),
+                    "{prefix}"
+                }
+            }
+            {children}
         }
     }
 }
@@ -10144,19 +10439,19 @@ fn palette(theme: UiTheme) -> Palette {
             shell: "rgba(39,46,52,0.92)",
             titlebar: "transparent",
             sidebar: "transparent",
-            sidebar_hover: "rgba(131,198,205,0.14)",
-            panel: "#f8fafc",
-            panel_alt: "rgba(255,255,255,0.14)",
-            border: "#3b4755",
-            text: "#dce6ee",
-            muted: "#9fb0bd",
-            accent: "#73b9ff",
-            accent_soft: "rgba(115,185,255,0.14)",
-            gradient: "linear-gradient(180deg, rgba(68,95,106,0.92) 0%, rgba(75,102,94,0.88) 52%, rgba(58,65,73,0.94) 100%)",
+            sidebar_hover: "rgba(124,200,255,0.12)",
+            panel: "#161c22",
+            panel_alt: "rgba(22,28,34,0.76)",
+            border: "#2d3946",
+            text: "#dde8f3",
+            muted: "#a2b4c4",
+            accent: "#7cc8ff",
+            accent_soft: "rgba(124,200,255,0.16)",
+            gradient: "linear-gradient(180deg, rgba(56,79,91,0.94) 0%, rgba(55,88,79,0.90) 54%, rgba(39,46,52,0.96) 100%)",
             close_hover: "#e81123",
-            control_hover: "rgba(255,255,255,0.08)",
-            shadow: "0 26px 72px rgba(0,0,0,0.34)",
-            panel_shadow: "0 22px 52px rgba(0,0,0,0.22)",
+            control_hover: "rgba(255,255,255,0.10)",
+            shadow: "0 26px 72px rgba(0,0,0,0.38)",
+            panel_shadow: "0 22px 52px rgba(0,0,0,0.28)",
         },
     }
 }
