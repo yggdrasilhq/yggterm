@@ -5530,6 +5530,7 @@ name = "yggui"
 version = "2.0.11"
 dependencies = [
  "anyhow",
+ "base64",
  "dioxus",
  "once_cell",
  "png",
