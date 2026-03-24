@@ -5933,18 +5933,21 @@ fn MainSurface(
                 } else {
                     rsx! {
                         div {
-                            style: "display:flex; flex-direction:column; gap:18px; min-width:0; width:min(980px, 100%); margin:0 auto;",
+                            style: "display:flex; flex-direction:column; min-width:0; min-height:0; width:100%; height:100%;",
                             div {
-                                style: "display:flex; align-items:flex-start; justify-content:space-between; gap:16px; flex-wrap:wrap;",
-                                SessionHeaderCopy {
-                                    title: session.title.clone(),
-                                    subtitle: snapshot
-                                        .active_summary
-                                        .clone()
-                                        .unwrap_or_else(|| preview_summary_text(&session)),
-                                    palette: snapshot.palette,
-                                    on_refresh_title: move |_| on_refresh_title.call(()),
-                                    on_refresh_subtitle: move |_| on_refresh_summary.call(()),
+                                style: "display:flex; align-items:flex-start; justify-content:space-between; gap:16px; padding:22px 26px 14px 26px; border-bottom:1px solid rgba(170,190,212,0.16);",
+                                div {
+                                    style: "display:flex; flex-direction:column; gap:16px; min-width:0; flex:1;",
+                                    SessionHeaderCopy {
+                                        title: session.title.clone(),
+                                        subtitle: snapshot
+                                            .active_summary
+                                            .clone()
+                                            .unwrap_or_else(|| preview_summary_text(&session)),
+                                        palette: snapshot.palette,
+                                        on_refresh_title: move |_| on_refresh_title.call(()),
+                                        on_refresh_subtitle: move |_| on_refresh_summary.call(()),
+                                    }
                                 }
                                 PreviewToolbar {
                                     palette: snapshot.palette,
@@ -5955,28 +5958,34 @@ fn MainSurface(
                                     on_set_preview_layout: move |mode| on_set_preview_layout.call(mode),
                                 }
                             }
-                            if snapshot.preview_layout == PreviewLayoutMode::Chat {
-                                div {
-                                    style: "display:flex; flex-direction:column; gap:18px;",
-                                    if !session.rendered_sections.is_empty() {
-                                        RenderedSectionsStrip {
-                                            sections: session.rendered_sections.clone(),
+                            div {
+                                style: "display:flex; flex-direction:column; gap:18px; min-width:0; min-height:0; overflow:auto; padding:24px;",
+                                if snapshot.preview_layout == PreviewLayoutMode::Chat {
+                                    div {
+                                        style: "display:flex; flex-direction:column; gap:18px; min-width:0; width:min(980px, 100%); margin:0 auto;",
+                                        if !session.rendered_sections.is_empty() {
+                                            RenderedSectionsStrip {
+                                                sections: session.rendered_sections.clone(),
+                                                palette: snapshot.palette,
+                                            }
+                                        }
+                                        for (ix, block) in session.preview.blocks.iter().cloned().enumerate() {
+                                            PreviewBlock {
+                                                block_ix: ix,
+                                                block: block.clone(),
+                                                palette: snapshot.palette,
+                                                on_toggle: move |_| on_toggle_preview_block.call(ix),
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    div {
+                                        style: "width:min(980px, 100%); margin:0 auto;",
+                                        PreviewGraph {
+                                            session: session.clone(),
                                             palette: snapshot.palette,
                                         }
                                     }
-                                    for (ix, block) in session.preview.blocks.iter().cloned().enumerate() {
-                                        PreviewBlock {
-                                            block_ix: ix,
-                                            block: block.clone(),
-                                            palette: snapshot.palette,
-                                            on_toggle: move |_| on_toggle_preview_block.call(ix),
-                                        }
-                                    }
-                                }
-                            } else {
-                                PreviewGraph {
-                                    session: session.clone(),
-                                    palette: snapshot.palette,
                                 }
                             }
                         }
@@ -6049,7 +6058,7 @@ fn SessionHeaderCopy(
 ) -> Element {
     rsx! {
         div {
-            style: "display:flex; flex-direction:column; gap:8px; min-width:280px; flex:1;",
+            style: "display:flex; flex-direction:column; gap:10px; min-width:280px; flex:1;",
             div {
                 style: "display:flex; align-items:flex-start; justify-content:space-between; gap:12px;",
                 div {
@@ -6071,7 +6080,7 @@ fn SessionHeaderCopy(
             div {
                 style: "display:flex; align-items:flex-start; gap:8px; min-width:0;",
                 div {
-                    style: format!("font-size:12px; line-height:1.6; color:{}; max-width:720px; white-space:pre-wrap; min-width:0;", palette.muted),
+                    style: format!("font-size:12px; line-height:1.65; color:{}; white-space:pre-wrap; overflow-wrap:anywhere; min-width:0; flex:1;", palette.muted),
                     "{subtitle}"
                 }
                 RefreshInlineButton {
