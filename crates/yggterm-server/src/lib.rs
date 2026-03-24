@@ -977,6 +977,7 @@ impl YggtermServer {
             prefix: live.prefix,
             cwd: live.cwd,
         };
+        self.upsert_ssh_target(&target);
         self.insert_live_session(&live.key, &live.id, live.kind, &target, Some(live.title));
     }
 

@@ -1586,19 +1586,33 @@ fn initial_server_sync(
         runtime = status(&endpoint).ok();
     }
 
-    let (snapshot, _) = match daemon_snapshot(&endpoint) {
+    let (mut snapshot, _) = match daemon_snapshot(&endpoint) {
         Ok(snapshot) => snapshot,
         Err(_) => {
             restart_daemon(&endpoint)?;
             daemon_snapshot(&endpoint)?
         }
     };
+    if snapshot_needs_remote_restore_restart(&snapshot) {
+        restart_daemon(&endpoint)?;
+        snapshot = daemon_snapshot(&endpoint)?.0;
+        runtime = status(&endpoint).ok();
+    }
     let detail = match &endpoint {
         #[cfg(unix)]
         ServerEndpoint::UnixSocket(path) => format!("server connected via {}", path.display()),
         ServerEndpoint::Tcp { host, port } => format!("server connected via {host}:{port}"),
     };
     Ok((snapshot, runtime, detail))
+}
+
+fn snapshot_needs_remote_restore_restart(snapshot: &ServerUiSnapshot) -> bool {
+    snapshot.remote_machines.is_empty()
+        && snapshot.ssh_targets.is_empty()
+        && snapshot
+            .live_sessions
+            .iter()
+            .any(|session| session.kind == SessionKind::SshShell)
 }
 
 fn ensure_daemon_running(endpoint: &ServerEndpoint) -> Result<()> {
