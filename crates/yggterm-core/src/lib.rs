@@ -202,9 +202,9 @@ impl SessionStore {
 
         let data = fs::read_to_string(&path)
             .with_context(|| format!("failed to read settings file {}", path.display()))?;
-        let parsed: AppSettings = serde_json::from_str(&data)
+        let value: Value = serde_json::from_str(&data)
             .with_context(|| format!("failed to parse settings file {}", path.display()))?;
-        Ok(parsed)
+        parse_settings_value(&value)
     }
 
     pub fn save_settings(&self, settings: &AppSettings) -> Result<()> {
@@ -503,10 +503,116 @@ impl SessionStore {
 }
 
 pub fn save_settings_file(path: &Path, settings: &AppSettings) -> Result<()> {
-    let data = serde_json::to_string_pretty(settings).context("failed to serialize settings")?;
+    let data = serde_json::to_string_pretty(&serialize_settings_value(settings))
+        .context("failed to serialize settings")?;
     fs::write(path, data)
         .with_context(|| format!("failed to write settings file {}", path.display()))?;
     Ok(())
+}
+
+fn parse_settings_value(value: &Value) -> Result<AppSettings> {
+    let mut settings = AppSettings::default();
+    let Some(object) = value.as_object() else {
+        anyhow::bail!("settings file must contain a JSON object");
+    };
+
+    if let Some(theme_mode) = object
+        .get("theme_mode")
+        .or_else(|| object.get("theme").filter(|value| value.is_string()))
+    {
+        settings.theme = serde_json::from_value(theme_mode.clone())
+            .context("failed to parse theme_mode")?;
+    }
+    if let Some(theme_spec) = object
+        .get("theme")
+        .filter(|value| value.is_object())
+        .or_else(|| object.get("yggui_theme"))
+    {
+        settings.yggui_theme = serde_json::from_value(theme_spec.clone())
+            .context("failed to parse theme object")?;
+    }
+    if let Some(value) = object.get("show_tree") {
+        settings.show_tree = serde_json::from_value(value.clone()).context("failed to parse show_tree")?;
+    }
+    if let Some(value) = object.get("show_settings") {
+        settings.show_settings =
+            serde_json::from_value(value.clone()).context("failed to parse show_settings")?;
+    }
+    if let Some(value) = object.get("tree_width") {
+        settings.tree_width =
+            serde_json::from_value(value.clone()).context("failed to parse tree_width")?;
+    }
+    if let Some(value) = object.get("terminal_font_size") {
+        settings.terminal_font_size = serde_json::from_value(value.clone())
+            .context("failed to parse terminal_font_size")?;
+    }
+    if let Some(value) = object.get("ui_font_size") {
+        settings.ui_font_size =
+            serde_json::from_value(value.clone()).context("failed to parse ui_font_size")?;
+    }
+    if let Some(value) = object.get("prefer_ghostty_backend") {
+        settings.prefer_ghostty_backend = serde_json::from_value(value.clone())
+            .context("failed to parse prefer_ghostty_backend")?;
+    }
+    if let Some(value) = object.get("litellm_endpoint") {
+        settings.litellm_endpoint = serde_json::from_value(value.clone())
+            .context("failed to parse litellm_endpoint")?;
+    }
+    if let Some(value) = object.get("litellm_api_key") {
+        settings.litellm_api_key = serde_json::from_value(value.clone())
+            .context("failed to parse litellm_api_key")?;
+    }
+    if let Some(value) = object.get("interface_llm_model") {
+        settings.interface_llm_model = serde_json::from_value(value.clone())
+            .context("failed to parse interface_llm_model")?;
+    }
+    if let Some(value) = object.get("default_agent_profile") {
+        settings.default_agent_profile = serde_json::from_value(value.clone())
+            .context("failed to parse default_agent_profile")?;
+    }
+    if let Some(value) = object.get("in_app_notifications") {
+        settings.in_app_notifications = serde_json::from_value(value.clone())
+            .context("failed to parse in_app_notifications")?;
+    }
+    if let Some(value) = object.get("system_notifications") {
+        settings.system_notifications = serde_json::from_value(value.clone())
+            .context("failed to parse system_notifications")?;
+    }
+    if let Some(value) = object.get("notification_sound") {
+        settings.notification_sound = serde_json::from_value(value.clone())
+            .context("failed to parse notification_sound")?;
+    }
+    if let Some(value) = object.get("selected_browser_path") {
+        settings.selected_browser_path = serde_json::from_value(value.clone())
+            .context("failed to parse selected_browser_path")?;
+    }
+    if let Some(value) = object.get("expanded_browser_paths") {
+        settings.expanded_browser_paths = serde_json::from_value(value.clone())
+            .context("failed to parse expanded_browser_paths")?;
+    }
+    Ok(settings)
+}
+
+fn serialize_settings_value(settings: &AppSettings) -> Value {
+    serde_json::json!({
+        "theme_mode": settings.theme,
+        "theme": settings.yggui_theme,
+        "show_tree": settings.show_tree,
+        "show_settings": settings.show_settings,
+        "tree_width": settings.tree_width,
+        "terminal_font_size": settings.terminal_font_size,
+        "ui_font_size": settings.ui_font_size,
+        "prefer_ghostty_backend": settings.prefer_ghostty_backend,
+        "litellm_endpoint": settings.litellm_endpoint,
+        "litellm_api_key": settings.litellm_api_key,
+        "interface_llm_model": settings.interface_llm_model,
+        "default_agent_profile": settings.default_agent_profile,
+        "in_app_notifications": settings.in_app_notifications,
+        "system_notifications": settings.system_notifications,
+        "notification_sound": settings.notification_sound,
+        "selected_browser_path": settings.selected_browser_path,
+        "expanded_browser_paths": settings.expanded_browser_paths,
+    })
 }
 
 pub fn resolve_yggterm_home() -> Result<PathBuf> {
