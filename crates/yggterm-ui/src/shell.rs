@@ -56,6 +56,7 @@ use yggterm_server::{
     ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionPreviewBlock,
     SessionRenderedSection, SshConnectTarget, TerminalBackend, WorkspaceViewMode, YggtermServer,
     connect_ssh_custom, focus_live, open_remote_session, open_stored_session, ping,
+    persist_remote_generated_copy,
     refresh_remote_machine,
     remove_ssh_target,
     request_terminal_launch, set_all_preview_blocks_folded,
@@ -392,6 +393,7 @@ impl ShellState {
         }
         state.refresh_tree_debug("init");
         state.server_daemon_detail = state.bootstrap.server_daemon_detail.clone();
+        state.hydrate_generated_copy_from_remote_cache();
         if let Some(update) = state.pending_update_restart.clone() {
             state.last_action = format!("update {} ready", update.version);
             state.push_notification(
@@ -584,6 +586,7 @@ impl ShellState {
         match result {
             Ok((snapshot, message)) => {
                 self.server.apply_snapshot(snapshot);
+                self.hydrate_generated_copy_from_remote_cache();
                 self.server_busy = false;
                 self.needs_initial_server_sync = false;
                 if was_initial_sync {
@@ -623,6 +626,21 @@ impl ShellState {
         }
         self.browser.ensure_expanded_paths(paths);
         self.sync_browser_settings();
+    }
+
+    fn hydrate_generated_copy_from_remote_cache(&mut self) {
+        for machine in self.server.remote_machines() {
+            for session in &machine.sessions {
+                if let Some(precis) = session.cached_precis.as_ref() {
+                    self.generated_precis
+                        .insert(session.session_path.clone(), precis.clone());
+                }
+                if let Some(summary) = session.cached_summary.as_ref() {
+                    self.generated_summaries
+                        .insert(session.session_path.clone(), summary.clone());
+                }
+            }
+        }
     }
 
     fn select_row(&mut self, row: &BrowserRow) {
@@ -932,14 +950,22 @@ impl ShellState {
     }
 
     fn selected_saved_ssh_target_machine_keys(&self) -> (Vec<String>, Vec<String>) {
+        let rows = merged_sidebar_rows(
+            self.browser.rows(),
+            self.server.remote_machines(),
+            self.server.ssh_targets(),
+            &self.server.live_sessions(),
+            &self.browser.expanded_path_set(),
+        );
         let selected_rows = if self.selected_tree_paths.is_empty() {
-            self.browser.selected_row().cloned().into_iter().collect::<Vec<_>>()
-        } else {
             self.browser
-                .rows()
-                .iter()
+                .selected_path()
+                .and_then(|path| rows.iter().find(|row| row.full_path == path).cloned())
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else {
+            rows.into_iter()
                 .filter(|row| self.selected_tree_paths.contains(&row.full_path))
-                .cloned()
                 .collect::<Vec<_>>()
         };
 
@@ -1274,6 +1300,7 @@ fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force:
     } else {
         None
     };
+    let remote_machine = remote_machine_for_session_path(&state.read().server, &session_path);
     if !is_local_stored_session_row(&row) && remote_context.is_none() {
         return;
     }
@@ -1320,6 +1347,7 @@ fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force:
         let row_for_task = row.clone();
         let settings_for_task = settings.clone();
         let remote_context_for_task = remote_context.clone();
+        let remote_machine_for_task = remote_machine.clone();
         let outcome = task::spawn_blocking(
             move || -> Result<(Option<String>, Option<yggterm_core::SessionNode>)> {
                 info!(session_path=%row_for_task.full_path, force, "running title generation task");
@@ -1332,6 +1360,19 @@ fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force:
                         &context,
                         force,
                     )?;
+                    if let (Some(machine), Some(title_text)) =
+                        (remote_machine_for_task.as_ref(), title.as_deref())
+                    {
+                        persist_remote_generated_copy(
+                            machine,
+                            &session_id,
+                            &cwd,
+                            Some(title_text),
+                            None,
+                            None,
+                            &settings_for_task.interface_llm_model,
+                        )?;
+                    }
                     Ok((title, None))
                 } else {
                     let title = store.generate_title_for_session_path(
@@ -1455,6 +1496,7 @@ fn spawn_precis_generation(mut state: Signal<ShellState>, session: ManagedSessio
     let session_id = session.id.clone();
     let cwd = metadata_value(&session, "Cwd");
     let remote_context = remote_scanned_session_context(&state.read().server, &session_path);
+    let remote_machine = remote_machine_for_session_path(&state.read().server, &session_path);
     let settings = state.read().settings.clone();
     if settings.litellm_endpoint.trim().is_empty()
         || settings.litellm_api_key.trim().is_empty()
@@ -1486,16 +1528,31 @@ fn spawn_precis_generation(mut state: Signal<ShellState>, session: ManagedSessio
         let cwd_for_task = cwd.clone();
         let remote_context_for_task = remote_context.clone();
         let settings_for_task = settings.clone();
+        let remote_machine_for_task = remote_machine.clone();
         let outcome = task::spawn_blocking(move || -> Result<Option<String>> {
             let store = SessionStore::open_or_init()?;
             if let Some(context) = remote_context_for_task {
-                return store.generate_precis_for_context(
+                let precis = store.generate_precis_for_context(
                     &settings_for_task,
                     &session_id_for_task,
                     &cwd_for_task,
                     &context,
                     force,
-                );
+                )?;
+                if let (Some(machine), Some(precis_text)) =
+                    (remote_machine_for_task.as_ref(), precis.as_deref())
+                {
+                    persist_remote_generated_copy(
+                        machine,
+                        &session_id_for_task,
+                        &cwd_for_task,
+                        None,
+                        Some(precis_text),
+                        None,
+                        &settings_for_task.interface_llm_model,
+                    )?;
+                }
+                return Ok(precis);
             }
             if !force
                 && let Some(precis) = store.resolve_precis_for_session_path(&path_for_task)?
@@ -1554,6 +1611,7 @@ fn spawn_summary_generation(mut state: Signal<ShellState>, session: ManagedSessi
     let session_id = session.id.clone();
     let cwd = metadata_value(&session, "Cwd");
     let remote_context = remote_scanned_session_context(&state.read().server, &session_path);
+    let remote_machine = remote_machine_for_session_path(&state.read().server, &session_path);
     let settings = state.read().settings.clone();
     if settings.litellm_endpoint.trim().is_empty()
         || settings.litellm_api_key.trim().is_empty()
@@ -1585,16 +1643,31 @@ fn spawn_summary_generation(mut state: Signal<ShellState>, session: ManagedSessi
         let cwd_for_task = cwd.clone();
         let remote_context_for_task = remote_context.clone();
         let settings_for_task = settings.clone();
+        let remote_machine_for_task = remote_machine.clone();
         let outcome = task::spawn_blocking(move || -> Result<Option<String>> {
             let store = SessionStore::open_or_init()?;
             if let Some(context) = remote_context_for_task {
-                return store.generate_summary_for_context(
+                let summary = store.generate_summary_for_context(
                     &settings_for_task,
                     &session_id_for_task,
                     &cwd_for_task,
                     &context,
                     force,
-                );
+                )?;
+                if let (Some(machine), Some(summary_text)) =
+                    (remote_machine_for_task.as_ref(), summary.as_deref())
+                {
+                    persist_remote_generated_copy(
+                        machine,
+                        &session_id_for_task,
+                        &cwd_for_task,
+                        None,
+                        None,
+                        Some(summary_text),
+                        &settings_for_task.interface_llm_model,
+                    )?;
+                }
+                return Ok(summary);
             }
             if !force
                 && let Some(summary) = store.resolve_summary_for_session_path(&path_for_task)?
@@ -2143,6 +2216,19 @@ fn remote_scanned_session_context(server: &YggtermServer, session_path: &str) ->
             .iter()
             .find(|session| session.session_path == session_path)
             .map(|session| session.recent_context.clone())
+    })
+}
+
+fn remote_machine_for_session_path(
+    server: &YggtermServer,
+    session_path: &str,
+) -> Option<RemoteMachineSnapshot> {
+    server.remote_machines().iter().find_map(|machine| {
+        machine
+            .sessions
+            .iter()
+            .any(|session| session.session_path == session_path)
+            .then(|| machine.clone())
     })
 }
 
@@ -4406,6 +4492,12 @@ fn app() -> Element {
                     state.with_mut(|shell| shell.clear_drag_state());
                 }
             },
+            onkeydown: move |evt| {
+                if evt.key() == Key::Delete && state.read().tree_rename_path.is_none() {
+                    evt.prevent_default();
+                    queue_delete_selected_items(state, false);
+                }
+            },
             oncontextmenu: |evt| {
                 evt.prevent_default();
                 evt.stop_propagation();
@@ -4988,6 +5080,12 @@ fn Sidebar(
                 zoom_percent_f32(snapshot.settings.ui_font_size, 14.0)
             ),
             tabindex: "0",
+            onkeydown: move |evt| {
+                if evt.key() == Key::Delete {
+                    evt.prevent_default();
+                    on_delete_selected_items.call(false);
+                }
+            },
             div {
                 style: "padding:12px 12px 0 12px; display:flex; gap:8px;",
                 SidebarQuickAction {
@@ -9111,6 +9209,8 @@ mod tests {
                     assistant_message_count: 10,
                     title_hint: "019caa6f".to_string(),
                     recent_context: "USER: test\nASSISTANT: reply".to_string(),
+                    cached_precis: None,
+                    cached_summary: None,
                     storage_path: "/home/pi/.codex/sessions/a.jsonl".to_string(),
                 }],
             }],
@@ -9146,6 +9246,8 @@ mod tests {
                     assistant_message_count: 10,
                     title_hint: "019caa6f".to_string(),
                     recent_context: "USER: test\nASSISTANT: reply".to_string(),
+                    cached_precis: None,
+                    cached_summary: None,
                     storage_path: "/home/pi/.codex/sessions/a.jsonl".to_string(),
                 }],
             }],
@@ -9288,6 +9390,8 @@ mod tests {
                         assistant_message_count: 1,
                         title_hint: "1".to_string(),
                         recent_context: "USER: one".to_string(),
+                        cached_precis: None,
+                        cached_summary: None,
                         storage_path: "a".to_string(),
                     },
                     RemoteScannedSession {
@@ -9301,6 +9405,8 @@ mod tests {
                         assistant_message_count: 1,
                         title_hint: "2".to_string(),
                         recent_context: "USER: two".to_string(),
+                        cached_precis: None,
+                        cached_summary: None,
                         storage_path: "b".to_string(),
                     },
                 ],
