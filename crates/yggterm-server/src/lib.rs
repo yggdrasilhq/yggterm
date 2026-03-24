@@ -737,13 +737,18 @@ impl YggtermServer {
         state: PersistedDaemonState,
         store: Option<&SessionStore>,
     ) {
-        self.ssh_targets = state.ssh_targets;
+        self.ssh_targets = state
+            .ssh_targets
+            .into_iter()
+            .filter(|target| !is_loopback_ssh_target(&target.ssh_target))
+            .collect();
         for target in &mut self.ssh_targets {
             target.label = ssh_machine_label(target);
         }
         self.remote_machines = state
             .remote_machines
             .into_iter()
+            .filter(|machine| !is_loopback_ssh_target(&machine.ssh_target))
             .map(|mut machine| {
                 if machine.health == RemoteMachineHealth::Healthy {
                     machine.health = RemoteMachineHealth::Cached;
@@ -868,6 +873,9 @@ impl YggtermServer {
         &mut self,
         target: &SshConnectTarget,
     ) -> anyhow::Result<()> {
+        if is_loopback_ssh_target(&target.ssh_target) {
+            return Ok(());
+        }
         let machine_key = machine_key_from_ssh_target(&target.ssh_target);
         let label = ssh_machine_label(target);
         let entry_ix = self.ensure_remote_machine_stub(target);
@@ -1435,6 +1443,9 @@ impl YggtermServer {
     }
 
     fn upsert_ssh_target(&mut self, target: &SshConnectTarget) {
+        if is_loopback_ssh_target(&target.ssh_target) {
+            return;
+        }
         if let Some(existing) = self.ssh_targets.iter_mut().find(|existing| {
             existing.kind == target.kind
                 && existing.ssh_target == target.ssh_target
@@ -1522,6 +1533,18 @@ fn ssh_machine_label(target: &SshConnectTarget) -> String {
             .trim()
             .to_string()
     }
+}
+
+fn ssh_host_from_target(ssh_target: &str) -> &str {
+    ssh_target
+        .rsplit('@')
+        .next()
+        .unwrap_or(ssh_target)
+        .trim()
+}
+
+fn is_loopback_ssh_target(ssh_target: &str) -> bool {
+    matches!(ssh_host_from_target(ssh_target), "localhost" | "127.0.0.1" | "::1")
 }
 
 fn machine_key_from_ssh_target(ssh_target: &str) -> String {
@@ -4260,7 +4283,8 @@ fn short_session_id(session_id: &str) -> String {
 mod tests {
     use super::{
         GhosttyHostSupport, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession,
-        SessionKind, SessionNode, SessionNodeKind, UiTheme, YggtermServer,
+        PersistedDaemonState, SessionKind, SessionNode, SessionNodeKind, SshConnectTarget,
+        UiTheme, WorkspaceViewMode, YggtermServer,
         dedupe_remote_scanned_sessions, load_remote_machine_sessions_from_mirror,
         mirror_remote_machine_sessions,
         parse_stored_transcript, remote_resume_shell_command, remote_scanned_session_path,
@@ -4487,5 +4511,53 @@ mod tests {
         assert_eq!(deduped[0].cached_precis.as_deref(), Some("precis"));
         assert_eq!(deduped[0].cached_summary.as_deref(), Some("summary"));
         assert_eq!(deduped[0].storage_path, "/two.jsonl");
+    }
+
+    #[test]
+    fn restore_persisted_state_filters_loopback_ssh_targets() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.restore_persisted_state(
+            PersistedDaemonState {
+                active_session_path: None,
+                active_view_mode: WorkspaceViewMode::Rendered,
+                ssh_targets: vec![SshConnectTarget {
+                    label: "localhost".to_string(),
+                    kind: SessionKind::SshShell,
+                    ssh_target: "localhost".to_string(),
+                    prefix: None,
+                    cwd: None,
+                }],
+                remote_machines: vec![RemoteMachineSnapshot {
+                    machine_key: "localhost".to_string(),
+                    label: "localhost".to_string(),
+                    ssh_target: "localhost".to_string(),
+                    prefix: None,
+                    health: RemoteMachineHealth::Cached,
+                    sessions: Vec::new(),
+                }],
+                stored_sessions: Vec::new(),
+                live_sessions: Vec::new(),
+            },
+            None,
+        );
+
+        assert!(server.ssh_targets().is_empty());
+        assert!(server.remote_machines().is_empty());
     }
 }
