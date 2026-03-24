@@ -332,6 +332,34 @@ impl SessionStore {
         resolver.resolve_precis_for_session(&identity.session_id)
     }
 
+    pub fn resolve_title_for_session_id(&self, session_id: &str) -> Result<Option<String>> {
+        let resolver = SessionTitleResolver::new(&self.home)?;
+        resolver.resolve_for_session(session_id)
+    }
+
+    pub fn resolve_precis_for_session_id(&self, session_id: &str) -> Result<Option<String>> {
+        let resolver = SessionTitleResolver::new(&self.home)?;
+        resolver.resolve_precis_for_session(session_id)
+    }
+
+    pub fn resolve_title_for_session_path(&self, session_path: &str) -> Result<Option<String>> {
+        let path = PathBuf::from(session_path);
+        if !path.exists() || !is_codex_session_file(&path) {
+            return Ok(None);
+        }
+
+        let Some(identity) = read_codex_session_identity(&path)? else {
+            return Ok(None);
+        };
+        let resolver = SessionTitleResolver::new(&self.home)?;
+        resolver.resolve_for_session(&identity.session_id)
+    }
+
+    pub fn resolve_summary_for_session_id(&self, session_id: &str) -> Result<Option<String>> {
+        let resolver = SessionTitleResolver::new(&self.home)?;
+        resolver.resolve_summary_for_session(session_id)
+    }
+
     pub fn resolve_summary_for_session_path(&self, session_path: &str) -> Result<Option<String>> {
         let path = PathBuf::from(session_path);
         if !path.exists() || !is_codex_session_file(&path) {

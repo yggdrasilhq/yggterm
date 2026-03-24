@@ -41,7 +41,7 @@ pub struct ToastPalette {
 pub fn ToastViewport(
     items: Vec<ToastItem>,
     palette: ToastPalette,
-    right_inset: usize,
+    center_offset: i32,
     max_age_ms: u64,
     max_visible: usize,
     now_ms: u64,
@@ -51,7 +51,6 @@ pub fn ToastViewport(
         .into_iter()
         .rev()
         .filter(|notification| now_ms.saturating_sub(notification.created_at_ms) <= max_age_ms)
-        .filter(|notification| notification.tone != ToastTone::Info)
         .take(max_visible)
         .collect::<Vec<_>>();
     let stack_key = visible
@@ -63,8 +62,8 @@ pub fn ToastViewport(
         div {
             key: "{stack_key}",
             style: format!(
-                "position:fixed; top:56px; right:{}px; z-index:80; display:flex; flex-direction:column; gap:10px; width:280px; pointer-events:none;",
-                right_inset
+                "position:fixed; top:72px; left:50%; transform:translateX(calc(-50% + {}px)); z-index:80; display:flex; flex-direction:column; gap:10px; width:320px; max-width:min(320px, calc(100vw - 32px)); pointer-events:none;",
+                center_offset
             ),
             for notification in visible {
                 div {
