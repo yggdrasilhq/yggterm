@@ -3,9 +3,9 @@ use std::fs;
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::Duration;
-use tracing::warn;
 use yggterm_core::{
-    ENV_YGGTERM_HOME, InstallContext, SessionStore, UpdatePolicy, check_for_update,
+    ENV_YGGTERM_HOME, InstallContext, PerfSpan, SessionNode, SessionNodeKind, SessionStore,
+    UiTheme, UpdatePolicy, WorkspaceDocumentKind, WorkspaceGroupKind, check_for_update,
     detect_install_context, install_release_update, refresh_desktop_integration,
 };
 use yggterm_server::{
@@ -24,8 +24,10 @@ fn main() -> Result<()> {
     let current_exe = std::env::current_exe()?;
     let install_context = detect_install_context(&current_exe)?;
     let store = SessionStore::open_or_init()?;
-    let mut pending_update_restart = None;
-    let mut launch_install_context = install_context.clone();
+    let startup_home = store.home_dir().to_path_buf();
+    let startup_span = PerfSpan::start(&startup_home, "startup", "gui_main");
+    let pending_update_restart = None;
+    let launch_install_context = install_context.clone();
     if args.as_slice() == ["server", "daemon"] {
         let _ = refresh_desktop_integration(&install_context);
         let endpoint = default_endpoint(store.home_dir());
@@ -56,68 +58,18 @@ fn main() -> Result<()> {
         return run_document_cli(&store, &args[1..]);
     }
 
-    if args.is_empty() {
-        if let Err(error) = refresh_desktop_integration(&install_context) {
-            warn!(error=%error, "failed to refresh desktop integration");
-        }
-        if install_context.update_policy == UpdatePolicy::Auto
-            && std::env::var_os("YGGTERM_SKIP_SELF_UPDATE").is_none()
-        {
-            match check_for_update(&install_context) {
-                Ok(Some(update)) => match install_release_update(&install_context, &update) {
-                    Ok(next_exe) => {
-                        launch_install_context =
-                            detect_install_context(&next_exe).unwrap_or_else(|_| InstallContext {
-                                channel: install_context.channel,
-                                update_policy: install_context.update_policy,
-                                repo: install_context.repo.clone(),
-                                asset_label: install_context.asset_label.clone(),
-                                current_version: update.version.clone(),
-                                executable_path: next_exe.clone(),
-                                managed_root: install_context.managed_root.clone(),
-                                manager_hint: install_context.manager_hint.clone(),
-                            });
-                        pending_update_restart = Some(yggui::PendingUpdateRestart {
-                            version: update.version,
-                            executable: next_exe,
-                        });
-                    }
-                    Err(error) => warn!(error=%error, "failed to install direct update"),
-                },
-                Ok(None) => {}
-                Err(error) => warn!(error=%error, "failed to check for update"),
-            }
-        }
-    }
-
-    let tree = store.load_tree()?;
+    let settings_span = PerfSpan::start(&startup_home, "startup", "load_settings");
     let settings = store.load_settings().unwrap_or_default();
-    let browser_tree = store
-        .load_codex_tree(&settings)
-        .unwrap_or_else(|_| tree.clone());
+    settings_span.finish(serde_json::json!({}));
+    let tree = placeholder_session_tree(store.sessions_root().to_path_buf(), settings.theme);
+    let browser_tree = placeholder_session_tree(store.home_dir().to_path_buf(), settings.theme);
     let settings_path = store.settings_path();
     let theme = settings.theme;
     let prefer_ghostty_backend = settings.prefer_ghostty_backend;
     let endpoint = default_endpoint(store.home_dir());
+    let host_span = PerfSpan::start(&startup_home, "startup", "detect_terminal_host");
     let host = detect_ghostty_host();
-    let mut daemon_connected = ping(&endpoint).is_ok();
-    let mut daemon_status = if daemon_connected {
-        status(&endpoint).ok()
-    } else {
-        None
-    };
-    if daemon_status
-        .as_ref()
-        .map(|status| status.server_version.as_str() != env!("CARGO_PKG_VERSION"))
-        .unwrap_or(false)
-    {
-        let _ = shutdown(&endpoint);
-        daemon_connected = false;
-        daemon_status = None;
-    }
-    if !daemon_connected {
-        spawn_server_daemon()?;
-    }
+    host_span.finish(serde_json::json!({ "detail": host.detail }));
 
     let launch_result = yggui::launch_shell(yggui::ShellBootstrap {
         tree,
@@ -131,18 +83,33 @@ fn main() -> Result<()> {
         ghostty_bridge_enabled: host.bridge_enabled,
         ghostty_embedded_surface_supported: host.embedded_surface_supported,
         ghostty_bridge_detail: host.detail.clone(),
-        server_daemon_detail: if let Some(status) = daemon_status {
-            format!("server {} connected", status.server_version)
-        } else if daemon_connected {
-            "server connected".to_string()
-        } else {
-            "starting server…".to_string()
-        },
+        server_daemon_detail: "starting server…".to_string(),
         prefer_ghostty_backend,
         pending_update_restart,
     });
+    startup_span.finish(serde_json::json!({
+        "update_policy": format!("{:?}", install_context.update_policy),
+        "theme": match theme { UiTheme::ZedLight => "light", UiTheme::ZedDark => "dark" },
+    }));
     let _ = shutdown(&endpoint);
     launch_result
+}
+
+fn placeholder_session_tree(path: std::path::PathBuf, theme: UiTheme) -> SessionNode {
+    SessionNode {
+        kind: SessionNodeKind::Group,
+        name: "sessions".to_string(),
+        title: Some(match theme {
+            UiTheme::ZedLight => "Sessions".to_string(),
+            UiTheme::ZedDark => "Sessions".to_string(),
+        }),
+        document_kind: None::<WorkspaceDocumentKind>,
+        group_kind: Some(WorkspaceGroupKind::Folder),
+        path,
+        children: Vec::new(),
+        session_id: None,
+        cwd: None,
+    }
 }
 
 fn run_install_cli(context: &InstallContext) -> Result<()> {
@@ -178,18 +145,6 @@ fn run_install_cli(context: &InstallContext) -> Result<()> {
             Ok(())
         }
     }
-}
-
-fn spawn_server_daemon() -> Result<()> {
-    let current_exe = std::env::current_exe()?;
-    Command::new(current_exe)
-        .arg("server")
-        .arg("daemon")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    Ok(())
 }
 
 fn run_document_cli(store: &SessionStore, args: &[String]) -> Result<()> {

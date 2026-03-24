@@ -601,6 +601,28 @@ impl YggtermServer {
         }
     }
 
+    pub fn set_session_precis_hint(&mut self, session_path: &str, precis: &str) {
+        for machine in &mut self.remote_machines {
+            for scanned in &mut machine.sessions {
+                if scanned.session_path == session_path {
+                    scanned.cached_precis = Some(precis.to_string());
+                    return;
+                }
+            }
+        }
+    }
+
+    pub fn set_session_summary_hint(&mut self, session_path: &str, summary: &str) {
+        for machine in &mut self.remote_machines {
+            for scanned in &mut machine.sessions {
+                if scanned.session_path == session_path {
+                    scanned.cached_summary = Some(summary.to_string());
+                    return;
+                }
+            }
+        }
+    }
+
     pub fn remote_machines(&self) -> &[RemoteMachineSnapshot] {
         &self.remote_machines
     }

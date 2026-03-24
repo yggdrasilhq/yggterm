@@ -9,7 +9,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
-use yggterm_core::{SessionStore, UiTheme};
+use yggterm_core::{PerfSpan, SessionStore, UiTheme};
 
 pub const SERVER_PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -154,6 +154,7 @@ struct DaemonRuntime {
 impl DaemonRuntime {
     fn load(support: GhosttyHostSupport) -> Result<Self> {
         let store = SessionStore::open_or_init()?;
+        let perf = PerfSpan::start(store.home_dir(), "daemon", "runtime_load");
         let settings = store.load_settings().unwrap_or_default();
         let tree = store
             .load_codex_tree(&settings)
@@ -168,13 +169,18 @@ impl DaemonRuntime {
         if let Some(saved) = load_persisted_state(&state_path)? {
             server.restore_persisted_state(saved, Some(&store));
         }
-        Ok(Self {
+        let runtime = Self {
             support,
             state_path,
             store,
             server,
             terminals: TerminalManager::new(),
-        })
+        };
+        perf.finish(serde_json::json!({
+            "prefer_ghostty_backend": settings.prefer_ghostty_backend,
+            "theme": format!("{:?}", settings.theme),
+        }));
+        Ok(runtime)
     }
 
     fn status(&self) -> ServerRuntimeStatus {
