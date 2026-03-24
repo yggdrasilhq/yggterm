@@ -185,6 +185,20 @@ Notifications are reusable shell components, not one-off project afterthoughts.
 - Toast stacks should animate upward when items leave.
 - Notification history panels are acceptable when the product benefits from persistent event history.
 - Clear-one and clear-all actions should be supported when a notification panel exists.
+- In-app toasts should usually sit horizontally centered near the top of the app, not pinned to a screen edge.
+
+### Update system
+
+Update UX is a reusable shell concern, not project-specific glue.
+
+- Direct-install update flows should reuse the notification and chrome systems.
+- Installing an update must not immediately tear down a running productive workspace.
+- Preferred behavior is:
+  - install in the background
+  - notify that the update is ready
+  - expose an explicit restart affordance
+- Update state should be readable from shell chrome without feeling alarmist.
+- If a restart is required, the app should say so plainly instead of silently relaunching itself.
 
 ### Debug telemetry
 
@@ -236,6 +250,7 @@ Preferred reusable boundaries:
 - window control primitives
 - rail/panel primitives
 - menu and toast primitives
+- update-state primitives
 - telemetry hooks for interaction-heavy components
 
 ### Window chrome specifics
