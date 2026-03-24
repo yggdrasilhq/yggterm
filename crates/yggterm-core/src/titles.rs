@@ -205,6 +205,47 @@ impl SessionTitleResolver {
         self.store.get_summary(session_id)
     }
 
+    pub fn generate_for_context(
+        &self,
+        settings: &AppSettings,
+        session_id: &str,
+        cwd: &str,
+        context: &str,
+        force: bool,
+    ) -> Result<Option<String>> {
+        info!(session_id, force, context_chars = context.len(), "resolving context title");
+        if !force {
+            if let Some(title) = self.store.get_title(session_id)? {
+                return Ok(Some(title));
+            }
+        } else {
+            let _ = self.store.delete_title(session_id);
+        }
+
+        if !settings_ready(settings) {
+            warn!(session_id, "title settings are not configured");
+            return Ok(None);
+        }
+        if context.trim().is_empty() {
+            warn!(session_id, "no context supplied for title generation");
+            return Ok(None);
+        }
+
+        let title = request_litellm_title(settings, context)?;
+        let Some(title) = sanitize_generated_title(&title) else {
+            warn!(session_id, "model response sanitized to empty title");
+            return Ok(None);
+        };
+        self.store.put_title(
+            session_id,
+            cwd,
+            &title,
+            &settings.interface_llm_model,
+            "litellm",
+        )?;
+        Ok(Some(title))
+    }
+
     pub fn generate_for_session(
         &self,
         settings: &AppSettings,
@@ -297,6 +338,40 @@ impl SessionTitleResolver {
         Ok(Some(precis))
     }
 
+    pub fn generate_precis_for_context(
+        &self,
+        settings: &AppSettings,
+        session_id: &str,
+        cwd: &str,
+        context: &str,
+        force: bool,
+    ) -> Result<Option<String>> {
+        if !force {
+            if let Some(precis) = self.store.get_precis(session_id)? {
+                return Ok(Some(precis));
+            }
+        } else {
+            let _ = self.store.delete_precis(session_id);
+        }
+
+        if !settings_ready(settings) || context.trim().is_empty() {
+            return Ok(None);
+        }
+
+        let precis = request_litellm_precis(settings, context)?;
+        let Some(precis) = sanitize_generated_precis(&precis) else {
+            return Ok(None);
+        };
+        self.store.put_precis(
+            session_id,
+            cwd,
+            &precis,
+            &settings.interface_llm_model,
+            "litellm",
+        )?;
+        Ok(Some(precis))
+    }
+
     pub fn generate_summary_for_session(
         &self,
         settings: &AppSettings,
@@ -322,6 +397,40 @@ impl SessionTitleResolver {
             return Ok(None);
         }
         let summary = request_litellm_summary(settings, &context)?;
+        let Some(summary) = sanitize_generated_summary(&summary) else {
+            return Ok(None);
+        };
+        self.store.put_summary(
+            session_id,
+            cwd,
+            &summary,
+            &settings.interface_llm_model,
+            "litellm",
+        )?;
+        Ok(Some(summary))
+    }
+
+    pub fn generate_summary_for_context(
+        &self,
+        settings: &AppSettings,
+        session_id: &str,
+        cwd: &str,
+        context: &str,
+        force: bool,
+    ) -> Result<Option<String>> {
+        if !force {
+            if let Some(summary) = self.store.get_summary(session_id)? {
+                return Ok(Some(summary));
+            }
+        } else {
+            let _ = self.store.delete_summary(session_id);
+        }
+
+        if !settings_ready(settings) || context.trim().is_empty() {
+            return Ok(None);
+        }
+
+        let summary = request_litellm_summary(settings, context)?;
         let Some(summary) = sanitize_generated_summary(&summary) else {
             return Ok(None);
         };
