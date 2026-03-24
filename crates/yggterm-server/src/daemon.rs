@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 use yggterm_core::{PerfSpan, SessionStore, UiTheme};
@@ -808,6 +809,14 @@ pub fn shutdown(endpoint: &ServerEndpoint) -> Result<Option<String>> {
     expect_ack(send_request(endpoint, &ServerRequest::Shutdown)?)
 }
 
+pub fn cleanup_legacy_daemons(endpoint: &ServerEndpoint, current_exe: &Path) -> Result<()> {
+    #[cfg(unix)]
+    cleanup_legacy_unix_daemons(endpoint)?;
+    #[cfg(target_os = "linux")]
+    cleanup_legacy_linux_daemon_processes(current_exe)?;
+    Ok(())
+}
+
 pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Result<()> {
     let runtime = Arc::new(Mutex::new(DaemonRuntime::load(runtime)?));
 
@@ -872,6 +881,111 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
             Ok(())
         }
     }
+}
+
+#[cfg(unix)]
+fn cleanup_legacy_unix_daemons(endpoint: &ServerEndpoint) -> Result<()> {
+    let ServerEndpoint::UnixSocket(current_path) = endpoint else {
+        return Ok(());
+    };
+    let Some(home_dir) = current_path.parent() else {
+        return Ok(());
+    };
+    let entries = fs::read_dir(home_dir)
+        .with_context(|| format!("reading daemon socket dir {}", home_dir.display()))?;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("server") || !name.ends_with(".sock") || path == *current_path {
+            continue;
+        }
+
+        let mut removed_stale = false;
+        match std::os::unix::net::UnixStream::connect(&path) {
+            Ok(mut stream) => {
+                let _ = stream.write_all(br#"{"kind":"shutdown"}"#);
+                let _ = stream.write_all(b"\n");
+                let _ = stream.flush();
+            }
+            Err(_) => {
+                let _ = fs::remove_file(&path);
+                removed_stale = true;
+            }
+        }
+
+        if removed_stale {
+            continue;
+        }
+
+        for _ in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if !path.exists() {
+                break;
+            }
+        }
+        if path.exists() {
+            let _ = fs::remove_file(&path);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_legacy_linux_daemon_processes(current_exe: &Path) -> Result<()> {
+    let current_exe = current_exe.to_string_lossy().to_string();
+    let proc_entries = fs::read_dir("/proc").context("reading /proc for stale daemon cleanup")?;
+    for entry in proc_entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(pid_str) = name.to_str() else {
+            continue;
+        };
+        if !pid_str.chars().all(|ch| ch.is_ascii_digit()) {
+            continue;
+        }
+        let pid = pid_str.parse::<u32>().unwrap_or(0);
+        if pid == std::process::id() {
+            continue;
+        }
+        let cmdline_path = entry.path().join("cmdline");
+        let Ok(bytes) = fs::read(&cmdline_path) else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+        let parts = bytes
+            .split(|byte| *byte == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).to_string())
+            .collect::<Vec<_>>();
+        if parts.is_empty() {
+            continue;
+        }
+        let argv0 = &parts[0];
+        let is_daemon = argv0.contains("yggterm")
+            && parts.iter().any(|part| part == "server")
+            && parts.iter().any(|part| part == "daemon");
+        if !is_daemon || argv0 == &current_exe {
+            continue;
+        }
+
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status();
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        if Path::new(&format!("/proc/{pid}")).exists() {
+            let _ = Command::new("kill")
+                .arg("-KILL")
+                .arg(pid.to_string())
+                .status();
+        }
+    }
+    Ok(())
 }
 
 fn expect_snapshot(response: ServerResponse) -> Result<(ServerUiSnapshot, Option<String>)> {

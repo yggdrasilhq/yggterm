@@ -61,15 +61,12 @@ use yggterm_server::{
     RemoteMachineSnapshot, RemoteScannedSession, ServerEndpoint, ServerRuntimeStatus,
     ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionPreviewBlock,
     SessionRenderedSection, SshConnectTarget, TerminalBackend, WorkspaceViewMode, YggtermServer,
-    connect_ssh_custom, focus_live, open_remote_session, open_stored_session, ping,
-    persist_remote_generated_copy,
-    refresh_remote_machine,
-    remove_ssh_target,
-    request_terminal_launch, set_all_preview_blocks_folded,
-    stage_remote_clipboard_png,
-    set_view_mode as daemon_set_view_mode, snapshot as daemon_snapshot, start_command_session,
-    shutdown as daemon_shutdown, start_local_session, start_local_session_at, status,
-    switch_agent_session_mode,
+    cleanup_legacy_daemons, connect_ssh_custom, focus_live, open_remote_session,
+    open_stored_session, ping, persist_remote_generated_copy, refresh_remote_machine,
+    remove_ssh_target, request_terminal_launch, set_all_preview_blocks_folded,
+    set_view_mode as daemon_set_view_mode, shutdown as daemon_shutdown,
+    snapshot as daemon_snapshot, stage_remote_clipboard_png, start_command_session,
+    start_local_session, start_local_session_at, status, switch_agent_session_mode,
     terminal_ensure, terminal_read, terminal_resize, terminal_write,
     toggle_preview_block as daemon_toggle_preview_block,
 };
@@ -2355,6 +2352,8 @@ fn snapshot_needs_remote_restore_restart(snapshot: &ServerUiSnapshot) -> bool {
 }
 
 fn ensure_daemon_running(endpoint: &ServerEndpoint) -> Result<()> {
+    let current_exe = std::env::current_exe()?;
+    cleanup_legacy_daemons(endpoint, &current_exe)?;
     if ping(endpoint).is_ok() {
         return Ok(());
     }
@@ -2363,6 +2362,8 @@ fn ensure_daemon_running(endpoint: &ServerEndpoint) -> Result<()> {
 }
 
 fn restart_daemon(endpoint: &ServerEndpoint) -> Result<()> {
+    let current_exe = std::env::current_exe()?;
+    cleanup_legacy_daemons(endpoint, &current_exe)?;
     let _ = daemon_shutdown(endpoint);
     thread::sleep(Duration::from_millis(200));
     spawn_daemon_process()?;
