@@ -676,6 +676,9 @@ impl YggtermServer {
         store: Option<&SessionStore>,
     ) {
         self.ssh_targets = state.ssh_targets;
+        for target in &mut self.ssh_targets {
+            target.label = ssh_machine_label(target);
+        }
         self.remote_machines = state
             .remote_machines
             .into_iter()
@@ -686,6 +689,9 @@ impl YggtermServer {
                 machine
             })
             .collect();
+        for target in self.ssh_targets.clone() {
+            self.ensure_remote_machine_stub(&target);
+        }
         for session in state.stored_sessions {
             let document = if session.kind == SessionKind::Document {
                 store.and_then(|store| store.load_document(&session.path).ok().flatten())
@@ -1033,7 +1039,12 @@ impl YggtermServer {
 
     pub fn restore_live_session(&mut self, live: PersistedLiveSession) {
         let target = SshConnectTarget {
-            label: live.title.clone(),
+            label: live
+                .ssh_target
+                .rsplit('@')
+                .next()
+                .unwrap_or(live.ssh_target.as_str())
+                .to_string(),
             kind: live.kind,
             ssh_target: live.ssh_target,
             prefix: live.prefix,
