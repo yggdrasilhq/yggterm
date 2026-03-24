@@ -66,6 +66,10 @@ impl SessionBrowserState {
         &self.rows
     }
 
+    pub fn root(&self) -> &SessionNode {
+        &self.root
+    }
+
     pub fn filter_query(&self) -> &str {
         &self.filter_query
     }
