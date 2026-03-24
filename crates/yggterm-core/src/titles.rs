@@ -225,12 +225,18 @@ impl SessionTitleResolver {
             let _ = self.store.delete_title(session_id);
         }
 
-        if !settings_ready(settings) {
-            warn!(session_id, "title settings are not configured");
-            return Ok(None);
-        }
         if context.trim().is_empty() {
             warn!(session_id, "no context supplied for title generation");
+            return Ok(None);
+        }
+
+        if !settings_ready(settings) {
+            if let Some(title) = heuristic_title_from_context(context) {
+                self.store
+                    .put_title(session_id, cwd, &title, "heuristic", "heuristic")?;
+                return Ok(Some(title));
+            }
+            warn!(session_id, "title settings are not configured");
             return Ok(None);
         }
 
@@ -277,14 +283,18 @@ impl SessionTitleResolver {
             let _ = self.store.delete_title(session_id);
         }
 
-        if !settings_ready(settings) {
-            warn!(session_id, "title settings are not configured");
-            return Ok(None);
-        }
-
         let context = extract_tail_context(file_path)?;
         if context.is_empty() {
             warn!(session_id, file_path=%file_path.display(), "no transcript context extracted for title generation");
+            return Ok(None);
+        }
+        if !settings_ready(settings) {
+            if let Some(title) = heuristic_title_from_context(&context) {
+                self.store
+                    .put_title(session_id, cwd, &title, "heuristic", "heuristic")?;
+                return Ok(Some(title));
+            }
+            warn!(session_id, "title settings are not configured");
             return Ok(None);
         }
         info!(
@@ -325,12 +335,16 @@ impl SessionTitleResolver {
             let _ = self.store.delete_precis(session_id);
         }
 
-        if !settings_ready(settings) {
-            return Ok(None);
-        }
-
         let context = extract_tail_context(file_path)?;
         if context.is_empty() {
+            return Ok(None);
+        }
+        if !settings_ready(settings) {
+            if let Some(precis) = heuristic_precis_from_context(&context) {
+                self.store
+                    .put_precis(session_id, cwd, &precis, "heuristic", "heuristic")?;
+                return Ok(Some(precis));
+            }
             return Ok(None);
         }
         let precis = request_litellm_precis(settings, &context)?;
@@ -363,7 +377,15 @@ impl SessionTitleResolver {
             let _ = self.store.delete_precis(session_id);
         }
 
-        if !settings_ready(settings) || context.trim().is_empty() {
+        if context.trim().is_empty() {
+            return Ok(None);
+        }
+        if !settings_ready(settings) {
+            if let Some(precis) = heuristic_precis_from_context(context) {
+                self.store
+                    .put_precis(session_id, cwd, &precis, "heuristic", "heuristic")?;
+                return Ok(Some(precis));
+            }
             return Ok(None);
         }
 
@@ -397,12 +419,16 @@ impl SessionTitleResolver {
             let _ = self.store.delete_summary(session_id);
         }
 
-        if !settings_ready(settings) {
-            return Ok(None);
-        }
-
         let context = extract_tail_context(file_path)?;
         if context.is_empty() {
+            return Ok(None);
+        }
+        if !settings_ready(settings) {
+            if let Some(summary) = heuristic_summary_from_context(&context) {
+                self.store
+                    .put_summary(session_id, cwd, &summary, "heuristic", "heuristic")?;
+                return Ok(Some(summary));
+            }
             return Ok(None);
         }
         let summary = request_litellm_summary(settings, &context)?;
@@ -435,7 +461,15 @@ impl SessionTitleResolver {
             let _ = self.store.delete_summary(session_id);
         }
 
-        if !settings_ready(settings) || context.trim().is_empty() {
+        if context.trim().is_empty() {
+            return Ok(None);
+        }
+        if !settings_ready(settings) {
+            if let Some(summary) = heuristic_summary_from_context(context) {
+                self.store
+                    .put_summary(session_id, cwd, &summary, "heuristic", "heuristic")?;
+                return Ok(Some(summary));
+            }
             return Ok(None);
         }
 
@@ -933,7 +967,7 @@ fn heuristic_title_from_context(context: &str) -> Option<String> {
 
 fn looks_like_generated_fallback_title(title: &str) -> bool {
     let compact = title.trim();
-    compact.len() == 8
+    (compact.len() == 7 || compact.len() == 8)
         && compact.starts_with('Q')
         && compact
             .chars()

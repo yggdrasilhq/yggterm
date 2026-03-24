@@ -21,8 +21,6 @@ use crate::theme::{
 };
 use crate::window_icon;
 use anyhow::{Result, anyhow};
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use dioxus::desktop::{
     Config, LogicalSize, WindowBuilder, WindowEvent as DesktopWindowEvent, use_window,
     use_wry_event_handler, window,
@@ -245,6 +243,7 @@ struct RenderSnapshot {
     pending_update_restart: Option<PendingUpdateRestart>,
     last_terminal_debug: String,
     last_tree_debug: String,
+    active_title: Option<String>,
     active_precis: Option<String>,
     active_summary: Option<String>,
     drag_paths: Vec<String>,
@@ -371,7 +370,6 @@ enum TerminalJsEvent {
     Resize { cols: u16, rows: u16 },
     Clipboard { action: String, chars: usize },
     ClipboardImageRequest,
-    ClipboardImage { mime: String, data_url: String },
     ClipboardError { action: String, message: String },
     Debug { message: String },
 }
@@ -530,6 +528,17 @@ impl ShellState {
         } else {
             self.browser.selected_path().map(ToOwned::to_owned)
         };
+        let active_session = self.server.active_session().cloned();
+        let active_title = active_session
+            .as_ref()
+            .and_then(|session| resolved_session_title(self, session));
+        let active_precis = active_session
+            .as_ref()
+            .and_then(|session| resolved_session_precis(self, session));
+        let active_summary = active_session
+            .as_ref()
+            .and_then(|session| resolved_session_summary(self, session));
+
         RenderSnapshot {
             palette: palette,
             search_query: self.search_query.clone(),
@@ -538,7 +547,7 @@ impl ShellState {
             rows,
             selected_path,
             selected_row: self.browser.selected_row().cloned(),
-            active_session: self.server.active_session().cloned(),
+            active_session,
             active_view_mode: self.server.active_view_mode(),
             ssh_targets: self.server.ssh_targets().to_vec(),
             live_sessions,
@@ -564,14 +573,9 @@ impl ShellState {
             pending_update_restart: self.pending_update_restart.clone(),
             last_terminal_debug: self.last_terminal_debug.clone(),
             last_tree_debug: self.last_tree_debug.clone(),
-            active_precis: self
-                .server
-                .active_session()
-                .and_then(|session| self.generated_precis.get(&session.session_path).cloned()),
-            active_summary: self
-                .server
-                .active_session()
-                .and_then(|session| self.generated_summaries.get(&session.session_path).cloned()),
+            active_title,
+            active_precis,
+            active_summary,
             drag_paths: self.drag_paths.clone(),
             drag_hover_target: self.drag_hover_target.clone(),
             optimistic_drag_paths: self.optimistic_drag_paths.clone(),
@@ -1590,19 +1594,6 @@ fn spawn_title_generation_for_target(
     if !should_start {
         return;
     }
-    if !copy_generation_settings_ready(&settings) {
-        state.with_mut(|shell| {
-            shell.title_requests_in_flight.remove(&session_path);
-            if announce {
-                shell.push_notification(
-                    NotificationTone::Warning,
-                    "LiteLLM Not Configured",
-                    "Open settings and configure LiteLLM before generating chat titles.",
-                );
-            }
-        });
-        return;
-    }
     if announce {
         state.with_mut(|shell| {
             shell.last_action = if force {
@@ -1774,9 +1765,6 @@ fn spawn_precis_generation_for_target(
 ) {
     let session_path = target.session_path.clone();
     let settings = state.read().settings.clone();
-    if !copy_generation_settings_ready(&settings) {
-        return;
-    }
     let should_start = state.with_mut(|shell| {
         if (!force && shell.generated_precis.contains_key(&session_path))
             || shell.precis_requests_in_flight.contains(&session_path)
@@ -1938,9 +1926,6 @@ fn spawn_summary_generation_for_target(
 ) {
     let session_path = target.session_path.clone();
     let settings = state.read().settings.clone();
-    if !copy_generation_settings_ready(&settings) {
-        return;
-    }
     let should_start = state.with_mut(|shell| {
         if (!force && shell.generated_summaries.contains_key(&session_path))
             || shell.summary_requests_in_flight.contains(&session_path)
@@ -2744,12 +2729,6 @@ fn supports_generated_session_copy(session: &ManagedSessionView) -> bool {
     session.kind.is_agent() || session.session_path.starts_with("remote-session://")
 }
 
-fn copy_generation_settings_ready(settings: &AppSettings) -> bool {
-    !settings.litellm_endpoint.trim().is_empty()
-        && !settings.litellm_api_key.trim().is_empty()
-        && !settings.interface_llm_model.trim().is_empty()
-}
-
 fn copy_generation_target_for_session(
     server: &YggtermServer,
     session: &ManagedSessionView,
@@ -2922,15 +2901,12 @@ fn background_copy_job_for_target(
 }
 
 fn next_background_copy_job(
-    settings: &AppSettings,
+    _settings: &AppSettings,
     local_root: &SessionNode,
     remote_machines: &[RemoteMachineSnapshot],
     active_target: Option<CopyGenerationTarget>,
     copy_retry_after_ms: &HashMap<String, u64>,
 ) -> Option<BackgroundCopyJob> {
-    if !copy_generation_settings_ready(settings) {
-        return None;
-    }
     let store = SessionStore::open_or_init().ok()?;
     let mut targets = Vec::new();
     collect_local_copy_targets(local_root, &mut targets);
@@ -2978,7 +2954,6 @@ fn maybe_spawn_background_copy_generation(mut state: Signal<ShellState>) {
             || shell.needs_initial_server_sync
             || PASSIVE_COPY_SUSPENDED.load(Ordering::Relaxed)
             || shell.passive_copy_suspended
-            || !copy_generation_settings_ready(&shell.settings)
             || !shell.title_requests_in_flight.is_empty()
             || !shell.precis_requests_in_flight.is_empty()
             || !shell.summary_requests_in_flight.is_empty()
@@ -3071,6 +3046,45 @@ fn remote_generated_copy(
             })
         })
     })
+}
+
+fn resolved_session_title(shell: &ShellState, session: &ManagedSessionView) -> Option<String> {
+    if !session.title.trim().is_empty() && !looks_like_generated_fallback_title(&session.title) {
+        return Some(session.title.clone());
+    }
+    let remote_title = remote_generated_copy(&shell.server, &session.session_path)
+        .map(|(title, _, _)| title)
+        .filter(|title| !title.trim().is_empty() && !looks_like_generated_fallback_title(title));
+    if remote_title.is_some() {
+        return remote_title;
+    }
+    if let Some(row_title) = shell
+        .browser
+        .rows()
+        .iter()
+        .find(|row| row.full_path == session.session_path)
+        .map(|row| row.label.clone())
+        .filter(|title| !title.trim().is_empty() && !looks_like_generated_fallback_title(title))
+    {
+        return Some(row_title);
+    }
+    None
+}
+
+fn resolved_session_precis(shell: &ShellState, session: &ManagedSessionView) -> Option<String> {
+    shell
+        .generated_precis
+        .get(&session.session_path)
+        .cloned()
+        .or_else(|| remote_generated_copy(&shell.server, &session.session_path).and_then(|(_, precis, _)| precis))
+}
+
+fn resolved_session_summary(shell: &ShellState, session: &ManagedSessionView) -> Option<String> {
+    shell
+        .generated_summaries
+        .get(&session.session_path)
+        .cloned()
+        .or_else(|| remote_generated_copy(&shell.server, &session.session_path).and_then(|(_, _, summary)| summary))
 }
 
 fn remote_machine_for_session_path(
@@ -3242,18 +3256,6 @@ fn read_native_clipboard_png() -> Result<Vec<u8>> {
     Err(anyhow!(
         "native clipboard image paste is not implemented on this platform yet"
     ))
-}
-
-fn parse_png_data_url(data_url: &str) -> Result<Vec<u8>> {
-    let Some(encoded) = data_url.strip_prefix("data:image/") else {
-        return Err(anyhow!("clipboard data is not an image"));
-    };
-    let Some((_, payload)) = encoded.split_once(";base64,") else {
-        return Err(anyhow!("clipboard image was not base64 encoded"));
-    };
-    BASE64_STANDARD
-        .decode(payload)
-        .map_err(|error| anyhow!("failed to decode clipboard image: {error}"))
 }
 
 fn stage_terminal_clipboard_image(
@@ -5411,30 +5413,25 @@ fn app() -> Element {
         let Some(session) = active else {
             return;
         };
-        let has_precis = state
-            .read()
-            .generated_precis
-            .contains_key(&session.session_path);
-        let has_summary = state
-            .read()
-            .generated_summaries
-            .contains_key(&session.session_path);
-        if looks_like_generated_fallback_title(&session.title) || !has_precis || !has_summary {
+        let (has_precis, has_summary, has_good_title) = {
+            let shell = state.read();
+            (
+                resolved_session_precis(&shell, &session).is_some(),
+                resolved_session_summary(&shell, &session).is_some(),
+                resolved_session_title(&shell, &session)
+                    .as_deref()
+                    .is_some_and(|title| !looks_like_generated_fallback_title(title)),
+            )
+        };
+        if !has_good_title || !has_precis || !has_summary {
             spawn_active_session_copy_hydration(state, session.clone());
         }
         let has_generation_context = copy_generation_target_for_session(&state.read().server, &session)
             .and_then(|target| target.remote_context)
             .is_some_and(|context| !context.trim().is_empty());
-        let settings_ready = {
-            let settings = &state.read().settings;
-            !settings.litellm_endpoint.trim().is_empty()
-                && !settings.litellm_api_key.trim().is_empty()
-                && !settings.interface_llm_model.trim().is_empty()
-        };
         if supports_generated_session_copy(&session)
-            && looks_like_generated_fallback_title(&session.title)
+            && !has_good_title
             && (!session.session_path.starts_with("remote-session://") || has_generation_context)
-            && settings_ready
         {
             queue_active_session_title_generation(state, false);
         }
@@ -6963,7 +6960,10 @@ fn MainSurface(
                                 div {
                                     style: "display:flex; flex-direction:column; gap:16px; min-width:0; flex:1;",
                                     SessionHeaderCopy {
-                                        title: session.title.clone(),
+                                        title: snapshot
+                                            .active_title
+                                            .clone()
+                                            .unwrap_or_else(|| session.title.clone()),
                                         subtitle: snapshot
                                             .active_summary
                                             .clone()
@@ -7023,7 +7023,10 @@ fn MainSurface(
                     div {
                         style: "display:flex; align-items:flex-start; justify-content:space-between; gap:16px; padding:22px 26px 14px 26px; border-bottom:1px solid rgba(170,190,212,0.16);",
                         SessionHeaderCopy {
-                            title: session.title.clone(),
+                            title: snapshot
+                                .active_title
+                                .clone()
+                                .unwrap_or_else(|| session.title.clone()),
                             subtitle: snapshot
                                 .active_precis
                                 .clone()
@@ -8317,32 +8320,7 @@ fn TerminalCanvas(
                                             state,
                                             NotificationTone::Success,
                                             "Image Staged",
-                                            format!("Staged clipboard image at {path} and pasted its path into the terminal."),
-                                        );
-                                    }
-                                    Err(error) => {
-                                        let message = format!("Failed to paste image: {error}");
-                                        let _ = terminal_write(&endpoint, &session_path, &format!("{message}\r\n"));
-                                        safe_push_notification(
-                                            state,
-                                            NotificationTone::Error,
-                                            "Image Paste Failed",
-                                            error.to_string(),
-                                        );
-                                    }
-                                }
-                            }
-                            Ok(TerminalJsEvent::ClipboardImage { mime, data_url }) => {
-                                match parse_png_data_url(&data_url)
-                                    .and_then(|png_bytes| stage_terminal_clipboard_image(state, &session_path, &png_bytes))
-                                {
-                                    Ok(path) => {
-                                        let _ = terminal_write(&endpoint, &session_path, &format!("@{} ", path));
-                                        safe_push_notification(
-                                            state,
-                                            NotificationTone::Success,
-                                            "Image Staged",
-                                            format!("Staged {mime} clipboard image at {path} and pasted its path into the terminal."),
+                                            format!("Staged clipboard image at {path} and inserted its path into the terminal."),
                                         );
                                     }
                                     Err(error) => {
