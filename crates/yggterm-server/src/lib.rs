@@ -30,8 +30,8 @@ use time::{OffsetDateTime, UtcOffset, macros::format_description};
 use tracing::warn;
 use uuid::Uuid;
 use yggterm_core::{
-    SessionNode, SessionNodeKind, SessionStore, SessionTitleStore, TranscriptRole, UiTheme,
-    WorkspaceDocument, WorkspaceDocumentKind, read_codex_session_identity_fields,
+    PerfSpan, SessionNode, SessionNodeKind, SessionStore, SessionTitleStore, TranscriptRole,
+    UiTheme, WorkspaceDocument, WorkspaceDocumentKind, read_codex_session_identity_fields,
     read_codex_transcript_messages, resolve_yggterm_home,
 };
 
@@ -961,8 +961,9 @@ impl YggtermServer {
             prefix: machine.prefix.clone(),
             cwd: cwd.map(ToOwned::to_owned),
         };
-        let remote_binary = resolve_remote_yggterm_binary(&target.ssh_target, target.prefix.as_deref())
-            .unwrap_or_else(|_| "yggterm".to_string());
+        let (remote_binary, remote_deploy_state) =
+            resolve_remote_yggterm_binary(&target.ssh_target, target.prefix.as_deref())
+                .unwrap_or_else(|_| ("yggterm".to_string(), RemoteDeployState::Planned));
         let resolved_title = title_hint
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| short_session_id(session_id));
@@ -997,7 +998,25 @@ impl YggtermServer {
                 upsert_session_metadata(
                     &mut session.metadata,
                     "Status",
-                    "remote resume queued".to_string(),
+                    format!(
+                        "remote resume queued · {}",
+                        match remote_deploy_state {
+                            RemoteDeployState::Ready => "remote yggterm ready",
+                            RemoteDeployState::CopyingBinary => "copying yggterm binary",
+                            RemoteDeployState::Planned => "remote bootstrap planned",
+                            RemoteDeployState::NotRequired => "not required",
+                        }
+                    ),
+                );
+                upsert_session_metadata(
+                    &mut session.metadata,
+                    "Deploy",
+                    match remote_deploy_state {
+                        RemoteDeployState::Ready => "ready".to_string(),
+                        RemoteDeployState::CopyingBinary => "copying".to_string(),
+                        RemoteDeployState::Planned => "planned".to_string(),
+                        RemoteDeployState::NotRequired => "not required".to_string(),
+                    },
                 );
             }
             self.focus_live_session(&session_path);
@@ -1048,7 +1067,25 @@ impl YggtermServer {
             upsert_session_metadata(
                 &mut session.metadata,
                 "Status",
-                "remote resume queued".to_string(),
+                format!(
+                    "remote resume queued · {}",
+                    match remote_deploy_state {
+                        RemoteDeployState::Ready => "remote yggterm ready",
+                        RemoteDeployState::CopyingBinary => "copying yggterm binary",
+                        RemoteDeployState::Planned => "remote bootstrap planned",
+                        RemoteDeployState::NotRequired => "not required",
+                    }
+                ),
+            );
+            upsert_session_metadata(
+                &mut session.metadata,
+                "Deploy",
+                match remote_deploy_state {
+                    RemoteDeployState::Ready => "ready".to_string(),
+                    RemoteDeployState::CopyingBinary => "copying".to_string(),
+                    RemoteDeployState::Planned => "planned".to_string(),
+                    RemoteDeployState::NotRequired => "not required".to_string(),
+                },
             );
         }
         self.request_terminal_launch_for_path(&session_path);
@@ -2251,8 +2288,14 @@ fn run_remote_yggterm_command(
     args: &[&str],
     stdin_bytes: Option<&[u8]>,
 ) -> anyhow::Result<String> {
-    let binary_expr = resolve_remote_yggterm_binary(ssh_target, exec_prefix)?;
-    run_remote_binary_command(ssh_target, exec_prefix, &binary_expr, args, stdin_bytes)
+    let resolved = resolve_remote_yggterm_binary(ssh_target, exec_prefix)?;
+    run_remote_binary_command(
+        ssh_target,
+        exec_prefix,
+        &resolved.0,
+        args,
+        stdin_bytes,
+    )
 }
 
 fn should_fallback_to_python(error: &anyhow::Error) -> bool {
@@ -2317,14 +2360,25 @@ fn bootstrap_remote_yggterm(ssh_target: &str, exec_prefix: Option<&str>) -> anyh
 fn resolve_remote_yggterm_binary(
     ssh_target: &str,
     exec_prefix: Option<&str>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, RemoteDeployState)> {
+    let perf_home = resolve_yggterm_home().ok();
+    let perf_span = perf_home
+        .as_ref()
+        .map(|home| PerfSpan::start(home.clone(), "remote", "resolve_yggterm_binary"));
     let cache_key = remote_cache_key(ssh_target, exec_prefix);
     if let Some(cached) = remote_command_cache()
         .lock()
         .ok()
         .and_then(|cache| cache.get(&cache_key).cloned())
     {
-        return Ok(cached);
+        if let Some(span) = perf_span {
+            span.finish(serde_json::json!({
+                "ssh_target": ssh_target,
+                "result": "cache_hit",
+                "binary_expr": cached.clone(),
+            }));
+        }
+        return Ok((cached, RemoteDeployState::Ready));
     }
 
     match remote_protocol_version_for_binary(ssh_target, exec_prefix, "yggterm") {
@@ -2332,7 +2386,14 @@ fn resolve_remote_yggterm_binary(
             if let Ok(mut cache) = remote_command_cache().lock() {
                 cache.insert(cache_key, "yggterm".to_string());
             }
-            return Ok("yggterm".to_string());
+            if let Some(span) = perf_span {
+                span.finish(serde_json::json!({
+                    "ssh_target": ssh_target,
+                    "result": "path_match",
+                    "binary_expr": "yggterm",
+                }));
+            }
+            return Ok(("yggterm".to_string(), RemoteDeployState::Ready));
         }
         Ok(_) => {}
         Err(error) if !should_fallback_to_python(&error) => return Err(error),
@@ -2353,7 +2414,14 @@ fn resolve_remote_yggterm_binary(
     if let Ok(mut cache) = remote_command_cache().lock() {
         cache.insert(cache_key, installed.clone());
     }
-    Ok(installed)
+    if let Some(span) = perf_span {
+        span.finish(serde_json::json!({
+            "ssh_target": ssh_target,
+            "result": "bootstrapped",
+            "binary_expr": installed,
+        }));
+    }
+    Ok((installed, RemoteDeployState::Ready))
 }
 
 pub fn stage_remote_clipboard_png(
@@ -3218,8 +3286,9 @@ fn build_live_session(
     let started_at = format_display_datetime(OffsetDateTime::now_utc());
     let shell_program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
     let default_cwd = target.cwd.clone().unwrap_or_else(|| local_default_cwd());
-    let remote_binary = resolve_remote_yggterm_binary(&target.ssh_target, target.prefix.as_deref())
-        .unwrap_or_else(|_| "yggterm".to_string());
+    let (remote_binary, remote_deploy_state) =
+        resolve_remote_yggterm_binary(&target.ssh_target, target.prefix.as_deref())
+            .unwrap_or_else(|_| ("yggterm".to_string(), RemoteDeployState::Planned));
     let (launch_command, session_path, source_value, target_value, prefix_value, deploy_state) =
         match kind {
             SessionKind::Shell => (
@@ -3264,7 +3333,7 @@ fn build_live_session(
                 "live-ssh".to_string(),
                 target.ssh_target.clone(),
                 target.prefix.clone().unwrap_or_else(|| "none".to_string()),
-                RemoteDeployState::Planned,
+                remote_deploy_state,
             ),
             SessionKind::Document => (
                 "document preview".to_string(),
