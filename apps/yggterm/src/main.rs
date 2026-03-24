@@ -11,7 +11,8 @@ use yggterm_core::{
 };
 use yggterm_server::{
     SessionKind, default_endpoint, detect_ghostty_host, ping, run_attach, run_daemon, shutdown,
-    run_remote_scan, run_remote_stage_clipboard_png, run_remote_upsert_generated_copy,
+    run_remote_protocol_version, run_remote_resume_codex, run_remote_scan,
+    run_remote_stage_clipboard_png, run_remote_upsert_generated_copy,
     start_local_session, status,
 };
 
@@ -42,6 +43,15 @@ fn main() -> Result<()> {
     }
     if args.as_slice() == ["server", "remote", "stage-clipboard-png"] {
         return run_remote_stage_clipboard_png();
+    }
+    if args.as_slice() == ["server", "remote", "protocol-version"] {
+        return run_remote_protocol_version();
+    }
+    if args.len() >= 4 && args[0] == "server" && args[1] == "remote" && args[2] == "resume-codex" {
+        return run_remote_resume_codex(
+            &args[3],
+            args.get(4).map(String::as_str).filter(|value| !value.is_empty()),
+        );
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "remote" && args[2] == "scan" {
         return run_remote_scan(args.get(3).map(String::as_str));
