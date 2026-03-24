@@ -692,12 +692,12 @@ impl YggtermServer {
                 if machine.health == RemoteMachineHealth::Healthy {
                     machine.health = RemoteMachineHealth::Cached;
                 }
-                if machine.sessions.is_empty()
-                    && let Ok(mirrored) =
-                        load_remote_machine_sessions_from_mirror(&machine.machine_key)
-                    && !mirrored.is_empty()
-                {
-                    machine.sessions = mirrored;
+                machine.sessions = if machine.sessions.is_empty() {
+                    load_remote_machine_sessions_from_mirror(&machine.machine_key).unwrap_or_default()
+                } else {
+                    overlay_mirrored_remote_sessions(&machine.machine_key, &machine.sessions)
+                };
+                if !machine.sessions.is_empty() {
                     machine.health = RemoteMachineHealth::Cached;
                 }
                 machine
@@ -823,6 +823,7 @@ impl YggtermServer {
                         .cmp(&left.modified_epoch)
                         .then_with(|| right.started_at.cmp(&left.started_at))
                 });
+                sessions = overlay_mirrored_remote_sessions(&machine_key, &sessions);
                 if let Err(mirror_error) = mirror_remote_machine_sessions(&machine_key, &sessions) {
                     warn!(machine_key, error=%mirror_error, "failed to mirror remote machine sessions locally");
                 }
@@ -840,7 +841,10 @@ impl YggtermServer {
                 let existing_sessions = if self.remote_machines[entry_ix].sessions.is_empty() {
                     load_remote_machine_sessions_from_mirror(&machine_key).unwrap_or_default()
                 } else {
-                    self.remote_machines[entry_ix].sessions.clone()
+                    overlay_mirrored_remote_sessions(
+                        &machine_key,
+                        &self.remote_machines[entry_ix].sessions,
+                    )
                 };
                 self.remote_machines[entry_ix] = RemoteMachineSnapshot {
                     machine_key,
@@ -1828,6 +1832,43 @@ fn load_remote_machine_sessions_from_mirror(
         sessions.push(row?);
     }
     Ok(sessions)
+}
+
+fn overlay_mirrored_remote_sessions(
+    machine_key: &str,
+    sessions: &[RemoteScannedSession],
+) -> Vec<RemoteScannedSession> {
+    let Ok(mirrored) = load_remote_machine_sessions_from_mirror(machine_key) else {
+        return sessions.to_vec();
+    };
+    if mirrored.is_empty() {
+        return sessions.to_vec();
+    }
+    let mirrored_by_id = mirrored
+        .into_iter()
+        .map(|session| (session.session_id.clone(), session))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    sessions
+        .iter()
+        .cloned()
+        .map(|mut session| {
+            if let Some(mirrored) = mirrored_by_id.get(&session.session_id) {
+                if !mirrored.title_hint.trim().is_empty() {
+                    session.title_hint = mirrored.title_hint.clone();
+                }
+                if session.recent_context.trim().is_empty() && !mirrored.recent_context.trim().is_empty() {
+                    session.recent_context = mirrored.recent_context.clone();
+                }
+                if mirrored.cached_precis.as_ref().is_some_and(|value| !value.trim().is_empty()) {
+                    session.cached_precis = mirrored.cached_precis.clone();
+                }
+                if mirrored.cached_summary.as_ref().is_some_and(|value| !value.trim().is_empty()) {
+                    session.cached_summary = mirrored.cached_summary.clone();
+                }
+            }
+            session
+        })
+        .collect()
 }
 
 fn update_remote_generated_copy_in_mirror(
