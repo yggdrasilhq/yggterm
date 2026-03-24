@@ -31,6 +31,7 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 - Cross-platform support (Linux/macOS/Windows where feasible).
 - Keep terminal semantics owned by the Yggterm daemon plus xterm.js unless the Ghostty tradeoff is revisited explicitly.
 - For SSH targets, prefer Yggterm-owned remote commands and metadata/clipboard flows over ad hoc shell-text or Python-side workarounds whenever the remote machine has a Yggterm binary available.
+- Remote SSH flows should version-check and, when needed, bootstrap a matching `yggterm` binary into `~/.yggterm/bin/yggterm` on the target machine before depending on remote Yggterm commands.
 - Yggterm should feel remote-first: multiple machines, SSH-heavy workflows, and restoring many live terminal contexts is a core use case.
 
 ## Design philosophy
