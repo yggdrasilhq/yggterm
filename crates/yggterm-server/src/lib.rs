@@ -3077,11 +3077,13 @@ fn short_session_id(session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        SessionKind, parse_stored_transcript, remote_resume_command,
+        GhosttyHostSupport, RemoteMachineHealth, RemoteMachineSnapshot, SessionKind, SessionNode,
+        SessionNodeKind, UiTheme, YggtermServer, parse_stored_transcript, remote_resume_command,
         stored_session_launch_command,
     };
     use anyhow::Result;
     use std::fs;
+    use std::path::PathBuf;
 
     #[test]
     fn parse_stored_transcript_counts_compacted_replacement_history() -> Result<()> {
@@ -3133,5 +3135,59 @@ mod tests {
         assert!(command.contains("tmux new-session -A -s yggterm &&"));
         assert!(command.contains("cd '/srv/workspace' && codex resume"));
         assert!(command.contains("'019caa6f-b32c-7a73-b4d3-db83225663dc'"));
+    }
+
+    #[test]
+    fn reopening_remote_scanned_session_refreshes_stale_launch_command() -> Result<()> {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.remote_machines.push(RemoteMachineSnapshot {
+            machine_key: "jojo".to_string(),
+            label: "jojo".to_string(),
+            ssh_target: "jojo".to_string(),
+            prefix: None,
+            health: RemoteMachineHealth::Healthy,
+            sessions: Vec::new(),
+        });
+
+        let session_path = server.open_remote_scanned_session(
+            "jojo",
+            "019d09a4-c69e-7071-bd9a-8834060029a9",
+            Some("/home/pi"),
+            Some("Q60029a9"),
+        )?;
+        server
+            .sessions
+            .get_mut(&session_path)
+            .expect("session")
+            .launch_command = "ssh jojo 'yggterm server attach 019d09a4-c69e-7071-bd9a-8834060029a9'"
+            .to_string();
+
+        let reopened = server.open_remote_scanned_session(
+            "jojo",
+            "019d09a4-c69e-7071-bd9a-8834060029a9",
+            Some("/home/pi"),
+            Some("Q60029a9"),
+        )?;
+        let session = server.sessions.get(&reopened).expect("reopened session");
+        assert_eq!(reopened, session_path);
+        assert!(session.launch_command.starts_with("ssh -tt jojo "));
+        assert!(session.launch_command.contains("codex resume"));
+        Ok(())
     }
 }
