@@ -153,6 +153,7 @@ struct ShellState {
     passive_copy_suspended: bool,
     passive_copy_failures: HashSet<String>,
     copy_retry_after_ms: HashMap<String, u64>,
+    terminal_image_paste_ms: HashMap<String, u64>,
     remote_machine_refresh_requests: HashSet<String>,
     drag_paths: Vec<String>,
     drag_hover_target: Option<DragDropTarget>,
@@ -463,6 +464,7 @@ impl ShellState {
             passive_copy_suspended: false,
             passive_copy_failures: HashSet::new(),
             copy_retry_after_ms: HashMap::new(),
+            terminal_image_paste_ms: HashMap::new(),
             remote_machine_refresh_requests: HashSet::new(),
             drag_paths: Vec::new(),
             drag_hover_target: None,
@@ -5420,12 +5422,9 @@ fn app() -> Element {
         if looks_like_generated_fallback_title(&session.title) || !has_precis || !has_summary {
             spawn_active_session_copy_hydration(state, session.clone());
         }
-        let has_remote_title_context = if session.session_path.starts_with("remote-session://") {
-            remote_scanned_session_context(&state.read().server, &session.session_path)
-                .is_some_and(|context| !context.trim().is_empty())
-        } else {
-            false
-        };
+        let has_generation_context = copy_generation_target_for_session(&state.read().server, &session)
+            .and_then(|target| target.remote_context)
+            .is_some_and(|context| !context.trim().is_empty());
         let settings_ready = {
             let settings = &state.read().settings;
             !settings.litellm_endpoint.trim().is_empty()
@@ -5434,13 +5433,13 @@ fn app() -> Element {
         };
         if supports_generated_session_copy(&session)
             && looks_like_generated_fallback_title(&session.title)
-            && (!session.session_path.starts_with("remote-session://") || has_remote_title_context)
+            && (!session.session_path.starts_with("remote-session://") || has_generation_context)
             && settings_ready
         {
             queue_active_session_title_generation(state, false);
         }
         if !has_precis
-            && (!session.session_path.starts_with("remote-session://") || has_remote_title_context)
+            && (!session.session_path.starts_with("remote-session://") || has_generation_context)
         {
             spawn_precis_generation(state, session.clone(), false);
         }
@@ -5449,7 +5448,7 @@ fn app() -> Element {
             maybe_spawn_background_copy_generation(state);
             return;
         }
-        if session.session_path.starts_with("remote-session://") && !has_remote_title_context {
+        if session.session_path.starts_with("remote-session://") && !has_generation_context {
             state.with_mut(|shell| shell.next_background_copy_scan_after_ms = current_millis());
             maybe_spawn_background_copy_generation(state);
             return;
@@ -8214,7 +8213,7 @@ fn TerminalCanvas(
         let host_id = future_host_id.clone();
         let title = terminal_title.clone();
         let theme = future_theme.clone();
-        let state = state;
+        let mut state = state;
         async move {
             if let Err(error) = terminal_ensure(&endpoint, &session_path) {
                 warn!(session=%session_path, error=%error, "failed to ensure terminal");
@@ -8292,6 +8291,23 @@ fn TerminalCanvas(
                                 );
                             }
                             Ok(TerminalJsEvent::ClipboardImageRequest) => {
+                                let should_handle = state.with_mut(|shell| {
+                                    let now = current_millis();
+                                    let last = shell
+                                        .terminal_image_paste_ms
+                                        .get(&session_path)
+                                        .copied()
+                                        .unwrap_or(0);
+                                    if now.saturating_sub(last) < 1_500 {
+                                        false
+                                    } else {
+                                        shell.terminal_image_paste_ms.insert(session_path.clone(), now);
+                                        true
+                                    }
+                                });
+                                if !should_handle {
+                                    continue;
+                                }
                                 match read_native_clipboard_png()
                                     .and_then(|png_bytes| stage_terminal_clipboard_image(state, &session_path, &png_bytes))
                                 {
