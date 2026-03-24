@@ -965,7 +965,7 @@ fn heuristic_title_from_context(context: &str) -> Option<String> {
     plausible_title(&title).then_some(title)
 }
 
-fn looks_like_generated_fallback_title(title: &str) -> bool {
+pub fn looks_like_generated_fallback_title(title: &str) -> bool {
     let compact = title.trim();
     (compact.len() == 7 || compact.len() == 8)
         && compact.starts_with('Q')
