@@ -10,9 +10,9 @@ use yggterm_core::{
     detect_install_context, install_release_update, refresh_desktop_integration,
 };
 use yggterm_server::{
-    SessionKind, default_endpoint, detect_ghostty_host, ping, run_attach, run_daemon, shutdown,
-    run_remote_protocol_version, run_remote_resume_codex, run_remote_scan,
-    run_remote_stage_clipboard_png, run_remote_upsert_generated_copy,
+    SessionKind, cleanup_legacy_daemons, default_endpoint, detect_ghostty_host, ping, run_attach,
+    run_daemon, run_remote_protocol_version, run_remote_resume_codex, run_remote_scan,
+    run_remote_stage_clipboard_png, run_remote_upsert_generated_copy, shutdown,
     start_local_session, status,
 };
 
@@ -89,6 +89,9 @@ fn main() -> Result<()> {
     let theme = settings.theme;
     let prefer_ghostty_backend = settings.prefer_ghostty_backend;
     let endpoint = default_endpoint(store.home_dir());
+    let cleanup_span = PerfSpan::start(&startup_home, "startup", "cleanup_legacy_daemons");
+    let _ = cleanup_legacy_daemons(&endpoint, &current_exe);
+    cleanup_span.finish(serde_json::json!({}));
     let host_span = PerfSpan::start(&startup_home, "startup", "detect_terminal_host");
     let host = detect_ghostty_host();
     host_span.finish(serde_json::json!({ "detail": host.detail }));
