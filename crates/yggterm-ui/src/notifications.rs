@@ -62,7 +62,7 @@ pub fn ToastViewport(
         div {
             key: "{stack_key}",
             style: format!(
-                "position:fixed; top:72px; left:50%; transform:translateX(calc(-50% + {}px)); z-index:80; display:flex; flex-direction:column; gap:10px; width:320px; max-width:min(320px, calc(100vw - 32px)); pointer-events:none;",
+                "position:fixed; top:22px; left:50%; transform:translateX(calc(-50% + {}px)); z-index:80; display:flex; flex-direction:column; gap:10px; width:320px; max-width:min(320px, calc(100vw - 32px)); pointer-events:none;",
                 center_offset
             ),
             for notification in visible {
