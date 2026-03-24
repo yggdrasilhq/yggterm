@@ -1484,6 +1484,28 @@ impl ShellState {
     }
 }
 
+fn safe_push_notification(
+    mut state: Signal<ShellState>,
+    tone: NotificationTone,
+    title: impl Into<String>,
+    message: impl Into<String>,
+) {
+    let title = title.into();
+    let message = message.into();
+    if let Err(error) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        state.with_mut(|shell| {
+            shell.push_notification(tone, title.clone(), message.clone());
+        });
+    })) {
+        warn!(
+            title=%title,
+            message=%message,
+            panic_payload=?error,
+            "suppressed notification panic"
+        );
+    }
+}
+
 fn queue_title_generation(state: Signal<ShellState>, row: BrowserRow, force: bool) {
     if let Some(target) = copy_generation_target_for_browser_row(&state.read().server, &row) {
         spawn_title_generation_for_target(state, target, force, force);
@@ -7940,7 +7962,7 @@ fn TerminalCanvas(
         let host_id = future_host_id.clone();
         let title = terminal_title.clone();
         let theme = future_theme.clone();
-        let mut state = state;
+        let state = state;
         async move {
             if let Err(error) = terminal_ensure(&endpoint, &session_path) {
                 warn!(session=%session_path, error=%error, "failed to ensure terminal");
@@ -8010,13 +8032,12 @@ fn TerminalCanvas(
                                         },
                                     )
                                 };
-                                state.with_mut(|shell| {
-                                    shell.push_notification(
-                                        NotificationTone::Success,
-                                        title,
-                                        message,
-                                    );
-                                });
+                                safe_push_notification(
+                                    state,
+                                    NotificationTone::Success,
+                                    title,
+                                    message,
+                                );
                             }
                             Ok(TerminalJsEvent::ClipboardError { action, message }) => {
                                 let title = if action == "cut" {
@@ -8024,13 +8045,12 @@ fn TerminalCanvas(
                                 } else {
                                     "Copy Failed"
                                 };
-                                state.with_mut(|shell| {
-                                    shell.push_notification(
-                                        NotificationTone::Error,
-                                        title,
-                                        message.clone(),
-                                    );
-                                });
+                                safe_push_notification(
+                                    state,
+                                    NotificationTone::Error,
+                                    title,
+                                    message,
+                                );
                             }
                             Ok(TerminalJsEvent::Debug { message }) => {
                                 info!(session=%session_path, %message, "terminal js debug");
