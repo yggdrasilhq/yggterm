@@ -58,6 +58,26 @@ It provides:
 
 These primitives are also the base layer for update-ready and background-job feedback in shell chrome.
 
+## Reusable theming
+
+The shell theming helpers live in:
+
+- [src/theme.rs](/home/pi/gh/yggterm/crates/yggui/src/theme.rs)
+
+They provide:
+
+- `clamp_theme_spec` for persisted theme normalization
+- `append_theme_stop` for editor interactions
+- `gradient_css` and `shell_tint` for shell surfaces
+- `preview_surface_css` for theme-preview pads
+- `dominant_accent` for lightweight accent derivation
+
+The production reference integration currently lives in `src/shell.rs`, where:
+
+- light/dark mode remains a separate shell choice
+- the custom gradient, brightness, and grain live under app settings
+- the theme editor can live-preview the shell before save
+
 ## Reusable rails
 
 The side-rail shell primitives live in:

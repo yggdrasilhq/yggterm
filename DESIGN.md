@@ -92,6 +92,31 @@ Avoid:
 - overly opaque frosted layers that bury hierarchy
 - gratuitous gradients inside the main content region
 
+### Theming system
+
+Yggdrasil shells should support a reusable visual theme editor.
+
+- Theme editing should be centered on a small floating modal, not a full settings page takeover.
+- The editor should feel Arc-like or Zen-like: compact, visual, tactile.
+- The core interaction model is:
+  - a preview pad
+  - draggable color stops
+  - a lightweight color library
+  - a brightness control
+  - a grain control
+- Double-clicking the preview pad should be able to add a color stop.
+- Dragging color stops should live-preview the shell background.
+- Light and dark shell modes should remain selectable independently of the custom gradient.
+- Saving should persist the theme; cancel should revert live preview.
+- If no custom colors exist, the shell should fall back to the system gradient cleanly.
+
+#### Theme surfaces
+
+- The outer shell background should be theme-driven.
+- Supporting chrome should inherit the shell gradient subtly through transparency and blur.
+- The main workspace should remain calmer and more neutral than the shell chrome.
+- Theme accent can be derived from the dominant gradient stop for lightweight emphasis.
+
 ### Typography
 
 #### Interface font
