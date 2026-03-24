@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::fs;
 use std::io::Read;
+use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use yggterm_core::{
@@ -24,6 +25,7 @@ fn main() -> Result<()> {
     let current_exe = std::env::current_exe()?;
     let install_context = detect_install_context(&current_exe)?;
     let store = SessionStore::open_or_init()?;
+    install_panic_logging(store.home_dir());
     let startup_home = store.home_dir().to_path_buf();
     let startup_span = PerfSpan::start(&startup_home, "startup", "gui_main");
     let pending_update_restart = None;
@@ -93,6 +95,39 @@ fn main() -> Result<()> {
     }));
     let _ = shutdown(&endpoint);
     launch_result
+}
+
+fn install_panic_logging(home_dir: &std::path::Path) {
+    let panic_log_path = home_dir.join("panic.log");
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|location| format!("{}:{}:{}", location.file(), location.line(), location.column()))
+            .unwrap_or_else(|| "unknown".to_string());
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|message| (*message).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "non-string panic payload".to_string());
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+        let message = format!(
+            "timestamp_unix: {}\nlocation: {}\npayload: {}\nbacktrace:\n{:?}\n---\n",
+            timestamp, location, payload, backtrace
+        );
+        eprintln!("{message}");
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&panic_log_path)
+        {
+            let _ = file.write_all(message.as_bytes());
+        }
+    }));
 }
 
 fn placeholder_session_tree(path: std::path::PathBuf, theme: UiTheme) -> SessionNode {
