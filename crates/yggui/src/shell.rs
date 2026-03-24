@@ -257,7 +257,6 @@ struct RenderSnapshot {
     theme_accent: String,
     shell_tint: String,
     shell_gradient: String,
-    theme_share_json: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -562,8 +561,6 @@ impl ShellState {
             theme_accent: dominant_accent(&active_theme_spec, palette.accent),
             shell_tint: shell_tint(self.settings.theme, &active_theme_spec),
             shell_gradient: gradient_css(self.settings.theme, &active_theme_spec),
-            theme_share_json: serde_json::to_string_pretty(&clamp_theme_spec(&self.theme_editor_draft))
-                .unwrap_or_else(|_| "{}".to_string()),
         }
     }
 
@@ -2018,6 +2015,7 @@ fn spawn_initial_server_sync(mut state: Signal<ShellState>) {
                 shell.server_daemon_detail = detail;
                 shell.server_busy = false;
                 shell.needs_initial_server_sync = false;
+                shell.next_background_copy_scan_after_ms = current_millis() + 2_500;
                 if let Some(runtime) = runtime {
                     shell.last_action = format!("server ready · {}", runtime.host_kind);
                 } else {
@@ -9065,13 +9063,13 @@ fn ThemeEditorOverlay(
 
     rsx! {
         div {
-            style: "position:fixed; inset:0; z-index:98; display:flex; align-items:center; justify-content:center; background:rgba(228,237,245,0.82);",
+            style: "position:fixed; inset:0; z-index:98; display:flex; align-items:center; justify-content:center; background:rgba(228,237,245,0.16);",
             onclick: move |evt| on_close.call(evt),
             div {
                 style: format!(
                     "width:min(460px, calc(100vw - 44px)); display:flex; flex-direction:column; gap:14px; padding:14px; \
                      border-radius:22px; background:rgba(250,252,255,0.96); color:{}; \
-                     box-shadow:0 26px 60px rgba(55,83,112,0.20), inset 0 0 0 1px rgba(214,223,232,0.92); \
+                     box-shadow:0 0 0 1px rgba(215,229,243,0.96), 0 0 0 10px rgba(129,188,255,0.18), 0 26px 60px rgba(55,83,112,0.20), inset 0 0 0 1px rgba(214,223,232,0.92); \
                      font-family:{};",
                     snapshot.palette.text,
                     interface_font_family()
@@ -9096,7 +9094,7 @@ fn ThemeEditorOverlay(
                             }
                             div {
                                 style: format!("font-size:11px; line-height:1.45; color:{};", snapshot.palette.muted),
-                                "Shape the shell gradient, brightness, and grain for Yggui. The active theme is saved in config as portable JSON."
+                                "Shape the shell gradient, brightness, and grain for Yggui. The active theme is saved in `~/.yggterm/settings.json` under the `theme` object."
                             }
                         }
                     }
@@ -9152,7 +9150,10 @@ fn ThemeEditorOverlay(
                             ));
                         },
                         div {
-                            style: "position:absolute; inset:0; background-image: radial-gradient(rgba(255,255,255,0.26) 0.8px, transparent 0.8px); background-size: 10px 10px; background-position: -5px -5px; opacity:0.72; pointer-events:none;",
+                            style: "position:absolute; inset:0; background-image: linear-gradient(rgba(144,173,199,0.18) 1px, transparent 1px), linear-gradient(90deg, rgba(144,173,199,0.18) 1px, transparent 1px); background-size: 24px 24px; opacity:0.78; pointer-events:none;",
+                        }
+                        div {
+                            style: "position:absolute; inset:0; background-image: linear-gradient(rgba(255,255,255,0.24) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.24) 1px, transparent 1px); background-size: 96px 96px; opacity:0.52; pointer-events:none;",
                         }
                         if !preview_has_stops {
                             div {
@@ -9319,71 +9320,48 @@ fn ThemeEditorOverlay(
                             }
                         }
                         div {
-                            style: "display:flex; align-items:center; gap:14px;",
+                            style: "display:flex; flex-direction:column; gap:8px; align-items:center;",
                             div {
-                                style: "display:flex; flex-direction:column; gap:8px; flex:1;",
+                                style: "display:flex; align-items:center; justify-content:space-between; gap:10px; width:100%;",
                                 div {
-                                    style: "display:flex; align-items:center; justify-content:space-between; gap:10px;",
-                                    div {
-                                        style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", snapshot.palette.muted),
-                                        "Grain"
-                                    }
-                                    div {
-                                        style: format!("font-size:11px; font-weight:700; color:{};", accent),
-                                        "{grain_percent}"
-                                    }
+                                    style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", snapshot.palette.muted),
+                                    "Grain"
                                 }
-                                input {
-                                    r#type: "range",
-                                    min: "0",
-                                    max: "100",
-                                    value: "{grain_percent}",
-                                    style: "width:100%; height:28px;",
-                                    oninput: move |evt| {
-                                        let value = evt.value().parse::<f32>().unwrap_or(12.0) / 100.0;
-                                        on_set_grain.call(value);
-                                    },
+                                div {
+                                    style: format!("font-size:11px; font-weight:700; color:{};", accent),
+                                    "{grain_percent}"
                                 }
                             }
                             div {
                                 style: format!(
-                                    "position:relative; width:74px; height:74px; border-radius:999px; background:conic-gradient({} 0deg, {} {:.1}deg, rgba(224,232,240,0.92) {:.1}deg 360deg); box-shadow: inset 0 0 0 1px rgba(214,223,232,0.92);",
+                                    "position:relative; width:92px; height:92px; border-radius:999px; background:conic-gradient({} 0deg, {} {:.1}deg, rgba(224,232,240,0.92) {:.1}deg 360deg); box-shadow: inset 0 0 0 1px rgba(214,223,232,0.92);",
                                     accent,
                                     accent,
                                     snapshot.theme_editor_draft.grain.clamp(0.0, 1.0) * 360.0,
                                     snapshot.theme_editor_draft.grain.clamp(0.0, 1.0) * 360.0
                                 ),
+                                input {
+                                    r#type: "range",
+                                    min: "0",
+                                    max: "100",
+                                    value: "{grain_percent}",
+                                    style: "position:absolute; inset:0; width:100%; height:100%; opacity:0; cursor:pointer;",
+                                    oninput: move |evt| {
+                                        let value = evt.value().parse::<f32>().unwrap_or(12.0) / 100.0;
+                                        on_set_grain.call(value);
+                                    },
+                                }
                                 div {
-                                    style: "position:absolute; inset:11px; border-radius:999px; background:rgba(250,252,255,0.94); box-shadow: inset 0 0 0 1px rgba(220,228,236,0.9); display:flex; align-items:center; justify-content:center;",
+                                    style: "position:absolute; inset:14px; border-radius:999px; background:rgba(250,252,255,0.94); box-shadow: inset 0 0 0 1px rgba(220,228,236,0.9); display:flex; flex-direction:column; align-items:center; justify-content:center; gap:2px;",
                                     span {
                                         style: format!("font-size:11px; font-weight:800; color:{};", snapshot.palette.text),
                                         "{grain_percent}"
                                     }
+                                    span {
+                                        style: format!("font-size:9px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:{};", snapshot.palette.muted),
+                                        "grain"
+                                    }
                                 }
-                            }
-                        }
-                        div {
-                            style: "display:flex; flex-direction:column; gap:8px;",
-                            div {
-                                style: "display:flex; align-items:center; justify-content:space-between; gap:10px;",
-                                div {
-                                    style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", snapshot.palette.muted),
-                                    "Portable Theme JSON"
-                                }
-                                div {
-                                    style: format!("font-size:10px; color:{};", snapshot.palette.muted),
-                                    "saved under `yggui_theme` in settings"
-                                }
-                            }
-                            textarea {
-                                readonly: true,
-                                value: "{snapshot.theme_share_json}",
-                                style: format!(
-                                    "width:100%; min-height:128px; resize:vertical; border:none; border-radius:14px; padding:12px; \
-                                     background:rgba(255,255,255,0.82); color:{}; box-shadow: inset 0 0 0 1px rgba(208,219,229,0.85); \
-                                     font: 11px/1.6 'JetBrains Mono', 'JetBrainsMono Nerd Font', ui-monospace, monospace;",
-                                    snapshot.palette.text
-                                ),
                             }
                         }
                     }
