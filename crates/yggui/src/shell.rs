@@ -15,6 +15,10 @@ use crate::notifications::{
     ToastTone as NotificationTone, ToastViewport,
 };
 use crate::rails::{RailHeader, RailScrollBody, RailSectionTitle, SideRailShell};
+use crate::theme::{
+    THEME_EDITOR_SWATCHES, append_theme_stop, clamp_theme_spec, default_theme_editor_spec,
+    dominant_accent, gradient_css, preview_surface_css, shell_tint,
+};
 use crate::window_icon;
 use anyhow::{Result, anyhow};
 use dioxus::desktop::{
@@ -22,7 +26,7 @@ use dioxus::desktop::{
     use_wry_event_handler, window,
 };
 use dioxus::document;
-use dioxus::html::input_data::MouseButton;
+use dioxus::html::{InteractionElementOffset, input_data::MouseButton};
 use dioxus::prelude::*;
 use keyboard_types::{Key, Modifiers};
 use once_cell::sync::OnceCell;
@@ -48,7 +52,7 @@ use yggterm_core::{
     AgentSessionProfile, AppSettings, BrowserRow, BrowserRowKind, InstallContext,
     SessionBrowserState, SessionNode, SessionStore, UiTheme, WorkspaceDocumentInput,
     WorkspaceDocumentKind, WorkspaceGroupKind, check_for_update, save_settings_file,
-    update_command_hint,
+    update_command_hint, YgguiThemeSpec,
 };
 use yggterm_platform::DockRect;
 use yggterm_server::{
@@ -79,6 +83,7 @@ const XTERM_FIT_JS: &str = include_str!("../../../assets/xterm/addon-fit.js");
 static XTERM_ASSETS_BOOTSTRAPPED: OnceCell<()> = OnceCell::new();
 const TREE_LOADING_DOT_CSS: &str = "@keyframes yggterm-tree-loading-dot { 0%, 80%, 100% { opacity: 0.28; transform: translateY(0px); } 40% { opacity: 1; transform: translateY(-1px); } }";
 const BACKGROUND_COPY_RETRY_MS: u64 = 300_000;
+const THEME_EDITOR_PAD_SIZE: f64 = 286.0;
 type WorkspaceReorderPlanItem = TreeReorderPlanItem<BrowserRowKind>;
 
 #[derive(Debug, Clone)]
@@ -153,6 +158,10 @@ struct ShellState {
     pending_delete: Option<PendingDeleteDialog>,
     tree_rename_path: Option<String>,
     tree_rename_value: String,
+    theme_editor_open: bool,
+    theme_editor_draft: YgguiThemeSpec,
+    theme_editor_selected_stop: Option<usize>,
+    theme_editor_drag_stop: Option<usize>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -237,6 +246,12 @@ struct RenderSnapshot {
     pending_delete: Option<PendingDeleteDialog>,
     tree_rename_path: Option<String>,
     tree_rename_value: String,
+    theme_editor_open: bool,
+    theme_editor_draft: YgguiThemeSpec,
+    theme_editor_selected_stop: Option<usize>,
+    theme_accent: String,
+    shell_tint: String,
+    shell_gradient: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,6 +397,7 @@ impl ShellState {
 
         let needs_initial_server_sync = bootstrap.initial_server_snapshot.is_none();
         PASSIVE_COPY_SUSPENDED.store(false, Ordering::Relaxed);
+        let initial_yggui_theme = clamp_theme_spec(&bootstrap.settings.yggui_theme);
         let mut state = Self {
             settings,
             bootstrap,
@@ -429,6 +445,10 @@ impl ShellState {
             pending_delete: None,
             tree_rename_path: None,
             tree_rename_value: String::new(),
+            theme_editor_open: false,
+            theme_editor_draft: initial_yggui_theme,
+            theme_editor_selected_stop: None,
+            theme_editor_drag_stop: None,
         };
         if let Some(path) = state.browser.selected_path().map(ToOwned::to_owned) {
             state.selected_tree_paths.insert(path.clone());
@@ -453,6 +473,12 @@ impl ShellState {
     }
 
     fn snapshot(&self) -> RenderSnapshot {
+        let active_theme_spec = if self.theme_editor_open {
+            clamp_theme_spec(&self.theme_editor_draft)
+        } else {
+            clamp_theme_spec(&self.settings.yggui_theme)
+        };
+        let palette = palette(self.settings.theme);
         let expanded_paths = self.browser.expanded_path_set();
         let live_sessions = self.server.live_sessions();
         let rows = merged_sidebar_rows(
@@ -472,7 +498,7 @@ impl ShellState {
             self.browser.selected_path().map(ToOwned::to_owned)
         };
         RenderSnapshot {
-            palette: palette(self.bootstrap.theme),
+            palette: palette,
             search_query: self.search_query.clone(),
             sidebar_open: self.sidebar_open,
             right_panel_mode: self.right_panel_mode,
@@ -520,6 +546,12 @@ impl ShellState {
             pending_delete: self.pending_delete.clone(),
             tree_rename_path: self.tree_rename_path.clone(),
             tree_rename_value: self.tree_rename_value.clone(),
+            theme_editor_open: self.theme_editor_open,
+            theme_editor_draft: self.theme_editor_draft.clone(),
+            theme_editor_selected_stop: self.theme_editor_selected_stop,
+            theme_accent: dominant_accent(&active_theme_spec, palette.accent),
+            shell_tint: shell_tint(self.settings.theme, &active_theme_spec),
+            shell_gradient: gradient_css(self.settings.theme, &active_theme_spec),
         }
     }
 
@@ -809,6 +841,135 @@ impl ShellState {
             "terminal zoom {}%",
             zoom_percent(self.settings.terminal_font_size, 10.0)
         );
+    }
+
+    fn set_ui_theme(&mut self, theme: UiTheme) {
+        self.settings.theme = theme;
+        self.persist_settings();
+        self.last_action = match theme {
+            UiTheme::ZedLight => "light theme".to_string(),
+            UiTheme::ZedDark => "dark theme".to_string(),
+        };
+    }
+
+    fn open_theme_editor(&mut self) {
+        self.theme_editor_open = true;
+        self.theme_editor_draft = clamp_theme_spec(&self.settings.yggui_theme);
+        self.theme_editor_selected_stop = None;
+        self.theme_editor_drag_stop = None;
+        self.last_action = "theme editor opened".to_string();
+    }
+
+    fn close_theme_editor(&mut self) {
+        self.theme_editor_open = false;
+        self.theme_editor_drag_stop = None;
+        self.last_action = "theme editor closed".to_string();
+    }
+
+    fn save_theme_editor(&mut self) {
+        self.settings.yggui_theme = clamp_theme_spec(&self.theme_editor_draft);
+        self.theme_editor_open = false;
+        self.theme_editor_drag_stop = None;
+        self.persist_settings();
+        self.last_action = "theme updated".to_string();
+        self.push_notification(
+            NotificationTone::Success,
+            "Theme Updated",
+            "Yggui shell theme applied.".to_string(),
+        );
+    }
+
+    fn reset_theme_editor(&mut self) {
+        self.theme_editor_draft = YgguiThemeSpec::default();
+        self.theme_editor_selected_stop = None;
+        self.theme_editor_drag_stop = None;
+        self.last_action = "theme reset".to_string();
+    }
+
+    fn seed_theme_editor(&mut self) {
+        self.theme_editor_draft = default_theme_editor_spec();
+        self.theme_editor_selected_stop = self.theme_editor_draft.colors.first().map(|_| 0);
+        self.last_action = "theme starter added".to_string();
+    }
+
+    fn add_theme_stop(&mut self, color: Option<&str>) {
+        let next = append_theme_stop(&self.theme_editor_draft, color);
+        if next.colors.len() == self.theme_editor_draft.colors.len() {
+            return;
+        }
+        self.theme_editor_draft = next;
+        self.theme_editor_selected_stop = self.theme_editor_draft.colors.len().checked_sub(1);
+        self.last_action = format!("theme color {}", self.theme_editor_draft.colors.len());
+    }
+
+    fn add_theme_stop_at(&mut self, x: f32, y: f32) {
+        self.add_theme_stop(None);
+        if let Some(index) = self.theme_editor_selected_stop
+            && let Some(stop) = self.theme_editor_draft.colors.get_mut(index)
+        {
+            stop.x = x.clamp(0.0, 1.0);
+            stop.y = y.clamp(0.0, 1.0);
+        }
+        self.theme_editor_draft = clamp_theme_spec(&self.theme_editor_draft);
+    }
+
+    fn select_theme_stop(&mut self, index: usize) {
+        if index < self.theme_editor_draft.colors.len() {
+            self.theme_editor_selected_stop = Some(index);
+        }
+    }
+
+    fn begin_theme_drag(&mut self, index: usize) {
+        self.select_theme_stop(index);
+        self.theme_editor_drag_stop = Some(index);
+    }
+
+    fn move_theme_stop(&mut self, x: f32, y: f32) {
+        let Some(index) = self.theme_editor_drag_stop else {
+            return;
+        };
+        if let Some(stop) = self.theme_editor_draft.colors.get_mut(index) {
+            stop.x = x.clamp(0.0, 1.0);
+            stop.y = y.clamp(0.0, 1.0);
+        }
+    }
+
+    fn end_theme_drag(&mut self) {
+        self.theme_editor_drag_stop = None;
+    }
+
+    fn remove_selected_theme_stop(&mut self) {
+        let Some(index) = self.theme_editor_selected_stop else {
+            return;
+        };
+        if index >= self.theme_editor_draft.colors.len() {
+            return;
+        }
+        self.theme_editor_draft.colors.remove(index);
+        self.theme_editor_selected_stop = if self.theme_editor_draft.colors.is_empty() {
+            None
+        } else {
+            Some(index.min(self.theme_editor_draft.colors.len() - 1))
+        };
+        self.last_action = "theme color removed".to_string();
+    }
+
+    fn update_selected_theme_color(&mut self, color: String) {
+        let Some(index) = self.theme_editor_selected_stop else {
+            return;
+        };
+        if let Some(stop) = self.theme_editor_draft.colors.get_mut(index) {
+            stop.color = color;
+        }
+        self.theme_editor_draft = clamp_theme_spec(&self.theme_editor_draft);
+    }
+
+    fn update_theme_brightness(&mut self, value: f32) {
+        self.theme_editor_draft.brightness = value.clamp(0.0, 1.0);
+    }
+
+    fn update_theme_grain(&mut self, value: f32) {
+        self.theme_editor_draft.grain = value.clamp(0.0, 1.0);
     }
 
     fn toggle_maximized(&mut self) {
@@ -4884,7 +5045,7 @@ fn app() -> Element {
                 "position: fixed; inset: 0; overflow: hidden; border-radius:{}px; \
                  background-color:{}; background-image:{}; backdrop-filter: blur(30px) saturate(165%); \
                  -webkit-backdrop-filter: blur(30px) saturate(165%);",
-                shell_radius, snapshot.palette.shell, snapshot.palette.gradient
+                shell_radius, snapshot.shell_tint, snapshot.shell_gradient
             ),
             onmouseup: move |_| {
                 if !state.read().drag_paths.is_empty() {
@@ -4904,7 +5065,7 @@ fn app() -> Element {
             },
             style { "{TOAST_CSS}" }
             div {
-                style: shell_style(snapshot.palette, shell_radius),
+                style: shell_style(snapshot.palette, shell_radius, &snapshot.shell_tint, &snapshot.shell_gradient),
                 WindowResizeHandles {}
                 Titlebar {
                     snapshot: titlebar_snapshot,
@@ -5083,6 +5244,8 @@ fn app() -> Element {
                         on_endpoint_change: move |value: String| state.with_mut(|shell| shell.update_litellm_endpoint(value)),
                         on_api_key_change: move |value: String| state.with_mut(|shell| shell.update_litellm_api_key(value)),
                         on_model_change: move |value: String| state.with_mut(|shell| shell.update_interface_llm_model(value)),
+                        on_set_ui_theme: move |theme: UiTheme| state.with_mut(|shell| shell.set_ui_theme(theme)),
+                        on_open_theme_editor: move |_| state.with_mut(|shell| shell.open_theme_editor()),
                         on_set_notification_delivery: move |mode: NotificationDeliveryMode| {
                             state.with_mut(|shell| shell.update_notification_delivery(mode))
                         },
@@ -5206,6 +5369,27 @@ fn app() -> Element {
                         palette: snapshot.palette,
                         on_cancel: move |_| state.with_mut(|shell| shell.cancel_delete_dialog()),
                         on_confirm: move |_| queue_delete_selected_items(state, true),
+                    }
+                }
+                if snapshot.theme_editor_open {
+                    ThemeEditorOverlay {
+                        snapshot: snapshot.clone(),
+                        on_close: move |_| state.with_mut(|shell| shell.close_theme_editor()),
+                        on_save: move |_| state.with_mut(|shell| shell.save_theme_editor()),
+                        on_reset: move |_| state.with_mut(|shell| shell.reset_theme_editor()),
+                        on_seed: move |_| state.with_mut(|shell| shell.seed_theme_editor()),
+                        on_set_ui_theme: move |theme: UiTheme| state.with_mut(|shell| shell.set_ui_theme(theme)),
+                        on_add_stop: move |_| state.with_mut(|shell| shell.add_theme_stop(None)),
+                        on_remove_stop: move |_| state.with_mut(|shell| shell.remove_selected_theme_stop()),
+                        on_pick_stop: move |index: usize| state.with_mut(|shell| shell.select_theme_stop(index)),
+                        on_begin_drag_stop: move |index: usize| state.with_mut(|shell| shell.begin_theme_drag(index)),
+                        on_drag_stop: move |(x, y): (f32, f32)| state.with_mut(|shell| shell.move_theme_stop(x, y)),
+                        on_end_drag_stop: move |_| state.with_mut(|shell| shell.end_theme_drag()),
+                        on_double_click_pad: move |(x, y): (f32, f32)| state.with_mut(|shell| shell.add_theme_stop_at(x, y)),
+                        on_update_stop_color: move |value: String| state.with_mut(|shell| shell.update_selected_theme_color(value)),
+                        on_pick_swatch: move |value: String| state.with_mut(|shell| shell.update_selected_theme_color(value)),
+                        on_set_brightness: move |value: f32| state.with_mut(|shell| shell.update_theme_brightness(value)),
+                        on_set_grain: move |value: f32| state.with_mut(|shell| shell.update_theme_grain(value)),
                     }
                 }
                 if !snapshot.notifications.is_empty() {
@@ -7966,6 +8150,8 @@ fn RightRail(
     on_endpoint_change: EventHandler<String>,
     on_api_key_change: EventHandler<String>,
     on_model_change: EventHandler<String>,
+    on_set_ui_theme: EventHandler<UiTheme>,
+    on_open_theme_editor: EventHandler<MouseEvent>,
     on_set_notification_delivery: EventHandler<NotificationDeliveryMode>,
     on_set_notification_sound: EventHandler<bool>,
     on_adjust_ui_zoom: EventHandler<i32>,
@@ -7991,6 +8177,8 @@ fn RightRail(
                     on_endpoint_change,
                     on_api_key_change,
                     on_model_change,
+                    on_set_ui_theme,
+                    on_open_theme_editor,
                     on_set_notification_delivery,
                     on_set_notification_sound,
                     on_adjust_ui_zoom,
@@ -8055,6 +8243,8 @@ fn SettingsRailBody(
     on_endpoint_change: EventHandler<String>,
     on_api_key_change: EventHandler<String>,
     on_model_change: EventHandler<String>,
+    on_set_ui_theme: EventHandler<UiTheme>,
+    on_open_theme_editor: EventHandler<MouseEvent>,
     on_set_notification_delivery: EventHandler<NotificationDeliveryMode>,
     on_set_notification_sound: EventHandler<bool>,
     on_adjust_ui_zoom: EventHandler<i32>,
@@ -8112,6 +8302,14 @@ fn SettingsRailBody(
                 secret: false,
                 palette: snapshot.palette,
                 on_change: on_model_change,
+            }
+            ThemeSettingsSection {
+                palette: snapshot.palette,
+                selected_theme: snapshot.settings.theme,
+                accent: snapshot.theme_accent.clone(),
+                custom_stop_count: snapshot.settings.yggui_theme.colors.len(),
+                on_select: on_set_ui_theme,
+                on_open_editor: on_open_theme_editor,
             }
             NotificationSettingsSection {
                 palette: snapshot.palette,
@@ -8604,12 +8802,382 @@ fn DeleteConfirmOverlay(
     }
 }
 
+#[component]
+fn ThemeEditorOverlay(
+    snapshot: RenderSnapshot,
+    on_close: EventHandler<MouseEvent>,
+    on_save: EventHandler<MouseEvent>,
+    on_reset: EventHandler<MouseEvent>,
+    on_seed: EventHandler<MouseEvent>,
+    on_set_ui_theme: EventHandler<UiTheme>,
+    on_add_stop: EventHandler<MouseEvent>,
+    on_remove_stop: EventHandler<MouseEvent>,
+    on_pick_stop: EventHandler<usize>,
+    on_begin_drag_stop: EventHandler<usize>,
+    on_drag_stop: EventHandler<(f32, f32)>,
+    on_end_drag_stop: EventHandler<MouseEvent>,
+    on_double_click_pad: EventHandler<(f32, f32)>,
+    on_update_stop_color: EventHandler<String>,
+    on_pick_swatch: EventHandler<String>,
+    on_set_brightness: EventHandler<f32>,
+    on_set_grain: EventHandler<f32>,
+) -> Element {
+    let selected_stop = snapshot
+        .theme_editor_selected_stop
+        .and_then(|index| snapshot.theme_editor_draft.colors.get(index).cloned());
+    let preview_surface = preview_surface_css(snapshot.settings.theme, &snapshot.theme_editor_draft);
+    let brightness_percent = (snapshot.theme_editor_draft.brightness * 100.0).round() as i32;
+    let grain_percent = (snapshot.theme_editor_draft.grain * 100.0).round() as i32;
+    let accent = snapshot.theme_accent.clone();
+    let preview_has_stops = !snapshot.theme_editor_draft.colors.is_empty();
+
+    rsx! {
+        div {
+            style: "position:fixed; inset:0; z-index:98; display:flex; align-items:center; justify-content:center; background:rgba(228,237,245,0.24); backdrop-filter: blur(18px) saturate(125%); -webkit-backdrop-filter: blur(18px) saturate(125%);",
+            onclick: move |evt| on_close.call(evt),
+            div {
+                style: format!(
+                    "width:min(460px, calc(100vw - 44px)); display:flex; flex-direction:column; gap:14px; padding:14px; \
+                     border-radius:22px; background:rgba(250,252,255,0.96); color:{}; \
+                     box-shadow:0 26px 60px rgba(55,83,112,0.20), inset 0 0 0 1px rgba(214,223,232,0.92); \
+                     font-family:{};",
+                    snapshot.palette.text,
+                    interface_font_family()
+                ),
+                onmousedown: |evt| evt.stop_propagation(),
+                onclick: |evt| evt.stop_propagation(),
+                div {
+                    style: "display:flex; align-items:center; justify-content:space-between; gap:12px;",
+                    div {
+                        style: "display:flex; align-items:center; gap:8px;",
+                        div {
+                            style: format!(
+                                "width:11px; height:11px; border-radius:999px; background:{}; box-shadow:0 0 0 4px rgba(128,175,212,0.12);",
+                                accent
+                            ),
+                        }
+                        div {
+                            style: "display:flex; flex-direction:column; gap:3px;",
+                            div {
+                                style: format!("font-size:15px; font-weight:800; letter-spacing:-0.01em; color:{};", snapshot.palette.text),
+                                "Edit Theme"
+                            }
+                            div {
+                                style: format!("font-size:11px; line-height:1.45; color:{};", snapshot.palette.muted),
+                                "Shape the shell gradient, brightness, and grain for Yggui."
+                            }
+                        }
+                    }
+                    div {
+                        style: "display:flex; align-items:center; gap:8px;",
+                        div {
+                            style: format!(
+                                "display:flex; align-items:center; gap:4px; padding:4px; border-radius:999px; \
+                                 background:rgba(236,242,247,0.92); box-shadow: inset 0 0 0 1px rgba(210,221,232,0.9);"
+                            ),
+                            button {
+                                style: segmented_pill_button_style(snapshot.palette, snapshot.settings.theme == UiTheme::ZedLight),
+                                onclick: move |_| on_set_ui_theme.call(UiTheme::ZedLight),
+                                "Light"
+                            }
+                            button {
+                                style: segmented_pill_button_style(snapshot.palette, snapshot.settings.theme == UiTheme::ZedDark),
+                                onclick: move |_| on_set_ui_theme.call(UiTheme::ZedDark),
+                                "Dark"
+                            }
+                        }
+                        button {
+                            style: icon_button_style(snapshot.palette),
+                            onclick: move |evt| on_close.call(evt),
+                            "✕"
+                        }
+                    }
+                }
+                div {
+                    style: "display:flex; gap:14px; align-items:stretch;",
+                    div {
+                        style: format!(
+                            "position:relative; width:{}px; min-width:{}px; height:{}px; border-radius:20px; overflow:hidden; \
+                             background:{}; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.56), 0 18px 38px rgba(84,113,137,0.12);",
+                            THEME_EDITOR_PAD_SIZE as i32,
+                            THEME_EDITOR_PAD_SIZE as i32,
+                            THEME_EDITOR_PAD_SIZE as i32,
+                            preview_surface
+                        ),
+                        onmousemove: move |evt| {
+                            let point = evt.element_coordinates();
+                            on_drag_stop.call((
+                                normalize_theme_editor_axis(point.x),
+                                normalize_theme_editor_axis(point.y),
+                            ));
+                        },
+                        onmouseup: move |evt| on_end_drag_stop.call(evt),
+                        ondoubleclick: move |evt| {
+                            let point = evt.element_coordinates();
+                            on_double_click_pad.call((
+                                normalize_theme_editor_axis(point.x),
+                                normalize_theme_editor_axis(point.y),
+                            ));
+                        },
+                        div {
+                            style: "position:absolute; inset:0; background-image: radial-gradient(rgba(255,255,255,0.26) 0.8px, transparent 0.8px); background-size: 10px 10px; background-position: -5px -5px; opacity:0.72; pointer-events:none;",
+                        }
+                        if !preview_has_stops {
+                            div {
+                                style: format!(
+                                    "position:absolute; inset:0; display:flex; align-items:center; justify-content:center; padding:18px; \
+                                     text-align:center; font-size:12px; font-weight:700; line-height:1.6; color:{};",
+                                    snapshot.palette.text
+                                ),
+                                "Double-click to add a color"
+                            }
+                        }
+                        for (index, stop) in snapshot.theme_editor_draft.colors.iter().enumerate() {
+                            button {
+                                key: "theme-stop-{index}",
+                                style: format!(
+                                    "position:absolute; left:calc({:.2}% - 11px); top:calc({:.2}% - 11px); width:22px; height:22px; \
+                                     border-radius:999px; border:{}; background:{}; box-shadow:0 10px 22px rgba(42,67,88,0.16);",
+                                    stop.x * 100.0,
+                                    stop.y * 100.0,
+                                    if snapshot.theme_editor_selected_stop == Some(index) {
+                                        format!("3px solid {}", accent)
+                                    } else {
+                                        "2px solid rgba(255,255,255,0.86)".to_string()
+                                    },
+                                    stop.color
+                                ),
+                                onmousedown: move |evt| {
+                                    evt.stop_propagation();
+                                    on_begin_drag_stop.call(index);
+                                },
+                                onclick: move |_| on_pick_stop.call(index),
+                            }
+                        }
+                    }
+                    div {
+                        style: "flex:1; display:flex; flex-direction:column; gap:12px; min-width:0;",
+                        div {
+                            style: "display:flex; align-items:center; justify-content:space-between; gap:10px;",
+                            div {
+                                style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", snapshot.palette.muted),
+                                "Colors"
+                            }
+                            div {
+                                style: "display:flex; align-items:center; gap:8px;",
+                                button {
+                                    style: chip_style(snapshot.palette, false),
+                                    onclick: move |evt| on_add_stop.call(evt),
+                                    if snapshot.theme_editor_draft.colors.is_empty() { "Add First +" } else { "+ Add" }
+                                }
+                                button {
+                                    style: chip_style(snapshot.palette, snapshot.theme_editor_selected_stop.is_some()),
+                                    onclick: move |evt| on_remove_stop.call(evt),
+                                    "Remove"
+                                }
+                            }
+                        }
+                        div {
+                            style: "display:flex; flex-wrap:wrap; gap:8px;",
+                            for (index, stop) in snapshot.theme_editor_draft.colors.iter().enumerate() {
+                                button {
+                                    key: "theme-chip-{index}",
+                                    style: format!(
+                                        "display:flex; align-items:center; gap:8px; height:32px; padding:0 10px; border:none; border-radius:999px; \
+                                         background:{}; color:{}; box-shadow:{};",
+                                        if snapshot.theme_editor_selected_stop == Some(index) {
+                                            "rgba(255,255,255,0.96)"
+                                        } else {
+                                            "rgba(246,249,252,0.84)"
+                                        },
+                                        snapshot.palette.text,
+                                        if snapshot.theme_editor_selected_stop == Some(index) {
+                                            format!("inset 0 0 0 2px {}", accent)
+                                        } else {
+                                            "inset 0 0 0 1px rgba(214,223,232,0.92)".to_string()
+                                        }
+                                    ),
+                                    onclick: move |_| on_pick_stop.call(index),
+                                    span {
+                                        style: format!("width:14px; height:14px; border-radius:999px; background:{}; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.88);", stop.color),
+                                    }
+                                    span {
+                                        style: format!("font-size:11px; font-weight:700; color:{};", snapshot.palette.text),
+                                        "Color {index + 1}"
+                                    }
+                                }
+                            }
+                        }
+                        div {
+                            style: "display:flex; flex-direction:column; gap:8px;",
+                            div {
+                                style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", snapshot.palette.muted),
+                                "Color Library"
+                            }
+                            div {
+                                style: "display:flex; flex-wrap:wrap; gap:8px;",
+                                for swatch in THEME_EDITOR_SWATCHES {
+                                    button {
+                                        key: "theme-swatch-{swatch}",
+                                        style: format!(
+                                            "width:24px; height:24px; border-radius:999px; border:2px solid rgba(255,255,255,0.92); background:{}; box-shadow:0 8px 16px rgba(45,67,88,0.12);",
+                                            swatch
+                                        ),
+                                        onclick: move |_| on_pick_swatch.call(swatch.to_string()),
+                                    }
+                                }
+                            }
+                        }
+                        div {
+                            style: "display:flex; flex-direction:column; gap:8px;",
+                            div {
+                                style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", snapshot.palette.muted),
+                                "Selected Color"
+                            }
+                            input {
+                                r#type: "color",
+                                value: selected_stop.as_ref().map(|stop| stop.color.clone()).unwrap_or_else(|| accent.clone()),
+                                style: "width:100%; height:42px; border:none; border-radius:12px; background:transparent;",
+                                oninput: move |evt| on_update_stop_color.call(evt.value()),
+                            }
+                        }
+                        div {
+                            style: "display:flex; flex-direction:column; gap:8px;",
+                            div {
+                                style: "display:flex; align-items:center; justify-content:space-between; gap:10px;",
+                                div {
+                                    style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", snapshot.palette.muted),
+                                    "Brightness"
+                                }
+                                div {
+                                    style: format!("font-size:11px; font-weight:700; color:{};", accent),
+                                    "{brightness_percent}"
+                                }
+                            }
+                            div {
+                                style: "position:relative; display:flex; align-items:center; height:34px;",
+                                div {
+                                    style: "position:absolute; inset:9px 0 9px 0; border-radius:999px; background:linear-gradient(90deg, rgba(213,224,235,0.58) 0%, rgba(255,255,255,0.92) 50%, rgba(203,227,214,0.66) 100%);",
+                                }
+                                div {
+                                    style: "position:absolute; left:0; right:0; top:50%; height:14px; transform:translateY(-50%); background:transparent; pointer-events:none;",
+                                    svg {
+                                        width: "100%",
+                                        height: "14",
+                                        view_box: "0 0 320 14",
+                                        path {
+                                            d: "M0 7 C 20 -1, 40 -1, 60 7 S 100 15, 120 7 S 160 -1, 180 7 S 220 15, 240 7 S 280 -1, 300 7 S 320 15, 340 7",
+                                            fill: "none",
+                                            stroke: "rgba(132,156,180,0.38)",
+                                            stroke_width: "2",
+                                        }
+                                    }
+                                }
+                                input {
+                                    r#type: "range",
+                                    min: "0",
+                                    max: "100",
+                                    value: "{brightness_percent}",
+                                    style: "position:relative; z-index:1; width:100%; height:34px; appearance:none; background:transparent;",
+                                    oninput: move |evt| {
+                                        let value = evt.value().parse::<f32>().unwrap_or(56.0) / 100.0;
+                                        on_set_brightness.call(value);
+                                    },
+                                }
+                            }
+                        }
+                        div {
+                            style: "display:flex; align-items:center; gap:14px;",
+                            div {
+                                style: "display:flex; flex-direction:column; gap:8px; flex:1;",
+                                div {
+                                    style: "display:flex; align-items:center; justify-content:space-between; gap:10px;",
+                                    div {
+                                        style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", snapshot.palette.muted),
+                                        "Grain"
+                                    }
+                                    div {
+                                        style: format!("font-size:11px; font-weight:700; color:{};", accent),
+                                        "{grain_percent}"
+                                    }
+                                }
+                                input {
+                                    r#type: "range",
+                                    min: "0",
+                                    max: "100",
+                                    value: "{grain_percent}",
+                                    style: "width:100%; height:28px;",
+                                    oninput: move |evt| {
+                                        let value = evt.value().parse::<f32>().unwrap_or(12.0) / 100.0;
+                                        on_set_grain.call(value);
+                                    },
+                                }
+                            }
+                            div {
+                                style: format!(
+                                    "position:relative; width:74px; height:74px; border-radius:999px; background:conic-gradient({} 0deg, {} {:.1}deg, rgba(224,232,240,0.92) {:.1}deg 360deg); box-shadow: inset 0 0 0 1px rgba(214,223,232,0.92);",
+                                    accent,
+                                    accent,
+                                    snapshot.theme_editor_draft.grain.clamp(0.0, 1.0) * 360.0,
+                                    snapshot.theme_editor_draft.grain.clamp(0.0, 1.0) * 360.0
+                                ),
+                                div {
+                                    style: "position:absolute; inset:11px; border-radius:999px; background:rgba(250,252,255,0.94); box-shadow: inset 0 0 0 1px rgba(220,228,236,0.9); display:flex; align-items:center; justify-content:center;",
+                                    span {
+                                        style: format!("font-size:11px; font-weight:800; color:{};", snapshot.palette.text),
+                                        "{grain_percent}"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                div {
+                    style: "display:flex; align-items:center; justify-content:space-between; gap:10px;",
+                    div {
+                        style: format!("font-size:11px; line-height:1.5; color:{};", snapshot.palette.muted),
+                        if preview_has_stops {
+                            "Double-click the pad to add another color, drag the dots to reshape the gradient, then save."
+                        } else {
+                            "Start empty or use the starter palette, then drag colors until the shell feels right."
+                        }
+                    }
+                    div {
+                        style: "display:flex; align-items:center; gap:8px;",
+                        if !preview_has_stops {
+                            button {
+                                style: chip_style(snapshot.palette, false),
+                                onclick: move |evt| on_seed.call(evt),
+                                "Use Starter"
+                            }
+                        }
+                        button {
+                            style: chip_style(snapshot.palette, false),
+                            onclick: move |evt| on_reset.call(evt),
+                            "Reset"
+                        }
+                        button {
+                            style: primary_action_style(snapshot.palette),
+                            onclick: move |evt| on_save.call(evt),
+                            "Apply Theme"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn toast_center_offset(right_panel_mode: RightPanelMode) -> i32 {
     if right_panel_mode == RightPanelMode::Hidden {
         0
     } else {
         -146
     }
+}
+
+fn normalize_theme_editor_axis(value: f64) -> f32 {
+    ((value / THEME_EDITOR_PAD_SIZE).clamp(0.0, 1.0)) as f32
 }
 
 #[component]
@@ -8634,6 +9202,66 @@ fn SettingsField(
                 placeholder: "{placeholder}",
                 style: settings_input_style(palette),
                 oninput: move |evt| on_change.call(evt.value()),
+            }
+        }
+    }
+}
+
+#[component]
+fn ThemeSettingsSection(
+    palette: Palette,
+    selected_theme: UiTheme,
+    accent: String,
+    custom_stop_count: usize,
+    on_select: EventHandler<UiTheme>,
+    on_open_editor: EventHandler<MouseEvent>,
+) -> Element {
+    rsx! {
+        div {
+            style: "display:flex; flex-direction:column; gap:8px;",
+            div {
+                style: "display:flex; align-items:center; justify-content:space-between; gap:8px;",
+                div {
+                    style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", palette.muted),
+                    "Theme"
+                }
+                span {
+                    style: format!("font-size:10px; font-weight:700; color:{};", accent),
+                    if custom_stop_count == 0 { "System Gradient" } else { "Custom Gradient" }
+                }
+            }
+            div {
+                style: format!(
+                    "display:flex; flex-direction:column; gap:10px; padding:10px; border-radius:14px; \
+                     background:rgba(255,255,255,0.56); box-shadow: inset 0 0 0 1px rgba(196,214,228,0.42);"
+                ),
+                div {
+                    style: format!(
+                        "display:flex; align-items:center; gap:5px; height:34px; padding:4px; border-radius:999px; \
+                         background:rgba(236,242,247,0.94); box-shadow: inset 0 0 0 1px rgba(210,221,232,0.92);"
+                    ),
+                    button {
+                        style: segmented_pill_button_style(palette, selected_theme == UiTheme::ZedLight),
+                        onclick: move |_| on_select.call(UiTheme::ZedLight),
+                        "Light"
+                    }
+                    button {
+                        style: segmented_pill_button_style(palette, selected_theme == UiTheme::ZedDark),
+                        onclick: move |_| on_select.call(UiTheme::ZedDark),
+                        "Dark"
+                    }
+                }
+                button {
+                    style: format!(
+                        "display:flex; align-items:center; justify-content:space-between; height:34px; padding:0 12px; \
+                         border:none; border-radius:11px; background:rgba(255,255,255,0.86); color:{}; \
+                         box-shadow: inset 0 0 0 1px rgba(208,219,229,0.85); font-size:12px; font-weight:700;",
+                        palette.text
+                    ),
+                    onclick: move |evt| on_open_editor.call(evt),
+                    span { "Edit Theme" }
+                    span { style: format!("color:{};", accent), "↗" }
+                }
             }
         }
     }
@@ -8828,14 +9456,14 @@ fn palette(theme: UiTheme) -> Palette {
     }
 }
 
-fn shell_style(palette: Palette, radius: u8) -> String {
+fn shell_style(palette: Palette, radius: u8, shell_tint: &str, shell_gradient: &str) -> String {
     format!(
         "position:fixed; inset:0; display:flex; flex-direction:column; overflow:hidden; \
          border-radius:{}px; background-color:{}; background-image:{}; box-shadow:{}; backdrop-filter: blur(30px) saturate(165%); \
          -webkit-backdrop-filter: blur(30px) saturate(165%); font-family:{};",
         radius,
-        palette.shell,
-        palette.gradient,
+        shell_tint,
+        shell_gradient,
         palette.shadow,
         interface_font_family()
     )
