@@ -36,6 +36,9 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 use tao::event::Event as TaoEvent;
+use tao::event::ElementState;
+use tao::keyboard::Key as TaoKey;
+use tao::keyboard::KeyCode as TaoKeyCode;
 use tao::window::ResizeDirection;
 use tokio::task;
 use tokio::time::sleep;
@@ -1726,7 +1729,8 @@ fn maybe_spawn_missing_remote_machine_refreshes(mut state: Signal<ShellState>) {
             .map(|machine| {
                 (
                     machine.machine_key.clone(),
-                    !machine.sessions.is_empty() || machine.health == RemoteMachineHealth::Offline,
+                    machine.health == RemoteMachineHealth::Healthy
+                        || machine.health == RemoteMachineHealth::Offline,
                 )
             })
             .collect::<HashMap<_, _>>();
@@ -2044,63 +2048,14 @@ fn merged_sidebar_rows(
     stored_rows: &[BrowserRow],
     remote_machines: &[RemoteMachineSnapshot],
     ssh_targets: &[SshConnectTarget],
-    live_sessions: &[ManagedSessionView],
+    _live_sessions: &[ManagedSessionView],
     expanded_paths: &HashSet<String>,
 ) -> Vec<BrowserRow> {
-    if live_sessions.is_empty() && ssh_targets.is_empty() && remote_machines.is_empty() {
+    if ssh_targets.is_empty() && remote_machines.is_empty() {
         return stored_rows.to_vec();
     }
 
-    let mut rows = Vec::with_capacity(stored_rows.len() + live_sessions.len() + 8);
-    if !live_sessions.is_empty() {
-        rows.push(BrowserRow {
-            kind: BrowserRowKind::Group,
-            full_path: "__live_sessions__".to_string(),
-            label: "live".to_string(),
-            detail_label: String::new(),
-            document_kind: None,
-            group_kind: None,
-            session_title: None,
-            depth: 0,
-            host_label: String::new(),
-            descendant_sessions: live_sessions.len(),
-            expanded: expanded_paths.contains("__live_sessions__"),
-            session_id: None,
-            session_cwd: None,
-        });
-        if expanded_paths.contains("__live_sessions__") {
-            push_live_group_rows(
-                &mut rows,
-                "agent sessions",
-                "__live_agents__",
-                1,
-                expanded_paths,
-                live_sessions.iter().filter(|session| {
-                    matches!(session.kind, SessionKind::Codex | SessionKind::CodexLiteLlm)
-                }),
-            );
-            push_live_group_rows(
-                &mut rows,
-                "shell sessions",
-                "__live_shells__",
-                1,
-                expanded_paths,
-                live_sessions
-                    .iter()
-                    .filter(|session| session.kind == SessionKind::Shell),
-            );
-            push_live_group_rows(
-                &mut rows,
-                "ssh sessions",
-                "__live_ssh__",
-                1,
-                expanded_paths,
-                live_sessions
-                    .iter()
-                    .filter(|session| session.kind == SessionKind::SshShell),
-            );
-        }
-    }
+    let mut rows = Vec::with_capacity(stored_rows.len() + remote_machines.len() * 6 + 8);
 
     let mut machine_rows = BTreeMap::<String, SidebarRemoteMachine>::new();
     for target in ssh_targets {
@@ -2186,6 +2141,7 @@ fn push_remote_machine_rows(
     }
 
     let mut emitted = HashMap::<String, usize>::new();
+    let folder_counts = remote_folder_session_counts(&machine.scanned_sessions);
 
     for scanned in &machine.scanned_sessions {
         let show_session = push_remote_folder_rows(
@@ -2194,6 +2150,7 @@ fn push_remote_machine_rows(
             &scanned.cwd,
             expanded_paths,
             &mut emitted,
+            &folder_counts,
         );
         if !show_session {
             continue;
@@ -2222,6 +2179,7 @@ fn push_remote_folder_rows(
     cwd: &str,
     expanded_paths: &HashSet<String>,
     emitted: &mut HashMap<String, usize>,
+    folder_counts: &HashMap<String, usize>,
 ) -> bool {
     let segments = cwd
         .split('/')
@@ -2255,7 +2213,7 @@ fn push_remote_folder_rows(
                     session_title: None,
                     depth: ix + 1,
                     host_label: machine_key.to_string(),
-                    descendant_sessions: 0,
+                    descendant_sessions: folder_counts.get(&current).copied().unwrap_or(0),
                     expanded: is_expanded,
                     session_id: None,
                     session_cwd: Some(current.clone()),
@@ -2268,6 +2226,21 @@ fn push_remote_folder_rows(
         all_ancestors_expanded &= is_expanded;
     }
     all_ancestors_expanded
+}
+
+fn remote_folder_session_counts(
+    sessions: &[RemoteScannedSession],
+) -> HashMap<String, usize> {
+    let mut counts = HashMap::<String, usize>::new();
+    for session in sessions {
+        let mut current = String::new();
+        for segment in session.cwd.split('/').filter(|segment| !segment.is_empty()) {
+            current.push('/');
+            current.push_str(segment);
+            *counts.entry(current.clone()).or_insert(0) += 1;
+        }
+    }
+    counts
 }
 
 fn remote_session_depth(cwd: &str) -> usize {
@@ -2327,66 +2300,6 @@ fn apply_machine_health_suffix(label: &str, health: MachineHealth) -> String {
             MachineHealth::Offline => "[offline]",
         }
     )
-}
-
-fn push_live_group_rows<'a, I>(
-    rows: &mut Vec<BrowserRow>,
-    label: &str,
-    group_path: &str,
-    depth: usize,
-    expanded_paths: &HashSet<String>,
-    sessions: I,
-) where
-    I: Iterator<Item = &'a ManagedSessionView>,
-{
-    let collected = sessions.collect::<Vec<_>>();
-    if collected.is_empty() {
-        return;
-    }
-    rows.push(BrowserRow {
-        kind: BrowserRowKind::Group,
-        full_path: group_path.to_string(),
-        label: label.to_string(),
-        detail_label: String::new(),
-        document_kind: None,
-        group_kind: None,
-        session_title: None,
-        depth,
-        host_label: "live".to_string(),
-        descendant_sessions: collected.len(),
-        expanded: expanded_paths.contains(group_path),
-        session_id: None,
-        session_cwd: None,
-    });
-    if !expanded_paths.contains(group_path) {
-        return;
-    }
-    for session in collected {
-        let label = if session.title.trim().is_empty() {
-            session.id.clone()
-        } else {
-            session.title.clone()
-        };
-        rows.push(BrowserRow {
-            kind: BrowserRowKind::Session,
-            full_path: session.session_path.clone(),
-            label,
-            detail_label: String::new(),
-            document_kind: None,
-            group_kind: None,
-            session_title: Some(session.title.clone()),
-            depth: depth + 1,
-            host_label: "live".to_string(),
-            descendant_sessions: 1,
-            expanded: true,
-            session_id: Some(session.id.clone()),
-            session_cwd: session
-                .metadata
-                .iter()
-                .find(|entry| entry.label == "Cwd")
-                .map(|entry| entry.value.clone()),
-        });
-    }
 }
 
 fn queue_session_note_creation(mut state: Signal<ShellState>, row: BrowserRow) {
@@ -4162,6 +4075,16 @@ fn app() -> Element {
     use_wry_event_handler(move |event, _| {
         if let TaoEvent::WindowEvent { event, .. } = event {
             match event {
+                DesktopWindowEvent::KeyboardInput { event, .. } => {
+                    if event.state == ElementState::Pressed
+                        && (event.logical_key == TaoKey::Delete
+                            || event.physical_key == TaoKeyCode::Delete)
+                        && state.read().tree_rename_path.is_none()
+                    {
+                        queue_delete_selected_items(state, false);
+                    }
+                    window_epoch.with_mut(|epoch| *epoch += 1);
+                }
                 DesktopWindowEvent::Moved(_)
                 | DesktopWindowEvent::Resized(_)
                 | DesktopWindowEvent::Focused(_)
@@ -4336,12 +4259,6 @@ fn app() -> Element {
                  -webkit-backdrop-filter: blur(30px) saturate(165%);",
                 shell_radius, snapshot.palette.shell, snapshot.palette.gradient
             ),
-            onkeydown: move |evt| {
-                if evt.key() == Key::Delete {
-                    let hard_delete = evt.modifiers().contains(Modifiers::SHIFT);
-                    queue_delete_selected_items(state, hard_delete);
-                }
-            },
             onmouseup: move |_| {
                 if !state.read().drag_paths.is_empty() {
                     queue_drop_current_drag_target(state);
@@ -4929,12 +4846,6 @@ fn Sidebar(
                 zoom_percent_f32(snapshot.settings.ui_font_size, 14.0)
             ),
             tabindex: "0",
-            onkeydown: move |evt| {
-                if evt.key() == Key::Delete {
-                    let hard_delete = evt.modifiers().contains(Modifiers::SHIFT);
-                    on_delete_selected_items.call(hard_delete);
-                }
-            },
             div {
                 style: "padding:12px 12px 0 12px; display:flex; gap:8px;",
                 SidebarQuickAction {
@@ -9159,8 +9070,6 @@ mod tests {
     #[test]
     fn merged_sidebar_rows_do_not_render_live_ssh_sessions_under_machine_roots() {
         let expanded_paths = HashSet::from([
-            "__live_sessions__".to_string(),
-            "__live_ssh__".to_string(),
             "__remote_machine__/dev".to_string(),
         ]);
         let rows = merged_sidebar_rows(
@@ -9214,8 +9123,8 @@ mod tests {
             &expanded_paths,
         );
 
-        assert!(rows.iter().any(|row| row.full_path == "__live_ssh__"));
-        assert!(rows.iter().any(|row| row.full_path == "ssh://dev/session-1"));
+        assert!(!rows.iter().any(|row| row.full_path == "__live_sessions__"));
+        assert!(!rows.iter().any(|row| row.full_path == "ssh://dev/session-1"));
         let machine_rows = rows
             .iter()
             .filter(|row| row.full_path.starts_with("__remote_machine__/dev") || row.host_label == "dev")
@@ -9227,6 +9136,59 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn remote_folder_rows_show_descendant_session_counts() {
+        let expanded_paths = HashSet::from([
+            "__remote_machine__/jojo".to_string(),
+            "__remote_folder__/jojo/home".to_string(),
+        ]);
+        let rows = merged_sidebar_rows(
+            &[],
+            &[RemoteMachineSnapshot {
+                machine_key: "jojo".to_string(),
+                label: "jojo".to_string(),
+                ssh_target: "jojo".to_string(),
+                prefix: None,
+                health: RemoteMachineHealth::Healthy,
+                sessions: vec![
+                    RemoteScannedSession {
+                        session_path: "remote-session://jojo/1".to_string(),
+                        session_id: "1".to_string(),
+                        cwd: "/home/pi".to_string(),
+                        started_at: "2026-03-24T10:00:00Z".to_string(),
+                        modified_epoch: 1,
+                        event_count: 1,
+                        user_message_count: 1,
+                        assistant_message_count: 1,
+                        title_hint: "1".to_string(),
+                        storage_path: "a".to_string(),
+                    },
+                    RemoteScannedSession {
+                        session_path: "remote-session://jojo/2".to_string(),
+                        session_id: "2".to_string(),
+                        cwd: "/home/pi".to_string(),
+                        started_at: "2026-03-24T10:01:00Z".to_string(),
+                        modified_epoch: 2,
+                        event_count: 1,
+                        user_message_count: 1,
+                        assistant_message_count: 1,
+                        title_hint: "2".to_string(),
+                        storage_path: "b".to_string(),
+                    },
+                ],
+            }],
+            &[],
+            &[],
+            &expanded_paths,
+        );
+
+        let home_row = rows
+            .iter()
+            .find(|row| row.full_path == "__remote_folder__/jojo/home")
+            .expect("home row");
+        assert_eq!(home_row.descendant_sessions, 2);
     }
 }
 
