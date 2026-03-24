@@ -334,10 +334,6 @@ impl SessionStore {
         session_path: &str,
         force: bool,
     ) -> Result<Option<String>> {
-        if !litellm_settings_ready(settings) {
-            return Ok(None);
-        }
-
         let path = PathBuf::from(session_path);
         if !path.exists() || !is_codex_session_file(&path) {
             return Ok(None);
@@ -358,9 +354,6 @@ impl SessionStore {
         context: &str,
         force: bool,
     ) -> Result<Option<String>> {
-        if !litellm_settings_ready(settings) {
-            return Ok(None);
-        }
         let resolver = SessionTitleResolver::new(&self.home)?;
         resolver.generate_for_context(settings, session_id, cwd, context, force)
     }
@@ -425,10 +418,6 @@ impl SessionStore {
         session_path: &str,
         force: bool,
     ) -> Result<Option<String>> {
-        if !litellm_settings_ready(settings) {
-            return Ok(None);
-        }
-
         let path = PathBuf::from(session_path);
         if !path.exists() || !is_codex_session_file(&path) {
             return Ok(None);
@@ -455,9 +444,6 @@ impl SessionStore {
         context: &str,
         force: bool,
     ) -> Result<Option<String>> {
-        if !litellm_settings_ready(settings) {
-            return Ok(None);
-        }
         let resolver = SessionTitleResolver::new(&self.home)?;
         resolver.generate_precis_for_context(settings, session_id, cwd, context, force)
     }
@@ -468,10 +454,6 @@ impl SessionStore {
         session_path: &str,
         force: bool,
     ) -> Result<Option<String>> {
-        if !litellm_settings_ready(settings) {
-            return Ok(None);
-        }
-
         let path = PathBuf::from(session_path);
         if !path.exists() || !is_codex_session_file(&path) {
             return Ok(None);
@@ -498,9 +480,6 @@ impl SessionStore {
         context: &str,
         force: bool,
     ) -> Result<Option<String>> {
-        if !litellm_settings_ready(settings) {
-            return Ok(None);
-        }
         let resolver = SessionTitleResolver::new(&self.home)?;
         resolver.generate_summary_for_context(settings, session_id, cwd, context, force)
     }

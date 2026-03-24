@@ -31,8 +31,8 @@ use tracing::warn;
 use uuid::Uuid;
 use yggterm_core::{
     PerfSpan, SessionNode, SessionNodeKind, SessionStore, SessionTitleStore, TranscriptRole,
-    UiTheme, WorkspaceDocument, WorkspaceDocumentKind, read_codex_session_identity_fields,
-    read_codex_transcript_messages, resolve_yggterm_home,
+    UiTheme, WorkspaceDocument, WorkspaceDocumentKind, looks_like_generated_fallback_title,
+    read_codex_session_identity_fields, read_codex_transcript_messages, resolve_yggterm_home,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2051,7 +2051,7 @@ fn load_remote_machine_sessions_from_mirror(
     for row in rows {
         sessions.push(row?);
     }
-    Ok(sessions)
+    Ok(dedupe_remote_scanned_sessions(sessions))
 }
 
 fn overlay_mirrored_remote_sessions(
@@ -2068,7 +2068,7 @@ fn overlay_mirrored_remote_sessions(
         .into_iter()
         .map(|session| (session.session_id.clone(), session))
         .collect::<std::collections::BTreeMap<_, _>>();
-    sessions
+    dedupe_remote_scanned_sessions(sessions
         .iter()
         .cloned()
         .map(|mut session| {
@@ -2088,7 +2088,58 @@ fn overlay_mirrored_remote_sessions(
             }
             session
         })
-        .collect()
+        .collect())
+}
+
+fn dedupe_remote_scanned_sessions(
+    sessions: Vec<RemoteScannedSession>,
+) -> Vec<RemoteScannedSession> {
+    let mut by_id = std::collections::BTreeMap::<String, RemoteScannedSession>::new();
+    for session in sessions {
+        match by_id.entry(session.session_id.clone()) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(session);
+            }
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                let existing = slot.get_mut();
+                let newer = session.modified_epoch > existing.modified_epoch
+                    || (session.modified_epoch == existing.modified_epoch
+                        && session.event_count > existing.event_count);
+                let mut merged = if newer { session.clone() } else { existing.clone() };
+                let other = if newer { existing.clone() } else { session };
+
+                if looks_like_generated_fallback_title(&merged.title_hint)
+                    && !looks_like_generated_fallback_title(&other.title_hint)
+                {
+                    merged.title_hint = other.title_hint;
+                }
+                if merged.cached_precis.as_ref().is_none_or(|value| value.trim().is_empty()) {
+                    merged.cached_precis = other.cached_precis;
+                }
+                if merged.cached_summary.as_ref().is_none_or(|value| value.trim().is_empty()) {
+                    merged.cached_summary = other.cached_summary;
+                }
+                if merged.recent_context.trim().is_empty()
+                    || other.recent_context.len() > merged.recent_context.len()
+                {
+                    merged.recent_context = other.recent_context;
+                }
+                if merged.storage_path.trim().is_empty() {
+                    merged.storage_path = other.storage_path;
+                }
+                *existing = merged;
+            }
+        }
+    }
+    let mut sessions = by_id.into_values().collect::<Vec<_>>();
+    sessions.sort_by(|left, right| {
+        right
+            .modified_epoch
+            .cmp(&left.modified_epoch)
+            .then_with(|| right.started_at.cmp(&left.started_at))
+            .then_with(|| right.event_count.cmp(&left.event_count))
+    });
+    sessions
 }
 
 fn update_remote_generated_copy_in_mirror(
@@ -2525,7 +2576,7 @@ fn scan_remote_machine_sessions(
             storage_path: summary.rollout_path,
         });
     }
-    Ok(sessions)
+    Ok(dedupe_remote_scanned_sessions(sessions))
 }
 
 pub fn run_remote_stage_clipboard_png() -> anyhow::Result<()> {
@@ -4209,7 +4260,8 @@ mod tests {
     use super::{
         GhosttyHostSupport, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession,
         SessionKind, SessionNode, SessionNodeKind, UiTheme, YggtermServer,
-        load_remote_machine_sessions_from_mirror, mirror_remote_machine_sessions,
+        dedupe_remote_scanned_sessions, load_remote_machine_sessions_from_mirror,
+        mirror_remote_machine_sessions,
         parse_stored_transcript, remote_resume_shell_command, remote_scanned_session_path,
         remote_ssh_launch_command, remote_command_cache, remote_cache_key,
         stored_session_launch_command,
@@ -4390,5 +4442,49 @@ mod tests {
 
         assert_eq!(loaded, sessions);
         Ok(())
+    }
+
+    #[test]
+    fn dedupe_remote_scanned_sessions_prefers_richer_newer_entry() {
+        let sessions = vec![
+            RemoteScannedSession {
+                session_path: remote_scanned_session_path("oc", "abc123"),
+                session_id: "abc123".to_string(),
+                cwd: "/home/pi".to_string(),
+                started_at: "2026-03-24T12:00:00Z".to_string(),
+                modified_epoch: 10,
+                event_count: 4,
+                user_message_count: 2,
+                assistant_message_count: 2,
+                title_hint: "Qabc123".to_string(),
+                recent_context: "short".to_string(),
+                cached_precis: None,
+                cached_summary: None,
+                storage_path: "/one.jsonl".to_string(),
+            },
+            RemoteScannedSession {
+                session_path: remote_scanned_session_path("oc", "abc123"),
+                session_id: "abc123".to_string(),
+                cwd: "/home/pi".to_string(),
+                started_at: "2026-03-24T12:05:00Z".to_string(),
+                modified_epoch: 11,
+                event_count: 8,
+                user_message_count: 4,
+                assistant_message_count: 4,
+                title_hint: "Container Mount Fix".to_string(),
+                recent_context: "much longer context payload".to_string(),
+                cached_precis: Some("precis".to_string()),
+                cached_summary: Some("summary".to_string()),
+                storage_path: "/two.jsonl".to_string(),
+            },
+        ];
+
+        let deduped = dedupe_remote_scanned_sessions(sessions);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].session_id, "abc123");
+        assert_eq!(deduped[0].title_hint, "Container Mount Fix");
+        assert_eq!(deduped[0].cached_precis.as_deref(), Some("precis"));
+        assert_eq!(deduped[0].cached_summary.as_deref(), Some("summary"));
+        assert_eq!(deduped[0].storage_path, "/two.jsonl");
     }
 }
