@@ -283,7 +283,7 @@ Each release artifact should also ship with a checksum.
 - `apps/yggterm`: CLI entrypoint and desktop launcher
 - `crates/yggterm-core`: settings, workspace store, title generation, install detection, and browser state
 - `crates/yggterm-server`: daemon, IPC, PTY runtime, and session orchestration
-- `crates/yggterm-ui`: Dioxus shell and app interaction surface
+- `crates/yggui`: Dioxus shell and app interaction surface
 - `crates/yggterm-platform`: platform detection helpers
 - `crates/yggterm-ghostty-bridge`: optional legacy bridge code, not part of the default path
 - `scripts/`: installers, packaging, and release helpers
