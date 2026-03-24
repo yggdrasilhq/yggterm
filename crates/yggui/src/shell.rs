@@ -9467,71 +9467,75 @@ fn ThemeEditorOverlay(
                     style: "display:flex; gap:14px; align-items:stretch;",
                     div {
                         style: format!(
-                            "position:relative; width:{}px; min-width:{}px; height:{}px; border-radius:20px; overflow:hidden; \
-                             background:{}; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.56), 0 18px 38px rgba(84,113,137,0.12);",
+                            "width:{}px; min-width:{}px; display:flex; flex-direction:column; gap:10px;",
                             THEME_EDITOR_PAD_SIZE as i32,
-                            THEME_EDITOR_PAD_SIZE as i32,
-                            THEME_EDITOR_PAD_SIZE as i32,
-                            preview_surface
+                            THEME_EDITOR_PAD_SIZE as i32
                         ),
-                        onmousemove: move |evt| {
-                            let point = evt.element_coordinates();
-                            on_drag_stop.call((
-                                normalize_theme_editor_axis(point.x),
-                                normalize_theme_editor_axis(point.y),
-                            ));
-                        },
-                        onmouseup: move |evt| on_end_drag_stop.call(evt),
-                        ondoubleclick: move |evt| {
-                            let point = evt.element_coordinates();
-                            on_double_click_pad.call((
-                                normalize_theme_editor_axis(point.x),
-                                normalize_theme_editor_axis(point.y),
-                            ));
-                        },
                         div {
-                            style: "position:absolute; inset:0; background-image: linear-gradient(rgba(144,173,199,0.18) 1px, transparent 1px), linear-gradient(90deg, rgba(144,173,199,0.18) 1px, transparent 1px); background-size: 24px 24px; opacity:0.78; pointer-events:none;",
-                        }
-                        div {
-                            style: "position:absolute; inset:0; background-image: linear-gradient(rgba(255,255,255,0.24) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.24) 1px, transparent 1px); background-size: 96px 96px; opacity:0.52; pointer-events:none;",
-                        }
-                        if !preview_has_stops {
+                            style: format!(
+                                "position:relative; width:{}px; min-width:{}px; height:{}px; border-radius:20px; overflow:hidden; \
+                                 background:{}; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.56), 0 18px 38px rgba(84,113,137,0.12);",
+                                THEME_EDITOR_PAD_SIZE as i32,
+                                THEME_EDITOR_PAD_SIZE as i32,
+                                THEME_EDITOR_PAD_SIZE as i32,
+                                preview_surface
+                            ),
+                            onmousemove: move |evt| {
+                                let point = evt.element_coordinates();
+                                on_drag_stop.call((
+                                    normalize_theme_editor_axis(point.x),
+                                    normalize_theme_editor_axis(point.y),
+                                ));
+                            },
+                            onmouseup: move |evt| on_end_drag_stop.call(evt),
+                            ondoubleclick: move |evt| {
+                                let point = evt.element_coordinates();
+                                on_double_click_pad.call((
+                                    normalize_theme_editor_axis(point.x),
+                                    normalize_theme_editor_axis(point.y),
+                                ));
+                            },
                             div {
-                                style: format!(
-                                    "position:absolute; inset:0; display:flex; align-items:center; justify-content:center; padding:18px; \
-                                     text-align:center; font-size:12px; font-weight:700; line-height:1.6; color:{};",
-                                    snapshot.palette.text
-                                ),
-                                "Double-click to add a color"
+                                style: "position:absolute; inset:0; background-image: linear-gradient(rgba(144,173,199,0.18) 1px, transparent 1px), linear-gradient(90deg, rgba(144,173,199,0.18) 1px, transparent 1px); background-size: 24px 24px; opacity:0.78; pointer-events:none;",
                             }
-                        }
-                        for (index, stop) in snapshot.theme_editor_draft.colors.iter().enumerate() {
-                            button {
-                                key: "theme-stop-{index}",
-                                style: format!(
-                                    "position:absolute; left:calc({:.2}% - 11px); top:calc({:.2}% - 11px); width:22px; height:22px; \
-                                     border-radius:999px; border:{}; background:{}; box-shadow:0 10px 22px rgba(42,67,88,0.16);",
-                                    stop.x * 100.0,
-                                    stop.y * 100.0,
-                                    if snapshot.theme_editor_selected_stop == Some(index) {
-                                        format!("3px solid {}", accent)
-                                    } else {
-                                        "2px solid rgba(255,255,255,0.86)".to_string()
+                            div {
+                                style: "position:absolute; inset:0; background-image: linear-gradient(rgba(255,255,255,0.24) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.24) 1px, transparent 1px); background-size: 96px 96px; opacity:0.52; pointer-events:none;",
+                            }
+                            if !preview_has_stops {
+                                div {
+                                    style: format!(
+                                        "position:absolute; inset:0; display:flex; align-items:center; justify-content:center; padding:18px; \
+                                         text-align:center; font-size:12px; font-weight:700; line-height:1.6; color:{};",
+                                        snapshot.palette.text
+                                    ),
+                                    "Double-click to add a color"
+                                }
+                            }
+                            for (index, stop) in snapshot.theme_editor_draft.colors.iter().enumerate() {
+                                button {
+                                    key: "theme-stop-{index}",
+                                    style: format!(
+                                        "position:absolute; left:calc({:.2}% - 11px); top:calc({:.2}% - 11px); width:22px; height:22px; \
+                                         border-radius:999px; border:{}; background:{}; box-shadow:0 10px 22px rgba(42,67,88,0.16);",
+                                        stop.x * 100.0,
+                                        stop.y * 100.0,
+                                        if snapshot.theme_editor_selected_stop == Some(index) {
+                                            format!("3px solid {}", accent)
+                                        } else {
+                                            "2px solid rgba(255,255,255,0.86)".to_string()
+                                        },
+                                        stop.color
+                                    ),
+                                    onmousedown: move |evt| {
+                                        evt.stop_propagation();
+                                        on_begin_drag_stop.call(index);
                                     },
-                                    stop.color
-                                ),
-                                onmousedown: move |evt| {
-                                    evt.stop_propagation();
-                                    on_begin_drag_stop.call(index);
-                                },
-                                onclick: move |_| on_pick_stop.call(index),
+                                    onclick: move |_| on_pick_stop.call(index),
+                                }
                             }
                         }
-                    }
-                    div {
-                        style: "flex:1; display:flex; flex-direction:column; gap:12px; min-width:0;",
                         div {
-                            style: "display:flex; align-items:center; justify-content:space-between; gap:10px;",
+                            style: "display:flex; align-items:center; justify-content:space-between; gap:12px; padding:8px 10px; border-radius:14px; background:rgba(247,250,253,0.9); box-shadow:inset 0 0 0 1px rgba(214,223,232,0.92);",
                             div {
                                 style: "display:flex; flex-direction:column; gap:3px;",
                                 div {
@@ -9548,7 +9552,7 @@ fn ThemeEditorOverlay(
                                 }
                             }
                             div {
-                                style: "display:flex; align-items:center; gap:8px; padding:5px; border-radius:14px; background:rgba(245,248,251,0.96); box-shadow:inset 0 0 0 1px rgba(214,223,232,0.92);",
+                                style: "display:flex; align-items:center; gap:8px;",
                                 button {
                                     style: theme_editor_action_button_style(snapshot.palette, &accent, false, true),
                                     onclick: move |evt| on_add_stop.call(evt),
@@ -9581,6 +9585,9 @@ fn ThemeEditorOverlay(
                                 }
                             }
                         }
+                    }
+                    div {
+                        style: "flex:1; display:flex; flex-direction:column; gap:12px; min-width:0;",
                         div {
                             style: "display:flex; flex-wrap:wrap; gap:8px;",
                             for (index, stop) in snapshot.theme_editor_draft.colors.iter().enumerate() {
