@@ -1556,16 +1556,21 @@ fn safe_shell_read<R>(
 }
 
 fn queue_title_generation(state: Signal<ShellState>, row: BrowserRow, force: bool) {
-    if let Some(target) = copy_generation_target_for_browser_row(&state.read().server, &row) {
+    let target = safe_shell_read(state, "queue_title_generation_read", |shell| {
+        copy_generation_target_for_browser_row(&shell.server, &row)
+    })
+    .flatten();
+    if let Some(target) = target {
         spawn_title_generation_for_target(state, target, force, force, true);
     }
 }
 
 fn queue_active_session_title_generation(state: Signal<ShellState>, force: bool) {
-    let Some(session) = state.read().server.active_session().cloned() else {
-        return;
-    };
-    let Some(target) = copy_generation_target_for_session(&state.read().server, &session) else {
+    let Some(target) = safe_shell_read(state, "queue_active_session_title_generation_read", |shell| {
+        let session = shell.server.active_session().cloned()?;
+        copy_generation_target_for_session(&shell.server, &session)
+    })
+    .flatten() else {
         return;
     };
     spawn_title_generation_for_target(state, target, force, force, true);
@@ -2533,6 +2538,7 @@ fn spawn_set_view_mode(mut state: Signal<ShellState>, mode: WorkspaceViewMode) {
 }
 
 fn spawn_open_session_row(mut state: Signal<ShellState>, row: BrowserRow) {
+    let prefer_terminal = state.read().server.active_view_mode() == WorkspaceViewMode::Terminal;
     state.with_mut(|shell| {
         shell.browser.select_path(row.full_path.clone());
         shell.context_menu_row = None;
@@ -2541,7 +2547,7 @@ fn spawn_open_session_row(mut state: Signal<ShellState>, row: BrowserRow) {
         shell.last_action = format!("opening {}", row.label);
     });
     spawn_server_snapshot_action(state, format!("opening {}", row.label), move |endpoint| {
-        if let Some((machine_key, session_id)) = parse_remote_scanned_session_path(&row.full_path) {
+        let opened = if let Some((machine_key, session_id)) = parse_remote_scanned_session_path(&row.full_path) {
             open_remote_session(
                 &endpoint,
                 machine_key,
@@ -2558,6 +2564,11 @@ fn spawn_open_session_row(mut state: Signal<ShellState>, row: BrowserRow) {
                 row.session_cwd.as_deref(),
                 Some(row.label.as_str()),
             )
+        }?;
+        if prefer_terminal {
+            request_terminal_launch(&endpoint)
+        } else {
+            Ok(opened)
         }
     });
 }
@@ -5455,7 +5466,8 @@ fn app() -> Element {
         }
         let has_generation_context = copy_generation_target_for_session(&state.read().server, &session)
             .and_then(|target| target.remote_context)
-            .is_some_and(|context| !context.trim().is_empty());
+            .is_some_and(|context| !context.trim().is_empty())
+            || preview_context_from_session(&session).is_some();
         if supports_generated_session_copy(&session)
             && !has_good_title
             && (!session.session_path.starts_with("remote-session://") || has_generation_context)
@@ -8412,12 +8424,12 @@ fn TerminalCanvas(
         div {
             key: "{instance_key}",
             style: "display:flex; flex-direction:column; min-height:0; height:100%;",
-            div {
-                style: format!(
-                    "display:flex; flex-direction:column; min-height:0; height:100%; gap:0; border-radius:11px; \
-                     background:{}; overflow:hidden;",
-                    theme.background
-                ),
+                    div {
+                        style: format!(
+                            "display:flex; flex-direction:column; min-height:0; height:100%; gap:0; border-radius:11px; \
+                             background:{}; overflow:hidden; padding-left:6px;",
+                            theme.background
+                        ),
                 div {
                     key: "{host_id}",
                     id: "{host_id}",
