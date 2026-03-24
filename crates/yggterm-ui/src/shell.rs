@@ -56,7 +56,8 @@ use yggterm_server::{
     refresh_remote_machine,
     request_terminal_launch, set_all_preview_blocks_folded,
     set_view_mode as daemon_set_view_mode, snapshot as daemon_snapshot, start_command_session,
-    start_local_session, start_local_session_at, status, switch_agent_session_mode,
+    shutdown as daemon_shutdown, start_local_session, start_local_session_at, status,
+    switch_agent_session_mode,
     terminal_ensure, terminal_read, terminal_resize, terminal_write,
     toggle_preview_block as daemon_toggle_preview_block,
 };
@@ -1574,36 +1575,67 @@ fn spawn_notify_only_update_check(mut state: Signal<ShellState>) {
 fn initial_server_sync(
     endpoint: ServerEndpoint,
 ) -> Result<(ServerUiSnapshot, Option<ServerRuntimeStatus>, String)> {
-    if ping(&endpoint).is_err() {
-        let current_exe = std::env::current_exe()?;
-        Command::new(current_exe)
-            .arg("server")
-            .arg("daemon")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
+    ensure_daemon_running(&endpoint)?;
 
-        for _ in 0..20 {
-            thread::sleep(Duration::from_millis(150));
-            if ping(&endpoint).is_ok() {
-                break;
-            }
+    let mut runtime = status(&endpoint).ok();
+    if runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.server_version != env!("CARGO_PKG_VERSION"))
+    {
+        restart_daemon(&endpoint)?;
+        runtime = status(&endpoint).ok();
+    }
+
+    let (snapshot, _) = match daemon_snapshot(&endpoint) {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            restart_daemon(&endpoint)?;
+            daemon_snapshot(&endpoint)?
         }
-    }
-
-    if ping(&endpoint).is_err() {
-        anyhow::bail!("daemon did not become reachable")
-    }
-
-    let runtime = status(&endpoint).ok();
-    let (snapshot, _) = daemon_snapshot(&endpoint)?;
+    };
     let detail = match &endpoint {
         #[cfg(unix)]
         ServerEndpoint::UnixSocket(path) => format!("server connected via {}", path.display()),
         ServerEndpoint::Tcp { host, port } => format!("server connected via {host}:{port}"),
     };
     Ok((snapshot, runtime, detail))
+}
+
+fn ensure_daemon_running(endpoint: &ServerEndpoint) -> Result<()> {
+    if ping(endpoint).is_ok() {
+        return Ok(());
+    }
+    spawn_daemon_process()?;
+    wait_for_daemon(endpoint)
+}
+
+fn restart_daemon(endpoint: &ServerEndpoint) -> Result<()> {
+    let _ = daemon_shutdown(endpoint);
+    thread::sleep(Duration::from_millis(200));
+    spawn_daemon_process()?;
+    wait_for_daemon(endpoint)
+}
+
+fn spawn_daemon_process() -> Result<()> {
+    let current_exe = std::env::current_exe()?;
+    Command::new(current_exe)
+        .arg("server")
+        .arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(())
+}
+
+fn wait_for_daemon(endpoint: &ServerEndpoint) -> Result<()> {
+    for _ in 0..20 {
+        thread::sleep(Duration::from_millis(150));
+        if ping(endpoint).is_ok() {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("daemon did not become reachable")
 }
 
 fn spawn_server_snapshot_action<F>(mut state: Signal<ShellState>, pending_label: String, request: F)

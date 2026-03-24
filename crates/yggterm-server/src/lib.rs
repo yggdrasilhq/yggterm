@@ -215,11 +215,17 @@ pub struct SnapshotSessionView {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerUiSnapshot {
+    #[serde(default)]
     pub active_session_path: Option<String>,
+    #[serde(default)]
     pub active_session: Option<SnapshotSessionView>,
+    #[serde(default = "default_workspace_view_mode")]
     pub active_view_mode: WorkspaceViewMode,
+    #[serde(default)]
     pub remote_machines: Vec<RemoteMachineSnapshot>,
+    #[serde(default)]
     pub ssh_targets: Vec<SshConnectTarget>,
+    #[serde(default)]
     pub live_sessions: Vec<SnapshotSessionView>,
 }
 
@@ -247,7 +253,9 @@ pub struct PersistedLiveSession {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedDaemonState {
+    #[serde(default)]
     pub active_session_path: Option<String>,
+    #[serde(default = "default_workspace_view_mode")]
     pub active_view_mode: WorkspaceViewMode,
     #[serde(default)]
     pub ssh_targets: Vec<SshConnectTarget>,
@@ -255,6 +263,10 @@ pub struct PersistedDaemonState {
     pub remote_machines: Vec<RemoteMachineSnapshot>,
     pub stored_sessions: Vec<PersistedStoredSession>,
     pub live_sessions: Vec<PersistedLiveSession>,
+}
+
+fn default_workspace_view_mode() -> WorkspaceViewMode {
+    WorkspaceViewMode::Rendered
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
