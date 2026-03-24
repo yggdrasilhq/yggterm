@@ -2051,6 +2051,55 @@ fn run_remote_python(
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+pub fn stage_remote_clipboard_png(
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+    png_bytes: &[u8],
+) -> anyhow::Result<String> {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o").arg("ConnectTimeout=5");
+    cmd.arg("-o").arg("BatchMode=yes");
+    let script = r#"import os, sys, time, uuid
+home = os.path.expanduser("~/.yggterm/clipboard")
+os.makedirs(home, exist_ok=True)
+path = os.path.join(home, f"clipboard-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}.png")
+payload = sys.stdin.buffer.read()
+if not payload:
+    raise SystemExit("no clipboard image payload supplied")
+with open(path, "wb") as handle:
+    handle.write(payload)
+print(path)
+"#;
+    let inner = format!("python3 -c {}", shell_single_quote(script));
+    let remote = match exec_prefix.map(str::trim).filter(|prefix| !prefix.is_empty()) {
+        Some(prefix) => format!("{prefix} sh -c {}", shell_single_quote(&inner)),
+        None => inner,
+    };
+    cmd.arg(ssh_target).arg(remote);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("failed to start remote clipboard upload for {ssh_target}"))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(png_bytes)
+            .with_context(|| format!("failed to send clipboard image to {ssh_target}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("failed waiting for remote clipboard upload on {ssh_target}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "remote clipboard upload failed for {}: {}",
+            ssh_target,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 fn scan_remote_machine_sessions(
     target: &SshConnectTarget,
 ) -> anyhow::Result<Vec<RemoteScannedSession>> {
