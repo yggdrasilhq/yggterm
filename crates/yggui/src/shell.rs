@@ -1493,18 +1493,18 @@ impl ShellState {
 }
 
 fn safe_push_notification(
-    mut state: Signal<ShellState>,
+    state: Signal<ShellState>,
     tone: NotificationTone,
     title: impl Into<String>,
     message: impl Into<String>,
 ) {
     let title = title.into();
     let message = message.into();
-    if let Err(error) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        state.with_mut(|shell| {
-            shell.push_notification(tone, title.clone(), message.clone());
-        });
-    })) {
+    let title_for_write = title.clone();
+    let message_for_write = message.clone();
+    if let Err(error) = safe_shell_mut(state, "push_notification", move |shell| {
+        shell.push_notification(tone, title_for_write, message_for_write);
+    }) {
         warn!(
             title=%title,
             message=%message,
@@ -1512,6 +1512,20 @@ fn safe_push_notification(
             "suppressed notification panic"
         );
     }
+}
+
+fn safe_shell_mut<R>(
+    mut state: Signal<ShellState>,
+    context: &'static str,
+    operation: impl FnOnce(&mut ShellState) -> R,
+) -> std::thread::Result<R> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        state.with_mut(operation)
+    }))
+    .map_err(|error| {
+        warn!(%context, panic_payload=?error, "suppressed shell state panic");
+        error
+    })
 }
 
 fn queue_title_generation(state: Signal<ShellState>, row: BrowserRow, force: bool) {
@@ -2048,7 +2062,7 @@ fn spawn_summary_generation_for_target(
     });
 }
 
-fn spawn_initial_server_sync(mut state: Signal<ShellState>) {
+fn spawn_initial_server_sync(state: Signal<ShellState>) {
     let endpoint = state.read().bootstrap.server_endpoint.clone();
     let perf_home = perf_home_dir(&state.read().bootstrap.settings_path);
     spawn(async move {
@@ -2057,7 +2071,7 @@ fn spawn_initial_server_sync(mut state: Signal<ShellState>) {
         perf.finish(json!({
             "ok": outcome.as_ref().is_ok_and(|result| result.is_ok()),
         }));
-        state.with_mut(|shell| match outcome {
+        let _ = safe_shell_mut(state, "initial_server_sync_complete", |shell| match outcome {
             Ok(Ok((snapshot, runtime, detail))) => {
                 shell.server.apply_snapshot(snapshot);
                 shell.server_daemon_detail = detail;
@@ -2097,7 +2111,7 @@ fn spawn_initial_server_sync(mut state: Signal<ShellState>) {
     });
 }
 
-fn spawn_initial_browser_tree_load(mut state: Signal<ShellState>) {
+fn spawn_initial_browser_tree_load(state: Signal<ShellState>) {
     let settings = state.read().settings.clone();
     let perf_home = perf_home_dir(&state.read().bootstrap.settings_path);
     spawn(async move {
@@ -2110,7 +2124,7 @@ fn spawn_initial_browser_tree_load(mut state: Signal<ShellState>) {
         perf.finish(json!({
             "ok": outcome.as_ref().is_ok_and(|result| result.is_ok()),
         }));
-        state.with_mut(|shell| {
+        let _ = safe_shell_mut(state, "initial_browser_tree_load_complete", |shell| {
             shell.browser_tree_loading_in_flight = false;
             match outcome {
                 Ok(Ok(browser_tree)) => {
@@ -2361,7 +2375,7 @@ fn wait_for_daemon(endpoint: &ServerEndpoint) -> Result<()> {
     anyhow::bail!("daemon did not become reachable")
 }
 
-fn maybe_spawn_missing_remote_machine_refreshes(mut state: Signal<ShellState>) {
+fn maybe_spawn_missing_remote_machine_refreshes(state: Signal<ShellState>) {
     let pending = {
         let shell = state.read();
         let known_remote_machines = shell
@@ -2412,19 +2426,19 @@ fn maybe_spawn_missing_remote_machine_refreshes(mut state: Signal<ShellState>) {
             .collect::<Vec<_>>()
     };
     for machine_key in pending {
-        state.with_mut(|shell| {
+        let _ = safe_shell_mut(state, "queue_remote_machine_refresh", |shell| {
             shell.remote_machine_refresh_requests.insert(machine_key.clone());
         });
         spawn_background_remote_machine_refresh(state, machine_key);
     }
 }
 
-fn spawn_background_remote_machine_refresh(mut state: Signal<ShellState>, machine_key: String) {
+fn spawn_background_remote_machine_refresh(state: Signal<ShellState>, machine_key: String) {
     let endpoint = state.read().bootstrap.server_endpoint.clone();
     spawn(async move {
         let request_machine_key = machine_key.clone();
         let outcome = task::spawn_blocking(move || refresh_remote_machine(&endpoint, &request_machine_key)).await;
-        state.with_mut(|shell| {
+        let _ = safe_shell_mut(state, "remote_machine_refresh_complete", |shell| {
             shell.remote_machine_refresh_requests.remove(&machine_key);
             match outcome {
                 Ok(Ok((snapshot, message))) => {
@@ -2457,7 +2471,7 @@ where
 
     spawn(async move {
         let outcome = task::spawn_blocking(move || request(endpoint)).await;
-        state.with_mut(|shell| match outcome {
+        let _ = safe_shell_mut(state, "server_snapshot_action_complete", |shell| match outcome {
             Ok(result) => shell.apply_daemon_snapshot_result(result),
             Err(error) => {
                 shell.server_busy = false;
