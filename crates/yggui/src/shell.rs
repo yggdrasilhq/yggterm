@@ -1528,6 +1528,23 @@ fn safe_shell_mut<R>(
     })
 }
 
+fn safe_shell_read<R>(
+    state: Signal<ShellState>,
+    context: &'static str,
+    operation: impl FnOnce(&ShellState) -> R,
+) -> Option<R> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let shell = state.read();
+        operation(&shell)
+    })) {
+        Ok(result) => Some(result),
+        Err(error) => {
+            warn!(%context, panic_payload=?error, "suppressed shell read panic");
+            None
+        }
+    }
+}
+
 fn queue_title_generation(state: Signal<ShellState>, row: BrowserRow, force: bool) {
     if let Some(target) = copy_generation_target_for_browser_row(&state.read().server, &row) {
         spawn_title_generation_for_target(state, target, force, force);
@@ -2376,54 +2393,64 @@ fn wait_for_daemon(endpoint: &ServerEndpoint) -> Result<()> {
 }
 
 fn maybe_spawn_missing_remote_machine_refreshes(state: Signal<ShellState>) {
-    let pending = {
-        let shell = state.read();
-        let known_remote_machines = shell
-            .server
-            .remote_machines()
-            .iter()
-            .map(|machine| {
-                (
-                    machine.machine_key.clone(),
-                    machine.health == RemoteMachineHealth::Healthy
-                        || machine.health == RemoteMachineHealth::Offline,
-                )
-            })
-            .collect::<HashMap<_, _>>();
+    let Some(pending) = safe_shell_read(
+        state,
+        "maybe_spawn_missing_remote_machine_refreshes_read",
+        |shell| {
+            let known_remote_machines = shell
+                .server
+                .remote_machines()
+                .iter()
+                .map(|machine| {
+                    (
+                        machine.machine_key.clone(),
+                        machine.health == RemoteMachineHealth::Healthy
+                            || machine.health == RemoteMachineHealth::Offline,
+                    )
+                })
+                .collect::<HashMap<_, _>>();
 
-        let mut desired_machine_keys = shell
-            .server
-            .ssh_targets()
-            .iter()
-            .map(|target| machine_key_from_labelish(&target.ssh_target))
-            .collect::<Vec<_>>();
-        desired_machine_keys.extend(
-            shell.server
-                .live_sessions()
+            let mut desired_machine_keys = shell
+                .server
+                .ssh_targets()
+                .iter()
+                .map(|target| machine_key_from_labelish(&target.ssh_target))
+                .collect::<Vec<_>>();
+            desired_machine_keys.extend(
+                shell.server
+                    .live_sessions()
+                    .into_iter()
+                    .filter(|session| session.kind == SessionKind::SshShell)
+                    .filter_map(|session| {
+                        session
+                            .ssh_target
+                            .as_deref()
+                            .map(machine_key_from_labelish)
+                            .or_else(|| {
+                                if session.host_label.trim().is_empty() {
+                                    None
+                                } else {
+                                    Some(machine_key_from_labelish(&session.host_label))
+                                }
+                            })
+                    }),
+            );
+            desired_machine_keys.sort();
+            desired_machine_keys.dedup();
+            desired_machine_keys
                 .into_iter()
-                .filter(|session| session.kind == SessionKind::SshShell)
-                .filter_map(|session| {
-                    session
-                        .ssh_target
-                        .as_deref()
-                        .map(machine_key_from_labelish)
-                        .or_else(|| {
-                            if session.host_label.trim().is_empty() {
-                                None
-                            } else {
-                                Some(machine_key_from_labelish(&session.host_label))
-                            }
-                        })
-                }),
-        );
-        desired_machine_keys.sort();
-        desired_machine_keys.dedup();
-        desired_machine_keys
-            .into_iter()
-            .filter(|machine_key| !machine_key.is_empty())
-            .filter(|machine_key| !shell.remote_machine_refresh_requests.contains(machine_key))
-            .filter(|machine_key| !known_remote_machines.get(machine_key).copied().unwrap_or(false))
-            .collect::<Vec<_>>()
+                .filter(|machine_key| !machine_key.is_empty())
+                .filter(|machine_key| !shell.remote_machine_refresh_requests.contains(machine_key))
+                .filter(|machine_key| {
+                    !known_remote_machines
+                        .get(machine_key)
+                        .copied()
+                        .unwrap_or(false)
+                })
+                .collect::<Vec<_>>()
+        },
+    ) else {
+        return;
     };
     for machine_key in pending {
         let _ = safe_shell_mut(state, "queue_remote_machine_refresh", |shell| {
