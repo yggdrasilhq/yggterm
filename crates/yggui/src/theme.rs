@@ -31,26 +31,26 @@ pub fn default_theme_editor_spec() -> YgguiThemeSpec {
     YgguiThemeSpec {
         colors: vec![
             YgguiThemeColorStop {
-                color: "#1f6fff".to_string(),
+                color: "#7cc8ff".to_string(),
                 x: 0.18,
-                y: 0.30,
+                y: 0.24,
                 alpha: 0.86,
             },
             YgguiThemeColorStop {
-                color: "#8f3dff".to_string(),
-                x: 0.52,
-                y: 0.18,
-                alpha: 0.84,
+                color: "#67d7a3".to_string(),
+                x: 0.64,
+                y: 0.34,
+                alpha: 0.78,
             },
             YgguiThemeColorStop {
-                color: "#c6d600".to_string(),
-                x: 0.60,
-                y: 0.68,
-                alpha: 0.90,
+                color: "#d7e3ee".to_string(),
+                x: 0.82,
+                y: 0.76,
+                alpha: 0.62,
             },
         ],
-        brightness: 0.58,
-        grain: 0.20,
+        brightness: 0.56,
+        grain: 0.12,
     }
 }
 
