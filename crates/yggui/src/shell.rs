@@ -166,6 +166,7 @@ struct ShellState {
     theme_editor_drag_stop: Option<usize>,
     background_copy_scan_in_flight: bool,
     next_background_copy_scan_after_ms: u64,
+    browser_tree_loading_in_flight: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -256,6 +257,7 @@ struct RenderSnapshot {
     theme_accent: String,
     shell_tint: String,
     shell_gradient: String,
+    theme_share_json: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -455,6 +457,7 @@ impl ShellState {
             theme_editor_drag_stop: None,
             background_copy_scan_in_flight: false,
             next_background_copy_scan_after_ms: 0,
+            browser_tree_loading_in_flight: true,
         };
         if let Some(path) = state.browser.selected_path().map(ToOwned::to_owned) {
             state.selected_tree_paths.insert(path.clone());
@@ -530,7 +533,8 @@ impl ShellState {
             context_menu_position: self.context_menu_position,
             preview_layout: self.preview_layout,
             server_busy: self.server_busy,
-            show_loading_tree: self.needs_initial_server_sync && self.server_busy,
+            show_loading_tree: (self.needs_initial_server_sync && self.server_busy)
+                || self.browser_tree_loading_in_flight,
             ssh_connect_target: self.ssh_connect_target.clone(),
             ssh_connect_prefix: self.ssh_connect_prefix.clone(),
             pending_update_restart: self.pending_update_restart.clone(),
@@ -558,6 +562,8 @@ impl ShellState {
             theme_accent: dominant_accent(&active_theme_spec, palette.accent),
             shell_tint: shell_tint(self.settings.theme, &active_theme_spec),
             shell_gradient: gradient_css(self.settings.theme, &active_theme_spec),
+            theme_share_json: serde_json::to_string_pretty(&clamp_theme_spec(&self.theme_editor_draft))
+                .unwrap_or_else(|_| "{}".to_string()),
         }
     }
 
@@ -888,10 +894,10 @@ impl ShellState {
     }
 
     fn reset_theme_editor(&mut self) {
-        self.theme_editor_draft = YgguiThemeSpec::default();
-        self.theme_editor_selected_stop = None;
+        self.theme_editor_draft = default_theme_editor_spec();
+        self.theme_editor_selected_stop = self.theme_editor_draft.colors.first().map(|_| 0);
         self.theme_editor_drag_stop = None;
-        self.last_action = "theme reset".to_string();
+        self.last_action = "theme reset to base".to_string();
     }
 
     fn seed_theme_editor(&mut self) {
@@ -2042,6 +2048,38 @@ fn spawn_initial_server_sync(mut state: Signal<ShellState>) {
             }
         });
         maybe_spawn_missing_remote_machine_refreshes(state);
+    });
+}
+
+fn spawn_initial_browser_tree_load(mut state: Signal<ShellState>) {
+    let settings = state.read().settings.clone();
+    let perf_home = perf_home_dir(&state.read().bootstrap.settings_path);
+    spawn(async move {
+        let perf = PerfSpan::start(&perf_home, "startup", "initial_browser_tree_load");
+        let outcome = task::spawn_blocking(move || -> Result<SessionNode> {
+            let store = SessionStore::open_or_init()?;
+            store.load_codex_tree(&settings)
+        })
+        .await;
+        perf.finish(json!({
+            "ok": outcome.as_ref().is_ok_and(|result| result.is_ok()),
+        }));
+        state.with_mut(|shell| {
+            shell.browser_tree_loading_in_flight = false;
+            match outcome {
+                Ok(Ok(browser_tree)) => {
+                    let selected_hint = shell.browser.selected_path().map(str::to_string);
+                    restore_browser_tree(shell, browser_tree, selected_hint.as_deref());
+                    shell.last_action = "loaded session tree".to_string();
+                }
+                Ok(Err(error)) => {
+                    shell.last_action = format!("session tree load failed: {error}");
+                }
+                Err(error) => {
+                    shell.last_action = format!("session tree task failed: {error}");
+                }
+            }
+        });
     });
 }
 
@@ -5021,6 +5059,7 @@ fn app() -> Element {
     let desktop = use_window();
     let mut hovered = use_signal(|| None::<HoveredControl>);
     let mut startup_sync_started = use_signal(|| false);
+    let mut browser_tree_load_started = use_signal(|| false);
     let mut update_check_started = use_signal(|| false);
     let mut desktop_refresh_started = use_signal(|| false);
     let mut dock_pulse_started = use_signal(|| false);
@@ -5062,6 +5101,16 @@ fn app() -> Element {
         if should_start {
             startup_sync_started.set(true);
             spawn_initial_server_sync(state);
+        }
+    });
+    use_effect(move || {
+        let should_start = {
+            let shell = state.read();
+            shell.browser_tree_loading_in_flight && !*browser_tree_load_started.read()
+        };
+        if should_start {
+            browser_tree_load_started.set(true);
+            spawn_initial_browser_tree_load(state);
         }
     });
     use_effect(move || {
@@ -9016,7 +9065,7 @@ fn ThemeEditorOverlay(
 
     rsx! {
         div {
-            style: "position:fixed; inset:0; z-index:98; display:flex; align-items:center; justify-content:center; background:rgba(228,237,245,0.24); backdrop-filter: blur(18px) saturate(125%); -webkit-backdrop-filter: blur(18px) saturate(125%);",
+            style: "position:fixed; inset:0; z-index:98; display:flex; align-items:center; justify-content:center; background:rgba(228,237,245,0.82);",
             onclick: move |evt| on_close.call(evt),
             div {
                 style: format!(
@@ -9047,7 +9096,7 @@ fn ThemeEditorOverlay(
                             }
                             div {
                                 style: format!("font-size:11px; line-height:1.45; color:{};", snapshot.palette.muted),
-                                "Shape the shell gradient, brightness, and grain for Yggui."
+                                "Shape the shell gradient, brightness, and grain for Yggui. The active theme is saved in config as portable JSON."
                             }
                         }
                     }
@@ -9313,6 +9362,30 @@ fn ThemeEditorOverlay(
                                 }
                             }
                         }
+                        div {
+                            style: "display:flex; flex-direction:column; gap:8px;",
+                            div {
+                                style: "display:flex; align-items:center; justify-content:space-between; gap:10px;",
+                                div {
+                                    style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", snapshot.palette.muted),
+                                    "Portable Theme JSON"
+                                }
+                                div {
+                                    style: format!("font-size:10px; color:{};", snapshot.palette.muted),
+                                    "saved under `yggui_theme` in settings"
+                                }
+                            }
+                            textarea {
+                                readonly: true,
+                                value: "{snapshot.theme_share_json}",
+                                style: format!(
+                                    "width:100%; min-height:128px; resize:vertical; border:none; border-radius:14px; padding:12px; \
+                                     background:rgba(255,255,255,0.82); color:{}; box-shadow: inset 0 0 0 1px rgba(208,219,229,0.85); \
+                                     font: 11px/1.6 'JetBrains Mono', 'JetBrainsMono Nerd Font', ui-monospace, monospace;",
+                                    snapshot.palette.text
+                                ),
+                            }
+                        }
                     }
                 }
                 div {
@@ -9337,7 +9410,7 @@ fn ThemeEditorOverlay(
                         button {
                             style: chip_style(snapshot.palette, false),
                             onclick: move |evt| on_reset.call(evt),
-                            "Reset"
+                            "Reset to Base"
                         }
                         button {
                             style: primary_action_style(snapshot.palette),
