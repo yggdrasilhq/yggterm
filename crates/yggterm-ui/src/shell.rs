@@ -9143,6 +9143,38 @@ mod tests {
         assert!(!rows.iter().any(|row| row.full_path == "__remote_folder__/pi-raspberry/srv/app"));
         assert!(!rows.iter().any(|row| row.full_path == "remote-session://pi-raspberry/019caa6f"));
     }
+
+    #[test]
+    fn saved_ssh_target_machine_key_only_matches_persisted_remote_machine_rows() {
+        let row = BrowserRow {
+            kind: BrowserRowKind::Group,
+            full_path: "__remote_machine__/pi-raspberry".to_string(),
+            label: "raspberry [cached]".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: None,
+            depth: 0,
+            host_label: String::new(),
+            descendant_sessions: 1,
+            expanded: true,
+            session_id: None,
+            session_cwd: None,
+        };
+        let targets = vec![SshConnectTarget {
+            label: "raspberry".to_string(),
+            kind: SessionKind::SshShell,
+            ssh_target: "pi@raspberry".to_string(),
+            prefix: None,
+            cwd: None,
+        }];
+
+        assert_eq!(
+            saved_ssh_target_machine_key(&row, &targets).as_deref(),
+            Some("pi-raspberry")
+        );
+        assert_eq!(saved_ssh_target_machine_key(&row, &[]), None);
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
