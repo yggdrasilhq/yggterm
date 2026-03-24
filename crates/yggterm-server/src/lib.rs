@@ -554,6 +554,34 @@ impl YggtermServer {
             return 0;
         }
 
+        let removed_ssh_targets = self
+            .sessions
+            .iter()
+            .filter_map(|(path, session)| {
+                session
+                    .ssh_target
+                    .as_ref()
+                    .filter(|ssh_target| machine_key_from_ssh_target(ssh_target) == machine_key)
+                    .map(|_| path.clone())
+            })
+            .collect::<Vec<_>>();
+        let removed_remote_sessions = self
+            .sessions
+            .keys()
+            .filter(|path| path.starts_with(&format!("remote-session://{machine_key}/")))
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in removed_ssh_targets
+            .into_iter()
+            .chain(removed_remote_sessions.into_iter())
+        {
+            self.sessions.remove(&path);
+            self.live_session_order.retain(|entry| entry != &path);
+            if self.active_session_path.as_deref() == Some(path.as_str()) {
+                self.active_session_path = None;
+            }
+        }
+
         self.remote_machines
             .retain(|machine| machine.machine_key != machine_key);
         removed
