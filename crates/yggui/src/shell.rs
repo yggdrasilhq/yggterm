@@ -762,7 +762,11 @@ impl ShellState {
         );
         match row.kind {
             BrowserRowKind::Group => {
-                self.browser.toggle_group(&row.full_path);
+                if is_synthetic_sidebar_row(row) {
+                    self.browser.toggle_virtual_group(&row.full_path);
+                } else {
+                    self.browser.toggle_group(&row.full_path);
+                }
                 self.sync_browser_settings();
                 self.last_action = format!("toggled {}", row.label);
             }
@@ -1083,7 +1087,9 @@ impl ShellState {
         self.selected_tree_paths.clear();
         self.selected_tree_paths.insert(row.full_path.clone());
         self.selection_anchor = Some(row.full_path.clone());
-        self.browser.select_path(row.full_path.clone());
+        if !is_synthetic_sidebar_row(row) {
+            self.browser.select_path(row.full_path.clone());
+        }
         if cfg!(debug_assertions) {
             info!(path=%row.full_path, mode=?mode, "tree row selected");
         }
@@ -1139,7 +1145,9 @@ impl ShellState {
         if self.selected_tree_paths.is_empty() {
             self.selected_tree_paths.insert(row.full_path.clone());
         }
-        self.browser.select_path(row.full_path.clone());
+        if !is_synthetic_sidebar_row(row) {
+            self.browser.select_path(row.full_path.clone());
+        }
         if cfg!(debug_assertions) {
             info!(anchor=%anchor, target=%row.full_path, selected=%self.selected_tree_paths.len(), "tree range selected");
         }
@@ -2663,6 +2671,12 @@ fn is_remote_scanned_sidebar_row(row: &BrowserRow) -> bool {
 
 fn is_remote_machine_group_row(row: &BrowserRow) -> bool {
     row.kind == BrowserRowKind::Group && row.full_path.starts_with("__remote_machine__/")
+}
+
+fn is_synthetic_sidebar_row(row: &BrowserRow) -> bool {
+    row.full_path.starts_with("__remote_machine__/")
+        || row.full_path.starts_with("__remote_folder__/")
+        || row.full_path == "__live_sessions__"
 }
 
 fn saved_ssh_target_machine_key(row: &BrowserRow, ssh_targets: &[SshConnectTarget]) -> Option<String> {
