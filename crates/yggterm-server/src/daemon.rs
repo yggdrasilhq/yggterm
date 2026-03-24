@@ -67,6 +67,9 @@ pub enum ServerRequest {
     RefreshRemoteMachine {
         machine_key: String,
     },
+    RemoveSshTarget {
+        machine_key: String,
+    },
     StartLocalSession {
         session_kind: SessionKind,
         cwd: Option<String>,
@@ -301,6 +304,17 @@ impl DaemonRuntime {
                 self.server.refresh_remote_machine_by_key(&machine_key)?;
                 self.persist()?;
                 self.snapshot_response(Some(format!("refreshed {machine_key}")))
+            }
+            ServerRequest::RemoveSshTarget { machine_key } => {
+                let removed = self.server.remove_ssh_targets_for_machine(&machine_key);
+                self.persist()?;
+                self.snapshot_response(Some(if removed == 0 {
+                    format!("no saved ssh target for {machine_key}")
+                } else if removed == 1 {
+                    format!("removed saved ssh target for {machine_key}")
+                } else {
+                    format!("removed {removed} saved ssh targets for {machine_key}")
+                }))
             }
             ServerRequest::StartLocalSession {
                 session_kind,
@@ -589,6 +603,18 @@ pub fn refresh_remote_machine(
     expect_snapshot(send_request(
         endpoint,
         &ServerRequest::RefreshRemoteMachine {
+            machine_key: machine_key.to_string(),
+        },
+    )?)
+}
+
+pub fn remove_ssh_target(
+    endpoint: &ServerEndpoint,
+    machine_key: &str,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
+    expect_snapshot(send_request(
+        endpoint,
+        &ServerRequest::RemoveSshTarget {
             machine_key: machine_key.to_string(),
         },
     )?)
