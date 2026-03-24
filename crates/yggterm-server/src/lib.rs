@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 use time::{OffsetDateTime, UtcOffset, macros::format_description};
 use tracing::warn;
@@ -39,6 +40,9 @@ pub enum WorkspaceViewMode {
     Terminal,
     Rendered,
 }
+
+static REMOTE_YGGTERM_COMMAND_CACHE: OnceLock<Mutex<std::collections::HashMap<String, String>>> =
+    OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TerminalBackend {
@@ -957,7 +961,8 @@ impl YggtermServer {
             prefix: machine.prefix.clone(),
             cwd: cwd.map(ToOwned::to_owned),
         };
-        let remote_command = remote_resume_command(session_id, cwd, target.prefix.as_deref());
+        let remote_binary = resolve_remote_yggterm_binary(&target.ssh_target, target.prefix.as_deref())
+            .unwrap_or_else(|_| "yggterm".to_string());
         let resolved_title = title_hint
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| short_session_id(session_id));
@@ -966,14 +971,15 @@ impl YggtermServer {
                 session.session_path = session_path.clone();
                 session.title = resolved_title.clone();
                 session.host_label = machine.label.clone();
-                session.launch_command = format!(
-                    "ssh -tt {} {}",
-                    target.ssh_target,
-                    shell_single_quote(&remote_command)
+                session.launch_command = remote_ssh_launch_command(
+                    &target.ssh_target,
+                    target.prefix.as_deref(),
+                    &remote_binary,
+                    &["server", "remote", "resume-codex", session_id, cwd.unwrap_or("")],
                 );
                 session.terminal_lines = vec![
                     format!("$ {}", session.launch_command),
-                    format!("Queue remote Codex resume {session_id}"),
+                    format!("Queue remote Yggterm resume {session_id}"),
                     format!("Target host: {}", target.ssh_target),
                     format!("Workspace: {}", cwd.unwrap_or("<unknown>")),
                     "Daemon PTY: request main viewport terminal stream".to_string(),
@@ -983,7 +989,7 @@ impl YggtermServer {
                 upsert_session_metadata(
                     &mut session.metadata,
                     "Restore",
-                    format!("codex resume {session_id}"),
+                    format!("yggterm server remote resume-codex {session_id}"),
                 );
                 if let Some(cwd) = cwd {
                     upsert_session_metadata(&mut session.metadata, "Cwd", cwd.to_string());
@@ -1009,14 +1015,15 @@ impl YggtermServer {
             session.session_path = session_path.clone();
             session.title = resolved_title;
             session.host_label = machine.label.clone();
-            session.launch_command = format!(
-                "ssh -tt {} {}",
-                target.ssh_target,
-                shell_single_quote(&remote_command)
+            session.launch_command = remote_ssh_launch_command(
+                &target.ssh_target,
+                target.prefix.as_deref(),
+                &remote_binary,
+                &["server", "remote", "resume-codex", session_id, cwd.unwrap_or("")],
             );
             session.terminal_lines = vec![
                 format!("$ {}", session.launch_command),
-                format!("Queue remote Codex resume {session_id}"),
+                format!("Queue remote Yggterm resume {session_id}"),
                 format!("Target host: {}", target.ssh_target),
                 format!(
                     "Workspace: {}",
@@ -1033,7 +1040,7 @@ impl YggtermServer {
             upsert_session_metadata(
                 &mut session.metadata,
                 "Restore",
-                format!("codex resume {session_id}"),
+                format!("yggterm server remote resume-codex {session_id}"),
             );
             if let Some(cwd) = cwd {
                 upsert_session_metadata(&mut session.metadata, "Cwd", cwd.to_string());
@@ -1498,7 +1505,7 @@ fn remote_scanned_session_path(machine_key: &str, session_id: &str) -> String {
     format!("remote-session://{machine_key}/{session_id}")
 }
 
-fn remote_resume_command(session_id: &str, cwd: Option<&str>, prefix: Option<&str>) -> String {
+fn remote_resume_shell_command(session_id: &str, cwd: Option<&str>, prefix: Option<&str>) -> String {
     let base = match cwd.filter(|cwd| !cwd.trim().is_empty()) {
         Some(cwd) => format!("cd {} && codex resume {}", shell_single_quote(cwd), shell_single_quote(session_id)),
         None => format!("codex resume {}", shell_single_quote(session_id)),
@@ -1510,6 +1517,27 @@ fn remote_resume_command(session_id: &str, cwd: Option<&str>, prefix: Option<&st
         Some(prefix) => format!("{prefix} && {base}"),
         None => base,
     }
+}
+
+fn remote_ssh_launch_command(
+    ssh_target: &str,
+    prefix: Option<&str>,
+    binary_expr: &str,
+    args: &[&str],
+) -> String {
+    let mut inner = String::from(binary_expr);
+    for arg in args {
+        inner.push(' ');
+        inner.push_str(&shell_single_quote(arg));
+    }
+    let remote = match prefix
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(prefix) => format!("{prefix} && {inner}"),
+        None => inner,
+    };
+    format!("ssh -tt {} {}", ssh_target, shell_single_quote(&remote))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2166,16 +2194,25 @@ fn remote_shell_command(exec_prefix: Option<&str>, inner: &str) -> String {
     }
 }
 
-fn run_remote_yggterm_command(
+fn remote_cache_key(ssh_target: &str, exec_prefix: Option<&str>) -> String {
+    format!("{}|{}", ssh_target, exec_prefix.unwrap_or_default())
+}
+
+fn remote_command_cache() -> &'static Mutex<std::collections::HashMap<String, String>> {
+    REMOTE_YGGTERM_COMMAND_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn run_remote_binary_command(
     ssh_target: &str,
     exec_prefix: Option<&str>,
+    binary_expr: &str,
     args: &[&str],
     stdin_bytes: Option<&[u8]>,
 ) -> anyhow::Result<String> {
     let mut cmd = Command::new("ssh");
     cmd.arg("-o").arg("ConnectTimeout=5");
     cmd.arg("-o").arg("BatchMode=yes");
-    let mut inner = String::from("yggterm");
+    let mut inner = String::from(binary_expr);
     for arg in args {
         inner.push(' ');
         inner.push_str(&shell_single_quote(arg));
@@ -2208,12 +2245,115 @@ fn run_remote_yggterm_command(
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+fn run_remote_yggterm_command(
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+    args: &[&str],
+    stdin_bytes: Option<&[u8]>,
+) -> anyhow::Result<String> {
+    let binary_expr = resolve_remote_yggterm_binary(ssh_target, exec_prefix)?;
+    run_remote_binary_command(ssh_target, exec_prefix, &binary_expr, args, stdin_bytes)
+}
+
 fn should_fallback_to_python(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}");
     message.contains("command not found")
         || message.contains("not found")
         || message.contains("No such file")
         || message.contains("remote yggterm command failed")
+}
+
+fn remote_protocol_version_for_binary(
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+    binary_expr: &str,
+) -> anyhow::Result<String> {
+    run_remote_binary_command(
+        ssh_target,
+        exec_prefix,
+        binary_expr,
+        &["server", "remote", "protocol-version"],
+        None,
+    )
+}
+
+fn bootstrap_remote_yggterm(ssh_target: &str, exec_prefix: Option<&str>) -> anyhow::Result<String> {
+    let exe_path = std::env::current_exe().context("resolving current yggterm executable")?;
+    let payload =
+        fs::read(&exe_path).with_context(|| format!("reading local yggterm binary {}", exe_path.display()))?;
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o").arg("ConnectTimeout=10");
+    cmd.arg("-o").arg("BatchMode=yes");
+    let remote_path = "$HOME/.yggterm/bin/yggterm";
+    let install_cmd = format!(
+        "mkdir -p \"$HOME/.yggterm/bin\" && cat > \"$HOME/.yggterm/bin/yggterm.tmp\" && chmod +x \"$HOME/.yggterm/bin/yggterm.tmp\" && mv \"$HOME/.yggterm/bin/yggterm.tmp\" \"{remote_path}\" && printf \"%s\" \"{remote_path}\""
+    );
+    let remote = remote_shell_command(exec_prefix, &install_cmd);
+    cmd.arg(ssh_target).arg(remote);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("failed to start remote bootstrap for {ssh_target}"))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(&payload)
+            .with_context(|| format!("failed to upload yggterm binary to {ssh_target}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("failed waiting for remote bootstrap on {ssh_target}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "remote bootstrap failed for {}: {}",
+            ssh_target,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn resolve_remote_yggterm_binary(
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+) -> anyhow::Result<String> {
+    let cache_key = remote_cache_key(ssh_target, exec_prefix);
+    if let Some(cached) = remote_command_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&cache_key).cloned())
+    {
+        return Ok(cached);
+    }
+
+    match remote_protocol_version_for_binary(ssh_target, exec_prefix, "yggterm") {
+        Ok(version) if version.trim() == daemon::SERVER_PROTOCOL_VERSION => {
+            if let Ok(mut cache) = remote_command_cache().lock() {
+                cache.insert(cache_key, "yggterm".to_string());
+            }
+            return Ok("yggterm".to_string());
+        }
+        Ok(_) => {}
+        Err(error) if !should_fallback_to_python(&error) => return Err(error),
+        Err(_) => {}
+    }
+
+    let installed = bootstrap_remote_yggterm(ssh_target, exec_prefix)?;
+    let installed_version =
+        remote_protocol_version_for_binary(ssh_target, exec_prefix, &installed)?;
+    if installed_version.trim() != daemon::SERVER_PROTOCOL_VERSION {
+        anyhow::bail!(
+            "remote yggterm protocol mismatch for {}: expected {}, got {}",
+            ssh_target,
+            daemon::SERVER_PROTOCOL_VERSION,
+            installed_version.trim()
+        );
+    }
+    if let Ok(mut cache) = remote_command_cache().lock() {
+        cache.insert(cache_key, installed.clone());
+    }
+    Ok(installed)
 }
 
 pub fn stage_remote_clipboard_png(
@@ -2342,6 +2482,35 @@ pub fn run_remote_stage_clipboard_png() -> anyhow::Result<()> {
         .with_context(|| format!("writing remote clipboard image {}", path.display()))?;
     println!("{}", path.display());
     Ok(())
+}
+
+pub fn run_remote_protocol_version() -> anyhow::Result<()> {
+    println!("{}", daemon::SERVER_PROTOCOL_VERSION);
+    Ok(())
+}
+
+pub fn run_remote_resume_codex(session_id: &str, cwd: Option<&str>) -> anyhow::Result<()> {
+    let command = remote_resume_shell_command(session_id, cwd, None);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let error = Command::new("sh").arg("-lc").arg(command).exec();
+        Err(anyhow::anyhow!("failed to exec remote codex resume: {error}"))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let status = Command::new("sh")
+            .arg("-lc")
+            .arg(command)
+            .status()
+            .context("running remote codex resume")?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("remote codex resume exited with status {status}"))
+        }
+    }
 }
 
 pub fn run_remote_scan(codex_home: Option<&str>) -> anyhow::Result<()> {
@@ -3049,10 +3218,8 @@ fn build_live_session(
     let started_at = format_display_datetime(OffsetDateTime::now_utc());
     let shell_program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
     let default_cwd = target.cwd.clone().unwrap_or_else(|| local_default_cwd());
-    let remote_command = match &target.prefix {
-        Some(prefix) => format!("{prefix} && yggterm server attach {uuid}"),
-        None => format!("yggterm server attach {uuid}"),
-    };
+    let remote_binary = resolve_remote_yggterm_binary(&target.ssh_target, target.prefix.as_deref())
+        .unwrap_or_else(|_| "yggterm".to_string());
     let (launch_command, session_path, source_value, target_value, prefix_value, deploy_state) =
         match kind {
             SessionKind::Shell => (
@@ -3087,10 +3254,11 @@ fn build_live_session(
                 RemoteDeployState::NotRequired,
             ),
             SessionKind::SshShell => (
-                format!(
-                    "ssh -tt {} {}",
-                    target.ssh_target,
-                    shell_single_quote(&remote_command)
+                remote_ssh_launch_command(
+                    &target.ssh_target,
+                    target.prefix.as_deref(),
+                    &remote_binary,
+                    &["server", "attach", uuid],
                 ),
                 format!("ssh://{}/{}", target.ssh_target, uuid),
                 "live-ssh".to_string(),
@@ -3124,7 +3292,7 @@ fn build_live_session(
     };
     let preview_runtime = match kind {
         SessionKind::SshShell => {
-            "Remote bootstrap will eventually ship the yggterm binary before attach.".to_string()
+            "Remote Yggterm bootstrap installs or reuses a matching server binary before attach.".to_string()
         }
         SessionKind::Shell => {
             "This local shell uses the same PTY/runtime path as other embedded terminals.".to_string()
@@ -3973,7 +4141,8 @@ mod tests {
         GhosttyHostSupport, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession,
         SessionKind, SessionNode, SessionNodeKind, UiTheme, YggtermServer,
         load_remote_machine_sessions_from_mirror, mirror_remote_machine_sessions,
-        parse_stored_transcript, remote_resume_command, remote_scanned_session_path,
+        parse_stored_transcript, remote_resume_shell_command, remote_scanned_session_path,
+        remote_ssh_launch_command, remote_command_cache, remote_cache_key,
         stored_session_launch_command,
     };
     use anyhow::Result;
@@ -4021,8 +4190,8 @@ mod tests {
     }
 
     #[test]
-    fn remote_resume_command_wraps_prefix_and_cwd() {
-        let command = remote_resume_command(
+    fn remote_resume_shell_command_wraps_prefix_and_cwd() {
+        let command = remote_resume_shell_command(
             "019caa6f-b32c-7a73-b4d3-db83225663dc",
             Some("/srv/workspace"),
             Some("tmux new-session -A -s yggterm"),
@@ -4033,7 +4202,25 @@ mod tests {
     }
 
     #[test]
+    fn remote_ssh_launch_command_wraps_binary_args_and_prefix() {
+        let command = remote_ssh_launch_command(
+            "jojo",
+            Some("tmux new-session -A -s yggterm"),
+            "$HOME/.yggterm/bin/yggterm",
+            &["server", "remote", "resume-codex", "abc123", "/srv/app"],
+        );
+        assert!(command.starts_with("ssh -tt jojo "));
+        assert!(command.contains("tmux new-session -A -s yggterm &&"));
+        assert!(command.contains("$HOME/.yggterm/bin/yggterm"));
+        assert!(command.contains("'resume-codex'"));
+        assert!(command.contains("'/srv/app'"));
+    }
+
+    #[test]
     fn reopening_remote_scanned_session_refreshes_stale_launch_command() -> Result<()> {
+        if let Ok(mut cache) = remote_command_cache().lock() {
+            cache.insert(remote_cache_key("jojo", None), "yggterm".to_string());
+        }
         let tree = SessionNode {
             kind: SessionNodeKind::Group,
             name: "root".to_string(),
@@ -4082,7 +4269,11 @@ mod tests {
         let session = server.sessions.get(&reopened).expect("reopened session");
         assert_eq!(reopened, session_path);
         assert!(session.launch_command.starts_with("ssh -tt jojo "));
-        assert!(session.launch_command.contains("codex resume"));
+        assert!(session.launch_command.contains("server"));
+        assert!(session.launch_command.contains("resume-codex"));
+        if let Ok(mut cache) = remote_command_cache().lock() {
+            cache.remove(&remote_cache_key("jojo", None));
+        }
         Ok(())
     }
 
