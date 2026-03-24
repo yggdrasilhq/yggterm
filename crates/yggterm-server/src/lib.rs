@@ -546,23 +546,8 @@ impl YggtermServer {
             return 0;
         }
 
-        let has_live_dependency = self.sessions.values().any(|session| {
-            session.source == SessionSource::LiveSsh
-                && session
-                    .ssh_target
-                    .as_deref()
-                    .map(machine_key_from_ssh_target)
-                    .as_deref()
-                    == Some(machine_key)
-        });
-        let has_saved_dependency = self
-            .ssh_targets
-            .iter()
-            .any(|target| machine_key_from_ssh_target(&target.ssh_target) == machine_key);
-        if !has_live_dependency && !has_saved_dependency {
-            self.remote_machines
-                .retain(|machine| machine.machine_key != machine_key);
-        }
+        self.remote_machines
+            .retain(|machine| machine.machine_key != machine_key);
         removed
     }
 
