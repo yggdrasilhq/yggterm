@@ -70,6 +70,44 @@ pub enum UiTheme {
     ZedLight,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct YgguiThemeColorStop {
+    pub color: String,
+    pub x: f32,
+    pub y: f32,
+    pub alpha: f32,
+}
+
+impl Default for YgguiThemeColorStop {
+    fn default() -> Self {
+        Self {
+            color: "#7cc8ff".to_string(),
+            x: 0.5,
+            y: 0.5,
+            alpha: 0.82,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct YgguiThemeSpec {
+    pub colors: Vec<YgguiThemeColorStop>,
+    pub brightness: f32,
+    pub grain: f32,
+}
+
+impl Default for YgguiThemeSpec {
+    fn default() -> Self {
+        Self {
+            colors: Vec::new(),
+            brightness: 0.56,
+            grain: 0.12,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentSessionProfile {
@@ -82,6 +120,7 @@ pub enum AgentSessionProfile {
 #[serde(default)]
 pub struct AppSettings {
     pub theme: UiTheme,
+    pub yggui_theme: YgguiThemeSpec,
     pub show_tree: bool,
     pub show_settings: bool,
     pub tree_width: f32,
@@ -103,6 +142,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             theme: UiTheme::ZedLight,
+            yggui_theme: YgguiThemeSpec::default(),
             show_tree: true,
             show_settings: false,
             tree_width: 300.0,
