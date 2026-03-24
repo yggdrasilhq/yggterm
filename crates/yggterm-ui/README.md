@@ -56,6 +56,8 @@ It provides:
 - reusable `ToastTone` and `ToastPalette`
 - shared `TOAST_CSS`
 
+These primitives are also the base layer for update-ready and background-job feedback in shell chrome.
+
 ## Reusable rails
 
 The side-rail shell primitives live in:
@@ -68,6 +70,14 @@ They provide:
 - `RailHeader`
 - `RailScrollBody`
 - `RailSectionTitle`
+
+## Reusable update UX
+
+Yggdrasil shells should treat update state as a reusable shell primitive.
+
+- background install can surface a lightweight chrome affordance
+- restart-required state should be explicit and user-controlled
+- update-ready notifications should reuse the toast system instead of inventing one-off dialogs
 
 ### Integration steps
 
