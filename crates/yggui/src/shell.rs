@@ -1560,7 +1560,7 @@ fn safe_shell_read<R>(
 
 fn queue_title_generation(state: Signal<ShellState>, row: BrowserRow, force: bool) {
     if let Some(target) = copy_generation_target_for_browser_row(&state.read().server, &row) {
-        spawn_title_generation_for_target(state, target, force, force);
+        spawn_title_generation_for_target(state, target, force, force, true);
     }
 }
 
@@ -1571,7 +1571,7 @@ fn queue_active_session_title_generation(state: Signal<ShellState>, force: bool)
     let Some(target) = copy_generation_target_for_session(&state.read().server, &session) else {
         return;
     };
-    spawn_title_generation_for_target(state, target, force, force);
+    spawn_title_generation_for_target(state, target, force, force, true);
 }
 
 fn spawn_title_generation_for_target(
@@ -1579,12 +1579,15 @@ fn spawn_title_generation_for_target(
     target: CopyGenerationTarget,
     force: bool,
     announce: bool,
+    priority: bool,
 ) {
     let session_path = target.session_path.clone();
     let settings = state.read().settings.clone();
     let should_start = state.with_mut(|shell| {
         if shell.title_requests_in_flight.contains(&session_path)
-            || (!force && !announce && !background_copy_retry_ready(shell, "title", &session_path))
+            || (!force
+                && !priority
+                && !background_copy_retry_ready(shell, "title", &session_path))
         {
             false
         } else {
@@ -1755,7 +1758,7 @@ fn spawn_precis_generation(state: Signal<ShellState>, session: ManagedSessionVie
     let Some(target) = copy_generation_target_for_session(&state.read().server, &session) else {
         return;
     };
-    spawn_precis_generation_for_target(state, target, force, force);
+    spawn_precis_generation_for_target(state, target, force, force, true);
 }
 
 fn spawn_precis_generation_for_target(
@@ -1763,6 +1766,7 @@ fn spawn_precis_generation_for_target(
     target: CopyGenerationTarget,
     force: bool,
     announce: bool,
+    priority: bool,
 ) {
     let session_path = target.session_path.clone();
     let settings = state.read().settings.clone();
@@ -1770,7 +1774,7 @@ fn spawn_precis_generation_for_target(
         if (!force && shell.generated_precis.contains_key(&session_path))
             || shell.precis_requests_in_flight.contains(&session_path)
             || (!force
-                && !announce
+                && !priority
                 && !background_copy_retry_ready(shell, "precis", &session_path))
         {
             false
@@ -1916,7 +1920,7 @@ fn spawn_summary_generation(state: Signal<ShellState>, session: ManagedSessionVi
     let Some(target) = copy_generation_target_for_session(&state.read().server, &session) else {
         return;
     };
-    spawn_summary_generation_for_target(state, target, force, force);
+    spawn_summary_generation_for_target(state, target, force, force, true);
 }
 
 fn spawn_summary_generation_for_target(
@@ -1924,6 +1928,7 @@ fn spawn_summary_generation_for_target(
     target: CopyGenerationTarget,
     force: bool,
     announce: bool,
+    priority: bool,
 ) {
     let session_path = target.session_path.clone();
     let settings = state.read().settings.clone();
@@ -1931,7 +1936,7 @@ fn spawn_summary_generation_for_target(
         if (!force && shell.generated_summaries.contains_key(&session_path))
             || shell.summary_requests_in_flight.contains(&session_path)
             || (!force
-                && !announce
+                && !priority
                 && !background_copy_retry_ready(shell, "summary", &session_path))
         {
             false
@@ -3009,13 +3014,13 @@ fn maybe_spawn_background_copy_generation(mut state: Signal<ShellState>) {
         });
         match job {
             Some(BackgroundCopyJob::Title(target)) => {
-                spawn_title_generation_for_target(state, target, false, false)
+                spawn_title_generation_for_target(state, target, false, false, false)
             }
             Some(BackgroundCopyJob::Precis(target)) => {
-                spawn_precis_generation_for_target(state, target, false, false)
+                spawn_precis_generation_for_target(state, target, false, false, false)
             }
             Some(BackgroundCopyJob::Summary(target)) => {
-                spawn_summary_generation_for_target(state, target, false, false)
+                spawn_summary_generation_for_target(state, target, false, false, false)
             }
             None => {}
         }
