@@ -177,6 +177,7 @@ enum NotificationDeliveryMode {
 struct PendingDeleteDialog {
     document_paths: Vec<String>,
     group_paths: Vec<String>,
+    ssh_machine_keys: Vec<String>,
     labels: Vec<String>,
     hard_delete: bool,
 }
@@ -925,6 +926,30 @@ impl ShellState {
         (document_paths, group_paths, labels)
     }
 
+    fn selected_saved_ssh_target_machine_keys(&self) -> (Vec<String>, Vec<String>) {
+        let selected_rows = if self.selected_tree_paths.is_empty() {
+            self.browser.selected_row().cloned().into_iter().collect::<Vec<_>>()
+        } else {
+            self.browser
+                .rows()
+                .iter()
+                .filter(|row| self.selected_tree_paths.contains(&row.full_path))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        let mut machine_keys = Vec::new();
+        let mut labels = Vec::new();
+        for row in selected_rows {
+            if let Some(machine_key) = saved_ssh_target_machine_key(&row, self.server.ssh_targets())
+            {
+                machine_keys.push(machine_key);
+                labels.push(row.label.clone());
+            }
+        }
+        (machine_keys, labels)
+    }
+
     fn begin_drag(&mut self, row: &BrowserRow, pointer: (f64, f64)) {
         if !is_workspace_row(row) {
             self.drag_paths.clear();
@@ -1023,13 +1048,16 @@ impl ShellState {
     }
 
     fn open_delete_dialog(&mut self, hard_delete: bool) {
-        let (document_paths, group_paths, labels) = self.selected_workspace_delete_paths();
-        if document_paths.is_empty() && group_paths.is_empty() {
+        let (document_paths, group_paths, mut labels) = self.selected_workspace_delete_paths();
+        let (ssh_machine_keys, ssh_labels) = self.selected_saved_ssh_target_machine_keys();
+        labels.extend(ssh_labels);
+        if document_paths.is_empty() && group_paths.is_empty() && ssh_machine_keys.is_empty() {
             return;
         }
         self.pending_delete = Some(PendingDeleteDialog {
             document_paths,
             group_paths,
+            ssh_machine_keys,
             labels,
             hard_delete,
         });
@@ -1044,6 +1072,7 @@ impl ShellState {
                 hard_delete,
                 documents=%self.pending_delete.as_ref().map(|pending| pending.document_paths.len()).unwrap_or(0),
                 groups=%self.pending_delete.as_ref().map(|pending| pending.group_paths.len()).unwrap_or(0),
+                ssh_machines=%self.pending_delete.as_ref().map(|pending| pending.ssh_machine_keys.len()).unwrap_or(0),
                 "tree delete dialog opened"
             );
         }
@@ -2023,11 +2052,7 @@ fn merged_sidebar_rows(
     }
 
     let mut rows = Vec::with_capacity(stored_rows.len() + live_sessions.len() + 8);
-    let non_ssh_sessions = live_sessions
-        .iter()
-        .filter(|session| session.kind != SessionKind::SshShell)
-        .collect::<Vec<_>>();
-    if !non_ssh_sessions.is_empty() {
+    if !live_sessions.is_empty() {
         rows.push(BrowserRow {
             kind: BrowserRowKind::Group,
             full_path: "__live_sessions__".to_string(),
@@ -2038,7 +2063,7 @@ fn merged_sidebar_rows(
             session_title: None,
             depth: 0,
             host_label: String::new(),
-            descendant_sessions: non_ssh_sessions.len(),
+            descendant_sessions: live_sessions.len(),
             expanded: expanded_paths.contains("__live_sessions__"),
             session_id: None,
             session_cwd: None,
@@ -2050,7 +2075,7 @@ fn merged_sidebar_rows(
                 "__live_agents__",
                 1,
                 expanded_paths,
-                non_ssh_sessions.iter().copied().filter(|session| {
+                live_sessions.iter().filter(|session| {
                     matches!(session.kind, SessionKind::Codex | SessionKind::CodexLiteLlm)
                 }),
             );
@@ -2060,10 +2085,19 @@ fn merged_sidebar_rows(
                 "__live_shells__",
                 1,
                 expanded_paths,
-                non_ssh_sessions
+                live_sessions
                     .iter()
-                    .copied()
                     .filter(|session| session.kind == SessionKind::Shell),
+            );
+            push_live_group_rows(
+                &mut rows,
+                "ssh sessions",
+                "__live_ssh__",
+                1,
+                expanded_paths,
+                live_sessions
+                    .iter()
+                    .filter(|session| session.kind == SessionKind::SshShell),
             );
         }
     }
@@ -2078,7 +2112,6 @@ fn merged_sidebar_rows(
                 label: ssh_target_machine_label(target),
                 health: MachineHealth::Cached,
                 scanned_sessions: Vec::new(),
-                live_sessions: Vec::new(),
             });
     }
     for machine in remote_machines {
@@ -2093,33 +2126,8 @@ fn merged_sidebar_rows(
                     RemoteMachineHealth::Offline => MachineHealth::Offline,
                 },
                 scanned_sessions: machine.sessions.clone(),
-                live_sessions: Vec::new(),
             },
         );
-    }
-    for session in live_sessions
-        .iter()
-        .filter(|session| session.kind == SessionKind::SshShell)
-    {
-        let machine_key = session
-            .ssh_target
-            .as_deref()
-            .map(machine_key_from_labelish)
-            .unwrap_or_else(|| machine_key_from_labelish(&session.host_label));
-        let entry = machine_rows
-            .entry(machine_key.clone())
-            .or_insert_with(|| SidebarRemoteMachine {
-                key: machine_key.clone(),
-                label: machine_label_text(&live_machine_label(session))
-                    .unwrap_or_else(|| live_machine_label(session)),
-                health: MachineHealth::Healthy,
-                scanned_sessions: Vec::new(),
-                live_sessions: Vec::new(),
-            });
-        entry.label = machine_label_text(&live_machine_label(session))
-            .unwrap_or_else(|| live_machine_label(session));
-        entry.health = MachineHealth::Healthy;
-        entry.live_sessions.push(session);
     }
     for machine in machine_rows.into_values() {
         push_remote_machine_rows(&mut rows, &machine, expanded_paths);
@@ -2129,23 +2137,11 @@ fn merged_sidebar_rows(
 }
 
 #[derive(Debug)]
-struct SidebarRemoteMachine<'a> {
+struct SidebarRemoteMachine {
     key: String,
     label: String,
     health: MachineHealth,
     scanned_sessions: Vec<RemoteScannedSession>,
-    live_sessions: Vec<&'a ManagedSessionView>,
-}
-
-fn live_machine_label(session: &ManagedSessionView) -> String {
-    let raw = if !session.host_label.trim().is_empty() {
-        session.host_label.trim()
-    } else if let Some(target) = session.ssh_target.as_deref() {
-        target.trim()
-    } else {
-        "remote"
-    };
-    format!("{raw} [ok]")
 }
 
 fn ssh_target_machine_label(target: &SshConnectTarget) -> String {
@@ -2164,7 +2160,7 @@ fn ssh_target_machine_label(target: &SshConnectTarget) -> String {
 
 fn push_remote_machine_rows(
     rows: &mut Vec<BrowserRow>,
-    machine: &SidebarRemoteMachine<'_>,
+    machine: &SidebarRemoteMachine,
     expanded_paths: &HashSet<String>,
 ) {
     let machine_label = apply_machine_health_suffix(&machine.label, machine.health);
@@ -2180,7 +2176,7 @@ fn push_remote_machine_rows(
         session_title: None,
         depth: 0,
         host_label: "live".to_string(),
-        descendant_sessions: machine.live_sessions.len() + machine.scanned_sessions.len(),
+        descendant_sessions: machine.scanned_sessions.len(),
         expanded: machine_expanded,
         session_id: None,
         session_cwd: None,
@@ -2189,11 +2185,6 @@ fn push_remote_machine_rows(
         return;
     }
 
-    let live_paths = machine
-        .live_sessions
-        .iter()
-        .map(|session| session.session_path.clone())
-        .collect::<HashSet<_>>();
     let mut emitted = HashMap::<String, usize>::new();
 
     for scanned in &machine.scanned_sessions {
@@ -2205,9 +2196,6 @@ fn push_remote_machine_rows(
             &mut emitted,
         );
         if !show_session {
-            continue;
-        }
-        if live_paths.contains(&scanned.session_path) {
             continue;
         }
         rows.push(BrowserRow {
@@ -2224,40 +2212,6 @@ fn push_remote_machine_rows(
             expanded: true,
             session_id: Some(scanned.session_id.clone()),
             session_cwd: Some(scanned.cwd.clone()),
-        });
-    }
-
-    let machine_name = machine_label_text(&machine_label).unwrap_or(machine.label.clone());
-    for session in &machine.live_sessions {
-        let cwd = session
-            .metadata
-            .iter()
-            .find(|entry| entry.label == "Cwd")
-            .map(|entry| entry.value.clone());
-        if let Some(cwd) = cwd.as_deref() {
-            if !push_remote_folder_rows(rows, &machine.key, cwd, expanded_paths, &mut emitted) {
-                continue;
-            }
-        }
-        let label = if session.title.trim().is_empty() || session.title.trim() == machine_name {
-            "terminal".to_string()
-        } else {
-            session.title.clone()
-        };
-        rows.push(BrowserRow {
-            kind: BrowserRowKind::Session,
-            full_path: session.session_path.clone(),
-            label,
-            detail_label: String::new(),
-            document_kind: None,
-            group_kind: None,
-            session_title: Some(session.title.clone()),
-            depth: cwd.as_deref().map(remote_session_depth).unwrap_or(1),
-            host_label: machine_name.clone(),
-            descendant_sessions: 1,
-            expanded: true,
-            session_id: Some(session.id.clone()),
-            session_cwd: cwd,
         });
     }
 }
@@ -2348,40 +2302,17 @@ fn queue_remove_saved_ssh_target(mut state: Signal<ShellState>, row: BrowserRow)
     };
 
     state.with_mut(|shell| {
-        shell.server_busy = true;
-        shell.last_action = format!("removing saved ssh target {}", row.label);
-        shell.close_context_menu();
-    });
-
-    let endpoint = state.read().bootstrap.server_endpoint.clone();
-    spawn(async move {
-        let request_machine_key = machine_key.clone();
-        let outcome = task::spawn_blocking(move || -> Result<(ServerUiSnapshot, Option<String>)> {
-            remove_ssh_target(&endpoint, &request_machine_key)
-        })
-        .await;
-
-        state.with_mut(|shell| match outcome {
-            Ok(result) => {
-                shell.apply_daemon_snapshot_result(result);
-                if !shell.server_busy {
-                    shell.push_notification(
-                        NotificationTone::Success,
-                        "SSH Target Removed",
-                        format!("Removed the saved SSH target for {}.", row.label),
-                    );
-                }
-            }
-            Err(error) => {
-                shell.server_busy = false;
-                shell.last_action = format!("remove ssh target failed: {error}");
-                shell.push_notification(
-                    NotificationTone::Error,
-                    "SSH Target Remove Failed",
-                    error.to_string(),
-                );
-            }
+        shell.select_tree_row(&row, TreeSelectionMode::Replace);
+        shell.pending_delete = Some(PendingDeleteDialog {
+            document_paths: Vec::new(),
+            group_paths: Vec::new(),
+            ssh_machine_keys: vec![machine_key],
+            labels: vec![row.label.clone()],
+            hard_delete: false,
         });
+        shell.close_context_menu();
+        shell.last_action = "confirm delete".to_string();
+        shell.refresh_tree_debug("open_delete_dialog_saved_ssh_target");
     });
 }
 
@@ -3265,13 +3196,16 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
         pending
     } else {
         let mut shell = state.write();
-        let (document_paths, group_paths, labels) = shell.selected_workspace_delete_paths();
-        if document_paths.is_empty() && group_paths.is_empty() {
+        let (document_paths, group_paths, mut labels) = shell.selected_workspace_delete_paths();
+        let (ssh_machine_keys, ssh_labels) = shell.selected_saved_ssh_target_machine_keys();
+        labels.extend(ssh_labels);
+        if document_paths.is_empty() && group_paths.is_empty() && ssh_machine_keys.is_empty() {
             return;
         }
         let pending = PendingDeleteDialog {
             document_paths,
             group_paths,
+            ssh_machine_keys,
             labels,
             hard_delete,
         };
@@ -3288,7 +3222,8 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
     state.with_mut(|shell| {
         shell.server_busy = true;
         shell.pending_delete = None;
-        let item_count = pending.document_paths.len() + pending.group_paths.len();
+        let item_count =
+            pending.document_paths.len() + pending.group_paths.len() + pending.ssh_machine_keys.len();
         shell.last_action = if hard_delete {
             format!("permanently deleting {item_count} item(s)")
         } else {
@@ -3300,40 +3235,59 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
 
     spawn(async move {
         let pending_for_task = pending.clone();
-        let outcome =
-            task::spawn_blocking(move || -> Result<(usize, yggterm_core::SessionNode)> {
+        let endpoint = state.read().bootstrap.server_endpoint.clone();
+        let outcome = task::spawn_blocking(
+            move || -> Result<(usize, Option<yggterm_core::SessionNode>, Option<(ServerUiSnapshot, Option<String>)>)> {
+                let mut deleted = 0usize;
+                let mut browser_tree = None;
+                let mut daemon_result = None;
+
+                if !pending_for_task.document_paths.is_empty()
+                    || !pending_for_task.group_paths.is_empty()
+                {
                 let store = SessionStore::open_or_init()?;
-                let deleted = store.delete_workspace_items(
+                    deleted += store.delete_workspace_items(
                     &pending_for_task.document_paths,
                     &pending_for_task.group_paths,
                 )?;
                 let settings = store.load_settings().unwrap_or_default();
-                let browser_tree = store.load_codex_tree(&settings)?;
-                Ok((deleted, browser_tree))
-            })
-            .await;
+                    browser_tree = Some(store.load_codex_tree(&settings)?);
+                }
+                for machine_key in &pending_for_task.ssh_machine_keys {
+                    daemon_result = Some(remove_ssh_target(&endpoint, machine_key)?);
+                    deleted += 1;
+                }
+                Ok((deleted, browser_tree, daemon_result))
+            },
+        )
+        .await;
 
         state.with_mut(|shell| match outcome {
-            Ok(Ok((deleted, browser_tree))) => {
-                let expanded_paths = shell.browser.expanded_paths();
-                shell.browser = SessionBrowserState::new(browser_tree);
-                shell.browser.restore_ui_state(&expanded_paths, None);
-                shell.selected_tree_paths.clear();
-                if let Some(path) = shell.browser.selected_path().map(ToOwned::to_owned) {
-                    shell.selected_tree_paths.insert(path.clone());
-                    shell.selection_anchor = Some(path);
-                } else {
-                    shell.selection_anchor = None;
+            Ok(Ok((deleted, maybe_browser_tree, maybe_daemon_result))) => {
+                if let Some(browser_tree) = maybe_browser_tree {
+                    let expanded_paths = shell.browser.expanded_paths();
+                    shell.browser = SessionBrowserState::new(browser_tree);
+                    shell.browser.restore_ui_state(&expanded_paths, None);
+                    shell.selected_tree_paths.clear();
+                    if let Some(path) = shell.browser.selected_path().map(ToOwned::to_owned) {
+                        shell.selected_tree_paths.insert(path.clone());
+                        shell.selection_anchor = Some(path);
+                    } else {
+                        shell.selection_anchor = None;
+                    }
+                    shell.sync_browser_settings();
                 }
-                shell.sync_browser_settings();
+                if let Some(result) = maybe_daemon_result {
+                    shell.apply_daemon_snapshot_result(Ok(result));
+                }
                 shell.server_busy = false;
                 shell.clear_drag_state();
-                shell.last_action = format!("deleted {deleted} workspace item(s)");
+                shell.last_action = format!("deleted {deleted} item(s)");
                 shell.refresh_tree_debug("delete_finished");
                 shell.push_notification(
                     NotificationTone::Success,
                     "Items Deleted",
-                    format!("Removed {deleted} item(s) from the workspace tree."),
+                    format!("Removed {deleted} item(s)."),
                 );
             }
             Ok(Err(error)) => {
@@ -4374,12 +4328,20 @@ fn app() -> Element {
 
     rsx! {
         div {
+            id: "yggterm-shell-root",
+            tabindex: "0",
             style: format!(
                 "position: fixed; inset: 0; overflow: hidden; border-radius:{}px; \
                  background-color:{}; background-image:{}; backdrop-filter: blur(30px) saturate(165%); \
                  -webkit-backdrop-filter: blur(30px) saturate(165%);",
                 shell_radius, snapshot.palette.shell, snapshot.palette.gradient
             ),
+            onkeydown: move |evt| {
+                if evt.key() == Key::Delete {
+                    let hard_delete = evt.modifiers().contains(Modifiers::SHIFT);
+                    queue_delete_selected_items(state, hard_delete);
+                }
+            },
             onmouseup: move |_| {
                 if !state.read().drag_paths.is_empty() {
                     queue_drop_current_drag_target(state);
@@ -4436,6 +4398,9 @@ fn app() -> Element {
                                 });
                                 continue_open
                             };
+                            let _ = document::eval(
+                                "document.getElementById('yggterm-shell-root')?.focus?.(); document.getElementById('yggterm-sidebar')?.focus?.();",
+                            );
                             if !should_continue {
                                 return;
                             }
@@ -4953,6 +4918,7 @@ fn Sidebar(
     let drag_active = !snapshot.drag_paths.is_empty();
     rsx! {
         div {
+            id: "yggterm-sidebar",
             style: format!(
                 "width:{}px; min-width:{}px; max-width:{}px; display:flex; flex-direction:column; \
                  background:{}; overflow:hidden; transition: opacity 180ms ease, transform 180ms ease; \
@@ -7938,7 +7904,23 @@ fn ContextMenuOverlay(
                     style: format!("padding:6px 12px 8px 12px; font-size:11px; font-weight:700; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.muted),
                     "{menu_title}"
                 }
-                if can_create_in_context {
+                if is_remote_machine_group_row(&row) {
+                    button {
+                        style: context_menu_action_style(palette, false),
+                        onclick: move |evt| on_refresh_remote_machine.call(evt),
+                        "Refresh Remote Sessions"
+                    }
+                    if can_remove_saved_ssh_target {
+                        div {
+                            style: format!("height:1px; margin:6px 4px; background:{}; opacity:0.7;", palette.border),
+                        }
+                        button {
+                            style: context_menu_action_style_destructive(palette),
+                            onclick: move |evt| on_remove_ssh_target.call(evt),
+                            "Delete…"
+                        }
+                    }
+                } else if can_create_in_context {
                     if can_move_selected_document {
                         button {
                             style: context_menu_action_style(palette, true),
@@ -7985,19 +7967,6 @@ fn ContextMenuOverlay(
                         onclick: move |evt| on_create_recipe.call(evt),
                         "New Terminal Plan"
                     }
-                } else if is_remote_machine_group_row(&row) {
-                    button {
-                        style: context_menu_action_style(palette, false),
-                        onclick: move |evt| on_refresh_remote_machine.call(evt),
-                        "Refresh Remote Sessions"
-                    }
-                    if can_remove_saved_ssh_target {
-                        button {
-                            style: context_menu_action_style_destructive(palette),
-                            onclick: move |evt| on_remove_ssh_target.call(evt),
-                            "Remove Saved SSH Target"
-                        }
-                    }
                 }
                 if is_local_stored_session_row(&row) {
                     button {
@@ -8028,8 +7997,11 @@ fn DeleteConfirmOverlay(
     on_cancel: EventHandler<MouseEvent>,
     on_confirm: EventHandler<MouseEvent>,
 ) -> Element {
-    let item_count = pending.document_paths.len() + pending.group_paths.len();
+    let item_count =
+        pending.document_paths.len() + pending.group_paths.len() + pending.ssh_machine_keys.len();
     let preview = pending.labels.iter().take(4).cloned().collect::<Vec<_>>();
+    let deleting_ssh_targets =
+        !pending.ssh_machine_keys.is_empty() && pending.document_paths.is_empty() && pending.group_paths.is_empty();
     rsx! {
         div {
             style: "position:fixed; inset:0; z-index:95; display:flex; align-items:center; justify-content:center; background:rgba(230,239,248,0.28); backdrop-filter: blur(18px) saturate(130%); -webkit-backdrop-filter: blur(18px) saturate(130%);",
@@ -8057,9 +8029,17 @@ fn DeleteConfirmOverlay(
                     div {
                         style: format!("font-size:12px; line-height:1.6; color:{};", palette.muted),
                         if pending.hard_delete {
-                            "This will permanently remove the selected items from the workspace tree."
+                            if deleting_ssh_targets {
+                                "This will permanently remove the selected SSH targets from the sidebar."
+                            } else {
+                                "This will permanently remove the selected items from the workspace tree."
+                            }
                         } else {
-                            "This will remove the selected items from the workspace tree. Hold Shift while pressing Delete to skip this dialog."
+                            if deleting_ssh_targets {
+                                "This will remove the selected SSH targets from the sidebar. Hold Shift while pressing Delete to skip this dialog."
+                            } else {
+                                "This will remove the selected items from the workspace tree. Hold Shift while pressing Delete to skip this dialog."
+                            }
                         }
                     }
                 }
@@ -9174,6 +9154,79 @@ mod tests {
             Some("pi-raspberry")
         );
         assert_eq!(saved_ssh_target_machine_key(&row, &[]), None);
+    }
+
+    #[test]
+    fn merged_sidebar_rows_do_not_render_live_ssh_sessions_under_machine_roots() {
+        let expanded_paths = HashSet::from([
+            "__live_sessions__".to_string(),
+            "__live_ssh__".to_string(),
+            "__remote_machine__/dev".to_string(),
+        ]);
+        let rows = merged_sidebar_rows(
+            &[],
+            &[RemoteMachineSnapshot {
+                machine_key: "dev".to_string(),
+                label: "dev".to_string(),
+                ssh_target: "dev".to_string(),
+                prefix: None,
+                health: RemoteMachineHealth::Healthy,
+                sessions: Vec::new(),
+            }],
+            &[SshConnectTarget {
+                label: "dev".to_string(),
+                kind: SessionKind::SshShell,
+                ssh_target: "dev".to_string(),
+                prefix: None,
+                cwd: None,
+            }],
+            &[ManagedSessionView {
+                id: "session-1".to_string(),
+                session_path: "ssh://dev/session-1".to_string(),
+                title: "dev".to_string(),
+                kind: SessionKind::SshShell,
+                host_label: "dev".to_string(),
+                source: yggterm_server::SessionSource::LiveSsh,
+                backend: TerminalBackend::Xterm,
+                bridge_available: false,
+                launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+                remote_deploy_state: yggterm_server::RemoteDeployState::Ready,
+                launch_command: "ssh dev".to_string(),
+                status_line: "attached".to_string(),
+                terminal_lines: Vec::new(),
+                rendered_sections: Vec::new(),
+                preview: yggterm_server::SessionPreview {
+                    summary: Vec::new(),
+                    blocks: Vec::new(),
+                },
+                metadata: Vec::new(),
+                terminal_process_id: None,
+                terminal_window_id: None,
+                terminal_host_token: None,
+                terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+                embedded_surface_id: None,
+                embedded_surface_detail: None,
+                last_launch_error: None,
+                last_window_error: None,
+                ssh_target: Some("dev".to_string()),
+                ssh_prefix: None,
+            }],
+            &expanded_paths,
+        );
+
+        assert!(rows.iter().any(|row| row.full_path == "__live_ssh__"));
+        assert!(rows.iter().any(|row| row.full_path == "ssh://dev/session-1"));
+        let machine_rows = rows
+            .iter()
+            .filter(|row| row.full_path.starts_with("__remote_machine__/dev") || row.host_label == "dev")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            machine_rows
+                .iter()
+                .filter(|row| row.kind == BrowserRowKind::Session)
+                .count(),
+            0
+        );
     }
 }
 
