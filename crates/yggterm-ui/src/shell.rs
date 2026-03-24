@@ -1428,44 +1428,48 @@ fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force:
                     "generated title".to_string()
                 };
                 shell.sync_browser_settings();
-                shell.push_notification(
-                    NotificationTone::Success,
-                    if force {
-                        "Title Regenerated"
-                    } else {
-                        "Title Generated"
-                    },
-                    format!("Session is now titled “{title}”."),
-                );
+                if force {
+                    shell.push_notification(
+                        NotificationTone::Success,
+                        "Title Regenerated",
+                        format!("Session is now titled “{title}”."),
+                    );
+                }
             }
             Ok(Ok((None, _))) => {
                 shell.title_requests_in_flight.remove(&session_path);
                 warn!(session_path=%row.full_path, "title generation produced no usable title");
-                shell.push_notification(
-                    NotificationTone::Warning,
-                    "No Title Generated",
-                    "The model did not return a usable short title for this session.",
-                );
+                if force {
+                    shell.push_notification(
+                        NotificationTone::Warning,
+                        "No Title Generated",
+                        "The model did not return a usable short title for this session.",
+                    );
+                }
             }
             Ok(Err(error)) => {
                 shell.title_requests_in_flight.remove(&session_path);
                 shell.last_action = format!("title generation failed: {error}");
                 warn!(session_path=%row.full_path, error=%error, "title generation failed");
-                shell.push_notification(
-                    NotificationTone::Error,
-                    "Title Generation Failed",
-                    error.to_string(),
-                );
+                if force {
+                    shell.push_notification(
+                        NotificationTone::Error,
+                        "Title Generation Failed",
+                        error.to_string(),
+                    );
+                }
             }
             Err(error) => {
                 shell.title_requests_in_flight.remove(&session_path);
                 shell.last_action = format!("title generation task failed: {error}");
                 warn!(session_path=%row.full_path, error=%error, "title generation task join failed");
-                shell.push_notification(
-                    NotificationTone::Error,
-                    "Title Task Failed",
-                    error.to_string(),
-                );
+                if force {
+                    shell.push_notification(
+                        NotificationTone::Error,
+                        "Title Task Failed",
+                        error.to_string(),
+                    );
+                }
             }
         });
     });
@@ -1959,19 +1963,9 @@ fn spawn_background_remote_machine_refresh(mut state: Signal<ShellState>, machin
                 }
                 Ok(Err(error)) => {
                     shell.last_action = format!("remote refresh failed: {error}");
-                    shell.push_notification(
-                        NotificationTone::Error,
-                        "Remote Refresh Failed",
-                        format!("{machine_key}: {error}"),
-                    );
                 }
                 Err(error) => {
                     shell.last_action = format!("remote refresh task failed: {error}");
-                    shell.push_notification(
-                        NotificationTone::Error,
-                        "Remote Refresh Task Failed",
-                        format!("{machine_key}: {error}"),
-                    );
                 }
             }
         });
