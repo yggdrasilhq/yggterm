@@ -48,18 +48,15 @@ pub struct BrowserMetrics {
 
 impl SessionBrowserState {
     pub fn new(root: SessionNode) -> Self {
+        let expanded_paths = default_level_one_expanded_paths(&root);
         let mut this = Self {
             root,
             filter_query: String::new(),
-            expanded_paths: HashSet::new(),
+            expanded_paths,
             rows: Vec::new(),
             selected_path: None,
             metrics: BrowserMetrics::default(),
         };
-        if !this.root.children.is_empty() {
-            this.expanded_paths
-                .insert(this.root.path.display().to_string());
-        }
         this.rebuild_rows();
         this.selected_path = first_session_path(&this.root);
         this
@@ -89,6 +86,10 @@ impl SessionBrowserState {
         paths
     }
 
+    pub fn expanded_path_set(&self) -> HashSet<String> {
+        self.expanded_paths.clone()
+    }
+
     pub fn selected_row(&self) -> Option<&BrowserRow> {
         self.selected_path
             .as_deref()
@@ -108,11 +109,13 @@ impl SessionBrowserState {
     }
 
     pub fn restore_ui_state(&mut self, expanded_paths: &[String], selected_path: Option<&str>) {
-        self.expanded_paths = expanded_paths.iter().cloned().collect();
-        if !self.root.children.is_empty() {
-            self.expanded_paths
-                .insert(self.root.path.display().to_string());
-        }
+        self.expanded_paths = default_level_one_expanded_paths(&self.root);
+        self.expanded_paths.extend(
+            expanded_paths
+                .iter()
+                .filter(|path| is_level_one_group_path(&self.root, path))
+                .cloned(),
+        );
         self.rebuild_rows();
         if let Some(path) = selected_path {
             self.select_path(path.to_string());
@@ -126,6 +129,20 @@ impl SessionBrowserState {
         }
         self.rebuild_rows();
         self.ensure_selection();
+    }
+
+    pub fn ensure_expanded_paths<I>(&mut self, paths: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut changed = false;
+        for path in paths {
+            changed |= self.expanded_paths.insert(path);
+        }
+        if changed {
+            self.rebuild_rows();
+            self.ensure_selection();
+        }
     }
 
     pub fn total_sessions(&self) -> usize {
@@ -218,6 +235,25 @@ impl SessionBrowserState {
         self.selected_path = Some(self.rows[next_ix].full_path.clone());
         Some(next_ix)
     }
+}
+
+fn default_level_one_expanded_paths(root: &SessionNode) -> HashSet<String> {
+    let mut expanded_paths = HashSet::new();
+    if !root.children.is_empty() {
+        expanded_paths.insert(root.path.display().to_string());
+        for child in &root.children {
+            if child.kind == SessionNodeKind::Group {
+                expanded_paths.insert(child.path.display().to_string());
+            }
+        }
+    }
+    expanded_paths
+}
+
+fn is_level_one_group_path(root: &SessionNode, path: &str) -> bool {
+    root.children.iter().any(|child| {
+        child.kind == SessionNodeKind::Group && child.path.display().to_string() == path
+    })
 }
 
 fn first_session_path(node: &SessionNode) -> Option<String> {
