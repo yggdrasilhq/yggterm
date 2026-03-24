@@ -432,6 +432,13 @@ That shared header may contain:
 
 Generated UI copy is not static decoration. It should be treated as refreshable state because long-running sessions drift over time.
 
+Hash-like fallback titles are placeholders, not real metadata.
+
+- A fallback short hash should only be used until generated copy exists.
+- Short-hash labels must widen until unique among visible session siblings or the active session set.
+- Two visible sessions should never share the same temporary hash label.
+- Keep this uniqueness rule reusable so sibling apps such as `codex-session-tui` can share the same session-label behavior.
+
 The refresh affordance should:
 
 - be lightweight and inline, not a loud primary button

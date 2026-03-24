@@ -485,8 +485,24 @@ fn unique_session_short_ids(root: &SessionNode) -> HashMap<String, String> {
     let mut sessions = Vec::<(String, String)>::new();
     collect_session_ids(root, &mut sessions);
 
+    unique_session_short_ids_for_pairs(&sessions)
+}
+
+/// Resolve the shortest visible per-session identifier that is unique within the
+/// current session set.
+///
+/// The UI starts from the compact trailing hash users already recognize, but it
+/// must widen until unique. If two sessions still collide all the way through
+/// the shared tail, this falls back to the full session id rather than letting
+/// two visible rows share the same short hash.
+///
+/// Keep this rule portable: `codex-session-tui` and any future browser/tree UI
+/// should use the same widening behavior so placeholder hash titles never
+/// collide in one visible list.
+pub fn unique_session_short_ids_for_pairs(sessions: &[(String, String)]) -> HashMap<String, String> {
     let mut out = HashMap::new();
-    for (path, session_id) in &sessions {
+
+    for (path, session_id) in sessions {
         let id_len = session_id.chars().count();
         let mut width = 7usize.min(id_len).max(1);
         while width < id_len {
