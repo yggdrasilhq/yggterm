@@ -494,18 +494,38 @@ fn request_litellm_title(settings: &AppSettings, context: &str) -> Result<String
         ]
     });
 
-    let response = client
+    let response = match client
         .post(url)
         .bearer_auth(settings.litellm_api_key.trim())
         .json(&body)
         .send()
-        .context("LiteLLM request failed")?
-        .error_for_status()
-        .context("LiteLLM returned an error status")?;
+    {
+        Ok(response) => match response.error_for_status() {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(title) = heuristic_title_from_context(context) {
+                    return Ok(title);
+                }
+                return Err(error).context("LiteLLM returned an error status");
+            }
+        },
+        Err(error) => {
+            if let Some(title) = heuristic_title_from_context(context) {
+                return Ok(title);
+            }
+            return Err(error).context("LiteLLM request failed");
+        }
+    };
 
-    let value: Value = response
-        .json()
-        .context("failed to parse LiteLLM response")?;
+    let value: Value = match response.json() {
+        Ok(value) => value,
+        Err(error) => {
+            if let Some(title) = heuristic_title_from_context(context) {
+                return Ok(title);
+            }
+            return Err(error).context("failed to parse LiteLLM response");
+        }
+    };
     let title = extract_completion_text(&value)
         .or_else(|| extract_reasoning_title(&value))
         .or_else(|| heuristic_title_from_context(context))
