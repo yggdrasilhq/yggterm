@@ -143,6 +143,8 @@ pub struct RemoteScannedSession {
     pub user_message_count: usize,
     pub assistant_message_count: usize,
     pub title_hint: String,
+    #[serde(default)]
+    pub recent_context: String,
     pub storage_path: String,
 }
 
@@ -551,6 +553,20 @@ impl YggtermServer {
         removed
     }
 
+    pub fn set_session_title_hint(&mut self, session_path: &str, title: &str) {
+        if let Some(session) = self.sessions.get_mut(session_path) {
+            session.title = title.to_string();
+        }
+        for machine in &mut self.remote_machines {
+            for scanned in &mut machine.sessions {
+                if scanned.session_path == session_path {
+                    scanned.title_hint = title.to_string();
+                    return;
+                }
+            }
+        }
+    }
+
     pub fn remote_machines(&self) -> &[RemoteMachineSnapshot] {
         &self.remote_machines
     }
@@ -843,11 +859,6 @@ impl YggtermServer {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("remote machine not found: {machine_key}"))?;
         let session_path = remote_scanned_session_path(machine_key, session_id);
-        if self.sessions.contains_key(&session_path) {
-            self.focus_live_session(&session_path);
-            return Ok(session_path);
-        }
-
         let target = SshConnectTarget {
             label: machine.label.clone(),
             kind: SessionKind::SshShell,
@@ -855,26 +866,63 @@ impl YggtermServer {
             prefix: machine.prefix.clone(),
             cwd: cwd.map(ToOwned::to_owned),
         };
+        let remote_command = remote_resume_command(session_id, cwd, target.prefix.as_deref());
+        let resolved_title = title_hint
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| short_session_id(session_id));
+        if self.sessions.contains_key(&session_path) {
+            if let Some(session) = self.sessions.get_mut(&session_path) {
+                session.session_path = session_path.clone();
+                session.title = resolved_title.clone();
+                session.host_label = machine.label.clone();
+                session.launch_command = format!(
+                    "ssh -tt {} {}",
+                    target.ssh_target,
+                    shell_single_quote(&remote_command)
+                );
+                session.terminal_lines = vec![
+                    format!("$ {}", session.launch_command),
+                    format!("Queue remote Codex resume {session_id}"),
+                    format!("Target host: {}", target.ssh_target),
+                    format!("Workspace: {}", cwd.unwrap_or("<unknown>")),
+                    "Daemon PTY: request main viewport terminal stream".to_string(),
+                ];
+                upsert_session_metadata(&mut session.metadata, "Source", "remote-codex".to_string());
+                upsert_session_metadata(&mut session.metadata, "Host", target.ssh_target.clone());
+                upsert_session_metadata(
+                    &mut session.metadata,
+                    "Restore",
+                    format!("codex resume {session_id}"),
+                );
+                if let Some(cwd) = cwd {
+                    upsert_session_metadata(&mut session.metadata, "Cwd", cwd.to_string());
+                }
+                upsert_session_metadata(
+                    &mut session.metadata,
+                    "Status",
+                    "remote resume queued".to_string(),
+                );
+            }
+            self.focus_live_session(&session_path);
+            self.request_terminal_launch_for_path(&session_path);
+            return Ok(session_path);
+        }
         self.insert_live_session(
             &session_path,
             session_id,
             SessionKind::SshShell,
             &target,
-            Some(
-                title_hint
-                    .map(ToOwned::to_owned)
-                    .unwrap_or_else(|| short_session_id(session_id)),
-            ),
+            Some(resolved_title.clone()),
         );
         if let Some(session) = self.sessions.get_mut(&session_path) {
-            let remote_command = remote_resume_command(session_id, cwd, target.prefix.as_deref());
             session.session_path = session_path.clone();
-            session.title = title_hint
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| short_session_id(session_id));
+            session.title = resolved_title;
             session.host_label = machine.label.clone();
-            session.launch_command =
-                format!("ssh {} {}", target.ssh_target, shell_single_quote(&remote_command));
+            session.launch_command = format!(
+                "ssh -tt {} {}",
+                target.ssh_target,
+                shell_single_quote(&remote_command)
+            );
             session.terminal_lines = vec![
                 format!("$ {}", session.launch_command),
                 format!("Queue remote Codex resume {session_id}"),
@@ -1385,6 +1433,8 @@ struct RemoteSummaryLine {
     user_message_count: usize,
     #[serde(default)]
     assistant_message_count: usize,
+    #[serde(default)]
+    recent_context: String,
 }
 
 fn default_unknown() -> String {
@@ -1406,6 +1456,45 @@ def summarize(path):
     event_count = 0
     user_count = 0
     assistant_count = 0
+    snippets = []
+    def normalize_lines(text):
+        if not text:
+            return []
+        if isinstance(text, str):
+            return [line.strip() for line in text.splitlines() if line.strip()]
+        return []
+    def extract_lines(payload):
+        lines = []
+        content = payload.get("content")
+        if isinstance(content, str):
+            lines.extend(normalize_lines(content))
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, str):
+                    lines.extend(normalize_lines(item))
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                text = (
+                    item.get("text")
+                    or item.get("input_text")
+                    or item.get("output_text")
+                    or item.get("content")
+                    or item.get("value")
+                )
+                lines.extend(normalize_lines(text))
+        return lines
+    def push_message(payload):
+        role = payload.get("role") or "assistant"
+        if role in ("user", "developer"):
+            label = "USER"
+        elif role == "assistant":
+            label = "ASSISTANT"
+        else:
+            label = "SYSTEM"
+        lines = extract_lines(payload)
+        if lines:
+            snippets.append(f"{label}: {' '.join(lines)}")
     try:
         stat = path.stat()
         modified_epoch = int(stat.st_mtime)
@@ -1433,6 +1522,7 @@ def summarize(path):
                             user_count += 1
                         elif role == "assistant":
                             assistant_count += 1
+                        push_message(payload)
                 elif ty == "compacted":
                     payload = value.get("payload") or {}
                     for msg in payload.get("replacement_history") or []:
@@ -1443,6 +1533,7 @@ def summarize(path):
                             user_count += 1
                         elif role == "assistant":
                             assistant_count += 1
+                        push_message(msg or {})
     except Exception:
         return None
     return {
@@ -1454,6 +1545,7 @@ def summarize(path):
         "event_count": event_count,
         "user_message_count": user_count,
         "assistant_message_count": assistant_count,
+        "recent_context": "\n".join(snippets[-6:]),
     }
 
 codex_home = os.path.expanduser(sys.argv[1] if len(sys.argv) > 1 else "~/.codex")
@@ -1538,6 +1630,7 @@ fn scan_remote_machine_sessions(
             user_message_count: summary.user_message_count,
             assistant_message_count: summary.assistant_message_count,
             title_hint: short_session_id(&summary.id),
+            recent_context: summary.recent_context,
             storage_path: summary.rollout_path,
         });
     }
@@ -2102,7 +2195,7 @@ fn build_live_session(
             ),
             SessionKind::SshShell => (
                 format!(
-                    "ssh {} {}",
+                    "ssh -tt {} {}",
                     target.ssh_target,
                     shell_single_quote(&remote_command)
                 ),

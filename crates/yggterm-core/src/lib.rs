@@ -304,6 +304,21 @@ impl SessionStore {
         resolver.generate_for_session(settings, &identity.session_id, &identity.cwd, &path, force)
     }
 
+    pub fn generate_title_for_context(
+        &self,
+        settings: &AppSettings,
+        session_id: &str,
+        cwd: &str,
+        context: &str,
+        force: bool,
+    ) -> Result<Option<String>> {
+        if !litellm_settings_ready(settings) {
+            return Ok(None);
+        }
+        let resolver = SessionTitleResolver::new(&self.home)?;
+        resolver.generate_for_context(settings, session_id, cwd, context, force)
+    }
+
     pub fn resolve_precis_for_session_path(&self, session_path: &str) -> Result<Option<String>> {
         let path = PathBuf::from(session_path);
         if !path.exists() || !is_codex_session_file(&path) {
@@ -358,6 +373,21 @@ impl SessionStore {
         )
     }
 
+    pub fn generate_precis_for_context(
+        &self,
+        settings: &AppSettings,
+        session_id: &str,
+        cwd: &str,
+        context: &str,
+        force: bool,
+    ) -> Result<Option<String>> {
+        if !litellm_settings_ready(settings) {
+            return Ok(None);
+        }
+        let resolver = SessionTitleResolver::new(&self.home)?;
+        resolver.generate_precis_for_context(settings, session_id, cwd, context, force)
+    }
+
     pub fn generate_summary_for_session_path(
         &self,
         settings: &AppSettings,
@@ -384,6 +414,21 @@ impl SessionStore {
             &path,
             force,
         )
+    }
+
+    pub fn generate_summary_for_context(
+        &self,
+        settings: &AppSettings,
+        session_id: &str,
+        cwd: &str,
+        context: &str,
+        force: bool,
+    ) -> Result<Option<String>> {
+        if !litellm_settings_ready(settings) {
+            return Ok(None);
+        }
+        let resolver = SessionTitleResolver::new(&self.home)?;
+        resolver.generate_summary_for_context(settings, session_id, cwd, context, force)
     }
 }
 

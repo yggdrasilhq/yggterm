@@ -133,6 +133,7 @@ struct ShellState {
     last_tree_debug: String,
     generated_precis: BTreeMap<String, String>,
     generated_summaries: BTreeMap<String, String>,
+    title_requests_in_flight: HashSet<String>,
     precis_requests_in_flight: HashSet<String>,
     summary_requests_in_flight: HashSet<String>,
     remote_machine_refresh_requests: HashSet<String>,
@@ -371,6 +372,7 @@ impl ShellState {
             last_tree_debug: "tree debug idle".to_string(),
             generated_precis: BTreeMap::new(),
             generated_summaries: BTreeMap::new(),
+            title_requests_in_flight: HashSet::new(),
             precis_requests_in_flight: HashSet::new(),
             summary_requests_in_flight: HashSet::new(),
             remote_machine_refresh_requests: HashSet::new(),
@@ -1254,7 +1256,36 @@ impl ShellState {
 }
 
 fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force: bool) {
-    if !is_local_stored_session_row(&row) {
+    let session_path = row.full_path.clone();
+    let remote_context = if is_remote_scanned_sidebar_row(&row) {
+        state.read().server.remote_machines().iter().find_map(|machine| {
+            machine
+                .sessions
+                .iter()
+                .find(|session| session.session_path == row.full_path)
+                .map(|session| {
+                    (
+                        session.session_id.clone(),
+                        session.cwd.clone(),
+                        session.recent_context.clone(),
+                    )
+                })
+        })
+    } else {
+        None
+    };
+    if !is_local_stored_session_row(&row) && remote_context.is_none() {
+        return;
+    }
+    let should_start = state.with_mut(|shell| {
+        if shell.title_requests_in_flight.contains(&session_path) {
+            false
+        } else {
+            shell.title_requests_in_flight.insert(session_path.clone());
+            true
+        }
+    });
+    if !should_start {
         return;
     }
 
@@ -1263,6 +1294,9 @@ fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force:
         || settings.litellm_api_key.trim().is_empty()
         || settings.interface_llm_model.trim().is_empty()
     {
+        state.with_mut(|shell| {
+            shell.title_requests_in_flight.remove(&session_path);
+        });
         state.with_mut(|shell| {
             shell.push_notification(
                 NotificationTone::Warning,
@@ -1285,42 +1319,59 @@ fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force:
     spawn(async move {
         let row_for_task = row.clone();
         let settings_for_task = settings.clone();
+        let remote_context_for_task = remote_context.clone();
         let outcome = task::spawn_blocking(
-            move || -> Result<(Option<String>, yggterm_core::SessionNode)> {
+            move || -> Result<(Option<String>, Option<yggterm_core::SessionNode>)> {
                 info!(session_path=%row_for_task.full_path, force, "running title generation task");
                 let store = SessionStore::open_or_init()?;
-                let title = store.generate_title_for_session_path(
-                    &settings_for_task,
-                    &row_for_task.full_path,
-                    force,
-                )?;
-                let browser_tree = store.load_codex_tree(&settings_for_task)?;
-                Ok((title, browser_tree))
+                if let Some((session_id, cwd, context)) = remote_context_for_task {
+                    let title = store.generate_title_for_context(
+                        &settings_for_task,
+                        &session_id,
+                        &cwd,
+                        &context,
+                        force,
+                    )?;
+                    Ok((title, None))
+                } else {
+                    let title = store.generate_title_for_session_path(
+                        &settings_for_task,
+                        &row_for_task.full_path,
+                        force,
+                    )?;
+                    let browser_tree = store.load_codex_tree(&settings_for_task)?;
+                    Ok((title, Some(browser_tree)))
+                }
             },
         )
         .await;
 
         state.with_mut(|shell| match outcome {
             Ok(Ok((Some(title), browser_tree))) => {
-                let selected_path = shell.browser.selected_path().map(str::to_string);
-                let expanded_paths = shell.browser.expanded_paths();
-                let filter_query = shell.search_query.clone();
-                shell.browser = SessionBrowserState::new(browser_tree);
-                shell.browser.restore_ui_state(
-                    &expanded_paths,
-                    selected_path
-                        .as_deref()
-                        .or(Some(row.full_path.as_str())),
-                );
-                shell.browser.set_filter_query(filter_query);
-                shell.apply_daemon_snapshot_result(open_stored_session(
-                    &shell.bootstrap.server_endpoint,
-                    SessionKind::Codex,
-                    &row.full_path,
-                    row.session_id.as_deref(),
-                    row.session_cwd.as_deref(),
-                    Some(&title),
-                ));
+                shell.title_requests_in_flight.remove(&session_path);
+                if let Some(browser_tree) = browser_tree {
+                    let selected_path = shell.browser.selected_path().map(str::to_string);
+                    let expanded_paths = shell.browser.expanded_paths();
+                    let filter_query = shell.search_query.clone();
+                    shell.browser = SessionBrowserState::new(browser_tree);
+                    shell.browser.restore_ui_state(
+                        &expanded_paths,
+                        selected_path
+                            .as_deref()
+                            .or(Some(row.full_path.as_str())),
+                    );
+                    shell.browser.set_filter_query(filter_query);
+                    shell.apply_daemon_snapshot_result(open_stored_session(
+                        &shell.bootstrap.server_endpoint,
+                        SessionKind::Codex,
+                        &row.full_path,
+                        row.session_id.as_deref(),
+                        row.session_cwd.as_deref(),
+                        Some(&title),
+                    ));
+                } else {
+                    shell.server.set_session_title_hint(&row.full_path, &title);
+                }
                 shell.last_action = if force {
                     "regenerated title".to_string()
                 } else {
@@ -1338,6 +1389,7 @@ fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force:
                 );
             }
             Ok(Ok((None, _))) => {
+                shell.title_requests_in_flight.remove(&session_path);
                 warn!(session_path=%row.full_path, "title generation produced no usable title");
                 shell.push_notification(
                     NotificationTone::Warning,
@@ -1346,6 +1398,7 @@ fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force:
                 );
             }
             Ok(Err(error)) => {
+                shell.title_requests_in_flight.remove(&session_path);
                 shell.last_action = format!("title generation failed: {error}");
                 warn!(session_path=%row.full_path, error=%error, "title generation failed");
                 shell.push_notification(
@@ -1355,6 +1408,7 @@ fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force:
                 );
             }
             Err(error) => {
+                shell.title_requests_in_flight.remove(&session_path);
                 shell.last_action = format!("title generation task failed: {error}");
                 warn!(session_path=%row.full_path, error=%error, "title generation task join failed");
                 shell.push_notification(
@@ -1371,7 +1425,7 @@ fn queue_active_session_title_generation(state: Signal<ShellState>, force: bool)
     let Some(session) = state.read().server.active_session().cloned() else {
         return;
     };
-    if !session.kind.is_agent() {
+    if !supports_generated_session_copy(&session) {
         return;
     }
     let row = BrowserRow {
@@ -1393,11 +1447,14 @@ fn queue_active_session_title_generation(state: Signal<ShellState>, force: bool)
 }
 
 fn spawn_precis_generation(mut state: Signal<ShellState>, session: ManagedSessionView, force: bool) {
-    if !session.kind.is_agent() {
+    if !supports_generated_session_copy(&session) {
         return;
     }
 
     let session_path = session.session_path.clone();
+    let session_id = session.id.clone();
+    let cwd = metadata_value(&session, "Cwd");
+    let remote_context = remote_scanned_session_context(&state.read().server, &session_path);
     let settings = state.read().settings.clone();
     if settings.litellm_endpoint.trim().is_empty()
         || settings.litellm_api_key.trim().is_empty()
@@ -1425,9 +1482,21 @@ fn spawn_precis_generation(mut state: Signal<ShellState>, session: ManagedSessio
 
     spawn(async move {
         let path_for_task = session_path.clone();
+        let session_id_for_task = session_id.clone();
+        let cwd_for_task = cwd.clone();
+        let remote_context_for_task = remote_context.clone();
         let settings_for_task = settings.clone();
         let outcome = task::spawn_blocking(move || -> Result<Option<String>> {
             let store = SessionStore::open_or_init()?;
+            if let Some(context) = remote_context_for_task {
+                return store.generate_precis_for_context(
+                    &settings_for_task,
+                    &session_id_for_task,
+                    &cwd_for_task,
+                    &context,
+                    force,
+                );
+            }
             if !force
                 && let Some(precis) = store.resolve_precis_for_session_path(&path_for_task)?
             {
@@ -1477,11 +1546,14 @@ fn spawn_precis_generation(mut state: Signal<ShellState>, session: ManagedSessio
 }
 
 fn spawn_summary_generation(mut state: Signal<ShellState>, session: ManagedSessionView, force: bool) {
-    if !session.kind.is_agent() {
+    if !supports_generated_session_copy(&session) {
         return;
     }
 
     let session_path = session.session_path.clone();
+    let session_id = session.id.clone();
+    let cwd = metadata_value(&session, "Cwd");
+    let remote_context = remote_scanned_session_context(&state.read().server, &session_path);
     let settings = state.read().settings.clone();
     if settings.litellm_endpoint.trim().is_empty()
         || settings.litellm_api_key.trim().is_empty()
@@ -1509,9 +1581,21 @@ fn spawn_summary_generation(mut state: Signal<ShellState>, session: ManagedSessi
 
     spawn(async move {
         let path_for_task = session_path.clone();
+        let session_id_for_task = session_id.clone();
+        let cwd_for_task = cwd.clone();
+        let remote_context_for_task = remote_context.clone();
         let settings_for_task = settings.clone();
         let outcome = task::spawn_blocking(move || -> Result<Option<String>> {
             let store = SessionStore::open_or_init()?;
+            if let Some(context) = remote_context_for_task {
+                return store.generate_summary_for_context(
+                    &settings_for_task,
+                    &session_id_for_task,
+                    &cwd_for_task,
+                    &context,
+                    force,
+                );
+            }
             if !force
                 && let Some(summary) = store.resolve_summary_for_session_path(&path_for_task)?
             {
@@ -1793,9 +1877,19 @@ fn spawn_background_remote_machine_refresh(mut state: Signal<ShellState>, machin
                 }
                 Ok(Err(error)) => {
                     shell.last_action = format!("remote refresh failed: {error}");
+                    shell.push_notification(
+                        NotificationTone::Error,
+                        "Remote Refresh Failed",
+                        format!("{machine_key}: {error}"),
+                    );
                 }
                 Err(error) => {
                     shell.last_action = format!("remote refresh task failed: {error}");
+                    shell.push_notification(
+                        NotificationTone::Error,
+                        "Remote Refresh Task Failed",
+                        format!("{machine_key}: {error}"),
+                    );
                 }
             }
         });
@@ -2036,6 +2130,30 @@ fn saved_ssh_target_machine_key(row: &BrowserRow, ssh_targets: &[SshConnectTarge
 
 fn is_local_stored_session_row(row: &BrowserRow) -> bool {
     row.kind == BrowserRowKind::Session && !is_live_sidebar_row(row) && !is_remote_scanned_sidebar_row(row)
+}
+
+fn supports_generated_session_copy(session: &ManagedSessionView) -> bool {
+    session.kind.is_agent() || session.session_path.starts_with("remote-session://")
+}
+
+fn remote_scanned_session_context(server: &YggtermServer, session_path: &str) -> Option<String> {
+    server.remote_machines().iter().find_map(|machine| {
+        machine
+            .sessions
+            .iter()
+            .find(|session| session.session_path == session_path)
+            .map(|session| session.recent_context.clone())
+    })
+}
+
+fn looks_like_generated_fallback_title(title: &str) -> bool {
+    let compact = title.trim();
+    compact.len() == 8
+        && compact.starts_with('Q')
+        && compact
+            .chars()
+            .skip(1)
+            .all(|ch| ch.is_ascii_hexdigit())
 }
 
 fn parse_remote_scanned_session_path(path: &str) -> Option<(&str, &str)> {
@@ -4164,12 +4282,32 @@ fn app() -> Element {
         let Some(session) = active else {
             return;
         };
+        let has_remote_title_context = if session.session_path.starts_with("remote-session://") {
+            remote_scanned_session_context(&state.read().server, &session.session_path)
+                .is_some_and(|context| !context.trim().is_empty())
+        } else {
+            false
+        };
+        let settings_ready = {
+            let settings = &state.read().settings;
+            !settings.litellm_endpoint.trim().is_empty()
+                && !settings.litellm_api_key.trim().is_empty()
+                && !settings.interface_llm_model.trim().is_empty()
+        };
+        if supports_generated_session_copy(&session)
+            && looks_like_generated_fallback_title(&session.title)
+            && (!session.session_path.starts_with("remote-session://") || has_remote_title_context)
+            && settings_ready
+        {
+            queue_active_session_title_generation(state, false);
+        }
         let has_precis = state
             .read()
             .generated_precis
             .contains_key(&session.session_path);
-        if has_precis {
-        } else {
+        if !has_precis
+            && (!session.session_path.starts_with("remote-session://") || has_remote_title_context)
+        {
             spawn_precis_generation(state, session.clone(), false);
         }
         let has_summary = state
@@ -4177,6 +4315,9 @@ fn app() -> Element {
             .generated_summaries
             .contains_key(&session.session_path);
         if has_summary {
+            return;
+        }
+        if session.session_path.starts_with("remote-session://") && !has_remote_title_context {
             return;
         }
         spawn_summary_generation(state, session, false);
@@ -4333,7 +4474,8 @@ fn app() -> Element {
                                 return;
                             }
                             let should_generate =
-                                is_local_stored_session_row(&row) && row.session_title.is_none();
+                                (is_local_stored_session_row(&row) && row.session_title.is_none())
+                                    || is_remote_scanned_sidebar_row(&row);
                             match row.kind {
                                 BrowserRowKind::Group | BrowserRowKind::Separator => state.with_mut(|shell| shell.select_row(&row)),
                                 BrowserRowKind::Session | BrowserRowKind::Document => spawn_open_session_row(state, row.clone()),
@@ -8988,6 +9130,7 @@ mod tests {
                     user_message_count: 11,
                     assistant_message_count: 10,
                     title_hint: "019caa6f".to_string(),
+                    recent_context: "USER: test\nASSISTANT: reply".to_string(),
                     storage_path: "/home/pi/.codex/sessions/a.jsonl".to_string(),
                 }],
             }],
@@ -9022,6 +9165,7 @@ mod tests {
                     user_message_count: 11,
                     assistant_message_count: 10,
                     title_hint: "019caa6f".to_string(),
+                    recent_context: "USER: test\nASSISTANT: reply".to_string(),
                     storage_path: "/home/pi/.codex/sessions/a.jsonl".to_string(),
                 }],
             }],
@@ -9163,6 +9307,7 @@ mod tests {
                         user_message_count: 1,
                         assistant_message_count: 1,
                         title_hint: "1".to_string(),
+                        recent_context: "USER: one".to_string(),
                         storage_path: "a".to_string(),
                     },
                     RemoteScannedSession {
@@ -9175,6 +9320,7 @@ mod tests {
                         user_message_count: 1,
                         assistant_message_count: 1,
                         title_hint: "2".to_string(),
+                        recent_context: "USER: two".to_string(),
                         storage_path: "b".to_string(),
                     },
                 ],
