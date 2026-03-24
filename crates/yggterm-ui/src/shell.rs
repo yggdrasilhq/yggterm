@@ -5739,16 +5739,10 @@ fn MainSurface(
                                 style: "display:flex; align-items:flex-start; justify-content:space-between; gap:16px; flex-wrap:wrap;",
                                 SessionHeaderCopy {
                                     title: session.title.clone(),
-                                    subtitle_label: "Summary".to_string(),
                                     subtitle: snapshot
                                         .active_summary
                                         .clone()
                                         .unwrap_or_else(|| preview_summary_text(&session)),
-                                    meta_line: format!(
-                                        "{} · {}",
-                                        session.host_label,
-                                        metadata_value(&session, "Started")
-                                    ),
                                     palette: snapshot.palette,
                                     on_refresh_title: move |_| on_refresh_title.call(()),
                                     on_refresh_subtitle: move |_| on_refresh_summary.call(()),
@@ -5797,16 +5791,10 @@ fn MainSurface(
                         style: "display:flex; align-items:flex-start; justify-content:space-between; gap:16px; padding:22px 26px 14px 26px; border-bottom:1px solid rgba(170,190,212,0.16);",
                         SessionHeaderCopy {
                             title: session.title.clone(),
-                            subtitle_label: "Precis".to_string(),
                             subtitle: snapshot
                                 .active_precis
                                 .clone()
                                 .unwrap_or_else(|| terminal_precis(&session)),
-                            meta_line: format!(
-                                "{} · {}",
-                                session.host_label,
-                                metadata_value(&session, "Started")
-                            ),
                             palette: snapshot.palette,
                             on_refresh_title: move |_| on_refresh_title.call(()),
                             on_refresh_subtitle: move |_| on_refresh_precis.call(()),
@@ -5855,9 +5843,7 @@ fn MainSurface(
 #[component]
 fn SessionHeaderCopy(
     title: String,
-    subtitle_label: String,
     subtitle: String,
-    meta_line: String,
     palette: Palette,
     on_refresh_title: EventHandler<MouseEvent>,
     on_refresh_subtitle: EventHandler<MouseEvent>,
@@ -5881,27 +5867,16 @@ fn SessionHeaderCopy(
                             onclick: move |evt| on_refresh_title.call(evt),
                         }
                     }
-                    div {
-                        style: format!("font-size:12px; color:{};", palette.muted),
-                        "{meta_line}"
-                    }
                 }
             }
             div {
                 style: "display:flex; align-items:flex-start; gap:8px; min-width:0;",
                 div {
-                    style: format!(
-                        "font-size:11px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:{}; padding-top:2px;",
-                        palette.muted
-                    ),
-                    "{subtitle_label}"
-                }
-                div {
                     style: format!("font-size:12px; line-height:1.6; color:{}; max-width:720px; white-space:pre-wrap; min-width:0;", palette.muted),
                     "{subtitle}"
                 }
                 RefreshInlineButton {
-                    label: format!("Regenerate {}", subtitle_label.to_lowercase()),
+                    label: "Regenerate detail".to_string(),
                     palette,
                     onclick: move |evt| on_refresh_subtitle.call(evt),
                 }
@@ -6470,6 +6445,11 @@ fn preview_summary_text(session: &ManagedSessionView) -> String {
                 || entry.label == "Storage"
                 || entry.label == "Started"
                 || entry.label == "Updated"
+                || entry.label == "UUID"
+                || entry.label == "Target"
+                || entry.label == "Prefix"
+                || entry.label == "Host"
+                || entry.label == "Deploy"
             {
                 None
             } else {
