@@ -1259,13 +1259,23 @@ impl ShellState {
         let title = title.into();
         let message = message.into();
         if self.settings.in_app_notifications {
-            self.notifications.push(ToastNotification {
-                id: self.next_notification_id,
-                tone,
-                title: title.clone(),
-                message: message.clone(),
-                created_at_ms: current_millis(),
-            });
+            let now = current_millis();
+            if let Some(existing) = self.notifications.iter_mut().rev().find(|notification| {
+                notification.tone == tone
+                    && notification.title == title
+                    && notification.message == message
+            }) {
+                existing.created_at_ms = now;
+            } else {
+                self.notifications.push(ToastNotification {
+                    id: self.next_notification_id,
+                    tone,
+                    title: title.clone(),
+                    message: message.clone(),
+                    created_at_ms: now,
+                });
+                self.next_notification_id += 1;
+            }
         }
         if self.settings.system_notifications {
             emit_system_notification(&title, &message);
@@ -1273,7 +1283,6 @@ impl ShellState {
         if self.settings.notification_sound {
             emit_notification_chime();
         }
-        self.next_notification_id += 1;
         if self.notifications.len() > 1000 {
             let overflow = self.notifications.len() - 1000;
             self.notifications.drain(0..overflow);
@@ -1936,13 +1945,6 @@ fn maybe_spawn_missing_remote_machine_refreshes(mut state: Signal<ShellState>) {
 
 fn spawn_background_remote_machine_refresh(mut state: Signal<ShellState>, machine_key: String) {
     let endpoint = state.read().bootstrap.server_endpoint.clone();
-    state.with_mut(|shell| {
-        shell.push_notification(
-            NotificationTone::Info,
-            "Refreshing Remote",
-            format!("Checking {machine_key} for session updates…"),
-        );
-    });
     spawn(async move {
         let request_machine_key = machine_key.clone();
         let outcome = task::spawn_blocking(move || refresh_remote_machine(&endpoint, &request_machine_key)).await;
