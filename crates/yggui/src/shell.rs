@@ -49,10 +49,10 @@ use tokio::task;
 use tokio::time::sleep;
 use tracing::{info, warn};
 use yggterm_core::{
-    AgentSessionProfile, AppSettings, BrowserRow, BrowserRowKind, InstallContext,
+    AgentSessionProfile, AppSettings, BrowserRow, BrowserRowKind, InstallContext, PerfSpan,
     SessionBrowserState, SessionNode, SessionStore, UiTheme, WorkspaceDocumentInput,
     WorkspaceDocumentKind, WorkspaceGroupKind, check_for_update, save_settings_file,
-    update_command_hint, YgguiThemeSpec,
+    install_release_update, refresh_desktop_integration, update_command_hint, YgguiThemeSpec,
 };
 use yggterm_platform::DockRect;
 use yggterm_server::{
@@ -83,6 +83,8 @@ const XTERM_FIT_JS: &str = include_str!("../../../assets/xterm/addon-fit.js");
 static XTERM_ASSETS_BOOTSTRAPPED: OnceCell<()> = OnceCell::new();
 const TREE_LOADING_DOT_CSS: &str = "@keyframes yggterm-tree-loading-dot { 0%, 80%, 100% { opacity: 0.28; transform: translateY(0px); } 40% { opacity: 1; transform: translateY(-1px); } }";
 const BACKGROUND_COPY_RETRY_MS: u64 = 300_000;
+const BACKGROUND_COPY_CONTINUE_MS: u64 = 350;
+const BACKGROUND_COPY_IDLE_MS: u64 = 1_500;
 const THEME_EDITOR_PAD_SIZE: f64 = 286.0;
 type WorkspaceReorderPlanItem = TreeReorderPlanItem<BrowserRowKind>;
 
@@ -162,6 +164,8 @@ struct ShellState {
     theme_editor_draft: YgguiThemeSpec,
     theme_editor_selected_stop: Option<usize>,
     theme_editor_drag_stop: Option<usize>,
+    background_copy_scan_in_flight: bool,
+    next_background_copy_scan_after_ms: u64,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -449,6 +453,8 @@ impl ShellState {
             theme_editor_draft: initial_yggui_theme,
             theme_editor_selected_stop: None,
             theme_editor_drag_stop: None,
+            background_copy_scan_in_flight: false,
+            next_background_copy_scan_after_ms: 0,
         };
         if let Some(path) = state.browser.selected_path().map(ToOwned::to_owned) {
             state.selected_tree_paths.insert(path.clone());
@@ -667,6 +673,7 @@ impl ShellState {
                 self.hydrate_generated_copy_from_remote_cache();
                 self.server_busy = false;
                 self.needs_initial_server_sync = false;
+                self.next_background_copy_scan_after_ms = 0;
                 if was_initial_sync {
                     self.seed_dynamic_top_level_expansions();
                 }
@@ -677,6 +684,7 @@ impl ShellState {
             Err(error) => {
                 self.server_busy = false;
                 self.needs_initial_server_sync = false;
+                self.next_background_copy_scan_after_ms = current_millis() + 2_000;
                 self.last_action = format!("server sync failed: {error}");
                 self.push_notification(
                     NotificationTone::Error,
@@ -1515,7 +1523,9 @@ fn spawn_title_generation_for_target(
         });
     }
     info!(session_path=%target.session_path, force, "queueing title generation");
+    let perf_home = perf_home_dir(&state.read().bootstrap.settings_path);
     spawn(async move {
+        let perf = PerfSpan::start(&perf_home, "copy_generation", "title");
         let target_for_task = target.clone();
         let settings_for_task = settings.clone();
         let outcome = task::spawn_blocking(move || -> Result<(Option<String>, Option<SessionNode>)> {
@@ -1554,6 +1564,12 @@ fn spawn_title_generation_for_target(
             }
         }).await;
 
+        perf.finish(json!({
+            "session_path": session_path.clone(),
+            "force": force,
+            "announce": announce,
+            "ok": outcome.as_ref().is_ok_and(|result| result.is_ok()),
+        }));
         state.with_mut(|shell| match outcome {
             Ok(Ok((Some(title), browser_tree))) => {
                 shell.title_requests_in_flight.remove(&session_path);
@@ -1690,7 +1706,9 @@ fn spawn_precis_generation_for_target(
     if !should_start {
         return;
     }
+    let perf_home = perf_home_dir(&state.read().bootstrap.settings_path);
     spawn(async move {
+        let perf = PerfSpan::start(&perf_home, "copy_generation", "precis");
         let target_for_task = target.clone();
         let settings_for_task = settings.clone();
         let outcome = task::spawn_blocking(move || -> Result<Option<String>> {
@@ -1726,11 +1744,20 @@ fn spawn_precis_generation_for_target(
             store.generate_precis_for_session_path(&settings_for_task, &target_for_task.session_path, force)
         }).await;
 
+        perf.finish(json!({
+            "session_path": session_path.clone(),
+            "force": force,
+            "announce": announce,
+            "ok": outcome.as_ref().is_ok_and(|result| result.is_ok()),
+        }));
         state.with_mut(|shell| {
             shell.precis_requests_in_flight.remove(&session_path);
             match outcome {
                 Ok(Ok(Some(precis))) => {
                     shell.generated_precis.insert(session_path.clone(), precis);
+                    if let Some(precis) = shell.generated_precis.get(&session_path).cloned() {
+                        shell.server.set_session_precis_hint(&session_path, &precis);
+                    }
                     shell
                         .passive_copy_failures
                         .remove(&background_copy_retry_key("precis", &session_path));
@@ -1843,7 +1870,9 @@ fn spawn_summary_generation_for_target(
     if !should_start {
         return;
     }
+    let perf_home = perf_home_dir(&state.read().bootstrap.settings_path);
     spawn(async move {
+        let perf = PerfSpan::start(&perf_home, "copy_generation", "summary");
         let target_for_task = target.clone();
         let settings_for_task = settings.clone();
         let outcome = task::spawn_blocking(move || -> Result<Option<String>> {
@@ -1879,11 +1908,20 @@ fn spawn_summary_generation_for_target(
             store.generate_summary_for_session_path(&settings_for_task, &target_for_task.session_path, force)
         }).await;
 
+        perf.finish(json!({
+            "session_path": session_path.clone(),
+            "force": force,
+            "announce": announce,
+            "ok": outcome.as_ref().is_ok_and(|result| result.is_ok()),
+        }));
         state.with_mut(|shell| {
             shell.summary_requests_in_flight.remove(&session_path);
             match outcome {
                 Ok(Ok(Some(summary))) => {
                     shell.generated_summaries.insert(session_path.clone(), summary);
+                    if let Some(summary) = shell.generated_summaries.get(&session_path).cloned() {
+                        shell.server.set_session_summary_hint(&session_path, &summary);
+                    }
                     shell
                         .passive_copy_failures
                         .remove(&background_copy_retry_key("summary", &session_path));
@@ -1961,8 +1999,13 @@ fn spawn_summary_generation_for_target(
 
 fn spawn_initial_server_sync(mut state: Signal<ShellState>) {
     let endpoint = state.read().bootstrap.server_endpoint.clone();
+    let perf_home = perf_home_dir(&state.read().bootstrap.settings_path);
     spawn(async move {
+        let perf = PerfSpan::start(&perf_home, "startup", "initial_server_sync");
         let outcome = task::spawn_blocking(move || initial_server_sync(endpoint)).await;
+        perf.finish(json!({
+            "ok": outcome.as_ref().is_ok_and(|result| result.is_ok()),
+        }));
         state.with_mut(|shell| match outcome {
             Ok(Ok((snapshot, runtime, detail))) => {
                 shell.server.apply_snapshot(snapshot);
@@ -2047,10 +2090,81 @@ fn restart_into_pending_update(mut state: Signal<ShellState>) {
     });
 }
 
+fn spawn_desktop_integration_refresh(mut state: Signal<ShellState>) {
+    let install_context = state.read().bootstrap.install_context.clone();
+    let perf_home = perf_home_dir(&state.read().bootstrap.settings_path);
+    spawn(async move {
+        let perf = PerfSpan::start(&perf_home, "startup", "refresh_desktop_integration");
+        let outcome =
+            task::spawn_blocking(move || refresh_desktop_integration(&install_context)).await;
+        perf.finish(json!({
+            "ok": outcome.as_ref().is_ok_and(|result| result.is_ok()),
+        }));
+        if let Ok(Err(error)) = outcome {
+            warn!(error=%error, "desktop integration refresh failed");
+            state.with_mut(|shell| {
+                shell.last_action = format!("desktop integration refresh failed: {error}");
+            });
+        }
+    });
+}
+
+fn spawn_auto_update_install_check(mut state: Signal<ShellState>) {
+    let install_context = state.read().bootstrap.install_context.clone();
+    let perf_home = perf_home_dir(&state.read().bootstrap.settings_path);
+    spawn(async move {
+        let perf = PerfSpan::start(&perf_home, "startup", "auto_update_install");
+        let outcome = task::spawn_blocking(move || -> Result<Option<PendingUpdateRestart>> {
+            let Some(update) = check_for_update(&install_context)? else {
+                return Ok(None);
+            };
+            let next_exe = install_release_update(&install_context, &update)?;
+            Ok(Some(PendingUpdateRestart {
+                version: update.version,
+                executable: next_exe,
+            }))
+        })
+        .await;
+        let pending = match outcome {
+            Ok(Ok(pending)) => pending,
+            Ok(Err(error)) => {
+                warn!(error=%error, "auto update install failed");
+                None
+            }
+            Err(error) => {
+                warn!(error=%error, "auto update task failed");
+                None
+            }
+        };
+        perf.finish(json!({
+            "installed": pending.as_ref().is_some(),
+        }));
+        if let Some(update) = pending {
+            state.with_mut(|shell| {
+                shell.pending_update_restart = Some(update.clone());
+                shell.last_action = format!("update {} ready", update.version);
+                shell.push_notification(
+                    NotificationTone::Success,
+                    "Update Ready",
+                    format!(
+                        "Yggterm {} was installed. Restart when you are ready.",
+                        update.version
+                    ),
+                );
+            });
+        }
+    });
+}
+
 fn spawn_notify_only_update_check(mut state: Signal<ShellState>) {
     let install_context = state.read().bootstrap.install_context.clone();
+    let perf_home = perf_home_dir(&state.read().bootstrap.settings_path);
     spawn(async move {
+        let perf = PerfSpan::start(&perf_home, "startup", "notify_only_update_check");
         let outcome = task::spawn_blocking(move || check_for_update(&install_context)).await;
+        perf.finish(json!({
+            "ok": outcome.as_ref().is_ok_and(|result| result.is_ok()),
+        }));
         state.with_mut(|shell| match outcome {
             Ok(Ok(Some(update))) => {
                 let hint = update_command_hint(shell.bootstrap.install_context.channel);
@@ -2584,20 +2698,19 @@ fn collect_local_copy_targets(node: &SessionNode, targets: &mut Vec<CopyGenerati
     }
 }
 
-fn next_background_copy_job(shell: &ShellState) -> Option<BackgroundCopyJob> {
-    if !copy_generation_settings_ready(&shell.settings)
-        || !shell.title_requests_in_flight.is_empty()
-        || !shell.precis_requests_in_flight.is_empty()
-        || !shell.summary_requests_in_flight.is_empty()
-    {
+fn next_background_copy_job(
+    settings: &AppSettings,
+    local_root: &SessionNode,
+    remote_machines: &[RemoteMachineSnapshot],
+    copy_retry_after_ms: &HashMap<String, u64>,
+) -> Option<BackgroundCopyJob> {
+    if !copy_generation_settings_ready(settings) {
         return None;
     }
     let store = SessionStore::open_or_init().ok()?;
     let mut targets = Vec::new();
-    if let Ok(tree) = store.load_codex_tree(&shell.settings) {
-        collect_local_copy_targets(&tree, &mut targets);
-    }
-    for machine in shell.server.remote_machines() {
+    collect_local_copy_targets(local_root, &mut targets);
+    for machine in remote_machines {
         for session in &machine.sessions {
             targets.push(CopyGenerationTarget {
                 session_path: session.session_path.clone(),
@@ -2611,20 +2724,17 @@ fn next_background_copy_job(shell: &ShellState) -> Option<BackgroundCopyJob> {
     }
     let now = current_millis();
     for target in targets {
-        let title_missing = if target.remote_machine.is_some() {
-            looks_like_generated_fallback_title(&target.title)
-        } else {
-            looks_like_generated_fallback_title(&target.title)
-                || store
-                    .resolve_title_for_session_id(&target.session_id)
-                    .ok()
-                    .flatten()
-                    .is_none()
-        };
+        let stored_title = store
+            .resolve_title_for_session_id(&target.session_id)
+            .ok()
+            .flatten();
+        let title_missing = looks_like_generated_fallback_title(&target.title)
+            && stored_title
+                .as_deref()
+                .is_none_or(looks_like_generated_fallback_title);
         if title_missing {
             let retry_key = background_copy_retry_key("title", &target.session_path);
-            if shell
-                .copy_retry_after_ms
+            if copy_retry_after_ms
                 .get(&retry_key)
                 .copied()
                 .is_none_or(|retry_after| retry_after <= now)
@@ -2632,24 +2742,25 @@ fn next_background_copy_job(shell: &ShellState) -> Option<BackgroundCopyJob> {
                 return Some(BackgroundCopyJob::Title(target));
             }
         }
-        let precis_missing = if let Some(machine) = target.remote_machine.as_ref() {
-            machine
-                .sessions
-                .iter()
-                .find(|session| session.session_path == target.session_path)
-                .and_then(|session| session.cached_precis.clone())
-                .is_none()
-        } else {
-            store
-                .resolve_precis_for_session_id(&target.session_id)
-                .ok()
-                .flatten()
-                .is_none()
-        };
+        let stored_precis = store
+            .resolve_precis_for_session_id(&target.session_id)
+            .ok()
+            .flatten();
+        let precis_missing = stored_precis.is_none()
+            && target
+                .remote_machine
+                .as_ref()
+                .and_then(|machine| {
+                    machine
+                        .sessions
+                        .iter()
+                        .find(|session| session.session_path == target.session_path)
+                        .and_then(|session| session.cached_precis.clone())
+                })
+                .is_none();
         if precis_missing {
             let retry_key = background_copy_retry_key("precis", &target.session_path);
-            if shell
-                .copy_retry_after_ms
+            if copy_retry_after_ms
                 .get(&retry_key)
                 .copied()
                 .is_none_or(|retry_after| retry_after <= now)
@@ -2657,24 +2768,25 @@ fn next_background_copy_job(shell: &ShellState) -> Option<BackgroundCopyJob> {
                 return Some(BackgroundCopyJob::Precis(target));
             }
         }
-        let summary_missing = if let Some(machine) = target.remote_machine.as_ref() {
-            machine
-                .sessions
-                .iter()
-                .find(|session| session.session_path == target.session_path)
-                .and_then(|session| session.cached_summary.clone())
-                .is_none()
-        } else {
-            store
-                .resolve_summary_for_session_id(&target.session_id)
-                .ok()
-                .flatten()
-                .is_none()
-        };
+        let stored_summary = store
+            .resolve_summary_for_session_id(&target.session_id)
+            .ok()
+            .flatten();
+        let summary_missing = stored_summary.is_none()
+            && target
+                .remote_machine
+                .as_ref()
+                .and_then(|machine| {
+                    machine
+                        .sessions
+                        .iter()
+                        .find(|session| session.session_path == target.session_path)
+                        .and_then(|session| session.cached_summary.clone())
+                })
+                .is_none();
         if summary_missing {
             let retry_key = background_copy_retry_key("summary", &target.session_path);
-            if shell
-                .copy_retry_after_ms
+            if copy_retry_after_ms
                 .get(&retry_key)
                 .copied()
                 .is_none_or(|retry_after| retry_after <= now)
@@ -2686,23 +2798,73 @@ fn next_background_copy_job(shell: &ShellState) -> Option<BackgroundCopyJob> {
     None
 }
 
-fn maybe_spawn_background_copy_generation(state: Signal<ShellState>) {
-    let job = {
+fn maybe_spawn_background_copy_generation(mut state: Signal<ShellState>) {
+    let scan = {
         let shell = state.read();
-        next_background_copy_job(&shell)
+        let now = current_millis();
+        if shell.background_copy_scan_in_flight
+            || shell.needs_initial_server_sync
+            || !copy_generation_settings_ready(&shell.settings)
+            || !shell.title_requests_in_flight.is_empty()
+            || !shell.precis_requests_in_flight.is_empty()
+            || !shell.summary_requests_in_flight.is_empty()
+            || shell.next_background_copy_scan_after_ms > now
+        {
+            None
+        } else {
+            Some((
+                shell.settings.clone(),
+                shell.browser.root().clone(),
+                shell.server.remote_machines().to_vec(),
+                shell.copy_retry_after_ms.clone(),
+                perf_home_dir(&shell.bootstrap.settings_path),
+            ))
+        }
     };
-    match job {
-        Some(BackgroundCopyJob::Title(target)) => {
-            spawn_title_generation_for_target(state, target, false, false)
+    let Some((settings, local_root, remote_machines, copy_retry_after_ms, perf_home)) = scan else {
+        return;
+    };
+    state.with_mut(|shell| shell.background_copy_scan_in_flight = true);
+    spawn(async move {
+        let perf = PerfSpan::start(&perf_home, "background", "copy_scan");
+        let outcome = task::spawn_blocking(move || {
+            next_background_copy_job(
+                &settings,
+                &local_root,
+                &remote_machines,
+                &copy_retry_after_ms,
+            )
+        })
+        .await;
+        let job = outcome.ok().flatten();
+        perf.finish(json!({
+            "job": job.as_ref().map(|job| match job {
+                BackgroundCopyJob::Title(target) => format!("title:{}", target.session_path),
+                BackgroundCopyJob::Precis(target) => format!("precis:{}", target.session_path),
+                BackgroundCopyJob::Summary(target) => format!("summary:{}", target.session_path),
+            }),
+        }));
+        state.with_mut(|shell| {
+            shell.background_copy_scan_in_flight = false;
+            shell.next_background_copy_scan_after_ms = if job.is_some() {
+                current_millis() + BACKGROUND_COPY_CONTINUE_MS
+            } else {
+                current_millis() + BACKGROUND_COPY_IDLE_MS
+            };
+        });
+        match job {
+            Some(BackgroundCopyJob::Title(target)) => {
+                spawn_title_generation_for_target(state, target, false, false)
+            }
+            Some(BackgroundCopyJob::Precis(target)) => {
+                spawn_precis_generation_for_target(state, target, false, false)
+            }
+            Some(BackgroundCopyJob::Summary(target)) => {
+                spawn_summary_generation_for_target(state, target, false, false)
+            }
+            None => {}
         }
-        Some(BackgroundCopyJob::Precis(target)) => {
-            spawn_precis_generation_for_target(state, target, false, false)
-        }
-        Some(BackgroundCopyJob::Summary(target)) => {
-            spawn_summary_generation_for_target(state, target, false, false)
-        }
-        None => {}
-    }
+    });
 }
 
 fn remote_scanned_session_context(server: &YggtermServer, session_path: &str) -> Option<String> {
@@ -4627,6 +4789,13 @@ fn parent_virtual_path(path: &str) -> Option<String> {
     }
 }
 
+fn perf_home_dir(settings_path: &std::path::Path) -> PathBuf {
+    settings_path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 #[derive(Clone)]
 struct GhosttyDockRequest {
     pid: Option<u32>,
@@ -4853,6 +5022,7 @@ fn app() -> Element {
     let mut hovered = use_signal(|| None::<HoveredControl>);
     let mut startup_sync_started = use_signal(|| false);
     let mut update_check_started = use_signal(|| false);
+    let mut desktop_refresh_started = use_signal(|| false);
     let mut dock_pulse_started = use_signal(|| false);
     let mut window_epoch = use_signal(|| 0_u64);
     use_effect(move || {
@@ -4895,17 +5065,30 @@ fn app() -> Element {
         }
     });
     use_effect(move || {
+        if *desktop_refresh_started.read() {
+            return;
+        }
+        desktop_refresh_started.set(true);
+        spawn_desktop_integration_refresh(state);
+    });
+    use_effect(move || {
         if *update_check_started.read() {
             return;
         }
         let should_start = {
             let shell = state.read();
-            shell.bootstrap.install_context.update_policy == yggterm_core::UpdatePolicy::NotifyOnly
-                && shell.bootstrap.install_context.channel != yggterm_core::InstallChannel::Unknown
+            shell.bootstrap.install_context.channel != yggterm_core::InstallChannel::Unknown
         };
         if should_start {
             update_check_started.set(true);
-            spawn_notify_only_update_check(state);
+            let install_context = state.read().bootstrap.install_context.clone();
+            if install_context.update_policy == yggterm_core::UpdatePolicy::NotifyOnly {
+                spawn_notify_only_update_check(state);
+            } else if install_context.update_policy == yggterm_core::UpdatePolicy::Auto
+                && std::env::var_os("YGGTERM_SKIP_SELF_UPDATE").is_none()
+            {
+                spawn_auto_update_install_check(state);
+            }
         }
     });
     use_effect(move || {

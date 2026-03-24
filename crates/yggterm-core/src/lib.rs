@@ -1,5 +1,6 @@
 mod browser;
 mod install;
+mod perf;
 mod titles;
 mod transcript;
 mod workspace;
@@ -21,6 +22,7 @@ pub use install::{
     install_mode_summary, install_release_update, refresh_desktop_integration, update_command_hint,
     write_direct_install_state,
 };
+pub use perf::{PERF_TELEMETRY_FILENAME, PerfSpan, append_perf_event, perf_telemetry_path};
 pub use transcript::{
     TranscriptMessage, TranscriptRole, message_lines_from_payload, read_codex_transcript_messages,
 };
