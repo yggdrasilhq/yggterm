@@ -2771,12 +2771,18 @@ fn copy_generation_target_for_browser_row(
 fn restore_browser_tree(shell: &mut ShellState, browser_tree: SessionNode, selected_hint: Option<&str>) {
     let selected_path = shell.browser.selected_path().map(str::to_string);
     let expanded_paths = shell.browser.expanded_paths();
+    let synthetic_expanded_paths = expanded_paths
+        .iter()
+        .filter(|path| path.starts_with("__remote_machine__/") || path.starts_with("__remote_folder__/"))
+        .cloned()
+        .collect::<Vec<_>>();
     let filter_query = shell.search_query.clone();
     shell.browser = SessionBrowserState::new(browser_tree);
     shell.browser.restore_ui_state(
         &expanded_paths,
         selected_path.as_deref().or(selected_hint),
     );
+    shell.browser.ensure_expanded_paths(synthetic_expanded_paths);
     shell.browser.set_filter_query(filter_query);
     shell.sync_browser_settings();
 }
@@ -5418,43 +5424,54 @@ fn app() -> Element {
                         ),
                         on_create_paper: move |_| queue_new_document(state),
                         on_select_row: move |(row, mode): (BrowserRow, TreeSelectionMode)| {
-                            let should_continue = {
-                                let mut continue_open = true;
-                                state.with_mut(|shell| {
-                                    if shell.consume_suppressed_tree_click() {
-                                        continue_open = false;
-                                        return;
-                                    }
-                                    shell.select_tree_row(&row, mode);
-                                });
-                                continue_open
-                            };
-                            let _ = document::eval(
-                                "document.getElementById('yggterm-shell-root')?.focus?.(); document.getElementById('yggterm-sidebar')?.focus?.();",
-                            );
-                            if !should_continue {
-                                return;
-                            }
-                            if mode != TreeSelectionMode::Replace {
-                                return;
-                            }
-                            if is_live_sidebar_row(&row) {
-                                spawn_server_snapshot_action(
-                                    state,
-                                    format!("focusing {}", row.label),
-                                    move |endpoint| focus_live(&endpoint, &row.full_path),
+                            let row_for_log = row.clone();
+                            if let Err(error) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                let should_continue = {
+                                    let mut continue_open = true;
+                                    state.with_mut(|shell| {
+                                        if shell.consume_suppressed_tree_click() {
+                                            continue_open = false;
+                                            return;
+                                        }
+                                        shell.select_tree_row(&row, mode);
+                                    });
+                                    continue_open
+                                };
+                                let _ = document::eval(
+                                    "document.getElementById('yggterm-shell-root')?.focus?.(); document.getElementById('yggterm-sidebar')?.focus?.();",
                                 );
-                                return;
-                            }
-                            let should_generate =
-                                (is_local_stored_session_row(&row) && row.session_title.is_none())
-                                    || is_remote_scanned_sidebar_row(&row);
-                            match row.kind {
-                                BrowserRowKind::Group | BrowserRowKind::Separator => state.with_mut(|shell| shell.select_row(&row)),
-                                BrowserRowKind::Session | BrowserRowKind::Document => spawn_open_session_row(state, row.clone()),
-                            }
-                            if should_generate {
-                                queue_title_generation(state, row.clone(), false);
+                                if !should_continue {
+                                    return;
+                                }
+                                if mode != TreeSelectionMode::Replace {
+                                    return;
+                                }
+                                if is_live_sidebar_row(&row) {
+                                    spawn_server_snapshot_action(
+                                        state,
+                                        format!("focusing {}", row.label),
+                                        move |endpoint| focus_live(&endpoint, &row.full_path),
+                                    );
+                                    return;
+                                }
+                                let should_generate =
+                                    (is_local_stored_session_row(&row) && row.session_title.is_none())
+                                        || is_remote_scanned_sidebar_row(&row);
+                                match row.kind {
+                                    BrowserRowKind::Group | BrowserRowKind::Separator => state.with_mut(|shell| shell.select_row(&row)),
+                                    BrowserRowKind::Session | BrowserRowKind::Document => spawn_open_session_row(state, row.clone()),
+                                }
+                                if should_generate {
+                                    queue_title_generation(state, row.clone(), false);
+                                }
+                            })) {
+                                warn!(
+                                    path=%row_for_log.full_path,
+                                    kind=?row_for_log.kind,
+                                    mode=?mode,
+                                    panic_payload=?error,
+                                    "suppressed sidebar row select panic"
+                                );
                             }
                         },
                         on_delete_selected_items: move |hard_delete: bool| queue_delete_selected_items(state, hard_delete),
