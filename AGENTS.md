@@ -59,6 +59,10 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 - When adding code, include clear ownership boundaries between Rust app logic, PTY runtime, and any optional Ghostty FFI.
 - Prefer incremental, testable changes.
 - Document integration assumptions in `README.md` or module-level docs.
+- Performance and UI snappiness are first-class requirements, not cleanup work.
+- For any non-trivial shell/runtime change, capture local performance telemetry under `~/.yggterm/perf-telemetry.jsonl`, inspect it, and plot it before closing the task.
+- Treat blocking startup work, render-path filesystem IO, synchronous IPC on the UI thread, and repeated full-tree rebuilds as bugs.
+- When a slowdown or UI hitch is reported, instrument first, optimize second, and leave the telemetry hooks in place for future regressions.
 - Treat `DESIGN.md` as reusable brand/design memory for this and future projects. Styling and naming rules should be captured there, not reinvented repeatedly.
 - The active shell is Dioxus-based. Keep steering it toward a polished Zed-shaped terminal workspace rather than rebuilding parallel frontend experiments.
 - Development and release workflow is server-first: builds happen in this server environment and release artifacts are pulled from `dist/` to a laptop for runtime testing.
