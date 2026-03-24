@@ -1936,6 +1936,13 @@ fn maybe_spawn_missing_remote_machine_refreshes(mut state: Signal<ShellState>) {
 
 fn spawn_background_remote_machine_refresh(mut state: Signal<ShellState>, machine_key: String) {
     let endpoint = state.read().bootstrap.server_endpoint.clone();
+    state.with_mut(|shell| {
+        shell.push_notification(
+            NotificationTone::Info,
+            "Refreshing Remote",
+            format!("Checking {machine_key} for session updates…"),
+        );
+    });
     spawn(async move {
         let request_machine_key = machine_key.clone();
         let outcome = task::spawn_blocking(move || refresh_remote_machine(&endpoint, &request_machine_key)).await;
@@ -2062,6 +2069,11 @@ fn spawn_connect_ssh_custom(mut state: Signal<ShellState>) {
     state.with_mut(|shell| {
         shell.server_busy = true;
         shell.last_action = format!("connecting {target}");
+        shell.push_notification(
+            NotificationTone::Info,
+            "Connecting SSH",
+            format!("Opening {target} and syncing its session index…"),
+        );
     });
     let endpoint = state.read().bootstrap.server_endpoint.clone();
     spawn(async move {
@@ -2219,6 +2231,23 @@ fn remote_scanned_session_context(server: &YggtermServer, session_path: &str) ->
     })
 }
 
+fn remote_generated_copy(
+    server: &YggtermServer,
+    session_path: &str,
+) -> Option<(String, Option<String>, Option<String>)> {
+    server.remote_machines().iter().find_map(|machine| {
+        machine.sessions.iter().find_map(|session| {
+            (session.session_path == session_path).then(|| {
+                (
+                    session.title_hint.clone(),
+                    session.cached_precis.clone(),
+                    session.cached_summary.clone(),
+                )
+            })
+        })
+    })
+}
+
 fn remote_machine_for_session_path(
     server: &YggtermServer,
     session_path: &str,
@@ -2230,6 +2259,79 @@ fn remote_machine_for_session_path(
             .any(|session| session.session_path == session_path)
             .then(|| machine.clone())
     })
+}
+
+fn spawn_active_session_copy_hydration(mut state: Signal<ShellState>, session: ManagedSessionView) {
+    let session_path = session.session_path.clone();
+    let remote_cached = remote_generated_copy(&state.read().server, &session_path);
+    let needs_local_lookup = is_local_stored_session_row(&BrowserRow {
+        kind: BrowserRowKind::Session,
+        full_path: session_path.clone(),
+        label: session.title.clone(),
+        detail_label: String::new(),
+        document_kind: None,
+        group_kind: None,
+        session_title: Some(session.title.clone()),
+        depth: 0,
+        host_label: session.host_label.clone(),
+        descendant_sessions: 0,
+        expanded: false,
+        session_id: Some(session.id.clone()),
+        session_cwd: Some(metadata_value(&session, "Cwd")),
+    });
+    spawn(async move {
+        let path_for_task = session_path.clone();
+        let outcome = task::spawn_blocking(move || -> Result<(Option<String>, Option<String>, Option<String>)> {
+            let store = SessionStore::open_or_init()?;
+            if let Some((title, precis, summary)) = remote_cached {
+                let resolved_title = if title.trim().is_empty() {
+                    store.resolve_title_for_session_id(&session.id)?
+                } else {
+                    Some(title)
+                };
+                let resolved_precis = if precis.as_ref().is_some_and(|value| !value.trim().is_empty()) {
+                    precis
+                } else {
+                    store.resolve_precis_for_session_id(&session.id)?
+                };
+                let resolved_summary = if summary.as_ref().is_some_and(|value| !value.trim().is_empty()) {
+                    summary
+                } else {
+                    store.resolve_summary_for_session_id(&session.id)?
+                };
+                return Ok((resolved_title, resolved_precis, resolved_summary));
+            }
+            if !needs_local_lookup {
+                return Ok((
+                    store.resolve_title_for_session_id(&session.id)?,
+                    store.resolve_precis_for_session_id(&session.id)?,
+                    store.resolve_summary_for_session_id(&session.id)?,
+                ));
+            }
+            Ok((
+                store.resolve_title_for_session_path(&path_for_task)?,
+                store.resolve_precis_for_session_path(&path_for_task)?,
+                store.resolve_summary_for_session_path(&path_for_task)?,
+            ))
+        }).await;
+
+        state.with_mut(|shell| {
+            let Ok(Ok((title, precis, summary))) = outcome else {
+                return;
+            };
+            if let Some(title) = title
+                && looks_like_generated_fallback_title(&session.title)
+            {
+                shell.server.set_session_title_hint(&session_path, &title);
+            }
+            if let Some(precis) = precis {
+                shell.generated_precis.insert(session_path.clone(), precis);
+            }
+            if let Some(summary) = summary {
+                shell.generated_summaries.insert(session_path.clone(), summary);
+            }
+        });
+    });
 }
 
 fn looks_like_generated_fallback_title(title: &str) -> bool {
@@ -4368,6 +4470,17 @@ fn app() -> Element {
         let Some(session) = active else {
             return;
         };
+        let has_precis = state
+            .read()
+            .generated_precis
+            .contains_key(&session.session_path);
+        let has_summary = state
+            .read()
+            .generated_summaries
+            .contains_key(&session.session_path);
+        if looks_like_generated_fallback_title(&session.title) || !has_precis || !has_summary {
+            spawn_active_session_copy_hydration(state, session.clone());
+        }
         let has_remote_title_context = if session.session_path.starts_with("remote-session://") {
             remote_scanned_session_context(&state.read().server, &session.session_path)
                 .is_some_and(|context| !context.trim().is_empty())
@@ -4387,19 +4500,11 @@ fn app() -> Element {
         {
             queue_active_session_title_generation(state, false);
         }
-        let has_precis = state
-            .read()
-            .generated_precis
-            .contains_key(&session.session_path);
         if !has_precis
             && (!session.session_path.starts_with("remote-session://") || has_remote_title_context)
         {
             spawn_precis_generation(state, session.clone(), false);
         }
-        let has_summary = state
-            .read()
-            .generated_summaries
-            .contains_key(&session.session_path);
         if has_summary {
             return;
         }
@@ -4816,7 +4921,7 @@ fn app() -> Element {
                             muted: snapshot.palette.muted,
                             accent: snapshot.palette.accent,
                         },
-                        right_inset: toast_right_inset(snapshot.right_panel_mode),
+                        center_offset: toast_center_offset(snapshot.right_panel_mode),
                         max_age_ms: 7000,
                         max_visible: 3,
                         now_ms: current_millis(),
@@ -8207,9 +8312,12 @@ fn DeleteConfirmOverlay(
     }
 }
 
-fn toast_right_inset(right_panel_mode: RightPanelMode) -> usize {
-    let _ = right_panel_mode;
-    18
+fn toast_center_offset(right_panel_mode: RightPanelMode) -> i32 {
+    if right_panel_mode == RightPanelMode::Hidden {
+        0
+    } else {
+        -146
+    }
 }
 
 #[component]
