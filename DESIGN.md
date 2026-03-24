@@ -103,11 +103,14 @@ Yggdrasil shells should support a reusable visual theme editor.
   - draggable color stops
   - a lightweight color library
   - a brightness control
-  - a grain control
+  - a single grain dial control
 - Double-clicking the preview pad should be able to add a color stop.
+- The preview pad should use a visible grid, not a blank field, so stop placement feels intentional.
 - Dragging color stops should live-preview the shell background.
 - Light and dark shell modes should remain selectable independently of the custom gradient.
 - Saving should persist the theme; cancel should revert live preview.
+- Reset should always return to the project’s base shell theme, not an empty placeholder state.
+- The active portable theme should be stored in `~/.yggterm/settings.json` under the `theme` object.
 - If no custom colors exist, the shell should fall back to the system gradient cleanly.
 
 #### Theme surfaces
@@ -116,6 +119,7 @@ Yggdrasil shells should support a reusable visual theme editor.
 - Supporting chrome should inherit the shell gradient subtly through transparency and blur.
 - The main workspace should remain calmer and more neutral than the shell chrome.
 - Theme accent can be derived from the dominant gradient stop for lightweight emphasis.
+- The theme modal itself should not blur the background. The surrounding UI should remain clearly visible, with a calm blue active-state halo around the modal to signal focused editing.
 
 ### Typography
 
