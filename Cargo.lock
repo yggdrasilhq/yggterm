@@ -5513,6 +5513,7 @@ dependencies = [
  "anyhow",
  "dirs",
  "portable-pty",
+ "rusqlite",
  "serde",
  "serde_json",
  "time",

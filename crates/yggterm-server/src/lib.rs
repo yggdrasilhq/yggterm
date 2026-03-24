@@ -17,6 +17,7 @@ pub use host::{GhosttyHostKind, GhosttyHostSupport, GhosttyTerminalHostMode, det
 pub use terminal::{TerminalChunk, TerminalManager, TerminalReadResult};
 
 use anyhow::Context;
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -25,10 +26,11 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::SystemTime;
 use time::{OffsetDateTime, UtcOffset, macros::format_description};
+use tracing::warn;
 use uuid::Uuid;
 use yggterm_core::{
     SessionNode, SessionNodeKind, SessionStore, TranscriptRole, UiTheme, WorkspaceDocument,
-    WorkspaceDocumentKind, read_codex_transcript_messages,
+    WorkspaceDocumentKind, read_codex_transcript_messages, resolve_yggterm_home,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -690,11 +692,28 @@ impl YggtermServer {
                 if machine.health == RemoteMachineHealth::Healthy {
                     machine.health = RemoteMachineHealth::Cached;
                 }
+                if machine.sessions.is_empty()
+                    && let Ok(mirrored) =
+                        load_remote_machine_sessions_from_mirror(&machine.machine_key)
+                    && !mirrored.is_empty()
+                {
+                    machine.sessions = mirrored;
+                    machine.health = RemoteMachineHealth::Cached;
+                }
                 machine
             })
             .collect();
         for target in self.ssh_targets.clone() {
             self.ensure_remote_machine_stub(&target);
+        }
+        for machine in &mut self.remote_machines {
+            if machine.sessions.is_empty()
+                && let Ok(mirrored) = load_remote_machine_sessions_from_mirror(&machine.machine_key)
+                && !mirrored.is_empty()
+            {
+                machine.sessions = mirrored;
+                machine.health = RemoteMachineHealth::Cached;
+            }
         }
         for session in state.stored_sessions {
             let document = if session.kind == SessionKind::Document {
@@ -804,6 +823,9 @@ impl YggtermServer {
                         .cmp(&left.modified_epoch)
                         .then_with(|| right.started_at.cmp(&left.started_at))
                 });
+                if let Err(mirror_error) = mirror_remote_machine_sessions(&machine_key, &sessions) {
+                    warn!(machine_key, error=%mirror_error, "failed to mirror remote machine sessions locally");
+                }
                 self.remote_machines[entry_ix] = RemoteMachineSnapshot {
                     machine_key,
                     label,
@@ -815,7 +837,11 @@ impl YggtermServer {
                 Ok(())
             }
             Err(error) => {
-                let existing_sessions = self.remote_machines[entry_ix].sessions.clone();
+                let existing_sessions = if self.remote_machines[entry_ix].sessions.is_empty() {
+                    load_remote_machine_sessions_from_mirror(&machine_key).unwrap_or_default()
+                } else {
+                    self.remote_machines[entry_ix].sessions.clone()
+                };
                 self.remote_machines[entry_ix] = RemoteMachineSnapshot {
                     machine_key,
                     label,
@@ -1696,6 +1722,149 @@ conn.commit()
 conn.close()
 "#;
 
+const REMOTE_METADATA_MIRROR_DB_FILENAME: &str = "remote-session-cache.db";
+
+fn open_remote_metadata_mirror_store() -> anyhow::Result<Connection> {
+    let home = resolve_yggterm_home()?;
+    let db_path = home.join(REMOTE_METADATA_MIRROR_DB_FILENAME);
+    let conn = Connection::open(&db_path)
+        .with_context(|| format!("failed to open remote metadata mirror {}", db_path.display()))?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS remote_session_metadata (
+            machine_key TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            cwd TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            modified_epoch INTEGER NOT NULL,
+            event_count INTEGER NOT NULL,
+            user_message_count INTEGER NOT NULL,
+            assistant_message_count INTEGER NOT NULL,
+            title_hint TEXT NOT NULL,
+            recent_context TEXT NOT NULL,
+            cached_precis TEXT,
+            cached_summary TEXT,
+            storage_path TEXT NOT NULL,
+            synced_at TEXT NOT NULL,
+            PRIMARY KEY(machine_key, session_id)
+        );",
+    )
+    .context("failed to initialize remote metadata mirror schema")?;
+    Ok(conn)
+}
+
+fn mirror_remote_machine_sessions(
+    machine_key: &str,
+    sessions: &[RemoteScannedSession],
+) -> anyhow::Result<()> {
+    let mut conn = open_remote_metadata_mirror_store()?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "DELETE FROM remote_session_metadata WHERE machine_key = ?1",
+        params![machine_key],
+    )?;
+    let synced_at =
+        OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
+    for session in sessions {
+        tx.execute(
+            "INSERT INTO remote_session_metadata (
+                machine_key, session_id, cwd, started_at, modified_epoch, event_count,
+                user_message_count, assistant_message_count, title_hint, recent_context,
+                cached_precis, cached_summary, storage_path, synced_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                machine_key,
+                session.session_id,
+                session.cwd,
+                session.started_at,
+                session.modified_epoch,
+                session.event_count as i64,
+                session.user_message_count as i64,
+                session.assistant_message_count as i64,
+                session.title_hint,
+                session.recent_context,
+                session.cached_precis,
+                session.cached_summary,
+                session.storage_path,
+                synced_at,
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn load_remote_machine_sessions_from_mirror(
+    machine_key: &str,
+) -> anyhow::Result<Vec<RemoteScannedSession>> {
+    let conn = open_remote_metadata_mirror_store()?;
+    let mut stmt = conn.prepare(
+        "SELECT session_id, cwd, started_at, modified_epoch, event_count, user_message_count,
+                assistant_message_count, title_hint, recent_context, cached_precis,
+                cached_summary, storage_path
+         FROM remote_session_metadata
+         WHERE machine_key = ?1
+         ORDER BY modified_epoch DESC, started_at DESC",
+    )?;
+    let rows = stmt.query_map(params![machine_key], |row| {
+        let session_id: String = row.get(0)?;
+        Ok(RemoteScannedSession {
+            session_path: remote_scanned_session_path(machine_key, &session_id),
+            session_id,
+            cwd: row.get(1)?,
+            started_at: row.get(2)?,
+            modified_epoch: row.get(3)?,
+            event_count: row.get::<_, i64>(4)? as usize,
+            user_message_count: row.get::<_, i64>(5)? as usize,
+            assistant_message_count: row.get::<_, i64>(6)? as usize,
+            title_hint: row.get(7)?,
+            recent_context: row.get(8)?,
+            cached_precis: row.get(9)?,
+            cached_summary: row.get(10)?,
+            storage_path: row.get(11)?,
+        })
+    })?;
+    let mut sessions = Vec::new();
+    for row in rows {
+        sessions.push(row?);
+    }
+    Ok(sessions)
+}
+
+fn update_remote_generated_copy_in_mirror(
+    machine_key: &str,
+    session_id: &str,
+    title: Option<&str>,
+    precis: Option<&str>,
+    summary: Option<&str>,
+) -> anyhow::Result<()> {
+    let conn = open_remote_metadata_mirror_store()?;
+    if let Some(title) = title {
+        conn.execute(
+            "UPDATE remote_session_metadata
+             SET title_hint = ?3
+             WHERE machine_key = ?1 AND session_id = ?2",
+            params![machine_key, session_id, title],
+        )?;
+    }
+    if let Some(precis) = precis {
+        conn.execute(
+            "UPDATE remote_session_metadata
+             SET cached_precis = ?3
+             WHERE machine_key = ?1 AND session_id = ?2",
+            params![machine_key, session_id, precis],
+        )?;
+    }
+    if let Some(summary) = summary {
+        conn.execute(
+            "UPDATE remote_session_metadata
+             SET cached_summary = ?3
+             WHERE machine_key = ?1 AND session_id = ?2",
+            params![machine_key, session_id, summary],
+        )?;
+    }
+    Ok(())
+}
+
 fn run_remote_python_lines(
     ssh_target: &str,
     exec_prefix: Option<&str>,
@@ -1855,6 +2024,15 @@ pub fn persist_remote_generated_copy(
         REMOTE_UPSERT_GENERATED_COPY_SCRIPT,
         &args,
     )?;
+    if let Err(error) = update_remote_generated_copy_in_mirror(
+        &machine.machine_key,
+        session_id,
+        title,
+        precis,
+        summary,
+    ) {
+        warn!(machine_key=%machine.machine_key, session_id, error=%error, "failed to update local remote metadata mirror");
+    }
     Ok(())
 }
 
@@ -3298,8 +3476,10 @@ fn short_session_id(session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        GhosttyHostSupport, RemoteMachineHealth, RemoteMachineSnapshot, SessionKind, SessionNode,
-        SessionNodeKind, UiTheme, YggtermServer, parse_stored_transcript, remote_resume_command,
+        GhosttyHostSupport, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession,
+        SessionKind, SessionNode, SessionNodeKind, UiTheme, YggtermServer,
+        load_remote_machine_sessions_from_mirror, mirror_remote_machine_sessions,
+        parse_stored_transcript, remote_resume_command, remote_scanned_session_path,
         stored_session_launch_command,
     };
     use anyhow::Result;
@@ -3409,6 +3589,52 @@ mod tests {
         assert_eq!(reopened, session_path);
         assert!(session.launch_command.starts_with("ssh -tt jojo "));
         assert!(session.launch_command.contains("codex resume"));
+        Ok(())
+    }
+
+    #[test]
+    fn remote_metadata_mirror_round_trips_sessions() -> Result<()> {
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-remote-mirror-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&home)?;
+        let previous_home = std::env::var_os(yggterm_core::ENV_YGGTERM_HOME);
+        unsafe {
+            std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, &home);
+        }
+
+        let sessions = vec![RemoteScannedSession {
+            session_path: remote_scanned_session_path("jojo", "abc123"),
+            session_id: "abc123".to_string(),
+            cwd: "/srv/app".to_string(),
+            started_at: "2026-03-24T12:00:00Z".to_string(),
+            modified_epoch: 42,
+            event_count: 9,
+            user_message_count: 4,
+            assistant_message_count: 5,
+            title_hint: "Deploy Fix".to_string(),
+            recent_context: "USER: test\nASSISTANT: reply".to_string(),
+            cached_precis: Some("Short precis".to_string()),
+            cached_summary: Some("Longer summary text".to_string()),
+            storage_path: "/home/pi/.codex/sessions/test.jsonl".to_string(),
+        }];
+        mirror_remote_machine_sessions("jojo", &sessions)?;
+        let loaded = load_remote_machine_sessions_from_mirror("jojo")?;
+
+        if let Some(previous_home) = previous_home {
+            unsafe {
+                std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, previous_home);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var(yggterm_core::ENV_YGGTERM_HOME);
+            }
+        }
+        let _ = fs::remove_dir_all(home);
+
+        assert_eq!(loaded, sessions);
         Ok(())
     }
 }
