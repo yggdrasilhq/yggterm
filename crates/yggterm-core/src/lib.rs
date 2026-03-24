@@ -26,7 +26,7 @@ pub use install::{
     write_direct_install_state,
 };
 pub use perf::{PERF_TELEMETRY_FILENAME, PerfSpan, append_perf_event, perf_telemetry_path};
-pub use titles::looks_like_generated_fallback_title;
+pub use titles::{SessionTitleStore, looks_like_generated_fallback_title};
 pub use transcript::{
     TranscriptMessage, TranscriptRole, message_lines_from_payload, read_codex_transcript_messages,
 };
@@ -899,6 +899,11 @@ fn read_codex_session_summary(
         session_id: identity.session_id,
         cwd: identity.cwd,
     }))
+}
+
+pub fn read_codex_session_identity_fields(path: &Path) -> Result<Option<(String, String)>> {
+    Ok(read_codex_session_identity(path)?
+        .map(|identity| (identity.session_id, identity.cwd)))
 }
 
 fn read_codex_session_identity(path: &Path) -> Result<Option<CodexSessionIdentity>> {
