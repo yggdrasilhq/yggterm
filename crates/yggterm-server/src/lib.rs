@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::SystemTime;
 use time::{OffsetDateTime, UtcOffset, macros::format_description};
@@ -1546,6 +1546,13 @@ fn default_unknown_cwd() -> String {
     "<unknown>".to_string()
 }
 
+fn current_millis_u64() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
 const REMOTE_SCAN_SCRIPT: &str = r#"
 import json, os, sys, sqlite3
 from pathlib import Path
@@ -1775,6 +1782,18 @@ if summary:
 conn.commit()
 conn.close()
 "#;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RemoteGeneratedCopyPayload {
+    session_id: String,
+    cwd: String,
+    title: Option<String>,
+    precis: Option<String>,
+    summary: Option<String>,
+    model: String,
+    source: String,
+    updated_at: String,
+}
 
 const REMOTE_METADATA_MIRROR_DB_FILENAME: &str = "remote-session-cache.db";
 
@@ -2051,11 +2070,81 @@ fn run_remote_python(
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+fn remote_shell_command(exec_prefix: Option<&str>, inner: &str) -> String {
+    match exec_prefix
+        .map(str::trim)
+        .filter(|prefix| !prefix.is_empty())
+    {
+        Some(prefix) => format!("{prefix} sh -c {}", shell_single_quote(inner)),
+        None => inner.to_string(),
+    }
+}
+
+fn run_remote_yggterm_command(
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+    args: &[&str],
+    stdin_bytes: Option<&[u8]>,
+) -> anyhow::Result<String> {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o").arg("ConnectTimeout=5");
+    cmd.arg("-o").arg("BatchMode=yes");
+    let mut inner = String::from("yggterm");
+    for arg in args {
+        inner.push(' ');
+        inner.push_str(&shell_single_quote(arg));
+    }
+    let remote = remote_shell_command(exec_prefix, &inner);
+    cmd.arg(ssh_target).arg(remote);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("failed to start remote yggterm command for {ssh_target}"))?;
+    if let Some(stdin) = child.stdin.as_mut()
+        && let Some(bytes) = stdin_bytes
+    {
+        stdin
+            .write_all(bytes)
+            .with_context(|| format!("failed to send remote yggterm payload to {ssh_target}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("failed waiting for remote yggterm command on {ssh_target}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "remote yggterm command failed for {}: {}",
+            ssh_target,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn should_fallback_to_python(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}");
+    message.contains("command not found")
+        || message.contains("not found")
+        || message.contains("No such file")
+        || message.contains("remote yggterm command failed")
+}
+
 pub fn stage_remote_clipboard_png(
     ssh_target: &str,
     exec_prefix: Option<&str>,
     png_bytes: &[u8],
 ) -> anyhow::Result<String> {
+    match run_remote_yggterm_command(
+        ssh_target,
+        exec_prefix,
+        &["server", "remote", "stage-clipboard-png"],
+        Some(png_bytes),
+    ) {
+        Ok(path) => return Ok(path),
+        Err(error) if !should_fallback_to_python(&error) => return Err(error),
+        Err(_) => {}
+    }
     let mut cmd = Command::new("ssh");
     cmd.arg("-o").arg("ConnectTimeout=5");
     cmd.arg("-o").arg("BatchMode=yes");
@@ -2136,6 +2225,130 @@ fn scan_remote_machine_sessions(
     Ok(sessions)
 }
 
+pub fn run_remote_stage_clipboard_png() -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let clipboard_dir = home.join("clipboard");
+    fs::create_dir_all(&clipboard_dir)
+        .with_context(|| format!("creating remote clipboard dir {}", clipboard_dir.display()))?;
+    let filename = format!(
+        "clipboard-{}-{}.png",
+        current_millis_u64(),
+        Uuid::new_v4().simple()
+    );
+    let path = clipboard_dir.join(filename);
+    let mut payload = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut payload)
+        .context("reading clipboard image payload from stdin")?;
+    if payload.is_empty() {
+        anyhow::bail!("no clipboard image payload supplied");
+    }
+    fs::write(&path, payload)
+        .with_context(|| format!("writing remote clipboard image {}", path.display()))?;
+    println!("{}", path.display());
+    Ok(())
+}
+
+pub fn run_remote_upsert_generated_copy(payload_json: &str) -> anyhow::Result<()> {
+    let payload: RemoteGeneratedCopyPayload =
+        serde_json::from_str(payload_json).context("parsing remote generated copy payload")?;
+    let home = resolve_yggterm_home()?;
+    let db_path = home.join("session-titles.db");
+    if let Some(parent) = db_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating title db dir {}", parent.display()))?;
+    }
+    let conn = Connection::open(&db_path)
+        .with_context(|| format!("opening session title db {}", db_path.display()))?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS session_titles (
+            session_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            cwd TEXT,
+            source TEXT,
+            model TEXT,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS session_precis (
+            session_id TEXT PRIMARY KEY,
+            precis TEXT NOT NULL,
+            cwd TEXT,
+            source TEXT,
+            model TEXT,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS session_summaries (
+            session_id TEXT PRIMARY KEY,
+            summary TEXT NOT NULL,
+            cwd TEXT,
+            source TEXT,
+            model TEXT,
+            updated_at TEXT NOT NULL
+        );",
+    )?;
+    if let Some(title) = payload.title.as_deref().filter(|value| !value.trim().is_empty()) {
+        conn.execute(
+            "INSERT INTO session_titles (session_id, title, cwd, source, model, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(session_id) DO UPDATE SET
+               title = excluded.title,
+               cwd = excluded.cwd,
+               source = excluded.source,
+               model = excluded.model,
+               updated_at = excluded.updated_at",
+            params![
+                payload.session_id,
+                title,
+                payload.cwd,
+                payload.source,
+                payload.model,
+                payload.updated_at,
+            ],
+        )?;
+    }
+    if let Some(precis) = payload.precis.as_deref().filter(|value| !value.trim().is_empty()) {
+        conn.execute(
+            "INSERT INTO session_precis (session_id, precis, cwd, source, model, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(session_id) DO UPDATE SET
+               precis = excluded.precis,
+               cwd = excluded.cwd,
+               source = excluded.source,
+               model = excluded.model,
+               updated_at = excluded.updated_at",
+            params![
+                payload.session_id,
+                precis,
+                payload.cwd,
+                payload.source,
+                payload.model,
+                payload.updated_at,
+            ],
+        )?;
+    }
+    if let Some(summary) = payload.summary.as_deref().filter(|value| !value.trim().is_empty()) {
+        conn.execute(
+            "INSERT INTO session_summaries (session_id, summary, cwd, source, model, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(session_id) DO UPDATE SET
+               summary = excluded.summary,
+               cwd = excluded.cwd,
+               source = excluded.source,
+               model = excluded.model,
+               updated_at = excluded.updated_at",
+            params![
+                payload.session_id,
+                summary,
+                payload.cwd,
+                payload.source,
+                payload.model,
+                payload.updated_at,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 pub fn persist_remote_generated_copy(
     machine: &RemoteMachineSnapshot,
     session_id: &str,
@@ -2147,23 +2360,35 @@ pub fn persist_remote_generated_copy(
 ) -> anyhow::Result<()> {
     let updated_at =
         time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
-    let payload = serde_json::json!({
-        "session_id": session_id,
-        "cwd": cwd,
-        "title": title,
-        "precis": precis,
-        "summary": summary,
-        "model": model,
-        "source": "interface-llm",
-        "updated_at": updated_at,
-    });
-    let args = vec![payload.to_string()];
-    let _ = run_remote_python(
+    let payload = RemoteGeneratedCopyPayload {
+        session_id: session_id.to_string(),
+        cwd: cwd.to_string(),
+        title: title.map(ToOwned::to_owned),
+        precis: precis.map(ToOwned::to_owned),
+        summary: summary.map(ToOwned::to_owned),
+        model: model.to_string(),
+        source: "interface-llm".to_string(),
+        updated_at,
+    };
+    let payload_json = serde_json::to_string(&payload)?;
+    match run_remote_yggterm_command(
         &machine.ssh_target,
         machine.prefix.as_deref(),
-        REMOTE_UPSERT_GENERATED_COPY_SCRIPT,
-        &args,
-    )?;
+        &["server", "remote", "upsert-generated-copy", &payload_json],
+        None,
+    ) {
+        Ok(_) => {}
+        Err(error) if !should_fallback_to_python(&error) => return Err(error),
+        Err(_) => {
+            let args = vec![payload_json];
+            let _ = run_remote_python(
+                &machine.ssh_target,
+                machine.prefix.as_deref(),
+                REMOTE_UPSERT_GENERATED_COPY_SCRIPT,
+                &args,
+            )?;
+        }
+    }
     if let Err(error) = update_remote_generated_copy_in_mirror(
         &machine.machine_key,
         session_id,

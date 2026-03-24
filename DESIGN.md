@@ -445,6 +445,11 @@ The refresh affordance should:
 - sit at the end of the title or secondary line it refreshes
 - use the same visual language in preview and terminal mode
 
+Remote-first shell behavior should prefer a Yggterm-owned server path on SSH targets over terminal-text workarounds.
+
+- If a remote machine has `yggterm` available, metadata sync, generated copy persistence, and clipboard/image staging should go through explicit remote Yggterm commands first.
+- Shell-typed fallbacks are acceptable only as compatibility bridges, not as the long-term design center.
+
 The header should not contain:
 
 - literal markdown markers like `#`
