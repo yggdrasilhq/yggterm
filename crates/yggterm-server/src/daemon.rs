@@ -923,9 +923,14 @@ fn handle_unix_stream(
 ) -> Result<bool> {
     let request = read_request(stream.try_clone().context("cloning unix stream")?)?;
     let should_shutdown = matches!(request, ServerRequest::Shutdown);
-    let response = {
+    let response = match {
         let mut runtime = runtime.lock().expect("daemon runtime lock poisoned");
-        runtime.handle_request(request)?
+        runtime.handle_request(request)
+    } {
+        Ok(response) => response,
+        Err(error) => ServerResponse::Error {
+            message: error.to_string(),
+        },
     };
     write_response(&mut stream, &response)?;
     Ok(should_shutdown)
@@ -937,9 +942,14 @@ fn handle_tcp_stream(
 ) -> Result<bool> {
     let request = read_request(stream.try_clone().context("cloning tcp stream")?)?;
     let should_shutdown = matches!(request, ServerRequest::Shutdown);
-    let response = {
+    let response = match {
         let mut runtime = runtime.lock().expect("daemon runtime lock poisoned");
-        runtime.handle_request(request)?
+        runtime.handle_request(request)
+    } {
+        Ok(response) => response,
+        Err(error) => ServerResponse::Error {
+            message: error.to_string(),
+        },
     };
     write_response(&mut stream, &response)?;
     Ok(should_shutdown)
