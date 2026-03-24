@@ -165,10 +165,6 @@ impl DaemonRuntime {
         if let Some(saved) = load_persisted_state(&state_path)? {
             server.restore_persisted_state(saved, Some(&store));
         }
-        let restored_targets = server.ssh_targets().to_vec();
-        for target in restored_targets {
-            let _ = server.refresh_remote_machine_for_ssh_target(&target);
-        }
         Ok(Self {
             support,
             state_path,
