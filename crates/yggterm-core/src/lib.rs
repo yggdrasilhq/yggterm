@@ -1095,4 +1095,58 @@ mod tests {
         assert_eq!(nodes[1].path, PathBuf::from("/workspace/notes~0000-paper"));
         assert_eq!(nodes[2].path, PathBuf::from("/workspace/notes~0001"));
     }
+
+    #[test]
+    fn browser_restore_only_keeps_level_one_groups_expanded() {
+        let root = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: Some(WorkspaceGroupKind::Folder),
+            path: PathBuf::from("/workspace"),
+            children: vec![SessionNode {
+                kind: SessionNodeKind::Group,
+                name: "machine-a".to_string(),
+                title: Some("machine-a".to_string()),
+                document_kind: None,
+                group_kind: Some(WorkspaceGroupKind::Folder),
+                path: PathBuf::from("/workspace/machine-a"),
+                children: vec![SessionNode {
+                    kind: SessionNodeKind::Group,
+                    name: "nested".to_string(),
+                    title: Some("nested".to_string()),
+                    document_kind: None,
+                    group_kind: Some(WorkspaceGroupKind::Folder),
+                    path: PathBuf::from("/workspace/machine-a/nested"),
+                    children: vec![SessionNode {
+                        kind: SessionNodeKind::CodexSession,
+                        name: "session-1".to_string(),
+                        title: Some("session-1".to_string()),
+                        document_kind: None,
+                        group_kind: None,
+                        path: PathBuf::from("/workspace/machine-a/nested/session-1"),
+                        children: Vec::new(),
+                        session_id: Some("session-1".to_string()),
+                        cwd: Some("/workspace/machine-a/nested".to_string()),
+                    }],
+                    session_id: None,
+                    cwd: None,
+                }],
+                session_id: None,
+                cwd: None,
+            }],
+            session_id: None,
+            cwd: None,
+        };
+
+        let mut browser = SessionBrowserState::new(root);
+        browser.restore_ui_state(
+            &["/workspace/machine-a/nested".to_string()],
+            Some("/workspace/machine-a/nested/session-1"),
+        );
+
+        assert!(browser.rows().iter().any(|row| row.full_path == "/workspace/machine-a"));
+        assert!(!browser.rows().iter().any(|row| row.full_path == "/workspace/machine-a/nested/session-1"));
+    }
 }

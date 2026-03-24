@@ -7,7 +7,7 @@ pub use attach::{AttachMetadata, run_attach};
 pub use daemon::{
     ServerEndpoint, ServerRequest, ServerResponse, ServerRuntimeStatus, TerminalStreamChunk,
     connect_ssh, connect_ssh_custom, default_endpoint, focus_live, open_remote_session,
-    open_stored_session, ping, raise_external_window, refresh_remote_machine,
+    open_stored_session, ping, raise_external_window, refresh_remote_machine, remove_ssh_target,
     request_terminal_launch, run_daemon, set_all_preview_blocks_folded, set_view_mode, shutdown,
     snapshot, start_command_session, start_local_session, start_local_session_at, status,
     switch_agent_session_mode, sync_external_window, sync_theme, terminal_ensure, terminal_read,
@@ -535,6 +535,35 @@ impl YggtermServer {
 
     pub fn ssh_targets(&self) -> &[SshConnectTarget] {
         &self.ssh_targets
+    }
+
+    pub fn remove_ssh_targets_for_machine(&mut self, machine_key: &str) -> usize {
+        let before = self.ssh_targets.len();
+        self.ssh_targets
+            .retain(|target| machine_key_from_ssh_target(&target.ssh_target) != machine_key);
+        let removed = before.saturating_sub(self.ssh_targets.len());
+        if removed == 0 {
+            return 0;
+        }
+
+        let has_live_dependency = self.sessions.values().any(|session| {
+            session.source == SessionSource::LiveSsh
+                && session
+                    .ssh_target
+                    .as_deref()
+                    .map(machine_key_from_ssh_target)
+                    .as_deref()
+                    == Some(machine_key)
+        });
+        let has_saved_dependency = self
+            .ssh_targets
+            .iter()
+            .any(|target| machine_key_from_ssh_target(&target.ssh_target) == machine_key);
+        if !has_live_dependency && !has_saved_dependency {
+            self.remote_machines
+                .retain(|machine| machine.machine_key != machine_key);
+        }
+        removed
     }
 
     pub fn remote_machines(&self) -> &[RemoteMachineSnapshot] {
