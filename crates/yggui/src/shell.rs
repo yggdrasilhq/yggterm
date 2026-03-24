@@ -336,6 +336,22 @@ enum TerminalJsCommand {
         foreground: String,
         cursor: String,
         selection: String,
+        black: String,
+        red: String,
+        green: String,
+        yellow: String,
+        blue: String,
+        magenta: String,
+        cyan: String,
+        white: String,
+        bright_black: String,
+        bright_red: String,
+        bright_green: String,
+        bright_yellow: String,
+        bright_blue: String,
+        bright_magenta: String,
+        bright_cyan: String,
+        bright_white: String,
         font_size: f32,
     },
     Write {
@@ -349,6 +365,8 @@ enum TerminalJsEvent {
     Ready,
     Input { data: String },
     Resize { cols: u16, rows: u16 },
+    Clipboard { action: String, chars: usize },
+    ClipboardError { action: String, message: String },
     Debug { message: String },
 }
 
@@ -5287,6 +5305,27 @@ fn app() -> Element {
                 if evt.key() == Key::Delete && state.read().tree_rename_path.is_none() {
                     evt.prevent_default();
                     queue_delete_selected_items(state, false);
+                    return;
+                }
+                let is_accel = evt.modifiers().contains(Modifiers::CONTROL)
+                    || evt.modifiers().contains(Modifiers::META);
+                let is_terminal_shortcut = is_accel
+                    && evt.modifiers().contains(Modifiers::SHIFT)
+                    && matches!(evt.key(), Key::Character(ref key) if key.eq_ignore_ascii_case("c") || key.eq_ignore_ascii_case("x"));
+                if is_terminal_shortcut && state.read().snapshot().active_view_mode != WorkspaceViewMode::Terminal {
+                    let (title, message) = match evt.key() {
+                        Key::Character(key) if key.eq_ignore_ascii_case("x") => (
+                            "Cut to Clipboard",
+                            "Moved the current UI selection to the clipboard.",
+                        ),
+                        _ => (
+                            "Copied to Clipboard",
+                            "Copied the current UI selection to the clipboard.",
+                        ),
+                    };
+                    state.with_mut(|shell| {
+                        shell.push_notification(NotificationTone::Success, title, message);
+                    });
                 }
             },
             oncontextmenu: |evt| {
@@ -5398,6 +5437,7 @@ fn app() -> Element {
                         on_cancel_rename: move |_| state.with_mut(|shell| shell.cancel_tree_rename()),
                     }
                     MainSurface {
+                        state,
                         snapshot: main_snapshot,
                         on_expand_preview: move || spawn_server_snapshot_action(
                             state,
@@ -6621,6 +6661,7 @@ fn BellIcon() -> Element {
 
 #[component]
 fn MainSurface(
+    state: Signal<ShellState>,
     snapshot: RenderSnapshot,
     on_expand_preview: EventHandler<()>,
     on_collapse_preview: EventHandler<()>,
@@ -6737,6 +6778,7 @@ fn MainSurface(
                         key: "{terminal_instance_key(&session.session_path, snapshot.settings.terminal_font_size)}",
                         session: session.clone(),
                         snapshot: snapshot.clone(),
+                        state,
                     }
                 }
             },
@@ -7857,7 +7899,11 @@ fn truncate_preview_excerpt(text: &str, max_chars: usize) -> String {
 }
 
 #[component]
-fn TerminalCanvas(session: ManagedSessionView, snapshot: RenderSnapshot) -> Element {
+fn TerminalCanvas(
+    session: ManagedSessionView,
+    snapshot: RenderSnapshot,
+    state: Signal<ShellState>,
+) -> Element {
     let endpoint = BOOTSTRAP
         .get()
         .expect("shell bootstrap initialized")
@@ -7868,7 +7914,11 @@ fn TerminalCanvas(session: ManagedSessionView, snapshot: RenderSnapshot) -> Elem
     let instance_key = terminal_instance_key(&session_path, snapshot.settings.terminal_font_size);
     let terminal_title = session.title.clone();
     let future_host_id = host_id.clone();
-    let theme = terminal_theme(snapshot.palette, snapshot.settings.terminal_font_size);
+    let theme = terminal_theme(
+        snapshot.settings.theme,
+        snapshot.palette,
+        snapshot.settings.terminal_font_size,
+    );
     let future_theme = theme.clone();
     info!(
         session=%session_path,
@@ -7890,6 +7940,7 @@ fn TerminalCanvas(session: ManagedSessionView, snapshot: RenderSnapshot) -> Elem
         let host_id = future_host_id.clone();
         let title = terminal_title.clone();
         let theme = future_theme.clone();
+        let mut state = state;
         async move {
             if let Err(error) = terminal_ensure(&endpoint, &session_path) {
                 warn!(session=%session_path, error=%error, "failed to ensure terminal");
@@ -7902,6 +7953,22 @@ fn TerminalCanvas(session: ManagedSessionView, snapshot: RenderSnapshot) -> Elem
                 foreground: theme.foreground.clone(),
                 cursor: theme.cursor.clone(),
                 selection: theme.selection.clone(),
+                black: theme.black.clone(),
+                red: theme.red.clone(),
+                green: theme.green.clone(),
+                yellow: theme.yellow.clone(),
+                blue: theme.blue.clone(),
+                magenta: theme.magenta.clone(),
+                cyan: theme.cyan.clone(),
+                white: theme.white.clone(),
+                bright_black: theme.bright_black.clone(),
+                bright_red: theme.bright_red.clone(),
+                bright_green: theme.bright_green.clone(),
+                bright_yellow: theme.bright_yellow.clone(),
+                bright_blue: theme.bright_blue.clone(),
+                bright_magenta: theme.bright_magenta.clone(),
+                bright_cyan: theme.bright_cyan.clone(),
+                bright_white: theme.bright_white.clone(),
                 font_size: theme.font_size,
             });
             let mut cursor = 0u64;
@@ -7922,6 +7989,48 @@ fn TerminalCanvas(session: ManagedSessionView, snapshot: RenderSnapshot) -> Elem
                             }
                             Ok(TerminalJsEvent::Resize { cols, rows }) => {
                                 let _ = terminal_resize(&endpoint, &session_path, cols, rows);
+                            }
+                            Ok(TerminalJsEvent::Clipboard { action, chars }) => {
+                                let (title, message) = if action == "cut" {
+                                    (
+                                        "Cut to Clipboard",
+                                        if chars == 0 {
+                                            "Terminal selection moved to the clipboard.".to_string()
+                                        } else {
+                                            format!("Moved {chars} character(s) from the terminal selection.")
+                                        },
+                                    )
+                                } else {
+                                    (
+                                        "Copied to Clipboard",
+                                        if chars == 0 {
+                                            "Terminal selection copied to the clipboard.".to_string()
+                                        } else {
+                                            format!("Copied {chars} character(s) from the terminal selection.")
+                                        },
+                                    )
+                                };
+                                state.with_mut(|shell| {
+                                    shell.push_notification(
+                                        NotificationTone::Success,
+                                        title,
+                                        message,
+                                    );
+                                });
+                            }
+                            Ok(TerminalJsEvent::ClipboardError { action, message }) => {
+                                let title = if action == "cut" {
+                                    "Cut Failed"
+                                } else {
+                                    "Copy Failed"
+                                };
+                                state.with_mut(|shell| {
+                                    shell.push_notification(
+                                        NotificationTone::Error,
+                                        title,
+                                        message.clone(),
+                                    );
+                                });
                             }
                             Ok(TerminalJsEvent::Debug { message }) => {
                                 info!(session=%session_path, %message, "terminal js debug");
@@ -7978,15 +8087,72 @@ struct TerminalTheme {
     cursor: String,
     font_size: f32,
     selection: String,
+    black: String,
+    red: String,
+    green: String,
+    yellow: String,
+    blue: String,
+    magenta: String,
+    cyan: String,
+    white: String,
+    bright_black: String,
+    bright_red: String,
+    bright_green: String,
+    bright_yellow: String,
+    bright_blue: String,
+    bright_magenta: String,
+    bright_cyan: String,
+    bright_white: String,
 }
 
-fn terminal_theme(palette: Palette, font_size: f32) -> TerminalTheme {
-    TerminalTheme {
-        background: palette.panel.to_string(),
-        foreground: palette.text.to_string(),
-        cursor: palette.accent.to_string(),
-        font_size: font_size.max(5.0),
-        selection: "rgba(107,165,255,0.16)".to_string(),
+fn terminal_theme(ui_theme: UiTheme, palette: Palette, font_size: f32) -> TerminalTheme {
+    match ui_theme {
+        UiTheme::ZedLight => TerminalTheme {
+            background: palette.panel.to_string(),
+            foreground: palette.text.to_string(),
+            cursor: palette.accent.to_string(),
+            font_size: font_size.max(5.0),
+            selection: "rgba(107,165,255,0.16)".to_string(),
+            black: "#2f3a46".to_string(),
+            red: "#d14d5a".to_string(),
+            green: "#2f9d68".to_string(),
+            yellow: "#b57f00".to_string(),
+            blue: "#2f7cf6".to_string(),
+            magenta: "#8b5cf6".to_string(),
+            cyan: "#0f8fa6".to_string(),
+            white: "#dbe4ec".to_string(),
+            bright_black: "#697785".to_string(),
+            bright_red: "#ea5f6c".to_string(),
+            bright_green: "#44b57f".to_string(),
+            bright_yellow: "#d89d18".to_string(),
+            bright_blue: "#4a90ff".to_string(),
+            bright_magenta: "#a77cff".to_string(),
+            bright_cyan: "#2ab3cc".to_string(),
+            bright_white: "#ffffff".to_string(),
+        },
+        UiTheme::ZedDark => TerminalTheme {
+            background: "#1f2329".to_string(),
+            foreground: "#abb2bf".to_string(),
+            cursor: "#61afef".to_string(),
+            font_size: font_size.max(5.0),
+            selection: "rgba(97,175,239,0.24)".to_string(),
+            black: "#282c34".to_string(),
+            red: "#e06c75".to_string(),
+            green: "#98c379".to_string(),
+            yellow: "#e5c07b".to_string(),
+            blue: "#61afef".to_string(),
+            magenta: "#c678dd".to_string(),
+            cyan: "#56b6c2".to_string(),
+            white: "#dcdfe4".to_string(),
+            bright_black: "#5c6370".to_string(),
+            bright_red: "#e06c75".to_string(),
+            bright_green: "#98c379".to_string(),
+            bright_yellow: "#e5c07b".to_string(),
+            bright_blue: "#61afef".to_string(),
+            bright_magenta: "#c678dd".to_string(),
+            bright_cyan: "#56b6c2".to_string(),
+            bright_white: "#ffffff".to_string(),
+        },
     }
 }
 
@@ -8124,7 +8290,11 @@ fn apply_active_terminal_zoom(state: Signal<ShellState>) {
         return;
     };
     let host_id = terminal_host_id(&session.session_path);
-    let theme = terminal_theme(snapshot.palette, snapshot.settings.terminal_font_size);
+    let theme = terminal_theme(
+        snapshot.settings.theme,
+        snapshot.palette,
+        snapshot.settings.terminal_font_size,
+    );
     info!(
         session=%session.session_path,
         host_id=%host_id,
@@ -8141,6 +8311,30 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
         serde_json::to_string(&theme.foreground).expect("serialize terminal foreground");
     let cursor = serde_json::to_string(&theme.cursor).expect("serialize terminal cursor");
     let selection = serde_json::to_string(&theme.selection).expect("serialize terminal selection");
+    let black = serde_json::to_string(&theme.black).expect("serialize terminal black");
+    let red = serde_json::to_string(&theme.red).expect("serialize terminal red");
+    let green = serde_json::to_string(&theme.green).expect("serialize terminal green");
+    let yellow = serde_json::to_string(&theme.yellow).expect("serialize terminal yellow");
+    let blue = serde_json::to_string(&theme.blue).expect("serialize terminal blue");
+    let magenta = serde_json::to_string(&theme.magenta).expect("serialize terminal magenta");
+    let cyan = serde_json::to_string(&theme.cyan).expect("serialize terminal cyan");
+    let white = serde_json::to_string(&theme.white).expect("serialize terminal white");
+    let bright_black =
+        serde_json::to_string(&theme.bright_black).expect("serialize terminal bright black");
+    let bright_red =
+        serde_json::to_string(&theme.bright_red).expect("serialize terminal bright red");
+    let bright_green =
+        serde_json::to_string(&theme.bright_green).expect("serialize terminal bright green");
+    let bright_yellow =
+        serde_json::to_string(&theme.bright_yellow).expect("serialize terminal bright yellow");
+    let bright_blue =
+        serde_json::to_string(&theme.bright_blue).expect("serialize terminal bright blue");
+    let bright_magenta =
+        serde_json::to_string(&theme.bright_magenta).expect("serialize terminal bright magenta");
+    let bright_cyan =
+        serde_json::to_string(&theme.bright_cyan).expect("serialize terminal bright cyan");
+    let bright_white =
+        serde_json::to_string(&theme.bright_white).expect("serialize terminal bright white");
     let constructed_debug = if cfg!(debug_assertions) {
         "dioxus.send({ kind: \"debug\", message: `constructed host=${hostId} fontSize=${term.options.fontSize} cols=${term.cols} rows=${term.rows}` });"
     } else {
@@ -8184,11 +8378,69 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
                 foreground: {foreground},
                 cursor: {cursor},
                 selectionBackground: {selection},
+                black: {black},
+                red: {red},
+                green: {green},
+                yellow: {yellow},
+                blue: {blue},
+                magenta: {magenta},
+                cyan: {cyan},
+                white: {white},
+                brightBlack: {bright_black},
+                brightRed: {bright_red},
+                brightGreen: {bright_green},
+                brightYellow: {bright_yellow},
+                brightBlue: {bright_blue},
+                brightMagenta: {bright_magenta},
+                brightCyan: {bright_cyan},
+                brightWhite: {bright_white},
             }},
         }});
         const fitAddon = new window.FitAddon.FitAddon();
         term.loadAddon(fitAddon);
         term.open(host);
+        term.attachCustomKeyEventHandler((event) => {{
+            const accel = event.ctrlKey || event.metaKey;
+            const key = (event.key || '').toLowerCase();
+            if (!accel || !event.shiftKey || (key !== 'c' && key !== 'x')) {{
+                return true;
+            }}
+            const selection = term.getSelection ? term.getSelection() : "";
+            if (!selection) {{
+                dioxus.send({{
+                    kind: "clipboard_error",
+                    action: key === 'x' ? "cut" : "copy",
+                    message: "Select terminal text before using the clipboard shortcut.",
+                }});
+                return false;
+            }}
+            const action = key === 'x' ? "cut" : "copy";
+            const finish = () => {{
+                try {{
+                    if (action === "cut" && term.clearSelection) {{
+                        term.clearSelection();
+                    }}
+                }} catch (_error) {{}}
+                dioxus.send({{ kind: "clipboard", action, chars: selection.length }});
+            }};
+            const fail = (error) => {{
+                dioxus.send({{
+                    kind: "clipboard_error",
+                    action,
+                    message: error && error.message ? error.message : "Clipboard access was denied.",
+                }});
+            }};
+            try {{
+                if (navigator.clipboard && navigator.clipboard.writeText) {{
+                    navigator.clipboard.writeText(selection).then(finish).catch(fail);
+                }} else {{
+                    fail(new Error("Clipboard API is unavailable."));
+                }}
+            }} catch (error) {{
+                fail(error);
+            }}
+            return false;
+        }});
         window.__yggtermXtermHosts = window.__yggtermXtermHosts || {{}};
         window.__yggtermXtermHosts[hostId] = {{ term, fitAddon }};
         const emitResize = () => {{
@@ -8230,6 +8482,22 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
                     foreground: message.foreground,
                     cursor: message.cursor,
                     selectionBackground: message.selection,
+                    black: message.black,
+                    red: message.red,
+                    green: message.green,
+                    yellow: message.yellow,
+                    blue: message.blue,
+                    magenta: message.magenta,
+                    cyan: message.cyan,
+                    white: message.white,
+                    brightBlack: message.bright_black,
+                    brightRed: message.bright_red,
+                    brightGreen: message.bright_green,
+                    brightYellow: message.bright_yellow,
+                    brightBlue: message.bright_blue,
+                    brightMagenta: message.bright_magenta,
+                    brightCyan: message.bright_cyan,
+                    brightWhite: message.bright_white,
                 }};
                 {reset_debug}
                 requestAnimationFrame(() => emitResize());
@@ -8243,6 +8511,22 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
         foreground = foreground,
         cursor = cursor,
         selection = selection,
+        black = black,
+        red = red,
+        green = green,
+        yellow = yellow,
+        blue = blue,
+        magenta = magenta,
+        cyan = cyan,
+        white = white,
+        bright_black = bright_black,
+        bright_red = bright_red,
+        bright_green = bright_green,
+        bright_yellow = bright_yellow,
+        bright_blue = bright_blue,
+        bright_magenta = bright_magenta,
+        bright_cyan = bright_cyan,
+        bright_white = bright_white,
         constructed_debug = constructed_debug,
         reset_debug = reset_debug
     )
@@ -8255,6 +8539,30 @@ fn terminal_apply_script(host_id: &str, theme: &TerminalTheme) -> String {
         serde_json::to_string(&theme.foreground).expect("serialize terminal foreground");
     let cursor = serde_json::to_string(&theme.cursor).expect("serialize terminal cursor");
     let selection = serde_json::to_string(&theme.selection).expect("serialize terminal selection");
+    let black = serde_json::to_string(&theme.black).expect("serialize terminal black");
+    let red = serde_json::to_string(&theme.red).expect("serialize terminal red");
+    let green = serde_json::to_string(&theme.green).expect("serialize terminal green");
+    let yellow = serde_json::to_string(&theme.yellow).expect("serialize terminal yellow");
+    let blue = serde_json::to_string(&theme.blue).expect("serialize terminal blue");
+    let magenta = serde_json::to_string(&theme.magenta).expect("serialize terminal magenta");
+    let cyan = serde_json::to_string(&theme.cyan).expect("serialize terminal cyan");
+    let white = serde_json::to_string(&theme.white).expect("serialize terminal white");
+    let bright_black =
+        serde_json::to_string(&theme.bright_black).expect("serialize terminal bright black");
+    let bright_red =
+        serde_json::to_string(&theme.bright_red).expect("serialize terminal bright red");
+    let bright_green =
+        serde_json::to_string(&theme.bright_green).expect("serialize terminal bright green");
+    let bright_yellow =
+        serde_json::to_string(&theme.bright_yellow).expect("serialize terminal bright yellow");
+    let bright_blue =
+        serde_json::to_string(&theme.bright_blue).expect("serialize terminal bright blue");
+    let bright_magenta =
+        serde_json::to_string(&theme.bright_magenta).expect("serialize terminal bright magenta");
+    let bright_cyan =
+        serde_json::to_string(&theme.bright_cyan).expect("serialize terminal bright cyan");
+    let bright_white =
+        serde_json::to_string(&theme.bright_white).expect("serialize terminal bright white");
     format!(
         r#"
         (() => {{
@@ -8270,6 +8578,22 @@ fn terminal_apply_script(host_id: &str, theme: &TerminalTheme) -> String {
             foreground: {foreground},
             cursor: {cursor},
             selectionBackground: {selection},
+            black: {black},
+            red: {red},
+            green: {green},
+            yellow: {yellow},
+            blue: {blue},
+            magenta: {magenta},
+            cyan: {cyan},
+            white: {white},
+            brightBlack: {bright_black},
+            brightRed: {bright_red},
+            brightGreen: {bright_green},
+            brightYellow: {bright_yellow},
+            brightBlue: {bright_blue},
+            brightMagenta: {bright_magenta},
+            brightCyan: {bright_cyan},
+            brightWhite: {bright_white},
           }};
           try {{
             entry.fitAddon && entry.fitAddon.fit();
@@ -8287,6 +8611,22 @@ fn terminal_apply_script(host_id: &str, theme: &TerminalTheme) -> String {
         foreground = foreground,
         cursor = cursor,
         selection = selection,
+        black = black,
+        red = red,
+        green = green,
+        yellow = yellow,
+        blue = blue,
+        magenta = magenta,
+        cyan = cyan,
+        white = white,
+        bright_black = bright_black,
+        bright_red = bright_red,
+        bright_green = bright_green,
+        bright_yellow = bright_yellow,
+        bright_blue = bright_blue,
+        bright_magenta = bright_magenta,
+        bright_cyan = bright_cyan,
+        bright_white = bright_white,
     )
 }
 
@@ -9193,20 +9533,51 @@ fn ThemeEditorOverlay(
                         div {
                             style: "display:flex; align-items:center; justify-content:space-between; gap:10px;",
                             div {
-                                style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", snapshot.palette.muted),
-                                "Colors"
+                                style: "display:flex; flex-direction:column; gap:3px;",
+                                div {
+                                    style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", snapshot.palette.muted),
+                                    "Gradient Stops"
+                                }
+                                div {
+                                    style: format!("font-size:11px; color:{};", snapshot.palette.muted),
+                                    if snapshot.theme_editor_draft.colors.is_empty() {
+                                        "Start with one color, then add more only when the gradient needs them."
+                                    } else {
+                                        "{snapshot.theme_editor_draft.colors.len()} stop(s) in this gradient"
+                                    }
+                                }
                             }
                             div {
-                                style: "display:flex; align-items:center; gap:8px;",
+                                style: "display:flex; align-items:center; gap:8px; padding:5px; border-radius:14px; background:rgba(245,248,251,0.96); box-shadow:inset 0 0 0 1px rgba(214,223,232,0.92);",
                                 button {
-                                    style: chip_style(snapshot.palette, false),
+                                    style: theme_editor_action_button_style(snapshot.palette, &accent, false, true),
                                     onclick: move |evt| on_add_stop.call(evt),
-                                    if snapshot.theme_editor_draft.colors.is_empty() { "Add First +" } else { "+ Add" }
+                                    span {
+                                        style: format!("font-size:14px; font-weight:800; color:{};", accent),
+                                        "+"
+                                    }
+                                    span { "Add Stop" }
                                 }
                                 button {
-                                    style: chip_style(snapshot.palette, snapshot.theme_editor_selected_stop.is_some()),
+                                    style: theme_editor_action_button_style(
+                                        snapshot.palette,
+                                        &accent,
+                                        snapshot.theme_editor_selected_stop.is_some(),
+                                        false,
+                                    ),
                                     onclick: move |evt| on_remove_stop.call(evt),
-                                    "Remove"
+                                    span {
+                                        style: format!(
+                                            "font-size:14px; font-weight:800; color:{};",
+                                            if snapshot.theme_editor_selected_stop.is_some() {
+                                                snapshot.palette.text
+                                            } else {
+                                                snapshot.palette.muted
+                                            }
+                                        ),
+                                        "−"
+                                    }
+                                    span { "Remove" }
                                 }
                             }
                         }
@@ -9763,6 +10134,40 @@ fn chip_style(palette: Palette, selected: bool) -> String {
     )
 }
 
+fn theme_editor_action_button_style(
+    palette: Palette,
+    accent: &str,
+    enabled: bool,
+    primary: bool,
+) -> String {
+    format!(
+        "display:flex; align-items:center; gap:7px; height:30px; padding:0 11px; border:none; border-radius:11px; \
+         background:{}; color:{}; font-size:11px; font-weight:700; box-shadow:{}; opacity:{};",
+        if primary {
+            "rgba(255,255,255,0.98)"
+        } else if enabled {
+            "rgba(235,242,248,0.96)"
+        } else {
+            "rgba(244,247,250,0.84)"
+        },
+        if primary {
+            accent
+        } else if enabled {
+            palette.text
+        } else {
+            palette.muted
+        },
+        if primary {
+            format!("inset 0 0 0 1px rgba(214,223,232,0.92), 0 8px 18px rgba(81,113,138,0.08)")
+        } else if enabled {
+            format!("inset 0 0 0 1px rgba(214,223,232,0.92)")
+        } else {
+            "inset 0 0 0 1px rgba(224,231,238,0.9)".to_string()
+        },
+        if enabled || primary { "1" } else { "0.72" },
+    )
+}
+
 fn primary_action_style(palette: Palette) -> String {
     format!(
         "width:100%; border:none; border-radius:12px; background:{}; color:white; padding:10px 12px; text-align:left; \
@@ -9951,25 +10356,35 @@ mod tests {
 
     #[test]
     fn terminal_theme_uses_requested_font_size_down_to_floor() {
-        let theme = terminal_theme(palette(UiTheme::ZedLight), 5.0);
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 5.0);
         assert_eq!(theme.font_size, 5.0);
 
-        let clamped = terminal_theme(palette(UiTheme::ZedLight), 2.0);
+        let clamped = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 2.0);
         assert_eq!(clamped.font_size, 5.0);
     }
 
     #[test]
     fn terminal_eval_script_bakes_font_size_into_xterm_constructor() {
-        let theme = terminal_theme(palette(UiTheme::ZedLight), 13.0);
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0);
         let script = terminal_eval_script("yggterm-terminal-test", &theme);
         assert!(script.contains("fontSize: 13"));
+        assert!(script.contains("brightWhite"));
     }
 
     #[test]
     fn terminal_apply_script_updates_live_xterm_font_size() {
-        let theme = terminal_theme(palette(UiTheme::ZedLight), 5.0);
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 5.0);
         let script = terminal_apply_script("yggterm-terminal-test", &theme);
         assert!(script.contains("entry.term.options.fontSize = 5"));
+        assert!(script.contains("brightBlack"));
+    }
+
+    #[test]
+    fn terminal_theme_uses_one_dark_palette_for_dark_mode() {
+        let theme = terminal_theme(UiTheme::ZedDark, palette(UiTheme::ZedDark), 13.0);
+        assert_eq!(theme.background, "#1f2329");
+        assert_eq!(theme.foreground, "#abb2bf");
+        assert_eq!(theme.blue, "#61afef");
     }
 
     #[test]
