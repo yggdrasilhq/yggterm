@@ -33,6 +33,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 use tao::event::Event as TaoEvent;
@@ -68,6 +69,7 @@ use yggterm_server::{
 };
 
 static BOOTSTRAP: OnceCell<ShellBootstrap> = OnceCell::new();
+static PASSIVE_COPY_SUSPENDED: AtomicBool = AtomicBool::new(false);
 const SIDE_RAIL_WIDTH: usize = 292;
 const EDGE_RESIZE_HANDLE: usize = 5;
 const CORNER_RESIZE_HANDLE: usize = 10;
@@ -76,6 +78,7 @@ const XTERM_JS: &str = include_str!("../../../assets/xterm/xterm.js");
 const XTERM_FIT_JS: &str = include_str!("../../../assets/xterm/addon-fit.js");
 static XTERM_ASSETS_BOOTSTRAPPED: OnceCell<()> = OnceCell::new();
 const TREE_LOADING_DOT_CSS: &str = "@keyframes yggterm-tree-loading-dot { 0%, 80%, 100% { opacity: 0.28; transform: translateY(0px); } 40% { opacity: 1; transform: translateY(-1px); } }";
+const BACKGROUND_COPY_RETRY_MS: u64 = 300_000;
 type WorkspaceReorderPlanItem = TreeReorderPlanItem<BrowserRowKind>;
 
 #[derive(Debug, Clone)]
@@ -137,6 +140,9 @@ struct ShellState {
     title_requests_in_flight: HashSet<String>,
     precis_requests_in_flight: HashSet<String>,
     summary_requests_in_flight: HashSet<String>,
+    passive_copy_suspended: bool,
+    passive_copy_failures: HashSet<String>,
+    copy_retry_after_ms: HashMap<String, u64>,
     remote_machine_refresh_requests: HashSet<String>,
     drag_paths: Vec<String>,
     drag_hover_target: Option<DragDropTarget>,
@@ -248,6 +254,39 @@ struct ContextMenuPlacement {
     bottom: Option<f64>,
 }
 
+#[derive(Clone)]
+struct CopyGenerationTarget {
+    session_path: String,
+    session_id: String,
+    cwd: String,
+    title: String,
+    remote_context: Option<String>,
+    remote_machine: Option<RemoteMachineSnapshot>,
+}
+
+#[derive(Clone)]
+enum BackgroundCopyJob {
+    Title(CopyGenerationTarget),
+    Precis(CopyGenerationTarget),
+    Summary(CopyGenerationTarget),
+}
+
+fn background_copy_retry_key(prefix: &str, session_path: &str) -> String {
+    format!("{prefix}:{session_path}")
+}
+
+fn background_copy_retry_ready(shell: &ShellState, prefix: &str, session_path: &str) -> bool {
+    let key = background_copy_retry_key(prefix, session_path);
+    !PASSIVE_COPY_SUSPENDED.load(Ordering::Relaxed)
+        && !shell.passive_copy_suspended
+        && !shell.passive_copy_failures.contains(&key)
+        && shell
+            .copy_retry_after_ms
+            .get(&key)
+            .copied()
+            .is_none_or(|retry_after| retry_after <= current_millis())
+}
+
 #[derive(Clone, Copy, PartialEq)]
 struct Palette {
     shell: &'static str,
@@ -342,6 +381,7 @@ impl ShellState {
         }
 
         let needs_initial_server_sync = bootstrap.initial_server_snapshot.is_none();
+        PASSIVE_COPY_SUSPENDED.store(false, Ordering::Relaxed);
         let mut state = Self {
             settings,
             bootstrap,
@@ -376,6 +416,9 @@ impl ShellState {
             title_requests_in_flight: HashSet::new(),
             precis_requests_in_flight: HashSet::new(),
             summary_requests_in_flight: HashSet::new(),
+            passive_copy_suspended: false,
+            passive_copy_failures: HashSet::new(),
+            copy_retry_after_ms: HashMap::new(),
             remote_machine_refresh_requests: HashSet::new(),
             drag_paths: Vec::new(),
             drag_hover_target: None,
@@ -681,18 +724,30 @@ impl ShellState {
 
     fn update_litellm_endpoint(&mut self, value: String) {
         self.settings.litellm_endpoint = value;
+        PASSIVE_COPY_SUSPENDED.store(false, Ordering::Relaxed);
+        self.passive_copy_suspended = false;
+        self.passive_copy_failures.clear();
+        self.copy_retry_after_ms.clear();
         self.persist_settings();
         self.last_action = "updated LiteLLM endpoint".to_string();
     }
 
     fn update_litellm_api_key(&mut self, value: String) {
         self.settings.litellm_api_key = value;
+        PASSIVE_COPY_SUSPENDED.store(false, Ordering::Relaxed);
+        self.passive_copy_suspended = false;
+        self.passive_copy_failures.clear();
+        self.copy_retry_after_ms.clear();
         self.persist_settings();
         self.last_action = "updated LiteLLM API key".to_string();
     }
 
     fn update_interface_llm_model(&mut self, value: String) {
         self.settings.interface_llm_model = value;
+        PASSIVE_COPY_SUSPENDED.store(false, Ordering::Relaxed);
+        self.passive_copy_suspended = false;
+        self.passive_copy_failures.clear();
+        self.copy_retry_after_ms.clear();
         self.persist_settings();
         self.last_action = "updated interface llm".to_string();
     }
@@ -1181,60 +1236,6 @@ impl ShellState {
         }
     }
 
-    fn generate_session_titles(&mut self) {
-        if self.settings.litellm_endpoint.trim().is_empty()
-            || self.settings.litellm_api_key.trim().is_empty()
-            || self.settings.interface_llm_model.trim().is_empty()
-        {
-            self.last_action = "configure LiteLLM settings first".to_string();
-            self.push_notification(
-                NotificationTone::Warning,
-                "LiteLLM Not Configured",
-                "Fill the endpoint, API key, and interface model before generating titles.",
-            );
-            return;
-        }
-
-        let selected_path = self.browser.selected_path().map(str::to_string);
-        let filter_query = self.search_query.clone();
-
-        match SessionStore::open_or_init().and_then(|store| {
-            let generated = store.generate_missing_codex_titles(&self.settings, 8)?;
-            let browser_tree = store.load_codex_tree(&self.settings)?;
-            Ok((generated, browser_tree))
-        }) {
-            Ok((generated, browser_tree)) => {
-                self.browser = SessionBrowserState::new(browser_tree);
-                self.browser.set_filter_query(filter_query);
-                if let Some(path) = selected_path {
-                    self.browser.select_path(path);
-                }
-                self.last_action = if generated == 0 {
-                    "titles already cached".to_string()
-                } else {
-                    format!("generated {generated} titles")
-                };
-                self.push_notification(
-                    NotificationTone::Success,
-                    "Session Titles Updated",
-                    if generated == 0 {
-                        "All visible titles were already cached.".to_string()
-                    } else {
-                        format!("Generated {generated} new session titles.")
-                    },
-                );
-            }
-            Err(error) => {
-                self.last_action = format!("title generation failed: {error}");
-                self.push_notification(
-                    NotificationTone::Error,
-                    "Title Generation Failed",
-                    error.to_string(),
-                );
-            }
-        }
-    }
-
     fn regenerate_title_for_row(&mut self, _row: &BrowserRow) {
         self.context_menu_row = None;
     }
@@ -1290,31 +1291,34 @@ impl ShellState {
     }
 }
 
-fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force: bool) {
-    let session_path = row.full_path.clone();
-    let remote_context = if is_remote_scanned_sidebar_row(&row) {
-        state.read().server.remote_machines().iter().find_map(|machine| {
-            machine
-                .sessions
-                .iter()
-                .find(|session| session.session_path == row.full_path)
-                .map(|session| {
-                    (
-                        session.session_id.clone(),
-                        session.cwd.clone(),
-                        session.recent_context.clone(),
-                    )
-                })
-        })
-    } else {
-        None
-    };
-    let remote_machine = remote_machine_for_session_path(&state.read().server, &session_path);
-    if !is_local_stored_session_row(&row) && remote_context.is_none() {
-        return;
+fn queue_title_generation(state: Signal<ShellState>, row: BrowserRow, force: bool) {
+    if let Some(target) = copy_generation_target_for_browser_row(&state.read().server, &row) {
+        spawn_title_generation_for_target(state, target, force, force);
     }
+}
+
+fn queue_active_session_title_generation(state: Signal<ShellState>, force: bool) {
+    let Some(session) = state.read().server.active_session().cloned() else {
+        return;
+    };
+    let Some(target) = copy_generation_target_for_session(&state.read().server, &session) else {
+        return;
+    };
+    spawn_title_generation_for_target(state, target, force, force);
+}
+
+fn spawn_title_generation_for_target(
+    mut state: Signal<ShellState>,
+    target: CopyGenerationTarget,
+    force: bool,
+    announce: bool,
+) {
+    let session_path = target.session_path.clone();
+    let settings = state.read().settings.clone();
     let should_start = state.with_mut(|shell| {
-        if shell.title_requests_in_flight.contains(&session_path) {
+        if shell.title_requests_in_flight.contains(&session_path)
+            || (!force && !announce && !background_copy_retry_ready(shell, "title", &session_path))
+        {
             false
         } else {
             shell.title_requests_in_flight.insert(session_path.clone());
@@ -1324,111 +1328,87 @@ fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force:
     if !should_start {
         return;
     }
-
-    let settings = state.read().settings.clone();
-    if settings.litellm_endpoint.trim().is_empty()
-        || settings.litellm_api_key.trim().is_empty()
-        || settings.interface_llm_model.trim().is_empty()
-    {
+    if !copy_generation_settings_ready(&settings) {
         state.with_mut(|shell| {
             shell.title_requests_in_flight.remove(&session_path);
-        });
-        state.with_mut(|shell| {
-            shell.push_notification(
-                NotificationTone::Warning,
-                "LiteLLM Not Configured",
-                "Open settings and configure LiteLLM before generating chat titles.",
-            );
+            if announce {
+                shell.push_notification(
+                    NotificationTone::Warning,
+                    "LiteLLM Not Configured",
+                    "Open settings and configure LiteLLM before generating chat titles.",
+                );
+            }
         });
         return;
     }
-
-    state.with_mut(|shell| {
-        shell.last_action = if force {
-            format!("regenerating title for {}", row.label)
-        } else {
-            format!("generating title for {}", row.label)
-        };
-    });
-    info!(session_path=%row.full_path, force, "queueing title generation");
-
+    if announce {
+        state.with_mut(|shell| {
+            shell.last_action = if force {
+                format!("regenerating title for {}", target.title)
+            } else {
+                format!("generating title for {}", target.title)
+            };
+        });
+    }
+    info!(session_path=%target.session_path, force, "queueing title generation");
     spawn(async move {
-        let row_for_task = row.clone();
+        let target_for_task = target.clone();
         let settings_for_task = settings.clone();
-        let remote_context_for_task = remote_context.clone();
-        let remote_machine_for_task = remote_machine.clone();
-        let outcome = task::spawn_blocking(
-            move || -> Result<(Option<String>, Option<yggterm_core::SessionNode>)> {
-                info!(session_path=%row_for_task.full_path, force, "running title generation task");
-                let store = SessionStore::open_or_init()?;
-                if let Some((session_id, cwd, context)) = remote_context_for_task {
-                    let title = store.generate_title_for_context(
-                        &settings_for_task,
-                        &session_id,
-                        &cwd,
-                        &context,
-                        force,
+        let outcome = task::spawn_blocking(move || -> Result<(Option<String>, Option<SessionNode>)> {
+            info!(session_path=%target_for_task.session_path, force, "running title generation task");
+            let store = SessionStore::open_or_init()?;
+            if let Some(context) = target_for_task.remote_context.as_deref() {
+                let title = store.generate_title_for_context(
+                    &settings_for_task,
+                    &target_for_task.session_id,
+                    &target_for_task.cwd,
+                    context,
+                    force,
+                )?;
+                if let (Some(machine), Some(title_text)) =
+                    (target_for_task.remote_machine.as_ref(), title.as_deref())
+                {
+                    persist_remote_generated_copy(
+                        machine,
+                        &target_for_task.session_id,
+                        &target_for_task.cwd,
+                        Some(title_text),
+                        None,
+                        None,
+                        &settings_for_task.interface_llm_model,
                     )?;
-                    if let (Some(machine), Some(title_text)) =
-                        (remote_machine_for_task.as_ref(), title.as_deref())
-                    {
-                        persist_remote_generated_copy(
-                            machine,
-                            &session_id,
-                            &cwd,
-                            Some(title_text),
-                            None,
-                            None,
-                            &settings_for_task.interface_llm_model,
-                        )?;
-                    }
-                    Ok((title, None))
-                } else {
-                    let title = store.generate_title_for_session_path(
-                        &settings_for_task,
-                        &row_for_task.full_path,
-                        force,
-                    )?;
-                    let browser_tree = store.load_codex_tree(&settings_for_task)?;
-                    Ok((title, Some(browser_tree)))
                 }
-            },
-        )
-        .await;
+                Ok((title, None))
+            } else {
+                let title = store.generate_title_for_session_path(
+                    &settings_for_task,
+                    &target_for_task.session_path,
+                    force,
+                )?;
+                let browser_tree = store.load_codex_tree(&settings_for_task)?;
+                Ok((title, Some(browser_tree)))
+            }
+        }).await;
 
         state.with_mut(|shell| match outcome {
             Ok(Ok((Some(title), browser_tree))) => {
                 shell.title_requests_in_flight.remove(&session_path);
+                shell
+                    .passive_copy_failures
+                    .remove(&background_copy_retry_key("title", &session_path));
+                shell
+                    .copy_retry_after_ms
+                    .remove(&background_copy_retry_key("title", &session_path));
                 if let Some(browser_tree) = browser_tree {
-                    let selected_path = shell.browser.selected_path().map(str::to_string);
-                    let expanded_paths = shell.browser.expanded_paths();
-                    let filter_query = shell.search_query.clone();
-                    shell.browser = SessionBrowserState::new(browser_tree);
-                    shell.browser.restore_ui_state(
-                        &expanded_paths,
-                        selected_path
-                            .as_deref()
-                            .or(Some(row.full_path.as_str())),
-                    );
-                    shell.browser.set_filter_query(filter_query);
-                    shell.apply_daemon_snapshot_result(open_stored_session(
-                        &shell.bootstrap.server_endpoint,
-                        SessionKind::Codex,
-                        &row.full_path,
-                        row.session_id.as_deref(),
-                        row.session_cwd.as_deref(),
-                        Some(&title),
-                    ));
-                } else {
-                    shell.server.set_session_title_hint(&row.full_path, &title);
+                    restore_browser_tree(shell, browser_tree, Some(&target.session_path));
                 }
+                shell.server.set_session_title_hint(&target.session_path, &title);
                 shell.last_action = if force {
                     "regenerated title".to_string()
                 } else {
                     "generated title".to_string()
                 };
-                shell.sync_browser_settings();
-                if force {
+                if announce {
                     shell.push_notification(
                         NotificationTone::Success,
                         "Title Regenerated",
@@ -1438,8 +1418,19 @@ fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force:
             }
             Ok(Ok((None, _))) => {
                 shell.title_requests_in_flight.remove(&session_path);
-                warn!(session_path=%row.full_path, "title generation produced no usable title");
-                if force {
+                if !announce && !force {
+                    PASSIVE_COPY_SUSPENDED.store(true, Ordering::Relaxed);
+                    shell.passive_copy_suspended = true;
+                    shell
+                        .passive_copy_failures
+                        .insert(background_copy_retry_key("title", &session_path));
+                }
+                shell.copy_retry_after_ms.insert(
+                    background_copy_retry_key("title", &session_path),
+                    current_millis() + BACKGROUND_COPY_RETRY_MS,
+                );
+                warn!(session_path=%target.session_path, "title generation produced no usable title");
+                if announce {
                     shell.push_notification(
                         NotificationTone::Warning,
                         "No Title Generated",
@@ -1449,9 +1440,20 @@ fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force:
             }
             Ok(Err(error)) => {
                 shell.title_requests_in_flight.remove(&session_path);
+                if !announce && !force {
+                    PASSIVE_COPY_SUSPENDED.store(true, Ordering::Relaxed);
+                    shell.passive_copy_suspended = true;
+                    shell
+                        .passive_copy_failures
+                        .insert(background_copy_retry_key("title", &session_path));
+                }
+                shell.copy_retry_after_ms.insert(
+                    background_copy_retry_key("title", &session_path),
+                    current_millis() + BACKGROUND_COPY_RETRY_MS,
+                );
                 shell.last_action = format!("title generation failed: {error}");
-                warn!(session_path=%row.full_path, error=%error, "title generation failed");
-                if force {
+                warn!(session_path=%target.session_path, error=%error, "title generation failed");
+                if announce {
                     shell.push_notification(
                         NotificationTone::Error,
                         "Title Generation Failed",
@@ -1461,9 +1463,20 @@ fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force:
             }
             Err(error) => {
                 shell.title_requests_in_flight.remove(&session_path);
+                if !announce && !force {
+                    PASSIVE_COPY_SUSPENDED.store(true, Ordering::Relaxed);
+                    shell.passive_copy_suspended = true;
+                    shell
+                        .passive_copy_failures
+                        .insert(background_copy_retry_key("title", &session_path));
+                }
+                shell.copy_retry_after_ms.insert(
+                    background_copy_retry_key("title", &session_path),
+                    current_millis() + BACKGROUND_COPY_RETRY_MS,
+                );
                 shell.last_action = format!("title generation task failed: {error}");
-                warn!(session_path=%row.full_path, error=%error, "title generation task join failed");
-                if force {
+                warn!(session_path=%target.session_path, error=%error, "title generation task join failed");
+                if announce {
                     shell.push_notification(
                         NotificationTone::Error,
                         "Title Task Failed",
@@ -1472,55 +1485,34 @@ fn queue_title_generation(mut state: Signal<ShellState>, row: BrowserRow, force:
                 }
             }
         });
+        maybe_spawn_background_copy_generation(state);
     });
 }
 
-fn queue_active_session_title_generation(state: Signal<ShellState>, force: bool) {
-    let Some(session) = state.read().server.active_session().cloned() else {
+fn spawn_precis_generation(state: Signal<ShellState>, session: ManagedSessionView, force: bool) {
+    let Some(target) = copy_generation_target_for_session(&state.read().server, &session) else {
         return;
     };
-    if !supports_generated_session_copy(&session) {
-        return;
-    }
-    let row = BrowserRow {
-        kind: BrowserRowKind::Session,
-        full_path: session.session_path.clone(),
-        label: session.title.clone(),
-        detail_label: String::new(),
-        document_kind: None,
-        group_kind: None,
-        session_title: Some(session.title.clone()),
-        depth: 0,
-        host_label: session.host_label.clone(),
-        descendant_sessions: 0,
-        expanded: false,
-        session_id: Some(session.id.clone()),
-        session_cwd: Some(metadata_value(&session, "Cwd")),
-    };
-    queue_title_generation(state, row, force);
+    spawn_precis_generation_for_target(state, target, force, force);
 }
 
-fn spawn_precis_generation(mut state: Signal<ShellState>, session: ManagedSessionView, force: bool) {
-    if !supports_generated_session_copy(&session) {
-        return;
-    }
-
-    let session_path = session.session_path.clone();
-    let session_id = session.id.clone();
-    let cwd = metadata_value(&session, "Cwd");
-    let remote_context = remote_scanned_session_context(&state.read().server, &session_path);
-    let remote_machine = remote_machine_for_session_path(&state.read().server, &session_path);
+fn spawn_precis_generation_for_target(
+    mut state: Signal<ShellState>,
+    target: CopyGenerationTarget,
+    force: bool,
+    announce: bool,
+) {
+    let session_path = target.session_path.clone();
     let settings = state.read().settings.clone();
-    if settings.litellm_endpoint.trim().is_empty()
-        || settings.litellm_api_key.trim().is_empty()
-        || settings.interface_llm_model.trim().is_empty()
-    {
+    if !copy_generation_settings_ready(&settings) {
         return;
     }
-
     let should_start = state.with_mut(|shell| {
-        if !force && shell.generated_precis.contains_key(&session_path)
+        if (!force && shell.generated_precis.contains_key(&session_path))
             || shell.precis_requests_in_flight.contains(&session_path)
+            || (!force
+                && !announce
+                && !background_copy_retry_ready(shell, "precis", &session_path))
         {
             false
         } else {
@@ -1534,31 +1526,26 @@ fn spawn_precis_generation(mut state: Signal<ShellState>, session: ManagedSessio
     if !should_start {
         return;
     }
-
     spawn(async move {
-        let path_for_task = session_path.clone();
-        let session_id_for_task = session_id.clone();
-        let cwd_for_task = cwd.clone();
-        let remote_context_for_task = remote_context.clone();
+        let target_for_task = target.clone();
         let settings_for_task = settings.clone();
-        let remote_machine_for_task = remote_machine.clone();
         let outcome = task::spawn_blocking(move || -> Result<Option<String>> {
             let store = SessionStore::open_or_init()?;
-            if let Some(context) = remote_context_for_task {
+            if let Some(context) = target_for_task.remote_context.as_deref() {
                 let precis = store.generate_precis_for_context(
                     &settings_for_task,
-                    &session_id_for_task,
-                    &cwd_for_task,
-                    &context,
+                    &target_for_task.session_id,
+                    &target_for_task.cwd,
+                    context,
                     force,
                 )?;
                 if let (Some(machine), Some(precis_text)) =
-                    (remote_machine_for_task.as_ref(), precis.as_deref())
+                    (target_for_task.remote_machine.as_ref(), precis.as_deref())
                 {
                     persist_remote_generated_copy(
                         machine,
-                        &session_id_for_task,
-                        &cwd_for_task,
+                        &target_for_task.session_id,
+                        &target_for_task.cwd,
                         None,
                         Some(precis_text),
                         None,
@@ -1568,20 +1555,25 @@ fn spawn_precis_generation(mut state: Signal<ShellState>, session: ManagedSessio
                 return Ok(precis);
             }
             if !force
-                && let Some(precis) = store.resolve_precis_for_session_path(&path_for_task)?
+                && let Some(precis) = store.resolve_precis_for_session_path(&target_for_task.session_path)?
             {
                 return Ok(Some(precis));
             }
-            store.generate_precis_for_session_path(&settings_for_task, &path_for_task, force)
-        })
-        .await;
+            store.generate_precis_for_session_path(&settings_for_task, &target_for_task.session_path, force)
+        }).await;
 
         state.with_mut(|shell| {
             shell.precis_requests_in_flight.remove(&session_path);
             match outcome {
                 Ok(Ok(Some(precis))) => {
                     shell.generated_precis.insert(session_path.clone(), precis);
-                    if force {
+                    shell
+                        .passive_copy_failures
+                        .remove(&background_copy_retry_key("precis", &session_path));
+                    shell
+                        .copy_retry_after_ms
+                        .remove(&background_copy_retry_key("precis", &session_path));
+                    if announce {
                         shell.push_notification(
                             NotificationTone::Success,
                             "Precis Regenerated",
@@ -1589,10 +1581,33 @@ fn spawn_precis_generation(mut state: Signal<ShellState>, session: ManagedSessio
                         );
                     }
                 }
-                Ok(Ok(None)) => {}
+                Ok(Ok(None)) => {
+                    if !announce && !force {
+                        PASSIVE_COPY_SUSPENDED.store(true, Ordering::Relaxed);
+                        shell.passive_copy_suspended = true;
+                        shell
+                            .passive_copy_failures
+                            .insert(background_copy_retry_key("precis", &session_path));
+                    }
+                    shell.copy_retry_after_ms.insert(
+                        background_copy_retry_key("precis", &session_path),
+                        current_millis() + BACKGROUND_COPY_RETRY_MS,
+                    );
+                }
                 Ok(Err(error)) => {
+                    if !announce && !force {
+                        PASSIVE_COPY_SUSPENDED.store(true, Ordering::Relaxed);
+                        shell.passive_copy_suspended = true;
+                        shell
+                            .passive_copy_failures
+                            .insert(background_copy_retry_key("precis", &session_path));
+                    }
+                    shell.copy_retry_after_ms.insert(
+                        background_copy_retry_key("precis", &session_path),
+                        current_millis() + BACKGROUND_COPY_RETRY_MS,
+                    );
                     shell.last_action = format!("precis generation failed: {error}");
-                    if force {
+                    if announce {
                         shell.push_notification(
                             NotificationTone::Error,
                             "Precis Generation Failed",
@@ -1601,8 +1616,19 @@ fn spawn_precis_generation(mut state: Signal<ShellState>, session: ManagedSessio
                     }
                 }
                 Err(error) => {
+                    if !announce && !force {
+                        PASSIVE_COPY_SUSPENDED.store(true, Ordering::Relaxed);
+                        shell.passive_copy_suspended = true;
+                        shell
+                            .passive_copy_failures
+                            .insert(background_copy_retry_key("precis", &session_path));
+                    }
+                    shell.copy_retry_after_ms.insert(
+                        background_copy_retry_key("precis", &session_path),
+                        current_millis() + BACKGROUND_COPY_RETRY_MS,
+                    );
                     shell.last_action = format!("precis task failed: {error}");
-                    if force {
+                    if announce {
                         shell.push_notification(
                             NotificationTone::Error,
                             "Precis Task Failed",
@@ -1612,30 +1638,34 @@ fn spawn_precis_generation(mut state: Signal<ShellState>, session: ManagedSessio
                 }
             }
         });
+        maybe_spawn_background_copy_generation(state);
     });
 }
 
-fn spawn_summary_generation(mut state: Signal<ShellState>, session: ManagedSessionView, force: bool) {
-    if !supports_generated_session_copy(&session) {
+fn spawn_summary_generation(state: Signal<ShellState>, session: ManagedSessionView, force: bool) {
+    let Some(target) = copy_generation_target_for_session(&state.read().server, &session) else {
         return;
-    }
+    };
+    spawn_summary_generation_for_target(state, target, force, force);
+}
 
-    let session_path = session.session_path.clone();
-    let session_id = session.id.clone();
-    let cwd = metadata_value(&session, "Cwd");
-    let remote_context = remote_scanned_session_context(&state.read().server, &session_path);
-    let remote_machine = remote_machine_for_session_path(&state.read().server, &session_path);
+fn spawn_summary_generation_for_target(
+    mut state: Signal<ShellState>,
+    target: CopyGenerationTarget,
+    force: bool,
+    announce: bool,
+) {
+    let session_path = target.session_path.clone();
     let settings = state.read().settings.clone();
-    if settings.litellm_endpoint.trim().is_empty()
-        || settings.litellm_api_key.trim().is_empty()
-        || settings.interface_llm_model.trim().is_empty()
-    {
+    if !copy_generation_settings_ready(&settings) {
         return;
     }
-
     let should_start = state.with_mut(|shell| {
-        if !force && shell.generated_summaries.contains_key(&session_path)
+        if (!force && shell.generated_summaries.contains_key(&session_path))
             || shell.summary_requests_in_flight.contains(&session_path)
+            || (!force
+                && !announce
+                && !background_copy_retry_ready(shell, "summary", &session_path))
         {
             false
         } else {
@@ -1649,31 +1679,26 @@ fn spawn_summary_generation(mut state: Signal<ShellState>, session: ManagedSessi
     if !should_start {
         return;
     }
-
     spawn(async move {
-        let path_for_task = session_path.clone();
-        let session_id_for_task = session_id.clone();
-        let cwd_for_task = cwd.clone();
-        let remote_context_for_task = remote_context.clone();
+        let target_for_task = target.clone();
         let settings_for_task = settings.clone();
-        let remote_machine_for_task = remote_machine.clone();
         let outcome = task::spawn_blocking(move || -> Result<Option<String>> {
             let store = SessionStore::open_or_init()?;
-            if let Some(context) = remote_context_for_task {
+            if let Some(context) = target_for_task.remote_context.as_deref() {
                 let summary = store.generate_summary_for_context(
                     &settings_for_task,
-                    &session_id_for_task,
-                    &cwd_for_task,
-                    &context,
+                    &target_for_task.session_id,
+                    &target_for_task.cwd,
+                    context,
                     force,
                 )?;
                 if let (Some(machine), Some(summary_text)) =
-                    (remote_machine_for_task.as_ref(), summary.as_deref())
+                    (target_for_task.remote_machine.as_ref(), summary.as_deref())
                 {
                     persist_remote_generated_copy(
                         machine,
-                        &session_id_for_task,
-                        &cwd_for_task,
+                        &target_for_task.session_id,
+                        &target_for_task.cwd,
                         None,
                         None,
                         Some(summary_text),
@@ -1683,20 +1708,25 @@ fn spawn_summary_generation(mut state: Signal<ShellState>, session: ManagedSessi
                 return Ok(summary);
             }
             if !force
-                && let Some(summary) = store.resolve_summary_for_session_path(&path_for_task)?
+                && let Some(summary) = store.resolve_summary_for_session_path(&target_for_task.session_path)?
             {
                 return Ok(Some(summary));
             }
-            store.generate_summary_for_session_path(&settings_for_task, &path_for_task, force)
-        })
-        .await;
+            store.generate_summary_for_session_path(&settings_for_task, &target_for_task.session_path, force)
+        }).await;
 
         state.with_mut(|shell| {
             shell.summary_requests_in_flight.remove(&session_path);
             match outcome {
                 Ok(Ok(Some(summary))) => {
                     shell.generated_summaries.insert(session_path.clone(), summary);
-                    if force {
+                    shell
+                        .passive_copy_failures
+                        .remove(&background_copy_retry_key("summary", &session_path));
+                    shell
+                        .copy_retry_after_ms
+                        .remove(&background_copy_retry_key("summary", &session_path));
+                    if announce {
                         shell.push_notification(
                             NotificationTone::Success,
                             "Summary Regenerated",
@@ -1704,10 +1734,33 @@ fn spawn_summary_generation(mut state: Signal<ShellState>, session: ManagedSessi
                         );
                     }
                 }
-                Ok(Ok(None)) => {}
+                Ok(Ok(None)) => {
+                    if !announce && !force {
+                        PASSIVE_COPY_SUSPENDED.store(true, Ordering::Relaxed);
+                        shell.passive_copy_suspended = true;
+                        shell
+                            .passive_copy_failures
+                            .insert(background_copy_retry_key("summary", &session_path));
+                    }
+                    shell.copy_retry_after_ms.insert(
+                        background_copy_retry_key("summary", &session_path),
+                        current_millis() + BACKGROUND_COPY_RETRY_MS,
+                    );
+                }
                 Ok(Err(error)) => {
+                    if !announce && !force {
+                        PASSIVE_COPY_SUSPENDED.store(true, Ordering::Relaxed);
+                        shell.passive_copy_suspended = true;
+                        shell
+                            .passive_copy_failures
+                            .insert(background_copy_retry_key("summary", &session_path));
+                    }
+                    shell.copy_retry_after_ms.insert(
+                        background_copy_retry_key("summary", &session_path),
+                        current_millis() + BACKGROUND_COPY_RETRY_MS,
+                    );
                     shell.last_action = format!("summary generation failed: {error}");
-                    if force {
+                    if announce {
                         shell.push_notification(
                             NotificationTone::Error,
                             "Summary Generation Failed",
@@ -1716,8 +1769,19 @@ fn spawn_summary_generation(mut state: Signal<ShellState>, session: ManagedSessi
                     }
                 }
                 Err(error) => {
+                    if !announce && !force {
+                        PASSIVE_COPY_SUSPENDED.store(true, Ordering::Relaxed);
+                        shell.passive_copy_suspended = true;
+                        shell
+                            .passive_copy_failures
+                            .insert(background_copy_retry_key("summary", &session_path));
+                    }
+                    shell.copy_retry_after_ms.insert(
+                        background_copy_retry_key("summary", &session_path),
+                        current_millis() + BACKGROUND_COPY_RETRY_MS,
+                    );
                     shell.last_action = format!("summary task failed: {error}");
-                    if force {
+                    if announce {
                         shell.push_notification(
                             NotificationTone::Error,
                             "Summary Task Failed",
@@ -1727,6 +1791,7 @@ fn spawn_summary_generation(mut state: Signal<ShellState>, session: ManagedSessi
                 }
             }
         });
+        maybe_spawn_background_copy_generation(state);
     });
 }
 
@@ -2215,6 +2280,220 @@ fn is_local_stored_session_row(row: &BrowserRow) -> bool {
 
 fn supports_generated_session_copy(session: &ManagedSessionView) -> bool {
     session.kind.is_agent() || session.session_path.starts_with("remote-session://")
+}
+
+fn copy_generation_settings_ready(settings: &AppSettings) -> bool {
+    !settings.litellm_endpoint.trim().is_empty()
+        && !settings.litellm_api_key.trim().is_empty()
+        && !settings.interface_llm_model.trim().is_empty()
+}
+
+fn copy_generation_target_for_session(
+    server: &YggtermServer,
+    session: &ManagedSessionView,
+) -> Option<CopyGenerationTarget> {
+    if !supports_generated_session_copy(session) {
+        return None;
+    }
+    Some(CopyGenerationTarget {
+        session_path: session.session_path.clone(),
+        session_id: session.id.clone(),
+        cwd: metadata_value(session, "Cwd"),
+        title: session.title.clone(),
+        remote_context: remote_scanned_session_context(server, &session.session_path),
+        remote_machine: remote_machine_for_session_path(server, &session.session_path),
+    })
+}
+
+fn copy_generation_target_for_browser_row(
+    server: &YggtermServer,
+    row: &BrowserRow,
+) -> Option<CopyGenerationTarget> {
+    let session_id = row.session_id.clone()?;
+    if is_remote_scanned_sidebar_row(row) {
+        let machine = remote_machine_for_session_path(server, &row.full_path)?;
+        let remote = machine
+            .sessions
+            .iter()
+            .find(|session| session.session_path == row.full_path)?;
+        return Some(CopyGenerationTarget {
+            session_path: row.full_path.clone(),
+            session_id,
+            cwd: row
+                .session_cwd
+                .clone()
+                .unwrap_or_else(|| remote.cwd.clone()),
+            title: row.label.clone(),
+            remote_context: Some(remote.recent_context.clone()),
+            remote_machine: Some(machine),
+        });
+    }
+    if !is_local_stored_session_row(row) {
+        return None;
+    }
+    Some(CopyGenerationTarget {
+        session_path: row.full_path.clone(),
+        session_id,
+        cwd: row.session_cwd.clone().unwrap_or_default(),
+        title: row.label.clone(),
+        remote_context: None,
+        remote_machine: None,
+    })
+}
+
+fn restore_browser_tree(shell: &mut ShellState, browser_tree: SessionNode, selected_hint: Option<&str>) {
+    let selected_path = shell.browser.selected_path().map(str::to_string);
+    let expanded_paths = shell.browser.expanded_paths();
+    let filter_query = shell.search_query.clone();
+    shell.browser = SessionBrowserState::new(browser_tree);
+    shell.browser.restore_ui_state(
+        &expanded_paths,
+        selected_path.as_deref().or(selected_hint),
+    );
+    shell.browser.set_filter_query(filter_query);
+    shell.sync_browser_settings();
+}
+
+fn collect_local_copy_targets(node: &SessionNode, targets: &mut Vec<CopyGenerationTarget>) {
+    if node.kind == yggterm_core::SessionNodeKind::CodexSession {
+        if let Some(session_id) = node.session_id.clone() {
+            targets.push(CopyGenerationTarget {
+                session_path: node.path.to_string_lossy().to_string(),
+                session_id,
+                cwd: node.cwd.clone().unwrap_or_default(),
+                title: node
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| node.name.clone()),
+                remote_context: None,
+                remote_machine: None,
+            });
+        }
+    }
+    for child in &node.children {
+        collect_local_copy_targets(child, targets);
+    }
+}
+
+fn next_background_copy_job(shell: &ShellState) -> Option<BackgroundCopyJob> {
+    if !copy_generation_settings_ready(&shell.settings)
+        || !shell.title_requests_in_flight.is_empty()
+        || !shell.precis_requests_in_flight.is_empty()
+        || !shell.summary_requests_in_flight.is_empty()
+    {
+        return None;
+    }
+    let store = SessionStore::open_or_init().ok()?;
+    let mut targets = Vec::new();
+    if let Ok(tree) = store.load_codex_tree(&shell.settings) {
+        collect_local_copy_targets(&tree, &mut targets);
+    }
+    for machine in shell.server.remote_machines() {
+        for session in &machine.sessions {
+            targets.push(CopyGenerationTarget {
+                session_path: session.session_path.clone(),
+                session_id: session.session_id.clone(),
+                cwd: session.cwd.clone(),
+                title: session.title_hint.clone(),
+                remote_context: Some(session.recent_context.clone()),
+                remote_machine: Some(machine.clone()),
+            });
+        }
+    }
+    let now = current_millis();
+    for target in targets {
+        let title_missing = if target.remote_machine.is_some() {
+            looks_like_generated_fallback_title(&target.title)
+        } else {
+            looks_like_generated_fallback_title(&target.title)
+                || store
+                    .resolve_title_for_session_id(&target.session_id)
+                    .ok()
+                    .flatten()
+                    .is_none()
+        };
+        if title_missing {
+            let retry_key = background_copy_retry_key("title", &target.session_path);
+            if shell
+                .copy_retry_after_ms
+                .get(&retry_key)
+                .copied()
+                .is_none_or(|retry_after| retry_after <= now)
+            {
+                return Some(BackgroundCopyJob::Title(target));
+            }
+        }
+        let precis_missing = if let Some(machine) = target.remote_machine.as_ref() {
+            machine
+                .sessions
+                .iter()
+                .find(|session| session.session_path == target.session_path)
+                .and_then(|session| session.cached_precis.clone())
+                .is_none()
+        } else {
+            store
+                .resolve_precis_for_session_id(&target.session_id)
+                .ok()
+                .flatten()
+                .is_none()
+        };
+        if precis_missing {
+            let retry_key = background_copy_retry_key("precis", &target.session_path);
+            if shell
+                .copy_retry_after_ms
+                .get(&retry_key)
+                .copied()
+                .is_none_or(|retry_after| retry_after <= now)
+            {
+                return Some(BackgroundCopyJob::Precis(target));
+            }
+        }
+        let summary_missing = if let Some(machine) = target.remote_machine.as_ref() {
+            machine
+                .sessions
+                .iter()
+                .find(|session| session.session_path == target.session_path)
+                .and_then(|session| session.cached_summary.clone())
+                .is_none()
+        } else {
+            store
+                .resolve_summary_for_session_id(&target.session_id)
+                .ok()
+                .flatten()
+                .is_none()
+        };
+        if summary_missing {
+            let retry_key = background_copy_retry_key("summary", &target.session_path);
+            if shell
+                .copy_retry_after_ms
+                .get(&retry_key)
+                .copied()
+                .is_none_or(|retry_after| retry_after <= now)
+            {
+                return Some(BackgroundCopyJob::Summary(target));
+            }
+        }
+    }
+    None
+}
+
+fn maybe_spawn_background_copy_generation(state: Signal<ShellState>) {
+    let job = {
+        let shell = state.read();
+        next_background_copy_job(&shell)
+    };
+    match job {
+        Some(BackgroundCopyJob::Title(target)) => {
+            spawn_title_generation_for_target(state, target, false, false)
+        }
+        Some(BackgroundCopyJob::Precis(target)) => {
+            spawn_precis_generation_for_target(state, target, false, false)
+        }
+        Some(BackgroundCopyJob::Summary(target)) => {
+            spawn_summary_generation_for_target(state, target, false, false)
+        }
+        None => {}
+    }
 }
 
 fn remote_scanned_session_context(server: &YggtermServer, session_path: &str) -> Option<String> {
@@ -4510,6 +4789,19 @@ fn app() -> Element {
         spawn_summary_generation(state, session, false);
     });
     use_effect(move || {
+        let shell = state.read();
+        let _ = shell.server.remote_machines().len();
+        let _ = shell.server.active_session_path().map(str::len);
+        let _ = shell.generated_precis.len();
+        let _ = shell.generated_summaries.len();
+        let _ = shell.title_requests_in_flight.len();
+        let _ = shell.precis_requests_in_flight.len();
+        let _ = shell.summary_requests_in_flight.len();
+        let _ = shell.browser.metrics().rebuild_count;
+        drop(shell);
+        maybe_spawn_background_copy_generation(state);
+    });
+    use_effect(move || {
         if *dock_pulse_started.read() {
             return;
         }
@@ -4789,7 +5081,6 @@ fn app() -> Element {
                         on_set_notification_sound: move |enabled: bool| {
                             state.with_mut(|shell| shell.update_notification_sound(enabled))
                         },
-                        on_generate_titles: move |_| state.with_mut(|shell| shell.generate_session_titles()),
                         on_adjust_ui_zoom: move |delta: i32| state.with_mut(|shell| shell.adjust_ui_zoom(delta)),
                         on_adjust_main_zoom: move |delta: i32| {
                             state.with_mut(|shell| shell.adjust_main_zoom(delta));
@@ -6080,7 +6371,7 @@ fn SessionHeaderCopy(
             div {
                 style: "display:flex; align-items:flex-start; gap:8px; min-width:0;",
                 div {
-                    style: format!("font-size:12px; line-height:1.65; color:{}; white-space:pre-wrap; overflow-wrap:anywhere; min-width:0; flex:1;", palette.muted),
+                    style: format!("font-size:12px; line-height:1.65; color:{}; white-space:pre-wrap; overflow-wrap:anywhere; min-width:0; flex:1; max-height:84px; overflow:auto; padding-right:4px;", palette.muted),
                     "{subtitle}"
                 }
                 RefreshInlineButton {
@@ -7665,7 +7956,6 @@ fn RightRail(
     on_model_change: EventHandler<String>,
     on_set_notification_delivery: EventHandler<NotificationDeliveryMode>,
     on_set_notification_sound: EventHandler<bool>,
-    on_generate_titles: EventHandler<MouseEvent>,
     on_adjust_ui_zoom: EventHandler<i32>,
     on_adjust_main_zoom: EventHandler<i32>,
     on_connect_ssh_custom: EventHandler<MouseEvent>,
@@ -7691,7 +7981,6 @@ fn RightRail(
                     on_model_change,
                     on_set_notification_delivery,
                     on_set_notification_sound,
-                    on_generate_titles,
                     on_adjust_ui_zoom,
                     on_adjust_main_zoom,
                 }
@@ -7756,7 +8045,6 @@ fn SettingsRailBody(
     on_model_change: EventHandler<String>,
     on_set_notification_delivery: EventHandler<NotificationDeliveryMode>,
     on_set_notification_sound: EventHandler<bool>,
-    on_generate_titles: EventHandler<MouseEvent>,
     on_adjust_ui_zoom: EventHandler<i32>,
     on_adjust_main_zoom: EventHandler<i32>,
 ) -> Element {
@@ -7895,19 +8183,6 @@ fn SettingsRailBody(
                     ],
                     palette: snapshot.palette,
                 }
-            }
-            button {
-                style: format!(
-                    "height:32px; border:none; border-radius:10px; background:{}; color:{}; \
-                     font-size:11px; font-weight:700; text-align:center;",
-                    snapshot.palette.accent_soft, snapshot.palette.text
-                ),
-                onclick: move |evt| on_generate_titles.call(evt),
-                "Generate Session Titles"
-            }
-            div {
-                style: format!("font-size:11px; line-height:1.5; color:{};", snapshot.palette.muted),
-                "Yggterm caches generated titles under ~/.yggterm/session-titles.db and only refreshes them when you ask for it here."
             }
             }
         }

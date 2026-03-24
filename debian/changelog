@@ -1,3 +1,12 @@
+yggterm (2.0.11-1) unstable; urgency=medium
+
+  * Remove the manual session-copy generation control from settings.
+  * Generate missing title, precis, and summary copy silently in the background.
+  * Add scrolling to long session subtitle regions so summary text no longer clips.
+  * Keep passive copy generation quiet on startup and avoid stale multi-process retry noise during validation.
+
+ -- Yggdrasil HQ <avi@gour.top>  Tue, 24 Mar 2026 18:30:00 +0530
+
 yggterm (2.0.10-1) unstable; urgency=medium
 
   * Extract reusable drag, chrome, rail, and notification primitives into yggterm-ui.
