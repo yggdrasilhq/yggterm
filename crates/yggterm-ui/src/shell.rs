@@ -130,6 +130,7 @@ struct ShellState {
     generated_summaries: BTreeMap<String, String>,
     precis_requests_in_flight: HashSet<String>,
     summary_requests_in_flight: HashSet<String>,
+    remote_machine_refresh_requests: HashSet<String>,
     drag_paths: Vec<String>,
     drag_hover_target: Option<DragDropTarget>,
     optimistic_drag_paths: Vec<String>,
@@ -365,6 +366,7 @@ impl ShellState {
             generated_summaries: BTreeMap::new(),
             precis_requests_in_flight: HashSet::new(),
             summary_requests_in_flight: HashSet::new(),
+            remote_machine_refresh_requests: HashSet::new(),
             drag_paths: Vec::new(),
             drag_hover_target: None,
             optimistic_drag_paths: Vec::new(),
@@ -1533,6 +1535,7 @@ fn spawn_initial_server_sync(mut state: Signal<ShellState>) {
                 );
             }
         });
+        maybe_spawn_missing_remote_machine_refreshes(state);
     });
 }
 
@@ -1652,6 +1655,89 @@ fn wait_for_daemon(endpoint: &ServerEndpoint) -> Result<()> {
     anyhow::bail!("daemon did not become reachable")
 }
 
+fn maybe_spawn_missing_remote_machine_refreshes(mut state: Signal<ShellState>) {
+    let pending = {
+        let shell = state.read();
+        let known_remote_machines = shell
+            .server
+            .remote_machines()
+            .iter()
+            .map(|machine| {
+                (
+                    machine.machine_key.clone(),
+                    !machine.sessions.is_empty() || machine.health == RemoteMachineHealth::Offline,
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        let mut desired_machine_keys = shell
+            .server
+            .ssh_targets()
+            .iter()
+            .map(|target| machine_key_from_labelish(&target.ssh_target))
+            .collect::<Vec<_>>();
+        desired_machine_keys.extend(
+            shell.server
+                .live_sessions()
+                .into_iter()
+                .filter(|session| session.kind == SessionKind::SshShell)
+                .filter_map(|session| {
+                    session
+                        .ssh_target
+                        .as_deref()
+                        .map(machine_key_from_labelish)
+                        .or_else(|| {
+                            if session.host_label.trim().is_empty() {
+                                None
+                            } else {
+                                Some(machine_key_from_labelish(&session.host_label))
+                            }
+                        })
+                }),
+        );
+        desired_machine_keys.sort();
+        desired_machine_keys.dedup();
+        desired_machine_keys
+            .into_iter()
+            .filter(|machine_key| !machine_key.is_empty())
+            .filter(|machine_key| !shell.remote_machine_refresh_requests.contains(machine_key))
+            .filter(|machine_key| !known_remote_machines.get(machine_key).copied().unwrap_or(false))
+            .collect::<Vec<_>>()
+    };
+    for machine_key in pending {
+        state.with_mut(|shell| {
+            shell.remote_machine_refresh_requests.insert(machine_key.clone());
+        });
+        spawn_background_remote_machine_refresh(state, machine_key);
+    }
+}
+
+fn spawn_background_remote_machine_refresh(mut state: Signal<ShellState>, machine_key: String) {
+    let endpoint = state.read().bootstrap.server_endpoint.clone();
+    spawn(async move {
+        let request_machine_key = machine_key.clone();
+        let outcome = task::spawn_blocking(move || refresh_remote_machine(&endpoint, &request_machine_key)).await;
+        state.with_mut(|shell| {
+            shell.remote_machine_refresh_requests.remove(&machine_key);
+            match outcome {
+                Ok(Ok((snapshot, message))) => {
+                    shell.server.apply_snapshot(snapshot);
+                    if let Some(message) = message {
+                        shell.last_action = message;
+                    }
+                }
+                Ok(Err(error)) => {
+                    shell.last_action = format!("remote refresh failed: {error}");
+                }
+                Err(error) => {
+                    shell.last_action = format!("remote refresh task failed: {error}");
+                }
+            }
+        });
+        maybe_spawn_missing_remote_machine_refreshes(state);
+    });
+}
+
 fn spawn_server_snapshot_action<F>(mut state: Signal<ShellState>, pending_label: String, request: F)
 where
     F: FnOnce(ServerEndpoint) -> Result<(ServerUiSnapshot, Option<String>)> + Send + 'static,
@@ -1676,6 +1762,7 @@ where
                 );
             }
         });
+        maybe_spawn_missing_remote_machine_refreshes(state);
     });
 }
 
