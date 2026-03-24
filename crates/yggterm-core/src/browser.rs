@@ -135,6 +135,12 @@ impl SessionBrowserState {
         self.ensure_selection();
     }
 
+    pub fn toggle_virtual_group(&mut self, path: &str) {
+        if !self.expanded_paths.remove(path) {
+            self.expanded_paths.insert(path.to_string());
+        }
+    }
+
     pub fn ensure_expanded_paths<I>(&mut self, paths: I)
     where
         I: IntoIterator<Item = String>,
