@@ -11,7 +11,7 @@ use yggterm_core::{
 };
 use yggterm_server::{
     SessionKind, default_endpoint, detect_ghostty_host, ping, run_attach, run_daemon, shutdown,
-    start_local_session, status,
+    run_remote_stage_clipboard_png, run_remote_upsert_generated_copy, start_local_session, status,
 };
 
 fn main() -> Result<()> {
@@ -38,6 +38,12 @@ fn main() -> Result<()> {
     }
     if args.len() == 3 && args[0] == "server" && args[1] == "attach" {
         return run_attach(&args[2]);
+    }
+    if args.as_slice() == ["server", "remote", "stage-clipboard-png"] {
+        return run_remote_stage_clipboard_png();
+    }
+    if args.len() == 4 && args[0] == "server" && args[1] == "remote" && args[2] == "upsert-generated-copy" {
+        return run_remote_upsert_generated_copy(&args[3]);
     }
     if args.as_slice() == ["server", "shutdown"] {
         let endpoint = default_endpoint(store.home_dir());
