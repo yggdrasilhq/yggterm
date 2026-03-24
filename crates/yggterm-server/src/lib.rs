@@ -6,12 +6,13 @@ mod terminal;
 pub use attach::{AttachMetadata, run_attach};
 pub use daemon::{
     ServerEndpoint, ServerRequest, ServerResponse, ServerRuntimeStatus, TerminalStreamChunk,
-    connect_ssh, connect_ssh_custom, default_endpoint, focus_live, open_remote_session,
-    open_stored_session, ping, raise_external_window, refresh_remote_machine, remove_ssh_target,
-    request_terminal_launch, run_daemon, set_all_preview_blocks_folded, set_view_mode, shutdown,
-    snapshot, start_command_session, start_local_session, start_local_session_at, status,
-    switch_agent_session_mode, sync_external_window, sync_theme, terminal_ensure, terminal_read,
-    terminal_resize, terminal_write, toggle_preview_block,
+    cleanup_legacy_daemons, connect_ssh, connect_ssh_custom, default_endpoint, focus_live,
+    open_remote_session, open_stored_session, ping, raise_external_window,
+    refresh_remote_machine, remove_ssh_target, request_terminal_launch, run_daemon,
+    set_all_preview_blocks_folded, set_view_mode, shutdown, snapshot, start_command_session,
+    start_local_session, start_local_session_at, status, switch_agent_session_mode,
+    sync_external_window, sync_theme, terminal_ensure, terminal_read, terminal_resize,
+    terminal_write, toggle_preview_block,
 };
 pub use host::{GhosttyHostKind, GhosttyHostSupport, GhosttyTerminalHostMode, detect_ghostty_host};
 pub use terminal::{TerminalChunk, TerminalManager, TerminalReadResult};
