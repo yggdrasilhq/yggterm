@@ -100,6 +100,26 @@ That means the current app already supports:
 - executable terminal recipes as an intermediate step toward richer terminal automation
 - generated session titles through a configured LiteLLM endpoint
 - direct install with self-update and package-manager-aware notify-only mode
+- SSH-side Yggterm commands for remote session scanning, generated-copy persistence, and clipboard image staging
+
+## Remote command surface
+
+For SSH machines, Yggterm now prefers a Yggterm-owned remote command surface over ad hoc remote helper scripts.
+
+That means the desktop app can ask a remote host to:
+
+- report its Yggterm remote protocol version
+- scan Codex sessions
+- persist generated `title` / `precis` / `summary`
+- stage clipboard images into that machine's `~/.yggterm/clipboard/`
+
+When the SSH target does not already have a compatible `yggterm` binary on `PATH`, Yggterm bootstraps a matching binary into:
+
+```text
+~/.yggterm/bin/yggterm
+```
+
+and then reuses that binary for later remote commands on the same host. This is the current foundation for a fuller VS Code-style remote server model.
 
 ## The workspace model
 
