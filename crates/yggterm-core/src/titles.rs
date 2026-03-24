@@ -216,7 +216,10 @@ impl SessionTitleResolver {
         info!(session_id, force, context_chars = context.len(), "resolving context title");
         if !force {
             if let Some(title) = self.store.get_title(session_id)? {
-                return Ok(Some(title));
+                if !looks_like_generated_fallback_title(&title) {
+                    return Ok(Some(title));
+                }
+                let _ = self.store.delete_title(session_id);
             }
         } else {
             let _ = self.store.delete_title(session_id);
@@ -257,15 +260,21 @@ impl SessionTitleResolver {
         info!(session_id, force, file_path=%file_path.display(), "resolving session title");
         if !force {
             if let Some(title) = self.store.get_title(session_id)? {
-                info!(session_id, "using cached session title");
-                return Ok(Some(title));
+                if !looks_like_generated_fallback_title(&title) {
+                    info!(session_id, "using cached session title");
+                    return Ok(Some(title));
+                }
+                let _ = self.store.delete_title(session_id);
             }
         } else {
             let _ = self.store.delete_title(session_id);
         }
 
         if let Some(title) = self.store.get_title(session_id)? {
-            return Ok(Some(title));
+            if !looks_like_generated_fallback_title(&title) {
+                return Ok(Some(title));
+            }
+            let _ = self.store.delete_title(session_id);
         }
 
         if !settings_ready(settings) {
@@ -715,7 +724,9 @@ fn sanitize_generated_summary(raw: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_tail_context, sanitize_generated_summary};
+    use super::{
+        extract_tail_context, looks_like_generated_fallback_title, sanitize_generated_summary,
+    };
     use anyhow::Result;
     use std::fs;
 
@@ -749,6 +760,12 @@ mod tests {
         let summary = sanitize_generated_summary("\"First line.\n\nSecond line.\"\n")
             .expect("summary");
         assert_eq!(summary, "First line. Second line.");
+    }
+
+    #[test]
+    fn fallback_title_detection_matches_hash_titles() {
+        assert!(looks_like_generated_fallback_title("Q4fc63d"));
+        assert!(!looks_like_generated_fallback_title("Remove Them Entirely"));
     }
 }
 
@@ -912,6 +929,16 @@ fn heuristic_title_from_context(context: &str) -> Option<String> {
 
     let title = words.join(" ");
     plausible_title(&title).then_some(title)
+}
+
+fn looks_like_generated_fallback_title(title: &str) -> bool {
+    let compact = title.trim();
+    compact.len() == 8
+        && compact.starts_with('Q')
+        && compact
+            .chars()
+            .skip(1)
+            .all(|ch| ch.is_ascii_hexdigit())
 }
 
 fn heuristic_copy_lines(context: &str) -> Vec<String> {
