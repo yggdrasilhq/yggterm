@@ -1,12 +1,12 @@
-# yggterm-ui
+# yggui
 
-`yggterm-ui` contains Dioxus shell primitives and reusable interaction logic for Yggdrasil applications.
+`yggui` contains Dioxus shell primitives and reusable interaction logic for Yggdrasil applications.
 
 ## Reusable drag tree
 
 The sidebar drag-and-drop engine is intentionally reusable and lives in:
 
-- [src/drag_tree.rs](/home/pi/gh/yggterm/crates/yggterm-ui/src/drag_tree.rs)
+- [src/drag_tree.rs](/home/pi/gh/yggterm/crates/yggui/src/drag_tree.rs)
 
 Use it when another app needs Yggterm-style tree reordering.
 
@@ -22,7 +22,7 @@ Use it when another app needs Yggterm-style tree reordering.
 
 The drag UI primitives live in:
 
-- [src/drag_visuals.rs](/home/pi/gh/yggterm/crates/yggterm-ui/src/drag_visuals.rs)
+- [src/drag_visuals.rs](/home/pi/gh/yggterm/crates/yggui/src/drag_visuals.rs)
 
 They provide:
 
@@ -35,7 +35,7 @@ The current sidebar in `src/shell.rs` is the reference integration for both the 
 
 The reusable titlebar and window-control primitives live in:
 
-- [src/chrome.rs](/home/pi/gh/yggterm/crates/yggterm-ui/src/chrome.rs)
+- [src/chrome.rs](/home/pi/gh/yggterm/crates/yggui/src/chrome.rs)
 
 They provide:
 
@@ -47,7 +47,7 @@ They provide:
 
 The toast system lives in:
 
-- [src/notifications.rs](/home/pi/gh/yggterm/crates/yggterm-ui/src/notifications.rs)
+- [src/notifications.rs](/home/pi/gh/yggterm/crates/yggui/src/notifications.rs)
 
 It provides:
 
@@ -62,7 +62,7 @@ These primitives are also the base layer for update-ready and background-job fee
 
 The side-rail shell primitives live in:
 
-- [src/rails.rs](/home/pi/gh/yggterm/crates/yggterm-ui/src/rails.rs)
+- [src/rails.rs](/home/pi/gh/yggterm/crates/yggui/src/rails.rs)
 
 They provide:
 

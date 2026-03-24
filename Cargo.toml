@@ -3,7 +3,7 @@ members = [
   "apps/yggterm",
   "crates/yggterm-core",
   "crates/yggterm-server",
-  "crates/yggterm-ui",
+  "crates/yggui",
   "crates/yggterm-gtk-glue",
   "crates/yggterm-platform",
   "crates/yggterm-ghostty-bridge",

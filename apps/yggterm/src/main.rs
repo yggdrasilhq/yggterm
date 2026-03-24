@@ -77,7 +77,7 @@ fn main() -> Result<()> {
                                 managed_root: install_context.managed_root.clone(),
                                 manager_hint: install_context.manager_hint.clone(),
                             });
-                        pending_update_restart = Some(yggterm_ui::PendingUpdateRestart {
+                        pending_update_restart = Some(yggui::PendingUpdateRestart {
                             version: update.version,
                             executable: next_exe,
                         });
@@ -119,7 +119,7 @@ fn main() -> Result<()> {
         spawn_server_daemon()?;
     }
 
-    let launch_result = yggterm_ui::launch_shell(yggterm_ui::ShellBootstrap {
+    let launch_result = yggui::launch_shell(yggui::ShellBootstrap {
         tree,
         browser_tree,
         settings,
