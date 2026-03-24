@@ -3165,15 +3165,20 @@ fn spawn_active_session_copy_hydration(mut state: Signal<ShellState>, session: M
                 return;
             };
             if let Some(title) = title
-                && looks_like_generated_fallback_title(&session.title)
             {
                 shell.server.set_session_title_hint(&session_path, &title);
             }
             if let Some(precis) = precis {
                 shell.generated_precis.insert(session_path.clone(), precis);
+                if let Some(precis) = shell.generated_precis.get(&session_path).cloned() {
+                    shell.server.set_session_precis_hint(&session_path, &precis);
+                }
             }
             if let Some(summary) = summary {
                 shell.generated_summaries.insert(session_path.clone(), summary);
+                if let Some(summary) = shell.generated_summaries.get(&session_path).cloned() {
+                    shell.server.set_session_summary_hint(&session_path, &summary);
+                }
             }
         });
     });
