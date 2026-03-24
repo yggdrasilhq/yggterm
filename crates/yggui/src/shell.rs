@@ -767,6 +767,7 @@ impl ShellState {
                 } else {
                     self.browser.toggle_group(&row.full_path);
                 }
+                self.suppress_tree_click_until_ms = current_millis().saturating_add(220);
                 self.sync_browser_settings();
                 self.last_action = format!("toggled {}", row.label);
             }
