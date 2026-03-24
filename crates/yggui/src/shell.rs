@@ -52,7 +52,8 @@ use yggterm_core::{
     AgentSessionProfile, AppSettings, BrowserRow, BrowserRowKind, InstallContext, PerfSpan,
     SessionBrowserState, SessionNode, SessionStore, UiTheme, WorkspaceDocumentInput,
     WorkspaceDocumentKind, WorkspaceGroupKind, check_for_update, save_settings_file,
-    install_release_update, refresh_desktop_integration, update_command_hint, YgguiThemeSpec,
+    install_release_update, looks_like_generated_fallback_title, refresh_desktop_integration,
+    unique_session_short_ids_for_pairs, update_command_hint, YgguiThemeSpec,
 };
 use yggterm_platform::DockRect;
 use yggterm_server::{
@@ -3200,16 +3201,6 @@ fn preview_context_from_session(session: &ManagedSessionView) -> Option<String> 
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
-fn looks_like_generated_fallback_title(title: &str) -> bool {
-    let compact = title.trim();
-    compact.len() == 8
-        && compact.starts_with('Q')
-        && compact
-            .chars()
-            .skip(1)
-            .all(|ch| ch.is_ascii_hexdigit())
-}
-
 fn parse_remote_scanned_session_path(path: &str) -> Option<(&str, &str)> {
     let rest = path.strip_prefix("remote-session://")?;
     let (machine_key, session_id) = rest.split_once('/')?;
@@ -3283,6 +3274,10 @@ fn stage_terminal_clipboard_image(
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     stage_local_clipboard_png(&home, png_bytes)
+}
+
+fn terminal_bracketed_paste(text: &str) -> String {
+    format!("\u{1b}[200~{text}\u{1b}[201~")
 }
 
 fn merged_sidebar_rows(
@@ -3381,6 +3376,13 @@ fn push_remote_machine_rows(
         return;
     }
 
+    let remote_short_ids = unique_session_short_ids_for_pairs(
+        &machine
+            .scanned_sessions
+            .iter()
+            .map(|session| (session.session_path.clone(), session.session_id.clone()))
+            .collect::<Vec<_>>(),
+    );
     let mut emitted = HashMap::<String, usize>::new();
     let folder_counts = remote_folder_session_counts(&machine.scanned_sessions);
 
@@ -3399,11 +3401,11 @@ fn push_remote_machine_rows(
         rows.push(BrowserRow {
             kind: BrowserRowKind::Session,
             full_path: scanned.session_path.clone(),
-            label: scanned.title_hint.clone(),
+            label: remote_scanned_session_label(scanned, &remote_short_ids),
             detail_label: String::new(),
             document_kind: None,
             group_kind: None,
-            session_title: Some(scanned.title_hint.clone()),
+            session_title: Some(remote_scanned_session_label(scanned, &remote_short_ids)),
             depth: remote_session_depth(&scanned.cwd),
             host_label: machine.key.clone(),
             descendant_sessions: 1,
@@ -3412,6 +3414,20 @@ fn push_remote_machine_rows(
             session_cwd: Some(scanned.cwd.clone()),
         });
     }
+}
+
+fn remote_scanned_session_label(
+    session: &RemoteScannedSession,
+    short_ids: &HashMap<String, String>,
+) -> String {
+    let title = session.title_hint.trim();
+    if !title.is_empty() && !looks_like_generated_fallback_title(title) {
+        return session.title_hint.clone();
+    }
+    short_ids
+        .get(&session.session_path)
+        .cloned()
+        .unwrap_or_else(|| session.title_hint.clone())
 }
 
 fn push_remote_folder_rows(
@@ -8315,12 +8331,16 @@ fn TerminalCanvas(
                                     .and_then(|png_bytes| stage_terminal_clipboard_image(state, &session_path, &png_bytes))
                                 {
                                     Ok(path) => {
-                                        let _ = terminal_write(&endpoint, &session_path, &format!("@{} ", path));
+                                        let _ = terminal_write(
+                                            &endpoint,
+                                            &session_path,
+                                            &terminal_bracketed_paste(&path),
+                                        );
                                         safe_push_notification(
                                             state,
                                             NotificationTone::Success,
                                             "Image Staged",
-                                            format!("Staged clipboard image at {path} and inserted its path into the terminal."),
+                                            format!("Staged clipboard image at {path} and pasted its path into the terminal."),
                                         );
                                     }
                                     Err(error) => {
@@ -11288,6 +11308,69 @@ mod tests {
         assert!(rows.iter().any(|row| row.kind == BrowserRowKind::Group && row.label == "raspberry [ok]"));
         assert!(rows.iter().any(|row| row.kind == BrowserRowKind::Group && row.full_path == "__remote_folder__/pi-raspberry/srv"));
         assert!(rows.iter().any(|row| row.kind == BrowserRowKind::Session && row.full_path == "remote-session://pi-raspberry/019caa6f"));
+    }
+
+    #[test]
+    fn merged_sidebar_rows_expand_remote_hash_labels_until_unique() {
+        let expanded_paths = HashSet::from([
+            "__remote_machine__/jojo".to_string(),
+            "__remote_folder__/jojo/home".to_string(),
+            "__remote_folder__/jojo/home/pi".to_string(),
+        ]);
+        let rows = merged_sidebar_rows(
+            &[],
+            &[RemoteMachineSnapshot {
+                machine_key: "jojo".to_string(),
+                label: "jojo".to_string(),
+                ssh_target: "pi@jojo".to_string(),
+                prefix: None,
+                health: RemoteMachineHealth::Healthy,
+                sessions: vec![
+                    RemoteScannedSession {
+                        session_path: "remote-session://jojo/a".to_string(),
+                        session_id: "019d0a2e-bd7b-7260-925e-1f0ed8d3189b".to_string(),
+                        cwd: "/home/pi".to_string(),
+                        started_at: "2026-03-23T10:00:00Z".to_string(),
+                        modified_epoch: 123,
+                        event_count: 22,
+                        user_message_count: 11,
+                        assistant_message_count: 10,
+                        title_hint: "Qd3189b".to_string(),
+                        recent_context: "USER: test\nASSISTANT: reply".to_string(),
+                        cached_precis: None,
+                        cached_summary: None,
+                        storage_path: "/home/pi/.codex/sessions/a.jsonl".to_string(),
+                    },
+                    RemoteScannedSession {
+                        session_path: "remote-session://jojo/b".to_string(),
+                        session_id: "019d0fff-bd7b-7260-925e-1f0ed8d3189b".to_string(),
+                        cwd: "/home/pi".to_string(),
+                        started_at: "2026-03-23T10:05:00Z".to_string(),
+                        modified_epoch: 124,
+                        event_count: 23,
+                        user_message_count: 12,
+                        assistant_message_count: 10,
+                        title_hint: "Qd3189b".to_string(),
+                        recent_context: "USER: test2\nASSISTANT: reply2".to_string(),
+                        cached_precis: None,
+                        cached_summary: None,
+                        storage_path: "/home/pi/.codex/sessions/b.jsonl".to_string(),
+                    },
+                ],
+            }],
+            &[],
+            &[],
+            &expanded_paths,
+        );
+
+        let labels = rows
+            .iter()
+            .filter(|row| row.kind == BrowserRowKind::Session)
+            .map(|row| row.label.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(labels.len(), 2);
+        assert_ne!(labels[0], labels[1]);
+        assert!(labels.iter().all(|label| label.len() > "Qd3189b".len()));
     }
 
     #[test]

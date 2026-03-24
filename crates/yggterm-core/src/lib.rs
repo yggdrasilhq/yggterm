@@ -15,7 +15,10 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use titles::{SessionTitleResolver, settings_ready as litellm_settings_ready};
 
-pub use browser::{BrowserMetrics, BrowserRow, BrowserRowKind, SessionBrowserState};
+pub use browser::{
+    BrowserMetrics, BrowserRow, BrowserRowKind, SessionBrowserState,
+    unique_session_short_ids_for_pairs,
+};
 pub use install::{
     InstallChannel, InstallContext, ReleaseUpdate, UpdatePolicy, check_for_update,
     current_asset_label, current_version, detect_install_context, direct_install_root,
@@ -23,6 +26,7 @@ pub use install::{
     write_direct_install_state,
 };
 pub use perf::{PERF_TELEMETRY_FILENAME, PerfSpan, append_perf_event, perf_telemetry_path};
+pub use titles::looks_like_generated_fallback_title;
 pub use transcript::{
     TranscriptMessage, TranscriptRole, message_lines_from_payload, read_codex_transcript_messages,
 };
