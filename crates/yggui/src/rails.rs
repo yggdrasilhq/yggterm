@@ -7,6 +7,7 @@ pub fn SideRailShell(
     zoom_percent: f32,
     body: Element,
 ) -> Element {
+    let rail_width = if visible { width_px } else { 0 };
     let opacity = if visible { "1" } else { "0" };
     let translate = if visible {
         "translateX(0)"
@@ -20,9 +21,9 @@ pub fn SideRailShell(
                 "width:{}px; min-width:{}px; max-width:{}px; display:flex; flex-direction:column; \
                  background:transparent; overflow:hidden; text-rendering:optimizeLegibility; \
                  -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale; \
-                 transition: opacity 180ms ease, transform 180ms ease; opacity:{}; transform:{}; \
+                 transition: width 180ms ease, min-width 180ms ease, max-width 180ms ease, opacity 180ms ease, transform 180ms ease; opacity:{}; transform:{}; \
                  pointer-events:{}; zoom:{}%;",
-                width_px, width_px, width_px, opacity, translate, pointer_events, zoom_percent
+                rail_width, rail_width, rail_width, opacity, translate, pointer_events, zoom_percent
             ),
             {body}
         }
