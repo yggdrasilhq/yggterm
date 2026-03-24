@@ -555,21 +555,41 @@ fn request_litellm_precis(settings: &AppSettings, context: &str) -> Result<Strin
         ]
     });
 
-    let response = client
+    let response = match client
         .post(url)
         .bearer_auth(settings.litellm_api_key.trim())
         .json(&body)
         .send()
-        .context("LiteLLM request failed")?
-        .error_for_status()
-        .context("LiteLLM returned an error status")?;
+    {
+        Ok(response) => match response.error_for_status() {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(precis) = heuristic_precis_from_context(context) {
+                    return Ok(precis);
+                }
+                return Err(error).context("LiteLLM returned an error status");
+            }
+        },
+        Err(error) => {
+            if let Some(precis) = heuristic_precis_from_context(context) {
+                return Ok(precis);
+            }
+            return Err(error).context("LiteLLM request failed");
+        }
+    };
 
-    let value: Value = response
-        .json()
-        .context("failed to parse LiteLLM response")?;
+    let value: Value = match response.json() {
+        Ok(value) => value,
+        Err(error) => {
+            if let Some(precis) = heuristic_precis_from_context(context) {
+                return Ok(precis);
+            }
+            return Err(error).context("failed to parse LiteLLM response");
+        }
+    };
     let precis = extract_completion_text(&value)
         .or_else(|| extract_reasoning_title(&value))
-        .or_else(|| heuristic_title_from_context(context))
+        .or_else(|| heuristic_precis_from_context(context))
         .context("LiteLLM response did not contain a precis")?;
     Ok(precis)
 }
@@ -596,21 +616,41 @@ fn request_litellm_summary(settings: &AppSettings, context: &str) -> Result<Stri
         ]
     });
 
-    let response = client
+    let response = match client
         .post(url)
         .bearer_auth(settings.litellm_api_key.trim())
         .json(&body)
         .send()
-        .context("LiteLLM request failed")?
-        .error_for_status()
-        .context("LiteLLM returned an error status")?;
+    {
+        Ok(response) => match response.error_for_status() {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(summary) = heuristic_summary_from_context(context) {
+                    return Ok(summary);
+                }
+                return Err(error).context("LiteLLM returned an error status");
+            }
+        },
+        Err(error) => {
+            if let Some(summary) = heuristic_summary_from_context(context) {
+                return Ok(summary);
+            }
+            return Err(error).context("LiteLLM request failed");
+        }
+    };
 
-    let value: Value = response
-        .json()
-        .context("failed to parse LiteLLM response")?;
+    let value: Value = match response.json() {
+        Ok(value) => value,
+        Err(error) => {
+            if let Some(summary) = heuristic_summary_from_context(context) {
+                return Ok(summary);
+            }
+            return Err(error).context("failed to parse LiteLLM response");
+        }
+    };
     let summary = extract_completion_text(&value)
         .or_else(|| extract_reasoning_title(&value))
-        .or_else(|| heuristic_title_from_context(context))
+        .or_else(|| heuristic_summary_from_context(context))
         .context("LiteLLM response did not contain a summary")?;
     Ok(summary)
 }
@@ -872,6 +912,56 @@ fn heuristic_title_from_context(context: &str) -> Option<String> {
 
     let title = words.join(" ");
     plausible_title(&title).then_some(title)
+}
+
+fn heuristic_copy_lines(context: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    for raw in context.lines().rev() {
+        let line = raw
+            .trim()
+            .strip_prefix("USER: ")
+            .or_else(|| raw.trim().strip_prefix("ASSISTANT: "))
+            .or_else(|| raw.trim().strip_prefix("MSG: "))
+            .unwrap_or(raw.trim())
+            .trim();
+        if line.is_empty() {
+            continue;
+        }
+        let compact = line
+            .replace('`', "")
+            .replace(" - ", ", ")
+            .replace("•", "")
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_string();
+        if compact.len() < 16 {
+            continue;
+        }
+        if lines.iter().any(|existing| existing == &compact) {
+            continue;
+        }
+        lines.push(compact);
+        if lines.len() >= 3 {
+            break;
+        }
+    }
+    lines.reverse();
+    lines
+}
+
+fn heuristic_precis_from_context(context: &str) -> Option<String> {
+    let lines = heuristic_copy_lines(context);
+    let first = lines.first()?;
+    sanitize_generated_precis(first)
+}
+
+fn heuristic_summary_from_context(context: &str) -> Option<String> {
+    let lines = heuristic_copy_lines(context);
+    if lines.is_empty() {
+        return None;
+    }
+    sanitize_generated_summary(&lines.join(" "))
 }
 
 fn title_case_word(word: &str) -> String {

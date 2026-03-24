@@ -145,6 +145,10 @@ pub struct RemoteScannedSession {
     pub title_hint: String,
     #[serde(default)]
     pub recent_context: String,
+    #[serde(default)]
+    pub cached_precis: Option<String>,
+    #[serde(default)]
+    pub cached_summary: Option<String>,
     pub storage_path: String,
 }
 
@@ -1446,6 +1450,12 @@ struct RemoteSummaryLine {
     assistant_message_count: usize,
     #[serde(default)]
     recent_context: String,
+    #[serde(default)]
+    title_hint: Option<String>,
+    #[serde(default)]
+    cached_precis: Option<String>,
+    #[serde(default)]
+    cached_summary: Option<String>,
 }
 
 fn default_unknown() -> String {
@@ -1457,8 +1467,33 @@ fn default_unknown_cwd() -> String {
 }
 
 const REMOTE_SCAN_SCRIPT: &str = r#"
-import json, os, sys
+import json, os, sys, sqlite3
 from pathlib import Path
+
+def load_generated_copy():
+    titles = {}
+    precis = {}
+    summaries = {}
+    db_path = Path(os.path.expanduser("~/.yggterm/session-titles.db"))
+    if not db_path.exists():
+        return titles, precis, summaries
+    conn = None
+    try:
+        conn = sqlite3.connect(str(db_path))
+        for session_id, title in conn.execute("SELECT session_id, title FROM session_titles"):
+            titles[session_id] = title
+        for session_id, value in conn.execute("SELECT session_id, precis FROM session_precis"):
+            precis[session_id] = value
+        for session_id, value in conn.execute("SELECT session_id, summary FROM session_summaries"):
+            summaries[session_id] = value
+    except Exception:
+        pass
+    finally:
+        if conn is not None:
+            conn.close()
+    return titles, precis, summaries
+
+GENERATED_TITLES, GENERATED_PRECIS, GENERATED_SUMMARIES = load_generated_copy()
 
 def summarize(path):
     session_id = "unknown"
@@ -1557,6 +1592,9 @@ def summarize(path):
         "user_message_count": user_count,
         "assistant_message_count": assistant_count,
         "recent_context": "\n".join(snippets[-6:]),
+        "title_hint": GENERATED_TITLES.get(session_id),
+        "cached_precis": GENERATED_PRECIS.get(session_id),
+        "cached_summary": GENERATED_SUMMARIES.get(session_id),
     }
 
 codex_home = os.path.expanduser(sys.argv[1] if len(sys.argv) > 1 else "~/.codex")
@@ -1566,6 +1604,96 @@ if root.exists():
         data = summarize(path)
         if data:
             print(json.dumps(data, ensure_ascii=False))
+"#;
+
+const REMOTE_UPSERT_GENERATED_COPY_SCRIPT: &str = r#"
+import json, os, sqlite3, sys
+from pathlib import Path
+
+payload = json.loads(sys.argv[1])
+home = Path(os.path.expanduser("~/.yggterm"))
+home.mkdir(parents=True, exist_ok=True)
+db_path = home / "session-titles.db"
+conn = sqlite3.connect(str(db_path))
+conn.executescript(
+    """
+    CREATE TABLE IF NOT EXISTS session_titles (
+        session_id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        cwd TEXT,
+        source TEXT,
+        model TEXT,
+        updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS session_precis (
+        session_id TEXT PRIMARY KEY,
+        precis TEXT NOT NULL,
+        cwd TEXT,
+        source TEXT,
+        model TEXT,
+        updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS session_summaries (
+        session_id TEXT PRIMARY KEY,
+        summary TEXT NOT NULL,
+        cwd TEXT,
+        source TEXT,
+        model TEXT,
+        updated_at TEXT NOT NULL
+    );
+    """
+)
+
+session_id = payload["session_id"]
+cwd = payload.get("cwd") or ""
+source = payload.get("source") or "interface-llm"
+model = payload.get("model") or ""
+updated_at = payload.get("updated_at") or ""
+
+title = payload.get("title")
+if title:
+    conn.execute(
+        """INSERT INTO session_titles (session_id, title, cwd, source, model, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(session_id) DO UPDATE SET
+             title = excluded.title,
+             cwd = excluded.cwd,
+             source = excluded.source,
+             model = excluded.model,
+             updated_at = excluded.updated_at""",
+        (session_id, title, cwd, source, model, updated_at),
+    )
+
+precis = payload.get("precis")
+if precis:
+    conn.execute(
+        """INSERT INTO session_precis (session_id, precis, cwd, source, model, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(session_id) DO UPDATE SET
+             precis = excluded.precis,
+             cwd = excluded.cwd,
+             source = excluded.source,
+             model = excluded.model,
+             updated_at = excluded.updated_at""",
+        (session_id, precis, cwd, source, model, updated_at),
+    )
+
+summary = payload.get("summary")
+if summary:
+    conn.execute(
+        """INSERT INTO session_summaries (session_id, summary, cwd, source, model, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(session_id) DO UPDATE SET
+             summary = excluded.summary,
+             cwd = excluded.cwd,
+             source = excluded.source,
+             model = excluded.model,
+             updated_at = excluded.updated_at""",
+        (session_id, summary, cwd, source, model, updated_at),
+    )
+
+conn.commit()
+conn.close()
 "#;
 
 fn run_remote_python_lines(
@@ -1617,6 +1745,52 @@ fn run_remote_python_lines(
         .collect())
 }
 
+fn run_remote_python(
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+    script: &str,
+    args: &[String],
+) -> anyhow::Result<String> {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o").arg("ConnectTimeout=5");
+    cmd.arg("-o").arg("BatchMode=yes");
+    let mut inner = String::from("python3 -");
+    for arg in args {
+        inner.push(' ');
+        inner.push_str(&shell_single_quote(arg));
+    }
+    let remote = match exec_prefix
+        .map(str::trim)
+        .filter(|prefix| !prefix.is_empty())
+    {
+        Some(prefix) => format!("{prefix} sh -c {}", shell_single_quote(&inner)),
+        None => inner,
+    };
+    cmd.arg(ssh_target).arg(remote);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("failed to start ssh python for {ssh_target}"))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(script.as_bytes())
+            .with_context(|| format!("failed to send script to {ssh_target}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("failed waiting for ssh python on {ssh_target}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "remote command failed for {}: {}",
+            ssh_target,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 fn scan_remote_machine_sessions(
     target: &SshConnectTarget,
 ) -> anyhow::Result<Vec<RemoteScannedSession>> {
@@ -1640,12 +1814,48 @@ fn scan_remote_machine_sessions(
             event_count: summary.event_count,
             user_message_count: summary.user_message_count,
             assistant_message_count: summary.assistant_message_count,
-            title_hint: short_session_id(&summary.id),
+            title_hint: summary
+                .title_hint
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| short_session_id(&summary.id)),
             recent_context: summary.recent_context,
+            cached_precis: summary.cached_precis.filter(|value| !value.trim().is_empty()),
+            cached_summary: summary.cached_summary.filter(|value| !value.trim().is_empty()),
             storage_path: summary.rollout_path,
         });
     }
     Ok(sessions)
+}
+
+pub fn persist_remote_generated_copy(
+    machine: &RemoteMachineSnapshot,
+    session_id: &str,
+    cwd: &str,
+    title: Option<&str>,
+    precis: Option<&str>,
+    summary: Option<&str>,
+    model: &str,
+) -> anyhow::Result<()> {
+    let updated_at =
+        time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
+    let payload = serde_json::json!({
+        "session_id": session_id,
+        "cwd": cwd,
+        "title": title,
+        "precis": precis,
+        "summary": summary,
+        "model": model,
+        "source": "interface-llm",
+        "updated_at": updated_at,
+    });
+    let args = vec![payload.to_string()];
+    let _ = run_remote_python(
+        &machine.ssh_target,
+        machine.prefix.as_deref(),
+        REMOTE_UPSERT_GENERATED_COPY_SCRIPT,
+        &args,
+    )?;
+    Ok(())
 }
 
 fn snapshot_preview_block(block: SessionPreviewBlock) -> SnapshotPreviewBlock {
