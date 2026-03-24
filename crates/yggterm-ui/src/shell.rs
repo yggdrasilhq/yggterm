@@ -442,7 +442,10 @@ impl ShellState {
             state.push_notification(
                 NotificationTone::Success,
                 "Update Ready",
-                format!("Yggterm {} was installed. Restarting now…", update.version),
+                format!(
+                    "Yggterm {} was installed. Restart when you are ready.",
+                    update.version
+                ),
             );
         }
         state.sync_browser_settings();
@@ -1835,6 +1838,51 @@ fn spawn_initial_server_sync(mut state: Signal<ShellState>) {
             }
         });
         maybe_spawn_missing_remote_machine_refreshes(state);
+    });
+}
+
+fn restart_into_pending_update(mut state: Signal<ShellState>) {
+    let pending = state.read().pending_update_restart.clone();
+    let Some(update) = pending else {
+        return;
+    };
+    state.with_mut(|shell| {
+        shell.last_action = format!("restarting into {}", update.version);
+    });
+    spawn(async move {
+        let next_exe = update.executable.clone();
+        let next_version = update.version.clone();
+        let launched = task::spawn_blocking(move || Command::new(&next_exe).spawn()).await;
+        state.with_mut(|shell| match launched {
+            Ok(Ok(_)) => {
+                window().close();
+            }
+            Ok(Err(error)) => {
+                shell.pending_update_restart = None;
+                shell.last_action = format!("restart failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "Update Restart Failed",
+                    error.to_string(),
+                );
+            }
+            Err(error) => {
+                shell.pending_update_restart = None;
+                shell.last_action = format!("restart task failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "Update Restart Failed",
+                    error.to_string(),
+                );
+            }
+        });
+        if state.read().pending_update_restart.as_ref().map(|u| u.version.as_str())
+            == Some(next_version.as_str())
+        {
+            state.with_mut(|shell| {
+                shell.pending_update_restart = None;
+            });
+        }
     });
 }
 
@@ -4644,7 +4692,6 @@ fn app() -> Element {
     let mut hovered = use_signal(|| None::<HoveredControl>);
     let mut startup_sync_started = use_signal(|| false);
     let mut update_check_started = use_signal(|| false);
-    let mut update_restart_started = use_signal(|| false);
     let mut dock_pulse_started = use_signal(|| false);
     let mut window_epoch = use_signal(|| 0_u64);
     use_effect(move || {
@@ -4699,46 +4746,6 @@ fn app() -> Element {
             update_check_started.set(true);
             spawn_notify_only_update_check(state);
         }
-    });
-    use_effect(move || {
-        if *update_restart_started.read() {
-            return;
-        }
-        let pending = state.read().pending_update_restart.clone();
-        let Some(update) = pending else {
-            return;
-        };
-        update_restart_started.set(true);
-        spawn(async move {
-            sleep(Duration::from_millis(1800)).await;
-            let next_exe = update.executable.clone();
-            let next_version = update.version.clone();
-            let launched = task::spawn_blocking(move || Command::new(&next_exe).spawn()).await;
-            state.with_mut(|shell| match launched {
-                Ok(Ok(_)) => {
-                    shell.last_action = format!("restarting into {}", next_version);
-                    window().close();
-                }
-                Ok(Err(error)) => {
-                    shell.pending_update_restart = None;
-                    shell.last_action = format!("restart failed: {error}");
-                    shell.push_notification(
-                        NotificationTone::Error,
-                        "Update Restart Failed",
-                        error.to_string(),
-                    );
-                }
-                Err(error) => {
-                    shell.pending_update_restart = None;
-                    shell.last_action = format!("restart task failed: {error}");
-                    shell.push_notification(
-                        NotificationTone::Error,
-                        "Update Restart Failed",
-                        error.to_string(),
-                    );
-                }
-            });
-        });
     });
     use_effect(move || {
         let active = state.read().server.active_session().cloned();
@@ -4910,6 +4917,7 @@ fn app() -> Element {
                     on_toggle_settings: move || state.with_mut(|shell| shell.toggle_settings_panel()),
                     on_toggle_connect: move || state.with_mut(|shell| shell.toggle_connect_panel()),
                     on_toggle_notifications: move || state.with_mut(|shell| shell.toggle_notifications_panel()),
+                    on_restart_update: move || restart_into_pending_update(state),
                     on_toggle_maximized: move || state.with_mut(|shell| shell.toggle_maximized()),
                     on_toggle_always_on_top: move || state.with_mut(|shell| shell.toggle_always_on_top()),
                     maximized: maximized,
@@ -5237,6 +5245,7 @@ fn Titlebar(
     on_toggle_settings: EventHandler<()>,
     on_toggle_connect: EventHandler<()>,
     on_toggle_notifications: EventHandler<()>,
+    on_restart_update: EventHandler<()>,
     on_toggle_maximized: EventHandler<()>,
     on_toggle_always_on_top: EventHandler<()>,
     maximized: bool,
@@ -5295,14 +5304,17 @@ fn Titlebar(
                         oninput: move |evt| on_search.call(evt.value()),
                     }
                     if let Some(update) = snapshot.pending_update_restart.clone() {
-                        div {
+                        button {
                             style: format!(
-                                "display:inline-flex; align-items:center; gap:6px; height:28px; padding:0 11px; border-radius:10px; \
-                                 background:rgba(255,255,255,0.82); color:{}; font-size:11px; font-weight:700; \
+                                "display:inline-flex; align-items:center; gap:7px; height:28px; padding:0 11px; border:none; border-radius:10px; \
+                                 background:rgba(255,255,255,0.82); color:{}; font-size:11px; font-weight:700; cursor:pointer; \
                                  box-shadow: inset 0 0 0 1px rgba(170,190,212,0.24); white-space:nowrap;",
                                 snapshot.palette.accent
                             ),
-                            "Updating to {update.version}…"
+                            onmousedown: |evt| evt.stop_propagation(),
+                            ondoubleclick: |evt| evt.stop_propagation(),
+                            onclick: move |_| on_restart_update.call(()),
+                            "Restart to Use {update.version}"
                         }
                     }
                     div { style: "flex:1; min-width:84px; height:100%;" }
