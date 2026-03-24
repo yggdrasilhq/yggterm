@@ -1,5 +1,5 @@
 [package]
-name = "yggterm-ui"
+name = "yggui"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
