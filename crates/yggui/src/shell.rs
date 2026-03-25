@@ -515,9 +515,7 @@ impl ShellState {
         };
         let palette = palette(self.settings.theme);
         let mut expanded_paths = self.browser.expanded_path_set();
-        if let Some(active) = self.server.active_session() {
-            expanded_paths.extend(self.active_session_visibility_paths(active));
-        }
+        expanded_paths.extend(self.active_session_visibility_paths());
         let live_sessions = self.server.live_sessions();
         let rows = merged_sidebar_rows(
             self.browser.rows(),
@@ -759,36 +757,53 @@ impl ShellState {
     }
 
     fn ensure_active_session_visible(&mut self) {
-        let Some(active) = self.server.active_session().cloned() else {
-            return;
-        };
-        let remote_paths = self.active_session_visibility_paths(&active);
+        let remote_paths = self.active_session_visibility_paths();
         if !remote_paths.is_empty() {
             self.browser.ensure_expanded_paths(remote_paths);
-        } else {
+        } else if let Some(active) = self.server.active_session().cloned() {
             self.browser.ensure_visible_path(&active.session_path);
         }
-        self.selected_tree_paths.clear();
-        self.selected_tree_paths.insert(active.session_path.clone());
-        self.selection_anchor = Some(active.session_path.clone());
-        if !active.session_path.starts_with("remote-session://") {
-            self.browser.select_path(active.session_path.clone());
+        if let Some(active) = self.server.active_session().cloned() {
+            self.selected_tree_paths.clear();
+            self.selected_tree_paths.insert(active.session_path.clone());
+            self.selection_anchor = Some(active.session_path.clone());
+            if !active.session_path.starts_with("remote-session://") {
+                self.browser.select_path(active.session_path.clone());
+            }
         }
         self.sync_browser_settings();
     }
 
-    fn active_session_visibility_paths(&self, active: &ManagedSessionView) -> Vec<String> {
-        let Some((machine_key, _)) = parse_remote_scanned_session_path(&active.session_path) else {
+    fn active_session_visibility_paths(&self) -> Vec<String> {
+        let active_path = self
+            .server
+            .active_session()
+            .map(|session| session.session_path.clone())
+            .or_else(|| self.server.active_session_path().map(ToOwned::to_owned));
+        let Some(active_path) = active_path else {
+            return Vec::new();
+        };
+        let Some((machine_key, session_id)) = parse_remote_scanned_session_path(&active_path) else {
             return Vec::new();
         };
         let mut paths = vec![format!("__remote_machine__/{machine_key}")];
-        let cwd = metadata_value(active, "Cwd");
+        let active_cwd = self.server.active_session().map(|active| metadata_value(active, "Cwd"));
         if let Some(machine) = self
             .server
             .remote_machines()
             .iter()
             .find(|machine| machine.machine_key == machine_key)
         {
+            let cwd = active_cwd.unwrap_or_else(|| {
+                machine
+                    .sessions
+                    .iter()
+                    .find(|session| {
+                        session.session_path == active_path || session.session_id == session_id
+                    })
+                    .map(|session| session.cwd.clone())
+                    .unwrap_or_default()
+            });
             paths.extend(
                 compressed_remote_folder_paths(
                     &SidebarRemoteMachine {
@@ -807,6 +822,7 @@ impl ShellState {
                 .map(|path| format!("__remote_folder__/{machine_key}{path}")),
             );
         } else {
+            let cwd = active_cwd.unwrap_or_default();
             let mut current = String::new();
             for segment in cwd.split('/').filter(|segment| !segment.is_empty()) {
                 current.push('/');
@@ -1511,9 +1527,7 @@ impl ShellState {
 
     fn record_restore_issue_telemetry(&self, source: &str) {
         let mut effective_expanded = self.browser.expanded_path_set();
-        if let Some(active) = self.server.active_session() {
-            effective_expanded.extend(self.active_session_visibility_paths(active));
-        }
+        effective_expanded.extend(self.active_session_visibility_paths());
         let live_sessions = self.server.live_sessions();
         let rows = merged_sidebar_rows(
             self.browser.rows(),
@@ -1526,11 +1540,7 @@ impl ShellState {
         let active_row_visible = active_path
             .as_ref()
             .is_some_and(|path| rows.iter().any(|row| row.full_path == *path));
-        let active_remote_paths = self
-            .server
-            .active_session()
-            .map(|session| self.active_session_visibility_paths(session))
-            .unwrap_or_default();
+        let active_remote_paths = self.active_session_visibility_paths();
         let payload = json!({
             "source": source,
             "active_session_path": active_path,
@@ -7778,7 +7788,7 @@ fn SessionHeaderCopy(
             div {
                 style: "display:flex; align-items:flex-start; gap:8px; min-width:0; min-height:0;",
                 div {
-                    style: format!("font-size:12px; line-height:1.68; color:{}; white-space:pre-wrap; overflow-wrap:anywhere; min-width:0; flex:1; max-height:38vh; overflow:auto; padding-right:6px; scrollbar-gutter:stable;", palette.muted),
+                    style: format!("font-size:12px; line-height:1.72; color:{}; white-space:pre-wrap; overflow-wrap:anywhere; min-width:0; flex:1; max-height:48vh; overflow:auto; padding-right:6px; scrollbar-gutter:stable;", palette.muted),
                     "{subtitle}"
                 }
                 RefreshInlineButton {
