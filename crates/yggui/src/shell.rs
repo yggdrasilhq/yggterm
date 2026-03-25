@@ -508,7 +508,10 @@ impl ShellState {
             clamp_theme_spec(&self.settings.yggui_theme)
         };
         let palette = palette(self.settings.theme);
-        let expanded_paths = self.browser.expanded_path_set();
+        let mut expanded_paths = self.browser.expanded_path_set();
+        if let Some(active) = self.server.active_session() {
+            expanded_paths.extend(self.active_session_visibility_paths(active));
+        }
         let live_sessions = self.server.live_sessions();
         let rows = merged_sidebar_rows(
             self.browser.rows(),
@@ -518,7 +521,9 @@ impl ShellState {
             &expanded_paths,
         );
         let selected_path = if let Some(active) = self.server.active_session() {
-            if active.source == yggterm_server::SessionSource::LiveSsh {
+            if active.source == yggterm_server::SessionSource::LiveSsh
+                || active.session_path.starts_with("remote-session://")
+            {
                 Some(active.session_path.clone())
             } else {
                 self.browser.selected_path().map(ToOwned::to_owned)
@@ -749,45 +754,53 @@ impl ShellState {
         let Some(active) = self.server.active_session().cloned() else {
             return;
         };
-        if let Some((machine_key, _)) = parse_remote_scanned_session_path(&active.session_path) {
-            let mut paths = vec![format!("__remote_machine__/{machine_key}")];
-            let cwd = metadata_value(&active, "Cwd");
-            if let Some(machine) = self
-                .server
-                .remote_machines()
-                .iter()
-                .find(|machine| machine.machine_key == machine_key)
-            {
-                paths.extend(
-                    compressed_remote_folder_paths(
-                        &SidebarRemoteMachine {
-                            key: machine.machine_key.clone(),
-                            label: machine.label.clone(),
-                            health: match machine.health {
-                                RemoteMachineHealth::Healthy => MachineHealth::Healthy,
-                                RemoteMachineHealth::Cached => MachineHealth::Cached,
-                                RemoteMachineHealth::Offline => MachineHealth::Offline,
-                            },
-                            scanned_sessions: machine.sessions.clone(),
-                        },
-                        &cwd,
-                    )
-                    .into_iter()
-                    .map(|path| format!("__remote_folder__/{machine_key}{path}")),
-                );
-            } else {
-                let mut current = String::new();
-                for segment in cwd.split('/').filter(|segment| !segment.is_empty()) {
-                    current.push('/');
-                    current.push_str(segment);
-                    paths.push(format!("__remote_folder__/{machine_key}{current}"));
-                }
-            }
-            self.browser.ensure_expanded_paths(paths);
+        let remote_paths = self.active_session_visibility_paths(&active);
+        if !remote_paths.is_empty() {
+            self.browser.ensure_expanded_paths(remote_paths);
         } else {
             self.browser.ensure_visible_path(&active.session_path);
         }
         self.sync_browser_settings();
+    }
+
+    fn active_session_visibility_paths(&self, active: &ManagedSessionView) -> Vec<String> {
+        let Some((machine_key, _)) = parse_remote_scanned_session_path(&active.session_path) else {
+            return Vec::new();
+        };
+        let mut paths = vec![format!("__remote_machine__/{machine_key}")];
+        let cwd = metadata_value(active, "Cwd");
+        if let Some(machine) = self
+            .server
+            .remote_machines()
+            .iter()
+            .find(|machine| machine.machine_key == machine_key)
+        {
+            paths.extend(
+                compressed_remote_folder_paths(
+                    &SidebarRemoteMachine {
+                        key: machine.machine_key.clone(),
+                        label: machine.label.clone(),
+                        health: match machine.health {
+                            RemoteMachineHealth::Healthy => MachineHealth::Healthy,
+                            RemoteMachineHealth::Cached => MachineHealth::Cached,
+                            RemoteMachineHealth::Offline => MachineHealth::Offline,
+                        },
+                        scanned_sessions: machine.sessions.clone(),
+                    },
+                    &cwd,
+                )
+                .into_iter()
+                .map(|path| format!("__remote_folder__/{machine_key}{path}")),
+            );
+        } else {
+            let mut current = String::new();
+            for segment in cwd.split('/').filter(|segment| !segment.is_empty()) {
+                current.push('/');
+                current.push_str(segment);
+                paths.push(format!("__remote_folder__/{machine_key}{current}"));
+            }
+        }
+        paths
     }
 
     fn hydrate_generated_copy_from_remote_cache(&mut self) {
@@ -7558,7 +7571,7 @@ fn SessionHeaderCopy(
             div {
                 style: "display:flex; align-items:flex-start; gap:8px; min-width:0; min-height:0;",
                 div {
-                    style: format!("font-size:12px; line-height:1.65; color:{}; white-space:pre-wrap; overflow-wrap:anywhere; min-width:0; flex:1; max-height:132px; overflow:auto; padding-right:6px;", palette.muted),
+                    style: format!("font-size:12px; line-height:1.65; color:{}; white-space:pre-wrap; overflow-wrap:anywhere; min-width:0; flex:1; max-height:180px; overflow:auto; padding-right:6px;", palette.muted),
                     "{subtitle}"
                 }
                 RefreshInlineButton {
