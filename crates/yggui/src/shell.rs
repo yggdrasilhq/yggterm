@@ -9505,6 +9505,9 @@ fn apply_active_terminal_zoom(state: Signal<ShellState>) {
 }
 
 fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
+    let css = serde_json::to_string(XTERM_CSS).expect("serialize xterm css");
+    let xterm = serde_json::to_string(XTERM_JS).expect("serialize xterm js");
+    let fit_bundle = serde_json::to_string(XTERM_FIT_JS).expect("serialize xterm fit addon");
     let background =
         serde_json::to_string(&theme.background).expect("serialize terminal background");
     let foreground =
@@ -9553,7 +9556,47 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
             dioxus.send({{ kind: "ready" }});
             return;
         }}
-        if (!window.Terminal || !window.FitAddon || !window.FitAddon.FitAddon) {{
+        const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        const ensureXtermAssets = async () => {{
+            window.__yggtermXtermBootstrapError = null;
+            const styleId = "yggterm-xterm-style";
+            if (!document.getElementById(styleId)) {{
+                const style = document.createElement("style");
+                style.id = styleId;
+                style.textContent = {css};
+                document.head.appendChild(style);
+            }}
+            const injectScript = (id, source) => {{
+                if (document.getElementById(id)) {{
+                    return;
+                }}
+                const script = document.createElement("script");
+                script.id = id;
+                script.type = "text/javascript";
+                script.text = source;
+                document.head.appendChild(script);
+            }};
+            try {{
+                if (!window.Terminal) {{
+                    injectScript("yggterm-xterm-script", {xterm});
+                }}
+                if (!window.FitAddon || !window.FitAddon.FitAddon) {{
+                    injectScript("yggterm-xterm-fit-script", {fit_bundle});
+                }}
+                for (let attempt = 0; attempt < 80; attempt += 1) {{
+                    if (window.Terminal && window.FitAddon && window.FitAddon.FitAddon) {{
+                        return true;
+                    }}
+                    await sleep(50);
+                }}
+                return false;
+            }} catch (error) {{
+                window.__yggtermXtermBootstrapError = error && error.message ? error.message : String(error);
+                return false;
+            }}
+        }};
+        const assetsReady = await ensureXtermAssets();
+        if (!assetsReady || !window.Terminal || !window.FitAddon || !window.FitAddon.FitAddon) {{
             const details = [
               window.Terminal ? "Terminal:ok" : "Terminal:missing",
               window.FitAddon && window.FitAddon.FitAddon ? "FitAddon:ok" : "FitAddon:missing",

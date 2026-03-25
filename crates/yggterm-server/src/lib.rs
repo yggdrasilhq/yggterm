@@ -3034,6 +3034,26 @@ fn resolve_remote_yggterm_binary(
         Err(_) => {}
     }
 
+    let installed_binary = "$HOME/.yggterm/bin/yggterm";
+    match remote_protocol_version_for_binary(ssh_target, exec_prefix, installed_binary) {
+        Ok(version) if version.trim() == daemon::SERVER_PROTOCOL_VERSION => {
+            if let Ok(mut cache) = remote_command_cache().lock() {
+                cache.insert(cache_key, installed_binary.to_string());
+            }
+            if let Some(span) = perf_span {
+                span.finish(serde_json::json!({
+                    "ssh_target": ssh_target,
+                    "result": "installed_path_match",
+                    "binary_expr": installed_binary,
+                }));
+            }
+            return Ok((installed_binary.to_string(), RemoteDeployState::Ready));
+        }
+        Ok(_) => {}
+        Err(error) if !should_fallback_to_python(&error) => return Err(error),
+        Err(_) => {}
+    }
+
     let installed = bootstrap_remote_yggterm(ssh_target, exec_prefix)?;
     let installed_version =
         remote_protocol_version_for_binary(ssh_target, exec_prefix, &installed)?;
