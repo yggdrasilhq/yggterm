@@ -661,10 +661,24 @@ impl YggtermServer {
             .iter()
             .filter_map(|key| self.sessions.get(key).cloned())
             .collect::<Vec<_>>();
-        if let Some(active) = self.active_session() {
+        if let Some(active) = self
+            .active_session()
+            .cloned()
+            .or_else(|| {
+                self.active_session_path.as_deref().and_then(|path| {
+                    synthesize_remote_active_session(
+                        path,
+                        &self.remote_machines,
+                        self.backend,
+                        self.theme,
+                        self.ghostty_host.bridge_enabled,
+                    )
+                })
+            })
+        {
             let active_path = active.session_path.clone();
             if !sessions.iter().any(|session| session.session_path == active_path) {
-                sessions.insert(0, active.clone());
+                sessions.insert(0, active);
             }
         }
         sessions
@@ -678,7 +692,21 @@ impl YggtermServer {
             .cloned()
             .map(snapshot_session_view)
             .collect::<Vec<_>>();
-        if let Some(active) = self.active_session().cloned().map(snapshot_session_view) {
+        let active_session = self
+            .active_session()
+            .cloned()
+            .or_else(|| {
+                self.active_session_path.as_deref().and_then(|path| {
+                    synthesize_remote_active_session(
+                        path,
+                        &self.remote_machines,
+                        self.backend,
+                        self.theme,
+                        self.ghostty_host.bridge_enabled,
+                    )
+                })
+            });
+        if let Some(active) = active_session.clone().map(snapshot_session_view) {
             let active_path = active.session_path.clone();
             if !live_sessions
                 .iter()
@@ -689,7 +717,7 @@ impl YggtermServer {
         }
         ServerUiSnapshot {
             active_session_path: self.active_session_path.clone(),
-            active_session: self.active_session().cloned().map(snapshot_session_view),
+            active_session: active_session.map(snapshot_session_view),
             active_view_mode: self.active_view_mode,
             remote_machines: self.remote_machines.clone(),
             ssh_targets: self.ssh_targets.clone(),
@@ -717,6 +745,28 @@ impl YggtermServer {
             let key = live.session_path.clone();
             self.sessions
                 .insert(key, managed_session_from_snapshot(live));
+        }
+        if let Some(active_path) = self.active_session_path.clone()
+            && !self.sessions.contains_key(&active_path)
+            && let Some(session) = synthesize_remote_active_session(
+                &active_path,
+                &self.remote_machines,
+                self.backend,
+                self.theme,
+                self.ghostty_host.bridge_enabled,
+            )
+        {
+            if !self.live_session_order.iter().any(|path| path == &active_path) {
+                self.live_session_order.insert(0, active_path.clone());
+            }
+            self.sessions.insert(active_path, session);
+        }
+        if self
+            .active_session_path
+            .as_ref()
+            .is_some_and(|path| !self.sessions.contains_key(path))
+        {
+            self.active_session_path = self.live_session_order.first().cloned();
         }
     }
 
@@ -2004,6 +2054,11 @@ fn apply_remote_scanned_session_preview(
     upsert_session_metadata(&mut session.metadata, "Host", ssh_target.to_string());
     upsert_session_metadata(&mut session.metadata, "UUID", scanned.session_id.clone());
     upsert_session_metadata(&mut session.metadata, "Cwd", scanned.cwd.clone());
+    upsert_session_metadata(
+        &mut session.metadata,
+        "Storage",
+        scanned.storage_path.clone(),
+    );
     upsert_session_metadata(&mut session.metadata, "Started", scanned.started_at.clone());
     upsert_session_metadata(
         &mut session.metadata,
@@ -4057,6 +4112,94 @@ fn build_live_session(
         ssh_target: Some(target.ssh_target.clone()),
         ssh_prefix: target.prefix.clone(),
     }
+}
+
+fn synthesize_remote_scanned_session_view(
+    machine: &RemoteMachineSnapshot,
+    scanned: &RemoteScannedSession,
+    backend: TerminalBackend,
+    theme: UiTheme,
+    ghostty_bridge_enabled: bool,
+) -> ManagedSessionView {
+    let target = SshConnectTarget {
+        label: machine.label.clone(),
+        kind: SessionKind::SshShell,
+        ssh_target: machine.ssh_target.clone(),
+        prefix: machine.prefix.clone(),
+        cwd: Some(scanned.cwd.clone()),
+    };
+    let mut session = build_live_session(
+        &scanned.session_id,
+        SessionKind::SshShell,
+        &target,
+        backend,
+        theme,
+        ghostty_bridge_enabled,
+    );
+    session.session_path = scanned.session_path.clone();
+    session.host_label = machine.label.clone();
+    session.title = if scanned.title_hint.trim().is_empty() {
+        short_session_id(&scanned.session_id)
+    } else {
+        scanned.title_hint.clone()
+    };
+    session.launch_command = remote_ssh_launch_command(
+        &target.ssh_target,
+        target.prefix.as_deref(),
+        "yggterm",
+        &[
+            "server",
+            "remote",
+            "resume-codex",
+            &scanned.session_id,
+            &scanned.cwd,
+        ],
+    );
+    session.terminal_lines = vec![
+        format!("$ {}", session.launch_command),
+        format!("Queue remote Yggterm resume {}", scanned.session_id),
+        format!("Target host: {}", target.ssh_target),
+        format!("Workspace: {}", scanned.cwd),
+        "Daemon PTY: request main viewport terminal stream".to_string(),
+    ];
+    upsert_session_metadata(&mut session.metadata, "Source", "remote-codex".to_string());
+    upsert_session_metadata(&mut session.metadata, "Host", target.ssh_target.clone());
+    upsert_session_metadata(&mut session.metadata, "UUID", scanned.session_id.clone());
+    upsert_session_metadata(
+        &mut session.metadata,
+        "Restore",
+        format!(
+            "yggterm server remote resume-codex {}",
+            scanned.session_id
+        ),
+    );
+    upsert_session_metadata(&mut session.metadata, "Cwd", scanned.cwd.clone());
+    apply_remote_scanned_session_preview(&mut session, scanned, &machine.label, &target.ssh_target);
+    session
+}
+
+fn synthesize_remote_active_session(
+    active_path: &str,
+    remote_machines: &[RemoteMachineSnapshot],
+    backend: TerminalBackend,
+    theme: UiTheme,
+    ghostty_bridge_enabled: bool,
+) -> Option<ManagedSessionView> {
+    let (machine_key, session_id) = parse_remote_scanned_session_path(active_path)?;
+    let machine = remote_machines
+        .iter()
+        .find(|machine| machine.machine_key == machine_key)?;
+    let scanned = machine
+        .sessions
+        .iter()
+        .find(|session| session.session_path == active_path || session.session_id == session_id)?;
+    Some(synthesize_remote_scanned_session_view(
+        machine,
+        scanned,
+        backend,
+        theme,
+        ghostty_bridge_enabled,
+    ))
 }
 
 fn hydrate_document_session(session: &mut ManagedSessionView, document: &WorkspaceDocument) {
