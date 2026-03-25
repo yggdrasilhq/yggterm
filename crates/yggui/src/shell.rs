@@ -28,6 +28,7 @@ use dioxus::desktop::{
 use dioxus::document;
 use dioxus::html::{InteractionElementOffset, input_data::MouseButton};
 use dioxus::prelude::*;
+use dioxus_core::schedule_update;
 use keyboard_types::{Key, Modifiers};
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
@@ -91,6 +92,7 @@ type WorkspaceReorderPlanItem = TreeReorderPlanItem<BrowserRowKind>;
 pub struct ShellBootstrap {
     pub tree: SessionNode,
     pub browser_tree: SessionNode,
+    pub browser_tree_loaded: bool,
     pub settings: AppSettings,
     pub install_context: InstallContext,
     pub settings_path: PathBuf,
@@ -392,6 +394,7 @@ enum MachineHealth {
 
 impl ShellState {
     fn new(bootstrap: ShellBootstrap) -> Self {
+        let browser_tree_loaded = bootstrap.browser_tree_loaded;
         let settings = bootstrap.settings.clone();
         let pending_update_restart = bootstrap.pending_update_restart.clone();
         let right_panel_mode = if settings.show_settings {
@@ -477,7 +480,7 @@ impl ShellState {
             theme_editor_drag_stop: None,
             background_copy_scan_in_flight: false,
             next_background_copy_scan_after_ms: 0,
-            browser_tree_loading_in_flight: true,
+            browser_tree_loading_in_flight: !browser_tree_loaded,
         };
         if let Some(path) = state.browser.selected_path().map(ToOwned::to_owned) {
             state.selected_tree_paths.insert(path.clone());
@@ -1857,7 +1860,13 @@ fn spawn_title_generation_for_target(
 ) {
     let session_path = target.session_path.clone();
     let session_title = target.title.clone();
-    let settings = state.read().settings.clone();
+    let (settings, perf_home) = {
+        let shell = state.read();
+        (
+            shell.settings.clone(),
+            perf_home_dir(&shell.bootstrap.settings_path),
+        )
+    };
     let should_start = state.with_mut(|shell| {
         if shell.title_requests_in_flight.contains(&session_path)
             || (!force
@@ -1903,7 +1912,6 @@ fn spawn_title_generation_for_target(
         });
     }
     info!(session_path=%target.session_path, force, "queueing title generation");
-    let perf_home = perf_home_dir(&state.read().bootstrap.settings_path);
     spawn(async move {
         let perf = PerfSpan::start(&perf_home, "copy_generation", "title");
         let target_for_task = target.clone();
@@ -2066,7 +2074,13 @@ fn spawn_precis_generation_for_target(
 ) {
     let session_path = target.session_path.clone();
     let session_title = target.title.clone();
-    let settings = state.read().settings.clone();
+    let (settings, perf_home) = {
+        let shell = state.read();
+        (
+            shell.settings.clone(),
+            perf_home_dir(&shell.bootstrap.settings_path),
+        )
+    };
     let should_start = state.with_mut(|shell| {
         if (!force && shell.generated_precis.contains_key(&session_path))
             || shell.precis_requests_in_flight.contains(&session_path)
@@ -2104,7 +2118,6 @@ fn spawn_precis_generation_for_target(
         None,
         announce,
     );
-    let perf_home = perf_home_dir(&state.read().bootstrap.settings_path);
     spawn(async move {
         let perf = PerfSpan::start(&perf_home, "copy_generation", "precis");
         let target_for_task = target.clone();
@@ -2254,7 +2267,13 @@ fn spawn_summary_generation_for_target(
 ) {
     let session_path = target.session_path.clone();
     let session_title = target.title.clone();
-    let settings = state.read().settings.clone();
+    let (settings, perf_home) = {
+        let shell = state.read();
+        (
+            shell.settings.clone(),
+            perf_home_dir(&shell.bootstrap.settings_path),
+        )
+    };
     let should_start = state.with_mut(|shell| {
         if (!force && shell.generated_summaries.contains_key(&session_path))
             || shell.summary_requests_in_flight.contains(&session_path)
@@ -2292,7 +2311,6 @@ fn spawn_summary_generation_for_target(
         None,
         announce,
     );
-    let perf_home = perf_home_dir(&state.read().bootstrap.settings_path);
     spawn(async move {
         let perf = PerfSpan::start(&perf_home, "copy_generation", "summary");
         let target_for_task = target.clone();
@@ -2426,7 +2444,11 @@ fn spawn_summary_generation_for_target(
     });
 }
 
-fn spawn_initial_server_sync(state: Signal<ShellState>) {
+fn spawn_initial_server_sync(
+    state: Signal<ShellState>,
+    schedule_ui: std::sync::Arc<dyn Fn() + Send + Sync>,
+    mut async_render_epoch: Signal<u64>,
+) {
     let endpoint = state.read().bootstrap.server_endpoint.clone();
     let perf_home = perf_home_dir(&state.read().bootstrap.settings_path);
     spawn(async move {
@@ -2467,11 +2489,17 @@ fn spawn_initial_server_sync(state: Signal<ShellState>) {
                 );
             }
         });
+        async_render_epoch.with_mut(|epoch| *epoch += 1);
+        schedule_ui();
         maybe_spawn_missing_remote_machine_refreshes(state);
     });
 }
 
-fn spawn_initial_browser_tree_load(state: Signal<ShellState>) {
+fn spawn_initial_browser_tree_load(
+    state: Signal<ShellState>,
+    schedule_ui: std::sync::Arc<dyn Fn() + Send + Sync>,
+    mut async_render_epoch: Signal<u64>,
+) {
     let settings = state.read().settings.clone();
     let perf_home = perf_home_dir(&state.read().bootstrap.settings_path);
     spawn(async move {
@@ -2500,6 +2528,8 @@ fn spawn_initial_browser_tree_load(state: Signal<ShellState>) {
                 }
             }
         });
+        async_render_epoch.with_mut(|epoch| *epoch += 1);
+        schedule_ui();
     });
 }
 
@@ -2655,7 +2685,7 @@ fn spawn_notify_only_update_check(mut state: Signal<ShellState>) {
     });
 }
 
-fn initial_server_sync(
+pub fn initial_server_sync(
     endpoint: ServerEndpoint,
 ) -> Result<(ServerUiSnapshot, Option<ServerRuntimeStatus>, String)> {
     ensure_daemon_running(&endpoint)?;
@@ -5982,9 +6012,12 @@ fn app() -> Element {
     let mut dock_pulse_started = use_signal(|| false);
     let mut window_epoch = use_signal(|| 0_u64);
     let mut terminal_mount_epoch = use_signal(|| 0_u64);
+    let mut async_render_epoch = use_signal(|| 0_u64);
+    let mut startup_refresh_pulse = use_signal(|| 0_u64);
     let mut last_terminal_session_path = use_signal(|| None::<String>);
     let mut last_open_recovery_path = use_signal(|| None::<String>);
     let mut last_preview_refresh_path = use_signal(|| None::<String>);
+    let schedule_ui_update = schedule_update();
     use_effect(move || {
         if XTERM_ASSETS_BOOTSTRAPPED.get().is_none() {
             let _ = XTERM_ASSETS_BOOTSTRAPPED.set(());
@@ -6014,6 +6047,7 @@ fn app() -> Element {
             }
         }
     });
+    let schedule_ui_update_for_sync = schedule_ui_update.clone();
     use_effect(move || {
         let should_start = {
             let shell = state.read();
@@ -6021,9 +6055,14 @@ fn app() -> Element {
         };
         if should_start {
             startup_sync_started.set(true);
-            spawn_initial_server_sync(state);
+            spawn_initial_server_sync(
+                state,
+                schedule_ui_update_for_sync.clone(),
+                async_render_epoch,
+            );
         }
     });
+    let schedule_ui_update_for_tree = schedule_ui_update.clone();
     use_effect(move || {
         let should_start = {
             let shell = state.read();
@@ -6031,7 +6070,11 @@ fn app() -> Element {
         };
         if should_start {
             browser_tree_load_started.set(true);
-            spawn_initial_browser_tree_load(state);
+            spawn_initial_browser_tree_load(
+                state,
+                schedule_ui_update_for_tree.clone(),
+                async_render_epoch,
+            );
         }
     });
     use_effect(move || {
@@ -6298,6 +6341,30 @@ fn app() -> Element {
             spawn_dock_hide(state, pid, window_id);
         }
     });
+    let startup_refresh_desktop = desktop.clone();
+    use_future(move || {
+        let mut state = state;
+        let mut startup_refresh_pulse = startup_refresh_pulse;
+        let desktop = startup_refresh_desktop.clone();
+        async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(140)).await;
+                startup_refresh_pulse.with_mut(|pulse| *pulse += 1);
+                desktop.request_redraw();
+                let should_continue = {
+                    let shell = state.read();
+                    shell.needs_initial_server_sync
+                        || shell.browser_tree_loading_in_flight
+                        || shell.server_busy
+                };
+                if !should_continue {
+                    break;
+                }
+            }
+        }
+    });
+    let _ = *async_render_epoch.read();
+    let _ = *startup_refresh_pulse.read();
     let snapshot = state.read().snapshot();
     let inner = desktop.inner_size();
     let context_menu_window_size = (inner.width as f64, inner.height as f64);
