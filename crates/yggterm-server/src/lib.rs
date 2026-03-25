@@ -1253,7 +1253,14 @@ impl YggtermServer {
             cwd: live.cwd,
         };
         self.upsert_ssh_target(&target);
-        self.insert_live_session(&live.key, &live.id, live.kind, &target, Some(live.title));
+        self.insert_live_session_with_launch(
+            &live.key,
+            &live.id,
+            live.kind,
+            &target,
+            Some(live.title),
+            false,
+        );
     }
 
     pub fn toggle_preview_block(&mut self, block_ix: usize) {
@@ -1461,6 +1468,18 @@ impl YggtermServer {
         target: &SshConnectTarget,
         title_override: Option<String>,
     ) {
+        self.insert_live_session_with_launch(key, session_id, kind, target, title_override, true);
+    }
+
+    fn insert_live_session_with_launch(
+        &mut self,
+        key: &str,
+        session_id: &str,
+        kind: SessionKind,
+        target: &SshConnectTarget,
+        title_override: Option<String>,
+        launch_now: bool,
+    ) {
         let mut session = build_live_session(
             session_id,
             kind,
@@ -1477,7 +1496,9 @@ impl YggtermServer {
         self.live_session_order.insert(0, key.to_string());
         self.active_session_path = Some(key.to_string());
         self.active_view_mode = WorkspaceViewMode::Terminal;
-        self.request_terminal_launch_for_active();
+        if launch_now {
+            self.request_terminal_launch_for_active();
+        }
     }
 
     fn refresh_stored_session_preview(
