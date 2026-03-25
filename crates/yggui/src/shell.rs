@@ -3026,7 +3026,19 @@ fn restore_browser_tree(shell: &mut ShellState, browser_tree: SessionNode, selec
     );
     shell.browser.ensure_expanded_paths(synthetic_expanded_paths);
     shell.browser.set_filter_query(filter_query);
+    shell.ensure_active_session_visible();
     shell.sync_browser_settings();
+}
+
+fn remote_preview_needs_refresh(session: &ManagedSessionView) -> bool {
+    session.session_path.starts_with("remote-session://")
+        && session.source == yggterm_server::SessionSource::LiveSsh
+        && (session.preview.blocks.is_empty()
+            || session
+                .preview
+                .blocks
+                .iter()
+                .any(|block| block.timestamp == "server:launch"))
 }
 
 fn background_copy_job_for_target(
@@ -5638,6 +5650,7 @@ fn app() -> Element {
     let mut terminal_mount_epoch = use_signal(|| 0_u64);
     let mut last_terminal_session_path = use_signal(|| None::<String>);
     let mut last_open_recovery_path = use_signal(|| None::<String>);
+    let mut last_preview_refresh_path = use_signal(|| None::<String>);
     use_effect(move || {
         if XTERM_ASSETS_BOOTSTRAPPED.get().is_none() {
             let _ = XTERM_ASSETS_BOOTSTRAPPED.set(());
@@ -5732,6 +5745,7 @@ fn app() -> Element {
     use_effect(move || {
         let active = state.read().server.active_session().cloned();
         let Some(session) = active else {
+            last_preview_refresh_path.set(None);
             return;
         };
         let (has_precis, has_summary, has_good_title) = {
@@ -5775,6 +5789,36 @@ fn app() -> Element {
         spawn_summary_generation(state, session, false);
         state.with_mut(|shell| shell.next_background_copy_scan_after_ms = current_millis());
         maybe_spawn_background_copy_generation(state);
+    });
+    use_effect(move || {
+        let (active, view_mode, server_busy) = {
+            let shell = state.read();
+            (
+                shell.server.active_session().cloned(),
+                shell.server.active_view_mode(),
+                shell.server_busy,
+            )
+        };
+        let Some(session) = active else {
+            last_preview_refresh_path.set(None);
+            return;
+        };
+        if view_mode != WorkspaceViewMode::Rendered || server_busy {
+            return;
+        }
+        if !remote_preview_needs_refresh(&session) {
+            last_preview_refresh_path.set(None);
+            return;
+        }
+        if *last_preview_refresh_path.read() == Some(session.session_path.clone()) {
+            return;
+        }
+        last_preview_refresh_path.set(Some(session.session_path.clone()));
+        spawn_server_snapshot_action(
+            state,
+            "refreshing preview".to_string(),
+            move |endpoint| daemon_set_view_mode(&endpoint, WorkspaceViewMode::Rendered),
+        );
     });
     use_effect(move || {
         let (selected_row, active_session_path, server_busy) = {
