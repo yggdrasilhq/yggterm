@@ -11,6 +11,10 @@ pub const TOAST_CSS: &str = r#"
   78% { opacity: 1; transform: translateY(0); }
   100% { opacity: 0; transform: translateY(-6px); }
 }
+@keyframes yggterm-toast-progress-indeterminate {
+  0% { transform: translateX(-65%); }
+  100% { transform: translateX(165%); }
+}
 "#;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -28,6 +32,9 @@ pub struct ToastItem {
     pub title: String,
     pub message: String,
     pub created_at_ms: u64,
+    pub job_key: Option<String>,
+    pub progress: Option<f32>,
+    pub persistent: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -50,7 +57,10 @@ pub fn ToastViewport(
     let visible = items
         .into_iter()
         .rev()
-        .filter(|notification| now_ms.saturating_sub(notification.created_at_ms) <= max_age_ms)
+        .filter(|notification| {
+            notification.persistent
+                || now_ms.saturating_sub(notification.created_at_ms) <= max_age_ms
+        })
         .take(max_visible)
         .collect::<Vec<_>>();
     let stack_key = visible
@@ -130,6 +140,46 @@ pub fn ToastCard(
                     palette.text
                 ),
                 "{item.message}"
+            }
+            if item.persistent || item.progress.is_some() {
+                ToastProgressBar {
+                    progress: item.progress,
+                    tone: item.tone,
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn ToastProgressBar(progress: Option<f32>, tone: ToastTone) -> Element {
+    let clamped = progress.map(|value| value.clamp(0.0, 1.0));
+    let accent = match tone {
+        ToastTone::Info => "#72bef7",
+        ToastTone::Success => "#2f9e62",
+        ToastTone::Warning => "#d79b24",
+        ToastTone::Error => "#d95c5c",
+    };
+    rsx! {
+        div {
+            style: "position:relative; width:100%; height:8px; border-radius:999px; overflow:hidden; \
+                    background:rgba(191,206,221,0.3); box-shadow:inset 0 0 0 1px rgba(255,255,255,0.24);",
+            if let Some(progress) = clamped {
+                div {
+                    style: format!(
+                        "height:100%; width:{:.2}%; border-radius:999px; background:{}; transition:width 180ms ease;",
+                        progress * 100.0,
+                        accent
+                    )
+                }
+            } else {
+                div {
+                    style: format!(
+                        "position:absolute; inset:0 auto 0 0; width:44%; border-radius:999px; background:{}; \
+                         animation:yggterm-toast-progress-indeterminate 1.1s ease-in-out infinite;",
+                        accent
+                    )
+                }
             }
         }
     }
