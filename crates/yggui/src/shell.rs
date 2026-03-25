@@ -35,7 +35,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -2717,8 +2717,20 @@ fn ensure_daemon_running(endpoint: &ServerEndpoint) -> Result<()> {
     if ping(endpoint).is_ok() {
         return Ok(());
     }
-    spawn_daemon_process()?;
-    wait_for_daemon(endpoint)
+    let mut last_error = None;
+    for _ in 0..3 {
+        prepare_current_endpoint_for_spawn(endpoint)?;
+        spawn_daemon_process(endpoint)?;
+        match wait_for_daemon(endpoint) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = Some(error);
+                let _ = daemon_shutdown(endpoint);
+                thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("daemon did not become reachable")))
 }
 
 fn restart_daemon(endpoint: &ServerEndpoint) -> Result<()> {
@@ -2726,30 +2738,96 @@ fn restart_daemon(endpoint: &ServerEndpoint) -> Result<()> {
     cleanup_legacy_daemons(endpoint, &current_exe)?;
     let _ = daemon_shutdown(endpoint);
     thread::sleep(Duration::from_millis(200));
-    spawn_daemon_process()?;
-    wait_for_daemon(endpoint)
+    let mut last_error = None;
+    for _ in 0..3 {
+        prepare_current_endpoint_for_spawn(endpoint)?;
+        spawn_daemon_process(endpoint)?;
+        match wait_for_daemon(endpoint) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = Some(error);
+                let _ = daemon_shutdown(endpoint);
+                thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("daemon did not become reachable")))
 }
 
-fn spawn_daemon_process() -> Result<()> {
+fn prepare_current_endpoint_for_spawn(endpoint: &ServerEndpoint) -> Result<()> {
+    #[cfg(unix)]
+    if let ServerEndpoint::UnixSocket(path) = endpoint {
+        if path.exists() && ping(endpoint).is_err() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    Ok(())
+}
+
+fn spawn_daemon_process(endpoint: &ServerEndpoint) -> Result<()> {
     let current_exe = std::env::current_exe()?;
+    let log_file = daemon_startup_log_file(endpoint)?;
     Command::new(current_exe)
         .arg("server")
         .arg("daemon")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(log_file.try_clone()?)
+        .stderr(log_file)
         .spawn()?;
     Ok(())
 }
 
 fn wait_for_daemon(endpoint: &ServerEndpoint) -> Result<()> {
-    for _ in 0..80 {
+    for _ in 0..100 {
         thread::sleep(Duration::from_millis(150));
         if ping(endpoint).is_ok() {
             return Ok(());
         }
     }
-    anyhow::bail!("daemon did not become reachable")
+    let tail = read_daemon_startup_log_tail(endpoint);
+    anyhow::bail!("daemon did not become reachable{tail}")
+}
+
+fn daemon_startup_log_file(endpoint: &ServerEndpoint) -> Result<std::fs::File> {
+    let path = daemon_startup_log_path(endpoint);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?)
+}
+
+fn daemon_startup_log_path(endpoint: &ServerEndpoint) -> PathBuf {
+    match endpoint {
+        #[cfg(unix)]
+        ServerEndpoint::UnixSocket(path) => path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("daemon.log"),
+        ServerEndpoint::Tcp { .. } => PathBuf::from("daemon.log"),
+    }
+}
+
+fn read_daemon_startup_log_tail(endpoint: &ServerEndpoint) -> String {
+    let path = daemon_startup_log_path(endpoint);
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return String::new();
+    };
+    let lines = contents
+        .lines()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("; daemon log tail: {}", lines.join(" | "))
+    }
 }
 
 fn maybe_spawn_missing_remote_machine_refreshes(state: Signal<ShellState>) {
@@ -6089,16 +6167,42 @@ fn app() -> Element {
         );
     });
     use_effect(move || {
-        let active_path = {
+        let (active_path, active_visible, show_loading_tree) = {
             let shell = state.read();
-            shell.server.active_session_path().map(ToOwned::to_owned)
+            let active_path = shell.server.active_session_path().map(ToOwned::to_owned);
+            let snapshot = shell.snapshot();
+            let active_visible = active_path
+                .as_ref()
+                .is_some_and(|path| snapshot.rows.iter().any(|row| row.full_path == *path));
+            (active_path, active_visible, snapshot.show_loading_tree)
         };
+        if show_loading_tree {
+            return;
+        }
         let Some(active_path) = active_path else {
             return;
         };
+        if !active_visible {
+            return;
+        }
         let row_id = sidebar_row_dom_id(&active_path);
         let _ = document::eval(&format!(
-            "requestAnimationFrame(() => document.getElementById({row_id:?})?.scrollIntoView({{ block: 'nearest', inline: 'nearest' }}));"
+            "(function() {{
+                const rowId = {row_id:?};
+                let attempts = 0;
+                const tick = () => {{
+                    const row = document.getElementById(rowId);
+                    const sidebar = document.getElementById('yggterm-sidebar');
+                    if (row && sidebar) {{
+                        row.scrollIntoView({{ block: 'nearest', inline: 'nearest' }});
+                        return;
+                    }}
+                    if (attempts++ < 8) {{
+                        requestAnimationFrame(tick);
+                    }}
+                }};
+                requestAnimationFrame(tick);
+            }})();"
         ));
     });
     use_effect(move || {
