@@ -2650,15 +2650,13 @@ fn initial_server_sync(
 ) -> Result<(ServerUiSnapshot, Option<ServerRuntimeStatus>, String)> {
     ensure_daemon_running(&endpoint)?;
 
-    #[cfg(debug_assertions)]
-    {
-        restart_daemon(&endpoint)?;
-    }
-
     let mut runtime = status(&endpoint).ok();
     if runtime
         .as_ref()
-        .is_some_and(|runtime| runtime.server_version != env!("CARGO_PKG_VERSION"))
+        .is_some_and(|runtime| {
+            runtime.server_version != env!("CARGO_PKG_VERSION")
+                || runtime.server_build_id != current_build_id()
+        })
     {
         restart_daemon(&endpoint)?;
         runtime = status(&endpoint).ok();
@@ -2682,6 +2680,16 @@ fn initial_server_sync(
         ServerEndpoint::Tcp { host, port } => format!("server connected via {host}:{port}"),
     };
     Ok((snapshot, runtime, detail))
+}
+
+fn current_build_id() -> u64 {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|dur| dur.as_secs())
+        .unwrap_or_default()
 }
 
 fn snapshot_needs_remote_restore_restart(snapshot: &ServerUiSnapshot) -> bool {
