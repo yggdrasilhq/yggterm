@@ -54,6 +54,12 @@ impl TerminalManager {
         Ok(())
     }
 
+    pub fn session_matches_spec(&self, key: &str, launch_command: &str, cwd: Option<&str>) -> bool {
+        self.sessions
+            .get(key)
+            .is_some_and(|session| session.matches_spec(launch_command, cwd))
+    }
+
     pub fn read(&self, key: &str, cursor: u64) -> Result<TerminalReadResult> {
         let session = self
             .sessions
@@ -130,6 +136,8 @@ struct PtySessionRuntime {
     chunks: Arc<Mutex<VecDeque<TerminalChunk>>>,
     seq: Arc<AtomicU64>,
     last_activity_ms: Arc<AtomicU64>,
+    launch_command: String,
+    cwd: Option<String>,
 }
 
 impl PtySessionRuntime {
@@ -211,7 +219,13 @@ impl PtySessionRuntime {
             chunks,
             seq,
             last_activity_ms,
+            launch_command: launch_command.to_string(),
+            cwd: cwd.map(|value| value.to_string()),
         })
+    }
+
+    fn matches_spec(&self, launch_command: &str, cwd: Option<&str>) -> bool {
+        self.launch_command == launch_command && self.cwd.as_deref() == cwd
     }
 
     fn read(&self, cursor: u64) -> TerminalReadResult {
