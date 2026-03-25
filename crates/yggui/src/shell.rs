@@ -713,6 +713,8 @@ impl ShellState {
                     self.seed_dynamic_top_level_expansions();
                 }
                 self.ensure_active_session_visible();
+                self.record_restore_issue_telemetry("apply_daemon_snapshot_result");
+                self.record_preview_issue_telemetry("apply_daemon_snapshot_result");
                 if let Some(message) = message {
                     self.last_action = message;
                 }
@@ -1469,7 +1471,9 @@ impl ShellState {
 
     fn refresh_tree_debug(&mut self, source: &str) {
         self.last_tree_debug = format!(
-            "{source} | selected={} [{}] | drag={} [{}] | hover={} | pending_delete={} | rename={}",
+            "{source} | active={} | view={:?} | selected={} [{}] | drag={} [{}] | hover={} | pending_delete={} | rename={}",
+            self.server.active_session_path().unwrap_or("none"),
+            self.server.active_view_mode(),
             self.selected_tree_paths.len(),
             join_debug_paths(self.selected_tree_paths.iter().cloned().collect()),
             self.drag_paths.len(),
@@ -1491,6 +1495,74 @@ impl ShellState {
                 .clone()
                 .unwrap_or_else(|| "none".to_string())
         );
+    }
+
+    fn record_restore_issue_telemetry(&self, source: &str) {
+        let mut effective_expanded = self.browser.expanded_path_set();
+        if let Some(active) = self.server.active_session() {
+            effective_expanded.extend(self.active_session_visibility_paths(active));
+        }
+        let live_sessions = self.server.live_sessions();
+        let rows = merged_sidebar_rows(
+            self.browser.rows(),
+            self.server.remote_machines(),
+            self.server.ssh_targets(),
+            &live_sessions,
+            &effective_expanded,
+        );
+        let active_path = self.server.active_session_path().map(ToOwned::to_owned);
+        let active_row_visible = active_path
+            .as_ref()
+            .is_some_and(|path| rows.iter().any(|row| row.full_path == *path));
+        let active_remote_paths = self
+            .server
+            .active_session()
+            .map(|session| self.active_session_visibility_paths(session))
+            .unwrap_or_default();
+        let payload = json!({
+            "source": source,
+            "active_session_path": active_path,
+            "active_view_mode": format!("{:?}", self.server.active_view_mode()),
+            "selected_path": self.browser.selected_path(),
+            "browser_expanded_paths": self.browser.expanded_paths(),
+            "effective_expanded_paths": effective_expanded.iter().cloned().collect::<Vec<_>>(),
+            "active_remote_paths": active_remote_paths,
+            "active_row_visible": active_row_visible,
+            "merged_row_count": rows.len(),
+            "merged_row_paths_head": rows.iter().take(32).map(|row| row.full_path.clone()).collect::<Vec<_>>(),
+            "remote_machine_count": self.server.remote_machines().len(),
+        });
+        self.record_ui_telemetry("restore_debug", payload.clone());
+        info!(source, payload=%payload, "restore debug");
+    }
+
+    fn record_preview_issue_telemetry(&self, source: &str) {
+        let payload = if let Some(session) = self.server.active_session() {
+            json!({
+                "source": source,
+                "active_session_path": session.session_path,
+                "active_view_mode": format!("{:?}", self.server.active_view_mode()),
+                "session_source": format!("{:?}", session.source),
+                "preview_blocks": session.preview.blocks.len(),
+                "preview_placeholder": remote_preview_needs_refresh(session),
+                "rendered_sections": session.rendered_sections.len(),
+                "active_title_len": resolved_session_title(self, session).map(|v| v.len()),
+                "active_precis_len": resolved_session_precis(self, session).map(|v| v.len()),
+                "active_summary_len": resolved_session_summary(self, session).map(|v| v.len()),
+                "preview_summary_len": preview_summary_text(session).len(),
+                "terminal_precis_len": terminal_precis(session).len(),
+                "last_tree_debug": self.last_tree_debug,
+            })
+        } else {
+            json!({
+                "source": source,
+                "active_session_path": Value::Null,
+                "active_view_mode": format!("{:?}", self.server.active_view_mode()),
+                "last_tree_debug": self.last_tree_debug,
+            })
+        };
+        self.record_ui_telemetry("preview_debug", payload.clone());
+        info!(source, payload=%payload, "preview debug");
     }
 
     fn record_ui_telemetry(&self, event: &str, payload: Value) {
@@ -3056,6 +3128,7 @@ fn restore_browser_tree(shell: &mut ShellState, browser_tree: SessionNode, selec
     shell.browser.ensure_expanded_paths(synthetic_expanded_paths);
     shell.browser.set_filter_query(filter_query);
     shell.ensure_active_session_visible();
+    shell.record_restore_issue_telemetry("restore_browser_tree");
     shell.sync_browser_settings();
 }
 
@@ -5868,15 +5941,19 @@ fn app() -> Element {
             return;
         }
         if server_busy {
+            state.with(|shell| shell.record_preview_issue_telemetry("preview_refresh_wait_busy"));
             return;
         }
         if !session.session_path.starts_with("remote-session://") {
+            state.with(|shell| shell.record_preview_issue_telemetry("preview_refresh_skip_non_remote"));
             last_preview_refresh_path.set(None);
             return;
         }
         if *last_preview_refresh_path.read() == Some(session.session_path.clone()) {
+            state.with(|shell| shell.record_preview_issue_telemetry("preview_refresh_skip_duplicate"));
             return;
         }
+        state.with(|shell| shell.record_preview_issue_telemetry("preview_refresh_request"));
         last_preview_refresh_path.set(Some(session.session_path.clone()));
         spawn_server_snapshot_action(
             state,
