@@ -2318,16 +2318,12 @@ fn spawn_initial_server_sync(state: Signal<ShellState>) {
         }));
         let _ = safe_shell_mut(state, "initial_server_sync_complete", |shell| match outcome {
             Ok(Ok((snapshot, runtime, detail))) => {
-                shell.server.apply_snapshot(snapshot);
+                let message = runtime
+                    .map(|runtime| format!("server ready · {}", runtime.host_kind))
+                    .unwrap_or_else(|| "server ready".to_string());
+                shell.apply_daemon_snapshot_result(Ok((snapshot, Some(message))));
                 shell.server_daemon_detail = detail;
-                shell.server_busy = false;
-                shell.needs_initial_server_sync = false;
                 shell.next_background_copy_scan_after_ms = current_millis() + 2_500;
-                if let Some(runtime) = runtime {
-                    shell.last_action = format!("server ready · {}", runtime.host_kind);
-                } else {
-                    shell.last_action = "server ready".to_string();
-                }
             }
             Ok(Err(error)) => {
                 shell.server_busy = false;
