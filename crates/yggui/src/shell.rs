@@ -7959,7 +7959,7 @@ fn SessionHeaderCopy(
             div {
                 style: "display:flex; align-items:flex-start; gap:8px; min-width:0; min-height:0;",
                 div {
-                    style: format!("font-size:12px; line-height:1.72; color:{}; white-space:pre-wrap; overflow-wrap:anywhere; min-width:0; flex:1; max-height:48vh; overflow:auto; padding-right:6px; scrollbar-gutter:stable;", palette.muted),
+                    style: format!("font-size:12px; line-height:1.72; color:{}; white-space:pre-wrap; overflow-wrap:anywhere; min-width:0; flex:1; max-height:60vh; overflow:auto; padding-right:6px; scrollbar-gutter:stable;", palette.muted),
                     "{subtitle}"
                 }
                 RefreshInlineButton {
@@ -9045,6 +9045,9 @@ fn TerminalCanvas(
         snapshot.settings.terminal_font_size,
     );
     let future_theme = theme.clone();
+    let is_remote_resume_session = session.session_path.starts_with("remote-session://");
+    let mut terminal_has_meaningful_output = use_signal(|| !is_remote_resume_session);
+    let mut resume_overlay_expired = use_signal(|| !is_remote_resume_session);
     info!(
         session=%session_path,
         host_id=%host_id,
@@ -9052,6 +9055,16 @@ fn TerminalCanvas(
         font_size=theme.font_size,
         "rendering terminal canvas"
     );
+    {
+        let mut resume_overlay_expired = resume_overlay_expired;
+        use_future(move || async move {
+            if !is_remote_resume_session {
+                return;
+            }
+            sleep(Duration::from_secs(6)).await;
+            resume_overlay_expired.set(true);
+        });
+    }
     {
         let host_id = host_id.clone();
         let theme = theme.clone();
@@ -9066,8 +9079,9 @@ fn TerminalCanvas(
         let title = terminal_title.clone();
         let theme = future_theme.clone();
         let mut state = state;
+        let mut terminal_has_meaningful_output = terminal_has_meaningful_output;
         async move {
-            if let Err(error) = terminal_ensure(&endpoint, &session_path) {
+            if let Err(error) = terminal_ensure_async(endpoint.clone(), session_path.clone()).await {
                 warn!(session=%session_path, error=%error, "failed to ensure terminal");
                 return;
             }
@@ -9102,18 +9116,21 @@ fn TerminalCanvas(
                     event = eval.recv::<TerminalJsEvent>() => {
                         match event {
                             Ok(TerminalJsEvent::Ready) => {
-                                if let Ok((next_cursor, chunks)) = terminal_read(&endpoint, &session_path, 0) {
+                                if let Ok((next_cursor, chunks)) = terminal_read_async(endpoint.clone(), session_path.clone(), 0).await {
                                     cursor = next_cursor;
                                     for chunk in chunks {
+                                        if terminal_chunk_has_meaningful_output(&chunk.data) {
+                                            terminal_has_meaningful_output.set(true);
+                                        }
                                         let _ = eval.send(TerminalJsCommand::Write { data: chunk.data });
                                     }
                                 }
                             }
                             Ok(TerminalJsEvent::Input { data }) => {
-                                let _ = terminal_write(&endpoint, &session_path, &data);
+                                let _ = terminal_write_async(endpoint.clone(), session_path.clone(), data).await;
                             }
                             Ok(TerminalJsEvent::Resize { cols, rows }) => {
-                                let _ = terminal_resize(&endpoint, &session_path, cols, rows);
+                                let _ = terminal_resize_async(endpoint.clone(), session_path.clone(), cols, rows).await;
                             }
                             Ok(TerminalJsEvent::Clipboard { action, chars }) => {
                                 let (title, message) = if action == "cut" {
@@ -9164,11 +9181,11 @@ fn TerminalCanvas(
                                     .and_then(|png_bytes| stage_terminal_clipboard_image(state, &session_path, &png_bytes))
                                 {
                                     Ok(path) => {
-                                        let _ = terminal_write(
-                                            &endpoint,
-                                            &session_path,
-                                            &format!("{path} "),
-                                        );
+                                        let _ = terminal_write_async(
+                                            endpoint.clone(),
+                                            session_path.clone(),
+                                            format!("{path} "),
+                                        ).await;
                                         safe_push_notification(
                                             state,
                                             NotificationTone::Success,
@@ -9178,7 +9195,11 @@ fn TerminalCanvas(
                                     }
                                     Err(error) => {
                                         let message = format!("Failed to paste image: {error}");
-                                        let _ = terminal_write(&endpoint, &session_path, &format!("{message}\r\n"));
+                                        let _ = terminal_write_async(
+                                            endpoint.clone(),
+                                            session_path.clone(),
+                                            format!("{message}\r\n"),
+                                        ).await;
                                         safe_push_notification(
                                             state,
                                             NotificationTone::Error,
@@ -9213,10 +9234,13 @@ fn TerminalCanvas(
                         }
                     }
                     _ = sleep(Duration::from_millis(60)) => {
-                        match terminal_read(&endpoint, &session_path, cursor) {
+                        match terminal_read_async(endpoint.clone(), session_path.clone(), cursor).await {
                             Ok((next_cursor, chunks)) => {
                                 cursor = next_cursor;
                                 for chunk in chunks {
+                                    if terminal_chunk_has_meaningful_output(&chunk.data) {
+                                        terminal_has_meaningful_output.set(true);
+                                    }
                                     let _ = eval.send(TerminalJsCommand::Write { data: chunk.data });
                                 }
                             }
@@ -9230,16 +9254,18 @@ fn TerminalCanvas(
             }
         }
     });
+    let show_resume_overlay =
+        is_remote_resume_session && !terminal_has_meaningful_output() && !resume_overlay_expired();
     rsx! {
         div {
             key: "{instance_key}",
             style: "display:flex; flex-direction:column; min-height:0; height:100%;",
-                    div {
-                        style: format!(
-                            "display:flex; flex-direction:column; min-height:0; height:100%; gap:0; border-radius:11px; \
-                             background:{}; overflow:hidden; padding-left:6px;",
-                            theme.background
-                        ),
+            div {
+                style: format!(
+                    "display:flex; flex-direction:column; min-height:0; height:100%; gap:0; border-radius:11px; \
+                     background:{}; overflow:hidden; padding-left:6px; position:relative;",
+                    theme.background
+                ),
                 div {
                     key: "{host_id}",
                     id: "{host_id}",
@@ -9248,9 +9274,139 @@ fn TerminalCanvas(
                         theme.background
                     )
                 }
+                if show_resume_overlay {
+                    div {
+                        style: "position:absolute; inset:0; z-index:2; display:flex; align-items:center; justify-content:center; pointer-events:none; background:linear-gradient(180deg, rgba(255,255,255,0.72) 0%, rgba(255,255,255,0.38) 100%); backdrop-filter:blur(1px);",
+                        div {
+                            style: "display:flex; flex-direction:column; align-items:center; gap:10px; padding:18px 20px; border-radius:18px; background:rgba(255,255,255,0.82); box-shadow:0 18px 44px rgba(148,163,184,0.18), inset 0 0 0 1px rgba(170,190,212,0.18); min-width:280px;",
+                            div {
+                                style: format!("font-size:14px; font-weight:700; color:{};", snapshot.palette.text),
+                                "Resuming remote Codex session…"
+                            }
+                            div {
+                                style: format!("font-size:12px; line-height:1.65; color:{}; text-align:center; max-width:360px;", snapshot.palette.muted),
+                                "Yggterm is attaching to {session.host_label} and waiting for the remote Codex TUI to paint. The terminal will appear here as soon as meaningful output arrives."
+                            }
+                            div {
+                                style: "display:flex; align-items:center; gap:6px;",
+                                for ix in 0..3 {
+                                    div {
+                                        key: "{ix}",
+                                        style: format!(
+                                            "width:8px; height:8px; border-radius:999px; background:{}; opacity:{}; animation:yggterm-tree-loading-dot 1.05s ease-in-out infinite; animation-delay:{}ms;",
+                                            snapshot.palette.accent,
+                                            0.92_f32 - (ix as f32 * 0.14),
+                                            ix * 140
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
+}
+
+fn terminal_chunk_has_meaningful_output(data: &str) -> bool {
+    let stripped = strip_terminal_control_sequences(data);
+    let printable = stripped
+        .chars()
+        .filter(|ch| !ch.is_control() && !ch.is_whitespace())
+        .count();
+    let newline_count = stripped
+        .chars()
+        .filter(|ch| *ch == '\n' || *ch == '\r')
+        .count();
+    printable >= 40 || newline_count >= 3
+}
+
+fn strip_terminal_control_sequences(data: &str) -> String {
+    let chars = data.chars().collect::<Vec<_>>();
+    let mut out = String::with_capacity(data.len());
+    let mut ix = 0usize;
+    while ix < chars.len() {
+        if chars[ix] == '\u{1b}' {
+            ix += 1;
+            if ix >= chars.len() {
+                break;
+            }
+            match chars[ix] {
+                '[' => {
+                    ix += 1;
+                    while ix < chars.len() {
+                        let ch = chars[ix];
+                        ix += 1;
+                        if ('@'..='~').contains(&ch) {
+                            break;
+                        }
+                    }
+                }
+                ']' => {
+                    ix += 1;
+                    while ix < chars.len() {
+                        let ch = chars[ix];
+                        ix += 1;
+                        if ch == '\u{7}' {
+                            break;
+                        }
+                        if ch == '\u{1b}' && ix < chars.len() && chars[ix] == '\\' {
+                            ix += 1;
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        out.push(chars[ix]);
+        ix += 1;
+    }
+    out
+}
+
+async fn terminal_ensure_async(
+    endpoint: ServerEndpoint,
+    session_path: String,
+) -> Result<Option<String>> {
+    task::spawn_blocking(move || terminal_ensure(&endpoint, &session_path))
+        .await
+        .map_err(|error| anyhow!("joining terminal ensure task: {error}"))?
+}
+
+async fn terminal_read_async(
+    endpoint: ServerEndpoint,
+    session_path: String,
+    cursor: u64,
+) -> Result<(u64, Vec<yggterm_server::TerminalStreamChunk>)> {
+    task::spawn_blocking(move || terminal_read(&endpoint, &session_path, cursor))
+        .await
+        .map_err(|error| anyhow!("joining terminal read task: {error}"))?
+}
+
+async fn terminal_write_async(
+    endpoint: ServerEndpoint,
+    session_path: String,
+    data: String,
+) -> Result<()> {
+    task::spawn_blocking(move || terminal_write(&endpoint, &session_path, &data))
+        .await
+        .map_err(|error| anyhow!("joining terminal write task: {error}"))?
+        .map(|_| ())
+}
+
+async fn terminal_resize_async(
+    endpoint: ServerEndpoint,
+    session_path: String,
+    cols: u16,
+    rows: u16,
+) -> Result<()> {
+    task::spawn_blocking(move || terminal_resize(&endpoint, &session_path, cols, rows))
+        .await
+        .map_err(|error| anyhow!("joining terminal resize task: {error}"))?
+        .map(|_| ())
 }
 
 #[derive(Debug, Clone)]
