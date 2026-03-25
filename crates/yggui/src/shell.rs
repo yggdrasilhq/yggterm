@@ -1056,6 +1056,11 @@ impl ShellState {
             .retain(|notification| notification.id != id);
     }
 
+    fn clear_job_notification(&mut self, job_key: &str) {
+        self.notifications
+            .retain(|notification| notification.job_key.as_deref() != Some(job_key));
+    }
+
     fn clear_notifications(&mut self) {
         self.notifications.clear();
     }
@@ -1485,6 +1490,9 @@ impl ShellState {
                     title: title.clone(),
                     message: message.clone(),
                     created_at_ms: now,
+                    job_key: None,
+                    progress: None,
+                    persistent: false,
                 });
                 self.next_notification_id += 1;
             }
@@ -1498,6 +1506,70 @@ impl ShellState {
         if self.notifications.len() > 1000 {
             let overflow = self.notifications.len() - 1000;
             self.notifications.drain(0..overflow);
+        }
+    }
+
+    fn upsert_job_notification(
+        &mut self,
+        job_key: impl Into<String>,
+        tone: NotificationTone,
+        title: impl Into<String>,
+        message: impl Into<String>,
+        progress: Option<f32>,
+        emit_system: bool,
+    ) {
+        let job_key = job_key.into();
+        let title = title.into();
+        let message = message.into();
+        let now = current_millis();
+        let mut created = false;
+        if self.settings.in_app_notifications {
+            if let Some(existing) = self
+                .notifications
+                .iter_mut()
+                .find(|notification| notification.job_key.as_deref() == Some(job_key.as_str()))
+            {
+                existing.tone = tone;
+                existing.title = title.clone();
+                existing.message = message.clone();
+                existing.progress = progress.map(|value| value.clamp(0.0, 1.0));
+                existing.persistent = true;
+                existing.created_at_ms = now;
+            } else {
+                self.notifications.push(ToastNotification {
+                    id: self.next_notification_id,
+                    tone,
+                    title: title.clone(),
+                    message: message.clone(),
+                    created_at_ms: now,
+                    job_key: Some(job_key.clone()),
+                    progress: progress.map(|value| value.clamp(0.0, 1.0)),
+                    persistent: true,
+                });
+                self.next_notification_id += 1;
+                created = true;
+            }
+        }
+        if emit_system && created && self.settings.system_notifications {
+            emit_system_notification(&title, &message);
+        }
+        if self.notifications.len() > 1000 {
+            let overflow = self.notifications.len() - 1000;
+            self.notifications.drain(0..overflow);
+        }
+    }
+
+    fn finish_job_notification(
+        &mut self,
+        job_key: &str,
+        tone: NotificationTone,
+        title: impl Into<String>,
+        message: impl Into<String>,
+        emit_completion: bool,
+    ) {
+        self.clear_job_notification(job_key);
+        if emit_completion {
+            self.push_notification(tone, title, message);
         }
     }
 }
@@ -1520,6 +1592,41 @@ fn safe_push_notification(
             message=%message,
             panic_payload=?error,
             "suppressed notification panic"
+        );
+    }
+}
+
+fn safe_upsert_job_notification(
+    state: Signal<ShellState>,
+    job_key: impl Into<String>,
+    tone: NotificationTone,
+    title: impl Into<String>,
+    message: impl Into<String>,
+    progress: Option<f32>,
+    emit_system: bool,
+) {
+    let job_key = job_key.into();
+    let title = title.into();
+    let message = message.into();
+    let title_for_write = title.clone();
+    let message_for_write = message.clone();
+    let job_key_for_write = job_key.clone();
+    if let Err(error) = safe_shell_mut(state, "upsert_job_notification", move |shell| {
+        shell.upsert_job_notification(
+            job_key_for_write,
+            tone,
+            title_for_write,
+            message_for_write,
+            progress,
+            emit_system,
+        );
+    }) {
+        warn!(
+            job_key=%job_key,
+            title=%title,
+            message=%message,
+            panic_payload=?error,
+            "suppressed job notification panic"
         );
     }
 }
@@ -1584,6 +1691,7 @@ fn spawn_title_generation_for_target(
     priority: bool,
 ) {
     let session_path = target.session_path.clone();
+    let session_title = target.title.clone();
     let settings = state.read().settings.clone();
     let should_start = state.with_mut(|shell| {
         if shell.title_requests_in_flight.contains(&session_path)
@@ -1600,6 +1708,26 @@ fn spawn_title_generation_for_target(
     if !should_start {
         return;
     }
+    let job_key = format!("copy:title:{session_path}");
+    let job_title = if announce || priority {
+        "Generating Title"
+    } else {
+        "Background Cache"
+    };
+    let job_message = if announce || priority {
+        format!("Generating a better title for {session_title}.")
+    } else {
+        format!("Caching a title for {session_title}.")
+    };
+    safe_upsert_job_notification(
+        state,
+        job_key.clone(),
+        NotificationTone::Info,
+        job_title,
+        job_message,
+        None,
+        announce,
+    );
     if announce {
         state.with_mut(|shell| {
             shell.last_action = if force {
@@ -1657,6 +1785,7 @@ fn spawn_title_generation_for_target(
             "announce": announce,
             "ok": outcome.as_ref().is_ok_and(|result| result.is_ok()),
         }));
+        let emit_completion = announce;
         state.with_mut(|shell| match outcome {
             Ok(Ok((Some(title), browser_tree))) => {
                 shell.title_requests_in_flight.remove(&session_path);
@@ -1675,13 +1804,13 @@ fn spawn_title_generation_for_target(
                 } else {
                     "generated title".to_string()
                 };
-                if announce {
-                    shell.push_notification(
-                        NotificationTone::Success,
-                        "Title Regenerated",
-                        format!("Session is now titled “{title}”."),
-                    );
-                }
+                shell.finish_job_notification(
+                    &job_key,
+                    NotificationTone::Success,
+                    "Title Regenerated",
+                    format!("Session is now titled “{title}”."),
+                    emit_completion,
+                );
             }
             Ok(Ok((None, _))) => {
                 shell.title_requests_in_flight.remove(&session_path);
@@ -1697,13 +1826,13 @@ fn spawn_title_generation_for_target(
                     current_millis() + BACKGROUND_COPY_RETRY_MS,
                 );
                 warn!(session_path=%target.session_path, "title generation produced no usable title");
-                if announce {
-                    shell.push_notification(
-                        NotificationTone::Warning,
-                        "No Title Generated",
-                        "The model did not return a usable short title for this session.",
-                    );
-                }
+                shell.finish_job_notification(
+                    &job_key,
+                    NotificationTone::Warning,
+                    "No Title Generated",
+                    "The model did not return a usable short title for this session.",
+                    true,
+                );
             }
             Ok(Err(error)) => {
                 shell.title_requests_in_flight.remove(&session_path);
@@ -1720,13 +1849,13 @@ fn spawn_title_generation_for_target(
                 );
                 shell.last_action = format!("title generation failed: {error}");
                 warn!(session_path=%target.session_path, error=%error, "title generation failed");
-                if announce {
-                    shell.push_notification(
-                        NotificationTone::Error,
-                        "Title Generation Failed",
-                        error.to_string(),
-                    );
-                }
+                shell.finish_job_notification(
+                    &job_key,
+                    NotificationTone::Error,
+                    "Title Generation Failed",
+                    error.to_string(),
+                    true,
+                );
             }
             Err(error) => {
                 shell.title_requests_in_flight.remove(&session_path);
@@ -1743,13 +1872,13 @@ fn spawn_title_generation_for_target(
                 );
                 shell.last_action = format!("title generation task failed: {error}");
                 warn!(session_path=%target.session_path, error=%error, "title generation task join failed");
-                if announce {
-                    shell.push_notification(
-                        NotificationTone::Error,
-                        "Title Task Failed",
-                        error.to_string(),
-                    );
-                }
+                shell.finish_job_notification(
+                    &job_key,
+                    NotificationTone::Error,
+                    "Title Task Failed",
+                    error.to_string(),
+                    true,
+                );
             }
         });
         maybe_spawn_background_copy_generation(state);
@@ -1771,6 +1900,7 @@ fn spawn_precis_generation_for_target(
     priority: bool,
 ) {
     let session_path = target.session_path.clone();
+    let session_title = target.title.clone();
     let settings = state.read().settings.clone();
     let should_start = state.with_mut(|shell| {
         if (!force && shell.generated_precis.contains_key(&session_path))
@@ -1791,6 +1921,24 @@ fn spawn_precis_generation_for_target(
     if !should_start {
         return;
     }
+    let job_key = format!("copy:precis:{session_path}");
+    safe_upsert_job_notification(
+        state,
+        job_key.clone(),
+        NotificationTone::Info,
+        if announce || priority {
+            "Generating Precis"
+        } else {
+            "Background Cache"
+        },
+        if announce || priority {
+            format!("Generating a short precis for {session_title}.")
+        } else {
+            format!("Caching a precis for {session_title}.")
+        },
+        None,
+        announce,
+    );
     let perf_home = perf_home_dir(&state.read().bootstrap.settings_path);
     spawn(async move {
         let perf = PerfSpan::start(&perf_home, "copy_generation", "precis");
@@ -1849,13 +1997,13 @@ fn spawn_precis_generation_for_target(
                     shell
                         .copy_retry_after_ms
                         .remove(&background_copy_retry_key("precis", &session_path));
-                    if announce {
-                        shell.push_notification(
-                            NotificationTone::Success,
-                            "Precis Regenerated",
-                            "Updated the terminal header precis from recent session context.",
-                        );
-                    }
+                    shell.finish_job_notification(
+                        &job_key,
+                        NotificationTone::Success,
+                        "Precis Regenerated",
+                        "Updated the terminal header precis from recent session context.",
+                        announce,
+                    );
                 }
                 Ok(Ok(None)) => {
                     if !announce && !force {
@@ -1868,6 +2016,13 @@ fn spawn_precis_generation_for_target(
                     shell.copy_retry_after_ms.insert(
                         background_copy_retry_key("precis", &session_path),
                         current_millis() + BACKGROUND_COPY_RETRY_MS,
+                    );
+                    shell.finish_job_notification(
+                        &job_key,
+                        NotificationTone::Warning,
+                        "No Precis Generated",
+                        "The model did not return a usable precis.",
+                        true,
                     );
                 }
                 Ok(Err(error)) => {
@@ -1883,13 +2038,13 @@ fn spawn_precis_generation_for_target(
                         current_millis() + BACKGROUND_COPY_RETRY_MS,
                     );
                     shell.last_action = format!("precis generation failed: {error}");
-                    if announce {
-                        shell.push_notification(
-                            NotificationTone::Error,
-                            "Precis Generation Failed",
-                            error.to_string(),
-                        );
-                    }
+                    shell.finish_job_notification(
+                        &job_key,
+                        NotificationTone::Error,
+                        "Precis Generation Failed",
+                        error.to_string(),
+                        true,
+                    );
                 }
                 Err(error) => {
                     if !announce && !force {
@@ -1904,13 +2059,13 @@ fn spawn_precis_generation_for_target(
                         current_millis() + BACKGROUND_COPY_RETRY_MS,
                     );
                     shell.last_action = format!("precis task failed: {error}");
-                    if announce {
-                        shell.push_notification(
-                            NotificationTone::Error,
-                            "Precis Task Failed",
-                            error.to_string(),
-                        );
-                    }
+                    shell.finish_job_notification(
+                        &job_key,
+                        NotificationTone::Error,
+                        "Precis Task Failed",
+                        error.to_string(),
+                        true,
+                    );
                 }
             }
         });
@@ -1933,6 +2088,7 @@ fn spawn_summary_generation_for_target(
     priority: bool,
 ) {
     let session_path = target.session_path.clone();
+    let session_title = target.title.clone();
     let settings = state.read().settings.clone();
     let should_start = state.with_mut(|shell| {
         if (!force && shell.generated_summaries.contains_key(&session_path))
@@ -1953,6 +2109,24 @@ fn spawn_summary_generation_for_target(
     if !should_start {
         return;
     }
+    let job_key = format!("copy:summary:{session_path}");
+    safe_upsert_job_notification(
+        state,
+        job_key.clone(),
+        NotificationTone::Info,
+        if announce || priority {
+            "Generating Summary"
+        } else {
+            "Background Cache"
+        },
+        if announce || priority {
+            format!("Generating a summary for {session_title}.")
+        } else {
+            format!("Caching a summary for {session_title}.")
+        },
+        None,
+        announce,
+    );
     let perf_home = perf_home_dir(&state.read().bootstrap.settings_path);
     spawn(async move {
         let perf = PerfSpan::start(&perf_home, "copy_generation", "summary");
@@ -2011,13 +2185,13 @@ fn spawn_summary_generation_for_target(
                     shell
                         .copy_retry_after_ms
                         .remove(&background_copy_retry_key("summary", &session_path));
-                    if announce {
-                        shell.push_notification(
-                            NotificationTone::Success,
-                            "Summary Regenerated",
-                            "Updated the preview summary from recent session context.",
-                        );
-                    }
+                    shell.finish_job_notification(
+                        &job_key,
+                        NotificationTone::Success,
+                        "Summary Regenerated",
+                        "Updated the preview summary from recent session context.",
+                        announce,
+                    );
                 }
                 Ok(Ok(None)) => {
                     if !announce && !force {
@@ -2030,6 +2204,13 @@ fn spawn_summary_generation_for_target(
                     shell.copy_retry_after_ms.insert(
                         background_copy_retry_key("summary", &session_path),
                         current_millis() + BACKGROUND_COPY_RETRY_MS,
+                    );
+                    shell.finish_job_notification(
+                        &job_key,
+                        NotificationTone::Warning,
+                        "No Summary Generated",
+                        "The model did not return a usable summary.",
+                        true,
                     );
                 }
                 Ok(Err(error)) => {
@@ -2045,13 +2226,13 @@ fn spawn_summary_generation_for_target(
                         current_millis() + BACKGROUND_COPY_RETRY_MS,
                     );
                     shell.last_action = format!("summary generation failed: {error}");
-                    if announce {
-                        shell.push_notification(
-                            NotificationTone::Error,
-                            "Summary Generation Failed",
-                            error.to_string(),
-                        );
-                    }
+                    shell.finish_job_notification(
+                        &job_key,
+                        NotificationTone::Error,
+                        "Summary Generation Failed",
+                        error.to_string(),
+                        true,
+                    );
                 }
                 Err(error) => {
                     if !announce && !force {
@@ -2066,13 +2247,13 @@ fn spawn_summary_generation_for_target(
                         current_millis() + BACKGROUND_COPY_RETRY_MS,
                     );
                     shell.last_action = format!("summary task failed: {error}");
-                    if announce {
-                        shell.push_notification(
-                            NotificationTone::Error,
-                            "Summary Task Failed",
-                            error.to_string(),
-                        );
-                    }
+                    shell.finish_job_notification(
+                        &job_key,
+                        NotificationTone::Error,
+                        "Summary Task Failed",
+                        error.to_string(),
+                        true,
+                    );
                 }
             }
         });
@@ -2785,7 +2966,8 @@ fn copy_generation_target_for_browser_row(
                 .clone()
                 .unwrap_or_else(|| remote.cwd.clone()),
             title: row.label.clone(),
-            remote_context: Some(remote.recent_context.clone()),
+            remote_context: (!remote.recent_context.trim().is_empty())
+                .then(|| remote.recent_context.clone()),
             remote_machine: Some(machine),
         });
     }
@@ -2913,7 +3095,8 @@ fn next_background_copy_job(
                 session_id: session.session_id.clone(),
                 cwd: session.cwd.clone(),
                 title: session.title_hint.clone(),
-                remote_context: Some(session.recent_context.clone()),
+                remote_context: (!session.recent_context.trim().is_empty())
+                    .then(|| session.recent_context.clone()),
                 remote_machine: Some(machine.clone()),
             });
         }
@@ -2975,6 +3158,15 @@ fn maybe_spawn_background_copy_generation(mut state: Signal<ShellState>) {
         return;
     };
     state.with_mut(|shell| shell.background_copy_scan_in_flight = true);
+    safe_upsert_job_notification(
+        state,
+        "background:copy_scan",
+        NotificationTone::Info,
+        "Background Cache",
+        "Scanning sessions for missing titles, precis, and summaries.",
+        None,
+        false,
+    );
     spawn(async move {
         let perf = PerfSpan::start(&perf_home, "background", "copy_scan");
         let outcome = task::spawn_blocking(move || {
@@ -2997,6 +3189,7 @@ fn maybe_spawn_background_copy_generation(mut state: Signal<ShellState>) {
         }));
         state.with_mut(|shell| {
             shell.background_copy_scan_in_flight = false;
+            shell.clear_job_notification("background:copy_scan");
             shell.next_background_copy_scan_after_ms = if job.is_some() {
                 current_millis() + BACKGROUND_COPY_CONTINUE_MS
             } else {
@@ -3024,7 +3217,9 @@ fn remote_scanned_session_context(server: &YggtermServer, session_path: &str) ->
             .sessions
             .iter()
             .find(|session| session.session_path == session_path)
-            .map(|session| session.recent_context.clone())
+            .and_then(|session| {
+                (!session.recent_context.trim().is_empty()).then(|| session.recent_context.clone())
+            })
     })
 }
 
@@ -3275,10 +3470,6 @@ fn stage_terminal_clipboard_image(
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     stage_local_clipboard_png(&home, png_bytes)
-}
-
-fn terminal_bracketed_paste(text: &str) -> String {
-    format!("\u{1b}[200~{text}\u{1b}[201~")
 }
 
 fn merged_sidebar_rows(
@@ -8336,7 +8527,7 @@ fn TerminalCanvas(
                                         let _ = terminal_write(
                                             &endpoint,
                                             &session_path,
-                                            &terminal_bracketed_paste(&path),
+                                            &format!("{path} "),
                                         );
                                         safe_push_notification(
                                             state,
