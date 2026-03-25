@@ -101,7 +101,20 @@ fn main() -> Result<()> {
     let settings = store.load_settings().unwrap_or_default();
     settings_span.finish(serde_json::json!({}));
     let tree = placeholder_session_tree(store.sessions_root().to_path_buf(), settings.theme);
-    let browser_tree = placeholder_session_tree(store.home_dir().to_path_buf(), settings.theme);
+    let browser_tree_span = PerfSpan::start(&startup_home, "startup", "load_browser_tree");
+    let (browser_tree, browser_tree_loaded) = match store.load_codex_tree(&settings) {
+        Ok(tree) => (tree, true),
+        Err(error) => {
+            tracing::warn!(error=%error, "failed to load browser tree for warm start");
+            (
+                placeholder_session_tree(store.home_dir().to_path_buf(), settings.theme),
+                false,
+            )
+        }
+    };
+    browser_tree_span.finish(serde_json::json!({
+        "loaded": browser_tree_loaded,
+    }));
     let settings_path = store.settings_path();
     let theme = settings.theme;
     let prefer_ghostty_backend = settings.prefer_ghostty_backend;
@@ -113,20 +126,33 @@ fn main() -> Result<()> {
     let host_span = PerfSpan::start(&startup_home, "startup", "detect_terminal_host");
     let host = detect_ghostty_host();
     host_span.finish(serde_json::json!({ "detail": host.detail }));
+    let initial_server_sync_span = PerfSpan::start(&startup_home, "startup", "warm_server_sync");
+    let (initial_server_snapshot, server_daemon_detail) =
+        match yggui::initial_server_sync(endpoint.clone()) {
+            Ok((snapshot, _runtime, detail)) => (Some(snapshot), detail),
+            Err(error) => {
+                tracing::warn!(error=%error, "failed to warm server snapshot before launch");
+                (None, format!("server unavailable: {error}"))
+            }
+        };
+    initial_server_sync_span.finish(serde_json::json!({
+        "loaded": initial_server_snapshot.is_some(),
+    }));
 
     let launch_result = yggui::launch_shell(yggui::ShellBootstrap {
         tree,
         browser_tree,
+        browser_tree_loaded,
         settings,
         install_context: launch_install_context,
         settings_path,
         server_endpoint: endpoint.clone(),
-        initial_server_snapshot: None,
+        initial_server_snapshot,
         theme,
         ghostty_bridge_enabled: host.bridge_enabled,
         ghostty_embedded_surface_supported: host.embedded_surface_supported,
         ghostty_bridge_detail: host.detail.clone(),
-        server_daemon_detail: "starting server…".to_string(),
+        server_daemon_detail,
         prefer_ghostty_backend,
         pending_update_restart,
     });
