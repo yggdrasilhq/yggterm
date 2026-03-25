@@ -3612,6 +3612,25 @@ fn resolved_session_summary(shell: &ShellState, session: &ManagedSessionView) ->
         .or_else(|| remote_generated_copy(&shell.server, &session.session_path).and_then(|(_, _, summary)| summary))
 }
 
+fn looks_like_truncated_summary(summary: &str) -> bool {
+    let trimmed = summary.trim();
+    trimmed.len() < 120 || !matches!(trimmed.chars().last(), Some('.' | '!' | '?'))
+}
+
+fn preview_header_summary(snapshot: &RenderSnapshot, session: &ManagedSessionView) -> String {
+    let fallback = preview_summary_text(session);
+    match snapshot.active_summary.clone() {
+        Some(summary) if summary.trim().is_empty() => fallback,
+        Some(summary)
+            if looks_like_truncated_summary(&summary) && fallback.len() > summary.len() + 24 =>
+        {
+            fallback
+        }
+        Some(summary) => summary,
+        None => fallback,
+    }
+}
+
 fn remote_machine_for_session_path(
     server: &YggtermServer,
     session_path: &str,
@@ -6222,11 +6241,9 @@ fn app() -> Element {
             return;
         }
         if server_busy {
-            state.with_mut(|shell| shell.record_preview_issue_telemetry("preview_refresh_wait_busy"));
             return;
         }
         if !session.session_path.starts_with("remote-session://") {
-            state.with_mut(|shell| shell.record_preview_issue_telemetry("preview_refresh_skip_non_remote"));
             last_preview_refresh_path.set(None);
             return;
         }
@@ -7849,10 +7866,7 @@ fn MainSurface(
                                             .active_title
                                             .clone()
                                             .unwrap_or_else(|| session.title.clone()),
-                                        subtitle: snapshot
-                                            .active_summary
-                                            .clone()
-                                            .unwrap_or_else(|| preview_summary_text(&session)),
+                                        subtitle: preview_header_summary(&snapshot, &session),
                                         allow_subtitle_scroll: false,
                                         palette: snapshot.palette,
                                         on_refresh_title: move |_| on_refresh_title.call(()),
@@ -9111,7 +9125,7 @@ fn TerminalCanvas(
             if !is_remote_resume_session {
                 return;
             }
-            sleep(Duration::from_secs(6)).await;
+            sleep(Duration::from_secs(10)).await;
             resume_overlay_expired.set(true);
         });
     }
@@ -9368,6 +9382,25 @@ fn TerminalCanvas(
 
 fn terminal_chunk_has_meaningful_output(data: &str) -> bool {
     let stripped = strip_terminal_control_sequences(data);
+    let normalized_lines = stripped
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if normalized_lines.is_empty() {
+        return false;
+    }
+    let prompt_like = normalized_lines.len() <= 2
+        && normalized_lines.iter().all(|line| line.len() <= 48)
+        && normalized_lines.iter().any(|line| {
+            line.ends_with('$')
+                || line.ends_with('#')
+                || line.ends_with('>')
+                || line.ends_with("%")
+        });
+    if prompt_like {
+        return false;
+    }
     let printable = stripped
         .chars()
         .filter(|ch| !ch.is_control() && !ch.is_whitespace())
@@ -9376,7 +9409,7 @@ fn terminal_chunk_has_meaningful_output(data: &str) -> bool {
         .chars()
         .filter(|ch| *ch == '\n' || *ch == '\r')
         .count();
-    printable >= 40 || newline_count >= 3
+    printable >= 80 || newline_count >= 6 || normalized_lines.len() >= 4
 }
 
 fn strip_terminal_control_sequences(data: &str) -> String {
