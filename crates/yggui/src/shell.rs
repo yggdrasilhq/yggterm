@@ -749,23 +749,43 @@ impl ShellState {
         let Some(active) = self.server.active_session().cloned() else {
             return;
         };
-        match active.source {
-            yggterm_server::SessionSource::Stored => {
-                self.browser.ensure_visible_path(&active.session_path);
-            }
-            yggterm_server::SessionSource::LiveSsh => {
-                if let Some((machine_key, _)) = parse_remote_scanned_session_path(&active.session_path) {
-                    let mut paths = vec![format!("__remote_machine__/{machine_key}")];
-                    let cwd = metadata_value(&active, "Cwd");
-                    let mut current = String::new();
-                    for segment in cwd.split('/').filter(|segment| !segment.is_empty()) {
-                        current.push('/');
-                        current.push_str(segment);
-                        paths.push(format!("__remote_folder__/{machine_key}{current}"));
-                    }
-                    self.browser.ensure_expanded_paths(paths);
+        if let Some((machine_key, _)) = parse_remote_scanned_session_path(&active.session_path) {
+            let mut paths = vec![format!("__remote_machine__/{machine_key}")];
+            let cwd = metadata_value(&active, "Cwd");
+            if let Some(machine) = self
+                .server
+                .remote_machines()
+                .iter()
+                .find(|machine| machine.machine_key == machine_key)
+            {
+                paths.extend(
+                    compressed_remote_folder_paths(
+                        &SidebarRemoteMachine {
+                            key: machine.machine_key.clone(),
+                            label: machine.label.clone(),
+                            health: match machine.health {
+                                RemoteMachineHealth::Healthy => MachineHealth::Healthy,
+                                RemoteMachineHealth::Cached => MachineHealth::Cached,
+                                RemoteMachineHealth::Offline => MachineHealth::Offline,
+                            },
+                            scanned_sessions: machine.sessions.clone(),
+                        },
+                        &cwd,
+                    )
+                    .into_iter()
+                    .map(|path| format!("__remote_folder__/{machine_key}{path}")),
+                );
+            } else {
+                let mut current = String::new();
+                for segment in cwd.split('/').filter(|segment| !segment.is_empty()) {
+                    current.push('/');
+                    current.push_str(segment);
+                    paths.push(format!("__remote_folder__/{machine_key}{current}"));
                 }
             }
+            self.browser.ensure_expanded_paths(paths);
+        } else {
+            self.browser.ensure_visible_path(&active.session_path);
         }
         self.sync_browser_settings();
     }
@@ -3032,7 +3052,6 @@ fn restore_browser_tree(shell: &mut ShellState, browser_tree: SessionNode, selec
 
 fn remote_preview_needs_refresh(session: &ManagedSessionView) -> bool {
     session.session_path.starts_with("remote-session://")
-        && session.source == yggterm_server::SessionSource::LiveSsh
         && (session.preview.blocks.is_empty()
             || session
                 .preview
@@ -3766,6 +3785,38 @@ fn populate_remote_folder_descendant_counts(node: &mut RemoteFolderNode) -> usiz
     }
     node.descendant_sessions = count;
     count
+}
+
+fn compressed_remote_folder_paths(machine: &SidebarRemoteMachine, cwd: &str) -> Vec<String> {
+    let tree = build_remote_folder_tree(&machine.scanned_sessions);
+    let mut paths = Vec::new();
+    for child in tree.children.values() {
+        if collect_compressed_remote_folder_paths(child, cwd, &mut paths) {
+            break;
+        }
+    }
+    paths
+}
+
+fn collect_compressed_remote_folder_paths(
+    node: &RemoteFolderNode,
+    cwd: &str,
+    paths: &mut Vec<String>,
+) -> bool {
+    if cwd != node.full_path
+        && !cwd
+            .strip_prefix(node.full_path.as_str())
+            .is_some_and(|suffix| suffix.starts_with('/'))
+    {
+        return false;
+    }
+    paths.push(node.full_path.clone());
+    for child in node.children.values() {
+        if collect_compressed_remote_folder_paths(child, cwd, paths) {
+            return true;
+        }
+    }
+    true
 }
 
 fn append_remote_folder_rows(
@@ -5803,10 +5854,14 @@ fn app() -> Element {
             last_preview_refresh_path.set(None);
             return;
         };
-        if view_mode != WorkspaceViewMode::Rendered || server_busy {
+        if view_mode != WorkspaceViewMode::Rendered {
+            last_preview_refresh_path.set(None);
             return;
         }
-        if !remote_preview_needs_refresh(&session) {
+        if server_busy {
+            return;
+        }
+        if !session.session_path.starts_with("remote-session://") {
             last_preview_refresh_path.set(None);
             return;
         }
@@ -5816,7 +5871,11 @@ fn app() -> Element {
         last_preview_refresh_path.set(Some(session.session_path.clone()));
         spawn_server_snapshot_action(
             state,
-            "refreshing preview".to_string(),
+            if remote_preview_needs_refresh(&session) {
+                "refreshing preview".to_string()
+            } else {
+                "syncing preview".to_string()
+            },
             move |endpoint| daemon_set_view_mode(&endpoint, WorkspaceViewMode::Rendered),
         );
     });
@@ -7481,7 +7540,7 @@ fn SessionHeaderCopy(
 ) -> Element {
     rsx! {
         div {
-            style: "display:flex; flex-direction:column; gap:10px; min-width:280px; flex:1;",
+            style: "display:flex; flex-direction:column; gap:10px; min-width:280px; flex:1; min-height:0;",
             div {
                 style: "display:flex; align-items:flex-start; justify-content:space-between; gap:12px;",
                 div {
@@ -7501,9 +7560,9 @@ fn SessionHeaderCopy(
                 }
             }
             div {
-                style: "display:flex; align-items:flex-start; gap:8px; min-width:0;",
+                style: "display:flex; align-items:flex-start; gap:8px; min-width:0; min-height:0;",
                 div {
-                    style: format!("font-size:12px; line-height:1.65; color:{}; white-space:pre-wrap; overflow-wrap:anywhere; min-width:0; flex:1; max-height:84px; overflow:auto; padding-right:4px;", palette.muted),
+                    style: format!("font-size:12px; line-height:1.65; color:{}; white-space:pre-wrap; overflow-wrap:anywhere; min-width:0; flex:1; max-height:132px; overflow:auto; padding-right:6px;", palette.muted),
                     "{subtitle}"
                 }
                 RefreshInlineButton {
@@ -12058,6 +12117,35 @@ mod tests {
                 && row.label == "data/smbfs"
         }));
         assert!(!rows.iter().any(|row| row.full_path == "__remote_folder__/jojo/home"));
+    }
+
+    #[test]
+    fn compressed_remote_folder_paths_follow_rendered_chain() {
+        let machine = SidebarRemoteMachine {
+            key: "jojo".to_string(),
+            label: "jojo".to_string(),
+            health: MachineHealth::Healthy,
+            scanned_sessions: vec![RemoteScannedSession {
+                session_path: "remote-session://jojo/1".to_string(),
+                session_id: "1".to_string(),
+                cwd: "/run/smb4k/data/smbfs/dada/obsidian/codex".to_string(),
+                started_at: "2026-03-24T10:00:00Z".to_string(),
+                modified_epoch: 1,
+                event_count: 1,
+                user_message_count: 1,
+                assistant_message_count: 1,
+                title_hint: "1".to_string(),
+                recent_context: "USER: one".to_string(),
+                cached_precis: None,
+                cached_summary: None,
+                storage_path: "a".to_string(),
+            }],
+        };
+
+        assert_eq!(
+            compressed_remote_folder_paths(&machine, "/run/smb4k/data/smbfs/dada/obsidian/codex"),
+            vec!["/run/smb4k/data/smbfs/dada/obsidian/codex".to_string()]
+        );
     }
 }
 

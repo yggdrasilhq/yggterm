@@ -382,6 +382,10 @@ impl YggtermServer {
         let Some(path) = self.active_session_path.clone() else {
             return Ok(());
         };
+        if let Some((machine_key, session_id)) = parse_remote_scanned_session_path(&path) {
+            self.refresh_remote_scanned_session_preview(machine_key, session_id)?;
+            return Ok(());
+        }
         let Some(session) = self.sessions.get(&path).cloned() else {
             return Ok(());
         };
