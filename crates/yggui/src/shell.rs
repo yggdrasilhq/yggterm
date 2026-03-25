@@ -82,8 +82,8 @@ const XTERM_FIT_JS: &str = include_str!("../../../assets/xterm/addon-fit.js");
 static XTERM_ASSETS_BOOTSTRAPPED: OnceCell<()> = OnceCell::new();
 const TREE_LOADING_DOT_CSS: &str = "@keyframes yggterm-tree-loading-dot { 0%, 80%, 100% { opacity: 0.28; transform: translateY(0px); } 40% { opacity: 1; transform: translateY(-1px); } }";
 const BACKGROUND_COPY_RETRY_MS: u64 = 300_000;
-const BACKGROUND_COPY_CONTINUE_MS: u64 = 350;
-const BACKGROUND_COPY_IDLE_MS: u64 = 1_500;
+const BACKGROUND_COPY_CONTINUE_MS: u64 = 15_000;
+const BACKGROUND_COPY_IDLE_MS: u64 = 120_000;
 const THEME_EDITOR_PAD_SIZE: f64 = 286.0;
 type WorkspaceReorderPlanItem = TreeReorderPlanItem<BrowserRowKind>;
 
@@ -2821,27 +2821,6 @@ fn restore_browser_tree(shell: &mut ShellState, browser_tree: SessionNode, selec
     shell.sync_browser_settings();
 }
 
-fn collect_local_copy_targets(node: &SessionNode, targets: &mut Vec<CopyGenerationTarget>) {
-    if node.kind == yggterm_core::SessionNodeKind::CodexSession {
-        if let Some(session_id) = node.session_id.clone() {
-            targets.push(CopyGenerationTarget {
-                session_path: node.path.to_string_lossy().to_string(),
-                session_id,
-                cwd: node.cwd.clone().unwrap_or_default(),
-                title: node
-                    .title
-                    .clone()
-                    .unwrap_or_else(|| node.name.clone()),
-                remote_context: None,
-                remote_machine: None,
-            });
-        }
-    }
-    for child in &node.children {
-        collect_local_copy_targets(child, targets);
-    }
-}
-
 fn background_copy_job_for_target(
     store: &SessionStore,
     target: &CopyGenerationTarget,
@@ -2920,14 +2899,13 @@ fn background_copy_job_for_target(
 
 fn next_background_copy_job(
     _settings: &AppSettings,
-    local_root: &SessionNode,
+    _local_root: &SessionNode,
     remote_machines: &[RemoteMachineSnapshot],
     active_target: Option<CopyGenerationTarget>,
     copy_retry_after_ms: &HashMap<String, u64>,
 ) -> Option<BackgroundCopyJob> {
     let store = SessionStore::open_or_init().ok()?;
     let mut targets = Vec::new();
-    collect_local_copy_targets(local_root, &mut targets);
     for machine in remote_machines {
         for session in &machine.sessions {
             targets.push(CopyGenerationTarget {
@@ -2972,6 +2950,7 @@ fn maybe_spawn_background_copy_generation(mut state: Signal<ShellState>) {
             || shell.needs_initial_server_sync
             || PASSIVE_COPY_SUSPENDED.load(Ordering::Relaxed)
             || shell.passive_copy_suspended
+            || shell.server.active_view_mode() == WorkspaceViewMode::Terminal
             || !shell.title_requests_in_flight.is_empty()
             || !shell.precis_requests_in_flight.is_empty()
             || !shell.summary_requests_in_flight.is_empty()
