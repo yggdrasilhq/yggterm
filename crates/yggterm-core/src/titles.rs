@@ -646,11 +646,11 @@ fn request_litellm_summary(settings: &AppSettings, context: &str) -> Result<Stri
     let body = serde_json::json!({
         "model": settings.interface_llm_model,
         "temperature": 0.2,
-        "max_tokens": 128,
+        "max_tokens": 220,
         "messages": [
             {
                 "role": "system",
-                "content": "Generate a compact session summary for a desktop preview header. Return only 2 or 3 short sentences, no markdown, no bullets, no quotes. Focus on the current objective, active work, and likely next step."
+                "content": "Generate a concise but complete desktop session summary. Return a single short paragraph of 3 to 5 sentences, no markdown, no bullets, no quotes. Cover the current objective, the concrete work already done, and the likely next step."
             },
             {
                 "role": "user",
@@ -753,7 +753,7 @@ fn sanitize_generated_summary(raw: &str) -> Option<String> {
     if sanitized.is_empty() {
         return None;
     }
-    Some(sanitized.chars().take(280).collect::<String>())
+    Some(sanitized.chars().take(560).collect::<String>())
 }
 
 #[cfg(test)]
@@ -1018,7 +1018,10 @@ fn heuristic_precis_from_context(context: &str) -> Option<String> {
 }
 
 fn heuristic_summary_from_context(context: &str) -> Option<String> {
-    let lines = heuristic_copy_lines(context);
+    let lines = heuristic_copy_lines(context)
+        .into_iter()
+        .take(4)
+        .collect::<Vec<_>>();
     if lines.is_empty() {
         return None;
     }
