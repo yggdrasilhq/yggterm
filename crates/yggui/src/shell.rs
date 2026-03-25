@@ -5525,6 +5525,7 @@ fn app() -> Element {
     let mut window_epoch = use_signal(|| 0_u64);
     let mut terminal_mount_epoch = use_signal(|| 0_u64);
     let mut last_terminal_session_path = use_signal(|| None::<String>);
+    let mut last_open_recovery_path = use_signal(|| None::<String>);
     use_effect(move || {
         if XTERM_ASSETS_BOOTSTRAPPED.get().is_none() {
             let _ = XTERM_ASSETS_BOOTSTRAPPED.set(());
@@ -5662,6 +5663,33 @@ fn app() -> Element {
         spawn_summary_generation(state, session, false);
         state.with_mut(|shell| shell.next_background_copy_scan_after_ms = current_millis());
         maybe_spawn_background_copy_generation(state);
+    });
+    use_effect(move || {
+        let (selected_row, active_session_path, server_busy) = {
+            let shell = state.read();
+            (
+                shell.browser.selected_row().cloned(),
+                shell.server.active_session_path().map(|path| path.to_string()),
+                shell.server_busy,
+            )
+        };
+        let Some(row) = selected_row else {
+            last_open_recovery_path.set(None);
+            return;
+        };
+        if active_session_path.is_some() || server_busy {
+            last_open_recovery_path.set(None);
+            return;
+        }
+        if !matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document) {
+            last_open_recovery_path.set(None);
+            return;
+        }
+        if *last_open_recovery_path.read() == Some(row.full_path.clone()) {
+            return;
+        }
+        last_open_recovery_path.set(Some(row.full_path.clone()));
+        spawn_open_session_row(state, row);
     });
     use_effect(move || {
         let shell = state.read();
