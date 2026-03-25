@@ -656,26 +656,44 @@ impl YggtermServer {
     }
 
     pub fn live_sessions(&self) -> Vec<ManagedSessionView> {
-        self.live_session_order
+        let mut sessions = self
+            .live_session_order
             .iter()
             .filter_map(|key| self.sessions.get(key).cloned())
-            .collect()
+            .collect::<Vec<_>>();
+        if let Some(active) = self.active_session() {
+            let active_path = active.session_path.clone();
+            if !sessions.iter().any(|session| session.session_path == active_path) {
+                sessions.insert(0, active.clone());
+            }
+        }
+        sessions
     }
 
     pub fn snapshot(&self) -> ServerUiSnapshot {
+        let mut live_sessions = self
+            .live_session_order
+            .iter()
+            .filter_map(|key| self.sessions.get(key))
+            .cloned()
+            .map(snapshot_session_view)
+            .collect::<Vec<_>>();
+        if let Some(active) = self.active_session().cloned().map(snapshot_session_view) {
+            let active_path = active.session_path.clone();
+            if !live_sessions
+                .iter()
+                .any(|session| session.session_path == active_path)
+            {
+                live_sessions.insert(0, active);
+            }
+        }
         ServerUiSnapshot {
             active_session_path: self.active_session_path.clone(),
             active_session: self.active_session().cloned().map(snapshot_session_view),
             active_view_mode: self.active_view_mode,
             remote_machines: self.remote_machines.clone(),
             ssh_targets: self.ssh_targets.clone(),
-            live_sessions: self
-                .live_session_order
-                .iter()
-                .filter_map(|key| self.sessions.get(key))
-                .cloned()
-                .map(snapshot_session_view)
-                .collect(),
+            live_sessions,
         }
     }
 
@@ -1515,16 +1533,102 @@ impl YggtermServer {
             .find(|session| session.session_id == session_id)
             .cloned()
         else {
-            return Ok(());
+            return self.refresh_remote_preview_from_active_session(machine_key, session_id);
         };
         let path = remote_scanned_session_path(machine_key, session_id);
+        let mut refreshed_title = None::<String>;
+        let mut refreshed_precis = None::<String>;
+        let mut refreshed_summary = None::<String>;
         if let Some(session) = self.sessions.get_mut(&path) {
-            apply_remote_scanned_session_preview(
-                session,
-                &scanned,
-                &machine.label,
-                &machine.ssh_target,
-            );
+            let target = SshConnectTarget {
+                label: machine.label.clone(),
+                kind: SessionKind::SshShell,
+                ssh_target: machine.ssh_target.clone(),
+                prefix: machine.prefix.clone(),
+                cwd: Some(scanned.cwd.clone()),
+            };
+            match fetch_remote_preview_payload(&target, &scanned.storage_path) {
+                Ok(payload) => {
+                    refreshed_title = payload.title_hint.clone();
+                    refreshed_precis = payload.cached_precis.clone();
+                    refreshed_summary = payload.cached_summary.clone();
+                    apply_remote_preview_payload(session, payload);
+                    upsert_session_metadata(&mut session.metadata, "Source", "remote-codex".to_string());
+                    upsert_session_metadata(&mut session.metadata, "Host", machine.ssh_target.clone());
+                    upsert_session_metadata(&mut session.metadata, "UUID", scanned.session_id.clone());
+                    upsert_session_metadata(&mut session.metadata, "Cwd", scanned.cwd.clone());
+                }
+                Err(error) => {
+                    warn!(machine_key, session_id, error=%error, "failed to fetch remote preview payload");
+                    apply_remote_scanned_session_preview(
+                        session,
+                        &scanned,
+                        &machine.label,
+                        &machine.ssh_target,
+                    );
+                }
+            }
+        }
+        if let Some(title) = refreshed_title.as_deref() {
+            self.set_session_title_hint(&path, title);
+        }
+        if let Some(precis) = refreshed_precis.as_deref() {
+            self.set_session_precis_hint(&path, precis);
+        }
+        if let Some(summary) = refreshed_summary.as_deref() {
+            self.set_session_summary_hint(&path, summary);
+        }
+        Ok(())
+    }
+
+    fn refresh_remote_preview_from_active_session(
+        &mut self,
+        machine_key: &str,
+        session_id: &str,
+    ) -> anyhow::Result<()> {
+        let path = remote_scanned_session_path(machine_key, session_id);
+        let Some(session) = self.sessions.get_mut(&path) else {
+            return Ok(());
+        };
+        let ssh_target = session
+            .ssh_target
+            .clone()
+            .or_else(|| session_metadata_value(session, "Host"))
+            .unwrap_or_else(|| machine_key.to_string());
+        let cwd = session_metadata_value(session, "Cwd");
+        let storage_path = session_metadata_value(session, "Storage").unwrap_or_default();
+        if storage_path.trim().is_empty() {
+            return Ok(());
+        }
+        let target = SshConnectTarget {
+            label: machine_key.to_string(),
+            kind: SessionKind::SshShell,
+            ssh_target: ssh_target.clone(),
+            prefix: session.ssh_prefix.clone(),
+            cwd,
+        };
+        match fetch_remote_preview_payload(&target, &storage_path) {
+            Ok(payload) => {
+                let refreshed_title = payload.title_hint.clone();
+                let refreshed_precis = payload.cached_precis.clone();
+                let refreshed_summary = payload.cached_summary.clone();
+                apply_remote_preview_payload(session, payload);
+                upsert_session_metadata(&mut session.metadata, "Source", "remote-codex".to_string());
+                upsert_session_metadata(&mut session.metadata, "Host", ssh_target);
+                upsert_session_metadata(&mut session.metadata, "UUID", session_id.to_string());
+                if let Some(title) = refreshed_title.as_deref() {
+                    self.set_session_title_hint(&path, title);
+                }
+                if let Some(precis) = refreshed_precis.as_deref() {
+                    self.set_session_precis_hint(&path, precis);
+                }
+                if let Some(summary) = refreshed_summary.as_deref() {
+                    self.set_session_summary_hint(&path, summary);
+                }
+            }
+            Err(error) => {
+                warn!(machine_key, session_id, error=%error, "failed to fetch remote preview payload from active session");
+            }
         }
         Ok(())
     }
@@ -1747,6 +1851,19 @@ struct RemoteSummaryLine {
     cached_summary: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RemotePreviewPayload {
+    #[serde(default)]
+    title_hint: Option<String>,
+    #[serde(default)]
+    cached_precis: Option<String>,
+    #[serde(default)]
+    cached_summary: Option<String>,
+    preview: SnapshotPreview,
+    #[serde(default)]
+    rendered_sections: Vec<SnapshotRenderedSection>,
+}
+
 fn default_unknown() -> String {
     "unknown".to_string()
 }
@@ -1875,6 +1992,59 @@ fn apply_remote_scanned_session_preview(
     upsert_session_metadata(&mut session.metadata, "Messages", messages);
 }
 
+fn apply_remote_preview_payload(session: &mut ManagedSessionView, payload: RemotePreviewPayload) {
+    if let Some(title_hint) = payload
+        .title_hint
+        .filter(|value| !value.trim().is_empty() && !looks_like_generated_fallback_title(value))
+    {
+        session.title = title_hint;
+    }
+    session.preview = SessionPreview {
+        summary: payload
+            .preview
+            .summary
+            .into_iter()
+            .map(|entry| SessionMetadataEntry {
+                label: leak_label(entry.label),
+                value: entry.value,
+            })
+            .collect(),
+        blocks: payload
+            .preview
+            .blocks
+            .into_iter()
+            .map(|block| SessionPreviewBlock {
+                role: leak_label(block.role),
+                timestamp: block.timestamp,
+                tone: block.tone,
+                folded: block.folded,
+                lines: block.lines,
+            })
+            .collect(),
+    };
+    session.rendered_sections = payload
+        .rendered_sections
+        .into_iter()
+        .map(|section| SessionRenderedSection {
+            title: leak_label(section.title),
+            lines: section.lines,
+        })
+        .collect();
+}
+
+fn fetch_remote_preview_payload(
+    target: &SshConnectTarget,
+    storage_path: &str,
+) -> anyhow::Result<RemotePreviewPayload> {
+    let output = run_remote_yggterm_command(
+        &target.ssh_target,
+        target.prefix.as_deref(),
+        &["server", "remote", "preview", storage_path],
+        None,
+    )?;
+    serde_json::from_str(&output).context("invalid remote preview payload")
+}
+
 fn collect_codex_session_files(
     root: &std::path::Path,
     out: &mut Vec<std::path::PathBuf>,
@@ -1938,6 +2108,55 @@ fn remote_summary_for_path(
         title_hint: title_store.get_title(&session_id)?,
         cached_precis: title_store.get_precis(&session_id)?,
         cached_summary: title_store.get_summary(&session_id)?,
+    }))
+}
+
+fn remote_preview_payload_for_path(
+    path: &std::path::Path,
+    title_store: &SessionTitleStore,
+) -> anyhow::Result<Option<RemotePreviewPayload>> {
+    let Some((session_id, cwd)) = read_codex_session_identity_fields(path)? else {
+        return Ok(None);
+    };
+    let title_hint = title_store
+        .get_title(&session_id)?
+        .filter(|value| !value.trim().is_empty() && !looks_like_generated_fallback_title(value));
+    let session = build_session(
+        SessionKind::Codex,
+        &path.display().to_string(),
+        Some(&session_id),
+        Some(&cwd),
+        title_hint.as_deref(),
+        None,
+        TerminalBackend::Xterm,
+        UiTheme::ZedLight,
+        false,
+    );
+    Ok(Some(RemotePreviewPayload {
+        title_hint,
+        cached_precis: title_store
+            .get_precis(&session_id)?
+            .filter(|value| !value.trim().is_empty()),
+        cached_summary: title_store
+            .get_summary(&session_id)?
+            .filter(|value| !value.trim().is_empty()),
+        preview: SnapshotPreview {
+            summary: snapshot_metadata_entries(&session.preview.summary),
+            blocks: session
+                .preview
+                .blocks
+                .into_iter()
+                .map(snapshot_preview_block)
+                .collect(),
+        },
+        rendered_sections: session
+            .rendered_sections
+            .into_iter()
+            .map(|section| SnapshotRenderedSection {
+                title: section.title.to_string(),
+                lines: section.lines,
+            })
+            .collect(),
     }))
 }
 
@@ -2900,6 +3119,15 @@ pub fn run_remote_scan(codex_home: Option<&str>) -> anyhow::Result<()> {
             println!("{}", serde_json::to_string(&summary)?);
         }
     }
+    Ok(())
+}
+
+pub fn run_remote_preview(path: &str) -> anyhow::Result<()> {
+    let yggterm_home = resolve_yggterm_home()?;
+    let title_store = SessionTitleStore::open(&yggterm_home)?;
+    let payload = remote_preview_payload_for_path(std::path::Path::new(path), &title_store)?
+        .with_context(|| format!("no previewable codex session at {path}"))?;
+    println!("{}", serde_json::to_string(&payload)?);
     Ok(())
 }
 
