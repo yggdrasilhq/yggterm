@@ -4296,6 +4296,11 @@ fn synthesize_remote_scanned_session_view(
             }
         ),
     );
+    upsert_session_metadata(
+        &mut session.metadata,
+        "Launch",
+        session.launch_command.clone(),
+    );
     upsert_session_metadata(&mut session.metadata, "Cwd", scanned.cwd.clone());
     apply_remote_scanned_session_preview(&mut session, scanned, &machine.label, &target.ssh_target);
     session
