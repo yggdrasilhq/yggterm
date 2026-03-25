@@ -24,6 +24,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
@@ -2933,7 +2934,9 @@ fn remote_protocol_version_for_binary(
 }
 
 fn bootstrap_remote_yggterm(ssh_target: &str, exec_prefix: Option<&str>) -> anyhow::Result<String> {
-    let exe_path = std::env::current_exe().context("resolving current yggterm executable")?;
+    let exe_path = local_remote_bootstrap_executable()
+        .or_else(|| std::env::current_exe().ok())
+        .context("resolving local yggterm remote executable")?;
     let payload =
         fs::read(&exe_path).with_context(|| format!("reading local yggterm binary {}", exe_path.display()))?;
     let mut cmd = Command::new("ssh");
@@ -2967,6 +2970,15 @@ fn bootstrap_remote_yggterm(ssh_target: &str, exec_prefix: Option<&str>) -> anyh
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn local_remote_bootstrap_executable() -> Option<PathBuf> {
+    let current = std::env::current_exe().ok()?;
+    let headless = current.with_file_name("yggterm-headless");
+    if headless.is_file() {
+        return Some(headless);
+    }
+    None
 }
 
 fn resolve_remote_yggterm_binary(
@@ -4162,6 +4174,9 @@ fn synthesize_remote_scanned_session_view(
         theme,
         ghostty_bridge_enabled,
     );
+    let (remote_binary, remote_deploy_state) =
+        resolve_remote_yggterm_binary(&target.ssh_target, target.prefix.as_deref())
+            .unwrap_or_else(|_| ("yggterm".to_string(), RemoteDeployState::Planned));
     session.session_path = scanned.session_path.clone();
     session.host_label = machine.label.clone();
     session.title = if scanned.title_hint.trim().is_empty() {
@@ -4172,7 +4187,7 @@ fn synthesize_remote_scanned_session_view(
     session.launch_command = remote_ssh_launch_command(
         &target.ssh_target,
         target.prefix.as_deref(),
-        "yggterm",
+        &remote_binary,
         &[
             "server",
             "remote",
@@ -4197,6 +4212,29 @@ fn synthesize_remote_scanned_session_view(
         format!(
             "yggterm server remote resume-codex {}",
             scanned.session_id
+        ),
+    );
+    upsert_session_metadata(
+        &mut session.metadata,
+        "Deploy",
+        match remote_deploy_state {
+            RemoteDeployState::Ready => "ready".to_string(),
+            RemoteDeployState::CopyingBinary => "copying".to_string(),
+            RemoteDeployState::Planned => "planned".to_string(),
+            RemoteDeployState::NotRequired => "not required".to_string(),
+        },
+    );
+    upsert_session_metadata(
+        &mut session.metadata,
+        "Status",
+        format!(
+            "remote resume queued · {}",
+            match remote_deploy_state {
+                RemoteDeployState::Ready => "remote yggterm ready",
+                RemoteDeployState::CopyingBinary => "copying yggterm binary",
+                RemoteDeployState::Planned => "remote bootstrap planned",
+                RemoteDeployState::NotRequired => "not required",
+            }
         ),
     );
     upsert_session_metadata(&mut session.metadata, "Cwd", scanned.cwd.clone());
