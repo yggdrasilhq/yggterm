@@ -9,6 +9,10 @@ license = "Apache-2.0"
 name = "yggterm"
 path = "src/main.rs"
 
+[[bin]]
+name = "yggterm-headless"
+path = "src/bin/yggterm-headless.rs"
+
 [features]
 default = []
 ghostty-ffi = ["yggterm-server/ghostty-ffi"]
