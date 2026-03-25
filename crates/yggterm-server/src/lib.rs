@@ -1304,6 +1304,35 @@ impl YggtermServer {
             cwd: live.cwd,
         };
         self.upsert_ssh_target(&target);
+        if let Some((machine_key, session_id)) = parse_remote_scanned_session_path(&live.key)
+            && let Some(machine) = self
+                .remote_machines
+                .iter()
+                .find(|machine| machine.machine_key == machine_key)
+                .cloned()
+            && let Some(scanned) = machine
+                .sessions
+                .iter()
+                .find(|session| session.session_id == session_id)
+                .cloned()
+        {
+            let mut session = synthesize_remote_scanned_session_view(
+                &machine,
+                &scanned,
+                self.backend,
+                self.theme,
+                self.ghostty_host.bridge_enabled,
+            );
+            if !live.title.trim().is_empty() && !looks_like_generated_fallback_title(&live.title) {
+                session.title = live.title.clone();
+            }
+            self.sessions.insert(live.key.clone(), session);
+            self.live_session_order.retain(|existing| existing != &live.key);
+            self.live_session_order.insert(0, live.key.clone());
+            self.active_session_path = Some(live.key);
+            self.active_view_mode = WorkspaceViewMode::Terminal;
+            return;
+        }
         self.insert_live_session_with_launch(
             &live.key,
             &live.id,
