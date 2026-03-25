@@ -1473,9 +1473,38 @@ impl YggtermServer {
                 );
             }
             SessionSource::LiveSsh => {
+                if session.kind == SessionKind::SshShell
+                    && let Some(ssh_target) = session.ssh_target.clone()
+                {
+                    let (remote_binary, remote_deploy_state) =
+                        resolve_remote_yggterm_binary(&ssh_target, session.ssh_prefix.as_deref())
+                            .unwrap_or_else(|_| ("yggterm".to_string(), RemoteDeployState::Planned));
+                    session.remote_deploy_state = remote_deploy_state;
+                    session.launch_command = remote_ssh_launch_command(
+                        &ssh_target,
+                        session.ssh_prefix.as_deref(),
+                        &remote_binary,
+                        &["server", "attach", &session.id],
+                    );
+                    upsert_session_metadata(
+                        &mut session.metadata,
+                        "Deploy",
+                        match remote_deploy_state {
+                            RemoteDeployState::Ready => "ready".to_string(),
+                            RemoteDeployState::CopyingBinary => "copying".to_string(),
+                            RemoteDeployState::Planned => "planned".to_string(),
+                            RemoteDeployState::NotRequired => "not required".to_string(),
+                        },
+                    );
+                    upsert_session_metadata(
+                        &mut session.metadata,
+                        "Launch",
+                        session.launch_command.clone(),
+                    );
+                }
                 session.backend = TerminalBackend::Xterm;
                 session.remote_deploy_state = if session.kind == SessionKind::SshShell {
-                    RemoteDeployState::Ready
+                    session.remote_deploy_state
                 } else {
                     RemoteDeployState::NotRequired
                 };
@@ -3878,9 +3907,6 @@ fn build_live_session(
     let started_at = format_display_datetime(OffsetDateTime::now_utc());
     let shell_program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
     let default_cwd = target.cwd.clone().unwrap_or_else(|| local_default_cwd());
-    let (remote_binary, remote_deploy_state) =
-        resolve_remote_yggterm_binary(&target.ssh_target, target.prefix.as_deref())
-            .unwrap_or_else(|_| ("yggterm".to_string(), RemoteDeployState::Planned));
     let (launch_command, session_path, source_value, target_value, prefix_value, deploy_state) =
         match kind {
             SessionKind::Shell => (
@@ -3918,14 +3944,14 @@ fn build_live_session(
                 remote_ssh_launch_command(
                     &target.ssh_target,
                     target.prefix.as_deref(),
-                    &remote_binary,
+                    "yggterm",
                     &["server", "attach", uuid],
                 ),
                 format!("ssh://{}/{}", target.ssh_target, uuid),
                 "live-ssh".to_string(),
                 target.ssh_target.clone(),
                 target.prefix.clone().unwrap_or_else(|| "none".to_string()),
-                remote_deploy_state,
+                RemoteDeployState::Planned,
             ),
             SessionKind::Document => (
                 "document preview".to_string(),

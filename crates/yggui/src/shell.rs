@@ -2743,7 +2743,7 @@ fn spawn_daemon_process() -> Result<()> {
 }
 
 fn wait_for_daemon(endpoint: &ServerEndpoint) -> Result<()> {
-    for _ in 0..20 {
+    for _ in 0..80 {
         thread::sleep(Duration::from_millis(150));
         if ping(endpoint).is_ok() {
             return Ok(());
