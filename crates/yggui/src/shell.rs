@@ -707,6 +707,7 @@ impl ShellState {
                 if was_initial_sync {
                     self.seed_dynamic_top_level_expansions();
                 }
+                self.ensure_active_session_visible();
                 if let Some(message) = message {
                     self.last_action = message;
                 }
@@ -741,6 +742,31 @@ impl ShellState {
             paths.push("__live_sessions__".to_string());
         }
         self.browser.ensure_expanded_paths(paths);
+        self.sync_browser_settings();
+    }
+
+    fn ensure_active_session_visible(&mut self) {
+        let Some(active) = self.server.active_session().cloned() else {
+            return;
+        };
+        match active.source {
+            yggterm_server::SessionSource::Stored => {
+                self.browser.ensure_visible_path(&active.session_path);
+            }
+            yggterm_server::SessionSource::LiveSsh => {
+                if let Some((machine_key, _)) = parse_remote_scanned_session_path(&active.session_path) {
+                    let mut paths = vec![format!("__remote_machine__/{machine_key}")];
+                    let cwd = metadata_value(&active, "Cwd");
+                    let mut current = String::new();
+                    for segment in cwd.split('/').filter(|segment| !segment.is_empty()) {
+                        current.push('/');
+                        current.push_str(segment);
+                        paths.push(format!("__remote_folder__/{machine_key}{current}"));
+                    }
+                    self.browser.ensure_expanded_paths(paths);
+                }
+            }
+        }
         self.sync_browser_settings();
     }
 
@@ -3527,6 +3553,21 @@ struct SidebarRemoteMachine {
     scanned_sessions: Vec<RemoteScannedSession>,
 }
 
+#[derive(Debug, Default)]
+struct RemoteFolderTree {
+    children: BTreeMap<String, RemoteFolderNode>,
+    root_session_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteFolderNode {
+    name: String,
+    full_path: String,
+    children: BTreeMap<String, RemoteFolderNode>,
+    session_indices: Vec<usize>,
+    descendant_sessions: usize,
+}
+
 fn ssh_target_machine_label(target: &SshConnectTarget) -> String {
     let raw = if !target.label.trim().is_empty() {
         target.label.trim()
@@ -3575,36 +3616,36 @@ fn push_remote_machine_rows(
             .map(|session| (session.session_path.clone(), session.session_id.clone()))
             .collect::<Vec<_>>(),
     );
-    let mut emitted = HashMap::<String, usize>::new();
-    let folder_counts = remote_folder_session_counts(&machine.scanned_sessions);
+    let folder_tree = build_remote_folder_tree(&machine.scanned_sessions);
 
-    for scanned in &machine.scanned_sessions {
-        let show_session = push_remote_folder_rows(
+    for child in folder_tree.children.values() {
+        append_remote_folder_rows(
             rows,
-            &machine.key,
-            &scanned.cwd,
+            machine,
+            child,
             expanded_paths,
-            &mut emitted,
-            &folder_counts,
+            &remote_short_ids,
+            1,
         );
-        if !show_session {
-            continue;
+    }
+    for &session_idx in &folder_tree.root_session_indices {
+        if let Some(scanned) = machine.scanned_sessions.get(session_idx) {
+            rows.push(BrowserRow {
+                kind: BrowserRowKind::Session,
+                full_path: scanned.session_path.clone(),
+                label: remote_scanned_session_label(scanned, &remote_short_ids),
+                detail_label: String::new(),
+                document_kind: None,
+                group_kind: None,
+                session_title: Some(remote_scanned_session_label(scanned, &remote_short_ids)),
+                depth: 1,
+                host_label: machine.key.clone(),
+                descendant_sessions: 1,
+                expanded: true,
+                session_id: Some(scanned.session_id.clone()),
+                session_cwd: Some(scanned.cwd.clone()),
+            });
         }
-        rows.push(BrowserRow {
-            kind: BrowserRowKind::Session,
-            full_path: scanned.session_path.clone(),
-            label: remote_scanned_session_label(scanned, &remote_short_ids),
-            detail_label: String::new(),
-            document_kind: None,
-            group_kind: None,
-            session_title: Some(remote_scanned_session_label(scanned, &remote_short_ids)),
-            depth: remote_session_depth(&scanned.cwd),
-            host_label: machine.key.clone(),
-            descendant_sessions: 1,
-            expanded: true,
-            session_id: Some(scanned.session_id.clone()),
-            session_cwd: Some(scanned.cwd.clone()),
-        });
     }
 }
 
@@ -3622,78 +3663,149 @@ fn remote_scanned_session_label(
         .unwrap_or_else(|| session.title_hint.clone())
 }
 
-fn push_remote_folder_rows(
-    rows: &mut Vec<BrowserRow>,
-    machine_key: &str,
-    cwd: &str,
-    expanded_paths: &HashSet<String>,
-    emitted: &mut HashMap<String, usize>,
-    folder_counts: &HashMap<String, usize>,
-) -> bool {
-    let segments = cwd
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    if segments.is_empty() {
-        return true;
-    }
-
-    let mut current = String::new();
-    let mut all_ancestors_expanded = true;
-    for (ix, segment) in segments.iter().enumerate() {
-        current.push('/');
-        current.push_str(segment);
-        let row_path = format!("__remote_folder__/{machine_key}{}", current);
-        let is_expanded = expanded_paths.contains(&row_path);
-        if ix == 0 || all_ancestors_expanded {
-            if !emitted.contains_key(&current) {
-                emitted.insert(current.clone(), ix + 1);
-                rows.push(BrowserRow {
-                    kind: BrowserRowKind::Group,
-                    full_path: row_path.clone(),
-                    label: if ix == 0 && cwd.starts_with('/') {
-                        format!("/{segment}")
-                    } else {
-                        (*segment).to_string()
-                    },
-                    detail_label: String::new(),
-                    document_kind: None,
-                    group_kind: None,
-                    session_title: None,
-                    depth: ix + 1,
-                    host_label: machine_key.to_string(),
-                    descendant_sessions: folder_counts.get(&current).copied().unwrap_or(0),
-                    expanded: is_expanded,
-                    session_id: None,
-                    session_cwd: Some(current.clone()),
-                });
-            }
-        } else {
-            all_ancestors_expanded = false;
+fn build_remote_folder_tree(sessions: &[RemoteScannedSession]) -> RemoteFolderTree {
+    let mut tree = RemoteFolderTree::default();
+    for (session_idx, session) in sessions.iter().enumerate() {
+        let segments = session
+            .cwd
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        if segments.is_empty() {
+            tree.root_session_indices.push(session_idx);
             continue;
         }
-        all_ancestors_expanded &= is_expanded;
-    }
-    all_ancestors_expanded
-}
-
-fn remote_folder_session_counts(
-    sessions: &[RemoteScannedSession],
-) -> HashMap<String, usize> {
-    let mut counts = HashMap::<String, usize>::new();
-    for session in sessions {
         let mut current = String::new();
-        for segment in session.cwd.split('/').filter(|segment| !segment.is_empty()) {
+        let mut children = &mut tree.children;
+        for (ix, segment) in segments.iter().enumerate() {
             current.push('/');
             current.push_str(segment);
-            *counts.entry(current.clone()).or_insert(0) += 1;
+            let label = if ix == 0 {
+                format!("/{segment}")
+            } else {
+                (*segment).to_string()
+            };
+            let node = children
+                .entry(current.clone())
+                .or_insert_with(|| RemoteFolderNode {
+                    name: label,
+                    full_path: current.clone(),
+                    children: BTreeMap::new(),
+                    session_indices: Vec::new(),
+                    descendant_sessions: 0,
+                });
+            if ix + 1 == segments.len() {
+                node.session_indices.push(session_idx);
+            }
+            children = &mut node.children;
         }
     }
-    counts
+    compress_remote_folder_children(&mut tree.children);
+    for child in tree.children.values_mut() {
+        populate_remote_folder_descendant_counts(child);
+    }
+    tree
 }
 
-fn remote_session_depth(cwd: &str) -> usize {
-    cwd.split('/').filter(|segment| !segment.is_empty()).count() + 1
+fn compress_remote_folder_children(children: &mut BTreeMap<String, RemoteFolderNode>) {
+    let keys = children.keys().cloned().collect::<Vec<_>>();
+    for key in keys {
+        if let Some(child) = children.get_mut(&key) {
+            compress_remote_folder_node(child, true);
+        }
+    }
+}
+
+fn compress_remote_folder_node(node: &mut RemoteFolderNode, can_compress_self: bool) {
+    let child_keys = node.children.keys().cloned().collect::<Vec<_>>();
+    for key in child_keys {
+        if let Some(child) = node.children.get_mut(&key) {
+            compress_remote_folder_node(child, true);
+        }
+    }
+    if !can_compress_self {
+        return;
+    }
+    while node.session_indices.is_empty() && node.children.len() == 1 {
+        let (_, child) = node.children.pop_first().expect("child exists");
+        node.name = remote_folder_join_label(&node.name, &child.name);
+        node.full_path = child.full_path;
+        node.session_indices = child.session_indices;
+        node.descendant_sessions = child.descendant_sessions;
+        node.children = child.children;
+    }
+}
+
+fn remote_folder_join_label(left: &str, right: &str) -> String {
+    if left == "/" {
+        return format!("/{right}");
+    }
+    if left.ends_with('/') {
+        format!("{left}{right}")
+    } else {
+        format!("{left}/{right}")
+    }
+}
+
+fn populate_remote_folder_descendant_counts(node: &mut RemoteFolderNode) -> usize {
+    let mut count = node.session_indices.len();
+    for child in node.children.values_mut() {
+        count += populate_remote_folder_descendant_counts(child);
+    }
+    node.descendant_sessions = count;
+    count
+}
+
+fn append_remote_folder_rows(
+    rows: &mut Vec<BrowserRow>,
+    machine: &SidebarRemoteMachine,
+    node: &RemoteFolderNode,
+    expanded_paths: &HashSet<String>,
+    short_ids: &HashMap<String, String>,
+    depth: usize,
+) {
+    let row_path = format!("__remote_folder__/{}{}", machine.key, node.full_path);
+    let is_expanded = expanded_paths.contains(&row_path);
+    rows.push(BrowserRow {
+        kind: BrowserRowKind::Group,
+        full_path: row_path,
+        label: node.name.clone(),
+        detail_label: String::new(),
+        document_kind: None,
+        group_kind: None,
+        session_title: None,
+        depth,
+        host_label: machine.key.clone(),
+        descendant_sessions: node.descendant_sessions,
+        expanded: is_expanded,
+        session_id: None,
+        session_cwd: Some(node.full_path.clone()),
+    });
+    if !is_expanded {
+        return;
+    }
+    for child in node.children.values() {
+        append_remote_folder_rows(rows, machine, child, expanded_paths, short_ids, depth + 1);
+    }
+    for &session_idx in &node.session_indices {
+        if let Some(scanned) = machine.scanned_sessions.get(session_idx) {
+            rows.push(BrowserRow {
+                kind: BrowserRowKind::Session,
+                full_path: scanned.session_path.clone(),
+                label: remote_scanned_session_label(scanned, short_ids),
+                detail_label: String::new(),
+                document_kind: None,
+                group_kind: None,
+                session_title: Some(remote_scanned_session_label(scanned, short_ids)),
+                depth: depth + 1,
+                host_label: machine.key.clone(),
+                descendant_sessions: 1,
+                expanded: true,
+                session_id: Some(scanned.session_id.clone()),
+                session_cwd: Some(scanned.cwd.clone()),
+            });
+        }
+    }
 }
 
 fn machine_key_from_labelish(value: &str) -> String {
@@ -11494,7 +11606,6 @@ mod tests {
     fn merged_sidebar_rows_include_scanned_remote_sessions_under_machine_root() {
         let expanded_paths = HashSet::from([
             "__remote_machine__/pi-raspberry".to_string(),
-            "__remote_folder__/pi-raspberry/srv".to_string(),
             "__remote_folder__/pi-raspberry/srv/app".to_string(),
         ]);
         let rows = merged_sidebar_rows(
@@ -11527,7 +11638,11 @@ mod tests {
         );
 
         assert!(rows.iter().any(|row| row.kind == BrowserRowKind::Group && row.label == "raspberry [ok]"));
-        assert!(rows.iter().any(|row| row.kind == BrowserRowKind::Group && row.full_path == "__remote_folder__/pi-raspberry/srv"));
+        assert!(rows.iter().any(|row| {
+            row.kind == BrowserRowKind::Group
+                && row.full_path == "__remote_folder__/pi-raspberry/srv/app"
+                && row.label == "/srv/app"
+        }));
         assert!(rows.iter().any(|row| row.kind == BrowserRowKind::Session && row.full_path == "remote-session://pi-raspberry/019caa6f"));
     }
 
@@ -11626,8 +11741,7 @@ mod tests {
             &expanded_paths,
         );
 
-        assert!(rows.iter().any(|row| row.full_path == "__remote_folder__/pi-raspberry/srv"));
-        assert!(!rows.iter().any(|row| row.full_path == "__remote_folder__/pi-raspberry/srv/app"));
+        assert!(rows.iter().any(|row| row.full_path == "__remote_folder__/pi-raspberry/srv/app"));
         assert!(!rows.iter().any(|row| row.full_path == "remote-session://pi-raspberry/019caa6f"));
     }
 
@@ -11738,7 +11852,7 @@ mod tests {
     fn remote_folder_rows_show_descendant_session_counts() {
         let expanded_paths = HashSet::from([
             "__remote_machine__/jojo".to_string(),
-            "__remote_folder__/jojo/home".to_string(),
+            "__remote_folder__/jojo/home/pi".to_string(),
         ]);
         let rows = merged_sidebar_rows(
             &[],
@@ -11788,9 +11902,118 @@ mod tests {
 
         let home_row = rows
             .iter()
-            .find(|row| row.full_path == "__remote_folder__/jojo/home")
+            .find(|row| row.full_path == "__remote_folder__/jojo/home/pi")
             .expect("home row");
         assert_eq!(home_row.descendant_sessions, 2);
+    }
+
+    #[test]
+    fn merged_sidebar_rows_compress_single_child_remote_folder_chains() {
+        let expanded_paths = HashSet::from([
+            "__remote_machine__/jojo".to_string(),
+            "__remote_folder__/jojo/run/smb4k/data/smbfs/dada/obsidian/codex".to_string(),
+        ]);
+        let rows = merged_sidebar_rows(
+            &[],
+            &[RemoteMachineSnapshot {
+                machine_key: "jojo".to_string(),
+                label: "jojo".to_string(),
+                ssh_target: "jojo".to_string(),
+                prefix: None,
+                health: RemoteMachineHealth::Healthy,
+                sessions: vec![RemoteScannedSession {
+                    session_path: "remote-session://jojo/1".to_string(),
+                    session_id: "1".to_string(),
+                    cwd: "/run/smb4k/data/smbfs/dada/obsidian/codex".to_string(),
+                    started_at: "2026-03-24T10:00:00Z".to_string(),
+                    modified_epoch: 1,
+                    event_count: 1,
+                    user_message_count: 1,
+                    assistant_message_count: 1,
+                    title_hint: "1".to_string(),
+                    recent_context: "USER: one".to_string(),
+                    cached_precis: None,
+                    cached_summary: None,
+                    storage_path: "a".to_string(),
+                }],
+            }],
+            &[],
+            &[],
+            &expanded_paths,
+        );
+
+        assert!(rows.iter().any(|row| {
+            row.kind == BrowserRowKind::Group
+                && row.full_path == "__remote_folder__/jojo/run/smb4k/data/smbfs/dada/obsidian/codex"
+                && row.label == "/run/smb4k/data/smbfs/dada/obsidian/codex"
+        }));
+        assert!(!rows.iter().any(|row| row.full_path == "__remote_folder__/jojo/run"));
+    }
+
+    #[test]
+    fn merged_sidebar_rows_break_compression_when_middle_folder_has_sessions() {
+        let expanded_paths = HashSet::from([
+            "__remote_machine__/jojo".to_string(),
+            "__remote_folder__/jojo/home/pi".to_string(),
+            "__remote_folder__/jojo/home/pi/data/smbfs".to_string(),
+        ]);
+        let rows = merged_sidebar_rows(
+            &[],
+            &[RemoteMachineSnapshot {
+                machine_key: "jojo".to_string(),
+                label: "jojo".to_string(),
+                ssh_target: "jojo".to_string(),
+                prefix: None,
+                health: RemoteMachineHealth::Healthy,
+                sessions: vec![
+                    RemoteScannedSession {
+                        session_path: "remote-session://jojo/1".to_string(),
+                        session_id: "1".to_string(),
+                        cwd: "/home/pi".to_string(),
+                        started_at: "2026-03-24T10:00:00Z".to_string(),
+                        modified_epoch: 1,
+                        event_count: 1,
+                        user_message_count: 1,
+                        assistant_message_count: 1,
+                        title_hint: "1".to_string(),
+                        recent_context: "USER: one".to_string(),
+                        cached_precis: None,
+                        cached_summary: None,
+                        storage_path: "a".to_string(),
+                    },
+                    RemoteScannedSession {
+                        session_path: "remote-session://jojo/2".to_string(),
+                        session_id: "2".to_string(),
+                        cwd: "/home/pi/data/smbfs".to_string(),
+                        started_at: "2026-03-24T10:01:00Z".to_string(),
+                        modified_epoch: 2,
+                        event_count: 1,
+                        user_message_count: 1,
+                        assistant_message_count: 1,
+                        title_hint: "2".to_string(),
+                        recent_context: "USER: two".to_string(),
+                        cached_precis: None,
+                        cached_summary: None,
+                        storage_path: "b".to_string(),
+                    },
+                ],
+            }],
+            &[],
+            &[],
+            &expanded_paths,
+        );
+
+        assert!(rows.iter().any(|row| {
+            row.kind == BrowserRowKind::Group
+                && row.full_path == "__remote_folder__/jojo/home/pi"
+                && row.label == "/home/pi"
+        }));
+        assert!(rows.iter().any(|row| {
+            row.kind == BrowserRowKind::Group
+                && row.full_path == "__remote_folder__/jojo/home/pi/data/smbfs"
+                && row.label == "data/smbfs"
+        }));
+        assert!(!rows.iter().any(|row| row.full_path == "__remote_folder__/jojo/home"));
     }
 }
 

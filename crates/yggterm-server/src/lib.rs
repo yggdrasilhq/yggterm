@@ -378,6 +378,24 @@ impl YggtermServer {
         self.active_view_mode = mode;
     }
 
+    pub fn refresh_active_session_preview_from_source(&mut self) -> anyhow::Result<()> {
+        let Some(path) = self.active_session_path.clone() else {
+            return Ok(());
+        };
+        let Some(session) = self.sessions.get(&path).cloned() else {
+            return Ok(());
+        };
+        match session.source {
+            SessionSource::Stored => self.refresh_stored_session_preview(&path, &session)?,
+            SessionSource::LiveSsh => {
+                if let Some((machine_key, session_id)) = parse_remote_scanned_session_path(&path) {
+                    self.refresh_remote_scanned_session_preview(machine_key, session_id)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn sync_theme(&mut self, theme: UiTheme) {
         if self.theme == theme {
             return;
@@ -1027,6 +1045,18 @@ impl YggtermServer {
                         RemoteDeployState::NotRequired => "not required".to_string(),
                     },
                 );
+                if let Some(scanned) = machine
+                    .sessions
+                    .iter()
+                    .find(|scanned| scanned.session_id == session_id)
+                {
+                    apply_remote_scanned_session_preview(
+                        session,
+                        scanned,
+                        &machine.label,
+                        &target.ssh_target,
+                    );
+                }
             }
             self.focus_live_session(&session_path);
             self.request_terminal_launch_for_path(&session_path);
@@ -1096,6 +1126,18 @@ impl YggtermServer {
                     RemoteDeployState::NotRequired => "not required".to_string(),
                 },
             );
+            if let Some(scanned) = machine
+                .sessions
+                .iter()
+                .find(|scanned| scanned.session_id == session_id)
+            {
+                apply_remote_scanned_session_preview(
+                    session,
+                    scanned,
+                    &machine.label,
+                    &target.ssh_target,
+                );
+            }
         }
         self.request_terminal_launch_for_path(&session_path);
         Ok(session_path)
@@ -1416,6 +1458,73 @@ impl YggtermServer {
         self.request_terminal_launch_for_active();
     }
 
+    fn refresh_stored_session_preview(
+        &mut self,
+        path: &str,
+        existing: &ManagedSessionView,
+    ) -> anyhow::Result<()> {
+        if existing.kind == SessionKind::Document {
+            return Ok(());
+        }
+        let cwd = session_metadata_value(existing, "Cwd");
+        let title_hint = (!looks_like_generated_fallback_title(&existing.title)
+            && !existing.title.trim().is_empty())
+            .then_some(existing.title.clone());
+        let refreshed = build_session(
+            existing.kind,
+            path,
+            Some(existing.id.as_str()),
+            cwd.as_deref(),
+            title_hint.as_deref(),
+            None,
+            self.backend,
+            self.theme,
+            self.ghostty_host.bridge_enabled,
+        );
+        if let Some(session) = self.sessions.get_mut(path) {
+            session.preview = refreshed.preview;
+            session.rendered_sections = refreshed.rendered_sections;
+            for entry in refreshed.metadata {
+                upsert_session_metadata(&mut session.metadata, entry.label, entry.value);
+            }
+        }
+        Ok(())
+    }
+
+    fn refresh_remote_scanned_session_preview(
+        &mut self,
+        machine_key: &str,
+        session_id: &str,
+    ) -> anyhow::Result<()> {
+        self.refresh_remote_machine_by_key(machine_key)?;
+        let Some(machine) = self
+            .remote_machines
+            .iter()
+            .find(|machine| machine.machine_key == machine_key)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let Some(scanned) = machine
+            .sessions
+            .iter()
+            .find(|session| session.session_id == session_id)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let path = remote_scanned_session_path(machine_key, session_id);
+        if let Some(session) = self.sessions.get_mut(&path) {
+            apply_remote_scanned_session_preview(
+                session,
+                &scanned,
+                &machine.label,
+                &machine.ssh_target,
+            );
+        }
+        Ok(())
+    }
+
     fn connect_ssh_like_target(&mut self, target: &SshConnectTarget) -> (Option<String>, bool) {
         self.upsert_ssh_target(target);
         if let Some(existing_key) = self
@@ -1566,6 +1675,12 @@ fn remote_scanned_session_path(machine_key: &str, session_id: &str) -> String {
     format!("remote-session://{machine_key}/{session_id}")
 }
 
+fn parse_remote_scanned_session_path(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix("remote-session://")?;
+    let (machine_key, session_id) = rest.split_once('/')?;
+    Some((machine_key, session_id))
+}
+
 fn remote_resume_shell_command(session_id: &str, cwd: Option<&str>, prefix: Option<&str>) -> String {
     let base = match cwd.filter(|cwd| !cwd.trim().is_empty()) {
         Some(cwd) => format!("cd {} && codex resume {}", shell_single_quote(cwd), shell_single_quote(session_id)),
@@ -1660,6 +1775,100 @@ fn summarize_recent_context(messages: &[yggterm_core::TranscriptMessage]) -> Str
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn preview_blocks_from_recent_context(recent_context: &str) -> Vec<SessionPreviewBlock> {
+    recent_context
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let (role, tone, content) = if let Some(rest) = trimmed.strip_prefix("USER:") {
+                ("USER", PreviewTone::User, rest.trim())
+            } else if let Some(rest) = trimmed.strip_prefix("ASSISTANT:") {
+                ("ASSISTANT", PreviewTone::Assistant, rest.trim())
+            } else if let Some(rest) = trimmed.strip_prefix("SYSTEM:") {
+                ("SYSTEM", PreviewTone::Assistant, rest.trim())
+            } else {
+                ("ASSISTANT", PreviewTone::Assistant, trimmed)
+            };
+            (!content.is_empty()).then(|| SessionPreviewBlock {
+                role,
+                timestamp: "remote:scan".to_string(),
+                tone,
+                folded: false,
+                lines: vec![content.to_string()],
+            })
+        })
+        .collect()
+}
+
+fn modified_epoch_display(epoch: i64) -> String {
+    OffsetDateTime::from_unix_timestamp(epoch)
+        .map(format_display_datetime)
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn session_metadata_value(session: &ManagedSessionView, label: &str) -> Option<String> {
+    session
+        .metadata
+        .iter()
+        .find(|entry| entry.label == label)
+        .map(|entry| entry.value.clone())
+}
+
+fn apply_remote_scanned_session_preview(
+    session: &mut ManagedSessionView,
+    scanned: &RemoteScannedSession,
+    machine_label: &str,
+    ssh_target: &str,
+) {
+    if !scanned.title_hint.trim().is_empty()
+        && !looks_like_generated_fallback_title(&scanned.title_hint)
+    {
+        session.title = scanned.title_hint.clone();
+    }
+    let preview_blocks = preview_blocks_from_recent_context(&scanned.recent_context);
+    if !preview_blocks.is_empty() {
+        session.preview.blocks = preview_blocks;
+        session.rendered_sections = vec![SessionRenderedSection {
+            title: "Recent Context",
+            lines: scanned
+                .recent_context
+                .lines()
+                .map(|line| line.trim().to_string())
+                .filter(|line| !line.is_empty())
+                .collect(),
+        }];
+    }
+    let messages = format!(
+        "{} user · {} assistant",
+        scanned.user_message_count, scanned.assistant_message_count
+    );
+    upsert_session_metadata(&mut session.preview.summary, "Session", scanned.session_id.clone());
+    upsert_session_metadata(&mut session.preview.summary, "Host", machine_label.to_string());
+    upsert_session_metadata(&mut session.preview.summary, "Cwd", scanned.cwd.clone());
+    upsert_session_metadata(&mut session.preview.summary, "Started", scanned.started_at.clone());
+    upsert_session_metadata(&mut session.preview.summary, "Messages", messages.clone());
+    upsert_session_metadata(
+        &mut session.preview.summary,
+        "Updated",
+        modified_epoch_display(scanned.modified_epoch),
+    );
+
+    upsert_session_metadata(&mut session.metadata, "Source", "remote-codex".to_string());
+    upsert_session_metadata(&mut session.metadata, "Host", ssh_target.to_string());
+    upsert_session_metadata(&mut session.metadata, "UUID", scanned.session_id.clone());
+    upsert_session_metadata(&mut session.metadata, "Cwd", scanned.cwd.clone());
+    upsert_session_metadata(&mut session.metadata, "Started", scanned.started_at.clone());
+    upsert_session_metadata(
+        &mut session.metadata,
+        "Updated",
+        modified_epoch_display(scanned.modified_epoch),
+    );
+    upsert_session_metadata(&mut session.metadata, "Messages", messages);
 }
 
 fn collect_codex_session_files(

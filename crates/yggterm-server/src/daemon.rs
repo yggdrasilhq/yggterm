@@ -388,6 +388,9 @@ impl DaemonRuntime {
                 self.snapshot_response(Some(format!("focused {key}")))
             }
             ServerRequest::SetViewMode { mode } => {
+                if mode == WorkspaceViewMode::Rendered {
+                    let _ = self.server.refresh_active_session_preview_from_source();
+                }
                 self.server.set_view_mode(mode);
                 if mode == WorkspaceViewMode::Terminal {
                     self.ensure_terminal_for_active()?;
