@@ -215,6 +215,9 @@ Notifications are reusable shell components, not one-off project afterthoughts.
 - Notification history panels are acceptable when the product benefits from persistent event history.
 - Clear-one and clear-all actions should be supported when a notification panel exists.
 - In-app toasts should usually sit horizontally centered near the top of the app, not pinned to a screen edge.
+- Long-running work such as generation, caching, indexing, sync, or remote bootstrap should use reusable job notifications with a visible progress bar.
+- Background jobs should not be silent; if the work may take more than a moment, the shell should make that work legible.
+- Job notifications should coalesce by task identity instead of stacking duplicate progress cards.
 
 ### Update system
 
