@@ -138,14 +138,21 @@ jobs:
       - package-linux-deb
     runs-on: ubuntu-24.04
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: release-artifacts
           merge-multiple: true
 
+      - name: Generate curated release notes
+        run: ./scripts/release-notes.sh "${{ github.ref_name }}" > release-artifacts/RELEASE_NOTES.md
+
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@v2
         with:
+          body_path: release-artifacts/RELEASE_NOTES.md
           files: |
             release-artifacts/*
