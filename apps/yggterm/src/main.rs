@@ -2,6 +2,8 @@ use anyhow::Result;
 use std::fs;
 use std::io::Read;
 use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use yggterm_core::{
@@ -11,7 +13,7 @@ use yggterm_core::{
 };
 use yggterm_server::{
     SessionKind, cleanup_legacy_daemons, default_endpoint, detect_ghostty_host, ping, run_attach,
-    run_daemon, run_remote_protocol_version, run_remote_resume_codex, run_remote_scan,
+    run_daemon, run_remote_preview, run_remote_protocol_version, run_remote_resume_codex, run_remote_scan,
     run_remote_stage_clipboard_png, run_remote_upsert_generated_copy, shutdown,
     start_local_session, status,
 };
@@ -56,6 +58,9 @@ fn main() -> Result<()> {
     if args.len() >= 3 && args[0] == "server" && args[1] == "remote" && args[2] == "scan" {
         return run_remote_scan(args.get(3).map(String::as_str));
     }
+    if args.len() == 4 && args[0] == "server" && args[1] == "remote" && args[2] == "preview" {
+        return run_remote_preview(&args[3]);
+    }
     if args.len() == 4 && args[0] == "server" && args[1] == "remote" && args[2] == "upsert-generated-copy" {
         return run_remote_upsert_generated_copy(&args[3]);
     }
@@ -64,6 +69,18 @@ fn main() -> Result<()> {
         if let Some(message) = shutdown(&endpoint)? {
             println!("{message}");
         }
+        return Ok(());
+    }
+    if args.as_slice() == ["server", "ping"] {
+        let endpoint = default_endpoint(store.home_dir());
+        ping(&endpoint)?;
+        println!("pong");
+        return Ok(());
+    }
+    if args.as_slice() == ["server", "status"] {
+        let endpoint = default_endpoint(store.home_dir());
+        let runtime = status(&endpoint)?;
+        println!("{}", serde_json::to_string_pretty(&runtime)?);
         return Ok(());
     }
     if args.as_slice() == ["server", "smoke"] {
@@ -89,6 +106,7 @@ fn main() -> Result<()> {
     let theme = settings.theme;
     let prefer_ghostty_backend = settings.prefer_ghostty_backend;
     let endpoint = default_endpoint(store.home_dir());
+    install_signal_shutdown(endpoint.clone());
     let cleanup_span = PerfSpan::start(&startup_home, "startup", "cleanup_legacy_daemons");
     let _ = cleanup_legacy_daemons(&endpoint, &current_exe);
     cleanup_span.finish(serde_json::json!({}));
@@ -118,6 +136,23 @@ fn main() -> Result<()> {
     }));
     let _ = shutdown(&endpoint);
     launch_result
+}
+
+fn install_signal_shutdown(endpoint: yggterm_server::ServerEndpoint) {
+    static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
+    if HANDLER_INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let shutdown_started = Arc::new(AtomicBool::new(false));
+    let handler_flag = shutdown_started.clone();
+    let _ = ctrlc::set_handler(move || {
+        if handler_flag.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let _ = shutdown(&endpoint);
+        std::process::exit(130);
+    });
 }
 
 fn install_panic_logging(home_dir: &std::path::Path) {
