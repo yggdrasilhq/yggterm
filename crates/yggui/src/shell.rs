@@ -768,6 +768,12 @@ impl ShellState {
         } else {
             self.browser.ensure_visible_path(&active.session_path);
         }
+        self.selected_tree_paths.clear();
+        self.selected_tree_paths.insert(active.session_path.clone());
+        self.selection_anchor = Some(active.session_path.clone());
+        if !active.session_path.starts_with("remote-session://") {
+            self.browser.select_path(active.session_path.clone());
+        }
         self.sync_browser_settings();
     }
 
@@ -1809,6 +1815,12 @@ fn queue_title_generation(state: Signal<ShellState>, row: BrowserRow, force: boo
     }
 }
 
+fn spawn_deferred_title_generation(state: Signal<ShellState>, row: BrowserRow, force: bool) {
+    spawn(async move {
+        queue_title_generation(state, row, force);
+    });
+}
+
 fn queue_active_session_title_generation(state: Signal<ShellState>, force: bool) {
     let Some(target) = safe_shell_read(state, "queue_active_session_title_generation_read", |shell| {
         let session = shell.server.active_session().cloned()?;
@@ -1818,6 +1830,12 @@ fn queue_active_session_title_generation(state: Signal<ShellState>, force: bool)
         return;
     };
     spawn_title_generation_for_target(state, target, force, force, true);
+}
+
+fn spawn_deferred_active_session_title_generation(state: Signal<ShellState>, force: bool) {
+    spawn(async move {
+        queue_active_session_title_generation(state, force);
+    });
 }
 
 fn spawn_title_generation_for_target(
@@ -2632,6 +2650,11 @@ fn initial_server_sync(
 ) -> Result<(ServerUiSnapshot, Option<ServerRuntimeStatus>, String)> {
     ensure_daemon_running(&endpoint)?;
 
+    #[cfg(debug_assertions)]
+    {
+        restart_daemon(&endpoint)?;
+    }
+
     let mut runtime = status(&endpoint).ok();
     if runtime
         .as_ref()
@@ -2881,6 +2904,8 @@ fn spawn_open_session_row(mut state: Signal<ShellState>, row: BrowserRow) {
         }?;
         if prefer_terminal {
             request_terminal_launch(&endpoint)
+        } else if row.full_path.starts_with("remote-session://") {
+            daemon_set_view_mode(&endpoint, WorkspaceViewMode::Rendered)
         } else {
             Ok(opened)
         }
@@ -3621,7 +3646,7 @@ fn merged_sidebar_rows(
     stored_rows: &[BrowserRow],
     remote_machines: &[RemoteMachineSnapshot],
     ssh_targets: &[SshConnectTarget],
-    _live_sessions: &[ManagedSessionView],
+    live_sessions: &[ManagedSessionView],
     expanded_paths: &HashSet<String>,
 ) -> Vec<BrowserRow> {
     if ssh_targets.is_empty() && remote_machines.is_empty() {
@@ -3657,11 +3682,85 @@ fn merged_sidebar_rows(
             },
         );
     }
+    merge_remote_live_sessions(&mut machine_rows, ssh_targets, live_sessions);
     for machine in machine_rows.into_values() {
         push_remote_machine_rows(&mut rows, &machine, expanded_paths);
     }
     rows.extend_from_slice(stored_rows);
     rows
+}
+
+fn merge_remote_live_sessions(
+    machine_rows: &mut BTreeMap<String, SidebarRemoteMachine>,
+    ssh_targets: &[SshConnectTarget],
+    live_sessions: &[ManagedSessionView],
+) {
+    for session in live_sessions {
+        let Some((machine_key, session_id)) = parse_remote_scanned_session_path(&session.session_path)
+        else {
+            continue;
+        };
+        let machine = machine_rows
+            .entry(machine_key.to_string())
+            .or_insert_with(|| SidebarRemoteMachine {
+                key: machine_key.to_string(),
+                label: ssh_targets
+                    .iter()
+                    .find(|target| machine_key_from_labelish(&target.ssh_target) == machine_key)
+                    .map(ssh_target_machine_label)
+                    .unwrap_or_else(|| format!("{machine_key} [ok]")),
+                health: MachineHealth::Healthy,
+                scanned_sessions: Vec::new(),
+            });
+        if machine
+            .scanned_sessions
+            .iter()
+            .any(|existing| existing.session_path == session.session_path)
+        {
+            continue;
+        }
+        machine
+            .scanned_sessions
+            .push(remote_scanned_session_from_live(machine_key, session_id, session));
+    }
+}
+
+fn remote_scanned_session_from_live(
+    _machine_key: &str,
+    session_id: &str,
+    session: &ManagedSessionView,
+) -> RemoteScannedSession {
+    let cwd = metadata_value(session, "Cwd");
+    let storage_path = metadata_value(session, "Storage");
+    let started_at = metadata_value(session, "Started");
+    let recent_context = preview_context_from_session(session).unwrap_or_default();
+    let user_message_count = session
+        .preview
+        .blocks
+        .iter()
+        .filter(|block| block.tone == PreviewTone::User)
+        .count();
+    let assistant_message_count = session
+        .preview
+        .blocks
+        .iter()
+        .filter(|block| block.tone == PreviewTone::Assistant)
+        .count();
+    RemoteScannedSession {
+        session_path: session.session_path.clone(),
+        session_id: session_id.to_string(),
+        cwd,
+        started_at,
+        modified_epoch: 0,
+        event_count: session.preview.blocks.len(),
+        user_message_count,
+        assistant_message_count,
+        title_hint: session.title.clone(),
+        recent_context,
+        cached_precis: None,
+        cached_summary: None,
+        storage_path,
+    }
 }
 
 #[derive(Debug)]
@@ -5972,6 +6071,19 @@ fn app() -> Element {
         );
     });
     use_effect(move || {
+        let active_path = {
+            let shell = state.read();
+            shell.server.active_session_path().map(ToOwned::to_owned)
+        };
+        let Some(active_path) = active_path else {
+            return;
+        };
+        let row_id = sidebar_row_dom_id(&active_path);
+        let _ = document::eval(&format!(
+            "requestAnimationFrame(() => document.getElementById({row_id:?})?.scrollIntoView({{ block: 'nearest', inline: 'nearest' }}));"
+        ));
+    });
+    use_effect(move || {
         let (selected_row, active_session_path, server_busy) = {
             let shell = state.read();
             (
@@ -6200,7 +6312,7 @@ fn app() -> Element {
                                     BrowserRowKind::Session | BrowserRowKind::Document => spawn_open_session_row(state, row.clone()),
                                 }
                                 if should_generate {
-                                    queue_title_generation(state, row.clone(), false);
+                                    spawn_deferred_title_generation(state, row.clone(), false);
                                 }
                             })) {
                                 warn!(
@@ -6303,7 +6415,9 @@ fn app() -> Element {
                                 }
                             }
                         },
-                        on_refresh_title: move |_| queue_active_session_title_generation(state, true),
+                        on_refresh_title: move |_| {
+                            spawn_deferred_active_session_title_generation(state, true)
+                        },
                         on_refresh_precis: move |_| {
                             if let Some(session) = state.read().server.active_session().cloned() {
                                 spawn_precis_generation(state, session, true);
@@ -6403,7 +6517,7 @@ fn app() -> Element {
                             let row = row.clone();
                             move |_| {
                                 state.with_mut(|shell| shell.regenerate_title_for_row(&row));
-                                queue_title_generation(state, row.clone(), true);
+                                spawn_deferred_title_generation(state, row.clone(), true);
                             }
                         },
                         on_refresh_remote_machine: {
@@ -6922,6 +7036,7 @@ fn SidebarRow(
     if row.kind == BrowserRowKind::Separator {
         return rsx! {
             div {
+                id: "{sidebar_row_dom_id(&row.full_path)}",
                 style: format!(
                     "width:100%; display:flex; align-items:center; gap:10px; border:none; background:transparent; cursor:{}; \
                      padding:8px 9px 8px {}px; margin:0; opacity:{}; border-radius:12px; background:{}; \
@@ -7061,6 +7176,7 @@ fn SidebarRow(
 
     rsx! {
         div {
+            id: "{sidebar_row_dom_id(&row.full_path)}",
             style: format!(
                 "width:100%; display:flex; flex-direction:column; align-items:stretch; gap:2px; \
                  border:none; border-radius:12px; background:{}; padding:6px 9px 6px {}px; margin:0; opacity:{}; cursor:{}; \
@@ -7654,7 +7770,7 @@ fn SessionHeaderCopy(
             div {
                 style: "display:flex; align-items:flex-start; gap:8px; min-width:0; min-height:0;",
                 div {
-                    style: format!("font-size:12px; line-height:1.65; color:{}; white-space:pre-wrap; overflow-wrap:anywhere; min-width:0; flex:1; max-height:180px; overflow:auto; padding-right:6px;", palette.muted),
+                    style: format!("font-size:12px; line-height:1.68; color:{}; white-space:pre-wrap; overflow-wrap:anywhere; min-width:0; flex:1; max-height:38vh; overflow:auto; padding-right:6px; scrollbar-gutter:stable;", palette.muted),
                     "{subtitle}"
                 }
                 RefreshInlineButton {
@@ -9052,6 +9168,18 @@ fn xterm_assets_bootstrap_script() -> String {
 fn terminal_host_id(session_path: &str) -> String {
     let mut id = String::from("yggterm-terminal-");
     for ch in session_path.chars() {
+        if ch.is_ascii_alphanumeric() {
+            id.push(ch.to_ascii_lowercase());
+        } else {
+            id.push('-');
+        }
+    }
+    id
+}
+
+fn sidebar_row_dom_id(path: &str) -> String {
+    let mut id = String::from("yggterm-sidebar-row-");
+    for ch in path.chars() {
         if ch.is_ascii_alphanumeric() {
             id.push(ch.to_ascii_lowercase());
         } else {
@@ -12143,6 +12271,63 @@ mod tests {
                 && row.label == "/run/smb4k/data/smbfs/dada/obsidian/codex"
         }));
         assert!(!rows.iter().any(|row| row.full_path == "__remote_folder__/jojo/run"));
+    }
+
+    #[test]
+    fn merged_sidebar_rows_include_live_remote_session_when_scan_snapshot_is_missing_it() {
+        let rows = merged_sidebar_rows(
+            &[],
+            &[RemoteMachineSnapshot {
+                machine_key: "oc".to_string(),
+                label: "oc [ok]".to_string(),
+                ssh_target: "oc".to_string(),
+                prefix: None,
+                health: RemoteMachineHealth::Healthy,
+                sessions: vec![],
+            }],
+            &[],
+            &[ManagedSessionView {
+                id: "019cf672-8d68-70a1-bd8b-68487c4fc63d".to_string(),
+                session_path: "remote-session://oc/019cf672-8d68-70a1-bd8b-68487c4fc63d".to_string(),
+                title: "Can You Change Timezone Host".to_string(),
+                kind: SessionKind::Codex,
+                host_label: "oc".to_string(),
+                source: yggterm_server::SessionSource::LiveSsh,
+                backend: TerminalBackend::Xterm,
+                bridge_available: true,
+                launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+                remote_deploy_state: yggterm_server::RemoteDeployState::Ready,
+                launch_command: String::new(),
+                status_line: String::new(),
+                terminal_lines: vec![],
+                rendered_sections: vec![],
+                preview: yggterm_server::SessionPreview {
+                    summary: vec![],
+                    blocks: vec![],
+                },
+                metadata: vec![
+                    SessionMetadataEntry { label: "Cwd", value: "/home/pi".to_string() },
+                    SessionMetadataEntry { label: "Storage", value: "/home/pi/.codex/sessions/foo.jsonl".to_string() },
+                    SessionMetadataEntry { label: "Started", value: "now".to_string() },
+                ],
+                terminal_process_id: None,
+                terminal_window_id: None,
+                terminal_host_token: None,
+                terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+                embedded_surface_id: None,
+                embedded_surface_detail: None,
+                last_launch_error: None,
+                last_window_error: None,
+                ssh_target: Some("oc".to_string()),
+                ssh_prefix: None,
+            }],
+            &HashSet::from_iter([
+                "__remote_machine__/oc".to_string(),
+                "__remote_folder__/oc/home/pi".to_string(),
+            ]),
+        );
+
+        assert!(rows.iter().any(|row| row.full_path == "remote-session://oc/019cf672-8d68-70a1-bd8b-68487c4fc63d"));
     }
 
     #[test]
