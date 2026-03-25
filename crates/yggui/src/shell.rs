@@ -486,6 +486,12 @@ impl ShellState {
         state.refresh_tree_debug("init");
         state.server_daemon_detail = state.bootstrap.server_daemon_detail.clone();
         state.hydrate_generated_copy_from_remote_cache();
+        if !state.needs_initial_server_sync {
+            state.seed_dynamic_top_level_expansions();
+            state.ensure_active_session_visible();
+            state.record_restore_issue_telemetry("init_state");
+            state.record_preview_issue_telemetry("init_state");
+        }
         if let Some(update) = state.pending_update_restart.clone() {
             state.last_action = format!("update {} ready", update.version);
             state.push_notification(
