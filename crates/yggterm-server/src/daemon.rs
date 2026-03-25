@@ -27,6 +27,8 @@ pub enum ServerEndpoint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerRuntimeStatus {
     pub server_version: String,
+    #[serde(default)]
+    pub server_build_id: u64,
     pub host_kind: String,
     pub host_detail: String,
     pub embedded_surface_supported: bool,
@@ -187,6 +189,7 @@ impl DaemonRuntime {
     fn status(&self) -> ServerRuntimeStatus {
         ServerRuntimeStatus {
             server_version: SERVER_PROTOCOL_VERSION.to_string(),
+            server_build_id: current_build_id(),
             host_kind: self.support.kind.as_str().to_string(),
             host_detail: self.support.detail.clone(),
             embedded_surface_supported: self.support.embedded_surface_supported,
@@ -484,6 +487,16 @@ impl DaemonRuntime {
         };
         Ok(response)
     }
+}
+
+fn current_build_id() -> u64 {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| fs::metadata(path).ok())
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|dur| dur.as_secs())
+        .unwrap_or_default()
 }
 
 pub fn default_endpoint(home_dir: &Path) -> ServerEndpoint {
