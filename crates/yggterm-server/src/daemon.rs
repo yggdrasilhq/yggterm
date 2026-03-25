@@ -209,8 +209,22 @@ impl DaemonRuntime {
         let Some((launch_command, cwd)) = self.server.terminal_spec(path) else {
             bail!("no terminal spec for session: {path}");
         };
-        self.terminals
-            .ensure_session(path, &launch_command, cwd.as_deref())?;
+        if self.terminals.has_session(path) {
+            if !self
+                .terminals
+                .session_matches_spec(path, &launch_command, cwd.as_deref())
+            {
+                let stop_command = self.server.terminal_stop_command(path);
+                self.terminals.restart_session(
+                    path,
+                    &launch_command,
+                    cwd.as_deref(),
+                    stop_command.as_deref(),
+                )?;
+            }
+            return Ok(());
+        }
+        self.terminals.ensure_session(path, &launch_command, cwd.as_deref())?;
         Ok(())
     }
 
