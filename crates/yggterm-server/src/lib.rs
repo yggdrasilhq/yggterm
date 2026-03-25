@@ -1481,12 +1481,22 @@ impl YggtermServer {
                         resolve_remote_yggterm_binary(&ssh_target, session.ssh_prefix.as_deref())
                             .unwrap_or_else(|_| ("yggterm".to_string(), RemoteDeployState::Planned));
                     session.remote_deploy_state = remote_deploy_state;
-                    session.launch_command = remote_ssh_launch_command(
-                        &ssh_target,
-                        session.ssh_prefix.as_deref(),
-                        &remote_binary,
-                        &["server", "attach", &session.id],
-                    );
+                    session.launch_command = if session.session_path.starts_with("remote-session://") {
+                        let cwd = session_metadata_value(session, "Cwd").unwrap_or_default();
+                        remote_ssh_launch_command(
+                            &ssh_target,
+                            session.ssh_prefix.as_deref(),
+                            &remote_binary,
+                            &["server", "remote", "resume-codex", &session.id, &cwd],
+                        )
+                    } else {
+                        remote_ssh_launch_command(
+                            &ssh_target,
+                            session.ssh_prefix.as_deref(),
+                            &remote_binary,
+                            &["server", "attach", &session.id],
+                        )
+                    };
                     upsert_session_metadata(
                         &mut session.metadata,
                         "Deploy",

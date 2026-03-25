@@ -9336,6 +9336,7 @@ fn xterm_assets_bootstrap_script() -> String {
     format!(
         r#"
         (() => {{
+          window.__yggtermXtermBootstrapError = null;
           const styleId = "yggterm-xterm-style";
           if (!document.getElementById(styleId)) {{
             const style = document.createElement("style");
@@ -9343,11 +9344,25 @@ fn xterm_assets_bootstrap_script() -> String {
             style.textContent = {css};
             document.head.appendChild(style);
           }}
-          if (!window.Terminal) {{
-            window.eval({xterm});
-          }}
-          if (!window.FitAddon || !window.FitAddon.FitAddon) {{
-            window.eval({fit});
+          const injectScript = (id, source) => {{
+            if (document.getElementById(id)) {{
+              return;
+            }}
+            const script = document.createElement("script");
+            script.id = id;
+            script.type = "text/javascript";
+            script.text = source;
+            document.head.appendChild(script);
+          }};
+          try {{
+            if (!window.Terminal) {{
+              injectScript("yggterm-xterm-script", {xterm});
+            }}
+            if (!window.FitAddon || !window.FitAddon.FitAddon) {{
+              injectScript("yggterm-xterm-fit-script", {fit});
+            }}
+          }} catch (error) {{
+            window.__yggtermXtermBootstrapError = error && error.message ? error.message : String(error);
           }}
         }})();
         "#
@@ -9539,7 +9554,13 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
             return;
         }}
         if (!window.Terminal || !window.FitAddon || !window.FitAddon.FitAddon) {{
-            host.innerHTML = '<div style="padding:18px;color:#fca5a5;font:13px system-ui;">xterm.js assets failed to load.</div>';
+            const details = [
+              window.Terminal ? "Terminal:ok" : "Terminal:missing",
+              window.FitAddon && window.FitAddon.FitAddon ? "FitAddon:ok" : "FitAddon:missing",
+              window.__yggtermXtermBootstrapError ? `Bootstrap:${{window.__yggtermXtermBootstrapError}}` : "Bootstrap:none",
+            ].join(" · ");
+            host.innerHTML = `<div style="padding:18px;color:#fca5a5;font:13px system-ui;">xterm.js assets failed to load.<br><span style="opacity:0.75">${{details}}</span></div>`;
+            dioxus.send({{ kind: "debug", message: details }});
             dioxus.send({{ kind: "ready" }});
             while (true) {{
                 await dioxus.recv();
