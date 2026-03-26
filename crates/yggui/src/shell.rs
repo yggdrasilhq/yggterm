@@ -86,7 +86,7 @@ const XTERM_CSS: &str = include_str!("../../../assets/xterm/xterm.css");
 const XTERM_JS: &str = include_str!("../../../assets/xterm/xterm.js");
 const XTERM_FIT_JS: &str = include_str!("../../../assets/xterm/addon-fit.js");
 const PREVIEW_BLOCK_WINDOW: usize = 24;
-const PREVIEW_SYNC_POLL_MS: u64 = 10_000;
+const REMOTE_PREVIEW_SYNC_DEBOUNCE_MS: u64 = 2_500;
 static XTERM_ASSETS_BOOTSTRAPPED: OnceCell<()> = OnceCell::new();
 const TREE_LOADING_DOT_CSS: &str = "@keyframes yggterm-tree-loading-dot { 0%, 80%, 100% { opacity: 0.28; transform: translateY(0px); } 40% { opacity: 1; transform: translateY(-1px); } }";
 const BACKGROUND_COPY_RETRY_MS: u64 = 300_000;
@@ -160,6 +160,7 @@ struct ShellState {
     passive_copy_failures: HashSet<String>,
     copy_retry_after_ms: HashMap<String, u64>,
     terminal_image_paste_ms: HashMap<String, u64>,
+    remote_preview_sync_after_ms: HashMap<String, u64>,
     remote_machine_refresh_requests: HashSet<String>,
     drag_paths: Vec<String>,
     drag_hover_target: Option<DragDropTarget>,
@@ -480,6 +481,7 @@ impl ShellState {
             passive_copy_failures: HashSet::new(),
             copy_retry_after_ms: HashMap::new(),
             terminal_image_paste_ms: HashMap::new(),
+            remote_preview_sync_after_ms: HashMap::new(),
             remote_machine_refresh_requests: HashSet::new(),
             drag_paths: Vec::new(),
             drag_hover_target: None,
@@ -3438,11 +3440,18 @@ fn remote_preview_fetch_target(
     server: &YggtermServer,
     session: &ManagedSessionView,
 ) -> Option<(SshConnectTarget, String)> {
-    let machine = remote_machine_for_session_path(server, &session.session_path)?;
+    remote_preview_fetch_target_for_path(server, &session.session_path)
+}
+
+fn remote_preview_fetch_target_for_path(
+    server: &YggtermServer,
+    session_path: &str,
+) -> Option<(SshConnectTarget, String)> {
+    let machine = remote_machine_for_session_path(server, session_path)?;
     let scanned = machine
         .sessions
         .iter()
-        .find(|candidate| candidate.session_path == session.session_path)?;
+        .find(|candidate| candidate.session_path == session_path)?;
     if scanned.storage_path.trim().is_empty() {
         return None;
     }
@@ -3491,6 +3500,63 @@ fn remote_preview_needs_refresh(session: &ManagedSessionView) -> bool {
                 .rendered_sections
                 .iter()
                 .any(|section| section.title == "Recent Context"))
+}
+
+fn schedule_remote_preview_sync(
+    shell: &mut ShellState,
+    session_path: &str,
+    debounce_ms: u64,
+) -> bool {
+    let now = current_millis();
+    let next_allowed = shell
+        .remote_preview_sync_after_ms
+        .get(session_path)
+        .copied()
+        .unwrap_or(0);
+    if next_allowed > now {
+        return false;
+    }
+    shell.remote_preview_sync_after_ms
+        .insert(session_path.to_string(), now.saturating_add(debounce_ms));
+    true
+}
+
+fn spawn_remote_preview_payload_sync(
+    mut state: Signal<ShellState>,
+    session_path: String,
+    reason: &'static str,
+) {
+    let fetch_target = {
+        let shell = state.read();
+        remote_preview_fetch_target_for_path(&shell.server, &session_path)
+    };
+    let Some((target, storage_path)) = fetch_target else {
+        return;
+    };
+    spawn(async move {
+        let path_for_task = session_path.clone();
+        let outcome =
+            task::spawn_blocking(move || fetch_remote_preview_payload(&target, &storage_path)).await;
+        match outcome {
+            Ok(Ok(payload)) => {
+                state.with_mut(|shell| {
+                    if apply_remote_preview_payload_for_path(
+                        &mut shell.server,
+                        &path_for_task,
+                        payload,
+                    ) {
+                        shell.record_preview_issue_telemetry(reason);
+                    }
+                });
+            }
+            Ok(Err(error)) => {
+                warn!(path=%path_for_task, error=%error, "failed to fetch remote preview payload");
+            }
+            Err(error) => {
+                warn!(path=%path_for_task, error=%error, "remote preview payload task join failed");
+            }
+        }
+    });
 }
 
 fn background_copy_job_for_target(
@@ -6536,27 +6602,6 @@ fn app() -> Element {
         spawn_summary_generation(state, session, summary_stale);
         state.with_mut(|shell| shell.next_background_copy_scan_after_ms = current_millis());
         maybe_spawn_background_copy_generation(state);
-    });
-    use_future(move || {
-        let mut state = state;
-        let mut last_preview_refresh_path = last_preview_refresh_path;
-        async move {
-            loop {
-                sleep(Duration::from_millis(PREVIEW_SYNC_POLL_MS)).await;
-                let should_rearm = {
-                    let shell = state.read();
-                    shell.server.active_view_mode() == WorkspaceViewMode::Rendered
-                        && !shell.server_busy
-                        && shell
-                            .server
-                            .active_session()
-                            .is_some_and(|session| session.session_path.starts_with("remote-session://"))
-                };
-                if should_rearm {
-                    last_preview_refresh_path.set(None);
-                }
-            }
-        }
     });
     use_effect(move || {
         let (active, view_mode, server_busy) = {
@@ -9634,11 +9679,31 @@ fn TerminalCanvas(
                                 if let Ok((next_cursor, chunks)) = terminal_read_async(endpoint.clone(), session_path.clone(), 0).await {
                                     cursor = next_cursor;
                                     read_poll_ms = if chunks.is_empty() { 140 } else { 60 };
+                                    let mut saw_meaningful_output = false;
                                     for chunk in chunks {
                                         if terminal_chunk_has_meaningful_output(&chunk.data) {
                                             terminal_has_meaningful_output.set(true);
+                                            saw_meaningful_output = true;
                                         }
                                         let _ = eval.send(TerminalJsCommand::Write { data: chunk.data });
+                                    }
+                                    if saw_meaningful_output
+                                        && session_path.starts_with("remote-session://")
+                                    {
+                                        let should_sync = state.with_mut(|shell| {
+                                            schedule_remote_preview_sync(
+                                                shell,
+                                                &session_path,
+                                                REMOTE_PREVIEW_SYNC_DEBOUNCE_MS,
+                                            )
+                                        });
+                                        if should_sync {
+                                            spawn_remote_preview_payload_sync(
+                                                state,
+                                                session_path.clone(),
+                                                "preview_refresh_from_terminal_output",
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -9760,11 +9825,31 @@ fn TerminalCanvas(
                                 } else {
                                     60
                                 };
+                                let mut saw_meaningful_output = false;
                                 for chunk in chunks {
                                     if terminal_chunk_has_meaningful_output(&chunk.data) {
                                         terminal_has_meaningful_output.set(true);
+                                        saw_meaningful_output = true;
                                     }
                                     let _ = eval.send(TerminalJsCommand::Write { data: chunk.data });
+                                }
+                                if saw_meaningful_output
+                                    && session_path.starts_with("remote-session://")
+                                {
+                                    let should_sync = state.with_mut(|shell| {
+                                        schedule_remote_preview_sync(
+                                            shell,
+                                            &session_path,
+                                            REMOTE_PREVIEW_SYNC_DEBOUNCE_MS,
+                                        )
+                                    });
+                                    if should_sync {
+                                        spawn_remote_preview_payload_sync(
+                                            state,
+                                            session_path.clone(),
+                                            "preview_refresh_from_terminal_output",
+                                        );
+                                    }
                                 }
                             }
                             Err(error) => {
