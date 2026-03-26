@@ -6480,53 +6480,53 @@ fn app() -> Element {
             let shell = state.read();
             remote_preview_fetch_target(&shell.server, &session)
         };
-        if remote_preview_needs_refresh(&session) {
-            if let Some((target, storage_path)) = fetch_target {
-                let session_path = session.session_path.clone();
-                spawn(async move {
-                    let path_for_task = session_path.clone();
-                    let outcome = task::spawn_blocking(move || {
-                        fetch_remote_preview_payload(&target, &storage_path)
-                    })
-                    .await;
-                    match outcome {
-                        Ok(Ok(payload)) => {
-                            state.with_mut(|shell| {
-                                if apply_remote_preview_payload_for_path(
-                                    &mut shell.server,
-                                    &path_for_task,
-                                    payload,
-                                ) {
-                                    shell.record_preview_issue_telemetry(
-                                        "preview_refresh_applied_client_side",
-                                    );
-                                }
-                            });
-                        }
-                        Ok(Err(error)) => {
-                            warn!(path=%path_for_task, error=%error, "failed to fetch remote preview payload from ui");
+        if let Some((target, storage_path)) = fetch_target {
+            let session_path = session.session_path.clone();
+            let needs_refresh = remote_preview_needs_refresh(&session);
+            spawn(async move {
+                let path_for_task = session_path.clone();
+                let outcome =
+                    task::spawn_blocking(move || fetch_remote_preview_payload(&target, &storage_path))
+                        .await;
+                match outcome {
+                    Ok(Ok(payload)) => {
+                        state.with_mut(|shell| {
+                            if apply_remote_preview_payload_for_path(
+                                &mut shell.server,
+                                &path_for_task,
+                                payload,
+                            ) {
+                                shell.record_preview_issue_telemetry(if needs_refresh {
+                                    "preview_refresh_applied_client_side"
+                                } else {
+                                    "preview_refresh_synced_client_side"
+                                });
+                            }
+                        });
+                    }
+                    Ok(Err(error)) => {
+                        warn!(path=%path_for_task, error=%error, "failed to fetch remote preview payload from ui");
+                        if needs_refresh {
                             spawn_server_snapshot_action(
                                 state,
                                 "refreshing preview".to_string(),
                                 move |endpoint| daemon_set_view_mode(&endpoint, WorkspaceViewMode::Rendered),
                             );
                         }
-                        Err(error) => {
-                            warn!(path=%path_for_task, error=%error, "preview payload task join failed");
-                        }
                     }
-                });
-            } else {
-                spawn_server_snapshot_action(
-                    state,
-                    "refreshing preview".to_string(),
-                    move |endpoint| daemon_set_view_mode(&endpoint, WorkspaceViewMode::Rendered),
-                );
-            }
+                    Err(error) => {
+                        warn!(path=%path_for_task, error=%error, "preview payload task join failed");
+                    }
+                }
+            });
         } else {
             spawn_server_snapshot_action(
                 state,
-                "syncing preview".to_string(),
+                if remote_preview_needs_refresh(&session) {
+                    "refreshing preview".to_string()
+                } else {
+                    "syncing preview".to_string()
+                },
                 move |endpoint| daemon_set_view_mode(&endpoint, WorkspaceViewMode::Rendered),
             );
         }
