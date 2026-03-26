@@ -100,6 +100,7 @@ const BACKGROUND_COPY_IDLE_MS: u64 = 120_000;
 const THEME_EDITOR_PAD_SIZE: f64 = 286.0;
 const SEARCH_INPUT_ID: &str = "yggterm-search-input";
 const PREVIEW_HEADER_SEARCH_HIT_ID: &str = "__preview_header__";
+const DEBUG_REQUEST_DELAY_ENV: &str = "YGGTERM_DEBUG_REQUEST_DELAY_MS";
 type WorkspaceReorderPlanItem = TreeReorderPlanItem<BrowserRowKind>;
 
 #[derive(Debug, Clone)]
@@ -896,8 +897,16 @@ impl ShellState {
         };
     }
 
-    fn begin_busy_request(&mut self, request_meta: YggRequestMeta, label: String) {
-        self.busy_request_id = Some(request_meta.request_id.clone());
+    fn begin_surface_request(
+        &mut self,
+        request_meta: YggRequestMeta,
+        label: String,
+        global_busy: bool,
+    ) {
+        if global_busy {
+            self.busy_request_id = Some(request_meta.request_id.clone());
+            self.server_busy = true;
+        }
         self.active_surface_requests.insert(
             request_meta.surface,
             ActiveSurfaceRequest {
@@ -905,8 +914,11 @@ impl ShellState {
                 operation: request_meta.operation,
             },
         );
-        self.server_busy = true;
         self.last_action = label;
+    }
+
+    fn begin_busy_request(&mut self, request_meta: YggRequestMeta, label: String) {
+        self.begin_surface_request(request_meta, label, true);
     }
 
     fn finish_busy_request_for(&mut self, request_id: &str) {
@@ -2052,7 +2064,6 @@ fn spawn_loading_notice(
                 .get(&surface)
                 .map(|request| request.request_id.as_str())
                 != Some(request_id.as_str())
-                || !shell.server_busy
             {
                 return;
             }
@@ -3222,6 +3233,19 @@ fn read_daemon_startup_log_tail(endpoint: &ServerEndpoint) -> String {
     }
 }
 
+async fn maybe_debug_request_delay() {
+    let Some(raw) = std::env::var(DEBUG_REQUEST_DELAY_ENV).ok() else {
+        return;
+    };
+    let Ok(delay_ms) = raw.parse::<u64>() else {
+        return;
+    };
+    if delay_ms == 0 {
+        return;
+    }
+    sleep(Duration::from_millis(delay_ms)).await;
+}
+
 fn maybe_spawn_missing_remote_machine_refreshes(state: Signal<ShellState>) {
     let Some(pending) = safe_shell_read(
         state,
@@ -3292,10 +3316,36 @@ fn maybe_spawn_missing_remote_machine_refreshes(state: Signal<ShellState>) {
 
 fn spawn_background_remote_machine_refresh(state: Signal<ShellState>, machine_key: String) {
     let endpoint = state.read().bootstrap.server_endpoint.clone();
+    let request_meta = YggRequestMeta::background(
+        format!("remote-machine-refresh-{}-{}", machine_key, current_millis()),
+        "refresh_remote_machine",
+        YggSurface::Sidebar,
+        YggTarget::RemoteMachine {
+            machine_key: machine_key.clone(),
+        },
+    );
+    let _ = safe_shell_mut(state, "remote_machine_refresh_begin", |shell| {
+        shell.begin_surface_request(
+            request_meta.clone(),
+            format!("refreshing {machine_key}"),
+            false,
+        );
+    });
+    spawn_loading_notice(
+        state,
+        request_meta.clone(),
+        "Remote Machine Still Refreshing",
+        format!(
+            "{machine_key} is still syncing. Yggterm is keeping the rest of the shell interactive while the sidebar refresh continues."
+        ),
+    );
     spawn(async move {
+        maybe_debug_request_delay().await;
         let request_machine_key = machine_key.clone();
         let outcome = task::spawn_blocking(move || refresh_remote_machine(&endpoint, &request_machine_key)).await;
+        let request_id = request_meta.request_id.clone();
         let _ = safe_shell_mut(state, "remote_machine_refresh_complete", |shell| {
+            shell.finish_busy_request_for(&request_id);
             shell.remote_machine_refresh_requests.remove(&machine_key);
             match outcome {
                 Ok(Ok((snapshot, message))) => {
@@ -3338,6 +3388,7 @@ where
     );
 
     spawn(async move {
+        maybe_debug_request_delay().await;
         let outcome = task::spawn_blocking(move || request(endpoint)).await;
         let request_id = request_meta.request_id.clone();
         let _ = safe_shell_mut(state, "server_snapshot_action_complete", |shell| match outcome {
@@ -3420,6 +3471,7 @@ fn spawn_open_session_row(mut state: Signal<ShellState>, row: BrowserRow) {
     let endpoint = state.read().bootstrap.server_endpoint.clone();
     let pending_label = format!("opening {}", row.label);
     spawn(async move {
+        maybe_debug_request_delay().await;
         let row_for_request = row.clone();
         let outcome = task::spawn_blocking(move || {
             let opened = if let Some((machine_key, session_id)) =
@@ -3511,6 +3563,7 @@ fn spawn_connect_ssh_custom(mut state: Signal<ShellState>) {
         );
     let endpoint = state.read().bootstrap.server_endpoint.clone();
     spawn(async move {
+        maybe_debug_request_delay().await;
         let target_for_request = target.clone();
         let target_for_message = target.clone();
         let outcome = task::spawn_blocking(move || {
@@ -3896,10 +3949,36 @@ fn spawn_remote_preview_payload_sync(
     let Some((target, storage_path)) = fetch_target else {
         return;
     };
+    let request_meta = YggRequestMeta::background(
+        format!("remote-preview-sync-{}-{}", session_path, current_millis()),
+        "remote_preview_sync",
+        YggSurface::Preview,
+        YggTarget::Preview {
+            session_path: session_path.clone(),
+        },
+    );
+    let _ = safe_shell_mut(state, "remote_preview_sync_begin", |shell| {
+        shell.begin_surface_request(
+            request_meta.clone(),
+            "refreshing preview".to_string(),
+            false,
+        );
+    });
+    spawn_loading_notice(
+        state,
+        request_meta.clone(),
+        "Preview Still Refreshing",
+        "The remote preview is still syncing. Yggterm is keeping the current preview visible while newer content arrives.",
+    );
     spawn(async move {
+        maybe_debug_request_delay().await;
         let path_for_task = session_path.clone();
         let outcome =
             task::spawn_blocking(move || fetch_remote_preview_payload(&target, &storage_path)).await;
+        let request_id = request_meta.request_id.clone();
+        let _ = safe_shell_mut(state, "remote_preview_sync_finish", |shell| {
+            shell.finish_busy_request_for(&request_id);
+        });
         match outcome {
             Ok(Ok(payload)) => {
                 state.with_mut(|shell| {
