@@ -1,4 +1,4 @@
-use crate::{AppSettings, read_codex_transcript_messages};
+use crate::{AppSettings, generation_context_from_messages, read_codex_transcript_messages};
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
 use rusqlite::{Connection, params};
@@ -329,7 +329,10 @@ impl SessionTitleResolver {
     ) -> Result<Option<String>> {
         if !force {
             if let Some(precis) = self.store.get_precis(session_id)? {
-                return Ok(Some(precis));
+                if !looks_like_low_signal_generated_copy(&precis) {
+                    return Ok(Some(precis));
+                }
+                let _ = self.store.delete_precis(session_id);
             }
         } else {
             let _ = self.store.delete_precis(session_id);
@@ -371,7 +374,10 @@ impl SessionTitleResolver {
     ) -> Result<Option<String>> {
         if !force {
             if let Some(precis) = self.store.get_precis(session_id)? {
-                return Ok(Some(precis));
+                if !looks_like_low_signal_generated_copy(&precis) {
+                    return Ok(Some(precis));
+                }
+                let _ = self.store.delete_precis(session_id);
             }
         } else {
             let _ = self.store.delete_precis(session_id);
@@ -413,7 +419,10 @@ impl SessionTitleResolver {
     ) -> Result<Option<String>> {
         if !force {
             if let Some(summary) = self.store.get_summary(session_id)? {
-                return Ok(Some(summary));
+                if !looks_like_low_signal_generated_copy(&summary) {
+                    return Ok(Some(summary));
+                }
+                let _ = self.store.delete_summary(session_id);
             }
         } else {
             let _ = self.store.delete_summary(session_id);
@@ -455,7 +464,10 @@ impl SessionTitleResolver {
     ) -> Result<Option<String>> {
         if !force {
             if let Some(summary) = self.store.get_summary(session_id)? {
-                return Ok(Some(summary));
+                if !looks_like_low_signal_generated_copy(&summary) {
+                    return Ok(Some(summary));
+                }
+                let _ = self.store.delete_summary(session_id);
             }
         } else {
             let _ = self.store.delete_summary(session_id);
@@ -495,24 +507,7 @@ pub fn settings_ready(settings: &AppSettings) -> bool {
 }
 
 fn extract_tail_context(path: &Path) -> Result<String> {
-    let mut snippets = Vec::<String>::new();
-    for message in read_codex_transcript_messages(path)? {
-        snippets.push(format!(
-            "{}: {}",
-            message.role.display_label(),
-            message.lines.join(" ")
-        ));
-    }
-
-    let tail = snippets
-        .into_iter()
-        .rev()
-        .take(6)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>();
-    Ok(tail.join("\n"))
+    Ok(generation_context_from_messages(&read_codex_transcript_messages(path)?))
 }
 
 fn request_litellm_title(settings: &AppSettings, context: &str) -> Result<String> {
@@ -528,11 +523,11 @@ fn request_litellm_title(settings: &AppSettings, context: &str) -> Result<String
         "messages": [
             {
                 "role": "system",
-                "content": "Generate a short UI title for a terminal or Codex session. Return only the title, 2 to 6 words, no quotes, no markdown, no trailing punctuation."
+                "content": "Generate a short UI title for a long-running coding or terminal session. Infer the main task from the overall objective and substantive recent work. Ignore boilerplate, tool chatter, screenshot-transcription chatter, launch/bootstrap notes, and policy text unless they are the actual task. Return only the title, 2 to 6 words, no quotes, no markdown, no trailing punctuation."
             },
             {
                 "role": "user",
-                "content": format!("Create a concise session title from this recent context:\n\n{context}")
+                "content": format!("Create a concise session title from this structured session context.\nPrioritize the main user goal and the concrete work being done now.\n\n{context}")
             }
         ]
     });
@@ -589,11 +584,11 @@ fn request_litellm_precis(settings: &AppSettings, context: &str) -> Result<Strin
         "messages": [
             {
                 "role": "system",
-                "content": "Generate a short terminal-session precis for a desktop header. Return only one concise sentence or two very short sentences, no markdown, no bullets, no quotes."
+                "content": "Generate a short desktop-header precis for a long-running coding or terminal session. State the current task and the most important current progress in one or two crisp sentences. Ignore boilerplate, screenshot-transcription chatter, launch/bootstrap notes, and policy text unless they are central to the task. No markdown, no bullets, no quotes."
             },
             {
                 "role": "user",
-                "content": format!("Create a concise UI precis from this recent session context:\n\n{context}")
+                "content": format!("Create a concise UI precis from this structured session context.\nFocus on what the operator is currently trying to achieve and what has already been established.\n\n{context}")
             }
         ]
     });
@@ -650,11 +645,11 @@ fn request_litellm_summary(settings: &AppSettings, context: &str) -> Result<Stri
         "messages": [
             {
                 "role": "system",
-                "content": "Generate a concise but complete desktop session summary. Return a single short paragraph of 3 to 5 sentences, no markdown, no bullets, no quotes. Cover the current objective, the concrete work already done, and the likely next step."
+                "content": "Generate a concise but useful desktop session summary for a long-running coding or terminal session. Return one short paragraph of 3 to 5 sentences, plain prose only. Cover: 1) the main objective, 2) concrete progress/results so far, and 3) the most likely next step. Ignore boilerplate, screenshot-transcription chatter, launch/bootstrap notes, and policy text unless they are central to the work."
             },
             {
                 "role": "user",
-                "content": format!("Create a concise preview summary from this recent session context:\n\n{context}")
+                "content": format!("Create a concise preview summary from this structured session context.\nDo not summarize the instructions themselves unless they are the subject of the work.\nPrefer the real task, verified findings, and latest progress.\n\n{context}")
             }
         ]
     });
@@ -992,6 +987,30 @@ pub fn looks_like_generated_fallback_title(title: &str) -> bool {
             .chars()
             .skip(1)
             .all(|ch| ch.is_ascii_hexdigit())
+}
+
+pub fn looks_like_low_signal_generated_copy(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return true;
+    }
+    [
+        "collaboration mode:",
+        "filesystem sandboxing",
+        "request_user_input",
+        "environment_context",
+        "open live terminal",
+        "this session should land in the main viewport",
+        "launch command prepared",
+        "remote bootstrap will eventually",
+        "server launch",
+        "viewed image",
+        "it's a screenshot of",
+        "the main visible text shows",
+        "other visible ui details",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn heuristic_copy_lines(context: &str) -> Vec<String> {

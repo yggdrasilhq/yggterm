@@ -53,7 +53,8 @@ use yggterm_core::{
     AgentSessionProfile, AppSettings, BrowserRow, BrowserRowKind, InstallContext, PerfSpan,
     SessionBrowserState, SessionNode, SessionStore, UiTheme, WorkspaceDocumentInput,
     WorkspaceDocumentKind, WorkspaceGroupKind, check_for_update, save_settings_file,
-    install_release_update, looks_like_generated_fallback_title, refresh_desktop_integration,
+    install_release_update, looks_like_generated_fallback_title,
+    looks_like_low_signal_generated_copy, refresh_desktop_integration,
     unique_session_short_ids_for_pairs, update_command_hint, YgguiThemeSpec,
 };
 use yggterm_platform::DockRect;
@@ -3614,7 +3615,11 @@ fn resolved_session_precis(shell: &ShellState, session: &ManagedSessionView) -> 
         .generated_precis
         .get(&session.session_path)
         .cloned()
-        .or_else(|| remote_generated_copy(&shell.server, &session.session_path).and_then(|(_, precis, _)| precis))
+        .or_else(|| {
+            remote_generated_copy(&shell.server, &session.session_path)
+                .and_then(|(_, precis, _)| precis)
+        })
+        .filter(|precis| !looks_like_low_signal_generated_copy(precis))
 }
 
 fn resolved_session_summary(shell: &ShellState, session: &ManagedSessionView) -> Option<String> {
@@ -3626,6 +3631,7 @@ fn resolved_session_summary(shell: &ShellState, session: &ManagedSessionView) ->
             remote_generated_copy(&shell.server, &session.session_path)
                 .and_then(|(_, _, summary)| summary)
         })
+        .filter(|summary| !looks_like_low_signal_generated_copy(summary))
 }
 
 fn looks_like_truncated_summary(summary: &str) -> bool {
