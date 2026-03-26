@@ -5556,6 +5556,7 @@ dependencies = [
  "anyhow",
  "base64",
  "dioxus",
+ "libc",
  "once_cell",
  "png",
  "serde",
