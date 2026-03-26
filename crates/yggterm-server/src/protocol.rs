@@ -162,4 +162,22 @@ impl YggRequestMeta {
             notify_loading_after_ms: YGG_LOADING_NOTIFICATION_AFTER_MS,
         }
     }
+
+    pub fn background(
+        request_id: impl Into<String>,
+        operation: impl Into<String>,
+        surface: YggSurface,
+        target: YggTarget,
+    ) -> Self {
+        Self {
+            request_id: request_id.into(),
+            operation: operation.into(),
+            target,
+            surface,
+            priority: YggOperationPriority::Background,
+            cache_policy: YggCachePolicy::PreferStaleThenRefresh,
+            stale_ok_after_ms: Some(0),
+            notify_loading_after_ms: YGG_LOADING_NOTIFICATION_AFTER_MS,
+        }
+    }
 }
