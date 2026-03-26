@@ -4,7 +4,7 @@ use serde_json::Value;
 pub const YGG_PROTOCOL_SCHEMA_VERSION: &str = "2026-03-26";
 pub const YGG_LOADING_NOTIFICATION_AFTER_MS: u64 = 3_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum YggOperationPriority {
     Interactive,
@@ -12,7 +12,7 @@ pub enum YggOperationPriority {
     Passive,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum YggCachePolicy {
     RequireFresh,
@@ -21,7 +21,7 @@ pub enum YggCachePolicy {
     CacheOnly,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum YggSurface {
     App,
