@@ -83,10 +83,12 @@ static PASSIVE_COPY_SUSPENDED: AtomicBool = AtomicBool::new(false);
 static PREVIEW_BLOCK_CACHE: OnceCell<Mutex<PreviewBlockCache>> = OnceCell::new();
 static PREVIEW_CONTENT_CACHE: OnceCell<Mutex<PreviewContentCache>> = OnceCell::new();
 static PREVIEW_RUN_CACHE: OnceCell<Mutex<PreviewRunCache>> = OnceCell::new();
+static SIDEBAR_MERGE_CACHE: OnceCell<Mutex<SidebarMergeCache>> = OnceCell::new();
 
 const PREVIEW_BLOCK_CACHE_LIMIT: usize = 256;
 const PREVIEW_CONTENT_CACHE_LIMIT: usize = 256;
 const PREVIEW_RUN_CACHE_LIMIT: usize = 256;
+const SIDEBAR_MERGE_CACHE_LIMIT: usize = 128;
 const SIDE_RAIL_WIDTH: usize = 292;
 const DEFERRED_STARTUP_SYNC_MS: u64 = 8_000;
 const EDGE_RESIZE_HANDLE: usize = 5;
@@ -480,6 +482,12 @@ struct PreviewContentCache {
 struct PreviewRunCache {
     order: VecDeque<u64>,
     entries: HashMap<u64, Vec<PreviewRun>>,
+}
+
+#[derive(Default)]
+struct SidebarMergeCache {
+    order: VecDeque<u64>,
+    entries: HashMap<u64, Vec<BrowserRow>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4564,6 +4572,10 @@ fn preview_run_cache() -> &'static Mutex<PreviewRunCache> {
     PREVIEW_RUN_CACHE.get_or_init(|| Mutex::new(PreviewRunCache::default()))
 }
 
+fn sidebar_merge_cache() -> &'static Mutex<SidebarMergeCache> {
+    SIDEBAR_MERGE_CACHE.get_or_init(|| Mutex::new(SidebarMergeCache::default()))
+}
+
 fn preview_content_cache_key(lines: &[String]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for line in lines {
@@ -4588,6 +4600,86 @@ fn preview_run_cache_key(blocks: &[SessionPreviewBlock], start_index: usize) -> 
             0xff_u8.hash(&mut hasher);
         }
         0xfe_u8.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn sidebar_merge_cache_key(
+    stored_rows: &[BrowserRow],
+    remote_machines: &[RemoteMachineSnapshot],
+    ssh_targets: &[SshConnectTarget],
+    live_sessions: &[ManagedSessionView],
+    expanded_paths: &HashSet<String>,
+) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for row in stored_rows {
+        match row.kind {
+            BrowserRowKind::Group => 1_u8,
+            BrowserRowKind::Separator => 2_u8,
+            BrowserRowKind::Session => 3_u8,
+            BrowserRowKind::Document => 4_u8,
+        }
+        .hash(&mut hasher);
+        row.full_path.hash(&mut hasher);
+        row.label.hash(&mut hasher);
+        row.detail_label.hash(&mut hasher);
+        row.session_title.hash(&mut hasher);
+        row.depth.hash(&mut hasher);
+        row.host_label.hash(&mut hasher);
+        row.descendant_sessions.hash(&mut hasher);
+        row.expanded.hash(&mut hasher);
+        row.session_id.hash(&mut hasher);
+        row.session_cwd.hash(&mut hasher);
+        0xfe_u8.hash(&mut hasher);
+    }
+    for machine in remote_machines {
+        machine.machine_key.hash(&mut hasher);
+        machine.label.hash(&mut hasher);
+        machine.ssh_target.hash(&mut hasher);
+        machine.prefix.hash(&mut hasher);
+        match machine.health {
+            RemoteMachineHealth::Healthy => 1_u8,
+            RemoteMachineHealth::Cached => 2_u8,
+            RemoteMachineHealth::Offline => 3_u8,
+        }
+        .hash(&mut hasher);
+        for session in &machine.sessions {
+            session.session_path.hash(&mut hasher);
+            session.session_id.hash(&mut hasher);
+            session.cwd.hash(&mut hasher);
+            session.started_at.hash(&mut hasher);
+            session.modified_epoch.hash(&mut hasher);
+            session.event_count.hash(&mut hasher);
+            session.user_message_count.hash(&mut hasher);
+            session.assistant_message_count.hash(&mut hasher);
+            session.title_hint.hash(&mut hasher);
+            session.storage_path.hash(&mut hasher);
+            0xfd_u8.hash(&mut hasher);
+        }
+        0xfc_u8.hash(&mut hasher);
+    }
+    for target in ssh_targets {
+        target.label.hash(&mut hasher);
+        target.ssh_target.hash(&mut hasher);
+        target.prefix.hash(&mut hasher);
+        target.cwd.hash(&mut hasher);
+        0xfb_u8.hash(&mut hasher);
+    }
+    for session in live_sessions {
+        session.session_path.hash(&mut hasher);
+        session.title.hash(&mut hasher);
+        session.host_label.hash(&mut hasher);
+        session.ssh_target.hash(&mut hasher);
+        session.ssh_prefix.hash(&mut hasher);
+        session.preview.blocks.len().hash(&mut hasher);
+        session.metadata.len().hash(&mut hasher);
+        0xfa_u8.hash(&mut hasher);
+    }
+    let mut expanded = expanded_paths.iter().collect::<Vec<_>>();
+    expanded.sort();
+    for path in expanded {
+        path.hash(&mut hasher);
+        0xf9_u8.hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -5374,6 +5466,54 @@ fn stage_terminal_clipboard_image(
 }
 
 fn merged_sidebar_rows(
+    stored_rows: &[BrowserRow],
+    remote_machines: &[RemoteMachineSnapshot],
+    ssh_targets: &[SshConnectTarget],
+    live_sessions: &[ManagedSessionView],
+    expanded_paths: &HashSet<String>,
+) -> Vec<BrowserRow> {
+    let key = sidebar_merge_cache_key(
+        stored_rows,
+        remote_machines,
+        ssh_targets,
+        live_sessions,
+        expanded_paths,
+    );
+    if let Ok(mut cache) = sidebar_merge_cache().lock() {
+        if let Some(hit) = cache.entries.get(&key).cloned() {
+            if let Some(ix) = cache.order.iter().position(|existing| *existing == key) {
+                cache.order.remove(ix);
+            }
+            cache.order.push_back(key);
+            return hit;
+        }
+    }
+
+    let rows = merged_sidebar_rows_uncached(
+        stored_rows,
+        remote_machines,
+        ssh_targets,
+        live_sessions,
+        expanded_paths,
+    );
+
+    if let Ok(mut cache) = sidebar_merge_cache().lock() {
+        cache.entries.insert(key, rows.clone());
+        if let Some(ix) = cache.order.iter().position(|existing| *existing == key) {
+            cache.order.remove(ix);
+        }
+        cache.order.push_back(key);
+        while cache.order.len() > SIDEBAR_MERGE_CACHE_LIMIT {
+            if let Some(oldest) = cache.order.pop_front() {
+                cache.entries.remove(&oldest);
+            }
+        }
+    }
+
+    rows
+}
+
+fn merged_sidebar_rows_uncached(
     stored_rows: &[BrowserRow],
     remote_machines: &[RemoteMachineSnapshot],
     ssh_targets: &[SshConnectTarget],
