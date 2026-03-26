@@ -66,6 +66,24 @@ impl SessionBrowserState {
         &self.rows
     }
 
+    pub fn search_rows(&self) -> Vec<BrowserRow> {
+        let filter = self.filter_query.to_ascii_lowercase();
+        let short_ids = unique_session_short_ids(&self.root);
+        let mut expanded_paths = HashSet::new();
+        collect_group_paths(&self.root, &mut expanded_paths);
+        let mut rows = Vec::new();
+        flatten_rows(
+            &self.root,
+            0,
+            &filter,
+            &expanded_paths,
+            &short_ids,
+            &mut rows,
+            true,
+        );
+        rows
+    }
+
     pub fn root(&self) -> &SessionNode {
         &self.root
     }
@@ -292,6 +310,15 @@ fn first_session_path(node: &SessionNode) -> Option<String> {
     }
 
     None
+}
+
+fn collect_group_paths(node: &SessionNode, expanded_paths: &mut HashSet<String>) {
+    if node.kind == SessionNodeKind::Group {
+        expanded_paths.insert(node.path.display().to_string());
+    }
+    for child in &node.children {
+        collect_group_paths(child, expanded_paths);
+    }
 }
 
 fn flatten_rows(
