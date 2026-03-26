@@ -1,6 +1,6 @@
 use crate::{
     GhosttyHostSupport, PersistedDaemonState, ServerUiSnapshot, SessionKind, TerminalManager,
-    WorkspaceViewMode, YggtermServer,
+    WorkspaceViewMode, YggtermServer, terminate_remote_codex_session,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -484,18 +484,36 @@ impl DaemonRuntime {
                 self.snapshot_response(Some("theme synced".to_string()))
             }
             ServerRequest::Shutdown => {
+                let remote_targets = self.server.remote_shutdown_targets();
+                let mut remote_errors = Vec::new();
+                let mut remote_stopped = 0usize;
+                for (machine, session_id) in remote_targets {
+                    match terminate_remote_codex_session(&machine, &session_id) {
+                        Ok(()) => remote_stopped += 1,
+                        Err(error) => remote_errors.push(format!(
+                            "{}:{}: {}",
+                            machine.machine_key, session_id, error
+                        )),
+                    }
+                }
                 let summary = self
                     .terminals
                     .shutdown_all(|path| self.server.terminal_stop_command(path));
                 self.persist()?;
+                let total_errors = summary.errors.len() + remote_errors.len();
                 ServerResponse::Ack {
-                    message: Some(if summary.errors.is_empty() {
-                        format!("stopped {} terminal sessions", summary.stopped)
+                    message: Some(if total_errors == 0 {
+                        format!(
+                            "stopped {} terminal sessions and {} remote persistent sessions",
+                            summary.stopped,
+                            remote_stopped
+                        )
                     } else {
                         format!(
-                            "stopped {} terminal sessions, {} errors",
+                            "stopped {} terminal sessions and {} remote persistent sessions, {} errors",
                             summary.stopped,
-                            summary.errors.len()
+                            remote_stopped,
+                            total_errors
                         )
                     }),
                 }

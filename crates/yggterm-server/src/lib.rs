@@ -27,7 +27,7 @@ use anyhow::Context;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -575,6 +575,29 @@ impl YggtermServer {
             SessionKind::Shell | SessionKind::SshShell => Some("exit\r".to_string()),
             SessionKind::Document => None,
         }
+    }
+
+    pub fn remote_shutdown_targets(&self) -> Vec<(RemoteMachineSnapshot, String)> {
+        let mut targets = Vec::new();
+        let mut seen = HashSet::<(String, String)>::new();
+        for path in self.sessions.keys() {
+            let Some((machine_key, session_id)) = parse_remote_scanned_session_path(path) else {
+                continue;
+            };
+            let dedupe_key = (machine_key.to_string(), session_id.to_string());
+            if !seen.insert(dedupe_key) {
+                continue;
+            }
+            if let Some(machine) = self
+                .remote_machines
+                .iter()
+                .find(|machine| machine.machine_key == machine_key)
+                .cloned()
+            {
+                targets.push((machine, session_id.to_string()));
+            }
+        }
+        targets
     }
 
     pub fn ssh_targets(&self) -> &[SshConnectTarget] {
@@ -1966,6 +1989,105 @@ fn remote_resume_shell_command(session_id: &str, cwd: Option<&str>, prefix: Opti
     }
 }
 
+fn remote_persistent_resume_shell_command(session_id: &str, cwd: Option<&str>) -> String {
+    match cwd.filter(|cwd| !cwd.trim().is_empty()) {
+        Some(cwd) => format!(
+            "cd {} && exec codex resume {}",
+            shell_single_quote(cwd),
+            shell_single_quote(session_id)
+        ),
+        None => format!("exec codex resume {}", shell_single_quote(session_id)),
+    }
+}
+
+fn remote_tmux_session_name(session_id: &str) -> String {
+    let suffix = session_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .take(24)
+        .collect::<String>();
+    format!("yggterm-{suffix}")
+}
+
+fn tmux_available() -> anyhow::Result<bool> {
+    Ok(Command::new("sh")
+        .arg("-lc")
+        .arg("command -v tmux >/dev/null 2>&1")
+        .status()
+        .context("checking tmux availability")?
+        .success())
+}
+
+fn tmux_has_session(session_name: &str) -> anyhow::Result<bool> {
+    Ok(Command::new("tmux")
+        .args(["has-session", "-t", session_name])
+        .status()
+        .with_context(|| format!("checking tmux session {session_name}"))?
+        .success())
+}
+
+fn tmux_spawn_codex_session(session_name: &str, command: &str) -> anyhow::Result<()> {
+    let status = Command::new("tmux")
+        .args(["new-session", "-d", "-s", session_name, "sh", "-lc", command])
+        .status()
+        .with_context(|| format!("creating tmux session {session_name}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("tmux failed to create session {session_name}: {status}");
+    }
+}
+
+fn tmux_attach_session(session_name: &str) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let error = Command::new("tmux")
+            .args(["attach-session", "-t", session_name])
+            .exec();
+        Err(anyhow::anyhow!(
+            "failed to exec tmux attach-session for {session_name}: {error}"
+        ))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let status = Command::new("tmux")
+            .args(["attach-session", "-t", session_name])
+            .status()
+            .with_context(|| format!("attaching tmux session {session_name}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            anyhow::bail!("tmux attach-session failed for {session_name}: {status}");
+        }
+    }
+}
+
+fn tmux_send_keys(session_name: &str, text: &str) -> anyhow::Result<()> {
+    let status = Command::new("tmux")
+        .args(["send-keys", "-t", session_name, text, "Enter"])
+        .status()
+        .with_context(|| format!("sending tmux keys to {session_name}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("tmux send-keys failed for {session_name}: {status}");
+    }
+}
+
+fn tmux_kill_session(session_name: &str) -> anyhow::Result<()> {
+    let status = Command::new("tmux")
+        .args(["kill-session", "-t", session_name])
+        .status()
+        .with_context(|| format!("killing tmux session {session_name}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("tmux kill-session failed for {session_name}: {status}");
+    }
+}
+
 fn remote_ssh_launch_command(
     ssh_target: &str,
     prefix: Option<&str>,
@@ -3319,6 +3441,15 @@ pub fn run_remote_protocol_version() -> anyhow::Result<()> {
 }
 
 pub fn run_remote_resume_codex(session_id: &str, cwd: Option<&str>) -> anyhow::Result<()> {
+    if tmux_available()? {
+        let session_name = remote_tmux_session_name(session_id);
+        if !tmux_has_session(&session_name)? {
+            let command = remote_persistent_resume_shell_command(session_id, cwd);
+            tmux_spawn_codex_session(&session_name, &command)?;
+        }
+        return tmux_attach_session(&session_name);
+    }
+
     let command = remote_resume_shell_command(session_id, cwd, None);
     #[cfg(unix)]
     {
@@ -3340,6 +3471,24 @@ pub fn run_remote_resume_codex(session_id: &str, cwd: Option<&str>) -> anyhow::R
             Err(anyhow::anyhow!("remote codex resume exited with status {status}"))
         }
     }
+}
+
+pub fn run_remote_terminate_codex(session_id: &str) -> anyhow::Result<()> {
+    if !tmux_available()? {
+        return Ok(());
+    }
+    let session_name = remote_tmux_session_name(session_id);
+    if !tmux_has_session(&session_name)? {
+        return Ok(());
+    }
+    let _ = tmux_send_keys(&session_name, "/quit");
+    for _ in 0..10 {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        if !tmux_has_session(&session_name)? {
+            return Ok(());
+        }
+    }
+    tmux_kill_session(&session_name)
 }
 
 pub fn run_remote_scan(codex_home: Option<&str>) -> anyhow::Result<()> {
@@ -3544,6 +3693,55 @@ pub fn persist_remote_generated_copy(
         warn!(machine_key=%machine.machine_key, session_id, error=%error, "failed to update local remote metadata mirror");
     }
     Ok(())
+}
+
+pub fn terminate_remote_codex_session(
+    machine: &RemoteMachineSnapshot,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    match run_remote_yggterm_command(
+        &machine.ssh_target,
+        machine.prefix.as_deref(),
+        &["server", "remote", "terminate-codex", session_id],
+        None,
+    ) {
+        Ok(_) => Ok(()),
+        Err(error) if !should_fallback_to_python(&error) => Err(error),
+        Err(_) => {
+            let session_name = remote_tmux_session_name(session_id);
+            let command = format!(
+                "if command -v tmux >/dev/null 2>&1 && tmux has-session -t {} 2>/dev/null; then tmux send-keys -t {} /quit Enter >/dev/null 2>&1 || true; sleep 2; tmux kill-session -t {} >/dev/null 2>&1 || true; fi",
+                shell_single_quote(&session_name),
+                shell_single_quote(&session_name),
+                shell_single_quote(&session_name),
+            );
+            let remote = remote_shell_command(machine.prefix.as_deref(), &command);
+            let status = Command::new("ssh")
+                .arg("-o")
+                .arg("ConnectTimeout=8")
+                .arg("-o")
+                .arg("BatchMode=yes")
+                .arg(&machine.ssh_target)
+                .arg(remote)
+                .status()
+                .with_context(|| {
+                    format!(
+                        "failed to terminate remote codex session {} on {}",
+                        session_id, machine.ssh_target
+                    )
+                })?;
+            if status.success() {
+                Ok(())
+            } else {
+                anyhow::bail!(
+                    "failed to terminate remote codex session {} on {}: {}",
+                    session_id,
+                    machine.ssh_target,
+                    status
+                );
+            }
+        }
+    }
 }
 
 fn snapshot_preview_block(block: SessionPreviewBlock) -> SnapshotPreviewBlock {
