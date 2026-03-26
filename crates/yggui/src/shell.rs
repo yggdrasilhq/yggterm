@@ -80,8 +80,10 @@ use yggterm_server::{
 
 static BOOTSTRAP: OnceCell<ShellBootstrap> = OnceCell::new();
 static PASSIVE_COPY_SUSPENDED: AtomicBool = AtomicBool::new(false);
+static PREVIEW_BLOCK_CACHE: OnceCell<Mutex<PreviewBlockCache>> = OnceCell::new();
 static PREVIEW_CONTENT_CACHE: OnceCell<Mutex<PreviewContentCache>> = OnceCell::new();
 
+const PREVIEW_BLOCK_CACHE_LIMIT: usize = 256;
 const PREVIEW_CONTENT_CACHE_LIMIT: usize = 256;
 const SIDE_RAIL_WIDTH: usize = 292;
 const DEFERRED_STARTUP_SYNC_MS: u64 = 8_000;
@@ -457,6 +459,12 @@ struct SearchContentHit {
 struct ActiveSurfaceRequest {
     request_id: String,
     operation: String,
+}
+
+#[derive(Default)]
+struct PreviewBlockCache {
+    order: VecDeque<u64>,
+    entries: HashMap<u64, Vec<SessionPreviewBlock>>,
 }
 
 #[derive(Default)]
@@ -4516,6 +4524,28 @@ fn palette_is_dark(palette: Palette) -> bool {
     palette.panel == "#161c22"
 }
 
+fn preview_block_cache() -> &'static Mutex<PreviewBlockCache> {
+    PREVIEW_BLOCK_CACHE.get_or_init(|| Mutex::new(PreviewBlockCache::default()))
+}
+
+fn preview_block_cache_key(blocks: &[SessionPreviewBlock]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for block in blocks {
+        match block.tone {
+            PreviewTone::User => 1_u8,
+            PreviewTone::Assistant => 2_u8,
+        }
+        .hash(&mut hasher);
+        block.timestamp.hash(&mut hasher);
+        for line in &block.lines {
+            line.hash(&mut hasher);
+            0xff_u8.hash(&mut hasher);
+        }
+        0xfe_u8.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 fn preview_content_cache() -> &'static Mutex<PreviewContentCache> {
     PREVIEW_CONTENT_CACHE.get_or_init(|| Mutex::new(PreviewContentCache::default()))
 }
@@ -4564,7 +4594,18 @@ fn is_preview_scaffold_line(line: &str) -> bool {
 }
 
 fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlock> {
-    let mut visible = session
+    let key = preview_block_cache_key(&session.preview.blocks);
+    if let Ok(mut cache) = preview_block_cache().lock() {
+        if let Some(hit) = cache.entries.get(&key).cloned() {
+            if let Some(ix) = cache.order.iter().position(|existing| *existing == key) {
+                cache.order.remove(ix);
+            }
+            cache.order.push_back(key);
+            return hit;
+        }
+    }
+
+    let visible = session
         .preview
         .blocks
         .iter()
@@ -4625,6 +4666,20 @@ fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlo
     if visible.is_empty() {
         visible = session.preview.blocks.clone();
     }
+
+    if let Ok(mut cache) = preview_block_cache().lock() {
+        cache.entries.insert(key, visible.clone());
+        if let Some(ix) = cache.order.iter().position(|existing| *existing == key) {
+            cache.order.remove(ix);
+        }
+        cache.order.push_back(key);
+        while cache.order.len() > PREVIEW_BLOCK_CACHE_LIMIT {
+            if let Some(oldest) = cache.order.pop_front() {
+                cache.entries.remove(&oldest);
+            }
+        }
+    }
+
     visible
 }
 
@@ -7562,7 +7617,7 @@ fn app() -> Element {
     let mut dock_pulse_started = use_signal(|| false);
     let mut window_epoch = use_signal(|| 0_u64);
     let mut terminal_mount_epoch = use_signal(|| 0_u64);
-    let mut async_render_epoch = use_signal(|| 0_u64);
+    let async_render_epoch = use_signal(|| 0_u64);
     let mut last_terminal_session_path = use_signal(|| None::<String>);
     let mut last_open_recovery_path = use_signal(|| None::<String>);
     let mut last_preview_refresh_path = use_signal(|| None::<String>);
@@ -7977,7 +8032,7 @@ fn app() -> Element {
         }
     });
     use_future(move || {
-        let mut state = state;
+        let state = state;
         async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(140)).await;
