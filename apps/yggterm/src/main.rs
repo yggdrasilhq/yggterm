@@ -12,8 +12,9 @@ use yggterm_core::{
     detect_install_context, install_release_update, refresh_desktop_integration,
 };
 use yggterm_server::{
-    SessionKind, cleanup_legacy_daemons, default_endpoint, detect_ghostty_host, ping, run_attach,
-    run_daemon, run_remote_preview, run_remote_protocol_version, run_remote_resume_codex, run_remote_scan,
+    PersistedDaemonState, SessionKind, YggtermServer, cleanup_legacy_daemons, default_endpoint,
+    detect_ghostty_host, ping, run_attach, run_daemon, run_remote_preview,
+    run_remote_protocol_version, run_remote_resume_codex, run_remote_scan,
     run_remote_stage_clipboard_png, run_remote_upsert_generated_copy, shutdown,
     start_local_session, status,
 };
@@ -127,17 +128,22 @@ fn main() -> Result<()> {
     let host = detect_ghostty_host();
     host_span.finish(serde_json::json!({ "detail": host.detail }));
     let initial_server_sync_span = PerfSpan::start(&startup_home, "startup", "warm_server_sync");
-    let (initial_server_snapshot, server_daemon_detail) =
-        match yggui::initial_server_sync(endpoint.clone()) {
-            Ok((snapshot, _runtime, detail)) => (Some(snapshot), detail),
-            Err(error) => {
-                tracing::warn!(error=%error, "failed to warm server snapshot before launch");
-                (None, format!("server unavailable: {error}"))
-            }
-        };
+    let initial_server_snapshot = load_initial_server_snapshot_fast(
+        &store,
+        &browser_tree,
+        prefer_ghostty_backend,
+        &host,
+        theme,
+    );
     initial_server_sync_span.finish(serde_json::json!({
         "loaded": initial_server_snapshot.is_some(),
+        "mode": "cached_snapshot_only",
     }));
+    let server_daemon_detail = if initial_server_snapshot.is_some() {
+        "warming server in background".to_string()
+    } else {
+        "no cached server snapshot".to_string()
+    };
 
     let launch_result = yggui::launch_shell(yggui::ShellBootstrap {
         tree,
@@ -155,6 +161,7 @@ fn main() -> Result<()> {
         server_daemon_detail,
         prefer_ghostty_backend,
         pending_update_restart,
+        refresh_server_after_launch: true,
     });
     startup_span.finish(serde_json::json!({
         "update_policy": format!("{:?}", install_context.update_policy),
@@ -162,6 +169,27 @@ fn main() -> Result<()> {
     }));
     let _ = shutdown(&endpoint);
     launch_result
+}
+
+fn load_initial_server_snapshot_fast(
+    store: &SessionStore,
+    browser_tree: &SessionNode,
+    prefer_ghostty_backend: bool,
+    host: &yggterm_server::GhosttyHostSupport,
+    theme: UiTheme,
+) -> Option<yggterm_server::ServerUiSnapshot> {
+    let state_path = store.home_dir().join("server-state.json");
+    let saved = fs::read_to_string(&state_path)
+        .ok()
+        .and_then(|json| serde_json::from_str::<PersistedDaemonState>(&json).ok())?;
+    let mut server = YggtermServer::new(
+        browser_tree,
+        prefer_ghostty_backend,
+        host.clone(),
+        theme,
+    );
+    server.restore_persisted_state(saved, Some(store));
+    Some(server.snapshot())
 }
 
 fn install_signal_shutdown(endpoint: yggterm_server::ServerEndpoint) {
