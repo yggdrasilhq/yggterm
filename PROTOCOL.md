@@ -223,6 +223,13 @@ Expected semantics:
 - `reconnect-check` must see the same session after the earlier client process has exited
 - `graceful-shutdown` must terminate the daemon and make later `ping` fail
 
+Observability:
+
+- `status` should expose whether the daemon restored from persisted cached state
+- `status` should expose the restored stored/live/remote-machine counts
+- `mock-yggclient` should emit those fields in startup and reconnect scenarios so cache-path
+  regressions can be profiled without the desktop shell
+
 ## Search
 
 Search should also use the protocol mindset:

@@ -15380,6 +15380,112 @@ mod tests {
         assert_eq!(rows[0].label, "Excel Shortcut Design");
         assert_eq!(search_sidebar_matches(&rows, "Excel Shortcut Design").len(), 1);
     }
+
+    #[test]
+    fn search_content_hits_preview_header_matches_summary() {
+        let session = ManagedSessionView {
+            id: "abc".to_string(),
+            session_path: "remote-session://oc/abc".to_string(),
+            title: "Excel Shortcut Design".to_string(),
+            kind: SessionKind::Codex,
+            host_label: "oc".to_string(),
+            source: yggterm_server::SessionSource::LiveSsh,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: yggterm_server::RemoteDeployState::Ready,
+            launch_command: "codex resume abc".to_string(),
+            status_line: "ready".to_string(),
+            terminal_lines: Vec::new(),
+            rendered_sections: Vec::new(),
+            preview: yggterm_server::SessionPreview {
+                summary: vec![SessionMetadataEntry {
+                    label: "Summary",
+                    value: "Timezone fix is complete and both hosts now report Asia/Kolkata."
+                        .to_string(),
+                }],
+                blocks: Vec::new(),
+            },
+            metadata: vec![
+                SessionMetadataEntry {
+                    label: "Summary",
+                    value: "Timezone fix is complete and both hosts now report Asia/Kolkata."
+                        .to_string(),
+                },
+                SessionMetadataEntry {
+                    label: "Precis",
+                    value: "Changed ssh dev from Etc/UTC to Asia/Kolkata.".to_string(),
+                },
+            ],
+            terminal_process_id: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: yggterm_server::GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: Some("oc".to_string()),
+            ssh_prefix: None,
+        };
+
+        let hits =
+            search_content_hits(Some(&session), WorkspaceViewMode::Rendered, "Asia/Kolkata");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].dom_id, PREVIEW_HEADER_SEARCH_HIT_ID);
+        assert_eq!(hits[0].label, "Summary");
+    }
+
+    #[test]
+    fn command_query_does_not_search_preview_or_terminal_content() {
+        let session = ManagedSessionView {
+            id: "abc".to_string(),
+            session_path: "local://abc".to_string(),
+            title: "Preview Session".to_string(),
+            kind: SessionKind::Codex,
+            host_label: "local".to_string(),
+            source: yggterm_server::SessionSource::Stored,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: yggterm_server::RemoteDeployState::NotRequired,
+            launch_command: "codex".to_string(),
+            status_line: "ready".to_string(),
+            terminal_lines: vec!["timezone migration".to_string()],
+            rendered_sections: Vec::new(),
+            preview: yggterm_server::SessionPreview {
+                summary: Vec::new(),
+                blocks: vec![yggterm_server::SessionPreviewBlock {
+                    role: "assistant",
+                    timestamp: "now".to_string(),
+                    tone: yggterm_server::PreviewTone::Assistant,
+                    folded: false,
+                    lines: vec!["timezone migration".to_string()],
+                }],
+            },
+            metadata: Vec::new(),
+            terminal_process_id: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: yggterm_server::GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+        };
+
+        assert!(content_search_query("/preview").is_none());
+        assert!(
+            search_content_hits(Some(&session), WorkspaceViewMode::Rendered, "/preview")
+                .is_empty()
+        );
+        assert!(
+            search_content_hits(Some(&session), WorkspaceViewMode::Terminal, "/preview")
+                .is_empty()
+        );
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
