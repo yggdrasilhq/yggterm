@@ -10,7 +10,9 @@ use std::time::Instant;
 use yggterm_core::resolve_yggterm_home;
 use yggterm_server::{
     YGG_LOADING_NOTIFICATION_AFTER_MS, YggEventEnvelope, YggEventKind, YggProgress,
-    YggRequestMeta, YggSurface, YggTarget, default_endpoint, ping, snapshot, status,
+    YggRequestMeta, YggSurface, YggTarget, default_endpoint, ping, request_terminal_launch,
+    shutdown, snapshot, start_local_session_at, status,
+    SessionKind,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +21,9 @@ enum Scenario {
     Ping,
     Status,
     Snapshot,
+    DisconnectSafe,
+    ReconnectCheck,
+    GracefulShutdown,
 }
 
 impl Scenario {
@@ -28,6 +33,9 @@ impl Scenario {
             Self::Ping => "ping",
             Self::Status => "status",
             Self::Snapshot => "snapshot",
+            Self::DisconnectSafe => "disconnect_safe",
+            Self::ReconnectCheck => "reconnect_check",
+            Self::GracefulShutdown => "graceful_shutdown",
         }
     }
 }
@@ -40,6 +48,9 @@ struct Config {
     slow_notice_ms: u64,
     delay_ms: u64,
     progress_step_ms: u64,
+    cwd: Option<String>,
+    title_hint: Option<String>,
+    expect_path: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -60,6 +71,9 @@ fn parse_args(args: Vec<String>) -> Result<Config> {
     let mut slow_notice_ms = YGG_LOADING_NOTIFICATION_AFTER_MS;
     let mut delay_ms = 0_u64;
     let mut progress_step_ms = 500_u64;
+    let mut cwd = None::<String>;
+    let mut title_hint = None::<String>;
+    let mut expect_path = None::<String>;
 
     let mut ix = 0usize;
     while ix < args.len() {
@@ -72,6 +86,9 @@ fn parse_args(args: Vec<String>) -> Result<Config> {
                     "ping" => Scenario::Ping,
                     "status" => Scenario::Status,
                     "snapshot" => Scenario::Snapshot,
+                    "disconnect-safe" => Scenario::DisconnectSafe,
+                    "reconnect-check" => Scenario::ReconnectCheck,
+                    "graceful-shutdown" => Scenario::GracefulShutdown,
                     other => bail!("unknown scenario: {other}"),
                 };
             }
@@ -113,6 +130,30 @@ fn parse_args(args: Vec<String>) -> Result<Config> {
                     .parse()
                     .context("invalid --progress-step-ms value")?;
             }
+            "--cwd" => {
+                ix += 1;
+                cwd = Some(
+                    args.get(ix)
+                        .context("missing value after --cwd")?
+                        .to_string(),
+                );
+            }
+            "--title-hint" => {
+                ix += 1;
+                title_hint = Some(
+                    args.get(ix)
+                        .context("missing value after --title-hint")?
+                        .to_string(),
+                );
+            }
+            "--expect-path" => {
+                ix += 1;
+                expect_path = Some(
+                    args.get(ix)
+                        .context("missing value after --expect-path")?
+                        .to_string(),
+                );
+            }
             other => bail!("unknown argument: {other}"),
         }
         ix += 1;
@@ -125,6 +166,9 @@ fn parse_args(args: Vec<String>) -> Result<Config> {
         slow_notice_ms,
         delay_ms,
         progress_step_ms,
+        cwd,
+        title_hint,
+        expect_path,
     })
 }
 
@@ -193,6 +237,71 @@ fn run_scenario(
                 "remote_machines": snap.remote_machines.len(),
                 "ssh_targets": snap.ssh_targets.len(),
                 "live_sessions": snap.live_sessions.len(),
+            }))
+        }
+        Scenario::DisconnectSafe => {
+            ping(endpoint)?;
+            let (snap, _) = start_local_session_at(
+                endpoint,
+                SessionKind::Shell,
+                cfg.cwd.as_deref(),
+                cfg.title_hint.as_deref().or(Some("mock lifetime probe")),
+            )?;
+            let session_path = snap
+                .active_session_path
+                .clone()
+                .context("disconnect-safe scenario did not produce an active session")?;
+            let _ = request_terminal_launch(endpoint);
+            let (snap, _) = snapshot(endpoint)?;
+            let retained_after_disconnect = snap
+                .active_session_path
+                .as_deref()
+                .is_some_and(|path| path == session_path)
+                || snap
+                .live_sessions
+                .iter()
+                .any(|session| session.session_path == session_path);
+            Ok(json!({
+                "session_path": session_path,
+                "active_view_mode": snap.active_view_mode,
+                "live_sessions": snap.live_sessions.len(),
+                "retained_after_disconnect": retained_after_disconnect,
+                "note": "client may now exit without shutdown; rerun reconnect-check with --expect-path"
+            }))
+        }
+        Scenario::ReconnectCheck => {
+            let expected_path = cfg
+                .expect_path
+                .as_deref()
+                .context("--expect-path is required for reconnect-check")?;
+            ping(endpoint)?;
+            let (snap, message) = snapshot(endpoint)?;
+            let active_matches = snap
+                .active_session_path
+                .as_deref()
+                .is_some_and(|path| path == expected_path);
+            let listed = snap
+                .live_sessions
+                .iter()
+                .any(|session| session.session_path == expected_path);
+            if !active_matches && !listed {
+                bail!("expected session path not found after reconnect: {expected_path}");
+            }
+            Ok(json!({
+                "message": message,
+                "expected_path": expected_path,
+                "active_matches": active_matches,
+                "listed": listed,
+                "active_session_path": snap.active_session_path,
+                "live_sessions": snap.live_sessions.len()
+            }))
+        }
+        Scenario::GracefulShutdown => {
+            let message = shutdown(endpoint)?;
+            let ping_after = ping(endpoint).is_ok();
+            Ok(json!({
+                "message": message,
+                "daemon_reachable_after": ping_after
             }))
         }
     };
