@@ -10649,12 +10649,21 @@ fn preview_summary_text(session: &ManagedSessionView) -> String {
         .collect::<Vec<_>>();
 
     if candidates.is_empty() {
-        for block in &session.preview.blocks {
+        for block in visible_preview_blocks(session).iter() {
             let joined = block
                 .lines
                 .iter()
                 .map(|line| line.trim())
                 .filter(|line| !line.is_empty())
+                .filter(|line| {
+                    let lower = line.to_ascii_lowercase();
+                    !(lower.contains("/.yggterm/clipboard/")
+                        || lower.contains("<collaboration_mode>")
+                        || lower.contains("collaboration mode:")
+                        || lower.contains("permissions instructions")
+                        || lower.contains("how to request escalation")
+                        || lower.contains("request_user_input"))
+                })
                 .take(2)
                 .collect::<Vec<_>>()
                 .join(" ");
