@@ -78,6 +78,7 @@ use yggterm_server::{
 static BOOTSTRAP: OnceCell<ShellBootstrap> = OnceCell::new();
 static PASSIVE_COPY_SUSPENDED: AtomicBool = AtomicBool::new(false);
 const SIDE_RAIL_WIDTH: usize = 292;
+const DEFERRED_STARTUP_SYNC_MS: u64 = 8_000;
 const EDGE_RESIZE_HANDLE: usize = 5;
 const CORNER_RESIZE_HANDLE: usize = 10;
 const XTERM_CSS: &str = include_str!("../../../assets/xterm/xterm.css");
@@ -6315,11 +6316,18 @@ fn app() -> Element {
         };
         if should_start {
             startup_sync_started.set(true);
-            spawn_initial_server_sync(
-                state,
-                schedule_ui_update_for_sync.clone(),
-                async_render_epoch,
-            );
+            let defer_sync = state.read().had_cached_startup_snapshot;
+            let schedule_ui = schedule_ui_update_for_sync.clone();
+            spawn(async move {
+                if defer_sync {
+                    sleep(Duration::from_millis(DEFERRED_STARTUP_SYNC_MS)).await;
+                }
+                spawn_initial_server_sync(
+                    state,
+                    schedule_ui,
+                    async_render_epoch,
+                );
+            });
         }
     });
     let schedule_ui_update_for_tree = schedule_ui_update.clone();
@@ -6675,8 +6683,8 @@ fn app() -> Element {
                 desktop.request_redraw();
                 let should_continue = {
                     let shell = state.read();
-                    shell.needs_initial_server_sync
-                        || shell.browser_tree_loading_in_flight
+                    shell.browser_tree_loading_in_flight
+                        || (shell.needs_initial_server_sync && !shell.had_cached_startup_snapshot)
                         || shell.server_busy
                 };
                 if !should_continue {
@@ -9387,13 +9395,6 @@ fn TerminalCanvas(
     let is_remote_resume_session = session.session_path.starts_with("remote-session://");
     let terminal_has_meaningful_output = use_signal(|| !is_remote_resume_session);
     let resume_overlay_expired = use_signal(|| !is_remote_resume_session);
-    info!(
-        session=%session_path,
-        host_id=%host_id,
-        instance_key=%instance_key,
-        font_size=theme.font_size,
-        "rendering terminal canvas"
-    );
     {
         let mut resume_overlay_expired = resume_overlay_expired;
         use_future(move || async move {
@@ -9566,7 +9567,9 @@ fn TerminalCanvas(
                                 );
                             }
                             Ok(TerminalJsEvent::Debug { message }) => {
-                                info!(session=%session_path, %message, "terminal js debug");
+                                if message.contains("error") || message.contains("failed") {
+                                    warn!(session=%session_path, %message, "terminal js debug");
+                                }
                             }
                             Err(error) => {
                                 warn!(session=%session_path, error=%error, "terminal eval bridge closed");
