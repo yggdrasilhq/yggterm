@@ -20,6 +20,8 @@ use yggterm_server::{
     start_local_session, status,
 };
 
+const DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT_ENV: &str = "YGGTERM_DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT";
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter("info")
@@ -186,6 +188,12 @@ fn load_initial_server_snapshot_fast(
     host: &yggterm_server::GhosttyHostSupport,
     theme: UiTheme,
 ) -> Option<yggterm_server::ServerUiSnapshot> {
+    if std::env::var(DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT_ENV)
+        .ok()
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    {
+        return None;
+    }
     let state_path = store.home_dir().join("server-state.json");
     let saved = fs::read_to_string(&state_path)
         .ok()
