@@ -1,6 +1,7 @@
 mod attach;
 mod daemon;
 mod host;
+mod protocol;
 mod terminal;
 
 pub use attach::{AttachMetadata, run_attach};
@@ -15,6 +16,11 @@ pub use daemon::{
     terminal_write, toggle_preview_block,
 };
 pub use host::{GhosttyHostKind, GhosttyHostSupport, GhosttyTerminalHostMode, detect_ghostty_host};
+pub use protocol::{
+    YGG_LOADING_NOTIFICATION_AFTER_MS, YGG_PROTOCOL_SCHEMA_VERSION, YggCachePolicy,
+    YggEventEnvelope, YggEventKind, YggOperationPriority, YggProgress, YggRequestMeta,
+    YggSurface, YggTarget,
+};
 pub use terminal::{TerminalChunk, TerminalManager, TerminalReadResult};
 
 use anyhow::Context;
