@@ -85,6 +85,7 @@ const XTERM_CSS: &str = include_str!("../../../assets/xterm/xterm.css");
 const XTERM_JS: &str = include_str!("../../../assets/xterm/xterm.js");
 const XTERM_FIT_JS: &str = include_str!("../../../assets/xterm/addon-fit.js");
 const PREVIEW_BLOCK_WINDOW: usize = 48;
+const PREVIEW_SYNC_POLL_MS: u64 = 2_500;
 static XTERM_ASSETS_BOOTSTRAPPED: OnceCell<()> = OnceCell::new();
 const TREE_LOADING_DOT_CSS: &str = "@keyframes yggterm-tree-loading-dot { 0%, 80%, 100% { opacity: 0.28; transform: translateY(0px); } 40% { opacity: 1; transform: translateY(-1px); } }";
 const BACKGROUND_COPY_RETRY_MS: u64 = 300_000;
@@ -6511,6 +6512,27 @@ fn app() -> Element {
         spawn_summary_generation(state, session, summary_stale);
         state.with_mut(|shell| shell.next_background_copy_scan_after_ms = current_millis());
         maybe_spawn_background_copy_generation(state);
+    });
+    use_future(move || {
+        let mut state = state;
+        let mut last_preview_refresh_path = last_preview_refresh_path;
+        async move {
+            loop {
+                sleep(Duration::from_millis(PREVIEW_SYNC_POLL_MS)).await;
+                let should_rearm = {
+                    let shell = state.read();
+                    shell.server.active_view_mode() == WorkspaceViewMode::Rendered
+                        && !shell.server_busy
+                        && shell
+                            .server
+                            .active_session()
+                            .is_some_and(|session| session.session_path.starts_with("remote-session://"))
+                };
+                if should_rearm {
+                    last_preview_refresh_path.set(None);
+                }
+            }
+        }
     });
     use_effect(move || {
         let (active, view_mode, server_busy) = {
