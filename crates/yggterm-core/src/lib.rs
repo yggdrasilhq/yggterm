@@ -26,9 +26,12 @@ pub use install::{
     write_direct_install_state,
 };
 pub use perf::{PERF_TELEMETRY_FILENAME, PerfSpan, append_perf_event, perf_telemetry_path};
-pub use titles::{SessionTitleStore, looks_like_generated_fallback_title};
+pub use titles::{
+    SessionTitleStore, looks_like_generated_fallback_title, looks_like_low_signal_generated_copy,
+};
 pub use transcript::{
-    TranscriptMessage, TranscriptRole, message_lines_from_payload, read_codex_transcript_messages,
+    TranscriptMessage, TranscriptRole, generation_context_from_messages,
+    message_lines_from_payload, read_codex_transcript_messages,
 };
 pub use workspace::{
     WorkspaceDocument, WorkspaceDocumentInput, WorkspaceDocumentKind, WorkspaceDocumentSummary,
