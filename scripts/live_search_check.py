@@ -13,6 +13,7 @@ OUT_DIR = Path("/tmp")
 DISPLAY = os.environ.get("YGGTERM_TEST_DISPLAY", ":101")
 RUNTIME_ROOT = OUT_DIR / f"yggterm-x11-runtime-{DISPLAY.replace(':', '')}"
 TELEMETRY_PATH = Path.home() / ".yggterm" / "ui-telemetry.jsonl"
+SERVER_STATE_PATH = Path.home() / ".yggterm" / "server-state.json"
 
 
 def run(cmd, **kwargs):
@@ -62,6 +63,31 @@ def recent_search_telemetry(after_size: int) -> str:
     with TELEMETRY_PATH.open("r", encoding="utf-8", errors="replace") as handle:
         handle.seek(after_size)
         return handle.read()
+
+
+def derive_search_query() -> str:
+    if not SERVER_STATE_PATH.exists():
+        return 'excel "shortcut design"'
+    try:
+        import json
+
+        obj = json.loads(SERVER_STATE_PATH.read_text(encoding="utf-8", errors="replace"))
+        active = obj.get("active_session_path")
+        if not active:
+            return 'excel "shortcut design"'
+        for item in obj.get("stored_sessions", []):
+            if item.get("path") == active and item.get("title_hint"):
+                title = str(item["title_hint"]).strip()
+                if title:
+                    return title
+        for item in obj.get("live_sessions", []):
+            if item.get("key") == active and item.get("title"):
+                title = str(item["title"]).strip()
+                if title:
+                    return title
+    except Exception:
+        pass
+    return 'excel "shortcut design"'
 
 
 def xprop_wm_class(window_id: str, env: dict[str, str]) -> str:
@@ -194,7 +220,7 @@ def main() -> int:
     env["DISPLAY"] = DISPLAY
     env["XDG_RUNTIME_DIR"] = str(RUNTIME_ROOT)
     env["GDK_BACKEND"] = "x11"
-    env["YGGTERM_SEARCH_QUERY"] = 'excel "shortcut design"'
+    env["YGGTERM_SEARCH_QUERY"] = derive_search_query()
     os.environ["DISPLAY"] = DISPLAY
     subprocess.run(
         f"pkill -f 'DISPLAY={DISPLAY} ./target/debug/yggterm' || true",
@@ -238,6 +264,7 @@ def main() -> int:
         time.sleep(0.8)
         cleared = capture("yggterm-live-search-cleared.png", win)
         telemetry = recent_search_telemetry(telemetry_size)
+        print(f"search_query={env['YGGTERM_SEARCH_QUERY']}")
         print(f"launcher_pid={app.pid} target_pid={target_pid} window={win} name={name}")
         print(klass)
         print(filtered)
