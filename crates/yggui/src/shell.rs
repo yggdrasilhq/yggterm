@@ -64,9 +64,10 @@ use yggterm_server::{
     RemoteMachineSnapshot, RemoteScannedSession, ServerEndpoint, ServerRuntimeStatus,
     ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionPreviewBlock,
     SessionRenderedSection, SshConnectTarget, TerminalBackend, WorkspaceViewMode, YggtermServer,
-    cleanup_legacy_daemons, connect_ssh_custom, focus_live, open_remote_session,
+    apply_remote_preview_payload_for_path, cleanup_legacy_daemons, connect_ssh_custom,
+    fetch_remote_generation_context, fetch_remote_preview_payload, focus_live, open_remote_session,
     open_stored_session, ping, persist_remote_generated_copy, refresh_remote_machine,
-    fetch_remote_generation_context, remove_ssh_target, request_terminal_launch, set_all_preview_blocks_folded,
+    remove_ssh_target, request_terminal_launch, set_all_preview_blocks_folded,
     set_view_mode as daemon_set_view_mode, shutdown as daemon_shutdown,
     snapshot as daemon_snapshot, stage_remote_clipboard_png, start_command_session,
     start_local_session, start_local_session_at, status, switch_agent_session_mode,
@@ -3427,6 +3428,30 @@ fn generation_context_for_target(target: &CopyGenerationTarget) -> Option<String
         .map(ToOwned::to_owned)
 }
 
+fn remote_preview_fetch_target(
+    server: &YggtermServer,
+    session: &ManagedSessionView,
+) -> Option<(SshConnectTarget, String)> {
+    let machine = remote_machine_for_session_path(server, &session.session_path)?;
+    let scanned = machine
+        .sessions
+        .iter()
+        .find(|candidate| candidate.session_path == session.session_path)?;
+    if scanned.storage_path.trim().is_empty() {
+        return None;
+    }
+    Some((
+        SshConnectTarget {
+            label: machine.label.clone(),
+            kind: SessionKind::Codex,
+            ssh_target: machine.ssh_target.clone(),
+            prefix: machine.prefix.clone(),
+            cwd: Some(scanned.cwd.clone()),
+        },
+        scanned.storage_path.clone(),
+    ))
+}
+
 fn restore_browser_tree(shell: &mut ShellState, browser_tree: SessionNode, selected_hint: Option<&str>) {
     let selected_path = shell.browser.selected_path().map(str::to_string);
     let expanded_paths = shell.browser.expanded_paths();
@@ -3455,7 +3480,11 @@ fn remote_preview_needs_refresh(session: &ManagedSessionView) -> bool {
                 .preview
                 .blocks
                 .iter()
-                .any(|block| block.timestamp == "server:launch"))
+                .any(|block| block.timestamp == "server:launch" || block.timestamp == "remote:scan")
+            || session
+                .rendered_sections
+                .iter()
+                .any(|section| section.title == "Recent Context"))
 }
 
 fn background_copy_job_for_target(
@@ -6429,15 +6458,60 @@ fn app() -> Element {
         }
         state.with_mut(|shell| shell.record_preview_issue_telemetry("preview_refresh_request"));
         last_preview_refresh_path.set(Some(session.session_path.clone()));
-        spawn_server_snapshot_action(
-            state,
-            if remote_preview_needs_refresh(&session) {
-                "refreshing preview".to_string()
+        let fetch_target = {
+            let shell = state.read();
+            remote_preview_fetch_target(&shell.server, &session)
+        };
+        if remote_preview_needs_refresh(&session) {
+            if let Some((target, storage_path)) = fetch_target {
+                let session_path = session.session_path.clone();
+                spawn(async move {
+                    let path_for_task = session_path.clone();
+                    let outcome = task::spawn_blocking(move || {
+                        fetch_remote_preview_payload(&target, &storage_path)
+                    })
+                    .await;
+                    match outcome {
+                        Ok(Ok(payload)) => {
+                            state.with_mut(|shell| {
+                                if apply_remote_preview_payload_for_path(
+                                    &mut shell.server,
+                                    &path_for_task,
+                                    payload,
+                                ) {
+                                    shell.record_preview_issue_telemetry(
+                                        "preview_refresh_applied_client_side",
+                                    );
+                                }
+                            });
+                        }
+                        Ok(Err(error)) => {
+                            warn!(path=%path_for_task, error=%error, "failed to fetch remote preview payload from ui");
+                            spawn_server_snapshot_action(
+                                state,
+                                "refreshing preview".to_string(),
+                                move |endpoint| daemon_set_view_mode(&endpoint, WorkspaceViewMode::Rendered),
+                            );
+                        }
+                        Err(error) => {
+                            warn!(path=%path_for_task, error=%error, "preview payload task join failed");
+                        }
+                    }
+                });
             } else {
-                "syncing preview".to_string()
-            },
-            move |endpoint| daemon_set_view_mode(&endpoint, WorkspaceViewMode::Rendered),
-        );
+                spawn_server_snapshot_action(
+                    state,
+                    "refreshing preview".to_string(),
+                    move |endpoint| daemon_set_view_mode(&endpoint, WorkspaceViewMode::Rendered),
+                );
+            }
+        } else {
+            spawn_server_snapshot_action(
+                state,
+                "syncing preview".to_string(),
+                move |endpoint| daemon_set_view_mode(&endpoint, WorkspaceViewMode::Rendered),
+            );
+        }
     });
     use_effect(move || {
         let (active_path, active_visible, show_loading_tree) = {
