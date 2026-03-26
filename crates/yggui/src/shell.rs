@@ -8379,7 +8379,7 @@ fn MainSurface(
                                         overscroll-behavior:contain; scrollbar-gutter:stable; contain:layout paint style;",
                                 if snapshot.preview_layout == PreviewLayoutMode::Chat {
                                     div {
-                                        style: "display:flex; flex-direction:column; gap:14px; min-width:0; width:min(1120px, 100%); margin:0 auto; \
+                                        style: "display:flex; flex-direction:column; gap:16px; min-width:0; width:min(1020px, 100%); margin:0 auto; \
                                                 contain:layout paint style;",
                                         if hidden_block_count > 0 {
                                             div {
@@ -8399,12 +8399,6 @@ fn MainSurface(
                                                     },
                                                     "Show {hidden_block_count} Earlier Messages"
                                                 }
-                                            }
-                                        }
-                                        if !preview_rendered_sections(&session).is_empty() {
-                                            RenderedSectionsStrip {
-                                                sections: preview_rendered_sections(&session),
-                                                palette: snapshot.palette,
                                             }
                                         }
                                         for run in grouped_runs.into_iter() {
@@ -9247,21 +9241,21 @@ fn PreviewRunBlock(
     let user_run = run.tone == PreviewTone::User;
     let dark = palette_is_dark(palette);
     let row_justify = if user_run { "flex-end" } else { "flex-start" };
-    let width = if user_run { "min(72%, 760px)" } else { "min(100%, 960px)" };
+    let width = if user_run { "min(72%, 720px)" } else { "min(100%, 880px)" };
     let background = match user_run {
-        true if dark => "rgba(43,52,66,0.94)",
-        true => "rgba(235,242,250,0.98)",
+        true if dark => "rgba(51,60,74,0.96)",
+        true => "rgba(238,244,250,0.98)",
         false => "transparent",
     };
     let border = match user_run {
-        true if dark => "rgba(111,148,185,0.26)",
-        true => "rgba(196,210,225,0.96)",
-        false if dark => "rgba(76,94,114,0.76)",
-        false => "rgba(226,232,240,0.92)",
+        true if dark => "rgba(118,154,192,0.24)",
+        true => "rgba(205,217,231,0.98)",
+        false if dark => "rgba(82,100,121,0.52)",
+        false => "rgba(224,231,239,0.92)",
     };
     let shadow = match user_run {
-        true if dark => "0 12px 28px rgba(0,0,0,0.22)",
-        true => "0 10px 24px rgba(148,163,184,0.10)",
+        true if dark => "0 14px 28px rgba(0,0,0,0.20)",
+        true => "0 12px 26px rgba(148,163,184,0.12)",
         false => "none",
     };
 
@@ -9288,14 +9282,19 @@ fn PreviewRunBlock(
                         }
                     ),
                     for (entry_ix, (block_ix, block)) in run.entries.iter().cloned().enumerate() {
-                        button {
+                        div {
+                            key: "{block_ix}",
                             style: format!(
-                                "width:100%; border:none; text-align:left; background:transparent; padding:{}; \
+                                "width:100%; text-align:left; background:transparent; padding:{}; \
                                  {} {}",
                                 if user_run { "13px 16px" } else { "10px 0 12px 0" },
                                 if entry_ix > 0 {
                                     if user_run {
-                                        format!("border-top:1px solid rgba(203,213,225,0.88);")
+                                        if dark {
+                                            "border-top:1px solid rgba(118,154,192,0.22);".to_string()
+                                        } else {
+                                            "border-top:1px solid rgba(203,213,225,0.88);".to_string()
+                                        }
                                     } else {
                                         format!("border-top:1px solid {};", border)
                                     }
@@ -9308,15 +9307,18 @@ fn PreviewRunBlock(
                                     String::new()
                                 }
                             ),
-                            onclick: move |_| on_toggle_block.call(block_ix),
                             div {
                                 style: "display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:8px;",
                                 div {
-                                    style: format!("font-size:10px; color:{}; opacity:0.86;", palette.muted),
+                                    style: format!("font-size:10px; color:{}; opacity:0.8;", palette.muted),
                                     "{block.timestamp}"
                                 }
-                                div {
-                                    style: format!("font-size:10px; color:{}; opacity:0.72;", palette.muted),
+                                button {
+                                    style: format!(
+                                        "border:none; background:transparent; color:{}; font-size:10px; opacity:0.72; padding:0;",
+                                        palette.muted
+                                    ),
+                                    onclick: move |_| on_toggle_block.call(block_ix),
                                     {if block.folded { "Expand".to_string() } else { "Collapse".to_string() }}
                                 }
                             }
