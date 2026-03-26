@@ -65,7 +65,8 @@ use yggterm_server::{
     GhosttyTerminalHostMode, ManagedSessionView, PreviewTone, RemoteMachineHealth,
     RemoteMachineSnapshot, RemoteScannedSession, ServerEndpoint, ServerRuntimeStatus,
     ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionPreviewBlock,
-    SessionRenderedSection, SshConnectTarget, TerminalBackend, WorkspaceViewMode, YggtermServer,
+    SessionRenderedSection, SshConnectTarget, TerminalBackend, WorkspaceViewMode,
+    YGG_LOADING_NOTIFICATION_AFTER_MS, YggRequestMeta, YggSurface, YggTarget, YggtermServer,
     apply_remote_preview_payload_for_path, cleanup_legacy_daemons, connect_ssh_custom,
     fetch_remote_generation_context, fetch_remote_preview_payload, focus_live, open_remote_session,
     open_stored_session, ping, persist_remote_generated_copy, refresh_remote_machine,
@@ -136,6 +137,7 @@ struct ShellState {
     search_focused: bool,
     search_sidebar_match_index: Option<usize>,
     search_content_match_index: Option<usize>,
+    busy_request_id: Option<String>,
     sidebar_open: bool,
     right_panel_mode: RightPanelMode,
     last_action: String,
@@ -493,6 +495,7 @@ impl ShellState {
             search_focused: false,
             search_sidebar_match_index: None,
             search_content_match_index: None,
+            busy_request_id: None,
             sidebar_open,
             right_panel_mode,
             last_action: "ready".to_string(),
@@ -852,13 +855,26 @@ impl ShellState {
         };
     }
 
+    fn begin_busy_request(&mut self, request_id: String, label: String) {
+        self.busy_request_id = Some(request_id);
+        self.server_busy = true;
+        self.last_action = label;
+    }
+
+    fn finish_busy_request(&mut self) {
+        if let Some(request_id) = self.busy_request_id.take() {
+            self.clear_job_notification(&format!("loading:{request_id}"));
+        }
+        self.server_busy = false;
+    }
+
     fn apply_daemon_snapshot_result(&mut self, result: Result<(ServerUiSnapshot, Option<String>)>) {
         let was_initial_sync = self.needs_initial_server_sync;
         match result {
             Ok((snapshot, message)) => {
                 self.server.apply_snapshot(snapshot);
                 self.hydrate_generated_copy_from_remote_cache();
-                self.server_busy = false;
+                self.finish_busy_request();
                 self.needs_initial_server_sync = false;
                 self.next_background_copy_scan_after_ms = 0;
                 if was_initial_sync {
@@ -872,7 +888,7 @@ impl ShellState {
                 }
             }
             Err(error) => {
-                self.server_busy = false;
+                self.finish_busy_request();
                 self.needs_initial_server_sync = false;
                 self.next_background_copy_scan_after_ms = current_millis() + 2_000;
                 self.last_action = format!("server sync failed: {error}");
@@ -1915,6 +1931,39 @@ fn safe_push_notification(
             "suppressed notification panic"
         );
     }
+}
+
+fn spawn_loading_notice(
+    state: Signal<ShellState>,
+    request_meta: YggRequestMeta,
+    title: impl Into<String>,
+    message: impl Into<String>,
+) {
+    let title = title.into();
+    let message = message.into();
+    spawn(async move {
+        sleep(Duration::from_millis(
+            request_meta
+                .notify_loading_after_ms
+                .max(YGG_LOADING_NOTIFICATION_AFTER_MS),
+        ))
+        .await;
+        let request_id = request_meta.request_id.clone();
+        let job_key = format!("loading:{request_id}");
+        let _ = safe_shell_mut(state, "loading_notice", move |shell| {
+            if shell.busy_request_id.as_deref() != Some(request_id.as_str()) || !shell.server_busy {
+                return;
+            }
+            shell.upsert_job_notification(
+                job_key,
+                NotificationTone::Info,
+                title.clone(),
+                message.clone(),
+                None,
+                false,
+            );
+        });
+    });
 }
 
 fn safe_upsert_job_notification(
@@ -3170,17 +3219,28 @@ where
     F: FnOnce(ServerEndpoint) -> Result<(ServerUiSnapshot, Option<String>)> + Send + 'static,
 {
     let endpoint = state.read().bootstrap.server_endpoint.clone();
+    let request_meta = YggRequestMeta::interactive(
+        format!("server-action-{}", current_millis()),
+        pending_label.clone(),
+        YggSurface::App,
+        YggTarget::App,
+    );
     state.with_mut(|shell| {
-        shell.server_busy = true;
-        shell.last_action = pending_label.clone();
+        shell.begin_busy_request(request_meta.request_id.clone(), pending_label.clone());
     });
+    spawn_loading_notice(
+        state,
+        request_meta.clone(),
+        "Still Loading",
+        format!("{pending_label} is taking longer than expected. Yggterm is keeping the current UI alive while the daemon finishes."),
+    );
 
     spawn(async move {
         let outcome = task::spawn_blocking(move || request(endpoint)).await;
         let _ = safe_shell_mut(state, "server_snapshot_action_complete", |shell| match outcome {
             Ok(result) => shell.apply_daemon_snapshot_result(result),
             Err(error) => {
-                shell.server_busy = false;
+                shell.finish_busy_request();
                 shell.last_action = format!("server task failed: {error}");
                 shell.push_notification(
                     NotificationTone::Error,
@@ -3196,11 +3256,11 @@ where
 fn spawn_set_view_mode(mut state: Signal<ShellState>, mode: WorkspaceViewMode) {
     state.with_mut(|shell| {
         shell.server.set_view_mode(mode);
-        shell.server_busy = true;
-        shell.last_action = match mode {
+        let label = match mode {
             WorkspaceViewMode::Rendered => "switching to preview".to_string(),
             WorkspaceViewMode::Terminal => "switching to terminal".to_string(),
         };
+        shell.begin_busy_request(format!("view-mode-{}", current_millis()), label);
     });
     spawn_server_snapshot_action(state, "syncing view mode".to_string(), move |endpoint| {
         if mode == WorkspaceViewMode::Terminal {
@@ -3214,15 +3274,38 @@ fn spawn_set_view_mode(mut state: Signal<ShellState>, mode: WorkspaceViewMode) {
 fn spawn_open_session_row(mut state: Signal<ShellState>, row: BrowserRow) {
     let prefer_terminal = state.read().server.active_view_mode() == WorkspaceViewMode::Terminal;
     let mut open_request_id = 0_u64;
+    let request_meta = YggRequestMeta::interactive(
+        format!("open-row-{}", current_millis()),
+        "open_row",
+        if prefer_terminal {
+            YggSurface::Terminal
+        } else {
+            YggSurface::Preview
+        },
+        YggTarget::Session {
+            session_path: row.full_path.clone(),
+        },
+    );
     state.with_mut(|shell| {
         shell.latest_open_request_id = shell.latest_open_request_id.saturating_add(1);
         open_request_id = shell.latest_open_request_id;
         shell.browser.select_path(row.full_path.clone());
         shell.context_menu_row = None;
         shell.sync_browser_settings();
-        shell.server_busy = true;
-        shell.last_action = format!("opening {}", row.label);
+        shell.begin_busy_request(
+            request_meta.request_id.clone(),
+            format!("opening {}", row.label),
+        );
     });
+    spawn_loading_notice(
+        state,
+        request_meta.clone(),
+        "Session Still Loading",
+        format!(
+            "{} is still loading. Yggterm is keeping the rest of the shell interactive while that session catches up.",
+            row.label
+        ),
+    );
     let endpoint = state.read().bootstrap.server_endpoint.clone();
     let pending_label = format!("opening {}", row.label);
     spawn(async move {
@@ -3264,7 +3347,7 @@ fn spawn_open_session_row(mut state: Signal<ShellState>, row: BrowserRow) {
             match outcome {
                 Ok(result) => shell.apply_daemon_snapshot_result(result),
                 Err(error) => {
-                    shell.server_busy = false;
+                    shell.finish_busy_request();
                     shell.last_action = format!("{pending_label} task failed: {error}");
                     shell.push_notification(
                         NotificationTone::Error,
@@ -3291,15 +3374,31 @@ fn spawn_connect_ssh_custom(mut state: Signal<ShellState>) {
         });
         return;
     }
+    let request_meta = YggRequestMeta::interactive(
+        format!("connect-ssh-{}", current_millis()),
+        "connect_ssh",
+        YggSurface::Sidebar,
+        YggTarget::RemoteMachine {
+            machine_key: machine_key_from_labelish(&target),
+        },
+    );
     state.with_mut(|shell| {
-        shell.server_busy = true;
-        shell.last_action = format!("connecting {target}");
+        shell.begin_busy_request(
+            request_meta.request_id.clone(),
+            format!("connecting {target}"),
+        );
         shell.push_notification(
             NotificationTone::Info,
             "Connecting SSH",
             format!("Opening {target} and syncing its session index…"),
         );
     });
+    spawn_loading_notice(
+        state,
+        request_meta,
+        "SSH Still Connecting",
+        format!("{target} is still syncing. Cached data can remain visible while the remote machine catches up."),
+    );
     let endpoint = state.read().bootstrap.server_endpoint.clone();
     spawn(async move {
         let target_for_request = target.clone();
@@ -3315,7 +3414,7 @@ fn spawn_connect_ssh_custom(mut state: Signal<ShellState>) {
         state.with_mut(|shell| match outcome {
             Ok(Ok((snapshot, message))) => {
                 shell.server.apply_snapshot(snapshot);
-                shell.server_busy = false;
+                shell.finish_busy_request();
                 shell.needs_initial_server_sync = false;
                 shell.last_action = message
                     .clone()
@@ -3329,7 +3428,7 @@ fn spawn_connect_ssh_custom(mut state: Signal<ShellState>) {
                 );
             }
             Ok(Err(error)) => {
-                shell.server_busy = false;
+                shell.finish_busy_request();
                 shell.last_action = format!("ssh connect failed: {error}");
                 shell.push_notification(
                     NotificationTone::Error,
@@ -3338,7 +3437,7 @@ fn spawn_connect_ssh_custom(mut state: Signal<ShellState>) {
                 );
             }
             Err(error) => {
-                shell.server_busy = false;
+                shell.finish_busy_request();
                 shell.last_action = format!("ssh task failed: {error}");
                 shell.push_notification(
                     NotificationTone::Error,
