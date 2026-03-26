@@ -6700,14 +6700,17 @@ fn app() -> Element {
             last_preview_refresh_path.set(None);
             return;
         }
-        let needs_refresh = remote_preview_needs_refresh(&session);
-        if !needs_refresh {
-            return;
-        }
         if *last_preview_refresh_path.read() == Some(session.session_path.clone()) {
             return;
         }
-        state.with_mut(|shell| shell.record_preview_issue_telemetry("preview_refresh_request"));
+        let needs_refresh = remote_preview_needs_refresh(&session);
+        state.with_mut(|shell| {
+            shell.record_preview_issue_telemetry(if needs_refresh {
+                "preview_refresh_request_placeholder"
+            } else {
+                "preview_refresh_request_active"
+            })
+        });
         last_preview_refresh_path.set(Some(session.session_path.clone()));
         let fetch_target = {
             let shell = state.read();
@@ -6752,15 +6755,13 @@ fn app() -> Element {
                 }
             });
         } else {
-            spawn_server_snapshot_action(
-                state,
-                if remote_preview_needs_refresh(&session) {
-                    "refreshing preview".to_string()
-                } else {
-                    "syncing preview".to_string()
-                },
-                move |endpoint| daemon_set_view_mode(&endpoint, WorkspaceViewMode::Rendered),
-            );
+            if needs_refresh {
+                spawn_server_snapshot_action(
+                    state,
+                    "refreshing preview".to_string(),
+                    move |endpoint| daemon_set_view_mode(&endpoint, WorkspaceViewMode::Rendered),
+                );
+            }
         }
     });
     use_effect(move || {
