@@ -909,22 +909,29 @@ impl ShellState {
         self.last_action = label;
     }
 
-    fn finish_busy_request(&mut self) {
-        if let Some(request_id) = self.busy_request_id.take() {
-            self.clear_job_notification(&format!("loading:{request_id}"));
-            self.active_surface_requests
-                .retain(|_, request| request.request_id != request_id);
+    fn finish_busy_request_for(&mut self, request_id: &str) {
+        if self.busy_request_id.as_deref() == Some(request_id) {
+            self.busy_request_id = None;
         }
-        self.server_busy = false;
+        self.clear_job_notification(&format!("loading:{request_id}"));
+        self.active_surface_requests
+            .retain(|_, request| request.request_id != request_id);
+        if self.active_surface_requests.is_empty() {
+            self.server_busy = false;
+        }
     }
 
     fn apply_daemon_snapshot_result(&mut self, result: Result<(ServerUiSnapshot, Option<String>)>) {
+        let request_id = self.busy_request_id.clone();
+        if let Some(request_id) = request_id.as_deref() {
+            self.apply_daemon_snapshot_result_for(request_id, result);
+            return;
+        }
         let was_initial_sync = self.needs_initial_server_sync;
         match result {
             Ok((snapshot, message)) => {
                 self.server.apply_snapshot(snapshot);
                 self.hydrate_generated_copy_from_remote_cache();
-                self.finish_busy_request();
                 self.needs_initial_server_sync = false;
                 self.next_background_copy_scan_after_ms = 0;
                 if was_initial_sync {
@@ -938,7 +945,45 @@ impl ShellState {
                 }
             }
             Err(error) => {
-                self.finish_busy_request();
+                self.needs_initial_server_sync = false;
+                self.next_background_copy_scan_after_ms = current_millis() + 2_000;
+                self.last_action = format!("server sync failed: {error}");
+                if !self.had_cached_startup_snapshot {
+                    self.push_notification(
+                        NotificationTone::Error,
+                        "Server Sync Failed",
+                        error.to_string(),
+                    );
+                }
+            }
+        }
+    }
+
+    fn apply_daemon_snapshot_result_for(
+        &mut self,
+        request_id: &str,
+        result: Result<(ServerUiSnapshot, Option<String>)>,
+    ) {
+        let was_initial_sync = self.needs_initial_server_sync;
+        match result {
+            Ok((snapshot, message)) => {
+                self.server.apply_snapshot(snapshot);
+                self.hydrate_generated_copy_from_remote_cache();
+                self.finish_busy_request_for(request_id);
+                self.needs_initial_server_sync = false;
+                self.next_background_copy_scan_after_ms = 0;
+                if was_initial_sync {
+                    self.seed_dynamic_top_level_expansions();
+                }
+                self.ensure_active_session_visible();
+                self.record_restore_issue_telemetry("apply_daemon_snapshot_result");
+                self.record_preview_issue_telemetry("apply_daemon_snapshot_result");
+                if let Some(message) = message {
+                    self.last_action = message;
+                }
+            }
+            Err(error) => {
+                self.finish_busy_request_for(request_id);
                 self.needs_initial_server_sync = false;
                 self.next_background_copy_scan_after_ms = current_millis() + 2_000;
                 self.last_action = format!("server sync failed: {error}");
@@ -1999,9 +2044,16 @@ fn spawn_loading_notice(
         ))
         .await;
         let request_id = request_meta.request_id.clone();
+        let surface = request_meta.surface;
         let job_key = format!("loading:{request_id}");
         let _ = safe_shell_mut(state, "loading_notice", move |shell| {
-            if shell.busy_request_id.as_deref() != Some(request_id.as_str()) || !shell.server_busy {
+            if shell
+                .active_surface_requests
+                .get(&surface)
+                .map(|request| request.request_id.as_str())
+                != Some(request_id.as_str())
+                || !shell.server_busy
+            {
                 return;
             }
             shell.upsert_job_notification(
@@ -3287,10 +3339,11 @@ where
 
     spawn(async move {
         let outcome = task::spawn_blocking(move || request(endpoint)).await;
+        let request_id = request_meta.request_id.clone();
         let _ = safe_shell_mut(state, "server_snapshot_action_complete", |shell| match outcome {
-            Ok(result) => shell.apply_daemon_snapshot_result(result),
+            Ok(result) => shell.apply_daemon_snapshot_result_for(&request_id, result),
             Err(error) => {
-                shell.finish_busy_request();
+                shell.finish_busy_request_for(&request_id);
                 shell.last_action = format!("server task failed: {error}");
                 shell.push_notification(
                     NotificationTone::Error,
@@ -3398,14 +3451,16 @@ fn spawn_open_session_row(mut state: Signal<ShellState>, row: BrowserRow) {
             }
         })
         .await;
+        let request_id = request_meta.request_id.clone();
         let _ = safe_shell_mut(state, "open_session_row_complete", |shell| {
             if open_request_id != shell.latest_open_request_id {
+                shell.finish_busy_request_for(&request_id);
                 return;
             }
             match outcome {
-                Ok(result) => shell.apply_daemon_snapshot_result(result),
+                Ok(result) => shell.apply_daemon_snapshot_result_for(&request_id, result),
                 Err(error) => {
-                    shell.finish_busy_request();
+                    shell.finish_busy_request_for(&request_id);
                     shell.last_action = format!("{pending_label} task failed: {error}");
                     shell.push_notification(
                         NotificationTone::Error,
@@ -3450,10 +3505,10 @@ fn spawn_connect_ssh_custom(mut state: Signal<ShellState>) {
     });
     spawn_loading_notice(
         state,
-        request_meta,
-        "SSH Still Connecting",
-        format!("{target} is still syncing. Cached data can remain visible while the remote machine catches up."),
-    );
+            request_meta.clone(),
+            "SSH Still Connecting",
+            format!("{target} is still syncing. Cached data can remain visible while the remote machine catches up."),
+        );
     let endpoint = state.read().bootstrap.server_endpoint.clone();
     spawn(async move {
         let target_for_request = target.clone();
@@ -3466,10 +3521,11 @@ fn spawn_connect_ssh_custom(mut state: Signal<ShellState>) {
             )
         })
         .await;
+        let request_id = request_meta.request_id.clone();
         state.with_mut(|shell| match outcome {
             Ok(Ok((snapshot, message))) => {
                 shell.server.apply_snapshot(snapshot);
-                shell.finish_busy_request();
+                shell.finish_busy_request_for(&request_id);
                 shell.needs_initial_server_sync = false;
                 shell.last_action = message
                     .clone()
@@ -3483,7 +3539,7 @@ fn spawn_connect_ssh_custom(mut state: Signal<ShellState>) {
                 );
             }
             Ok(Err(error)) => {
-                shell.finish_busy_request();
+                shell.finish_busy_request_for(&request_id);
                 shell.last_action = format!("ssh connect failed: {error}");
                 shell.push_notification(
                     NotificationTone::Error,
@@ -3492,7 +3548,7 @@ fn spawn_connect_ssh_custom(mut state: Signal<ShellState>) {
                 );
             }
             Err(error) => {
-                shell.finish_busy_request();
+                shell.finish_busy_request_for(&request_id);
                 shell.last_action = format!("ssh task failed: {error}");
                 shell.push_notification(
                     NotificationTone::Error,
