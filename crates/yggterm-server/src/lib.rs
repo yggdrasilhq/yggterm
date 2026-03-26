@@ -2176,6 +2176,35 @@ fn fetch_remote_preview_payload(
     serde_json::from_str(&output).context("invalid remote preview payload")
 }
 
+pub fn fetch_remote_generation_context(
+    target: &SshConnectTarget,
+    storage_path: &str,
+) -> anyhow::Result<String> {
+    match run_remote_yggterm_command(
+        &target.ssh_target,
+        target.prefix.as_deref(),
+        &["server", "remote", "generation-context", storage_path],
+        None,
+    ) {
+        Ok(context) => Ok(context),
+        Err(first_error) => {
+            let cache_key = remote_cache_key(&target.ssh_target, target.prefix.as_deref());
+            if let Ok(mut cache) = remote_command_cache().lock() {
+                cache.remove(&cache_key);
+            }
+            let installed = bootstrap_remote_yggterm(&target.ssh_target, target.prefix.as_deref())?;
+            run_remote_binary_command(
+                &target.ssh_target,
+                target.prefix.as_deref(),
+                &installed,
+                &["server", "remote", "generation-context", storage_path],
+                None,
+            )
+            .with_context(|| format!("retrying remote generation-context after bootstrap: {first_error:#}"))
+        }
+    }
+}
+
 fn collect_codex_session_files(
     root: &std::path::Path,
     out: &mut Vec<std::path::PathBuf>,
@@ -3290,6 +3319,15 @@ pub fn run_remote_preview(path: &str) -> anyhow::Result<()> {
     let payload = remote_preview_payload_for_path(std::path::Path::new(path), &title_store)?
         .with_context(|| format!("no previewable codex session at {path}"))?;
     println!("{}", serde_json::to_string(&payload)?);
+    Ok(())
+}
+
+pub fn run_remote_generation_context(path: &str) -> anyhow::Result<()> {
+    let context = generation_context_from_messages(
+        &read_codex_transcript_messages(std::path::Path::new(path))
+            .with_context(|| format!("reading remote transcript {}", path))?,
+    );
+    println!("{context}");
     Ok(())
 }
 

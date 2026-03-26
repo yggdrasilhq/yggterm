@@ -13,6 +13,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use time::OffsetDateTime;
 use titles::{SessionTitleResolver, settings_ready as litellm_settings_ready};
 
 pub use browser::{
@@ -413,6 +414,24 @@ impl SessionStore {
         };
         let resolver = SessionTitleResolver::new(&self.home)?;
         resolver.resolve_summary_for_session(&identity.session_id)
+    }
+
+    pub fn precis_needs_refresh_for_session_id(
+        &self,
+        session_id: &str,
+        source_updated_at: OffsetDateTime,
+    ) -> Result<bool> {
+        let resolver = SessionTitleResolver::new(&self.home)?;
+        resolver.precis_needs_refresh(session_id, source_updated_at)
+    }
+
+    pub fn summary_needs_refresh_for_session_id(
+        &self,
+        session_id: &str,
+        source_updated_at: OffsetDateTime,
+    ) -> Result<bool> {
+        let resolver = SessionTitleResolver::new(&self.home)?;
+        resolver.summary_needs_refresh(session_id, source_updated_at)
     }
 
     pub fn generate_precis_for_session_path(

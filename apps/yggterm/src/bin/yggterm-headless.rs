@@ -2,8 +2,9 @@ use anyhow::Result;
 use yggterm_core::{SessionStore, detect_install_context, refresh_desktop_integration};
 use yggterm_server::{
     cleanup_legacy_daemons, default_endpoint, detect_ghostty_host, ping, run_attach, run_daemon,
-    run_remote_preview, run_remote_protocol_version, run_remote_resume_codex, run_remote_scan,
-    run_remote_stage_clipboard_png, run_remote_upsert_generated_copy, shutdown, status,
+    run_remote_generation_context, run_remote_preview, run_remote_protocol_version,
+    run_remote_resume_codex, run_remote_scan, run_remote_stage_clipboard_png,
+    run_remote_upsert_generated_copy, shutdown, status,
 };
 
 fn main() -> Result<()> {
@@ -45,6 +46,13 @@ fn main() -> Result<()> {
     }
     if args.len() == 4 && args[0] == "server" && args[1] == "remote" && args[2] == "preview" {
         return run_remote_preview(&args[3]);
+    }
+    if args.len() == 4
+        && args[0] == "server"
+        && args[1] == "remote"
+        && args[2] == "generation-context"
+    {
+        return run_remote_generation_context(&args[3]);
     }
     if args.len() == 4 && args[0] == "server" && args[1] == "remote" && args[2] == "upsert-generated-copy" {
         return run_remote_upsert_generated_copy(&args[3]);
