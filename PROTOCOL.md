@@ -176,6 +176,7 @@ It should be able to:
 - emit JSONL envelopes for success, slow-load, and failure paths
 - simulate client-side timeout thresholds and delayed-loading notifications
 - inject artificial latency with progress ticks so loading-state UX can be tested deliberately
+- prove session lifetime semantics across disconnect/reconnect/shutdown paths
 
 This makes distributed regressions easier to reproduce than relying on the full GUI alone.
 
@@ -196,6 +197,31 @@ That should emit:
 - several `progress` envelopes during the injected delay
 - a `progress` envelope once the `3000ms` loading threshold is exceeded
 - final `result` or `error`
+
+Session lifetime examples:
+
+```bash
+# Start a live shell session, then let the mock client exit without shutdown.
+./target/debug/mock-yggclient \
+  --scenario disconnect-safe \
+  --cwd ~/gh/yggterm \
+  --title-hint "mock reconnect probe"
+
+# Reconnect from a later client process and verify the same session is still present.
+./target/debug/mock-yggclient \
+  --scenario reconnect-check \
+  --expect-path local://<session-uuid>
+
+# Explicit shutdown should tear the session graph down.
+./target/debug/mock-yggclient \
+  --scenario graceful-shutdown
+```
+
+Expected semantics:
+
+- `disconnect-safe` must leave the daemon and session graph alive
+- `reconnect-check` must see the same session after the earlier client process has exited
+- `graceful-shutdown` must terminate the daemon and make later `ping` fail
 
 ## Search
 
