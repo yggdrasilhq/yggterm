@@ -33,6 +33,14 @@ pub struct ServerRuntimeStatus {
     pub host_detail: String,
     pub embedded_surface_supported: bool,
     pub bridge_enabled: bool,
+    #[serde(default)]
+    pub restored_from_persisted_state: bool,
+    #[serde(default)]
+    pub restored_stored_sessions: usize,
+    #[serde(default)]
+    pub restored_live_sessions: usize,
+    #[serde(default)]
+    pub restored_remote_machines: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,6 +160,10 @@ struct DaemonRuntime {
     store: SessionStore,
     server: YggtermServer,
     terminals: TerminalManager,
+    restored_from_persisted_state: bool,
+    restored_stored_sessions: usize,
+    restored_live_sessions: usize,
+    restored_remote_machines: usize,
 }
 
 impl DaemonRuntime {
@@ -169,7 +181,15 @@ impl DaemonRuntime {
             settings.theme,
         );
         let state_path = store.home_dir().join("server-state.json");
+        let mut restored_from_persisted_state = false;
+        let mut restored_stored_sessions = 0usize;
+        let mut restored_live_sessions = 0usize;
+        let mut restored_remote_machines = 0usize;
         if let Some(saved) = load_persisted_state(&state_path)? {
+            restored_from_persisted_state = true;
+            restored_stored_sessions = saved.stored_sessions.len();
+            restored_live_sessions = saved.live_sessions.len();
+            restored_remote_machines = saved.remote_machines.len();
             server.restore_persisted_state(saved, Some(&store));
         }
         let runtime = Self {
@@ -178,6 +198,10 @@ impl DaemonRuntime {
             store,
             server,
             terminals: TerminalManager::new(),
+            restored_from_persisted_state,
+            restored_stored_sessions,
+            restored_live_sessions,
+            restored_remote_machines,
         };
         perf.finish(serde_json::json!({
             "prefer_ghostty_backend": settings.prefer_ghostty_backend,
@@ -194,6 +218,10 @@ impl DaemonRuntime {
             host_detail: self.support.detail.clone(),
             embedded_surface_supported: self.support.embedded_surface_supported,
             bridge_enabled: self.support.bridge_enabled,
+            restored_from_persisted_state: self.restored_from_persisted_state,
+            restored_stored_sessions: self.restored_stored_sessions,
+            restored_live_sessions: self.restored_live_sessions,
+            restored_remote_machines: self.restored_remote_machines,
         }
     }
 
