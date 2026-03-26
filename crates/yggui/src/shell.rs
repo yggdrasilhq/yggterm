@@ -9790,14 +9790,14 @@ fn TerminalCanvas(
             div {
                 style: format!(
                     "display:flex; flex-direction:column; min-height:0; height:100%; gap:0; border-radius:11px; \
-                     background:{}; overflow:hidden; padding-left:6px; position:relative;",
+                     background:{}; overflow:hidden; padding:0 4px; position:relative;",
                     theme.background
                 ),
                 div {
                     key: "{host_id}",
                     id: "{host_id}",
                     style: format!(
-                        "flex:1; min-height:0; width:100%; height:100%; background:{}; overflow:hidden;",
+                        "flex:1; min-width:0; min-height:0; height:100%; background:{}; overflow:hidden;",
                         theme.background
                     )
                 }
