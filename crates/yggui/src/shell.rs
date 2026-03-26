@@ -8162,10 +8162,12 @@ fn MainSurface(
                                 }
                             }
                             div {
-                                style: "display:flex; flex-direction:column; gap:18px; min-width:0; min-height:0; overflow:auto; padding:24px;",
+                                style: "display:flex; flex-direction:column; gap:18px; min-width:0; min-height:0; overflow:auto; padding:24px; \
+                                        overscroll-behavior:contain; scrollbar-gutter:stable; contain:layout paint style;",
                                 if snapshot.preview_layout == PreviewLayoutMode::Chat {
                                     div {
-                                        style: "display:flex; flex-direction:column; gap:18px; min-width:0; width:min(980px, 100%); margin:0 auto;",
+                                        style: "display:flex; flex-direction:column; gap:18px; min-width:0; width:min(980px, 100%); margin:0 auto; \
+                                                contain:layout paint style;",
                                         if !preview_rendered_sections(&session).is_empty() {
                                             RenderedSectionsStrip {
                                                 sections: preview_rendered_sections(&session),
@@ -8781,7 +8783,8 @@ fn PreviewGraph(session: ManagedSessionView, palette: Palette) -> Element {
 fn RenderedSectionsStrip(sections: Vec<SessionRenderedSection>, palette: Palette) -> Element {
     rsx! {
         div {
-            style: "display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:12px;",
+            style: "display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:12px; \
+                    contain:layout paint style;",
             for section in sections {
                 RenderedSectionCard {
                     section,
@@ -8801,7 +8804,8 @@ fn RenderedSectionCard(section: SessionRenderedSection, palette: Palette) -> Ele
         div {
             style: format!(
                 "display:flex; flex-direction:column; gap:10px; min-width:0; padding:14px 16px; border-radius:18px; \
-                 background:rgba(255,255,255,0.82); box-shadow:inset 0 0 0 1px rgba(170,190,212,0.14);"
+                 background:rgba(255,255,255,0.82); box-shadow:inset 0 0 0 1px rgba(170,190,212,0.14); \
+                 content-visibility:auto; contain:layout paint style; contain-intrinsic-size:220px 140px;"
             ),
             div {
                 style: "display:flex; align-items:center; justify-content:space-between; gap:12px;",
@@ -9021,7 +9025,11 @@ fn PreviewBlock(
         div {
             style: format!("display:flex; justify-content:{}; width:100%;", row_justify),
             div {
-                style: format!("display:flex; align-items:flex-start; gap:12px; width:{};", card_width),
+                style: format!(
+                    "display:flex; align-items:flex-start; gap:12px; width:{}; content-visibility:auto; \
+                     contain:layout paint style; contain-intrinsic-size:760px 260px;",
+                    card_width
+                ),
                 if !user_block {
                     div {
                         style: format!(
@@ -9037,7 +9045,8 @@ fn PreviewBlock(
                 button {
                     style: format!(
                         "width:100%; border:none; text-align:left; background:{}; border-radius:20px; \
-                         padding:18px 20px; box-shadow: inset 0 0 0 1px {}, 0 16px 32px rgba(148,163,184,0.08);",
+                         padding:18px 20px; box-shadow: inset 0 0 0 1px {}, 0 6px 18px rgba(148,163,184,0.06); \
+                         contain:layout paint style;",
                         background, outline
                     ),
                     onclick: move |evt| on_toggle.call(evt),
@@ -9095,7 +9104,10 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
     let blocks = preview_content_blocks(&lines);
     rsx! {
         div {
-            style: format!("display:flex; flex-direction:column; gap:10px; color:{};", palette.text),
+            style: format!(
+                "display:flex; flex-direction:column; gap:10px; color:{}; contain:layout paint style;",
+                palette.text
+            ),
             for block in blocks {
                 match block {
                     PreviewContentBlock::Heading { level, text } => rsx! {
@@ -9181,7 +9193,8 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                     },
                     PreviewContentBlock::Code { language, code } => rsx! {
                         div {
-                            style: "display:flex; flex-direction:column; gap:8px; border-radius:16px; background:rgba(15,23,42,0.92); color:#e5eef8; overflow:hidden;",
+                            style: "display:flex; flex-direction:column; gap:8px; border-radius:16px; background:rgba(15,23,42,0.92); color:#e5eef8; overflow:hidden; \
+                                    content-visibility:auto; contain:layout paint style; contain-intrinsic-size:720px 220px;",
                             div {
                                 style: "display:flex; align-items:center; justify-content:space-between; gap:12px; padding:10px 14px; border-bottom:1px solid rgba(255,255,255,0.08);",
                                 div {
