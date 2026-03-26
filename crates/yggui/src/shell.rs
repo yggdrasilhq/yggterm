@@ -6627,6 +6627,10 @@ fn app() -> Element {
             last_preview_refresh_path.set(None);
             return;
         }
+        let needs_refresh = remote_preview_needs_refresh(&session);
+        if !needs_refresh {
+            return;
+        }
         if *last_preview_refresh_path.read() == Some(session.session_path.clone()) {
             return;
         }
@@ -6638,7 +6642,6 @@ fn app() -> Element {
         };
         if let Some((target, storage_path)) = fetch_target {
             let session_path = session.session_path.clone();
-            let needs_refresh = remote_preview_needs_refresh(&session);
             spawn(async move {
                 let path_for_task = session_path.clone();
                 let outcome =
