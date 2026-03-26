@@ -119,8 +119,27 @@ It should be able to:
 - measure repeated latency
 - emit JSONL envelopes for success, slow-load, and failure paths
 - simulate client-side timeout thresholds and delayed-loading notifications
+- inject artificial latency with progress ticks so loading-state UX can be tested deliberately
 
 This makes distributed regressions easier to reproduce than relying on the full GUI alone.
+
+Example:
+
+```bash
+./target/debug/mock-yggclient \
+  --scenario startup \
+  --delay-ms 4200 \
+  --progress-step-ms 700 \
+  --jsonl-out /tmp/mock-yggclient.jsonl
+```
+
+That should emit:
+
+- `accepted`
+- `loading`
+- several `progress` envelopes during the injected delay
+- a `progress` envelope once the `3000ms` loading threshold is exceeded
+- final `result` or `error`
 
 ## Search
 
