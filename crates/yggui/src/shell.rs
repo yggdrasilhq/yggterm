@@ -6709,19 +6709,6 @@ fn app() -> Element {
         spawn_open_session_row(state, row);
     });
     use_effect(move || {
-        let shell = state.read();
-        let _ = shell.server.remote_machines().len();
-        let _ = shell.server.active_session_path().map(str::len);
-        let _ = shell.generated_precis.len();
-        let _ = shell.generated_summaries.len();
-        let _ = shell.title_requests_in_flight.len();
-        let _ = shell.precis_requests_in_flight.len();
-        let _ = shell.summary_requests_in_flight.len();
-        let _ = shell.browser.metrics().rebuild_count;
-        drop(shell);
-        maybe_spawn_background_copy_generation(state);
-    });
-    use_effect(move || {
         if *dock_pulse_started.read() {
             return;
         }
