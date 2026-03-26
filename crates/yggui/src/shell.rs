@@ -6725,12 +6725,16 @@ fn app() -> Element {
         dock_pulse_started.set(true);
         spawn(async move {
             loop {
-                let active = {
+                let should_pulse = {
                     let shell = state.read();
-                    shell.server.active_view_mode() == WorkspaceViewMode::Terminal
-                        || shell.docked_window_id.is_some()
+                    shell.docked_window_id.is_some()
+                        || shell.server.active_session().is_some_and(|session| {
+                            session.backend == TerminalBackend::Ghostty
+                                && session.terminal_host_mode
+                                    == GhosttyTerminalHostMode::ControlledDock
+                        })
                 };
-                if active {
+                if should_pulse {
                     window_epoch.with_mut(|epoch| *epoch += 1);
                 }
                 let _ = task::spawn_blocking(|| thread::sleep(Duration::from_millis(350))).await;
