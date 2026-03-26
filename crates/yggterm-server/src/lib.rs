@@ -33,8 +33,9 @@ use tracing::warn;
 use uuid::Uuid;
 use yggterm_core::{
     PerfSpan, SessionNode, SessionNodeKind, SessionStore, SessionTitleStore, TranscriptRole,
-    UiTheme, WorkspaceDocument, WorkspaceDocumentKind, looks_like_generated_fallback_title,
-    read_codex_session_identity_fields, read_codex_transcript_messages, resolve_yggterm_home,
+    UiTheme, WorkspaceDocument, WorkspaceDocumentKind, generation_context_from_messages,
+    looks_like_generated_fallback_title, read_codex_session_identity_fields,
+    read_codex_transcript_messages, resolve_yggterm_home,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2020,22 +2021,7 @@ fn current_millis_u64() -> u64 {
 }
 
 fn summarize_recent_context(messages: &[yggterm_core::TranscriptMessage]) -> String {
-    messages
-        .iter()
-        .rev()
-        .take(6)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .map(|message| {
-            format!(
-                "{}: {}",
-                message.role.display_label(),
-                message.lines.join(" ")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    generation_context_from_messages(messages)
 }
 
 fn preview_blocks_from_recent_context(recent_context: &str) -> Vec<SessionPreviewBlock> {

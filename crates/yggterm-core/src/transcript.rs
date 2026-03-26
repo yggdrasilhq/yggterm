@@ -28,6 +28,71 @@ pub struct TranscriptMessage {
     pub lines: Vec<String>,
 }
 
+pub fn generation_context_from_messages(messages: &[TranscriptMessage]) -> String {
+    let mut goals = Vec::<String>::new();
+    let mut recent = Vec::<(TranscriptRole, String)>::new();
+    let mut recent_chars = 0usize;
+
+    for message in messages {
+        let Some(text) = message_text_for_generation(message) else {
+            continue;
+        };
+        if message.role == TranscriptRole::User
+            && text.len() >= 28
+            && !goals.iter().any(|existing| existing == &text)
+        {
+            goals.push(text.clone());
+        }
+    }
+
+    for message in messages.iter().rev() {
+        let Some(text) = message_text_for_generation(message) else {
+            continue;
+        };
+        if recent.iter().any(|(_, existing)| existing == &text) {
+            continue;
+        }
+        recent_chars += text.len();
+        recent.push((message.role, text));
+        if recent.len() >= 8 || recent_chars >= 2600 {
+            break;
+        }
+    }
+    recent.reverse();
+
+    let mut sections = Vec::new();
+    let goal_tail = goals
+        .into_iter()
+        .rev()
+        .take(3)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
+    if !goal_tail.is_empty() {
+        sections.push(format!(
+            "PRIMARY USER GOALS:\n{}",
+            goal_tail
+                .iter()
+                .map(|goal| format!("- {goal}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    if !recent.is_empty() {
+        sections.push(format!(
+            "RECENT SUBSTANTIVE TURNS:\n{}",
+            recent
+                .iter()
+                .map(|(role, text)| format!("{}: {}", role.display_label(), text))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+
+    sections.join("\n\n")
+}
+
 pub fn read_codex_transcript_messages(path: &Path) -> Result<Vec<TranscriptMessage>> {
     let file = fs::File::open(path)
         .with_context(|| format!("failed to read session transcript {}", path.display()))?;
@@ -172,9 +237,60 @@ fn normalize_preview_text(text: &str) -> Vec<String> {
         .collect()
 }
 
+fn message_text_for_generation(message: &TranscriptMessage) -> Option<String> {
+    let joined = message
+        .lines
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let compact = joined
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string();
+    if compact.is_empty() || looks_like_generation_noise(&compact, message.role) {
+        return None;
+    }
+    Some(compact)
+}
+
+fn looks_like_generation_noise(text: &str, role: TranscriptRole) -> bool {
+    let lower = text.to_ascii_lowercase();
+    if lower.len() < 16 {
+        return true;
+    }
+    if role == TranscriptRole::System {
+        return true;
+    }
+    [
+        "collaboration mode:",
+        "filesystem sandboxing",
+        "request_user_input",
+        "environment_context",
+        "open live terminal",
+        "this session should land in the main viewport",
+        "launch command prepared",
+        "remote bootstrap will eventually",
+        "server launch",
+        "viewed image",
+        "it's a screenshot of",
+        "the main visible text shows",
+        "other visible ui details",
+        "heads up, you have less than",
+        "run /status for a breakdown",
+        "model to change",
+        "rate limits until",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{TranscriptRole, read_codex_transcript_messages};
+    use super::{TranscriptMessage, TranscriptRole, generation_context_from_messages, read_codex_transcript_messages};
     use anyhow::Result;
     use std::fs;
 
@@ -226,5 +342,38 @@ mod tests {
 
         let _ = fs::remove_file(path);
         Ok(())
+    }
+
+    #[test]
+    fn generation_context_filters_noise_and_keeps_goals() {
+        let messages = vec![
+            TranscriptMessage {
+                role: TranscriptRole::User,
+                timestamp: None,
+                lines: vec!["Can you change the timezone of this host and ssh dev to Asia/Kolkata?".into()],
+            },
+            TranscriptMessage {
+                role: TranscriptRole::Assistant,
+                timestamp: None,
+                lines: vec!["Open live terminal 019... through the Yggterm server.".into()],
+            },
+            TranscriptMessage {
+                role: TranscriptRole::Assistant,
+                timestamp: None,
+                lines: vec!["I changed the dev SSH target from Etc/UTC to Asia/Kolkata and verified it.".into()],
+            },
+            TranscriptMessage {
+                role: TranscriptRole::Assistant,
+                timestamp: None,
+                lines: vec!["It's a screenshot of a terminal/app window titled Can You Change Timezone Host.".into()],
+            },
+        ];
+
+        let context = generation_context_from_messages(&messages);
+        assert!(context.contains("PRIMARY USER GOALS"));
+        assert!(context.contains("Can you change the timezone"));
+        assert!(context.contains("I changed the dev SSH target"));
+        assert!(!context.contains("Open live terminal"));
+        assert!(!context.contains("It's a screenshot of"));
     }
 }
