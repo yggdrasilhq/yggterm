@@ -82,9 +82,11 @@ static BOOTSTRAP: OnceCell<ShellBootstrap> = OnceCell::new();
 static PASSIVE_COPY_SUSPENDED: AtomicBool = AtomicBool::new(false);
 static PREVIEW_BLOCK_CACHE: OnceCell<Mutex<PreviewBlockCache>> = OnceCell::new();
 static PREVIEW_CONTENT_CACHE: OnceCell<Mutex<PreviewContentCache>> = OnceCell::new();
+static PREVIEW_RUN_CACHE: OnceCell<Mutex<PreviewRunCache>> = OnceCell::new();
 
 const PREVIEW_BLOCK_CACHE_LIMIT: usize = 256;
 const PREVIEW_CONTENT_CACHE_LIMIT: usize = 256;
+const PREVIEW_RUN_CACHE_LIMIT: usize = 256;
 const SIDE_RAIL_WIDTH: usize = 292;
 const DEFERRED_STARTUP_SYNC_MS: u64 = 8_000;
 const EDGE_RESIZE_HANDLE: usize = 5;
@@ -471,6 +473,12 @@ struct PreviewBlockCache {
 struct PreviewContentCache {
     order: VecDeque<u64>,
     entries: HashMap<u64, Vec<PreviewContentBlock>>,
+}
+
+#[derive(Default)]
+struct PreviewRunCache {
+    order: VecDeque<u64>,
+    entries: HashMap<u64, Vec<PreviewRun>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4550,11 +4558,34 @@ fn preview_content_cache() -> &'static Mutex<PreviewContentCache> {
     PREVIEW_CONTENT_CACHE.get_or_init(|| Mutex::new(PreviewContentCache::default()))
 }
 
+fn preview_run_cache() -> &'static Mutex<PreviewRunCache> {
+    PREVIEW_RUN_CACHE.get_or_init(|| Mutex::new(PreviewRunCache::default()))
+}
+
 fn preview_content_cache_key(lines: &[String]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for line in lines {
         line.hash(&mut hasher);
         0xff_u8.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn preview_run_cache_key(blocks: &[SessionPreviewBlock], start_index: usize) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    start_index.hash(&mut hasher);
+    for block in blocks {
+        match block.tone {
+            PreviewTone::User => 1_u8,
+            PreviewTone::Assistant => 2_u8,
+        }
+        .hash(&mut hasher);
+        block.timestamp.hash(&mut hasher);
+        for line in &block.lines {
+            line.hash(&mut hasher);
+            0xff_u8.hash(&mut hasher);
+        }
+        0xfe_u8.hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -4684,6 +4715,17 @@ fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlo
 }
 
 fn group_preview_runs(blocks: &[SessionPreviewBlock], start_index: usize) -> Vec<PreviewRun> {
+    let key = preview_run_cache_key(blocks, start_index);
+    if let Ok(mut cache) = preview_run_cache().lock() {
+        if let Some(hit) = cache.entries.get(&key).cloned() {
+            if let Some(ix) = cache.order.iter().position(|existing| *existing == key) {
+                cache.order.remove(ix);
+            }
+            cache.order.push_back(key);
+            return hit;
+        }
+    }
+
     let mut runs: Vec<PreviewRun> = Vec::new();
     let mut last_date_key = None::<(i32, u8, u8)>;
     for (offset, block) in blocks.iter().cloned().enumerate() {
@@ -4707,6 +4749,18 @@ fn group_preview_runs(blocks: &[SessionPreviewBlock], start_index: usize) -> Vec
                 display_timestamp,
             }],
         });
+    }
+    if let Ok(mut cache) = preview_run_cache().lock() {
+        cache.entries.insert(key, runs.clone());
+        if let Some(ix) = cache.order.iter().position(|existing| *existing == key) {
+            cache.order.remove(ix);
+        }
+        cache.order.push_back(key);
+        while cache.order.len() > PREVIEW_RUN_CACHE_LIMIT {
+            if let Some(oldest) = cache.order.pop_front() {
+                cache.entries.remove(&oldest);
+            }
+        }
     }
     runs
 }
