@@ -819,6 +819,33 @@ impl ShellState {
         search_sidebar_matches(&rows, &self.search_query)
     }
 
+    fn refresh_search_state(&mut self, source: &str) {
+        let trimmed = self.search_query.trim();
+        if trimmed.is_empty() || trimmed.starts_with('/') {
+            return;
+        }
+        let matches = self.current_search_sidebar_matches();
+        if matches.is_empty() {
+            self.search_sidebar_match_index = None;
+        } else if self.search_sidebar_match_index.is_none() {
+            self.search_sidebar_match_index = Some(0);
+        }
+        self.record_ui_telemetry(
+            "search_resolved_debug",
+            json!({
+                "source": source,
+                "query": self.search_query,
+                "sidebar_matches": matches.len(),
+                "content_hits": search_content_hits(
+                    self.server.active_session(),
+                    self.server.active_view_mode(),
+                    &self.search_query,
+                )
+                .len(),
+            }),
+        );
+    }
+
     fn toggle_sidebar(&mut self) {
         self.sidebar_open = !self.sidebar_open;
         self.sync_browser_settings();
@@ -966,6 +993,7 @@ impl ShellState {
                     self.seed_dynamic_top_level_expansions();
                 }
                 self.ensure_active_session_visible();
+                self.refresh_search_state("apply_daemon_snapshot_result");
                 self.record_restore_issue_telemetry("apply_daemon_snapshot_result");
                 self.record_preview_issue_telemetry("apply_daemon_snapshot_result");
                 if let Some(message) = message {
@@ -2907,6 +2935,7 @@ fn spawn_initial_browser_tree_load(
                 Ok(Ok(browser_tree)) => {
                     let selected_hint = shell.browser.selected_path().map(str::to_string);
                     restore_browser_tree(shell, browser_tree, selected_hint.as_deref());
+                    shell.refresh_search_state("initial_browser_tree_load_complete");
                     shell.last_action = "loaded session tree".to_string();
                 }
                 Ok(Err(error)) => {
@@ -2964,6 +2993,50 @@ fn restart_into_pending_update(mut state: Signal<ShellState>) {
                 shell.pending_update_restart = None;
             });
         }
+    });
+}
+
+fn spawn_graceful_shutdown_and_close(mut state: Signal<ShellState>) {
+    let endpoint = BOOTSTRAP
+        .get()
+        .expect("shell bootstrap initialized")
+        .server_endpoint
+        .clone();
+    state.with_mut(|shell| {
+        shell.server_busy = true;
+        shell.last_action = "closing yggterm sessions".to_string();
+        shell.push_notification(
+            NotificationTone::Info,
+            "Closing Yggterm",
+            "Gracefully shutting down local and remote Yggterm sessions.",
+        );
+    });
+    spawn(async move {
+        let outcome = task::spawn_blocking(move || daemon_shutdown(&endpoint)).await;
+        state.with_mut(|shell| match outcome {
+            Ok(Ok(_)) => {
+                shell.last_action = "closed yggterm sessions".to_string();
+                window().close();
+            }
+            Ok(Err(error)) => {
+                shell.server_busy = false;
+                shell.last_action = format!("shutdown failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "Yggterm Close Failed",
+                    error.to_string(),
+                );
+            }
+            Err(error) => {
+                shell.server_busy = false;
+                shell.last_action = format!("shutdown task failed: {error}");
+                shell.push_notification(
+                    NotificationTone::Error,
+                    "Yggterm Close Failed",
+                    error.to_string(),
+                );
+            }
+        });
     });
 }
 
@@ -3186,13 +3259,26 @@ fn prepare_current_endpoint_for_spawn(endpoint: &ServerEndpoint) -> Result<()> {
 fn spawn_daemon_process(endpoint: &ServerEndpoint) -> Result<()> {
     let current_exe = std::env::current_exe()?;
     let log_file = daemon_startup_log_file(endpoint)?;
-    Command::new(current_exe)
+    let mut command = Command::new(current_exe);
+    command
         .arg("server")
         .arg("daemon")
         .stdin(Stdio::null())
         .stdout(log_file.try_clone()?)
-        .stderr(log_file)
-        .spawn()?;
+        .stderr(log_file);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    command.spawn()?;
     Ok(())
 }
 
@@ -4691,10 +4777,15 @@ fn search_sidebar_matches(rows: &[BrowserRow], query: &str) -> Vec<BrowserRow> {
     if terms.is_empty() {
         return Vec::new();
     }
-    rows.iter()
-        .filter(|row| matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document))
+    filtered_sidebar_rows(rows, query)
+        .into_iter()
+        .filter(|row| {
+            matches!(
+                row.kind,
+                BrowserRowKind::Group | BrowserRowKind::Session | BrowserRowKind::Document
+            )
+        })
         .filter(|row| row_matches_search(row, &terms))
-        .cloned()
         .collect()
 }
 
@@ -7985,6 +8076,7 @@ fn app() -> Element {
                     on_restart_update: move || restart_into_pending_update(state),
                     on_toggle_maximized: move || state.with_mut(|shell| shell.toggle_maximized()),
                     on_toggle_always_on_top: move || state.with_mut(|shell| shell.toggle_always_on_top()),
+                    on_close_app: move || spawn_graceful_shutdown_and_close(state),
                     maximized: maximized,
                 }
                 div {
@@ -8363,6 +8455,7 @@ fn Titlebar(
     on_restart_update: EventHandler<()>,
     on_toggle_maximized: EventHandler<()>,
     on_toggle_always_on_top: EventHandler<()>,
+    on_close_app: EventHandler<()>,
     maximized: bool,
 ) -> Element {
     let command_mode_active = snapshot.command_mode_active;
@@ -8573,6 +8666,7 @@ fn Titlebar(
                         on_hover_control: on_hover_control,
                         on_toggle_maximized: on_toggle_maximized,
                         on_toggle_always_on_top: on_toggle_always_on_top,
+                        on_close_app: on_close_app,
                         maximized: maximized,
                         always_on_top: snapshot.always_on_top,
                     }
@@ -14996,6 +15090,60 @@ mod tests {
         assert_eq!(search_sidebar_matches(&rows, "q4fc63d").len(), 1);
         assert_eq!(search_sidebar_matches(&rows, "\"excel shortcut\" gh/excel").len(), 1);
         assert!(search_sidebar_matches(&rows, "timezone").is_empty());
+    }
+
+    #[test]
+    fn search_sidebar_matches_include_group_rows() {
+        let rows = vec![
+            BrowserRow {
+                kind: BrowserRowKind::Group,
+                full_path: "__remote_machine__/oc".to_string(),
+                label: "oc [ok]".to_string(),
+                detail_label: String::new(),
+                document_kind: None,
+                group_kind: None,
+                session_title: None,
+                depth: 0,
+                host_label: String::new(),
+                descendant_sessions: 1,
+                expanded: true,
+                session_id: None,
+                session_cwd: None,
+            },
+            BrowserRow {
+                kind: BrowserRowKind::Group,
+                full_path: "__remote_folder__/oc/home/pi/gh".to_string(),
+                label: "/home/pi/gh".to_string(),
+                detail_label: String::new(),
+                document_kind: None,
+                group_kind: None,
+                session_title: None,
+                depth: 1,
+                host_label: "oc".to_string(),
+                descendant_sessions: 1,
+                expanded: true,
+                session_id: None,
+                session_cwd: Some("/home/pi/gh".to_string()),
+            },
+            BrowserRow {
+                kind: BrowserRowKind::Session,
+                full_path: "remote-session://oc/1".to_string(),
+                label: "Excel Shortcut Design".to_string(),
+                detail_label: String::new(),
+                document_kind: None,
+                group_kind: None,
+                session_title: Some("Excel Shortcut Design".to_string()),
+                depth: 2,
+                host_label: "oc".to_string(),
+                descendant_sessions: 0,
+                expanded: true,
+                session_id: Some("1".to_string()),
+                session_cwd: Some("/home/pi/gh/excel-inspired".to_string()),
+            },
+        ];
+
+        let matches = search_sidebar_matches(&rows, "home/pi/gh");
+        assert!(matches.iter().any(|row| row.full_path == "__remote_folder__/oc/home/pi/gh"));
     }
 }
 
