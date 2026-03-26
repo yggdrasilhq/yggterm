@@ -84,8 +84,8 @@ const CORNER_RESIZE_HANDLE: usize = 10;
 const XTERM_CSS: &str = include_str!("../../../assets/xterm/xterm.css");
 const XTERM_JS: &str = include_str!("../../../assets/xterm/xterm.js");
 const XTERM_FIT_JS: &str = include_str!("../../../assets/xterm/addon-fit.js");
-const PREVIEW_BLOCK_WINDOW: usize = 48;
-const PREVIEW_SYNC_POLL_MS: u64 = 2_500;
+const PREVIEW_BLOCK_WINDOW: usize = 24;
+const PREVIEW_SYNC_POLL_MS: u64 = 10_000;
 static XTERM_ASSETS_BOOTSTRAPPED: OnceCell<()> = OnceCell::new();
 const TREE_LOADING_DOT_CSS: &str = "@keyframes yggterm-tree-loading-dot { 0%, 80%, 100% { opacity: 0.28; transform: translateY(0px); } 40% { opacity: 1; transform: translateY(-1px); } }";
 const BACKGROUND_COPY_RETRY_MS: u64 = 300_000;
@@ -9237,14 +9237,14 @@ fn PreviewBlock(
 
 #[component]
 fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
-    let blocks = preview_content_blocks(&lines);
+    let blocks = use_memo(move || preview_content_blocks(&lines));
     rsx! {
         div {
             style: format!(
                 "display:flex; flex-direction:column; gap:10px; color:{}; contain:layout paint style;",
                 palette.text
             ),
-            for block in blocks {
+            for block in blocks.read().iter().cloned() {
                 match block {
                     PreviewContentBlock::Heading { level, text } => rsx! {
                         div {
