@@ -73,6 +73,7 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 - Keep `debian/` metadata and packaging scripts current so each release can emit a usable `.deb` with accurate runtime dependencies.
 - For every release build, always generate the `.deb` package (and checksum) in `dist/` so laptop-side GUI/runtime testing can be done outside the SSH server environment.
 - For incremental development releases, always bump the patch version (e.g. `0.1.0` -> `0.1.1`) before packaging.
+- For GUI fixes, do not mark the issue as solved until it has been self-tested live on a different X11 display. Use `x11automation` when helpful for reliable interaction/click targeting. If only build/test validation was done, state that explicitly instead of claiming the GUI issue is fixed.
 
 ## Licensing
 
