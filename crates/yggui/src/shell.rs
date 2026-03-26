@@ -3513,19 +3513,37 @@ fn spawn_background_remote_machine_refresh(state: Signal<ShellState>, machine_ke
     });
 }
 
-fn spawn_server_snapshot_action<F>(mut state: Signal<ShellState>, pending_label: String, request: F)
+fn spawn_server_snapshot_action<F>(state: Signal<ShellState>, pending_label: String, request: F)
+where
+    F: FnOnce(ServerEndpoint) -> Result<(ServerUiSnapshot, Option<String>)> + Send + 'static,
+{
+    spawn_surface_snapshot_action(
+        state,
+        pending_label,
+        YggRequestMeta::interactive(
+            format!("server-action-{}", current_millis()),
+            "server_action",
+            YggSurface::App,
+            YggTarget::App,
+        ),
+        true,
+        request,
+    );
+}
+
+fn spawn_surface_snapshot_action<F>(
+    mut state: Signal<ShellState>,
+    pending_label: String,
+    request_meta: YggRequestMeta,
+    global_busy: bool,
+    request: F,
+)
 where
     F: FnOnce(ServerEndpoint) -> Result<(ServerUiSnapshot, Option<String>)> + Send + 'static,
 {
     let endpoint = state.read().bootstrap.server_endpoint.clone();
-    let request_meta = YggRequestMeta::interactive(
-        format!("server-action-{}", current_millis()),
-        pending_label.clone(),
-        YggSurface::App,
-        YggTarget::App,
-    );
     state.with_mut(|shell| {
-        shell.begin_busy_request(request_meta.clone(), pending_label.clone());
+        shell.begin_surface_request(request_meta.clone(), pending_label.clone(), global_busy);
     });
     spawn_loading_notice(
         state,
@@ -3557,24 +3575,22 @@ where
 fn spawn_set_view_mode(mut state: Signal<ShellState>, mode: WorkspaceViewMode) {
     state.with_mut(|shell| {
         shell.server.set_view_mode(mode);
-        let label = match mode {
-            WorkspaceViewMode::Rendered => "switching to preview".to_string(),
-            WorkspaceViewMode::Terminal => "switching to terminal".to_string(),
-        };
-        shell.begin_busy_request(
-            YggRequestMeta::interactive(
-                format!("view-mode-{}", current_millis()),
-                "set_view_mode",
-                match mode {
-                    WorkspaceViewMode::Rendered => YggSurface::Preview,
-                    WorkspaceViewMode::Terminal => YggSurface::Terminal,
-                },
-                YggTarget::ActiveSession,
-            ),
-            label,
-        );
     });
-    spawn_server_snapshot_action(state, "syncing view mode".to_string(), move |endpoint| {
+    let surface = match mode {
+        WorkspaceViewMode::Rendered => YggSurface::Preview,
+        WorkspaceViewMode::Terminal => YggSurface::Terminal,
+    };
+    spawn_surface_snapshot_action(
+        state,
+        "syncing view mode".to_string(),
+        YggRequestMeta::interactive(
+            format!("view-mode-{}", current_millis()),
+            "set_view_mode",
+            surface,
+            YggTarget::ActiveSession,
+        ),
+        false,
+        move |endpoint| {
         if mode == WorkspaceViewMode::Terminal {
             request_terminal_launch(&endpoint)
         } else {
@@ -3604,7 +3620,7 @@ fn spawn_open_session_row(mut state: Signal<ShellState>, row: BrowserRow) {
         shell.browser.select_path(row.full_path.clone());
         shell.context_menu_row = None;
         shell.sync_browser_settings();
-        shell.begin_busy_request(request_meta.clone(), format!("opening {}", row.label));
+        shell.begin_surface_request(request_meta.clone(), format!("opening {}", row.label), false);
     });
     spawn_loading_notice(
         state,
@@ -8320,24 +8336,44 @@ fn app() -> Element {
                         state,
                         snapshot: main_snapshot,
                         terminal_mount_epoch: *terminal_mount_epoch.read(),
-                        on_expand_preview: move || spawn_server_snapshot_action(
+                        on_expand_preview: move || spawn_surface_snapshot_action(
                             state,
                             "expanding preview".to_string(),
+                            YggRequestMeta::interactive(
+                                format!("preview-expand-{}", current_millis()),
+                                "expand_preview",
+                                YggSurface::Preview,
+                                YggTarget::ActiveSession,
+                            ),
+                            false,
                             |endpoint| set_all_preview_blocks_folded(&endpoint, false),
                         ),
-                        on_collapse_preview: move || spawn_server_snapshot_action(
+                        on_collapse_preview: move || spawn_surface_snapshot_action(
                             state,
                             "collapsing preview".to_string(),
+                            YggRequestMeta::interactive(
+                                format!("preview-collapse-{}", current_millis()),
+                                "collapse_preview",
+                                YggSurface::Preview,
+                                YggTarget::ActiveSession,
+                            ),
+                            false,
                             |endpoint| set_all_preview_blocks_folded(&endpoint, true),
                         ),
                         on_toggle_preview_block: move |ix: usize| {
                             state.with_mut(|shell| {
                                 shell.server.toggle_preview_block(ix);
-                                shell.server_busy = true;
                             });
-                            spawn_server_snapshot_action(
+                            spawn_surface_snapshot_action(
                                 state,
                                 format!("toggling preview block {}", ix + 1),
+                                YggRequestMeta::interactive(
+                                    format!("preview-toggle-{}-{}", ix, current_millis()),
+                                    "toggle_preview_block",
+                                    YggSurface::Preview,
+                                    YggTarget::ActiveSession,
+                                ),
+                                false,
                                 move |endpoint| daemon_toggle_preview_block(&endpoint, ix),
                             )
                         },
@@ -9711,7 +9747,11 @@ fn MainSurface(
                     }
                 } else {
                     let visible_blocks = visible_preview_blocks(&session);
-                    let rendered_block_limit = (*preview_block_limit.read()).max(PREVIEW_BLOCK_WINDOW);
+                    let rendered_block_limit = if snapshot.search_active {
+                        visible_blocks.len()
+                    } else {
+                        (*preview_block_limit.read()).max(PREVIEW_BLOCK_WINDOW)
+                    };
                     let hidden_block_count = visible_blocks.len().saturating_sub(rendered_block_limit);
                     let rendered_blocks = if hidden_block_count > 0 {
                         visible_blocks[hidden_block_count..].to_vec()
@@ -9759,7 +9799,7 @@ fn MainSurface(
                                     div {
                                         style: "display:flex; flex-direction:column; gap:16px; min-width:0; width:min(1020px, 100%); margin:0 auto; \
                                                 contain:layout paint style;",
-                                        if hidden_block_count > 0 {
+                                        if hidden_block_count > 0 && !snapshot.search_active {
                                             div {
                                                 style: "display:flex; justify-content:center; margin:0 0 4px 0;",
                                                 button {
