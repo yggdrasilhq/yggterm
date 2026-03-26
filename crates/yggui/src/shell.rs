@@ -614,12 +614,17 @@ impl ShellState {
         let mut expanded_paths = self.browser.expanded_path_set();
         expanded_paths.extend(self.active_session_visibility_paths());
         let live_sessions = self.server.live_sessions();
-        let merged_rows = merged_sidebar_rows(
+        let mut merged_rows = merged_sidebar_rows(
             self.browser.rows(),
             self.server.remote_machines(),
             self.server.ssh_targets(),
             &live_sessions,
             &expanded_paths,
+        );
+        enrich_sidebar_rows_with_live_titles(
+            &mut merged_rows,
+            &live_sessions,
+            self.server.remote_machines(),
         );
         let command_mode_active = is_command_query(&self.search_query);
         let effective_search_query = if command_mode_active {
@@ -809,12 +814,17 @@ impl ShellState {
         let mut expanded_paths = self.browser.expanded_path_set();
         expanded_paths.extend(self.active_session_visibility_paths());
         let live_sessions = self.server.live_sessions();
-        let rows = merged_sidebar_rows(
+        let mut rows = merged_sidebar_rows(
             self.browser.rows(),
             self.server.remote_machines(),
             self.server.ssh_targets(),
             &live_sessions,
             &expanded_paths,
+        );
+        enrich_sidebar_rows_with_live_titles(
+            &mut rows,
+            &live_sessions,
+            self.server.remote_machines(),
         );
         search_sidebar_matches(&rows, &self.search_query)
     }
@@ -5195,6 +5205,41 @@ fn merged_sidebar_rows(
     }
     rows.extend_from_slice(stored_rows);
     rows
+}
+
+fn enrich_sidebar_rows_with_live_titles(
+    rows: &mut [BrowserRow],
+    live_sessions: &[ManagedSessionView],
+    remote_machines: &[RemoteMachineSnapshot],
+) {
+    let mut title_by_path = HashMap::<String, String>::new();
+    for session in live_sessions {
+        let title = session.title.trim();
+        if !title.is_empty() && !looks_like_generated_fallback_title(title) {
+            title_by_path.insert(session.session_path.clone(), title.to_string());
+        }
+    }
+    for machine in remote_machines {
+        for session in &machine.sessions {
+            let title = session.title_hint.trim();
+            if !title.is_empty() && !looks_like_generated_fallback_title(title) {
+                title_by_path
+                    .entry(session.session_path.clone())
+                    .or_insert_with(|| title.to_string());
+            }
+        }
+    }
+    for row in rows {
+        let Some(title) = title_by_path.get(&row.full_path).cloned() else {
+            continue;
+        };
+        row.session_title = Some(title.clone());
+        if matches!(row.kind, BrowserRowKind::Session)
+            && (row.label.trim().is_empty() || looks_like_generated_fallback_title(&row.label))
+        {
+            row.label = title;
+        }
+    }
 }
 
 fn merge_remote_live_sessions(
@@ -15144,6 +15189,62 @@ mod tests {
 
         let matches = search_sidebar_matches(&rows, "home/pi/gh");
         assert!(matches.iter().any(|row| row.full_path == "__remote_folder__/oc/home/pi/gh"));
+    }
+
+    #[test]
+    fn enrich_sidebar_rows_uses_live_session_titles_for_search() {
+        let mut rows = vec![BrowserRow {
+            kind: BrowserRowKind::Session,
+            full_path: "/home/pi/.codex/sessions/example.jsonl".to_string(),
+            label: "Qabc123".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: Some("Qabc123".to_string()),
+            depth: 1,
+            host_label: String::new(),
+            descendant_sessions: 0,
+            expanded: true,
+            session_id: Some("abc123".to_string()),
+            session_cwd: Some("/home/pi/gh/excel-inspired".to_string()),
+        }];
+        let live_sessions = vec![ManagedSessionView {
+            id: "abc123".to_string(),
+            session_path: "/home/pi/.codex/sessions/example.jsonl".to_string(),
+            title: "Excel Shortcut Design".to_string(),
+            kind: SessionKind::Codex,
+            host_label: String::new(),
+            source: yggterm_server::SessionSource::Stored,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: yggterm_server::RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: Vec::new(),
+            rendered_sections: Vec::new(),
+            preview: yggterm_server::SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: Vec::new(),
+            terminal_process_id: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: yggterm_server::GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+        }];
+
+        enrich_sidebar_rows_with_live_titles(&mut rows, &live_sessions, &[]);
+
+        assert_eq!(rows[0].session_title.as_deref(), Some("Excel Shortcut Design"));
+        assert_eq!(rows[0].label, "Excel Shortcut Design");
+        assert_eq!(search_sidebar_matches(&rows, "Excel Shortcut Design").len(), 1);
     }
 }
 
