@@ -6274,7 +6274,6 @@ fn app() -> Element {
     let mut window_epoch = use_signal(|| 0_u64);
     let mut terminal_mount_epoch = use_signal(|| 0_u64);
     let mut async_render_epoch = use_signal(|| 0_u64);
-    let mut startup_refresh_pulse = use_signal(|| 0_u64);
     let mut last_terminal_session_path = use_signal(|| None::<String>);
     let mut last_open_recovery_path = use_signal(|| None::<String>);
     let mut last_preview_refresh_path = use_signal(|| None::<String>);
@@ -6671,16 +6670,11 @@ fn app() -> Element {
             spawn_dock_hide(state, pid, window_id);
         }
     });
-    let startup_refresh_desktop = desktop.clone();
     use_future(move || {
         let mut state = state;
-        let mut startup_refresh_pulse = startup_refresh_pulse;
-        let desktop = startup_refresh_desktop.clone();
         async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(140)).await;
-                startup_refresh_pulse.with_mut(|pulse| *pulse += 1);
-                desktop.request_redraw();
                 let should_continue = {
                     let shell = state.read();
                     shell.browser_tree_loading_in_flight
@@ -6694,7 +6688,6 @@ fn app() -> Element {
         }
     });
     let _ = *async_render_epoch.read();
-    let _ = *startup_refresh_pulse.read();
     let snapshot = state.read().snapshot();
     let inner = desktop.inner_size();
     let context_menu_window_size = (inner.width as f64, inner.height as f64);
@@ -6705,6 +6698,7 @@ fn app() -> Element {
     let preferred_agent_kind = preferred_agent_session_kind(&snapshot.settings);
     let maximized = snapshot.maximized;
     let shell_radius = if maximized { 0 } else { 11 };
+    let shell_backdrop = shell_backdrop_style(maximized);
     let context_menu_overlay = snapshot.context_menu_row.clone().map(|row| {
         let context_row = resolve_creation_context_row(&snapshot.rows, &row);
         (row, context_row)
@@ -6716,9 +6710,9 @@ fn app() -> Element {
             tabindex: "0",
             style: format!(
                 "position: fixed; inset: 0; overflow: hidden; border-radius:{}px; \
-                 background-color:{}; background-image:{}; backdrop-filter: blur(30px) saturate(165%); \
-                 -webkit-backdrop-filter: blur(30px) saturate(165%);",
-                shell_radius, snapshot.shell_tint, snapshot.shell_gradient
+                 background-color:{}; background-image:{}; backdrop-filter:{}; \
+                 -webkit-backdrop-filter:{};",
+                shell_radius, snapshot.shell_tint, snapshot.shell_gradient, shell_backdrop, shell_backdrop
             ),
             onmouseup: move |_| {
                 if !state.read().drag_paths.is_empty() {
@@ -6759,7 +6753,13 @@ fn app() -> Element {
             },
             style { "{TOAST_CSS}" }
             div {
-                style: shell_style(snapshot.palette, shell_radius, &snapshot.shell_tint, &snapshot.shell_gradient),
+                style: shell_style(
+                    snapshot.palette,
+                    shell_radius,
+                    &snapshot.shell_tint,
+                    &snapshot.shell_gradient,
+                    maximized,
+                ),
                 WindowResizeHandles {}
                 Titlebar {
                     snapshot: titlebar_snapshot,
@@ -11916,15 +11916,32 @@ fn palette(theme: UiTheme) -> Palette {
     }
 }
 
-fn shell_style(palette: Palette, radius: u8, shell_tint: &str, shell_gradient: &str) -> String {
+fn shell_backdrop_style(maximized: bool) -> &'static str {
+    if maximized {
+        "none"
+    } else {
+        "blur(10px) saturate(135%)"
+    }
+}
+
+fn shell_style(
+    palette: Palette,
+    radius: u8,
+    shell_tint: &str,
+    shell_gradient: &str,
+    maximized: bool,
+) -> String {
+    let backdrop = shell_backdrop_style(maximized);
     format!(
         "position:fixed; inset:0; display:flex; flex-direction:column; overflow:hidden; \
-         border-radius:{}px; background-color:{}; background-image:{}; box-shadow:{}; backdrop-filter: blur(30px) saturate(165%); \
-         -webkit-backdrop-filter: blur(30px) saturate(165%); font-family:{};",
+         border-radius:{}px; background-color:{}; background-image:{}; box-shadow:{}; backdrop-filter:{}; \
+         -webkit-backdrop-filter:{}; font-family:{};",
         radius,
         shell_tint,
         shell_gradient,
         palette.shadow,
+        backdrop,
+        backdrop,
         interface_font_family()
     )
 }
