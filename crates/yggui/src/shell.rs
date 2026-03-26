@@ -184,6 +184,7 @@ struct ShellState {
     browser_tree_loading_in_flight: bool,
     recent_ui_telemetry: HashMap<String, (String, u64)>,
     had_cached_startup_snapshot: bool,
+    latest_open_request_id: u64,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -408,7 +409,14 @@ enum PreviewContentBlock {
 #[derive(Debug, Clone, PartialEq)]
 struct PreviewRun {
     tone: PreviewTone,
-    entries: Vec<(usize, SessionPreviewBlock)>,
+    entries: Vec<PreviewRunEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PreviewRunEntry {
+    block_ix: usize,
+    block: SessionPreviewBlock,
+    display_timestamp: String,
 }
 
 #[derive(Default)]
@@ -518,6 +526,7 @@ impl ShellState {
             browser_tree_loading_in_flight: !browser_tree_loaded,
             recent_ui_telemetry: HashMap::new(),
             had_cached_startup_snapshot: has_initial_server_snapshot,
+            latest_open_request_id: 0,
         };
         if let Some(path) = state.browser.selected_path().map(ToOwned::to_owned) {
             state.selected_tree_paths.insert(path.clone());
@@ -3105,39 +3114,68 @@ fn spawn_set_view_mode(mut state: Signal<ShellState>, mode: WorkspaceViewMode) {
 
 fn spawn_open_session_row(mut state: Signal<ShellState>, row: BrowserRow) {
     let prefer_terminal = state.read().server.active_view_mode() == WorkspaceViewMode::Terminal;
+    let mut open_request_id = 0_u64;
     state.with_mut(|shell| {
+        shell.latest_open_request_id = shell.latest_open_request_id.saturating_add(1);
+        open_request_id = shell.latest_open_request_id;
         shell.browser.select_path(row.full_path.clone());
         shell.context_menu_row = None;
         shell.sync_browser_settings();
         shell.server_busy = true;
         shell.last_action = format!("opening {}", row.label);
     });
-    spawn_server_snapshot_action(state, format!("opening {}", row.label), move |endpoint| {
-        let opened = if let Some((machine_key, session_id)) = parse_remote_scanned_session_path(&row.full_path) {
-            open_remote_session(
-                &endpoint,
-                machine_key,
-                session_id,
-                row.session_cwd.as_deref(),
-                Some(row.label.as_str()),
-            )
-        } else {
-            open_stored_session(
-                &endpoint,
-                session_kind_for_row(row.kind),
-                &row.full_path,
-                row.session_id.as_deref(),
-                row.session_cwd.as_deref(),
-                Some(row.label.as_str()),
-            )
-        }?;
-        if prefer_terminal {
-            request_terminal_launch(&endpoint)
-        } else if row.full_path.starts_with("remote-session://") {
-            daemon_set_view_mode(&endpoint, WorkspaceViewMode::Rendered)
-        } else {
-            Ok(opened)
-        }
+    let endpoint = state.read().bootstrap.server_endpoint.clone();
+    let pending_label = format!("opening {}", row.label);
+    spawn(async move {
+        let row_for_request = row.clone();
+        let outcome = task::spawn_blocking(move || {
+            let opened = if let Some((machine_key, session_id)) =
+                parse_remote_scanned_session_path(&row_for_request.full_path)
+            {
+                open_remote_session(
+                    &endpoint,
+                    machine_key,
+                    session_id,
+                    row_for_request.session_cwd.as_deref(),
+                    Some(row_for_request.label.as_str()),
+                )
+            } else {
+                open_stored_session(
+                    &endpoint,
+                    session_kind_for_row(row_for_request.kind),
+                    &row_for_request.full_path,
+                    row_for_request.session_id.as_deref(),
+                    row_for_request.session_cwd.as_deref(),
+                    Some(row_for_request.label.as_str()),
+                )
+            }?;
+            if prefer_terminal {
+                request_terminal_launch(&endpoint)
+            } else if row_for_request.full_path.starts_with("remote-session://") {
+                daemon_set_view_mode(&endpoint, WorkspaceViewMode::Rendered)
+            } else {
+                Ok(opened)
+            }
+        })
+        .await;
+        let _ = safe_shell_mut(state, "open_session_row_complete", |shell| {
+            if open_request_id != shell.latest_open_request_id {
+                return;
+            }
+            match outcome {
+                Ok(result) => shell.apply_daemon_snapshot_result(result),
+                Err(error) => {
+                    shell.server_busy = false;
+                    shell.last_action = format!("{pending_label} task failed: {error}");
+                    shell.push_notification(
+                        NotificationTone::Error,
+                        "Open Session Failed",
+                        error.to_string(),
+                    );
+                }
+            }
+        });
+        maybe_spawn_missing_remote_machine_refreshes(state);
     });
 }
 
@@ -4042,20 +4080,86 @@ fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlo
 
 fn group_preview_runs(blocks: &[SessionPreviewBlock], start_index: usize) -> Vec<PreviewRun> {
     let mut runs: Vec<PreviewRun> = Vec::new();
+    let mut last_date_key = None::<(i32, u8, u8)>;
     for (offset, block) in blocks.iter().cloned().enumerate() {
         let ix = start_index + offset;
+        let display_timestamp = format_preview_timestamp_label(&block.timestamp, &mut last_date_key);
         if let Some(last) = runs.last_mut()
             && last.tone == block.tone
         {
-            last.entries.push((ix, block));
+            last.entries.push(PreviewRunEntry {
+                block_ix: ix,
+                block,
+                display_timestamp,
+            });
             continue;
         }
         runs.push(PreviewRun {
             tone: block.tone,
-            entries: vec![(ix, block)],
+            entries: vec![PreviewRunEntry {
+                block_ix: ix,
+                block,
+                display_timestamp,
+            }],
         });
     }
     runs
+}
+
+fn format_preview_timestamp_label(
+    raw: &str,
+    last_date_key: &mut Option<(i32, u8, u8)>,
+) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let parsed = parse_preview_timestamp(trimmed);
+    let Some(timestamp) = parsed else {
+        return trimmed.to_string();
+    };
+    let date_key = (
+        timestamp.year(),
+        timestamp.month() as u8,
+        timestamp.day(),
+    );
+    let time_only = timestamp
+        .format(time::macros::format_description!("[hour repr:12]:[minute][period case:upper]"))
+        .unwrap_or_else(|_| trimmed.to_string());
+    let full = timestamp
+        .format(time::macros::format_description!(
+            "[month repr:short] [day], [year] [hour repr:12]:[minute][period case:upper] UTC[offset_hour sign:mandatory][offset_minute]"
+        ))
+        .unwrap_or_else(|_| trimmed.to_string());
+    if last_date_key.as_ref() == Some(&date_key) {
+        return time_only;
+    }
+    *last_date_key = Some(date_key);
+    full
+}
+
+fn parse_preview_timestamp(raw: &str) -> Option<OffsetDateTime> {
+    let iso = time::format_description::well_known::Rfc3339;
+    OffsetDateTime::parse(raw, &iso)
+        .ok()
+        .or_else(|| {
+            OffsetDateTime::parse(
+                raw,
+                &time::macros::format_description!(
+                    "[month repr:short] [day], [year] [hour repr:12]:[minute] [period case:upper] UTC[offset_hour sign:mandatory][offset_minute]"
+                ),
+            )
+            .ok()
+        })
+        .or_else(|| {
+            OffsetDateTime::parse(
+                raw,
+                &time::macros::format_description!(
+                    "[month repr:short] [day], [year] [hour repr:12]:[minute][period case:upper] UTC[offset_hour sign:mandatory][offset_minute]"
+                ),
+            )
+            .ok()
+        })
 }
 
 fn remote_machine_for_session_path(
@@ -7040,15 +7144,9 @@ fn app() -> Element {
                                     );
                                     return;
                                 }
-                                let should_generate =
-                                    (is_local_stored_session_row(&row) && row.session_title.is_none())
-                                        || is_remote_scanned_sidebar_row(&row);
                                 match row.kind {
                                     BrowserRowKind::Group | BrowserRowKind::Separator => state.with_mut(|shell| shell.select_row(&row)),
                                     BrowserRowKind::Session | BrowserRowKind::Document => spawn_open_session_row(state, row.clone()),
-                                }
-                                if should_generate {
-                                    spawn_deferred_title_generation(state, row.clone(), false);
                                 }
                             })) {
                                 warn!(
@@ -9266,20 +9364,20 @@ fn PreviewRunBlock(
     let dark = palette_is_dark(palette);
     let row_justify = if user_run { "flex-end" } else { "flex-start" };
     let width = if user_run { "min(72%, 720px)" } else { "min(100%, 880px)" };
+    let serif_stack = "\"Source Serif 4\", \"Noto Serif\", \"Iowan Old Style\", Georgia, serif";
     let background = match user_run {
-        true if dark => "rgba(51,60,74,0.96)",
-        true => "rgba(238,244,250,0.98)",
+        true if dark => "rgba(52,56,64,0.96)",
+        true => "rgba(241,243,246,0.98)",
         false => "transparent",
     };
     let border = match user_run {
-        true if dark => "rgba(118,154,192,0.24)",
-        true => "rgba(205,217,231,0.98)",
-        false if dark => "rgba(82,100,121,0.52)",
-        false => "rgba(224,231,239,0.92)",
+        true if dark => "rgba(96,104,116,0.32)",
+        true => "rgba(223,227,233,0.98)",
+        false => "transparent",
     };
     let shadow = match user_run {
-        true if dark => "0 14px 28px rgba(0,0,0,0.20)",
-        true => "0 12px 26px rgba(148,163,184,0.12)",
+        true if dark => "0 12px 24px rgba(0,0,0,0.18)",
+        true => "0 10px 20px rgba(148,163,184,0.10)",
         false => "none",
     };
 
@@ -9289,8 +9387,9 @@ fn PreviewRunBlock(
             div {
                 style: format!(
                     "display:flex; flex-direction:column; gap:0; width:{}; content-visibility:auto; \
-                     contain:layout paint style; contain-intrinsic-size:760px 260px;",
-                    width
+                     contain:layout paint style; contain-intrinsic-size:760px 260px; font-family:{};",
+                    width,
+                    serif_stack
                 ),
                 div {
                     style: format!(
@@ -9305,9 +9404,9 @@ fn PreviewRunBlock(
                             String::new()
                         }
                     ),
-                    for (entry_ix, (block_ix, block)) in run.entries.iter().cloned().enumerate() {
+                    for (entry_ix, entry) in run.entries.iter().cloned().enumerate() {
                         div {
-                            key: "{block_ix}",
+                            key: "{entry.block_ix}",
                             style: format!(
                                 "width:100%; text-align:left; background:transparent; padding:{}; \
                                  {} {}",
@@ -9315,12 +9414,12 @@ fn PreviewRunBlock(
                                 if entry_ix > 0 {
                                     if user_run {
                                         if dark {
-                                            "border-top:1px solid rgba(118,154,192,0.22);".to_string()
+                                            "border-top:1px solid rgba(100,108,120,0.24);".to_string()
                                         } else {
-                                            "border-top:1px solid rgba(203,213,225,0.88);".to_string()
+                                            "border-top:1px solid rgba(223,227,233,0.92);".to_string()
                                         }
                                     } else {
-                                        format!("border-top:1px solid {};", border)
+                                        "border-top:none;".to_string()
                                     }
                                 } else {
                                     String::new()
@@ -9334,27 +9433,27 @@ fn PreviewRunBlock(
                             div {
                                 style: "display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:8px;",
                                 div {
-                                    style: format!("font-size:10px; color:{}; opacity:0.8;", palette.muted),
-                                    "{block.timestamp}"
+                                    style: format!("font-size:10px; color:{}; opacity:0.82;", palette.muted),
+                                    "{entry.display_timestamp}"
                                 }
-                                if block.folded || block.lines.len() > 8 {
+                                if entry.block.folded || entry.block.lines.len() > 8 {
                                     button {
                                         style: format!(
                                             "border:none; background:transparent; color:{}; font-size:10px; opacity:0.72; padding:0;",
                                             palette.muted
                                         ),
-                                        onclick: move |_| on_toggle_block.call(block_ix),
-                                        {if block.folded { "Expand".to_string() } else { "Collapse".to_string() }}
+                                        onclick: move |_| on_toggle_block.call(entry.block_ix),
+                                        {if entry.block.folded { "Expand".to_string() } else { "Collapse".to_string() }}
                                     }
                                 }
                             }
-                            if block.folded {
+                            if entry.block.folded {
                                 div {
                                     style: format!("font-size:11px; color:{};", palette.muted),
-                                    "{block.lines.len()} lines hidden"
+                                    "{entry.block.lines.len()} lines hidden"
                                 }
                             } else {
-                                PreviewContent { lines: block.lines.clone(), palette }
+                                PreviewContent { lines: entry.block.lines.clone(), palette }
                             }
                         }
                     }
@@ -9370,7 +9469,8 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
     rsx! {
         div {
             style: format!(
-                "display:flex; flex-direction:column; gap:9px; color:{}; contain:layout paint style;",
+                "display:flex; flex-direction:column; gap:9px; color:{}; contain:layout paint style; \
+                 font-family:\"Source Serif 4\", \"Noto Serif\", \"Iowan Old Style\", Georgia, serif;",
                 palette.text
             ),
             for block in blocks.read().iter().cloned() {
@@ -9380,9 +9480,9 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                             style: format!(
                                 "font-size:{}px; line-height:1.38; font-weight:750; letter-spacing:-0.01em; color:{}; white-space:pre-wrap; padding-top:{}px;",
                                 match level {
-                                    1 => 17,
-                                    2 => 15,
-                                    _ => 13,
+                                    1 => 18,
+                                    2 => 16,
+                                    _ => 14,
                                 },
                                 palette.text,
                                 if level == 1 { 4 } else { 2 }
@@ -9392,7 +9492,7 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                     },
                     PreviewContentBlock::Paragraph(text) => rsx! {
                         div {
-                            style: "font-size:12px; line-height:1.68; white-space:pre-wrap;",
+                            style: "font-size:13px; line-height:1.72; white-space:pre-wrap;",
                             "{text}"
                         }
                     },
@@ -9403,7 +9503,7 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                                 style: format!("width:6px; height:6px; border-radius:999px; background:{}; margin-top:8px; flex:0 0 auto;", palette.accent_soft),
                             }
                             div {
-                                style: "font-size:12px; line-height:1.68; white-space:pre-wrap;",
+                                style: "font-size:13px; line-height:1.72; white-space:pre-wrap;",
                                 "{text}"
                             }
                         }
@@ -9412,11 +9512,11 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                         div {
                             style: "display:flex; align-items:flex-start; gap:10px;",
                             div {
-                                style: format!("min-width:22px; color:{}; font-size:12px; font-weight:700; line-height:1.66; flex:0 0 auto;", palette.accent),
+                                style: format!("min-width:22px; color:{}; font-size:13px; font-weight:700; line-height:1.7; flex:0 0 auto;", palette.accent),
                                 "{number}."
                             }
                             div {
-                                style: "font-size:12px; line-height:1.68; white-space:pre-wrap;",
+                                style: "font-size:13px; line-height:1.72; white-space:pre-wrap;",
                                 "{text}"
                             }
                         }
@@ -9437,7 +9537,7 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                             }
                             div {
                                 style: format!(
-                                    "font-size:12px; line-height:1.68; white-space:pre-wrap; color:{};",
+                                    "font-size:13px; line-height:1.72; white-space:pre-wrap; color:{};",
                                     if done { palette.muted } else { palette.text }
                                 ),
                                 "{text}"
@@ -9451,7 +9551,7 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                                 style: format!("width:3px; border-radius:999px; background:{}; flex:0 0 auto;", palette.accent_soft),
                             }
                             div {
-                                style: format!("font-size:12px; line-height:1.7; white-space:pre-wrap; color:{};", palette.muted),
+                                style: format!("font-size:13px; line-height:1.72; white-space:pre-wrap; color:{};", palette.muted),
                                 "{text}"
                             }
                         }
