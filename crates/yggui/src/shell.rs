@@ -178,6 +178,7 @@ struct ShellState {
     copy_retry_after_ms: HashMap<String, u64>,
     terminal_image_paste_ms: HashMap<String, u64>,
     remote_preview_sync_after_ms: HashMap<String, u64>,
+    remote_preview_dirty_epoch: HashMap<String, u64>,
     remote_machine_refresh_requests: HashSet<String>,
     drag_paths: Vec<String>,
     drag_hover_target: Option<DragDropTarget>,
@@ -569,6 +570,7 @@ impl ShellState {
             copy_retry_after_ms: HashMap::new(),
             terminal_image_paste_ms: HashMap::new(),
             remote_preview_sync_after_ms: HashMap::new(),
+            remote_preview_dirty_epoch: HashMap::new(),
             remote_machine_refresh_requests: HashSet::new(),
             drag_paths: Vec::new(),
             drag_hover_target: None,
@@ -7674,7 +7676,7 @@ fn app() -> Element {
     let async_render_epoch = use_signal(|| 0_u64);
     let mut last_terminal_session_path = use_signal(|| None::<String>);
     let mut last_open_recovery_path = use_signal(|| None::<String>);
-    let mut last_preview_refresh_path = use_signal(|| None::<String>);
+    let mut last_preview_refresh_marker = use_signal(|| None::<(String, u64)>);
     let schedule_ui_update = schedule_update();
     use_effect(move || {
         if XTERM_ASSETS_BOOTSTRAPPED.get().is_none() {
@@ -7790,7 +7792,7 @@ fn app() -> Element {
     use_effect(move || {
         let active = state.read().server.active_session().cloned();
         let Some(session) = active else {
-            last_preview_refresh_path.set(None);
+            last_preview_refresh_marker.set(None);
             return;
         };
         let (has_precis, has_summary, has_good_title, precis_stale, summary_stale) = {
@@ -7856,33 +7858,39 @@ fn app() -> Element {
         maybe_spawn_background_copy_generation(state);
     });
     use_effect(move || {
-        let (active, view_mode, server_busy) = {
+        let (active, view_mode, server_busy, dirty_epoch) = {
             let shell = state.read();
             (
                 shell.server.active_session().cloned(),
                 shell.server.active_view_mode(),
                 shell.server_busy,
+                shell
+                    .server
+                    .active_session_path()
+                    .and_then(|path| shell.remote_preview_dirty_epoch.get(path).copied())
+                    .unwrap_or(0),
             )
         };
         let Some(session) = active else {
-            last_preview_refresh_path.set(None);
+            last_preview_refresh_marker.set(None);
             return;
         };
         if view_mode != WorkspaceViewMode::Rendered {
-            last_preview_refresh_path.set(None);
+            last_preview_refresh_marker.set(None);
             return;
         }
         if server_busy {
             return;
         }
         if !session.session_path.starts_with("remote-session://") {
-            last_preview_refresh_path.set(None);
-            return;
-        }
-        if *last_preview_refresh_path.read() == Some(session.session_path.clone()) {
+            last_preview_refresh_marker.set(None);
             return;
         }
         let needs_refresh = remote_preview_needs_refresh(&session);
+        let refresh_marker = (session.session_path.clone(), dirty_epoch);
+        if *last_preview_refresh_marker.read() == Some(refresh_marker.clone()) && !needs_refresh {
+            return;
+        }
         state.with_mut(|shell| {
             shell.record_preview_issue_telemetry(if needs_refresh {
                 "preview_refresh_request_placeholder"
@@ -7890,7 +7898,7 @@ fn app() -> Element {
                 "preview_refresh_request_active"
             })
         });
-        last_preview_refresh_path.set(Some(session.session_path.clone()));
+        last_preview_refresh_marker.set(Some(refresh_marker));
         let fetch_target = {
             let shell = state.read();
             remote_preview_fetch_target(&shell.server, &session)
@@ -7910,6 +7918,7 @@ fn app() -> Element {
                                 &path_for_task,
                                 payload,
                             ) {
+                                shell.remote_preview_dirty_epoch.remove(&path_for_task);
                                 shell.record_preview_issue_telemetry(if needs_refresh {
                                     "preview_refresh_applied_client_side"
                                 } else {
@@ -11404,11 +11413,19 @@ fn TerminalCanvas(
                                         && session_path.starts_with("remote-session://")
                                     {
                                         let should_sync = state.with_mut(|shell| {
-                                            schedule_remote_preview_sync(
-                                                shell,
-                                                &session_path,
-                                                REMOTE_PREVIEW_SYNC_DEBOUNCE_MS,
-                                            )
+                                            let now = current_millis();
+                                            shell.remote_preview_dirty_epoch.insert(
+                                                session_path.clone(),
+                                                now,
+                                            );
+                                            shell.server.active_view_mode() == WorkspaceViewMode::Rendered
+                                                && shell.server.active_session_path()
+                                                    == Some(session_path.as_str())
+                                                && schedule_remote_preview_sync(
+                                                    shell,
+                                                    &session_path,
+                                                    REMOTE_PREVIEW_SYNC_DEBOUNCE_MS,
+                                                )
                                         });
                                         if should_sync {
                                             spawn_remote_preview_payload_sync(
@@ -11550,11 +11567,19 @@ fn TerminalCanvas(
                                     && session_path.starts_with("remote-session://")
                                 {
                                     let should_sync = state.with_mut(|shell| {
-                                        schedule_remote_preview_sync(
-                                            shell,
-                                            &session_path,
-                                            REMOTE_PREVIEW_SYNC_DEBOUNCE_MS,
-                                        )
+                                        let now = current_millis();
+                                        shell.remote_preview_dirty_epoch.insert(
+                                            session_path.clone(),
+                                            now,
+                                        );
+                                        shell.server.active_view_mode() == WorkspaceViewMode::Rendered
+                                            && shell.server.active_session_path()
+                                                == Some(session_path.as_str())
+                                            && schedule_remote_preview_sync(
+                                                shell,
+                                                &session_path,
+                                                REMOTE_PREVIEW_SYNC_DEBOUNCE_MS,
+                                            )
                                     });
                                     if should_sync {
                                         spawn_remote_preview_payload_sync(
