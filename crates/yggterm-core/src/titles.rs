@@ -5,7 +5,7 @@ use rusqlite::{Connection, params};
 use serde_json::Value;
 use std::path::Path;
 use std::time::Duration;
-use time::OffsetDateTime;
+use time::{Duration as TimeDuration, OffsetDateTime};
 use tracing::{info, warn};
 
 const TITLE_DB_FILENAME: &str = "session-titles.db";
@@ -16,6 +16,12 @@ pub struct SessionTitleStore {
 
 pub struct SessionTitleResolver {
     store: SessionTitleStore,
+}
+
+#[derive(Debug, Clone)]
+struct GeneratedCopyRecord {
+    value: String,
+    updated_at: OffsetDateTime,
 }
 
 impl SessionTitleStore {
@@ -66,24 +72,40 @@ impl SessionTitleStore {
     }
 
     pub fn get_precis(&self, session_id: &str) -> Result<Option<String>> {
+        Ok(self.get_precis_record(session_id)?.map(|record| record.value))
+    }
+
+    pub fn get_precis_record(&self, session_id: &str) -> Result<Option<GeneratedCopyRecord>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT precis FROM session_precis WHERE session_id = ?1")?;
+            .prepare("SELECT precis, updated_at FROM session_precis WHERE session_id = ?1")?;
         let mut rows = stmt.query(params![session_id])?;
         if let Some(row) = rows.next()? {
-            Ok(Some(row.get(0)?))
+            let updated_at = row.get::<_, String>(1)?;
+            Ok(Some(GeneratedCopyRecord {
+                value: row.get(0)?,
+                updated_at: parse_copy_timestamp(&updated_at)?,
+            }))
         } else {
             Ok(None)
         }
     }
 
     pub fn get_summary(&self, session_id: &str) -> Result<Option<String>> {
+        Ok(self.get_summary_record(session_id)?.map(|record| record.value))
+    }
+
+    pub fn get_summary_record(&self, session_id: &str) -> Result<Option<GeneratedCopyRecord>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT summary FROM session_summaries WHERE session_id = ?1")?;
+            .prepare("SELECT summary, updated_at FROM session_summaries WHERE session_id = ?1")?;
         let mut rows = stmt.query(params![session_id])?;
         if let Some(row) = rows.next()? {
-            Ok(Some(row.get(0)?))
+            let updated_at = row.get::<_, String>(1)?;
+            Ok(Some(GeneratedCopyRecord {
+                value: row.get(0)?,
+                updated_at: parse_copy_timestamp(&updated_at)?,
+            }))
         } else {
             Ok(None)
         }
@@ -203,6 +225,30 @@ impl SessionTitleResolver {
 
     pub fn resolve_summary_for_session(&self, session_id: &str) -> Result<Option<String>> {
         self.store.get_summary(session_id)
+    }
+
+    pub fn precis_needs_refresh(
+        &self,
+        session_id: &str,
+        source_updated_at: OffsetDateTime,
+    ) -> Result<bool> {
+        let Some(record) = self.store.get_precis_record(session_id)? else {
+            return Ok(true);
+        };
+        Ok(looks_like_low_signal_generated_copy(&record.value)
+            || source_updated_at - record.updated_at > TimeDuration::days(5))
+    }
+
+    pub fn summary_needs_refresh(
+        &self,
+        session_id: &str,
+        source_updated_at: OffsetDateTime,
+    ) -> Result<bool> {
+        let Some(record) = self.store.get_summary_record(session_id)? else {
+            return Ok(true);
+        };
+        Ok(looks_like_low_signal_generated_copy(&record.value)
+            || source_updated_at - record.updated_at > TimeDuration::days(5))
     }
 
     pub fn generate_for_context(
@@ -571,6 +617,11 @@ fn request_litellm_title(settings: &AppSettings, context: &str) -> Result<String
     Ok(title)
 }
 
+fn parse_copy_timestamp(value: &str) -> Result<OffsetDateTime> {
+    OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+        .with_context(|| format!("invalid generated-copy timestamp: {value}"))
+}
+
 fn request_litellm_precis(settings: &AppSettings, context: &str) -> Result<String> {
     let url = completions_url(&settings.litellm_endpoint);
     let client = Client::builder()
@@ -584,11 +635,11 @@ fn request_litellm_precis(settings: &AppSettings, context: &str) -> Result<Strin
         "messages": [
             {
                 "role": "system",
-                "content": "Generate a short desktop-header precis for a long-running coding or terminal session. State the current task and the most important current progress in one or two crisp sentences. Ignore boilerplate, screenshot-transcription chatter, launch/bootstrap notes, and policy text unless they are central to the task. No markdown, no bullets, no quotes."
+                "content": "Generate a short desktop-header precis for a long-running coding or terminal session. State the current task and the most important current progress in one or two crisp sentences. Prefer the overarching task over subordinate screenshot/image-inspection substeps. Ignore boilerplate, screenshot-transcription chatter, launch/bootstrap notes, and policy text unless they are central to the task. No markdown, no bullets, no quotes."
             },
             {
                 "role": "user",
-                "content": format!("Create a concise UI precis from this structured session context.\nFocus on what the operator is currently trying to achieve and what has already been established.\n\n{context}")
+                "content": format!("Create a concise UI precis from this structured session context.\nFocus on what the operator is currently trying to achieve and what has already been established.\nIf there is a temporary screenshot/image-reading turn inside a longer workflow, do not center the precis on that substep.\n\n{context}")
             }
         ]
     });
@@ -645,11 +696,11 @@ fn request_litellm_summary(settings: &AppSettings, context: &str) -> Result<Stri
         "messages": [
             {
                 "role": "system",
-                "content": "Generate a concise but useful desktop session summary for a long-running coding or terminal session. Return one short paragraph of 3 to 5 sentences, plain prose only. Cover: 1) the main objective, 2) concrete progress/results so far, and 3) the most likely next step. Ignore boilerplate, screenshot-transcription chatter, launch/bootstrap notes, and policy text unless they are central to the work."
+                "content": "Generate a concise but useful desktop session summary for a long-running coding or terminal session. Return one short paragraph of 3 to 5 sentences, plain prose only. Cover: 1) the main objective, 2) concrete progress/results so far, and 3) the most likely next step. Prefer the overarching work over subordinate screenshot/image-inspection substeps. Ignore boilerplate, screenshot-transcription chatter, launch/bootstrap notes, and policy text unless they are central to the work."
             },
             {
                 "role": "user",
-                "content": format!("Create a concise preview summary from this structured session context.\nDo not summarize the instructions themselves unless they are the subject of the work.\nPrefer the real task, verified findings, and latest progress.\n\n{context}")
+                "content": format!("Create a concise preview summary from this structured session context.\nDo not summarize the instructions themselves unless they are the subject of the work.\nPrefer the real task, verified findings, and latest progress.\nIf the latest turns are just a screenshot/image check inside a larger task, keep the summary centered on the larger task.\n\n{context}")
             }
         ]
     });
@@ -690,6 +741,11 @@ fn request_litellm_summary(settings: &AppSettings, context: &str) -> Result<Stri
         .or_else(|| extract_reasoning_title(&value))
         .or_else(|| heuristic_summary_from_context(context))
         .context("LiteLLM response did not contain a summary")?;
+    if looks_like_low_signal_generated_copy(&summary) {
+        if let Some(summary) = heuristic_summary_from_context(context) {
+            return Ok(summary);
+        }
+    }
     Ok(summary)
 }
 
@@ -732,7 +788,9 @@ fn sanitize_generated_precis(raw: &str) -> Option<String> {
     if sanitized.is_empty() {
         return None;
     }
-    Some(sanitized.chars().take(180).collect::<String>())
+    let without_aux = strip_auxiliary_image_sentences(sanitized);
+    let final_text = if without_aux.is_empty() { sanitized } else { without_aux.as_str() };
+    Some(final_text.chars().take(180).collect::<String>())
 }
 
 fn sanitize_generated_summary(raw: &str) -> Option<String> {
@@ -748,6 +806,12 @@ fn sanitize_generated_summary(raw: &str) -> Option<String> {
     if sanitized.is_empty() {
         return None;
     }
+    let sanitized_owned = strip_auxiliary_image_sentences(sanitized);
+    let sanitized = if sanitized_owned.is_empty() {
+        sanitized.to_string()
+    } else {
+        sanitized_owned
+    };
     const MAX_SUMMARY_CHARS: usize = 560;
     let bounded = sanitized.chars().take(MAX_SUMMARY_CHARS).collect::<String>();
     if sanitized.chars().count() <= MAX_SUMMARY_CHARS {
@@ -768,6 +832,31 @@ fn sanitize_generated_summary(raw: &str) -> Option<String> {
         return Some(format!("{}…", bounded[..ix].trim_end()));
     }
     Some(format!("{}…", bounded.trim_end()))
+}
+
+fn strip_auxiliary_image_sentences(text: &str) -> String {
+    let kept = text
+        .split_terminator(['.', '!', '?'])
+        .map(str::trim)
+        .filter(|sentence| {
+            let lower = sentence.to_ascii_lowercase();
+            !lower.contains("can you read this image")
+                && !lower.contains("clipboard/clipboard-")
+                && !lower.contains("@/home/")
+                && !lower.contains("it's a screenshot of")
+                && !lower.contains("it’s a screenshot of")
+                && !lower.contains("i'm opening the image now")
+                && !lower.contains("i’m opening the image now")
+                && !lower.contains("extract the text or key contents")
+                && !lower.contains("other visible ui details")
+                && !lower.contains("the main visible text shows")
+        })
+        .collect::<Vec<_>>();
+    if kept.is_empty() {
+        String::new()
+    } else {
+        format!("{}.", kept.join(". "))
+    }
 }
 
 #[cfg(test)]
@@ -1016,6 +1105,19 @@ pub fn looks_like_low_signal_generated_copy(text: &str) -> bool {
 fn heuristic_copy_lines(context: &str) -> Vec<String> {
     let mut lines = Vec::new();
     for raw in context.lines().rev() {
+        let raw_trimmed = raw.trim();
+        if raw_trimmed.is_empty()
+            || raw_trimmed.ends_with(':')
+            || matches!(
+                raw_trimmed,
+                "PRIMARY USER GOALS:"
+                    | "RECENT SUBSTANTIVE TURNS:"
+                    | "LIVE PREVIEW CONTEXT:"
+                    | "REMOTE SESSION CONTEXT:"
+            )
+        {
+            continue;
+        }
         let line = raw
             .trim()
             .strip_prefix("USER: ")
@@ -1035,6 +1137,26 @@ fn heuristic_copy_lines(context: &str) -> Vec<String> {
             .trim_matches('\'')
             .to_string();
         if compact.len() < 16 {
+            continue;
+        }
+        if looks_like_low_signal_generated_copy(&compact) {
+            continue;
+        }
+        let lower = compact.to_ascii_lowercase();
+        if lower.contains("can you read this image")
+            || lower.contains("clipboard/clipboard-")
+            || lower.contains("@/home/")
+            || lower.contains("it’s a screenshot of")
+            || lower.contains("it's a screenshot of")
+            || lower.contains("i’m opening the image now")
+            || lower.contains("i'm opening the image now")
+            || lower.contains("extract the text or key contents")
+            || lower.contains("the main visible text shows")
+            || lower.contains("other visible ui details")
+            || lower.contains("collaboration mode:")
+            || lower.contains("current_date>")
+            || lower.contains("environment_context")
+        {
             continue;
         }
         if lines.iter().any(|existing| existing == &compact) {
