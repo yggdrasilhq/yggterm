@@ -3859,15 +3859,37 @@ fn preview_block_text(block: &SessionPreviewBlock) -> String {
         .join(" ")
 }
 
+fn is_preview_scaffold_line(line: &str) -> bool {
+    matches!(
+        line.trim(),
+        "PRIMARY USER GOALS:"
+            | "RECENT SUBSTANTIVE TURNS:"
+            | "RECENT CONTEXT:"
+            | "SERVER NOTES:"
+            | "RENDERED SESSION:"
+    )
+}
+
 fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlock> {
     let mut visible = session
         .preview
         .blocks
         .iter()
-        .filter(|block| {
-            let compact = preview_block_text(block);
+        .filter_map(|block| {
+            let cleaned_lines = block
+                .lines
+                .iter()
+                .filter(|line| !is_preview_scaffold_line(line))
+                .cloned()
+                .collect::<Vec<_>>();
+            if cleaned_lines.is_empty() {
+                return None;
+            }
+            let mut cleaned = block.clone();
+            cleaned.lines = cleaned_lines;
+            let compact = preview_block_text(&cleaned);
             if compact.is_empty() {
-                return false;
+                return None;
             }
             let lower = compact.to_ascii_lowercase();
             if lower.len() > 40
@@ -3882,11 +3904,10 @@ fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlo
                     || lower.contains("how to request escalation")
                     || lower.contains("prefix_rule guidance"))
             {
-                return false;
+                return None;
             }
-            true
+            Some(cleaned)
         })
-        .cloned()
         .collect::<Vec<_>>();
 
     if visible.is_empty() {
@@ -8263,7 +8284,7 @@ fn MainSurface(
                                         overscroll-behavior:contain; scrollbar-gutter:stable; contain:layout paint style;",
                                 if snapshot.preview_layout == PreviewLayoutMode::Chat {
                                     div {
-                                        style: "display:flex; flex-direction:column; gap:18px; min-width:0; width:min(980px, 100%); margin:0 auto; \
+                                        style: "display:flex; flex-direction:column; gap:14px; min-width:0; width:min(1120px, 100%); margin:0 auto; \
                                                 contain:layout paint style;",
                                         if hidden_block_count > 0 {
                                             div {
@@ -8302,7 +8323,7 @@ fn MainSurface(
                                     }
                                 } else {
                                     div {
-                                        style: "width:min(980px, 100%); margin:0 auto;",
+                                        style: "width:min(1120px, 100%); margin:0 auto;",
                                         PreviewGraph {
                                             session: session.clone(),
                                             visible_blocks: rendered_blocks.clone(),
@@ -9132,9 +9153,9 @@ fn PreviewBlock(
 ) -> Element {
     let user_block = block.tone == PreviewTone::User;
     let background = if user_block {
-        "rgba(231, 243, 255, 0.98)"
+        "rgba(232, 242, 255, 0.96)"
     } else {
-        "rgba(255, 255, 255, 0.96)"
+        "rgba(255, 255, 255, 0.84)"
     };
     let badge_background = if user_block {
         "rgba(37, 99, 235, 0.12)"
@@ -9143,12 +9164,12 @@ fn PreviewBlock(
     };
     let badge = if user_block { palette.accent } else { palette.text };
     let outline = if user_block {
-        "rgba(66, 153, 225, 0.18)"
+        "rgba(66, 153, 225, 0.16)"
     } else {
-        "rgba(148, 163, 184, 0.14)"
+        "rgba(170, 190, 212, 0.12)"
     };
     let row_justify = if user_block { "flex-end" } else { "flex-start" };
-    let card_width = if user_block { "min(76%, 760px)" } else { "min(92%, 900px)" };
+    let card_width = if user_block { "min(72%, 760px)" } else { "min(100%, 980px)" };
     let avatar_bg = if user_block {
         "linear-gradient(180deg, rgba(73,138,255,0.18) 0%, rgba(73,138,255,0.10) 100%)"
     } else {
@@ -9163,14 +9184,14 @@ fn PreviewBlock(
             div {
                 style: format!(
                     "display:flex; align-items:flex-start; gap:12px; width:{}; content-visibility:auto; \
-                     contain:layout paint style; contain-intrinsic-size:760px 260px;",
+                     contain:layout paint style; contain-intrinsic-size:760px 220px;",
                     card_width
                 ),
                 if !user_block {
                     div {
                         style: format!(
-                            "width:34px; height:34px; border-radius:999px; background:{}; color:{}; \
-                             display:flex; align-items:center; justify-content:center; font-size:12px; font-weight:800; \
+                            "width:30px; height:30px; border-radius:999px; background:{}; color:{}; \
+                             display:flex; align-items:center; justify-content:center; font-size:11px; font-weight:800; \
                              flex:0 0 auto; box-shadow: inset 0 0 0 1px rgba(170,190,212,0.18);",
                             avatar_bg,
                             avatar_fg
@@ -9180,32 +9201,40 @@ fn PreviewBlock(
                 }
                 button {
                     style: format!(
-                        "width:100%; border:none; text-align:left; background:{}; border-radius:20px; \
-                         padding:18px 20px; box-shadow: inset 0 0 0 1px {}, 0 6px 18px rgba(148,163,184,0.06); \
+                        "width:100%; border:none; text-align:left; background:{}; border-radius:{}px; \
+                         padding:{}; box-shadow: inset 0 0 0 1px {}, {}; \
                          contain:layout paint style;",
-                        background, outline
+                        background,
+                        if user_block { 18 } else { 22 },
+                        if user_block { "16px 18px" } else { "18px 22px" },
+                        outline,
+                        if user_block {
+                            "0 8px 20px rgba(103,145,188,0.08)"
+                        } else {
+                            "0 6px 14px rgba(148,163,184,0.04)"
+                        }
                     ),
                     onclick: move |evt| on_toggle.call(evt),
                     div {
-                        style: "display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px;",
+                        style: "display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:10px;",
                         div {
                             style: "display:flex; align-items:center; gap:8px;",
                             span {
                                 style: format!(
-                                    "display:inline-flex; align-items:center; justify-content:center; min-width:58px; height:23px; \
-                                     border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:700;",
+                                    "display:inline-flex; align-items:center; justify-content:center; min-width:54px; height:22px; \
+                                     border-radius:999px; background:{}; color:{}; font-size:10px; font-weight:800; letter-spacing:0.02em;",
                                     badge_background,
                                     badge
                                 ),
                                 "{block.role}"
                             }
                             span {
-                                style: format!("font-size:11px; color:{};", palette.muted),
+                                style: format!("font-size:10px; color:{}; opacity:0.9;", palette.muted),
                                 "{block.timestamp}"
                             }
                         }
                         span {
-                            style: format!("font-size:11px; color:{};", palette.muted),
+                            style: format!("font-size:10px; color:{}; opacity:0.78;", palette.muted),
                             {if block.folded { format!("Expand {}", block_ix + 1) } else { format!("Collapse {}", block_ix + 1) }}
                         }
                     }
@@ -9221,8 +9250,8 @@ fn PreviewBlock(
                 if user_block {
                     div {
                         style: format!(
-                            "width:34px; height:34px; border-radius:999px; background:{}; color:{}; \
-                             display:flex; align-items:center; justify-content:center; font-size:12px; font-weight:800; \
+                            "width:30px; height:30px; border-radius:999px; background:{}; color:{}; \
+                             display:flex; align-items:center; justify-content:center; font-size:11px; font-weight:800; \
                              flex:0 0 auto; box-shadow: inset 0 0 0 1px rgba(170,190,212,0.18);",
                             avatar_bg,
                             avatar_fg
