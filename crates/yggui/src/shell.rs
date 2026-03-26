@@ -22,8 +22,8 @@ use crate::theme::{
 use crate::window_icon;
 use anyhow::{Result, anyhow};
 use dioxus::desktop::{
-    Config, LogicalSize, WindowBuilder, WindowEvent as DesktopWindowEvent, use_window,
-    use_wry_event_handler, window,
+    Config, LogicalSize, WindowBuilder, WindowCloseBehaviour,
+    WindowEvent as DesktopWindowEvent, use_window, use_wry_event_handler, window,
 };
 use dioxus::document;
 use dioxus::html::{InteractionElementOffset, input_data::MouseButton};
@@ -194,6 +194,7 @@ struct ShellState {
     recent_ui_telemetry: HashMap<String, (String, u64)>,
     had_cached_startup_snapshot: bool,
     latest_open_request_id: u64,
+    closing_app: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -572,6 +573,7 @@ impl ShellState {
             recent_ui_telemetry: HashMap::new(),
             had_cached_startup_snapshot: has_initial_server_snapshot,
             latest_open_request_id: 0,
+            closing_app: false,
         };
         if let Some(path) = state.browser.selected_path().map(ToOwned::to_owned) {
             state.selected_tree_paths.insert(path.clone());
@@ -581,6 +583,7 @@ impl ShellState {
         state.server_daemon_detail = state.bootstrap.server_daemon_detail.clone();
         if !initial_search_query.trim().is_empty() {
             state.set_search(initial_search_query);
+            state.refresh_search_state("init_state");
         }
         state.hydrate_generated_copy_from_remote_cache();
         if !state.needs_initial_server_sync {
@@ -611,27 +614,44 @@ impl ShellState {
             clamp_theme_spec(&self.settings.yggui_theme)
         };
         let palette = palette(self.settings.theme);
-        let mut expanded_paths = self.browser.expanded_path_set();
-        expanded_paths.extend(self.active_session_visibility_paths());
-        let live_sessions = self.server.live_sessions();
-        let mut merged_rows = merged_sidebar_rows(
-            self.browser.rows(),
-            self.server.remote_machines(),
-            self.server.ssh_targets(),
-            &live_sessions,
-            &expanded_paths,
-        );
-        enrich_sidebar_rows_with_live_titles(
-            &mut merged_rows,
-            &live_sessions,
-            self.server.remote_machines(),
-        );
         let command_mode_active = is_command_query(&self.search_query);
         let effective_search_query = if command_mode_active {
             ""
         } else {
             self.search_query.as_str()
         };
+        let search_active = !effective_search_query.trim().is_empty();
+        let live_sessions = self.server.live_sessions();
+        let mut expanded_paths = self.browser.expanded_path_set();
+        expanded_paths.extend(self.active_session_visibility_paths());
+        let stored_rows = if search_active {
+            self.browser.search_rows()
+        } else {
+            self.browser.rows().to_vec()
+        };
+        let merged_expanded_paths = if search_active {
+            search_expanded_paths(
+                &stored_rows,
+                self.server.remote_machines(),
+                self.server.ssh_targets(),
+                &live_sessions,
+                &expanded_paths,
+            )
+        } else {
+            expanded_paths.clone()
+        };
+        let mut merged_rows = merged_sidebar_rows(
+            &stored_rows,
+            self.server.remote_machines(),
+            self.server.ssh_targets(),
+            &live_sessions,
+            &merged_expanded_paths,
+        );
+        enrich_sidebar_rows_with_live_titles(
+            &mut merged_rows,
+            &live_sessions,
+            self.server.remote_machines(),
+        );
         let rows = filtered_sidebar_rows(&merged_rows, effective_search_query);
         let search_sidebar_matches = search_sidebar_matches(&merged_rows, effective_search_query);
         let selected_path = if let Some(active) = self.server.active_session() {
@@ -667,7 +687,7 @@ impl ShellState {
         RenderSnapshot {
             palette: palette,
             search_query: self.search_query.clone(),
-            search_active: !effective_search_query.trim().is_empty(),
+            search_active,
             command_mode_active,
             search_focused: self.search_focused,
             search_command_suggestions: search_command_suggestions(&self.search_query),
@@ -813,13 +833,21 @@ impl ShellState {
     fn current_search_sidebar_matches(&self) -> Vec<BrowserRow> {
         let mut expanded_paths = self.browser.expanded_path_set();
         expanded_paths.extend(self.active_session_visibility_paths());
+        let stored_rows = self.browser.search_rows();
         let live_sessions = self.server.live_sessions();
-        let mut rows = merged_sidebar_rows(
-            self.browser.rows(),
+        let search_expanded = search_expanded_paths(
+            &stored_rows,
             self.server.remote_machines(),
             self.server.ssh_targets(),
             &live_sessions,
             &expanded_paths,
+        );
+        let mut rows = merged_sidebar_rows(
+            &stored_rows,
+            self.server.remote_machines(),
+            self.server.ssh_targets(),
+            &live_sessions,
+            &search_expanded,
         );
         enrich_sidebar_rows_with_live_titles(
             &mut rows,
@@ -3007,12 +3035,16 @@ fn restart_into_pending_update(mut state: Signal<ShellState>) {
 }
 
 fn spawn_graceful_shutdown_and_close(mut state: Signal<ShellState>) {
+    if state.read().closing_app {
+        return;
+    }
     let endpoint = BOOTSTRAP
         .get()
         .expect("shell bootstrap initialized")
         .server_endpoint
         .clone();
     state.with_mut(|shell| {
+        shell.closing_app = true;
         shell.server_busy = true;
         shell.last_action = "closing yggterm sessions".to_string();
         shell.push_notification(
@@ -3026,9 +3058,11 @@ fn spawn_graceful_shutdown_and_close(mut state: Signal<ShellState>) {
         state.with_mut(|shell| match outcome {
             Ok(Ok(_)) => {
                 shell.last_action = "closed yggterm sessions".to_string();
-                window().close();
+                let _ = window().set_visible(false);
+                std::process::exit(0);
             }
             Ok(Err(error)) => {
+                shell.closing_app = false;
                 shell.server_busy = false;
                 shell.last_action = format!("shutdown failed: {error}");
                 shell.push_notification(
@@ -3038,6 +3072,7 @@ fn spawn_graceful_shutdown_and_close(mut state: Signal<ShellState>) {
                 );
             }
             Err(error) => {
+                shell.closing_app = false;
                 shell.server_busy = false;
                 shell.last_action = format!("shutdown task failed: {error}");
                 shell.push_notification(
@@ -4780,6 +4815,58 @@ fn filtered_sidebar_rows(rows: &[BrowserRow], query: &str) -> Vec<BrowserRow> {
         .filter(|row| keep_paths.contains(&row.full_path))
         .cloned()
         .collect()
+}
+
+fn search_expanded_paths(
+    stored_rows: &[BrowserRow],
+    remote_machines: &[RemoteMachineSnapshot],
+    ssh_targets: &[SshConnectTarget],
+    live_sessions: &[ManagedSessionView],
+    base_expanded_paths: &HashSet<String>,
+) -> HashSet<String> {
+    let mut expanded = base_expanded_paths.clone();
+    for row in stored_rows {
+        if matches!(row.kind, BrowserRowKind::Group | BrowserRowKind::Separator) {
+            expanded.insert(row.full_path.clone());
+        }
+    }
+    let mut machine_rows = BTreeMap::<String, SidebarRemoteMachine>::new();
+    for target in ssh_targets {
+        let machine_key = machine_key_from_labelish(&target.ssh_target);
+        machine_rows
+            .entry(machine_key.clone())
+            .or_insert_with(|| SidebarRemoteMachine {
+                key: machine_key.clone(),
+                label: ssh_target_machine_label(target),
+                health: MachineHealth::Cached,
+                scanned_sessions: Vec::new(),
+            });
+    }
+    for machine in remote_machines {
+        machine_rows.insert(
+            machine.machine_key.clone(),
+            SidebarRemoteMachine {
+                key: machine.machine_key.clone(),
+                label: machine.label.clone(),
+                health: match machine.health {
+                    RemoteMachineHealth::Healthy => MachineHealth::Healthy,
+                    RemoteMachineHealth::Cached => MachineHealth::Cached,
+                    RemoteMachineHealth::Offline => MachineHealth::Offline,
+                },
+                scanned_sessions: machine.sessions.clone(),
+            },
+        );
+    }
+    merge_remote_live_sessions(&mut machine_rows, ssh_targets, live_sessions);
+    for machine in machine_rows.into_values() {
+        expanded.insert(format!("__remote_machine__/{}", machine.key));
+        for session in &machine.scanned_sessions {
+            for path in compressed_remote_folder_paths(&machine, &session.cwd) {
+                expanded.insert(format!("__remote_folder__/{}{}", machine.key, path));
+            }
+        }
+    }
+    expanded
 }
 
 fn search_sidebar_matches(rows: &[BrowserRow], query: &str) -> Vec<BrowserRow> {
@@ -7425,16 +7512,19 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
 
     dioxus::LaunchBuilder::desktop()
         .with_cfg(
-            Config::new().with_window(
-                WindowBuilder::new()
-                    .with_title("yggterm")
-                    .with_window_icon(Some(window_icon::load_window_icon()))
-                    .with_transparent(true)
-                    .with_decorations(false)
-                    .with_resizable(true)
-                    .with_inner_size(LogicalSize::new(1460.0, 920.0))
-                    .with_min_inner_size(LogicalSize::new(1024.0, 720.0)),
-            ),
+            Config::new()
+                .with_window(
+                    WindowBuilder::new()
+                        .with_title("yggterm")
+                        .with_window_icon(Some(window_icon::load_window_icon()))
+                        .with_transparent(true)
+                        .with_decorations(false)
+                        .with_resizable(true)
+                        .with_inner_size(LogicalSize::new(1460.0, 920.0))
+                        .with_min_inner_size(LogicalSize::new(1024.0, 720.0)),
+                )
+                .with_close_behaviour(WindowCloseBehaviour::WindowHides)
+                .with_exits_when_last_window_closes(false),
         )
         .launch(app);
 
@@ -7485,6 +7575,9 @@ fn app() -> Element {
                 | DesktopWindowEvent::Focused(_)
                 | DesktopWindowEvent::ScaleFactorChanged { .. } => {
                     window_epoch.with_mut(|epoch| *epoch += 1);
+                }
+                DesktopWindowEvent::CloseRequested => {
+                    spawn_graceful_shutdown_and_close(state);
                 }
                 _ => {}
             }
@@ -15189,6 +15282,47 @@ mod tests {
 
         let matches = search_sidebar_matches(&rows, "home/pi/gh");
         assert!(matches.iter().any(|row| row.full_path == "__remote_folder__/oc/home/pi/gh"));
+    }
+
+    #[test]
+    fn search_expanded_paths_include_collapsed_remote_sessions() {
+        let stored_rows = Vec::<BrowserRow>::new();
+        let remote_machines = vec![RemoteMachineSnapshot {
+            machine_key: "oc".to_string(),
+            label: "oc [ok]".to_string(),
+            ssh_target: "oc".to_string(),
+            prefix: None,
+            health: RemoteMachineHealth::Healthy,
+            sessions: vec![RemoteScannedSession {
+                session_path: "remote-session://oc/1".to_string(),
+                session_id: "1".to_string(),
+                cwd: "/home/pi/gh/excel-inspired".to_string(),
+                started_at: "2026-03-24T10:00:00Z".to_string(),
+                modified_epoch: 1,
+                event_count: 1,
+                user_message_count: 1,
+                assistant_message_count: 1,
+                title_hint: "Excel Shortcut Design".to_string(),
+                recent_context: "USER: design excel shortcuts".to_string(),
+                cached_precis: None,
+                cached_summary: None,
+                storage_path: "a".to_string(),
+            }],
+        }];
+
+        let expanded = search_expanded_paths(
+            &stored_rows,
+            &remote_machines,
+            &[],
+            &[],
+            &HashSet::new(),
+        );
+        let rows = merged_sidebar_rows(&stored_rows, &remote_machines, &[], &[], &expanded);
+
+        assert!(rows.iter().any(|row| row.full_path == "__remote_machine__/oc"));
+        assert!(rows.iter().any(|row| row.full_path == "__remote_folder__/oc/home/pi/gh/excel-inspired"));
+        assert!(rows.iter().any(|row| row.full_path == "remote-session://oc/1"));
+        assert_eq!(search_sidebar_matches(&rows, "Excel Shortcut Design").len(), 1);
     }
 
     #[test]
