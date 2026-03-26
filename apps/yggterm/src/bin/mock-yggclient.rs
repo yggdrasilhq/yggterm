@@ -213,6 +213,10 @@ fn run_scenario(
             Ok(json!({
                 "server_version": daemon_status.server_version,
                 "server_build_id": daemon_status.server_build_id,
+                "restored_from_persisted_state": daemon_status.restored_from_persisted_state,
+                "restored_stored_sessions": daemon_status.restored_stored_sessions,
+                "restored_live_sessions": daemon_status.restored_live_sessions,
+                "restored_remote_machines": daemon_status.restored_remote_machines,
                 "active_session_path": snap.active_session_path,
                 "active_view_mode": snap.active_view_mode,
                 "remote_machines": snap.remote_machines.len(),
@@ -275,6 +279,7 @@ fn run_scenario(
                 .as_deref()
                 .context("--expect-path is required for reconnect-check")?;
             ping(endpoint)?;
+            let daemon_status = status(endpoint)?;
             let (snap, message) = snapshot(endpoint)?;
             let active_matches = snap
                 .active_session_path
@@ -293,7 +298,11 @@ fn run_scenario(
                 "active_matches": active_matches,
                 "listed": listed,
                 "active_session_path": snap.active_session_path,
-                "live_sessions": snap.live_sessions.len()
+                "live_sessions": snap.live_sessions.len(),
+                "restored_from_persisted_state": daemon_status.restored_from_persisted_state,
+                "restored_stored_sessions": daemon_status.restored_stored_sessions,
+                "restored_live_sessions": daemon_status.restored_live_sessions,
+                "restored_remote_machines": daemon_status.restored_remote_machines
             }))
         }
         Scenario::GracefulShutdown => {
