@@ -1922,7 +1922,7 @@ fn spawn_title_generation_for_target(
     target: CopyGenerationTarget,
     force: bool,
     announce: bool,
-    priority: bool,
+    _priority: bool,
 ) {
     let session_path = target.session_path.clone();
     let session_title = target.title.clone();
@@ -1947,12 +1947,12 @@ fn spawn_title_generation_for_target(
         return;
     }
     let job_key = format!("copy:title:{session_path}");
-    let job_title = if announce || priority {
+    let job_title = if announce {
         "Generating Title"
     } else {
         "Background Cache"
     };
-    let job_message = if announce || priority {
+    let job_message = if announce {
         format!("Generating a better title for {session_title}.")
     } else {
         format!("Caching a title for {session_title}.")
