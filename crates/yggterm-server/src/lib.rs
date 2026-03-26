@@ -1993,7 +1993,7 @@ struct RemoteSummaryLine {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct RemotePreviewPayload {
+pub struct RemotePreviewPayload {
     #[serde(default)]
     title_hint: Option<String>,
     #[serde(default)]
@@ -2163,7 +2163,7 @@ fn apply_remote_preview_payload(session: &mut ManagedSessionView, payload: Remot
         .collect();
 }
 
-fn fetch_remote_preview_payload(
+pub fn fetch_remote_preview_payload(
     target: &SshConnectTarget,
     storage_path: &str,
 ) -> anyhow::Result<RemotePreviewPayload> {
@@ -2174,6 +2174,33 @@ fn fetch_remote_preview_payload(
         None,
     )?;
     serde_json::from_str(&output).context("invalid remote preview payload")
+}
+
+pub fn apply_remote_preview_payload_for_path(
+    server: &mut YggtermServer,
+    session_path: &str,
+    payload: RemotePreviewPayload,
+) -> bool {
+    let mut applied = false;
+    let refreshed_title = payload.title_hint.clone();
+    let refreshed_precis = payload.cached_precis.clone();
+    let refreshed_summary = payload.cached_summary.clone();
+    if let Some(session) = server.sessions.get_mut(session_path) {
+        apply_remote_preview_payload(session, payload);
+        applied = true;
+    }
+    if applied {
+        if let Some(title) = refreshed_title.as_deref() {
+            server.set_session_title_hint(session_path, title);
+        }
+        if let Some(precis) = refreshed_precis.as_deref() {
+            server.set_session_precis_hint(session_path, precis);
+        }
+        if let Some(summary) = refreshed_summary.as_deref() {
+            server.set_session_summary_hint(session_path, summary);
+        }
+    }
+    applied
 }
 
 pub fn fetch_remote_generation_context(
