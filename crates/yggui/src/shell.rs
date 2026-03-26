@@ -9336,13 +9336,15 @@ fn PreviewRunBlock(
                                     style: format!("font-size:10px; color:{}; opacity:0.8;", palette.muted),
                                     "{block.timestamp}"
                                 }
-                                button {
-                                    style: format!(
-                                        "border:none; background:transparent; color:{}; font-size:10px; opacity:0.72; padding:0;",
-                                        palette.muted
-                                    ),
-                                    onclick: move |_| on_toggle_block.call(block_ix),
-                                    {if block.folded { "Expand".to_string() } else { "Collapse".to_string() }}
+                                if block.folded || block.lines.len() > 8 {
+                                    button {
+                                        style: format!(
+                                            "border:none; background:transparent; color:{}; font-size:10px; opacity:0.72; padding:0;",
+                                            palette.muted
+                                        ),
+                                        onclick: move |_| on_toggle_block.call(block_ix),
+                                        {if block.folded { "Expand".to_string() } else { "Collapse".to_string() }}
+                                    }
                                 }
                             }
                             if block.folded {
