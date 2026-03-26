@@ -105,6 +105,7 @@ pub struct ShellBootstrap {
     pub server_daemon_detail: String,
     pub prefer_ghostty_backend: bool,
     pub pending_update_restart: Option<PendingUpdateRestart>,
+    pub refresh_server_after_launch: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,6 +171,7 @@ struct ShellState {
     next_background_copy_scan_after_ms: u64,
     browser_tree_loading_in_flight: bool,
     recent_ui_telemetry: HashMap<String, (String, u64)>,
+    had_cached_startup_snapshot: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -424,7 +426,9 @@ impl ShellState {
             server.apply_snapshot(initial_server_snapshot);
         }
 
-        let needs_initial_server_sync = bootstrap.initial_server_snapshot.is_none();
+        let has_initial_server_snapshot = bootstrap.initial_server_snapshot.is_some();
+        let needs_initial_server_sync =
+            bootstrap.refresh_server_after_launch || !has_initial_server_snapshot;
         PASSIVE_COPY_SUSPENDED.store(false, Ordering::Relaxed);
         let initial_yggui_theme = clamp_theme_spec(&bootstrap.settings.yggui_theme);
         let mut state = Self {
@@ -445,7 +449,7 @@ impl ShellState {
             context_menu_row: None,
             context_menu_position: None,
             preview_layout: PreviewLayoutMode::Chat,
-            server_busy: needs_initial_server_sync,
+            server_busy: !has_initial_server_snapshot,
             server_daemon_detail: String::new(),
             needs_initial_server_sync,
             ssh_connect_target: String::new(),
@@ -483,6 +487,7 @@ impl ShellState {
             next_background_copy_scan_after_ms: 0,
             browser_tree_loading_in_flight: !browser_tree_loaded,
             recent_ui_telemetry: HashMap::new(),
+            had_cached_startup_snapshot: has_initial_server_snapshot,
         };
         if let Some(path) = state.browser.selected_path().map(ToOwned::to_owned) {
             state.selected_tree_paths.insert(path.clone());
@@ -733,11 +738,13 @@ impl ShellState {
                 self.needs_initial_server_sync = false;
                 self.next_background_copy_scan_after_ms = current_millis() + 2_000;
                 self.last_action = format!("server sync failed: {error}");
-                self.push_notification(
-                    NotificationTone::Error,
-                    "Server Sync Failed",
-                    error.to_string(),
-                );
+                if !self.had_cached_startup_snapshot {
+                    self.push_notification(
+                        NotificationTone::Error,
+                        "Server Sync Failed",
+                        error.to_string(),
+                    );
+                }
             }
         }
     }
@@ -2511,11 +2518,13 @@ fn spawn_initial_server_sync(
                 shell.needs_initial_server_sync = false;
                 shell.server_daemon_detail = format!("server unavailable: {error}");
                 shell.last_action = format!("server sync failed: {error}");
-                shell.push_notification(
-                    NotificationTone::Warning,
-                    "Server Unavailable",
-                    error.to_string(),
-                );
+                if !shell.had_cached_startup_snapshot {
+                    shell.push_notification(
+                        NotificationTone::Warning,
+                        "Server Unavailable",
+                        error.to_string(),
+                    );
+                }
             }
             Err(error) => {
                 shell.server_busy = false;
@@ -7883,7 +7892,7 @@ fn MainSurface(
                                             .clone()
                                             .unwrap_or_else(|| session.title.clone()),
                                         subtitle: preview_header_summary(&snapshot, &session),
-                                        allow_subtitle_scroll: false,
+                                        allow_subtitle_scroll: true,
                                         palette: snapshot.palette,
                                         on_refresh_title: move |_| on_refresh_title.call(()),
                                         on_refresh_subtitle: move |_| on_refresh_summary.call(()),
