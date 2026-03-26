@@ -1,0 +1,214 @@
+use anyhow::{Context, Result, bail};
+use serde_json::json;
+use std::env;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::PathBuf;
+use std::time::Instant;
+use yggterm_core::resolve_yggterm_home;
+use yggterm_server::{
+    YGG_LOADING_NOTIFICATION_AFTER_MS, YggEventEnvelope, YggEventKind, YggProgress,
+    YggRequestMeta, YggSurface, YggTarget, default_endpoint, ping, snapshot, status,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scenario {
+    Startup,
+    Ping,
+    Status,
+    Snapshot,
+}
+
+impl Scenario {
+    fn operation_name(self) -> &'static str {
+        match self {
+            Self::Startup => "startup_probe",
+            Self::Ping => "ping",
+            Self::Status => "status",
+            Self::Snapshot => "snapshot",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Config {
+    scenario: Scenario,
+    iterations: usize,
+    jsonl_out: Option<PathBuf>,
+    slow_notice_ms: u64,
+}
+
+fn main() -> Result<()> {
+    let cfg = parse_args(env::args().skip(1).collect())?;
+    let home_dir = resolve_yggterm_home()?;
+    let endpoint = default_endpoint(&home_dir);
+
+    for iteration in 0..cfg.iterations {
+        run_scenario(&cfg, &endpoint, iteration)?;
+    }
+    Ok(())
+}
+
+fn parse_args(args: Vec<String>) -> Result<Config> {
+    let mut scenario = Scenario::Startup;
+    let mut iterations = 1usize;
+    let mut jsonl_out = None::<PathBuf>;
+    let mut slow_notice_ms = YGG_LOADING_NOTIFICATION_AFTER_MS;
+
+    let mut ix = 0usize;
+    while ix < args.len() {
+        match args[ix].as_str() {
+            "--scenario" => {
+                ix += 1;
+                let value = args.get(ix).context("missing value after --scenario")?;
+                scenario = match value.as_str() {
+                    "startup" => Scenario::Startup,
+                    "ping" => Scenario::Ping,
+                    "status" => Scenario::Status,
+                    "snapshot" => Scenario::Snapshot,
+                    other => bail!("unknown scenario: {other}"),
+                };
+            }
+            "--iterations" => {
+                ix += 1;
+                iterations = args
+                    .get(ix)
+                    .context("missing value after --iterations")?
+                    .parse()
+                    .context("invalid --iterations value")?;
+            }
+            "--jsonl-out" => {
+                ix += 1;
+                jsonl_out = Some(PathBuf::from(
+                    args.get(ix).context("missing value after --jsonl-out")?,
+                ));
+            }
+            "--slow-notice-ms" => {
+                ix += 1;
+                slow_notice_ms = args
+                    .get(ix)
+                    .context("missing value after --slow-notice-ms")?
+                    .parse()
+                    .context("invalid --slow-notice-ms value")?;
+            }
+            other => bail!("unknown argument: {other}"),
+        }
+        ix += 1;
+    }
+
+    Ok(Config {
+        scenario,
+        iterations,
+        jsonl_out,
+        slow_notice_ms,
+    })
+}
+
+fn run_scenario(
+    cfg: &Config,
+    endpoint: &yggterm_server::ServerEndpoint,
+    iteration: usize,
+) -> Result<()> {
+    let request_id = format!("mock-yggclient-{}-{iteration}", cfg.scenario.operation_name());
+    let meta = YggRequestMeta::interactive(
+        request_id,
+        cfg.scenario.operation_name(),
+        YggSurface::App,
+        YggTarget::App,
+    );
+
+    emit(
+        cfg,
+        YggEventEnvelope::new(meta.clone(), YggEventKind::Accepted)
+            .with_message(format!("starting {}", cfg.scenario.operation_name())),
+    )?;
+    let start = Instant::now();
+    emit(
+        cfg,
+        YggEventEnvelope::new(meta.clone(), YggEventKind::Loading)
+            .with_message("waiting on daemon")
+            .with_progress(YggProgress {
+                step: "dispatch".to_string(),
+                current: Some(0),
+                total: Some(1),
+                message: Some("sending request".to_string()),
+            }),
+    )?;
+
+    let result: Result<serde_json::Value> = match cfg.scenario {
+        Scenario::Startup => {
+            ping(endpoint)?;
+            let daemon_status = status(endpoint)?;
+            let (snap, _) = snapshot(endpoint)?;
+            Ok(json!({
+                "server_version": daemon_status.server_version,
+                "server_build_id": daemon_status.server_build_id,
+                "active_session_path": snap.active_session_path,
+                "active_view_mode": snap.active_view_mode,
+                "remote_machines": snap.remote_machines.len(),
+                "ssh_targets": snap.ssh_targets.len(),
+                "live_sessions": snap.live_sessions.len(),
+            }))
+        }
+        Scenario::Ping => {
+            ping(endpoint)?;
+            Ok(json!({"pong": true}))
+        }
+        Scenario::Status => {
+            let daemon_status = status(endpoint)?;
+            Ok(serde_json::to_value(daemon_status)?)
+        }
+        Scenario::Snapshot => {
+            let (snap, message) = snapshot(endpoint)?;
+            Ok(json!({
+                "message": message,
+                "active_session_path": snap.active_session_path,
+                "active_view_mode": snap.active_view_mode,
+                "remote_machines": snap.remote_machines.len(),
+                "ssh_targets": snap.ssh_targets.len(),
+                "live_sessions": snap.live_sessions.len(),
+            }))
+        }
+    };
+
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    if elapsed_ms >= cfg.slow_notice_ms {
+        emit(
+            cfg,
+            YggEventEnvelope::new(meta.clone(), YggEventKind::Progress)
+                .with_elapsed_ms(elapsed_ms)
+                .with_message("loading threshold exceeded; stale-or-local UI should stay interactive")
+                .with_progress(YggProgress {
+                    step: "waiting".to_string(),
+                    current: None,
+                    total: None,
+                    message: Some("show local loading state and notify the user".to_string()),
+                }),
+        )?;
+    }
+
+    match result {
+        Ok(value) => emit(
+            cfg,
+            YggEventEnvelope::new(meta, YggEventKind::Result)
+                .with_elapsed_ms(elapsed_ms)
+                .with_data(value),
+        ),
+        Err(error) => emit(
+            cfg,
+            YggEventEnvelope::new(meta, YggEventKind::Error)
+                .with_elapsed_ms(elapsed_ms)
+                .with_message(error.to_string()),
+        ),
+    }
+}
+
+fn emit(cfg: &Config, event: YggEventEnvelope) -> Result<()> {
+    let line = serde_json::to_string(&event)?;
+    println!("{line}");
+    if let Some(path) = &cfg.jsonl_out {
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        writeln!(file, "{line}")?;
+    }
+    Ok(())
+}
