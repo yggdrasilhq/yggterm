@@ -33,13 +33,14 @@ use keyboard_types::{Key, Modifiers};
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use tao::event::Event as TaoEvent;
@@ -78,6 +79,9 @@ use yggterm_server::{
 
 static BOOTSTRAP: OnceCell<ShellBootstrap> = OnceCell::new();
 static PASSIVE_COPY_SUSPENDED: AtomicBool = AtomicBool::new(false);
+static PREVIEW_CONTENT_CACHE: OnceCell<Mutex<PreviewContentCache>> = OnceCell::new();
+
+const PREVIEW_CONTENT_CACHE_LIMIT: usize = 256;
 const SIDE_RAIL_WIDTH: usize = 292;
 const DEFERRED_STARTUP_SYNC_MS: u64 = 8_000;
 const EDGE_RESIZE_HANDLE: usize = 5;
@@ -405,6 +409,12 @@ enum PreviewContentBlock {
 struct PreviewRun {
     tone: PreviewTone,
     entries: Vec<(usize, SessionPreviewBlock)>,
+}
+
+#[derive(Default)]
+struct PreviewContentCache {
+    order: VecDeque<u64>,
+    entries: HashMap<u64, Vec<PreviewContentBlock>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3916,6 +3926,19 @@ fn is_placeholder_rendered_section_title(title: &str) -> bool {
 
 fn palette_is_dark(palette: Palette) -> bool {
     palette.panel == "#161c22"
+}
+
+fn preview_content_cache() -> &'static Mutex<PreviewContentCache> {
+    PREVIEW_CONTENT_CACHE.get_or_init(|| Mutex::new(PreviewContentCache::default()))
+}
+
+fn preview_content_cache_key(lines: &[String]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for line in lines {
+        line.hash(&mut hasher);
+        0xff_u8.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 fn preview_rendered_sections(session: &ManagedSessionView) -> Vec<SessionRenderedSection> {
@@ -9486,6 +9509,28 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
 }
 
 fn preview_content_blocks(lines: &[String]) -> Vec<PreviewContentBlock> {
+    let key = preview_content_cache_key(lines);
+    if let Ok(cache) = preview_content_cache().lock()
+        && let Some(cached) = cache.entries.get(&key)
+    {
+        return cached.clone();
+    }
+    let parsed = build_preview_content_blocks(lines);
+    if let Ok(mut cache) = preview_content_cache().lock() {
+        if !cache.entries.contains_key(&key) {
+            cache.order.push_back(key);
+        }
+        cache.entries.insert(key, parsed.clone());
+        while cache.order.len() > PREVIEW_CONTENT_CACHE_LIMIT {
+            if let Some(stale) = cache.order.pop_front() {
+                cache.entries.remove(&stale);
+            }
+        }
+    }
+    parsed
+}
+
+fn build_preview_content_blocks(lines: &[String]) -> Vec<PreviewContentBlock> {
     let mut blocks = Vec::new();
     let mut paragraph = Vec::<String>::new();
     let mut code = Vec::<String>::new();
