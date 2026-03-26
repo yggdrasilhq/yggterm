@@ -2280,7 +2280,11 @@ fn spawn_precis_generation_for_target(
 }
 
 fn spawn_summary_generation(state: Signal<ShellState>, session: ManagedSessionView, force: bool) {
-    let Some(target) = copy_generation_target_for_session(&state.read().server, &session) else {
+    let target = {
+        let shell = state.read();
+        copy_generation_target_for_session(&shell.server, &session)
+    };
+    let Some(target) = target else {
         return;
     };
     spawn_summary_generation_for_target(state, target, force, force, true);
@@ -3609,12 +3613,17 @@ fn resolved_session_summary(shell: &ShellState, session: &ManagedSessionView) ->
         .generated_summaries
         .get(&session.session_path)
         .cloned()
-        .or_else(|| remote_generated_copy(&shell.server, &session.session_path).and_then(|(_, _, summary)| summary))
+        .or_else(|| {
+            remote_generated_copy(&shell.server, &session.session_path)
+                .and_then(|(_, _, summary)| summary)
+        })
 }
 
 fn looks_like_truncated_summary(summary: &str) -> bool {
     let trimmed = summary.trim();
-    trimmed.len() < 120 || !matches!(trimmed.chars().last(), Some('.' | '!' | '?'))
+    trimmed.len() < 80
+        || (!matches!(trimmed.chars().last(), Some('.' | '!' | '?' | '…'))
+            && trimmed.len() < 180)
 }
 
 fn preview_header_summary(snapshot: &RenderSnapshot, session: &ManagedSessionView) -> String {
@@ -3622,7 +3631,12 @@ fn preview_header_summary(snapshot: &RenderSnapshot, session: &ManagedSessionVie
     match snapshot.active_summary.clone() {
         Some(summary) if summary.trim().is_empty() => fallback,
         Some(summary)
-            if looks_like_truncated_summary(&summary) && fallback.len() > summary.len() + 24 =>
+            if looks_like_truncated_summary(&summary)
+                && fallback.len() > summary.len() + 64
+                && !fallback.contains("Cwd:")
+                && !fallback.contains("Messages:")
+                && !fallback.contains("user ·")
+                && !fallback.contains("assistant") =>
         {
             fallback
         }
@@ -6661,12 +6675,14 @@ fn app() -> Element {
                             spawn_deferred_active_session_title_generation(state, true)
                         },
                         on_refresh_precis: move |_| {
-                            if let Some(session) = state.read().server.active_session().cloned() {
+                            let session = { state.read().server.active_session().cloned() };
+                            if let Some(session) = session {
                                 spawn_precis_generation(state, session, true);
                             }
                         },
                         on_refresh_summary: move |_| {
-                            if let Some(session) = state.read().server.active_session().cloned() {
+                            let session = { state.read().server.active_session().cloned() };
+                            if let Some(session) = session {
                                 spawn_summary_generation(state, session, true);
                             }
                         },
