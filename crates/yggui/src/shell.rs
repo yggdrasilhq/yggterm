@@ -99,6 +99,7 @@ const BACKGROUND_COPY_CONTINUE_MS: u64 = 15_000;
 const BACKGROUND_COPY_IDLE_MS: u64 = 120_000;
 const THEME_EDITOR_PAD_SIZE: f64 = 286.0;
 const SEARCH_INPUT_ID: &str = "yggterm-search-input";
+const PREVIEW_HEADER_SEARCH_HIT_ID: &str = "__preview_header__";
 type WorkspaceReorderPlanItem = TreeReorderPlanItem<BrowserRowKind>;
 
 #[derive(Debug, Clone)]
@@ -4500,6 +4501,22 @@ fn search_content_hits(
     match view_mode {
         WorkspaceViewMode::Rendered => {
             let mut hits = Vec::new();
+            let header_haystack = [
+                resolved_session_title_for_search(session),
+                resolved_session_precis_for_search(session),
+                resolved_session_summary_for_search(session),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n");
+            if !header_haystack.trim().is_empty() && text_matches_search_terms(&header_haystack, &terms)
+            {
+                hits.push(SearchContentHit {
+                    dom_id: PREVIEW_HEADER_SEARCH_HIT_ID.to_string(),
+                    label: "Summary".to_string(),
+                });
+            }
             for (ix, block) in visible_preview_blocks(session).iter().enumerate() {
                 let haystack = block.lines.join("\n");
                 if text_matches_search_terms(&haystack, &terms) {
@@ -4526,6 +4543,33 @@ fn search_content_hits(
                 }
             })
             .collect(),
+    }
+}
+
+fn resolved_session_title_for_search(session: &ManagedSessionView) -> Option<String> {
+    let title = session.title.trim();
+    if title.is_empty() {
+        None
+    } else {
+        Some(title.to_string())
+    }
+}
+
+fn resolved_session_precis_for_search(session: &ManagedSessionView) -> Option<String> {
+    let precis = metadata_value(session, "Precis");
+    if precis.trim().is_empty() {
+        None
+    } else {
+        Some(precis)
+    }
+}
+
+fn resolved_session_summary_for_search(session: &ManagedSessionView) -> Option<String> {
+    let summary = metadata_value(session, "Summary");
+    if summary.trim().is_empty() {
+        None
+    } else {
+        Some(summary)
     }
 }
 
@@ -4864,11 +4908,30 @@ fn merge_remote_live_sessions(
                 health: MachineHealth::Healthy,
                 scanned_sessions: Vec::new(),
             });
-        if machine
+        if let Some(existing) = machine
             .scanned_sessions
-            .iter()
-            .any(|existing| existing.session_path == session.session_path)
+            .iter_mut()
+            .find(|existing| existing.session_path == session.session_path)
         {
+            let live = remote_scanned_session_from_live(machine_key, session_id, session);
+            if !live.title_hint.trim().is_empty() {
+                existing.title_hint = live.title_hint;
+            }
+            if !live.recent_context.trim().is_empty() {
+                existing.recent_context = live.recent_context;
+            }
+            if !live.cwd.trim().is_empty() {
+                existing.cwd = live.cwd;
+            }
+            if !live.storage_path.trim().is_empty() {
+                existing.storage_path = live.storage_path;
+            }
+            existing.user_message_count = live.user_message_count;
+            existing.assistant_message_count = live.assistant_message_count;
+            existing.event_count = live.event_count;
+            if !live.started_at.trim().is_empty() {
+                existing.started_at = live.started_at;
+            }
             continue;
         }
         machine
@@ -7631,6 +7694,15 @@ fn app() -> Element {
                                         }})();"
                                     ));
                                 }
+                            } else if dom_id == PREVIEW_HEADER_SEARCH_HIT_ID {
+                                let _ = document::eval(
+                                    "(function() {
+                                        const scroller = document.querySelector('[data-preview-scroll=\"1\"]');
+                                        if (scroller) {
+                                            scroller.scrollTo({ top: 0, behavior: 'smooth' });
+                                        }
+                                    })();",
+                                );
                             } else {
                                 let _ = document::eval(&format!(
                                     "(function() {{
@@ -7662,6 +7734,15 @@ fn app() -> Element {
                                         }})();"
                                     ));
                                 }
+                            } else if dom_id == PREVIEW_HEADER_SEARCH_HIT_ID {
+                                let _ = document::eval(
+                                    "(function() {
+                                        const scroller = document.querySelector('[data-preview-scroll=\"1\"]');
+                                        if (scroller) {
+                                            scroller.scrollTo({ top: 0, behavior: 'smooth' });
+                                        }
+                                    })();",
+                                );
                             } else {
                                 let _ = document::eval(&format!(
                                     "(function() {{
@@ -9179,6 +9260,7 @@ fn MainSurface(
                                 }
                             }
                             div {
+                                "data-preview-scroll": "1",
                                 style: "display:flex; flex-direction:column; gap:18px; min-width:0; min-height:0; overflow:auto; padding:24px; \
                                         overscroll-behavior:contain; scrollbar-gutter:stable; contain:layout paint style;",
                                 if snapshot.preview_layout == PreviewLayoutMode::Chat {
@@ -14362,6 +14444,88 @@ mod tests {
         );
 
         assert!(rows.iter().any(|row| row.full_path == "remote-session://oc/019cf672-8d68-70a1-bd8b-68487c4fc63d"));
+    }
+
+    #[test]
+    fn merged_sidebar_rows_refresh_stale_remote_title_from_live_session() {
+        let rows = merged_sidebar_rows(
+            &[],
+            &[RemoteMachineSnapshot {
+                machine_key: "oc".to_string(),
+                label: "oc [ok]".to_string(),
+                ssh_target: "oc".to_string(),
+                prefix: None,
+                health: RemoteMachineHealth::Healthy,
+                sessions: vec![RemoteScannedSession {
+                    session_path: "remote-session://oc/019cf672-8d68-70a1-bd8b-68487c4fc63d".to_string(),
+                    session_id: "019cf672-8d68-70a1-bd8b-68487c4fc63d".to_string(),
+                    cwd: "/home/pi".to_string(),
+                    started_at: "now".to_string(),
+                    modified_epoch: 1,
+                    event_count: 1,
+                    user_message_count: 1,
+                    assistant_message_count: 1,
+                    title_hint: "Q4fc63d".to_string(),
+                    recent_context: String::new(),
+                    cached_precis: None,
+                    cached_summary: None,
+                    storage_path: "/home/pi/.codex/sessions/foo.jsonl".to_string(),
+                }],
+            }],
+            &[],
+            &[ManagedSessionView {
+                id: "019cf672-8d68-70a1-bd8b-68487c4fc63d".to_string(),
+                session_path: "remote-session://oc/019cf672-8d68-70a1-bd8b-68487c4fc63d".to_string(),
+                title: "Excel Shortcut Design".to_string(),
+                kind: SessionKind::Codex,
+                host_label: "oc".to_string(),
+                source: yggterm_server::SessionSource::LiveSsh,
+                backend: TerminalBackend::Xterm,
+                bridge_available: true,
+                launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+                remote_deploy_state: yggterm_server::RemoteDeployState::Ready,
+                launch_command: String::new(),
+                status_line: String::new(),
+                terminal_lines: vec![],
+                rendered_sections: vec![],
+                preview: yggterm_server::SessionPreview {
+                    summary: vec![],
+                    blocks: vec![SessionPreviewBlock {
+                        timestamp: "Mar 24, 2026 10:00 AM UTC+0530".to_string(),
+                        role: "USER",
+                        lines: vec!["Build Excel shortcut UI".to_string()],
+                        tone: PreviewTone::User,
+                        folded: false,
+                    }],
+                },
+                metadata: vec![
+                    SessionMetadataEntry { label: "Cwd", value: "/home/pi".to_string() },
+                    SessionMetadataEntry { label: "Storage", value: "/home/pi/.codex/sessions/foo.jsonl".to_string() },
+                    SessionMetadataEntry { label: "Started", value: "now".to_string() },
+                ],
+                terminal_process_id: None,
+                terminal_window_id: None,
+                terminal_host_token: None,
+                terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+                embedded_surface_id: None,
+                embedded_surface_detail: None,
+                last_launch_error: None,
+                last_window_error: None,
+                ssh_target: Some("oc".to_string()),
+                ssh_prefix: None,
+            }],
+            &HashSet::from_iter([
+                "__remote_machine__/oc".to_string(),
+                "__remote_folder__/oc/home/pi".to_string(),
+            ]),
+        );
+
+        let session_row = rows
+            .iter()
+            .find(|row| row.full_path == "remote-session://oc/019cf672-8d68-70a1-bd8b-68487c4fc63d")
+            .expect("remote row");
+        assert_eq!(session_row.label, "Excel Shortcut Design");
+        assert_eq!(search_sidebar_matches(&rows, "excel design").len(), 1);
     }
 
     #[test]
