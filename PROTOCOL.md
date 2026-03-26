@@ -109,6 +109,62 @@ If loading exceeds `3000ms`, notify the user with the concrete reason:
 - Duplicate background work should coalesce by semantic job key.
 - Retry policies should be visible in telemetry and reproducible in the mock client.
 
+## Session Lifetime Semantics
+
+The client and server must distinguish between accidental disconnect and intentional shutdown.
+
+### Accidental Disconnect
+
+Examples:
+
+- laptop sleep
+- Wi-Fi drop
+- SSH disconnect
+- yggclient crash
+- `Ctrl+C` / process kill during local development
+
+Expected behavior:
+
+- the local `yggserver` must keep running
+- local PTY sessions must stay alive
+- remote Yggterm-managed sessions must stay alive
+- reconnecting from a later yggclient should restore the same running sessions
+
+This is the Yggterm equivalent of GNU Screen or tmux persistence. Client death must not imply
+session death.
+
+### Intentional Shutdown
+
+Examples:
+
+- clicking the custom titlebar close button
+- explicit `yggterm server shutdown`
+
+Expected behavior:
+
+- the client requests graceful shutdown
+- local PTY sessions are terminated cleanly
+- remote Yggterm-managed persistent sessions are terminated cleanly
+- only after that does the client window close
+
+Intentional shutdown is the only path that should tear down the whole Yggterm session graph.
+
+### Remote Persistence Model
+
+Remote long-running Codex sessions should be owned by the remote headless Yggterm surface rather
+than by the lifetime of an SSH attach process.
+
+Current direction:
+
+- `yggclient` talks to the local daemon
+- the local daemon bootstraps a headless `yggterm` binary on the remote machine
+- remote resume/attach operations run through that remote helper
+- remote helper persists the actual long-running Codex session independently of the current SSH
+  attach, so a dropped SSH connection does not destroy the work
+
+The current implementation may use tmux-backed persistence internally, but the protocol contract is
+more general than tmux itself.
+
 ## Mock Client
 
 `mock-yggclient` exists to profile the protocol behavior without the full desktop shell.

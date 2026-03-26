@@ -16,6 +16,7 @@ use yggterm_server::{
     detect_ghostty_host, ping, run_attach, run_daemon, run_remote_generation_context,
     run_remote_preview,
     run_remote_protocol_version, run_remote_resume_codex, run_remote_scan,
+    run_remote_terminate_codex,
     run_remote_stage_clipboard_png, run_remote_upsert_generated_copy, shutdown,
     start_local_session, status,
 };
@@ -71,6 +72,9 @@ fn main() -> Result<()> {
         && args[2] == "generation-context"
     {
         return run_remote_generation_context(&args[3]);
+    }
+    if args.len() == 4 && args[0] == "server" && args[1] == "remote" && args[2] == "terminate-codex" {
+        return run_remote_terminate_codex(&args[3]);
     }
     if args.len() == 4 && args[0] == "server" && args[1] == "remote" && args[2] == "upsert-generated-copy" {
         return run_remote_upsert_generated_copy(&args[3]);
@@ -177,7 +181,6 @@ fn main() -> Result<()> {
         "update_policy": format!("{:?}", install_context.update_policy),
         "theme": match theme { UiTheme::ZedLight => "light", UiTheme::ZedDark => "dark" },
     }));
-    let _ = shutdown(&endpoint);
     launch_result
 }
 
@@ -208,7 +211,7 @@ fn load_initial_server_snapshot_fast(
     Some(server.snapshot())
 }
 
-fn install_signal_shutdown(endpoint: yggterm_server::ServerEndpoint) {
+fn install_signal_shutdown(_endpoint: yggterm_server::ServerEndpoint) {
     static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
     if HANDLER_INSTALLED.swap(true, Ordering::SeqCst) {
         return;
@@ -220,7 +223,6 @@ fn install_signal_shutdown(endpoint: yggterm_server::ServerEndpoint) {
         if handler_flag.swap(true, Ordering::SeqCst) {
             return;
         }
-        let _ = shutdown(&endpoint);
         std::process::exit(130);
     });
 }
