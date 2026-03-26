@@ -753,7 +753,26 @@ fn sanitize_generated_summary(raw: &str) -> Option<String> {
     if sanitized.is_empty() {
         return None;
     }
-    Some(sanitized.chars().take(560).collect::<String>())
+    const MAX_SUMMARY_CHARS: usize = 560;
+    let bounded = sanitized.chars().take(MAX_SUMMARY_CHARS).collect::<String>();
+    if sanitized.chars().count() <= MAX_SUMMARY_CHARS {
+        return Some(bounded);
+    }
+    if let Some(ix) = bounded
+        .char_indices()
+        .rev()
+        .find_map(|(ix, ch)| ((ch == '.' || ch == '!' || ch == '?') && ix >= 160).then_some(ix + ch.len_utf8()))
+    {
+        return Some(bounded[..ix].trim().to_string());
+    }
+    if let Some(ix) = bounded
+        .char_indices()
+        .rev()
+        .find_map(|(ix, ch)| ch.is_whitespace().then_some(ix))
+    {
+        return Some(format!("{}…", bounded[..ix].trim_end()));
+    }
+    Some(format!("{}…", bounded.trim_end()))
 }
 
 #[cfg(test)]
