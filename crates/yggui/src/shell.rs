@@ -84,6 +84,7 @@ const CORNER_RESIZE_HANDLE: usize = 10;
 const XTERM_CSS: &str = include_str!("../../../assets/xterm/xterm.css");
 const XTERM_JS: &str = include_str!("../../../assets/xterm/xterm.js");
 const XTERM_FIT_JS: &str = include_str!("../../../assets/xterm/addon-fit.js");
+const PREVIEW_BLOCK_WINDOW: usize = 48;
 static XTERM_ASSETS_BOOTSTRAPPED: OnceCell<()> = OnceCell::new();
 const TREE_LOADING_DOT_CSS: &str = "@keyframes yggterm-tree-loading-dot { 0%, 80%, 100% { opacity: 0.28; transform: translateY(0px); } 40% { opacity: 1; transform: translateY(-1px); } }";
 const BACKGROUND_COPY_RETRY_MS: u64 = 300_000;
@@ -8175,6 +8176,15 @@ fn MainSurface(
     on_refresh_precis: EventHandler<()>,
     on_refresh_summary: EventHandler<()>,
 ) -> Element {
+    let active_session_path = snapshot
+        .active_session
+        .as_ref()
+        .map(|session| session.session_path.clone());
+    let mut preview_block_limit = use_signal(|| PREVIEW_BLOCK_WINDOW);
+    use_effect(move || {
+        let _ = active_session_path.clone();
+        preview_block_limit.set(PREVIEW_BLOCK_WINDOW);
+    });
     let body = if let Some(session) = snapshot.active_session.clone() {
         match snapshot.active_view_mode {
             WorkspaceViewMode::Rendered => {
@@ -8191,6 +8201,13 @@ fn MainSurface(
                     }
                 } else {
                     let visible_blocks = visible_preview_blocks(&session);
+                    let rendered_block_limit = (*preview_block_limit.read()).max(PREVIEW_BLOCK_WINDOW);
+                    let hidden_block_count = visible_blocks.len().saturating_sub(rendered_block_limit);
+                    let rendered_blocks = if hidden_block_count > 0 {
+                        visible_blocks[hidden_block_count..].to_vec()
+                    } else {
+                        visible_blocks.clone()
+                    };
                     rsx! {
                         div {
                             style: "display:flex; flex-direction:column; min-width:0; min-height:0; width:100%; height:100%;",
@@ -8226,18 +8243,38 @@ fn MainSurface(
                                     div {
                                         style: "display:flex; flex-direction:column; gap:18px; min-width:0; width:min(980px, 100%); margin:0 auto; \
                                                 contain:layout paint style;",
+                                        if hidden_block_count > 0 {
+                                            div {
+                                                style: "display:flex; justify-content:center; margin:0 0 4px 0;",
+                                                button {
+                                                    class: "yggui-secondary-button",
+                                                    style: format!(
+                                                        "border:none; border-radius:999px; padding:10px 16px; background:{}; color:{}; \
+                                                         box-shadow:0 12px 30px rgba(128,162,198,0.14); font-size:12px; font-weight:600; cursor:pointer;",
+                                                        snapshot.palette.accent_soft,
+                                                        snapshot.palette.text
+                                                    ),
+                                                    onclick: move |_| {
+                                                        preview_block_limit.with_mut(|limit| {
+                                                            *limit += PREVIEW_BLOCK_WINDOW;
+                                                        });
+                                                    },
+                                                    "Show {hidden_block_count} Earlier Messages"
+                                                }
+                                            }
+                                        }
                                         if !preview_rendered_sections(&session).is_empty() {
                                             RenderedSectionsStrip {
                                                 sections: preview_rendered_sections(&session),
                                                 palette: snapshot.palette,
                                             }
                                         }
-                                        for (ix, block) in visible_blocks.iter().cloned().enumerate() {
+                                        for (ix, block) in rendered_blocks.iter().cloned().enumerate() {
                                             PreviewBlock {
-                                                block_ix: ix,
+                                                block_ix: hidden_block_count + ix,
                                                 block: block.clone(),
                                                 palette: snapshot.palette,
-                                                on_toggle: move |_| on_toggle_preview_block.call(ix),
+                                                on_toggle: move |_| on_toggle_preview_block.call(hidden_block_count + ix),
                                             }
                                         }
                                     }
@@ -8246,7 +8283,7 @@ fn MainSurface(
                                         style: "width:min(980px, 100%); margin:0 auto;",
                                         PreviewGraph {
                                             session: session.clone(),
-                                            visible_blocks: visible_blocks.clone(),
+                                            visible_blocks: rendered_blocks.clone(),
                                             palette: snapshot.palette,
                                         }
                                     }
