@@ -632,6 +632,13 @@ impl YggtermServer {
     }
 
     pub fn set_session_precis_hint(&mut self, session_path: &str, precis: &str) {
+        if let Some(session) = self.sessions.get_mut(session_path) {
+            upsert_session_metadata(
+                &mut session.preview.summary,
+                "Precis",
+                precis.to_string(),
+            );
+        }
         for machine in &mut self.remote_machines {
             for scanned in &mut machine.sessions {
                 if scanned.session_path == session_path {
@@ -643,6 +650,13 @@ impl YggtermServer {
     }
 
     pub fn set_session_summary_hint(&mut self, session_path: &str, summary: &str) {
+        if let Some(session) = self.sessions.get_mut(session_path) {
+            upsert_session_metadata(
+                &mut session.preview.summary,
+                "Summary",
+                summary.to_string(),
+            );
+        }
         for machine in &mut self.remote_machines {
             for scanned in &mut machine.sessions {
                 if scanned.session_path == session_path {
@@ -2104,6 +2118,20 @@ fn apply_remote_scanned_session_preview(
         "Updated",
         modified_epoch_display(scanned.modified_epoch),
     );
+    if let Some(precis) = &scanned.cached_precis {
+        upsert_session_metadata(
+            &mut session.preview.summary,
+            "Precis",
+            precis.clone(),
+        );
+    }
+    if let Some(summary) = &scanned.cached_summary {
+        upsert_session_metadata(
+            &mut session.preview.summary,
+            "Summary",
+            summary.clone(),
+        );
+    }
 
     upsert_session_metadata(&mut session.metadata, "Source", "remote-codex".to_string());
     upsert_session_metadata(&mut session.metadata, "Host", ssh_target.to_string());

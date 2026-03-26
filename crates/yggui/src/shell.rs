@@ -3817,6 +3817,24 @@ fn preview_header_summary(snapshot: &RenderSnapshot, session: &ManagedSessionVie
     }
 }
 
+fn is_placeholder_rendered_section_title(title: &str) -> bool {
+    matches!(title, "Rendered Session" | "Server Notes" | "Recent Context")
+}
+
+fn preview_rendered_sections(session: &ManagedSessionView) -> Vec<SessionRenderedSection> {
+    let filtered = session
+        .rendered_sections
+        .iter()
+        .filter(|section| !is_placeholder_rendered_section_title(&section.title))
+        .cloned()
+        .collect::<Vec<_>>();
+    if filtered.is_empty() {
+        Vec::new()
+    } else {
+        filtered
+    }
+}
+
 fn remote_machine_for_session_path(
     server: &YggtermServer,
     session_path: &str,
@@ -8140,9 +8158,9 @@ fn MainSurface(
                                 if snapshot.preview_layout == PreviewLayoutMode::Chat {
                                     div {
                                         style: "display:flex; flex-direction:column; gap:18px; min-width:0; width:min(980px, 100%); margin:0 auto;",
-                                        if !session.rendered_sections.is_empty() {
+                                        if !preview_rendered_sections(&session).is_empty() {
                                             RenderedSectionsStrip {
-                                                sections: session.rendered_sections.clone(),
+                                                sections: preview_rendered_sections(&session),
                                                 palette: snapshot.palette,
                                             }
                                         }
@@ -8682,9 +8700,9 @@ fn PreviewGraph(session: ManagedSessionView, palette: Palette) -> Element {
                         }
                     }
                 }
-                if !session.rendered_sections.is_empty() {
+                if !preview_rendered_sections(&session).is_empty() {
                     RenderedSectionsStrip {
-                        sections: session.rendered_sections.clone(),
+                        sections: preview_rendered_sections(&session),
                         palette,
                     }
                 }
@@ -8854,8 +8872,12 @@ fn preview_summary_text(session: &ManagedSessionView) -> String {
                 || entry.label == "Prefix"
                 || entry.label == "Host"
                 || entry.label == "Deploy"
+                || entry.label == "Bridge"
+                || entry.label == "Messages"
             {
                 None
+            } else if entry.label == "Summary" || entry.label == "Precis" {
+                Some(value.to_string())
             } else {
                 Some(format!("{}: {}", entry.label, value))
             }
