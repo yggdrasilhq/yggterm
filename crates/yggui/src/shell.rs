@@ -46,6 +46,7 @@ use tao::event::ElementState;
 use tao::keyboard::Key as TaoKey;
 use tao::keyboard::KeyCode as TaoKeyCode;
 use tao::window::ResizeDirection;
+use time::OffsetDateTime;
 use tokio::task;
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -65,7 +66,7 @@ use yggterm_server::{
     SessionRenderedSection, SshConnectTarget, TerminalBackend, WorkspaceViewMode, YggtermServer,
     cleanup_legacy_daemons, connect_ssh_custom, focus_live, open_remote_session,
     open_stored_session, ping, persist_remote_generated_copy, refresh_remote_machine,
-    remove_ssh_target, request_terminal_launch, set_all_preview_blocks_folded,
+    fetch_remote_generation_context, remove_ssh_target, request_terminal_launch, set_all_preview_blocks_folded,
     set_view_mode as daemon_set_view_mode, shutdown as daemon_shutdown,
     snapshot as daemon_snapshot, stage_remote_clipboard_png, start_command_session,
     start_local_session, start_local_session_at, status, switch_agent_session_mode,
@@ -287,8 +288,10 @@ struct CopyGenerationTarget {
     session_id: String,
     cwd: String,
     title: String,
+    source_updated_at: Option<OffsetDateTime>,
     remote_context: Option<String>,
     remote_machine: Option<RemoteMachineSnapshot>,
+    storage_path: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1705,12 +1708,20 @@ impl ShellState {
                 .iter_mut()
                 .find(|notification| notification.job_key.as_deref() == Some(job_key.as_str()))
             {
+                let next_progress = progress.map(|value| value.clamp(0.0, 1.0));
+                let changed = existing.tone != tone
+                    || existing.title != title
+                    || existing.message != message
+                    || existing.progress != next_progress
+                    || !existing.persistent;
                 existing.tone = tone;
                 existing.title = title.clone();
                 existing.message = message.clone();
-                existing.progress = progress.map(|value| value.clamp(0.0, 1.0));
+                existing.progress = next_progress;
                 existing.persistent = true;
-                existing.created_at_ms = now;
+                if changed {
+                    existing.created_at_ms = now;
+                }
             } else {
                 self.notifications.push(ToastNotification {
                     id: self.next_notification_id,
@@ -1889,9 +1900,7 @@ fn spawn_title_generation_for_target(
     };
     let should_start = state.with_mut(|shell| {
         if shell.title_requests_in_flight.contains(&session_path)
-            || (!force
-                && !priority
-                && !background_copy_retry_ready(shell, "title", &session_path))
+            || (!force && !background_copy_retry_ready(shell, "title", &session_path))
         {
             false
         } else {
@@ -1939,12 +1948,12 @@ fn spawn_title_generation_for_target(
         let outcome = task::spawn_blocking(move || -> Result<(Option<String>, Option<SessionNode>)> {
             info!(session_path=%target_for_task.session_path, force, "running title generation task");
             let store = SessionStore::open_or_init()?;
-            if let Some(context) = target_for_task.remote_context.as_deref() {
+            if let Some(context) = generation_context_for_target(&target_for_task) {
                 let title = store.generate_title_for_context(
                     &settings_for_task,
                     &target_for_task.session_id,
                     &target_for_task.cwd,
-                    context,
+                    &context,
                     force,
                 )?;
                 if let (Some(machine), Some(title_text)) =
@@ -2112,9 +2121,7 @@ fn spawn_precis_generation_for_target(
     let should_start = state.with_mut(|shell| {
         if (!force && shell.generated_precis.contains_key(&session_path))
             || shell.precis_requests_in_flight.contains(&session_path)
-            || (!force
-                && !priority
-                && !background_copy_retry_ready(shell, "precis", &session_path))
+            || (!force && !background_copy_retry_ready(shell, "precis", &session_path))
         {
             false
         } else {
@@ -2152,13 +2159,25 @@ fn spawn_precis_generation_for_target(
         let settings_for_task = settings.clone();
         let outcome = task::spawn_blocking(move || -> Result<Option<String>> {
             let store = SessionStore::open_or_init()?;
-            if let Some(context) = target_for_task.remote_context.as_deref() {
+            let effective_force = force
+                || target_for_task
+                    .source_updated_at
+                    .and_then(|updated_at| {
+                        store
+                            .precis_needs_refresh_for_session_id(
+                                &target_for_task.session_id,
+                                updated_at,
+                            )
+                            .ok()
+                    })
+                    .unwrap_or(false);
+            if let Some(context) = generation_context_for_target(&target_for_task) {
                 let precis = store.generate_precis_for_context(
                     &settings_for_task,
                     &target_for_task.session_id,
                     &target_for_task.cwd,
-                    context,
-                    force,
+                    &context,
+                    effective_force,
                 )?;
                 if let (Some(machine), Some(precis_text)) =
                     (target_for_task.remote_machine.as_ref(), precis.as_deref())
@@ -2175,12 +2194,11 @@ fn spawn_precis_generation_for_target(
                 }
                 return Ok(precis);
             }
-            if !force
-                && let Some(precis) = store.resolve_precis_for_session_path(&target_for_task.session_path)?
-            {
-                return Ok(Some(precis));
-            }
-            store.generate_precis_for_session_path(&settings_for_task, &target_for_task.session_path, force)
+            store.generate_precis_for_session_path(
+                &settings_for_task,
+                &target_for_task.session_path,
+                effective_force,
+            )
         }).await;
 
         perf.finish(json!({
@@ -2317,9 +2335,7 @@ fn spawn_summary_generation_for_target(
     let should_start = state.with_mut(|shell| {
         if (!force && shell.generated_summaries.contains_key(&session_path))
             || shell.summary_requests_in_flight.contains(&session_path)
-            || (!force
-                && !priority
-                && !background_copy_retry_ready(shell, "summary", &session_path))
+            || (!force && !background_copy_retry_ready(shell, "summary", &session_path))
         {
             false
         } else {
@@ -2357,13 +2373,25 @@ fn spawn_summary_generation_for_target(
         let settings_for_task = settings.clone();
         let outcome = task::spawn_blocking(move || -> Result<Option<String>> {
             let store = SessionStore::open_or_init()?;
-            if let Some(context) = target_for_task.remote_context.as_deref() {
+            let effective_force = force
+                || target_for_task
+                    .source_updated_at
+                    .and_then(|updated_at| {
+                        store
+                            .summary_needs_refresh_for_session_id(
+                                &target_for_task.session_id,
+                                updated_at,
+                            )
+                            .ok()
+                    })
+                    .unwrap_or(false);
+            if let Some(context) = generation_context_for_target(&target_for_task) {
                 let summary = store.generate_summary_for_context(
                     &settings_for_task,
                     &target_for_task.session_id,
                     &target_for_task.cwd,
-                    context,
-                    force,
+                    &context,
+                    effective_force,
                 )?;
                 if let (Some(machine), Some(summary_text)) =
                     (target_for_task.remote_machine.as_ref(), summary.as_deref())
@@ -2380,12 +2408,11 @@ fn spawn_summary_generation_for_target(
                 }
                 return Ok(summary);
             }
-            if !force
-                && let Some(summary) = store.resolve_summary_for_session_path(&target_for_task.session_path)?
-            {
-                return Ok(Some(summary));
-            }
-            store.generate_summary_for_session_path(&settings_for_task, &target_for_task.session_path, force)
+            store.generate_summary_for_session_path(
+                &settings_for_task,
+                &target_for_task.session_path,
+                effective_force,
+            )
         }).await;
 
         perf.finish(json!({
@@ -3270,14 +3297,32 @@ fn copy_generation_target_for_session(
         return None;
     }
     let preview_context = preview_context_from_session(session);
+    let remote_machine = remote_machine_for_session_path(server, &session.session_path);
+    let scanned_remote = remote_machine.as_ref().and_then(|machine| {
+        machine
+            .sessions
+            .iter()
+            .find(|candidate| candidate.session_path == session.session_path)
+            .cloned()
+    });
+    let remote_context = scanned_remote
+        .as_ref()
+        .and_then(|remote| (!remote.recent_context.trim().is_empty()).then(|| remote.recent_context.clone()))
+        .or_else(|| remote_scanned_session_context(server, &session.session_path));
+    let storage_path = scanned_remote
+        .as_ref()
+        .map(|remote| remote.storage_path.clone())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| metadata_value(session, "Storage"));
     Some(CopyGenerationTarget {
         session_path: session.session_path.clone(),
         session_id: session.id.clone(),
         cwd: metadata_value(session, "Cwd"),
         title: session.title.clone(),
-        remote_context: remote_scanned_session_context(server, &session.session_path)
-            .or(preview_context),
-        remote_machine: remote_machine_for_session_path(server, &session.session_path),
+        source_updated_at: source_updated_at_for_session(server, session),
+        remote_context: remote_context.or(preview_context),
+        remote_machine,
+        storage_path: (!storage_path.trim().is_empty()).then_some(storage_path),
     })
 }
 
@@ -3291,7 +3336,8 @@ fn copy_generation_target_for_browser_row(
         let remote = machine
             .sessions
             .iter()
-            .find(|session| session.session_path == row.full_path)?;
+            .find(|session| session.session_path == row.full_path)?
+            .clone();
         return Some(CopyGenerationTarget {
             session_path: row.full_path.clone(),
             session_id,
@@ -3300,9 +3346,12 @@ fn copy_generation_target_for_browser_row(
                 .clone()
                 .unwrap_or_else(|| remote.cwd.clone()),
             title: row.label.clone(),
+            source_updated_at: remote_session_updated_at(&remote),
             remote_context: (!remote.recent_context.trim().is_empty())
                 .then(|| remote.recent_context.clone()),
             remote_machine: Some(machine),
+            storage_path: (!remote.storage_path.trim().is_empty())
+                .then(|| remote.storage_path.clone()),
         });
     }
     if !is_local_stored_session_row(row) {
@@ -3313,9 +3362,69 @@ fn copy_generation_target_for_browser_row(
         session_id,
         cwd: row.session_cwd.clone().unwrap_or_default(),
         title: row.label.clone(),
+        source_updated_at: local_session_updated_at(&row.full_path),
         remote_context: None,
         remote_machine: None,
+        storage_path: Some(row.full_path.clone()),
     })
+}
+
+fn source_updated_at_for_session(
+    server: &YggtermServer,
+    session: &ManagedSessionView,
+) -> Option<OffsetDateTime> {
+    if session.session_path.starts_with("remote-session://") {
+        remote_machine_for_session_path(server, &session.session_path)
+            .as_ref()
+            .and_then(|machine| {
+                machine
+                    .sessions
+                    .iter()
+                    .find(|candidate| candidate.session_path == session.session_path)
+                    .and_then(remote_session_updated_at)
+            })
+    } else {
+        local_session_updated_at(&session.session_path)
+    }
+}
+
+fn remote_session_updated_at(session: &RemoteScannedSession) -> Option<OffsetDateTime> {
+    (session.modified_epoch > 0)
+        .then(|| OffsetDateTime::from_unix_timestamp(session.modified_epoch).ok())
+        .flatten()
+}
+
+fn local_session_updated_at(path: &str) -> Option<OffsetDateTime> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?;
+    let unix = modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
+    OffsetDateTime::from_unix_timestamp(unix).ok()
+}
+
+fn generation_context_for_target(target: &CopyGenerationTarget) -> Option<String> {
+    if let (Some(machine), Some(storage_path)) =
+        (target.remote_machine.as_ref(), target.storage_path.as_deref())
+    {
+        let ssh_target = SshConnectTarget {
+            label: machine.label.clone(),
+            kind: SessionKind::Codex,
+            ssh_target: machine.ssh_target.clone(),
+            prefix: machine.prefix.clone(),
+            cwd: None,
+        };
+        if let Ok(context) = fetch_remote_generation_context(&ssh_target, storage_path) {
+            let trimmed = context.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    target
+        .remote_context
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn restore_browser_tree(shell: &mut ShellState, browser_tree: SessionNode, selected_hint: Option<&str>) {
@@ -3374,7 +3483,15 @@ fn background_copy_job_for_target(
         .resolve_precis_for_session_id(&target.session_id)
         .ok()
         .flatten();
-    let precis_missing = stored_precis.is_none()
+    let precis_needs_refresh = target
+        .source_updated_at
+        .and_then(|updated_at| {
+            store
+                .precis_needs_refresh_for_session_id(&target.session_id, updated_at)
+                .ok()
+        })
+        .unwrap_or(stored_precis.is_none());
+    let precis_missing = precis_needs_refresh
         && target
             .remote_machine
             .as_ref()
@@ -3400,7 +3517,15 @@ fn background_copy_job_for_target(
         .resolve_summary_for_session_id(&target.session_id)
         .ok()
         .flatten();
-    let summary_missing = stored_summary.is_none()
+    let summary_needs_refresh = target
+        .source_updated_at
+        .and_then(|updated_at| {
+            store
+                .summary_needs_refresh_for_session_id(&target.session_id, updated_at)
+                .ok()
+        })
+        .unwrap_or(stored_summary.is_none());
+    let summary_missing = summary_needs_refresh
         && target
             .remote_machine
             .as_ref()
@@ -3441,9 +3566,12 @@ fn next_background_copy_job(
                 session_id: session.session_id.clone(),
                 cwd: session.cwd.clone(),
                 title: session.title_hint.clone(),
+                source_updated_at: remote_session_updated_at(session),
                 remote_context: (!session.recent_context.trim().is_empty())
                     .then(|| session.recent_context.clone()),
                 remote_machine: Some(machine.clone()),
+                storage_path: (!session.storage_path.trim().is_empty())
+                    .then(|| session.storage_path.clone()),
             });
         }
     }
@@ -6210,17 +6338,37 @@ fn app() -> Element {
             last_preview_refresh_path.set(None);
             return;
         };
-        let (has_precis, has_summary, has_good_title) = {
+        let (has_precis, has_summary, has_good_title, precis_stale, summary_stale) = {
             let shell = state.read();
+            let source_updated_at = source_updated_at_for_session(&shell.server, &session);
+            let store = SessionStore::open_or_init().ok();
             (
                 resolved_session_precis(&shell, &session).is_some(),
                 resolved_session_summary(&shell, &session).is_some(),
                 resolved_session_title(&shell, &session)
                     .as_deref()
                     .is_some_and(|title| !looks_like_generated_fallback_title(title)),
+                source_updated_at
+                    .and_then(|updated_at| {
+                        store.as_ref().and_then(|store| {
+                            store
+                                .precis_needs_refresh_for_session_id(&session.id, updated_at)
+                                .ok()
+                        })
+                    })
+                    .unwrap_or(false),
+                source_updated_at
+                    .and_then(|updated_at| {
+                        store.as_ref().and_then(|store| {
+                            store
+                                .summary_needs_refresh_for_session_id(&session.id, updated_at)
+                                .ok()
+                        })
+                    })
+                    .unwrap_or(false),
             )
         };
-        if !has_good_title || !has_precis || !has_summary {
+        if !has_good_title || !has_precis || !has_summary || precis_stale || summary_stale {
             spawn_active_session_copy_hydration(state, session.clone());
         }
         let has_generation_context = copy_generation_target_for_session(&state.read().server, &session)
@@ -6233,12 +6381,12 @@ fn app() -> Element {
         {
             queue_active_session_title_generation(state, false);
         }
-        if !has_precis
+        if (!has_precis || precis_stale)
             && (!session.session_path.starts_with("remote-session://") || has_generation_context)
         {
-            spawn_precis_generation(state, session.clone(), false);
+            spawn_precis_generation(state, session.clone(), precis_stale);
         }
-        if has_summary {
+        if has_summary && !summary_stale {
             state.with_mut(|shell| shell.next_background_copy_scan_after_ms = current_millis());
             maybe_spawn_background_copy_generation(state);
             return;
@@ -6248,7 +6396,7 @@ fn app() -> Element {
             maybe_spawn_background_copy_generation(state);
             return;
         }
-        spawn_summary_generation(state, session, false);
+        spawn_summary_generation(state, session, summary_stale);
         state.with_mut(|shell| shell.next_background_copy_scan_after_ms = current_millis());
         maybe_spawn_background_copy_generation(state);
     });
@@ -7169,7 +7317,7 @@ fn Sidebar(
                         on_end_drag.call(());
                     }
                 },
-                if snapshot.show_loading_tree {
+                if snapshot.show_loading_tree && snapshot.rows.is_empty() {
                     SidebarLoadingState { palette: snapshot.palette }
                 } else {
                     for row in snapshot.rows.iter().cloned() {
@@ -9141,8 +9289,8 @@ fn TerminalCanvas(
     );
     let future_theme = theme.clone();
     let is_remote_resume_session = session.session_path.starts_with("remote-session://");
-    let mut terminal_has_meaningful_output = use_signal(|| !is_remote_resume_session);
-    let mut resume_overlay_expired = use_signal(|| !is_remote_resume_session);
+    let terminal_has_meaningful_output = use_signal(|| !is_remote_resume_session);
+    let resume_overlay_expired = use_signal(|| !is_remote_resume_session);
     info!(
         session=%session_path,
         host_id=%host_id,
