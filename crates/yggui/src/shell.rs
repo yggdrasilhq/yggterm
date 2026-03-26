@@ -401,6 +401,12 @@ enum PreviewContentBlock {
     Code { language: Option<String>, code: String },
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct PreviewRun {
+    tone: PreviewTone,
+    entries: Vec<(usize, SessionPreviewBlock)>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MachineHealth {
     Healthy,
@@ -3903,7 +3909,13 @@ fn preview_header_summary(snapshot: &RenderSnapshot, session: &ManagedSessionVie
 }
 
 fn is_placeholder_rendered_section_title(title: &str) -> bool {
-    matches!(title, "Rendered Session" | "Server Notes" | "Recent Context")
+    title.eq_ignore_ascii_case("Rendered Session")
+        || title.eq_ignore_ascii_case("Server Notes")
+        || title.eq_ignore_ascii_case("Recent Context")
+}
+
+fn palette_is_dark(palette: Palette) -> bool {
+    palette.panel == "#161c22"
 }
 
 fn preview_rendered_sections(session: &ManagedSessionView) -> Vec<SessionRenderedSection> {
@@ -4003,6 +4015,24 @@ fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlo
         visible = session.preview.blocks.clone();
     }
     visible
+}
+
+fn group_preview_runs(blocks: &[SessionPreviewBlock], start_index: usize) -> Vec<PreviewRun> {
+    let mut runs: Vec<PreviewRun> = Vec::new();
+    for (offset, block) in blocks.iter().cloned().enumerate() {
+        let ix = start_index + offset;
+        if let Some(last) = runs.last_mut()
+            && last.tone == block.tone
+        {
+            last.entries.push((ix, block));
+            continue;
+        }
+        runs.push(PreviewRun {
+            tone: block.tone,
+            entries: vec![(ix, block)],
+        });
+    }
+    runs
 }
 
 fn remote_machine_for_session_path(
@@ -8315,6 +8345,7 @@ fn MainSurface(
                     } else {
                         visible_blocks.clone()
                     };
+                    let grouped_runs = group_preview_runs(&rendered_blocks, hidden_block_count);
                     rsx! {
                         div {
                             style: "display:flex; flex-direction:column; min-width:0; min-height:0; width:100%; height:100%;",
@@ -8376,12 +8407,11 @@ fn MainSurface(
                                                 palette: snapshot.palette,
                                             }
                                         }
-                                        for (ix, block) in rendered_blocks.iter().cloned().enumerate() {
-                                            PreviewBlock {
-                                                block_ix: hidden_block_count + ix,
-                                                block: block.clone(),
+                                        for run in grouped_runs.into_iter() {
+                                            PreviewRunBlock {
+                                                run: run.clone(),
                                                 palette: snapshot.palette,
-                                                on_toggle: move |_| on_toggle_preview_block.call(hidden_block_count + ix),
+                                                on_toggle_block: move |ix| on_toggle_preview_block.call(ix),
                                             }
                                         }
                                     }
@@ -9209,118 +9239,96 @@ fn AgentModeSelector(
 }
 
 #[component]
-fn PreviewBlock(
-    block_ix: usize,
-    block: SessionPreviewBlock,
+fn PreviewRunBlock(
+    run: PreviewRun,
     palette: Palette,
-    on_toggle: EventHandler<MouseEvent>,
+    on_toggle_block: EventHandler<usize>,
 ) -> Element {
-    let user_block = block.tone == PreviewTone::User;
-    let background = if user_block {
-        "rgba(232, 242, 255, 0.96)"
-    } else {
-        "rgba(255, 255, 255, 0.84)"
+    let user_run = run.tone == PreviewTone::User;
+    let dark = palette_is_dark(palette);
+    let row_justify = if user_run { "flex-end" } else { "flex-start" };
+    let width = if user_run { "min(72%, 760px)" } else { "min(100%, 960px)" };
+    let background = match user_run {
+        true if dark => "rgba(43,52,66,0.94)",
+        true => "rgba(235,242,250,0.98)",
+        false => "transparent",
     };
-    let badge_background = if user_block {
-        "rgba(37, 99, 235, 0.12)"
-    } else {
-        "rgba(15, 23, 42, 0.06)"
+    let border = match user_run {
+        true if dark => "rgba(111,148,185,0.26)",
+        true => "rgba(196,210,225,0.96)",
+        false if dark => "rgba(76,94,114,0.76)",
+        false => "rgba(226,232,240,0.92)",
     };
-    let badge = if user_block { palette.accent } else { palette.text };
-    let outline = if user_block {
-        "rgba(66, 153, 225, 0.16)"
-    } else {
-        "rgba(170, 190, 212, 0.12)"
+    let shadow = match user_run {
+        true if dark => "0 12px 28px rgba(0,0,0,0.22)",
+        true => "0 10px 24px rgba(148,163,184,0.10)",
+        false => "none",
     };
-    let row_justify = if user_block { "flex-end" } else { "flex-start" };
-    let card_width = if user_block { "min(72%, 760px)" } else { "min(100%, 980px)" };
-    let avatar_bg = if user_block {
-        "linear-gradient(180deg, rgba(73,138,255,0.18) 0%, rgba(73,138,255,0.10) 100%)"
-    } else {
-        "linear-gradient(180deg, rgba(255,255,255,0.96) 0%, rgba(248,252,255,0.88) 100%)"
-    };
-    let avatar_fg = if user_block { palette.accent } else { palette.text };
-    let avatar_label = if user_block { "U" } else { "A" };
 
     rsx! {
         div {
             style: format!("display:flex; justify-content:{}; width:100%;", row_justify),
             div {
                 style: format!(
-                    "display:flex; align-items:flex-start; gap:12px; width:{}; content-visibility:auto; \
-                     contain:layout paint style; contain-intrinsic-size:760px 220px;",
-                    card_width
+                    "display:flex; flex-direction:column; gap:0; width:{}; content-visibility:auto; \
+                     contain:layout paint style; contain-intrinsic-size:760px 260px;",
+                    width
                 ),
-                if !user_block {
-                    div {
-                        style: format!(
-                            "width:30px; height:30px; border-radius:999px; background:{}; color:{}; \
-                             display:flex; align-items:center; justify-content:center; font-size:11px; font-weight:800; \
-                             flex:0 0 auto; box-shadow: inset 0 0 0 1px rgba(170,190,212,0.18);",
-                            avatar_bg,
-                            avatar_fg
-                        ),
-                        "{avatar_label}"
-                    }
-                }
-                button {
+                div {
                     style: format!(
-                        "width:100%; border:none; text-align:left; background:{}; border-radius:{}px; \
-                         padding:{}; box-shadow: inset 0 0 0 1px {}, {}; \
-                         contain:layout paint style;",
+                        "display:flex; flex-direction:column; gap:0; background:{}; border-radius:{}px; \
+                         box-shadow:{}; {}",
                         background,
-                        if user_block { 18 } else { 22 },
-                        if user_block { "16px 18px" } else { "18px 22px" },
-                        outline,
-                        if user_block {
-                            "0 8px 20px rgba(103,145,188,0.08)"
+                        if user_run { 22 } else { 0 },
+                        shadow,
+                        if user_run {
+                            format!("border:1px solid {};", border)
                         } else {
-                            "0 6px 14px rgba(148,163,184,0.04)"
+                            String::new()
                         }
                     ),
-                    onclick: move |evt| on_toggle.call(evt),
-                    div {
-                        style: "display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:10px;",
-                        div {
-                            style: "display:flex; align-items:center; gap:8px;",
-                            span {
-                                style: format!(
-                                    "display:inline-flex; align-items:center; justify-content:center; min-width:54px; height:22px; \
-                                     border-radius:999px; background:{}; color:{}; font-size:10px; font-weight:800; letter-spacing:0.02em;",
-                                    badge_background,
-                                    badge
-                                ),
-                                "{block.role}"
+                    for (entry_ix, (block_ix, block)) in run.entries.iter().cloned().enumerate() {
+                        button {
+                            style: format!(
+                                "width:100%; border:none; text-align:left; background:transparent; padding:{}; \
+                                 {} {}",
+                                if user_run { "13px 16px" } else { "10px 0 12px 0" },
+                                if entry_ix > 0 {
+                                    if user_run {
+                                        format!("border-top:1px solid rgba(203,213,225,0.88);")
+                                    } else {
+                                        format!("border-top:1px solid {};", border)
+                                    }
+                                } else {
+                                    String::new()
+                                },
+                                if user_run {
+                                    "border-radius:0;".to_string()
+                                } else {
+                                    String::new()
+                                }
+                            ),
+                            onclick: move |_| on_toggle_block.call(block_ix),
+                            div {
+                                style: "display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:8px;",
+                                div {
+                                    style: format!("font-size:10px; color:{}; opacity:0.86;", palette.muted),
+                                    "{block.timestamp}"
+                                }
+                                div {
+                                    style: format!("font-size:10px; color:{}; opacity:0.72;", palette.muted),
+                                    {if block.folded { "Expand".to_string() } else { "Collapse".to_string() }}
+                                }
                             }
-                            span {
-                                style: format!("font-size:10px; color:{}; opacity:0.9;", palette.muted),
-                                "{block.timestamp}"
+                            if block.folded {
+                                div {
+                                    style: format!("font-size:11px; color:{};", palette.muted),
+                                    "{block.lines.len()} lines hidden"
+                                }
+                            } else {
+                                PreviewContent { lines: block.lines.clone(), palette }
                             }
                         }
-                        span {
-                            style: format!("font-size:10px; color:{}; opacity:0.78;", palette.muted),
-                            {if block.folded { format!("Expand {}", block_ix + 1) } else { format!("Collapse {}", block_ix + 1) }}
-                        }
-                    }
-                    if block.folded {
-                        div {
-                            style: format!("font-size:12px; color:{};", palette.muted),
-                            "{block.lines.len()} lines hidden"
-                        }
-                    } else {
-                        PreviewContent { lines: block.lines.clone(), palette }
-                    }
-                }
-                if user_block {
-                    div {
-                        style: format!(
-                            "width:30px; height:30px; border-radius:999px; background:{}; color:{}; \
-                             display:flex; align-items:center; justify-content:center; font-size:11px; font-weight:800; \
-                             flex:0 0 auto; box-shadow: inset 0 0 0 1px rgba(170,190,212,0.18);",
-                            avatar_bg,
-                            avatar_fg
-                        ),
-                        "{avatar_label}"
                     }
                 }
             }
@@ -9334,7 +9342,7 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
     rsx! {
         div {
             style: format!(
-                "display:flex; flex-direction:column; gap:10px; color:{}; contain:layout paint style;",
+                "display:flex; flex-direction:column; gap:9px; color:{}; contain:layout paint style;",
                 palette.text
             ),
             for block in blocks.read().iter().cloned() {
@@ -9344,9 +9352,9 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                             style: format!(
                                 "font-size:{}px; line-height:1.38; font-weight:750; letter-spacing:-0.01em; color:{}; white-space:pre-wrap; padding-top:{}px;",
                                 match level {
-                                    1 => 18,
-                                    2 => 16,
-                                    _ => 14,
+                                    1 => 17,
+                                    2 => 15,
+                                    _ => 13,
                                 },
                                 palette.text,
                                 if level == 1 { 4 } else { 2 }
@@ -9356,7 +9364,7 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                     },
                     PreviewContentBlock::Paragraph(text) => rsx! {
                         div {
-                            style: "font-size:13px; line-height:1.66; white-space:pre-wrap;",
+                            style: "font-size:12px; line-height:1.68; white-space:pre-wrap;",
                             "{text}"
                         }
                     },
@@ -9367,7 +9375,7 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                                 style: format!("width:6px; height:6px; border-radius:999px; background:{}; margin-top:8px; flex:0 0 auto;", palette.accent_soft),
                             }
                             div {
-                                style: "font-size:13px; line-height:1.66; white-space:pre-wrap;",
+                                style: "font-size:12px; line-height:1.68; white-space:pre-wrap;",
                                 "{text}"
                             }
                         }
@@ -9380,7 +9388,7 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                                 "{number}."
                             }
                             div {
-                                style: "font-size:13px; line-height:1.66; white-space:pre-wrap;",
+                                style: "font-size:12px; line-height:1.68; white-space:pre-wrap;",
                                 "{text}"
                             }
                         }
@@ -9401,7 +9409,7 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                             }
                             div {
                                 style: format!(
-                                    "font-size:13px; line-height:1.66; white-space:pre-wrap; color:{};",
+                                    "font-size:12px; line-height:1.68; white-space:pre-wrap; color:{};",
                                     if done { palette.muted } else { palette.text }
                                 ),
                                 "{text}"
@@ -9415,7 +9423,7 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                                 style: format!("width:3px; border-radius:999px; background:{}; flex:0 0 auto;", palette.accent_soft),
                             }
                             div {
-                                style: format!("font-size:13px; line-height:1.68; white-space:pre-wrap; color:{};", palette.muted),
+                                style: format!("font-size:12px; line-height:1.7; white-space:pre-wrap; color:{};", palette.muted),
                                 "{text}"
                             }
                         }
@@ -9446,7 +9454,7 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                                     }
                                 }
                                 div {
-                                    style: format!("font-size:12px; line-height:1.6; color:{}; font-family:'JetBrains Mono', 'Iosevka Term', monospace; white-space:pre-wrap; overflow-wrap:anywhere;", palette.muted),
+                                    style: format!("font-size:11px; line-height:1.6; color:{}; font-family:'JetBrains Mono', 'Iosevka Term', monospace; white-space:pre-wrap; overflow-wrap:anywhere;", palette.muted),
                                     "{path}"
                                 }
                             }
@@ -9464,7 +9472,7 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                                 }
                             }
                             pre {
-                                style: "margin:0; padding:14px 16px 16px 16px; overflow:auto; white-space:pre-wrap; font-size:12px; line-height:1.68; font-family:'JetBrains Mono', 'Iosevka Term', monospace;",
+                                style: "margin:0; padding:14px 16px 16px 16px; overflow:auto; white-space:pre-wrap; font-size:11px; line-height:1.66; font-family:'JetBrains Mono', 'Iosevka Term', monospace;",
                                 code { "{code}" }
                             }
                         }
