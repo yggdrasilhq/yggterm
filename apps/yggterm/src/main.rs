@@ -13,7 +13,8 @@ use yggterm_core::{
 };
 use yggterm_server::{
     PersistedDaemonState, SessionKind, YggtermServer, cleanup_legacy_daemons, default_endpoint,
-    detect_ghostty_host, ping, run_attach, run_daemon, run_remote_preview,
+    detect_ghostty_host, ping, run_attach, run_daemon, run_remote_generation_context,
+    run_remote_preview,
     run_remote_protocol_version, run_remote_resume_codex, run_remote_scan,
     run_remote_stage_clipboard_png, run_remote_upsert_generated_copy, shutdown,
     start_local_session, status,
@@ -61,6 +62,13 @@ fn main() -> Result<()> {
     }
     if args.len() == 4 && args[0] == "server" && args[1] == "remote" && args[2] == "preview" {
         return run_remote_preview(&args[3]);
+    }
+    if args.len() == 4
+        && args[0] == "server"
+        && args[1] == "remote"
+        && args[2] == "generation-context"
+    {
+        return run_remote_generation_context(&args[3]);
     }
     if args.len() == 4 && args[0] == "server" && args[1] == "remote" && args[2] == "upsert-generated-copy" {
         return run_remote_upsert_generated_copy(&args[3]);

@@ -18,4 +18,5 @@ serde.workspace = true
 serde_json.workspace = true
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tao = "0.34.6"
+time = { version = "0.3", features = ["formatting", "parsing"] }
 tracing.workspace = true
