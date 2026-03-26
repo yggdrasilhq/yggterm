@@ -897,6 +897,7 @@ impl YggtermServer {
                 document.as_ref(),
             );
         }
+        let desired_active_path = state.active_session_path.clone();
         let mut restored_live_fingerprints = Vec::<(SessionKind, String, Option<String>)>::new();
         for live in state.live_sessions {
             if is_legacy_demo_live_session(&live) {
@@ -913,9 +914,12 @@ impl YggtermServer {
             self.restore_live_session(live);
         }
         self.active_view_mode = state.active_view_mode;
-        if let Some(path) = state.active_session_path {
+        if let Some(path) = desired_active_path {
             if self.sessions.contains_key(&path) {
-                self.active_session_path = Some(path);
+                self.active_session_path = Some(path.clone());
+                if self.active_view_mode == WorkspaceViewMode::Terminal {
+                    self.request_terminal_launch_for_path(&path);
+                }
             }
         }
     }
@@ -1344,8 +1348,6 @@ impl YggtermServer {
             self.sessions.insert(live.key.clone(), session);
             self.live_session_order.retain(|existing| existing != &live.key);
             self.live_session_order.insert(0, live.key.clone());
-            self.active_session_path = Some(live.key);
-            self.active_view_mode = WorkspaceViewMode::Terminal;
             return;
         }
         self.insert_live_session_with_launch(
@@ -1628,9 +1630,9 @@ impl YggtermServer {
         self.sessions.insert(key.to_string(), session);
         self.live_session_order.retain(|existing| existing != key);
         self.live_session_order.insert(0, key.to_string());
-        self.active_session_path = Some(key.to_string());
-        self.active_view_mode = WorkspaceViewMode::Terminal;
         if launch_now {
+            self.active_session_path = Some(key.to_string());
+            self.active_view_mode = WorkspaceViewMode::Terminal;
             self.request_terminal_launch_for_active();
         }
     }
