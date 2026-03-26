@@ -7051,29 +7051,31 @@ fn app() -> Element {
                             }
                         },
                     }
-                    RightRail {
-                        snapshot: metadata_snapshot,
-                        on_endpoint_change: move |value: String| state.with_mut(|shell| shell.update_litellm_endpoint(value)),
-                        on_api_key_change: move |value: String| state.with_mut(|shell| shell.update_litellm_api_key(value)),
-                        on_model_change: move |value: String| state.with_mut(|shell| shell.update_interface_llm_model(value)),
-                        on_set_ui_theme: move |theme: UiTheme| state.with_mut(|shell| shell.set_ui_theme(theme)),
-                        on_open_theme_editor: move |_| state.with_mut(|shell| shell.open_theme_editor()),
-                        on_set_notification_delivery: move |mode: NotificationDeliveryMode| {
-                            state.with_mut(|shell| shell.update_notification_delivery(mode))
-                        },
-                        on_set_notification_sound: move |enabled: bool| {
-                            state.with_mut(|shell| shell.update_notification_sound(enabled))
-                        },
-                        on_adjust_ui_zoom: move |delta: i32| state.with_mut(|shell| shell.adjust_ui_zoom(delta)),
-                        on_adjust_main_zoom: move |delta: i32| {
-                            state.with_mut(|shell| shell.adjust_main_zoom(delta));
-                            apply_active_terminal_zoom(state);
-                        },
-                        on_connect_ssh_custom: move |_| spawn_connect_ssh_custom(state),
-                        on_ssh_target_change: move |value: String| state.with_mut(|shell| shell.update_ssh_connect_target(value)),
-                        on_ssh_prefix_change: move |value: String| state.with_mut(|shell| shell.update_ssh_connect_prefix(value)),
-                        on_clear_notification: move |id: u64| state.with_mut(|shell| shell.clear_notification(id)),
-                        on_clear_notifications: move |_| state.with_mut(|shell| shell.clear_notifications()),
+                    if metadata_snapshot.right_panel_mode != RightPanelMode::Hidden {
+                        RightRail {
+                            snapshot: metadata_snapshot,
+                            on_endpoint_change: move |value: String| state.with_mut(|shell| shell.update_litellm_endpoint(value)),
+                            on_api_key_change: move |value: String| state.with_mut(|shell| shell.update_litellm_api_key(value)),
+                            on_model_change: move |value: String| state.with_mut(|shell| shell.update_interface_llm_model(value)),
+                            on_set_ui_theme: move |theme: UiTheme| state.with_mut(|shell| shell.set_ui_theme(theme)),
+                            on_open_theme_editor: move |_| state.with_mut(|shell| shell.open_theme_editor()),
+                            on_set_notification_delivery: move |mode: NotificationDeliveryMode| {
+                                state.with_mut(|shell| shell.update_notification_delivery(mode))
+                            },
+                            on_set_notification_sound: move |enabled: bool| {
+                                state.with_mut(|shell| shell.update_notification_sound(enabled))
+                            },
+                            on_adjust_ui_zoom: move |delta: i32| state.with_mut(|shell| shell.adjust_ui_zoom(delta)),
+                            on_adjust_main_zoom: move |delta: i32| {
+                                state.with_mut(|shell| shell.adjust_main_zoom(delta));
+                                apply_active_terminal_zoom(state);
+                            },
+                            on_connect_ssh_custom: move |_| spawn_connect_ssh_custom(state),
+                            on_ssh_target_change: move |value: String| state.with_mut(|shell| shell.update_ssh_connect_target(value)),
+                            on_ssh_prefix_change: move |value: String| state.with_mut(|shell| shell.update_ssh_connect_prefix(value)),
+                            on_clear_notification: move |id: u64| state.with_mut(|shell| shell.clear_notification(id)),
+                            on_clear_notifications: move |_| state.with_mut(|shell| shell.clear_notifications()),
+                        }
                     }
                 }
                 if let Some((row, context_row)) = context_menu_overlay.clone() {
