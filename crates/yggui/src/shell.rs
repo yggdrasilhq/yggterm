@@ -138,6 +138,7 @@ struct ShellState {
     search_sidebar_match_index: Option<usize>,
     search_content_match_index: Option<usize>,
     busy_request_id: Option<String>,
+    active_surface_requests: HashMap<YggSurface, ActiveSurfaceRequest>,
     sidebar_open: bool,
     right_panel_mode: RightPanelMode,
     last_action: String,
@@ -241,6 +242,10 @@ struct RenderSnapshot {
     search_sidebar_match_index: Option<usize>,
     search_content_hits: Vec<SearchContentHit>,
     search_content_hit_index: Option<usize>,
+    sidebar_loading: bool,
+    preview_loading: bool,
+    terminal_loading: bool,
+    metadata_loading: bool,
     sidebar_open: bool,
     right_panel_mode: RightPanelMode,
     rows: Vec<BrowserRow>,
@@ -437,6 +442,12 @@ struct SearchContentHit {
     label: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveSurfaceRequest {
+    request_id: String,
+    operation: String,
+}
+
 #[derive(Default)]
 struct PreviewContentCache {
     order: VecDeque<u64>,
@@ -452,6 +463,7 @@ enum MachineHealth {
 
 impl ShellState {
     fn new(bootstrap: ShellBootstrap) -> Self {
+        let initial_search_query = std::env::var("YGGTERM_SEARCH_QUERY").unwrap_or_default();
         let browser_tree_loaded = bootstrap.browser_tree_loaded;
         let settings = bootstrap.settings.clone();
         let pending_update_restart = bootstrap.pending_update_restart.clone();
@@ -496,6 +508,7 @@ impl ShellState {
             search_sidebar_match_index: None,
             search_content_match_index: None,
             busy_request_id: None,
+            active_surface_requests: HashMap::new(),
             sidebar_open,
             right_panel_mode,
             last_action: "ready".to_string(),
@@ -556,6 +569,9 @@ impl ShellState {
         }
         state.refresh_tree_debug("init");
         state.server_daemon_detail = state.bootstrap.server_daemon_detail.clone();
+        if !initial_search_query.trim().is_empty() {
+            state.set_search(initial_search_query);
+        }
         state.hydrate_generated_copy_from_remote_cache();
         if !state.needs_initial_server_sync {
             state.seed_dynamic_top_level_expansions();
@@ -588,14 +604,15 @@ impl ShellState {
         let mut expanded_paths = self.browser.expanded_path_set();
         expanded_paths.extend(self.active_session_visibility_paths());
         let live_sessions = self.server.live_sessions();
-        let rows = merged_sidebar_rows(
+        let merged_rows = merged_sidebar_rows(
             self.browser.rows(),
             self.server.remote_machines(),
             self.server.ssh_targets(),
             &live_sessions,
             &expanded_paths,
         );
-        let search_sidebar_matches = search_sidebar_matches(&rows, &self.search_query);
+        let rows = filtered_sidebar_rows(&merged_rows, &self.search_query);
+        let search_sidebar_matches = search_sidebar_matches(&merged_rows, &self.search_query);
         let selected_path = if let Some(active) = self.server.active_session() {
             if active.source == yggterm_server::SessionSource::LiveSsh
                 || active.session_path.starts_with("remote-session://")
@@ -635,6 +652,10 @@ impl ShellState {
             search_sidebar_match_index,
             search_content_hits,
             search_content_hit_index,
+            sidebar_loading: self.active_surface_requests.contains_key(&YggSurface::Sidebar),
+            preview_loading: self.active_surface_requests.contains_key(&YggSurface::Preview),
+            terminal_loading: self.active_surface_requests.contains_key(&YggSurface::Terminal),
+            metadata_loading: self.active_surface_requests.contains_key(&YggSurface::MetadataRail),
             sidebar_open: self.sidebar_open,
             right_panel_mode: self.right_panel_mode,
             rows,
@@ -691,11 +712,7 @@ impl ShellState {
         self.search_sidebar_match_index = None;
         self.search_content_match_index = None;
         let trimmed = self.search_query.trim();
-        self.browser.set_filter_query(if trimmed.starts_with('/') {
-            String::new()
-        } else {
-            self.search_query.clone()
-        });
+        self.browser.set_filter_query(String::new());
         self.last_action = if self.search_query.is_empty() {
             "search cleared".to_string()
         } else if trimmed.starts_with('/') {
@@ -703,10 +720,33 @@ impl ShellState {
         } else {
             format!("filtered {}", self.search_query)
         };
+        self.record_ui_telemetry(
+            "search_debug",
+            json!({
+                "query": self.search_query,
+                "focused": self.search_focused,
+                "sidebar_matches": self.current_search_sidebar_matches().len(),
+                "content_hits": search_content_hits(
+                    self.server.active_session(),
+                    self.server.active_view_mode(),
+                    &self.search_query,
+                )
+                .len(),
+                "active_view_mode": format!("{:?}", self.server.active_view_mode()),
+                "selected_paths": self.selected_tree_paths.iter().cloned().collect::<Vec<_>>(),
+            }),
+        );
     }
 
     fn set_search_focus(&mut self, focused: bool) {
         self.search_focused = focused;
+        self.record_ui_telemetry(
+            "search_focus_debug",
+            json!({
+                "focused": focused,
+                "query": self.search_query,
+            }),
+        );
     }
 
     fn next_search_sidebar_row(&mut self, step: isize) -> Option<BrowserRow> {
@@ -855,8 +895,15 @@ impl ShellState {
         };
     }
 
-    fn begin_busy_request(&mut self, request_id: String, label: String) {
-        self.busy_request_id = Some(request_id);
+    fn begin_busy_request(&mut self, request_meta: YggRequestMeta, label: String) {
+        self.busy_request_id = Some(request_meta.request_id.clone());
+        self.active_surface_requests.insert(
+            request_meta.surface,
+            ActiveSurfaceRequest {
+                request_id: request_meta.request_id,
+                operation: request_meta.operation,
+            },
+        );
         self.server_busy = true;
         self.last_action = label;
     }
@@ -864,6 +911,8 @@ impl ShellState {
     fn finish_busy_request(&mut self) {
         if let Some(request_id) = self.busy_request_id.take() {
             self.clear_job_notification(&format!("loading:{request_id}"));
+            self.active_surface_requests
+                .retain(|_, request| request.request_id != request_id);
         }
         self.server_busy = false;
     }
@@ -3226,7 +3275,7 @@ where
         YggTarget::App,
     );
     state.with_mut(|shell| {
-        shell.begin_busy_request(request_meta.request_id.clone(), pending_label.clone());
+        shell.begin_busy_request(request_meta.clone(), pending_label.clone());
     });
     spawn_loading_notice(
         state,
@@ -3260,7 +3309,18 @@ fn spawn_set_view_mode(mut state: Signal<ShellState>, mode: WorkspaceViewMode) {
             WorkspaceViewMode::Rendered => "switching to preview".to_string(),
             WorkspaceViewMode::Terminal => "switching to terminal".to_string(),
         };
-        shell.begin_busy_request(format!("view-mode-{}", current_millis()), label);
+        shell.begin_busy_request(
+            YggRequestMeta::interactive(
+                format!("view-mode-{}", current_millis()),
+                "set_view_mode",
+                match mode {
+                    WorkspaceViewMode::Rendered => YggSurface::Preview,
+                    WorkspaceViewMode::Terminal => YggSurface::Terminal,
+                },
+                YggTarget::ActiveSession,
+            ),
+            label,
+        );
     });
     spawn_server_snapshot_action(state, "syncing view mode".to_string(), move |endpoint| {
         if mode == WorkspaceViewMode::Terminal {
@@ -3292,10 +3352,7 @@ fn spawn_open_session_row(mut state: Signal<ShellState>, row: BrowserRow) {
         shell.browser.select_path(row.full_path.clone());
         shell.context_menu_row = None;
         shell.sync_browser_settings();
-        shell.begin_busy_request(
-            request_meta.request_id.clone(),
-            format!("opening {}", row.label),
-        );
+        shell.begin_busy_request(request_meta.clone(), format!("opening {}", row.label));
     });
     spawn_loading_notice(
         state,
@@ -3383,10 +3440,7 @@ fn spawn_connect_ssh_custom(mut state: Signal<ShellState>) {
         },
     );
     state.with_mut(|shell| {
-        shell.begin_busy_request(
-            request_meta.request_id.clone(),
-            format!("connecting {target}"),
-        );
+        shell.begin_busy_request(request_meta.clone(), format!("connecting {target}"));
         shell.push_notification(
             NotificationTone::Info,
             "Connecting SSH",
@@ -3728,14 +3782,13 @@ fn restore_browser_tree(shell: &mut ShellState, browser_tree: SessionNode, selec
         .filter(|path| path.starts_with("__remote_machine__/") || path.starts_with("__remote_folder__/"))
         .cloned()
         .collect::<Vec<_>>();
-    let filter_query = shell.search_query.clone();
     shell.browser = SessionBrowserState::new(browser_tree);
     shell.browser.restore_ui_state(
         &expanded_paths,
         selected_path.as_deref().or(selected_hint),
     );
     shell.browser.ensure_expanded_paths(synthetic_expanded_paths);
-    shell.browser.set_filter_query(filter_query);
+    shell.browser.set_filter_query(String::new());
     shell.ensure_active_session_visible();
     shell.record_restore_issue_telemetry("restore_browser_tree");
     shell.sync_browser_settings();
@@ -4312,23 +4365,124 @@ fn clamp_search_index(index: Option<usize>, len: usize) -> Option<usize> {
     }
 }
 
-fn search_sidebar_matches(rows: &[BrowserRow], query: &str) -> Vec<BrowserRow> {
+fn search_terms(query: &str) -> Vec<String> {
     let trimmed = query.trim();
     if trimmed.is_empty() || trimmed.starts_with('/') {
         return Vec::new();
     }
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    for ch in trimmed.chars() {
+        match ch {
+            '"' => {
+                if in_quotes {
+                    if !current.trim().is_empty() {
+                        terms.push(current.trim().to_ascii_lowercase());
+                    }
+                    current.clear();
+                    in_quotes = false;
+                } else {
+                    if !current.trim().is_empty() {
+                        terms.push(current.trim().to_ascii_lowercase());
+                        current.clear();
+                    }
+                    in_quotes = true;
+                }
+            }
+            ch if ch.is_whitespace() && !in_quotes => {
+                if !current.trim().is_empty() {
+                    terms.push(current.trim().to_ascii_lowercase());
+                    current.clear();
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.trim().is_empty() {
+        terms.push(current.trim().to_ascii_lowercase());
+    }
+    terms
+}
+
+fn text_matches_search_terms(text: &str, terms: &[String]) -> bool {
+    if terms.is_empty() {
+        return false;
+    }
+    let haystack = text.to_ascii_lowercase();
+    terms.iter().all(|term| haystack.contains(term))
+}
+
+fn row_search_blob(row: &BrowserRow) -> String {
+    let mut parts = vec![
+        row.label.as_str(),
+        row.detail_label.as_str(),
+        row.full_path.as_str(),
+        row.host_label.as_str(),
+    ];
+    if let Some(session_title) = row.session_title.as_deref() {
+        parts.push(session_title);
+    }
+    if let Some(session_id) = row.session_id.as_deref() {
+        parts.push(session_id);
+    }
+    if let Some(cwd) = row.session_cwd.as_deref() {
+        parts.push(cwd);
+    }
+    parts.join("\n")
+}
+
+fn row_matches_search(row: &BrowserRow, terms: &[String]) -> bool {
+    text_matches_search_terms(&row_search_blob(row), terms)
+}
+
+fn filtered_sidebar_rows(rows: &[BrowserRow], query: &str) -> Vec<BrowserRow> {
+    let terms = search_terms(query);
+    if terms.is_empty() {
+        return rows.to_vec();
+    }
+    let mut ancestor_stack = Vec::<String>::new();
+    let mut ancestors_by_path = HashMap::<String, Vec<String>>::new();
+    for row in rows {
+        ancestor_stack.truncate(row.depth);
+        ancestors_by_path.insert(row.full_path.clone(), ancestor_stack.clone());
+        if matches!(row.kind, BrowserRowKind::Group | BrowserRowKind::Separator) {
+            ancestor_stack.push(row.full_path.clone());
+        }
+    }
+    let mut keep_paths = HashSet::<String>::new();
+    for row in rows {
+        if row_matches_search(row, &terms) {
+            keep_paths.insert(row.full_path.clone());
+            if let Some(ancestors) = ancestors_by_path.get(&row.full_path) {
+                keep_paths.extend(ancestors.iter().cloned());
+            }
+        }
+    }
     rows.iter()
-        .filter(|row| matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document))
+        .filter(|row| keep_paths.contains(&row.full_path))
         .cloned()
         .collect()
 }
 
-fn content_search_query(query: &str) -> Option<String> {
-    let trimmed = query.trim();
-    if trimmed.is_empty() || trimmed.starts_with('/') {
+fn search_sidebar_matches(rows: &[BrowserRow], query: &str) -> Vec<BrowserRow> {
+    let terms = search_terms(query);
+    if terms.is_empty() {
+        return Vec::new();
+    }
+    rows.iter()
+        .filter(|row| matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document))
+        .filter(|row| row_matches_search(row, &terms))
+        .cloned()
+        .collect()
+}
+
+fn content_search_query(query: &str) -> Option<Vec<String>> {
+    let terms = search_terms(query);
+    if terms.is_empty() {
         None
     } else {
-        Some(trimmed.to_ascii_lowercase())
+        Some(terms)
     }
 }
 
@@ -4340,15 +4494,15 @@ fn search_content_hits(
     let Some(session) = session else {
         return Vec::new();
     };
-    let Some(query) = content_search_query(query) else {
+    let Some(terms) = content_search_query(query) else {
         return Vec::new();
     };
     match view_mode {
         WorkspaceViewMode::Rendered => {
             let mut hits = Vec::new();
             for (ix, block) in visible_preview_blocks(session).iter().enumerate() {
-                let haystack = block.lines.join("\n").to_ascii_lowercase();
-                if haystack.contains(&query) {
+                let haystack = block.lines.join("\n");
+                if text_matches_search_terms(&haystack, &terms) {
                     hits.push(SearchContentHit {
                         dom_id: preview_block_dom_id(&session.id, ix),
                         label: block.timestamp.clone(),
@@ -4362,9 +4516,9 @@ fn search_content_hits(
             .iter()
             .enumerate()
             .filter_map(|(ix, line)| {
-                if line.to_ascii_lowercase().contains(&query) {
+                if text_matches_search_terms(line, &terms) {
                     Some(SearchContentHit {
-                        dom_id: format!("terminal-line-{}-{ix}", sanitize_dom_id(&session.id)),
+                        dom_id: format!("__terminal_line__:{ix}"),
                         label: format!("Line {}", ix + 1),
                     })
                 } else {
@@ -6077,12 +6231,11 @@ fn queue_document_save(
         state.with_mut(|shell| match outcome {
             Ok(Ok((document, browser_tree))) => {
                 let expanded_paths = shell.browser.expanded_paths();
-                let filter_query = shell.search_query.clone();
                 shell.browser = SessionBrowserState::new(browser_tree);
                 shell
                     .browser
                     .restore_ui_state(&expanded_paths, Some(&document.virtual_path));
-                shell.browser.set_filter_query(filter_query);
+                shell.browser.set_filter_query(String::new());
                 shell.browser.select_path(document.virtual_path.clone());
                 shell.sync_browser_settings();
                 shell.apply_daemon_snapshot_result(open_stored_session(
@@ -7364,6 +7517,57 @@ fn app() -> Element {
                     ));
                     return;
                 }
+                if !is_accel
+                    && !evt.modifiers().contains(Modifiers::SHIFT)
+                    && matches!(evt.key(), Key::Character(ref key) if key == "/")
+                {
+                    evt.prevent_default();
+                    let _ = document::eval(&format!(
+                        "(function() {{
+                            const input = document.getElementById({SEARCH_INPUT_ID:?});
+                            if (input) {{
+                                input.focus();
+                                if (input.select) input.select();
+                            }}
+                        }})();"
+                    ));
+                    return;
+                }
+                if evt.key() == Key::Escape {
+                    let should_clear = {
+                        let shell = state.read();
+                        shell.search_focused || !shell.search_query.trim().is_empty()
+                    };
+                    if should_clear {
+                        evt.prevent_default();
+                        state.with_mut(|shell| {
+                            shell.set_search(String::new());
+                            shell.set_search_focus(false);
+                        });
+                        let _ = document::eval(&format!(
+                            "(function() {{
+                                const input = document.getElementById({SEARCH_INPUT_ID:?});
+                                if (input && input.blur) input.blur();
+                            }})();"
+                        ));
+                        return;
+                    }
+                }
+                if !is_accel && matches!(evt.key(), Key::Character(ref key) if key == "[" || key == "]") {
+                    let has_search = !state.read().search_query.trim().is_empty();
+                    if has_search {
+                        evt.prevent_default();
+                        let step = if matches!(evt.key(), Key::Character(ref key) if key == "[") {
+                            -1
+                        } else {
+                            1
+                        };
+                        if let Some(row) = state.with_mut(|shell| shell.next_search_sidebar_row(step)) {
+                            spawn_open_session_row(state, row);
+                        }
+                        return;
+                    }
+                }
                 if evt.key() == Key::Delete && state.read().tree_rename_path.is_none() {
                     evt.prevent_default();
                     queue_delete_selected_items(state, false);
@@ -7408,28 +7612,66 @@ fn app() -> Element {
                     on_toggle_sidebar: move || state.with_mut(|shell| shell.toggle_sidebar()),
                     on_search: move |value: String| state.with_mut(|shell| shell.set_search(value)),
                     on_set_search_focus: move |focused: bool| state.with_mut(|shell| shell.set_search_focus(focused)),
-                    on_prev_search_content: move |_| {
+                            on_prev_search_content: move |_| {
                         if let Some(dom_id) = state.with_mut(|shell| shell.next_search_content_dom_id(-1)) {
-                            let _ = document::eval(&format!(
-                                "(function() {{
-                                    const el = document.getElementById({dom_id:?});
-                                    if (el) {{
-                                        el.scrollIntoView({{ block: 'center', inline: 'nearest', behavior: 'smooth' }});
-                                    }}
-                                }})();"
-                            ));
+                            if let Some(line_index) = dom_id.strip_prefix("__terminal_line__:") {
+                                let host_id = state
+                                    .read()
+                                    .server
+                                    .active_session()
+                                    .map(|session| terminal_host_id(&session.session_path));
+                                if let (Some(host_id), Ok(line_index)) = (host_id, line_index.parse::<usize>()) {
+                                    let _ = document::eval(&format!(
+                                        "(function() {{
+                                            const registry = window.__yggtermXtermHosts || {{}};
+                                            const entry = registry[{host_id:?}];
+                                            if (!entry || !entry.term) return;
+                                            const target = Math.max(0, {line_index} - Math.floor((entry.term.rows || 1) / 2));
+                                            try {{ entry.term.scrollToLine(target); }} catch (_error) {{}}
+                                        }})();"
+                                    ));
+                                }
+                            } else {
+                                let _ = document::eval(&format!(
+                                    "(function() {{
+                                        const el = document.getElementById({dom_id:?});
+                                        if (el) {{
+                                            el.scrollIntoView({{ block: 'center', inline: 'nearest', behavior: 'smooth' }});
+                                        }}
+                                    }})();"
+                                ));
+                            }
                         }
                     },
                     on_next_search_content: move |_| {
                         if let Some(dom_id) = state.with_mut(|shell| shell.next_search_content_dom_id(1)) {
-                            let _ = document::eval(&format!(
-                                "(function() {{
-                                    const el = document.getElementById({dom_id:?});
-                                    if (el) {{
-                                        el.scrollIntoView({{ block: 'center', inline: 'nearest', behavior: 'smooth' }});
-                                    }}
-                                }})();"
-                            ));
+                            if let Some(line_index) = dom_id.strip_prefix("__terminal_line__:") {
+                                let host_id = state
+                                    .read()
+                                    .server
+                                    .active_session()
+                                    .map(|session| terminal_host_id(&session.session_path));
+                                if let (Some(host_id), Ok(line_index)) = (host_id, line_index.parse::<usize>()) {
+                                    let _ = document::eval(&format!(
+                                        "(function() {{
+                                            const registry = window.__yggtermXtermHosts || {{}};
+                                            const entry = registry[{host_id:?}];
+                                            if (!entry || !entry.term) return;
+                                            const target = Math.max(0, {line_index} - Math.floor((entry.term.rows || 1) / 2));
+                                            try {{ entry.term.scrollToLine(target); }} catch (_error) {{}}
+                                        }})();"
+                                    ));
+                                }
+                            } else {
+                                let _ = document::eval(&format!(
+                                    "(function() {{
+                                        const el = document.getElementById({dom_id:?});
+                                        if (el) {{
+                                            el.scrollIntoView({{ block: 'center', inline: 'nearest', behavior: 'smooth' }});
+                                        }}
+                                    }})();"
+                                ));
+                            }
                         }
                     },
                     on_hover_control: move |control: Option<HoveredControl>| hovered.set(control),
@@ -7880,7 +8122,12 @@ fn Titlebar(
                                 onblur: move |_| on_set_search_focus.call(false),
                                 oninput: move |evt| on_search.call(evt.value()),
                             }
-                            if snapshot.search_active && snapshot.active_view_mode == WorkspaceViewMode::Rendered {
+                            if snapshot.search_active
+                                && matches!(
+                                    snapshot.active_view_mode,
+                                    WorkspaceViewMode::Rendered | WorkspaceViewMode::Terminal
+                                )
+                            {
                                 button {
                                     title: "Previous search hit",
                                     style: chip_style(snapshot.palette, false),
@@ -8139,6 +8386,15 @@ fn Sidebar(
                         } else {
                             "Sidebar 0/0"
                         }
+                    }
+                }
+            }
+            if snapshot.sidebar_loading && !snapshot.show_loading_tree {
+                div {
+                    style: "padding:8px 12px 0 12px; display:flex; justify-content:flex-start;",
+                    LoadingStateChip {
+                        label: "Refreshing tree…".to_string(),
+                        palette: snapshot.palette,
                     }
                 }
             }
@@ -8905,6 +9161,9 @@ fn MainSurface(
                                         subtitle: preview_header_summary(&snapshot, &session),
                                         allow_subtitle_scroll: true,
                                         palette: snapshot.palette,
+                                        loading_label: snapshot
+                                            .preview_loading
+                                            .then_some("Refreshing preview…".to_string()),
                                         on_refresh_title: move |_| on_refresh_title.call(()),
                                         on_refresh_subtitle: move |_| on_refresh_summary.call(()),
                                     }
@@ -8912,6 +9171,7 @@ fn MainSurface(
                                 PreviewToolbar {
                                     palette: snapshot.palette,
                                     preview_layout: snapshot.preview_layout,
+                                    preview_loading: snapshot.preview_loading,
                                     server_busy: snapshot.server_busy,
                                     on_expand_preview: move |_| on_expand_preview.call(()),
                                     on_collapse_preview: move |_| on_collapse_preview.call(()),
@@ -8986,6 +9246,9 @@ fn MainSurface(
                                 .unwrap_or_else(|| terminal_precis(&session)),
                             allow_subtitle_scroll: true,
                             palette: snapshot.palette,
+                            loading_label: snapshot
+                                .terminal_loading
+                                .then_some("Resuming terminal…".to_string()),
                             on_refresh_title: move |_| on_refresh_title.call(()),
                             on_refresh_subtitle: move |_| on_refresh_precis.call(()),
                         }
@@ -9038,6 +9301,7 @@ fn SessionHeaderCopy(
     subtitle: String,
     allow_subtitle_scroll: bool,
     palette: Palette,
+    loading_label: Option<String>,
     on_refresh_title: EventHandler<MouseEvent>,
     on_refresh_subtitle: EventHandler<MouseEvent>,
 ) -> Element {
@@ -9064,6 +9328,12 @@ fn SessionHeaderCopy(
                         div {
                             style: format!("font-size:22px; font-weight:700; color:{}; line-height:1.2; min-width:0;", palette.text),
                             "{title}"
+                        }
+                        if let Some(loading_label) = loading_label.clone() {
+                            LoadingStateChip {
+                                label: loading_label,
+                                palette,
+                            }
                         }
                         RefreshInlineButton {
                             label: "Regenerate title".to_string(),
@@ -9152,6 +9422,7 @@ fn IconToggleButton(
 fn PreviewToolbar(
     palette: Palette,
     preview_layout: PreviewLayoutMode,
+    preview_loading: bool,
     server_busy: bool,
     on_expand_preview: EventHandler<MouseEvent>,
     on_collapse_preview: EventHandler<MouseEvent>,
@@ -9179,6 +9450,12 @@ fn PreviewToolbar(
             }
             div {
                 style: "display:flex; justify-content:flex-end; gap:8px;",
+                if preview_loading {
+                    LoadingStateChip {
+                        label: "Refreshing…".to_string(),
+                        palette,
+                    }
+                }
                 button {
                     style: chip_style(palette, server_busy),
                     onclick: move |evt| on_expand_preview.call(evt),
@@ -9190,6 +9467,27 @@ fn PreviewToolbar(
                     "Collapse All"
                 }
             }
+        }
+    }
+}
+
+#[component]
+fn LoadingStateChip(label: String, palette: Palette) -> Element {
+    rsx! {
+        div {
+            style: format!(
+                "display:inline-flex; align-items:center; gap:7px; padding:6px 10px; border-radius:999px; \
+                 background:rgba(255,255,255,0.72); color:{}; font-size:11px; font-weight:700; \
+                 box-shadow: inset 0 0 0 1px rgba(170,190,212,0.18); white-space:nowrap;",
+                palette.muted
+            ),
+            div {
+                style: format!(
+                    "width:7px; height:7px; border-radius:999px; background:{}; opacity:0.9; animation:yggterm-tree-loading-dot 1.05s ease-in-out infinite;",
+                    palette.accent
+                )
+            }
+            "{label}"
         }
     }
 }
@@ -14159,6 +14457,121 @@ mod tests {
             compressed_remote_folder_paths(&machine, "/run/smb4k/data/smbfs/dada/obsidian/codex"),
             vec!["/run/smb4k/data/smbfs/dada/obsidian/codex".to_string()]
         );
+    }
+
+    #[test]
+    fn search_terms_support_quoted_phrases() {
+        assert_eq!(
+            search_terms(r#"excel "shortcut design" legal"#),
+            vec![
+                "excel".to_string(),
+                "shortcut design".to_string(),
+                "legal".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn filtered_sidebar_rows_keep_matching_ancestors() {
+        let rows = vec![
+            BrowserRow {
+                kind: BrowserRowKind::Group,
+                full_path: "__remote_machine__/oc".to_string(),
+                label: "oc [ok]".to_string(),
+                detail_label: String::new(),
+                document_kind: None,
+                group_kind: None,
+                session_title: None,
+                depth: 0,
+                host_label: String::new(),
+                descendant_sessions: 2,
+                expanded: true,
+                session_id: None,
+                session_cwd: None,
+            },
+            BrowserRow {
+                kind: BrowserRowKind::Group,
+                full_path: "__remote_folder__/oc/home/pi".to_string(),
+                label: "/home/pi".to_string(),
+                detail_label: String::new(),
+                document_kind: None,
+                group_kind: None,
+                session_title: None,
+                depth: 1,
+                host_label: String::new(),
+                descendant_sessions: 2,
+                expanded: true,
+                session_id: None,
+                session_cwd: None,
+            },
+            BrowserRow {
+                kind: BrowserRowKind::Session,
+                full_path: "remote-session://oc/1".to_string(),
+                label: "Excel Shortcut Design".to_string(),
+                detail_label: "Q123456 · ~/gh/excel-inspired".to_string(),
+                document_kind: None,
+                group_kind: None,
+                session_title: Some("Excel Shortcut Design".to_string()),
+                depth: 2,
+                host_label: "oc".to_string(),
+                descendant_sessions: 0,
+                expanded: true,
+                session_id: Some("019cf672-8d68-70a1-bd8b-68487c4fc63d".to_string()),
+                session_cwd: Some("/home/pi/gh/excel-inspired".to_string()),
+            },
+            BrowserRow {
+                kind: BrowserRowKind::Session,
+                full_path: "remote-session://oc/2".to_string(),
+                label: "Timezone Host".to_string(),
+                detail_label: "Qabcdef0 · ~/gh/yggterm".to_string(),
+                document_kind: None,
+                group_kind: None,
+                session_title: Some("Timezone Host".to_string()),
+                depth: 2,
+                host_label: "oc".to_string(),
+                descendant_sessions: 0,
+                expanded: true,
+                session_id: Some("019caaaa-8d68-70a1-bd8b-68487c4fc63d".to_string()),
+                session_cwd: Some("/home/pi/gh/yggterm".to_string()),
+            },
+        ];
+
+        let filtered = filtered_sidebar_rows(&rows, "excel design");
+        let filtered_paths = filtered
+            .iter()
+            .map(|row| row.full_path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            filtered_paths,
+            vec![
+                "__remote_machine__/oc",
+                "__remote_folder__/oc/home/pi",
+                "remote-session://oc/1",
+            ]
+        );
+    }
+
+    #[test]
+    fn search_sidebar_matches_hash_and_path_terms() {
+        let rows = vec![BrowserRow {
+            kind: BrowserRowKind::Session,
+            full_path: "remote-session://oc/1".to_string(),
+            label: "Excel Shortcut Design".to_string(),
+            detail_label: "Q4fc63d · ~/gh/excel-inspired".to_string(),
+            document_kind: None,
+            group_kind: None,
+            session_title: Some("Excel Shortcut Design".to_string()),
+            depth: 2,
+            host_label: "oc".to_string(),
+            descendant_sessions: 0,
+            expanded: true,
+            session_id: Some("019cf672-8d68-70a1-bd8b-68487c4fc63d".to_string()),
+            session_cwd: Some("/home/pi/gh/excel-inspired".to_string()),
+        }];
+
+        assert_eq!(search_sidebar_matches(&rows, "q4fc63d").len(), 1);
+        assert_eq!(search_sidebar_matches(&rows, "\"excel shortcut\" gh/excel").len(), 1);
+        assert!(search_sidebar_matches(&rows, "timezone").is_empty());
     }
 }
 
