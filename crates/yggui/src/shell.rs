@@ -3777,6 +3777,7 @@ fn resolved_session_precis(shell: &ShellState, session: &ManagedSessionView) -> 
             remote_generated_copy(&shell.server, &session.session_path)
                 .and_then(|(_, precis, _)| precis)
         })
+        .or_else(|| preview_summary_metadata_value(session, "Precis"))
         .filter(|precis| !looks_like_low_signal_generated_copy(precis))
 }
 
@@ -3789,7 +3790,18 @@ fn resolved_session_summary(shell: &ShellState, session: &ManagedSessionView) ->
             remote_generated_copy(&shell.server, &session.session_path)
                 .and_then(|(_, _, summary)| summary)
         })
+        .or_else(|| preview_summary_metadata_value(session, "Summary"))
         .filter(|summary| !looks_like_low_signal_generated_copy(summary))
+}
+
+fn preview_summary_metadata_value(session: &ManagedSessionView, label: &str) -> Option<String> {
+    session
+        .preview
+        .summary
+        .iter()
+        .find(|entry| entry.label == label)
+        .map(|entry| entry.value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn looks_like_truncated_summary(summary: &str) -> bool {
@@ -3834,6 +3846,51 @@ fn preview_rendered_sections(session: &ManagedSessionView) -> Vec<SessionRendere
     } else {
         filtered
     }
+}
+
+fn preview_block_text(block: &SessionPreviewBlock) -> String {
+    block.lines
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlock> {
+    let mut visible = session
+        .preview
+        .blocks
+        .iter()
+        .filter(|block| {
+            let compact = preview_block_text(block);
+            if compact.is_empty() {
+                return false;
+            }
+            let lower = compact.to_ascii_lowercase();
+            if lower.len() > 40
+                && (lower.contains("<permissions instructions>")
+                    || lower.contains("filesystem sandboxing")
+                    || lower.contains("request_user_input")
+                    || lower.contains("collaboration mode:")
+                    || lower.contains("<collaboration_mode>")
+                    || lower.contains("environment_context")
+                    || lower.contains("current_date>")
+                    || lower.contains("while commands are running inside the sandbox")
+                    || lower.contains("how to request escalation")
+                    || lower.contains("prefix_rule guidance"))
+            {
+                return false;
+            }
+            true
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if visible.is_empty() {
+        visible = session.preview.blocks.clone();
+    }
+    visible
 }
 
 fn remote_machine_for_session_path(
@@ -8133,6 +8190,7 @@ fn MainSurface(
                         }
                     }
                 } else {
+                    let visible_blocks = visible_preview_blocks(&session);
                     rsx! {
                         div {
                             style: "display:flex; flex-direction:column; min-width:0; min-height:0; width:100%; height:100%;",
@@ -8174,7 +8232,7 @@ fn MainSurface(
                                                 palette: snapshot.palette,
                                             }
                                         }
-                                        for (ix, block) in session.preview.blocks.iter().cloned().enumerate() {
+                                        for (ix, block) in visible_blocks.iter().cloned().enumerate() {
                                             PreviewBlock {
                                                 block_ix: ix,
                                                 block: block.clone(),
@@ -8188,6 +8246,7 @@ fn MainSurface(
                                         style: "width:min(980px, 100%); margin:0 auto;",
                                         PreviewGraph {
                                             session: session.clone(),
+                                            visible_blocks: visible_blocks.clone(),
                                             palette: snapshot.palette,
                                         }
                                     }
@@ -8634,7 +8693,11 @@ fn build_document_input(
 }
 
 #[component]
-fn PreviewGraph(session: ManagedSessionView, palette: Palette) -> Element {
+fn PreviewGraph(
+    session: ManagedSessionView,
+    visible_blocks: Vec<SessionPreviewBlock>,
+    palette: Palette,
+) -> Element {
     let summary_entries = session
         .preview
         .summary
@@ -8648,9 +8711,7 @@ fn PreviewGraph(session: ManagedSessionView, palette: Palette) -> Element {
         .take(4)
         .cloned()
         .collect::<Vec<_>>();
-    let timeline_excerpt = session
-        .preview
-        .blocks
+    let timeline_excerpt = visible_blocks
         .iter()
         .rev()
         .find_map(|block| preview_block_excerpt(block, 140))
@@ -8719,7 +8780,7 @@ fn PreviewGraph(session: ManagedSessionView, palette: Palette) -> Element {
             }
             div {
                 style: "display:flex; flex-direction:column; gap:14px; padding-top:2px;",
-                for (ix, block) in session.preview.blocks.iter().enumerate() {
+                for (ix, block) in visible_blocks.iter().enumerate() {
                 div {
                     style: "display:grid; grid-template-columns:56px 1fr; gap:18px; align-items:flex-start;",
                     div {
@@ -8733,7 +8794,7 @@ fn PreviewGraph(session: ManagedSessionView, palette: Palette) -> Element {
                             ),
                             {if block.tone == PreviewTone::User { "U" } else { "A" }}
                         }
-                        if ix + 1 != session.preview.blocks.len() {
+                        if ix + 1 != visible_blocks.len() {
                             div {
                                 style: "width:2px; min-height:54px; border-radius:999px; background:linear-gradient(180deg, rgba(120,153,189,0.42) 0%, rgba(120,153,189,0.08) 100%);"
                             }
@@ -8868,6 +8929,17 @@ fn OverviewStatCard(label: String, value: String, palette: Palette) -> Element {
 }
 
 fn preview_summary_text(session: &ManagedSessionView) -> String {
+    if let Some(summary) = preview_summary_metadata_value(session, "Summary")
+        .filter(|value| !looks_like_low_signal_generated_copy(value))
+    {
+        return summary;
+    }
+    if let Some(precis) = preview_summary_metadata_value(session, "Precis")
+        .filter(|value| !looks_like_low_signal_generated_copy(value))
+    {
+        return precis;
+    }
+
     let mut candidates = session
         .preview
         .summary
@@ -8932,6 +9004,11 @@ fn preview_summary_text(session: &ManagedSessionView) -> String {
 }
 
 fn terminal_precis(session: &ManagedSessionView) -> String {
+    if let Some(precis) = preview_summary_metadata_value(session, "Precis")
+        .filter(|value| !looks_like_low_signal_generated_copy(value))
+    {
+        return precis;
+    }
     let mut candidates = Vec::new();
     for block in &session.preview.blocks {
         for line in &block.lines {
