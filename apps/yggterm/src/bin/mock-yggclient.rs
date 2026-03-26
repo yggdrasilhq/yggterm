@@ -4,6 +4,8 @@ use std::env;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
+use std::thread::sleep;
+use std::time::Duration;
 use std::time::Instant;
 use yggterm_core::resolve_yggterm_home;
 use yggterm_server::{
@@ -36,6 +38,8 @@ struct Config {
     iterations: usize,
     jsonl_out: Option<PathBuf>,
     slow_notice_ms: u64,
+    delay_ms: u64,
+    progress_step_ms: u64,
 }
 
 fn main() -> Result<()> {
@@ -54,6 +58,8 @@ fn parse_args(args: Vec<String>) -> Result<Config> {
     let mut iterations = 1usize;
     let mut jsonl_out = None::<PathBuf>;
     let mut slow_notice_ms = YGG_LOADING_NOTIFICATION_AFTER_MS;
+    let mut delay_ms = 0_u64;
+    let mut progress_step_ms = 500_u64;
 
     let mut ix = 0usize;
     while ix < args.len() {
@@ -91,6 +97,22 @@ fn parse_args(args: Vec<String>) -> Result<Config> {
                     .parse()
                     .context("invalid --slow-notice-ms value")?;
             }
+            "--delay-ms" => {
+                ix += 1;
+                delay_ms = args
+                    .get(ix)
+                    .context("missing value after --delay-ms")?
+                    .parse()
+                    .context("invalid --delay-ms value")?;
+            }
+            "--progress-step-ms" => {
+                ix += 1;
+                progress_step_ms = args
+                    .get(ix)
+                    .context("missing value after --progress-step-ms")?
+                    .parse()
+                    .context("invalid --progress-step-ms value")?;
+            }
             other => bail!("unknown argument: {other}"),
         }
         ix += 1;
@@ -101,6 +123,8 @@ fn parse_args(args: Vec<String>) -> Result<Config> {
         iterations,
         jsonl_out,
         slow_notice_ms,
+        delay_ms,
+        progress_step_ms,
     })
 }
 
@@ -134,6 +158,8 @@ fn run_scenario(
                 message: Some("sending request".to_string()),
             }),
     )?;
+
+    maybe_emit_artificial_delay(cfg, &meta)?;
 
     let result: Result<serde_json::Value> = match cfg.scenario {
         Scenario::Startup => {
@@ -201,6 +227,41 @@ fn run_scenario(
                 .with_message(error.to_string()),
         ),
     }
+}
+
+fn maybe_emit_artificial_delay(cfg: &Config, meta: &YggRequestMeta) -> Result<()> {
+    if cfg.delay_ms == 0 {
+        return Ok(());
+    }
+
+    let total_steps = if cfg.progress_step_ms == 0 {
+        1
+    } else {
+        cfg.delay_ms.div_ceil(cfg.progress_step_ms)
+    };
+    let mut elapsed = 0_u64;
+    let step_ms = cfg.progress_step_ms.max(1);
+
+    while elapsed < cfg.delay_ms {
+        let sleep_ms = (cfg.delay_ms - elapsed).min(step_ms);
+        sleep(Duration::from_millis(sleep_ms));
+        elapsed += sleep_ms;
+
+        emit(
+            cfg,
+            YggEventEnvelope::new(meta.clone(), YggEventKind::Progress)
+                .with_elapsed_ms(elapsed)
+                .with_message("artificial latency injection")
+                .with_progress(YggProgress {
+                    step: "delayed".to_string(),
+                    current: Some(elapsed.div_ceil(step_ms)),
+                    total: Some(total_steps),
+                    message: Some(format!("simulating a slow server path for {}ms", cfg.delay_ms)),
+                }),
+        )?;
+    }
+
+    Ok(())
 }
 
 fn emit(cfg: &Config, event: YggEventEnvelope) -> Result<()> {
