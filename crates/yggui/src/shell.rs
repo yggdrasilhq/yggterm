@@ -97,6 +97,7 @@ const BACKGROUND_COPY_RETRY_MS: u64 = 300_000;
 const BACKGROUND_COPY_CONTINUE_MS: u64 = 15_000;
 const BACKGROUND_COPY_IDLE_MS: u64 = 120_000;
 const THEME_EDITOR_PAD_SIZE: f64 = 286.0;
+const SEARCH_INPUT_ID: &str = "yggterm-search-input";
 type WorkspaceReorderPlanItem = TreeReorderPlanItem<BrowserRowKind>;
 
 #[derive(Debug, Clone)]
@@ -132,6 +133,9 @@ struct ShellState {
     server: YggtermServer,
     settings: AppSettings,
     search_query: String,
+    search_focused: bool,
+    search_sidebar_match_index: Option<usize>,
+    search_content_match_index: Option<usize>,
     sidebar_open: bool,
     right_panel_mode: RightPanelMode,
     last_action: String,
@@ -229,6 +233,12 @@ struct PendingDeleteDialog {
 struct RenderSnapshot {
     palette: Palette,
     search_query: String,
+    search_active: bool,
+    search_focused: bool,
+    search_sidebar_matches: Vec<BrowserRow>,
+    search_sidebar_match_index: Option<usize>,
+    search_content_hits: Vec<SearchContentHit>,
+    search_content_hit_index: Option<usize>,
     sidebar_open: bool,
     right_panel_mode: RightPanelMode,
     rows: Vec<BrowserRow>,
@@ -419,6 +429,12 @@ struct PreviewRunEntry {
     display_timestamp: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchContentHit {
+    dom_id: String,
+    label: String,
+}
+
 #[derive(Default)]
 struct PreviewContentCache {
     order: VecDeque<u64>,
@@ -474,6 +490,9 @@ impl ShellState {
             browser,
             server,
             search_query: String::new(),
+            search_focused: false,
+            search_sidebar_match_index: None,
+            search_content_match_index: None,
             sidebar_open,
             right_panel_mode,
             last_action: "ready".to_string(),
@@ -573,6 +592,7 @@ impl ShellState {
             &live_sessions,
             &expanded_paths,
         );
+        let search_sidebar_matches = search_sidebar_matches(&rows, &self.search_query);
         let selected_path = if let Some(active) = self.server.active_session() {
             if active.source == yggterm_server::SessionSource::LiveSsh
                 || active.session_path.starts_with("remote-session://")
@@ -594,10 +614,24 @@ impl ShellState {
         let active_summary = active_session
             .as_ref()
             .and_then(|session| resolved_session_summary(self, session));
+        let search_content_hits =
+            search_content_hits(active_session.as_ref(), self.server.active_view_mode(), &self.search_query);
+        let search_sidebar_match_index = clamp_search_index(
+            self.search_sidebar_match_index,
+            search_sidebar_matches.len(),
+        );
+        let search_content_hit_index =
+            clamp_search_index(self.search_content_match_index, search_content_hits.len());
 
         RenderSnapshot {
             palette: palette,
             search_query: self.search_query.clone(),
+            search_active: !self.search_query.trim().is_empty(),
+            search_focused: self.search_focused,
+            search_sidebar_matches,
+            search_sidebar_match_index,
+            search_content_hits,
+            search_content_hit_index,
             sidebar_open: self.sidebar_open,
             right_panel_mode: self.right_panel_mode,
             rows,
@@ -651,12 +685,77 @@ impl ShellState {
 
     fn set_search(&mut self, query: String) {
         self.search_query = query;
-        self.browser.set_filter_query(self.search_query.clone());
+        self.search_sidebar_match_index = None;
+        self.search_content_match_index = None;
+        let trimmed = self.search_query.trim();
+        self.browser.set_filter_query(if trimmed.starts_with('/') {
+            String::new()
+        } else {
+            self.search_query.clone()
+        });
         self.last_action = if self.search_query.is_empty() {
             "search cleared".to_string()
+        } else if trimmed.starts_with('/') {
+            "search command mode".to_string()
         } else {
             format!("filtered {}", self.search_query)
         };
+    }
+
+    fn set_search_focus(&mut self, focused: bool) {
+        self.search_focused = focused;
+    }
+
+    fn next_search_sidebar_row(&mut self, step: isize) -> Option<BrowserRow> {
+        let rows = self.current_search_sidebar_matches();
+        if rows.is_empty() {
+            return None;
+        }
+        let current = self
+            .search_sidebar_match_index
+            .or_else(|| {
+                let selected = self.selected_tree_paths.iter().next()?;
+                rows.iter().position(|row| row.full_path == *selected)
+            })
+            .unwrap_or(0);
+        let len = rows.len() as isize;
+        let next = (current as isize + step).rem_euclid(len) as usize;
+        self.search_sidebar_match_index = Some(next);
+        let row = rows[next].clone();
+        self.select_tree_row(&row, TreeSelectionMode::Replace);
+        self.last_action = format!("search result {}/{}", next + 1, rows.len());
+        Some(row)
+    }
+
+    fn next_search_content_dom_id(&mut self, step: isize) -> Option<String> {
+        let hits = search_content_hits(
+            self.server.active_session(),
+            self.server.active_view_mode(),
+            &self.search_query,
+        );
+        if hits.is_empty() {
+            return None;
+        }
+        let current = self.search_content_match_index.unwrap_or(0);
+        let len = hits.len() as isize;
+        let next = (current as isize + step).rem_euclid(len) as usize;
+        self.search_content_match_index = Some(next);
+        self.last_action = format!("content hit {}/{}", next + 1, hits.len());
+        Some(hits[next].dom_id.clone())
+    }
+
+    fn current_search_sidebar_matches(&self) -> Vec<BrowserRow> {
+        let mut expanded_paths = self.browser.expanded_path_set();
+        expanded_paths.extend(self.active_session_visibility_paths());
+        let live_sessions = self.server.live_sessions();
+        let rows = merged_sidebar_rows(
+            self.browser.rows(),
+            self.server.remote_machines(),
+            self.server.ssh_targets(),
+            &live_sessions,
+            &expanded_paths,
+        );
+        search_sidebar_matches(&rows, &self.search_query)
     }
 
     fn toggle_sidebar(&mut self) {
@@ -4106,6 +4205,93 @@ fn group_preview_runs(blocks: &[SessionPreviewBlock], start_index: usize) -> Vec
     runs
 }
 
+fn clamp_search_index(index: Option<usize>, len: usize) -> Option<usize> {
+    if len == 0 {
+        None
+    } else {
+        Some(index.unwrap_or(0).min(len.saturating_sub(1)))
+    }
+}
+
+fn search_sidebar_matches(rows: &[BrowserRow], query: &str) -> Vec<BrowserRow> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() || trimmed.starts_with('/') {
+        return Vec::new();
+    }
+    rows.iter()
+        .filter(|row| matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document))
+        .cloned()
+        .collect()
+}
+
+fn content_search_query(query: &str) -> Option<String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() || trimmed.starts_with('/') {
+        None
+    } else {
+        Some(trimmed.to_ascii_lowercase())
+    }
+}
+
+fn search_content_hits(
+    session: Option<&ManagedSessionView>,
+    view_mode: WorkspaceViewMode,
+    query: &str,
+) -> Vec<SearchContentHit> {
+    let Some(session) = session else {
+        return Vec::new();
+    };
+    let Some(query) = content_search_query(query) else {
+        return Vec::new();
+    };
+    match view_mode {
+        WorkspaceViewMode::Rendered => {
+            let mut hits = Vec::new();
+            for (ix, block) in visible_preview_blocks(session).iter().enumerate() {
+                let haystack = block.lines.join("\n").to_ascii_lowercase();
+                if haystack.contains(&query) {
+                    hits.push(SearchContentHit {
+                        dom_id: preview_block_dom_id(&session.id, ix),
+                        label: block.timestamp.clone(),
+                    });
+                }
+            }
+            hits
+        }
+        WorkspaceViewMode::Terminal => session
+            .terminal_lines
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, line)| {
+                if line.to_ascii_lowercase().contains(&query) {
+                    Some(SearchContentHit {
+                        dom_id: format!("terminal-line-{}-{ix}", sanitize_dom_id(&session.id)),
+                        label: format!("Line {}", ix + 1),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect(),
+    }
+}
+
+fn preview_block_dom_id(session_id: &str, ix: usize) -> String {
+    format!("preview-block-{}-{ix}", sanitize_dom_id(session_id))
+}
+
+fn sanitize_dom_id(value: &str) -> String {
+    value.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
 fn format_preview_timestamp_label(
     raw: &str,
     last_date_key: &mut Option<(i32, u8, u8)>,
@@ -6908,6 +7094,25 @@ fn app() -> Element {
         ));
     });
     use_effect(move || {
+        let target_dom_id = {
+            let snapshot = state.read().snapshot();
+            snapshot
+                .search_content_hit_index
+                .and_then(|ix| snapshot.search_content_hits.get(ix).map(|hit| hit.dom_id.clone()))
+        };
+        let Some(dom_id) = target_dom_id else {
+            return;
+        };
+        let _ = document::eval(&format!(
+            "(function() {{
+                const el = document.getElementById({dom_id:?});
+                if (el) {{
+                    el.scrollIntoView({{ block: 'center', inline: 'nearest', behavior: 'smooth' }});
+                }}
+            }})();"
+        ));
+    });
+    use_effect(move || {
         let (selected_row, active_session_path, server_busy) = {
             let shell = state.read();
             (
@@ -7042,13 +7247,29 @@ fn app() -> Element {
                 }
             },
             onkeydown: move |evt| {
+                let is_accel = evt.modifiers().contains(Modifiers::CONTROL)
+                    || evt.modifiers().contains(Modifiers::META);
+                if is_accel
+                    && evt.modifiers().contains(Modifiers::SHIFT)
+                    && matches!(evt.key(), Key::Character(ref key) if key.eq_ignore_ascii_case("p"))
+                {
+                    evt.prevent_default();
+                    let _ = document::eval(&format!(
+                        "(function() {{
+                            const input = document.getElementById({SEARCH_INPUT_ID:?});
+                            if (input) {{
+                                input.focus();
+                                if (input.select) input.select();
+                            }}
+                        }})();"
+                    ));
+                    return;
+                }
                 if evt.key() == Key::Delete && state.read().tree_rename_path.is_none() {
                     evt.prevent_default();
                     queue_delete_selected_items(state, false);
                     return;
                 }
-                let is_accel = evt.modifiers().contains(Modifiers::CONTROL)
-                    || evt.modifiers().contains(Modifiers::META);
                 let is_terminal_shortcut = is_accel
                     && evt.modifiers().contains(Modifiers::SHIFT)
                     && matches!(evt.key(), Key::Character(ref key) if key.eq_ignore_ascii_case("c") || key.eq_ignore_ascii_case("x"));
@@ -7087,6 +7308,31 @@ fn app() -> Element {
                     hovered: hovered,
                     on_toggle_sidebar: move || state.with_mut(|shell| shell.toggle_sidebar()),
                     on_search: move |value: String| state.with_mut(|shell| shell.set_search(value)),
+                    on_set_search_focus: move |focused: bool| state.with_mut(|shell| shell.set_search_focus(focused)),
+                    on_prev_search_content: move |_| {
+                        if let Some(dom_id) = state.with_mut(|shell| shell.next_search_content_dom_id(-1)) {
+                            let _ = document::eval(&format!(
+                                "(function() {{
+                                    const el = document.getElementById({dom_id:?});
+                                    if (el) {{
+                                        el.scrollIntoView({{ block: 'center', inline: 'nearest', behavior: 'smooth' }});
+                                    }}
+                                }})();"
+                            ));
+                        }
+                    },
+                    on_next_search_content: move |_| {
+                        if let Some(dom_id) = state.with_mut(|shell| shell.next_search_content_dom_id(1)) {
+                            let _ = document::eval(&format!(
+                                "(function() {{
+                                    const el = document.getElementById({dom_id:?});
+                                    if (el) {{
+                                        el.scrollIntoView({{ block: 'center', inline: 'nearest', behavior: 'smooth' }});
+                                    }}
+                                }})();"
+                            ));
+                        }
+                    },
                     on_hover_control: move |control: Option<HoveredControl>| hovered.set(control),
                     on_set_view_mode: move |mode: WorkspaceViewMode| spawn_set_view_mode(state, mode),
                     on_toggle_meta: move || state.with_mut(|shell| shell.toggle_metadata_panel()),
@@ -7113,6 +7359,16 @@ fn app() -> Element {
                             move |endpoint| start_local_session(&endpoint, SessionKind::Shell),
                         ),
                         on_create_paper: move |_| queue_new_document(state),
+                        on_prev_search_row: move |_| {
+                            if let Some(row) = state.with_mut(|shell| shell.next_search_sidebar_row(-1)) {
+                                spawn_open_session_row(state, row);
+                            }
+                        },
+                        on_next_search_row: move |_| {
+                            if let Some(row) = state.with_mut(|shell| shell.next_search_sidebar_row(1)) {
+                                spawn_open_session_row(state, row);
+                            }
+                        },
                         on_select_row: move |(row, mode): (BrowserRow, TreeSelectionMode)| {
                             let row_for_log = row.clone();
                             if let Err(error) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -7451,6 +7707,9 @@ fn Titlebar(
     hovered: Signal<Option<HoveredControl>>,
     on_toggle_sidebar: EventHandler<()>,
     on_search: EventHandler<String>,
+    on_set_search_focus: EventHandler<bool>,
+    on_prev_search_content: EventHandler<()>,
+    on_next_search_content: EventHandler<()>,
     on_hover_control: EventHandler<Option<HoveredControl>>,
     on_set_view_mode: EventHandler<WorkspaceViewMode>,
     on_toggle_meta: EventHandler<()>,
@@ -7506,14 +7765,51 @@ fn Titlebar(
                 div {
                     style: "flex:1; display:flex; align-items:center; justify-content:center; gap:10px; padding:0 16px;",
                     div { style: "flex:1; min-width:84px; height:100%;" }
-                    input {
-                        r#type: "text",
-                        value: "{snapshot.search_query}",
-                        placeholder: "Search sessions…",
-                        style: search_input_style(snapshot.palette.text),
-                        onmousedown: |evt| evt.stop_propagation(),
-                        ondoubleclick: |evt| evt.stop_propagation(),
-                        oninput: move |evt| on_search.call(evt.value()),
+                    div {
+                        style: "display:flex; flex-direction:column; align-items:stretch; gap:4px; flex:1; max-width:520px; min-width:220px;",
+                        div {
+                            style: "display:flex; align-items:center; gap:8px;",
+                            input {
+                                id: SEARCH_INPUT_ID,
+                                r#type: "text",
+                                value: "{snapshot.search_query}",
+                                placeholder: "Search sessions…",
+                                style: search_input_style(snapshot.palette.text),
+                                onmousedown: |evt| evt.stop_propagation(),
+                                ondoubleclick: |evt| evt.stop_propagation(),
+                                onfocus: move |_| on_set_search_focus.call(true),
+                                onblur: move |_| on_set_search_focus.call(false),
+                                oninput: move |evt| on_search.call(evt.value()),
+                            }
+                            if snapshot.search_active && snapshot.active_view_mode == WorkspaceViewMode::Rendered {
+                                button {
+                                    title: "Previous search hit",
+                                    style: chip_style(snapshot.palette, false),
+                                    onclick: move |_| on_prev_search_content.call(()),
+                                    "↑"
+                                }
+                                button {
+                                    title: "Next search hit",
+                                    style: chip_style(snapshot.palette, false),
+                                    onclick: move |_| on_next_search_content.call(()),
+                                    "↓"
+                                }
+                                div {
+                                    style: format!("font-size:11px; color:{}; min-width:62px; text-align:right;", snapshot.palette.muted),
+                                    if let Some(ix) = snapshot.search_content_hit_index {
+                                        {format!("{}/{}", ix + 1, snapshot.search_content_hits.len())}
+                                    } else {
+                                        "0/0"
+                                    }
+                                }
+                            }
+                        }
+                        if snapshot.search_focused || snapshot.search_active {
+                            div {
+                                style: format!("font-size:10px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", snapshot.palette.muted),
+                                "Prefix '/' for yggterm commands · Ctrl+Shift+P focuses search"
+                            }
+                        }
                     }
                     if let Some(update) = snapshot.pending_update_restart.clone() {
                         button {
@@ -7657,6 +7953,8 @@ fn Sidebar(
     on_start_session: EventHandler<MouseEvent>,
     on_start_terminal: EventHandler<MouseEvent>,
     on_create_paper: EventHandler<MouseEvent>,
+    on_prev_search_row: EventHandler<()>,
+    on_next_search_row: EventHandler<()>,
     on_select_row: EventHandler<(BrowserRow, TreeSelectionMode)>,
     on_delete_selected_items: EventHandler<bool>,
     on_open_context_menu: EventHandler<(BrowserRow, (f64, f64))>,
@@ -7718,6 +8016,31 @@ fn Sidebar(
                     label: "+Paper".to_string(),
                     palette: snapshot.palette,
                     onclick: on_create_paper,
+                }
+            }
+            if snapshot.search_active {
+                div {
+                    style: "padding:8px 12px 0 12px; display:flex; align-items:center; gap:8px;",
+                    button {
+                        title: "Previous matching session",
+                        style: chip_style(snapshot.palette, false),
+                        onclick: move |_| on_prev_search_row.call(()),
+                        "↑"
+                    }
+                    button {
+                        title: "Next matching session",
+                        style: chip_style(snapshot.palette, false),
+                        onclick: move |_| on_next_search_row.call(()),
+                        "↓"
+                    }
+                    div {
+                        style: format!("font-size:11px; color:{}; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", snapshot.palette.muted),
+                        if let Some(ix) = snapshot.search_sidebar_match_index {
+                            {format!("Sidebar {}/{}", ix + 1, snapshot.search_sidebar_matches.len())}
+                        } else {
+                            "Sidebar 0/0"
+                        }
+                    }
                 }
             }
             div {
@@ -8525,6 +8848,7 @@ fn MainSurface(
                                         }
                                         for run in grouped_runs.into_iter() {
                                             PreviewRunBlock {
+                                                session_id: session.id.clone(),
                                                 run: run.clone(),
                                                 palette: snapshot.palette,
                                                 on_toggle_block: move |ix| on_toggle_preview_block.call(ix),
@@ -9356,6 +9680,7 @@ fn AgentModeSelector(
 
 #[component]
 fn PreviewRunBlock(
+    session_id: String,
     run: PreviewRun,
     palette: Palette,
     on_toggle_block: EventHandler<usize>,
@@ -9416,6 +9741,7 @@ fn PreviewRunBlock(
                     for (entry_ix, entry) in run.entries.iter().cloned().enumerate() {
                         div {
                             key: "{entry.block_ix}",
+                            id: "{preview_block_dom_id(&session_id, entry.block_ix)}",
                             style: format!(
                                 "width:100%; min-width:0; box-sizing:border-box; text-align:left; background:transparent; padding:{}; \
                                  {} {}",
