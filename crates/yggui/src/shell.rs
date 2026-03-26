@@ -239,7 +239,9 @@ struct RenderSnapshot {
     palette: Palette,
     search_query: String,
     search_active: bool,
+    command_mode_active: bool,
     search_focused: bool,
+    search_command_suggestions: Vec<SearchCommandSuggestion>,
     search_sidebar_matches: Vec<BrowserRow>,
     search_sidebar_match_index: Option<usize>,
     search_content_hits: Vec<SearchContentHit>,
@@ -298,6 +300,12 @@ struct RenderSnapshot {
 }
 
 type SharedSnapshot = Arc<RenderSnapshot>;
+
+#[derive(Clone, PartialEq, Eq)]
+struct SearchCommandSuggestion {
+    command: String,
+    description: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TreeSelectionMode {
@@ -613,8 +621,14 @@ impl ShellState {
             &live_sessions,
             &expanded_paths,
         );
-        let rows = filtered_sidebar_rows(&merged_rows, &self.search_query);
-        let search_sidebar_matches = search_sidebar_matches(&merged_rows, &self.search_query);
+        let command_mode_active = is_command_query(&self.search_query);
+        let effective_search_query = if command_mode_active {
+            ""
+        } else {
+            self.search_query.as_str()
+        };
+        let rows = filtered_sidebar_rows(&merged_rows, effective_search_query);
+        let search_sidebar_matches = search_sidebar_matches(&merged_rows, effective_search_query);
         let selected_path = if let Some(active) = self.server.active_session() {
             if active.source == yggterm_server::SessionSource::LiveSsh
                 || active.session_path.starts_with("remote-session://")
@@ -637,7 +651,7 @@ impl ShellState {
             .as_ref()
             .and_then(|session| resolved_session_summary(self, session));
         let search_content_hits =
-            search_content_hits(active_session.as_ref(), self.server.active_view_mode(), &self.search_query);
+            search_content_hits(active_session.as_ref(), self.server.active_view_mode(), effective_search_query);
         let search_sidebar_match_index = clamp_search_index(
             self.search_sidebar_match_index,
             search_sidebar_matches.len(),
@@ -648,8 +662,10 @@ impl ShellState {
         RenderSnapshot {
             palette: palette,
             search_query: self.search_query.clone(),
-            search_active: !self.search_query.trim().is_empty(),
+            search_active: !effective_search_query.trim().is_empty(),
+            command_mode_active,
             search_focused: self.search_focused,
+            search_command_suggestions: search_command_suggestions(&self.search_query),
             search_sidebar_matches,
             search_sidebar_match_index,
             search_content_hits,
@@ -4572,6 +4588,75 @@ fn row_matches_search(row: &BrowserRow, terms: &[String]) -> bool {
     text_matches_search_terms(&row_search_blob(row), terms)
 }
 
+fn is_command_query(query: &str) -> bool {
+    query.trim_start().starts_with('/')
+}
+
+fn search_command_suggestions(query: &str) -> Vec<SearchCommandSuggestion> {
+    const COMMANDS: &[(&str, &str)] = &[
+        ("/preview", "Switch to preview mode"),
+        ("/terminal", "Switch to terminal mode"),
+        ("/refresh", "Refresh daemon snapshot"),
+        ("/expand-all", "Expand all preview blocks"),
+        ("/collapse-all", "Collapse all preview blocks"),
+        ("/settings", "Open settings panel"),
+        ("/metadata", "Open session metadata"),
+        ("/notifications", "Open notifications panel"),
+        ("/connect", "Open Connect SSH panel"),
+    ];
+
+    let needle = query.trim();
+    if !needle.starts_with('/') {
+        return vec![];
+    }
+    COMMANDS
+        .iter()
+        .filter(|(command, _)| command.starts_with(needle))
+        .map(|(command, description)| SearchCommandSuggestion {
+            command: (*command).to_string(),
+            description: (*description).to_string(),
+        })
+        .collect()
+}
+
+fn execute_search_command(mut state: Signal<ShellState>, query: String) {
+    let command = query.trim().to_ascii_lowercase();
+    match command.as_str() {
+        "/preview" => spawn_set_view_mode(state, WorkspaceViewMode::Rendered),
+        "/terminal" => spawn_set_view_mode(state, WorkspaceViewMode::Terminal),
+        "/refresh" => spawn_server_snapshot_action(
+            state,
+            "refreshing workspace".to_string(),
+            move |endpoint| daemon_snapshot(&endpoint),
+        ),
+        "/expand-all" => {
+            spawn_server_snapshot_action(state, "expanding preview".to_string(), move |endpoint| {
+                set_all_preview_blocks_folded(&endpoint, false)
+            });
+        }
+        "/collapse-all" => {
+            spawn_server_snapshot_action(state, "collapsing preview".to_string(), move |endpoint| {
+                set_all_preview_blocks_folded(&endpoint, true)
+            });
+        }
+        "/settings" => state.with_mut(|shell| shell.toggle_settings_panel()),
+        "/metadata" => state.with_mut(|shell| shell.toggle_metadata_panel()),
+        "/notifications" => state.with_mut(|shell| shell.toggle_notifications_panel()),
+        "/connect" => state.with_mut(|shell| shell.toggle_connect_panel()),
+        _ => state.with_mut(|shell| {
+            shell.push_notification(
+                NotificationTone::Warning,
+                "Unknown Command",
+                format!("{command} is not a recognized yggterm command."),
+            );
+        }),
+    }
+    state.with_mut(|shell| {
+        shell.set_search(String::new());
+        shell.set_search_focus(false);
+    });
+}
+
 fn filtered_sidebar_rows(rows: &[BrowserRow], query: &str) -> Vec<BrowserRow> {
     let terms = search_terms(query);
     if terms.is_empty() {
@@ -7809,6 +7894,7 @@ fn app() -> Element {
                     hovered: hovered,
                     on_toggle_sidebar: move || state.with_mut(|shell| shell.toggle_sidebar()),
                     on_search: move |value: String| state.with_mut(|shell| shell.set_search(value)),
+                    on_execute_search_command: move |command: String| execute_search_command(state, command),
                     on_set_search_focus: move |focused: bool| state.with_mut(|shell| shell.set_search_focus(focused)),
                             on_prev_search_content: move |_| {
                         if let Some(dom_id) = state.with_mut(|shell| shell.next_search_content_dom_id(-1)) {
@@ -8264,6 +8350,7 @@ fn Titlebar(
     hovered: Signal<Option<HoveredControl>>,
     on_toggle_sidebar: EventHandler<()>,
     on_search: EventHandler<String>,
+    on_execute_search_command: EventHandler<String>,
     on_set_search_focus: EventHandler<bool>,
     on_prev_search_content: EventHandler<()>,
     on_next_search_content: EventHandler<()>,
@@ -8278,6 +8365,8 @@ fn Titlebar(
     on_toggle_always_on_top: EventHandler<()>,
     maximized: bool,
 ) -> Element {
+    let command_mode_active = snapshot.command_mode_active;
+    let search_query = snapshot.search_query.clone();
     rsx! {
         TitlebarChrome {
             background: snapshot.palette.titlebar.to_string(),
@@ -8337,6 +8426,12 @@ fn Titlebar(
                                 onfocus: move |_| on_set_search_focus.call(true),
                                 onblur: move |_| on_set_search_focus.call(false),
                                 oninput: move |evt| on_search.call(evt.value()),
+                                onkeydown: move |evt| {
+                                    if evt.key() == Key::Enter && command_mode_active {
+                                        evt.prevent_default();
+                                        on_execute_search_command.call(search_query.clone());
+                                    }
+                                },
                             }
                             if snapshot.search_active
                                 && matches!(
@@ -8366,7 +8461,37 @@ fn Titlebar(
                                 }
                             }
                         }
-                        if snapshot.search_focused || snapshot.search_active {
+                        if snapshot.command_mode_active {
+                            div {
+                                style: "display:flex; flex-direction:column; gap:4px;",
+                                div {
+                                    style: format!("font-size:10px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", snapshot.palette.muted),
+                                    "Press Enter to run a yggterm command"
+                                }
+                                for suggestion in snapshot.search_command_suggestions.iter().take(5) {
+                                    button {
+                                        style: format!(
+                                            "display:flex; align-items:center; justify-content:space-between; gap:12px; \
+                                             height:28px; border:none; border-radius:10px; padding:0 10px; cursor:pointer; \
+                                             background:rgba(255,255,255,0.72); color:{}; box-shadow: inset 0 0 0 1px rgba(196,210,224,0.45);",
+                                            snapshot.palette.text
+                                        ),
+                                        onclick: {
+                                            let command = suggestion.command.clone();
+                                            move |_| on_execute_search_command.call(command.clone())
+                                        },
+                                        span {
+                                            style: "font-size:11px; font-weight:700;",
+                                            "{suggestion.command}"
+                                        }
+                                        span {
+                                            style: format!("font-size:10px; color:{};", snapshot.palette.muted),
+                                            "{suggestion.description}"
+                                        }
+                                    }
+                                }
+                            }
+                        } else if snapshot.search_focused || snapshot.search_active {
                             div {
                                 style: format!("font-size:10px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", snapshot.palette.muted),
                                 "Prefix '/' for yggterm commands · Ctrl+Shift+P focuses search"
