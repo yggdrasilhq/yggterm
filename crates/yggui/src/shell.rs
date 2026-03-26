@@ -397,6 +397,7 @@ enum PreviewContentBlock {
     Numbered { number: usize, text: String },
     Task { done: bool, text: String },
     Quote(String),
+    ImageAttachment { path: String },
     Code { language: Option<String>, code: String },
 }
 
@@ -3978,6 +3979,25 @@ fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlo
             Some(cleaned)
         })
         .collect::<Vec<_>>();
+
+    let mut deduped = Vec::with_capacity(visible.len());
+    let mut last_signature = None::<(PreviewTone, String)>;
+    for block in visible.into_iter() {
+        let signature = (
+            block.tone,
+            preview_block_text(&block)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_lowercase(),
+        );
+        if last_signature.as_ref() == Some(&signature) {
+            continue;
+        }
+        last_signature = Some(signature);
+        deduped.push(block);
+    }
+    let mut visible = deduped;
 
     if visible.is_empty() {
         visible = session.preview.blocks.clone();
@@ -9400,6 +9420,38 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                             }
                         }
                     },
+                    PreviewContentBlock::ImageAttachment { path } => {
+                        let exists = Path::new(&path).exists();
+                        let file_url = format!("file://{}", path);
+                        rsx! {
+                            div {
+                                style: "display:flex; flex-direction:column; gap:10px; padding:12px; border-radius:18px; background:rgba(247,250,253,0.92); \
+                                        box-shadow:inset 0 0 0 1px rgba(170,190,212,0.16); content-visibility:auto; contain:layout paint style;",
+                                div {
+                                    style: "display:flex; align-items:center; justify-content:space-between; gap:12px;",
+                                    div {
+                                        style: format!("font-size:11px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:{};", palette.muted),
+                                        "Image Attachment"
+                                    }
+                                    div {
+                                        style: format!("font-size:11px; color:{};", palette.muted),
+                                        if exists { "local file" } else { "path only" }
+                                    }
+                                }
+                                if exists {
+                                    img {
+                                        src: "{file_url}",
+                                        style: "display:block; width:auto; max-width:min(100%, 560px); max-height:320px; border-radius:14px; object-fit:contain; background:rgba(255,255,255,0.86); \
+                                                box-shadow:inset 0 0 0 1px rgba(170,190,212,0.14);",
+                                    }
+                                }
+                                div {
+                                    style: format!("font-size:12px; line-height:1.6; color:{}; font-family:'JetBrains Mono', 'Iosevka Term', monospace; white-space:pre-wrap; overflow-wrap:anywhere;", palette.muted),
+                                    "{path}"
+                                }
+                            }
+                        }
+                    },
                     PreviewContentBlock::Code { language, code } => rsx! {
                         div {
                             style: "display:flex; flex-direction:column; gap:8px; border-radius:16px; background:rgba(15,23,42,0.92); color:#e5eef8; overflow:hidden; \
@@ -9537,6 +9589,14 @@ fn preview_content_blocks(lines: &[String]) -> Vec<PreviewContentBlock> {
             blocks.push(PreviewContentBlock::Quote(quote.trim().to_string()));
             continue;
         }
+        if let Some((image_path, residue)) = extract_image_path_from_line(line) {
+            flush_paragraph(&mut blocks, &mut paragraph);
+            if let Some(text) = residue.filter(|value| !value.trim().is_empty()) {
+                blocks.push(PreviewContentBlock::Paragraph(text));
+            }
+            blocks.push(PreviewContentBlock::ImageAttachment { path: image_path });
+            continue;
+        }
         paragraph.push(line.to_string());
     }
 
@@ -9558,6 +9618,34 @@ fn parse_numbered_preview_item(line: &str) -> Option<(usize, String)> {
         return None;
     }
     Some((number.parse().ok()?, text.trim().to_string()))
+}
+
+fn extract_image_path_from_line(line: &str) -> Option<(String, Option<String>)> {
+    let mut found_path = None::<String>;
+    for token in line.split_whitespace() {
+        let cleaned = token
+            .trim_matches(|ch: char| matches!(ch, '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']'))
+            .trim_start_matches('@')
+            .to_string();
+        if cleaned.starts_with('/') && looks_like_image_path(&cleaned) {
+            found_path = Some(cleaned);
+            break;
+        }
+    }
+    let path = found_path?;
+    let residue = line.replace(&format!("@{path}"), "").replace(&path, "");
+    let residue = residue.trim().trim_matches(':').trim().to_string();
+    Some((path, (!residue.is_empty()).then_some(residue)))
+}
+
+fn looks_like_image_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp"
+        ))
 }
 
 fn preview_block_excerpt(block: &SessionPreviewBlock, max_chars: usize) -> Option<String> {
