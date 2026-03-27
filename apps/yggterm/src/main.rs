@@ -9,8 +9,8 @@ use std::time::Duration;
 use yggterm_core::{
     ENV_YGGTERM_DIRECT_INSTALL_ROOT, ENV_YGGTERM_HOME, InstallContext, PerfSpan, SessionNode,
     SessionNodeKind, SessionStore, UiTheme, UpdatePolicy, WorkspaceDocumentKind,
-    WorkspaceGroupKind, check_for_update, detect_install_context, install_release_update,
-    refresh_desktop_integration,
+    WorkspaceGroupKind, check_for_update, current_version, detect_install_context,
+    install_release_update, refresh_desktop_integration,
 };
 use yggterm_server::{
     PersistedDaemonState, SessionKind, YggtermServer, cleanup_legacy_daemons, default_endpoint,
@@ -109,6 +109,13 @@ fn main() -> Result<()> {
     }
     if args.as_slice() == ["server", "smoke"] {
         return run_server_smoke();
+    }
+    if matches!(
+        args.first().map(String::as_str),
+        Some("--version" | "-V" | "version")
+    ) {
+        println!("{}", current_version());
+        return Ok(());
     }
     if let Some(command) = args.first()
         && command == "install"
