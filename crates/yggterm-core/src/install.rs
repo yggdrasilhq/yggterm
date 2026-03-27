@@ -433,18 +433,20 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
     let desktop_path = applications_dir.join(format!("{YGGTERM_DESKTOP_APP_ID}.desktop"));
     let legacy_desktop_path = applications_dir.join("yggterm.desktop");
     let desktop_exec_path = launcher_path.as_deref().unwrap_or(&context.executable_path);
+    let desktop_icon_path = desktop_exec_escape(&direct_scalable_icon_path);
     let desktop_contents = format!(
         "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Yggterm\nComment=Remote-first terminal workspace\nExec={}\nTryExec={}\nIcon={}\nTerminal=false\nCategories=System;TerminalEmulator;Development;\nStartupNotify=true\nStartupWMClass={}\nX-Desktop-File-Install-Version=0.27\n",
         desktop_exec_escape(desktop_exec_path),
         desktop_exec_escape(desktop_exec_path),
-        YGGTERM_DESKTOP_APP_ID,
+        desktop_icon_path,
         YGGTERM_DESKTOP_APP_ID,
     );
     write_if_changed(&desktop_path, desktop_contents.as_bytes())?;
     let legacy_desktop_contents = format!(
-        "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Yggterm\nComment=Remote-first terminal workspace\nExec={}\nTryExec={}\nIcon=yggterm\nTerminal=false\nCategories=System;TerminalEmulator;Development;\nStartupNotify=true\nStartupWMClass={}\nX-Desktop-File-Install-Version=0.27\n",
+        "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Yggterm\nComment=Remote-first terminal workspace\nExec={}\nTryExec={}\nIcon={}\nTerminal=false\nCategories=System;TerminalEmulator;Development;\nStartupNotify=true\nStartupWMClass={}\nX-Desktop-File-Install-Version=0.27\n",
         desktop_exec_escape(desktop_exec_path),
         desktop_exec_escape(desktop_exec_path),
+        desktop_icon_path,
         YGGTERM_DESKTOP_APP_ID,
     );
     write_if_changed(&legacy_desktop_path, legacy_desktop_contents.as_bytes())?;
