@@ -10,6 +10,7 @@ use std::time::Duration;
 const DEFAULT_RELEASE_REPO: &str = "yggdrasilhq/yggterm";
 const INSTALL_STATE_FILENAME: &str = "install-state.json";
 pub const ENV_YGGTERM_DIRECT_INSTALL_ROOT: &str = "YGGTERM_DIRECT_INSTALL_ROOT";
+pub const YGGTERM_DESKTOP_APP_ID: &str = "dev.yggterm.Yggterm";
 const LINUX_LAUNCHER_MARKER: &str = "yggterm-direct-launcher-v2";
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -378,16 +379,18 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
         None
     };
 
-    let icon_path = icons_dir.join("yggterm.png");
-    write_if_changed(
-        &icon_path,
-        include_bytes!("../../../assets/brand/yggterm-icon-512.png"),
-    )?;
-    let scalable_icon_path = scalable_icons_dir.join("yggterm.svg");
-    write_if_changed(
-        &scalable_icon_path,
-        include_bytes!("../../../assets/brand/yggterm-icon.svg"),
-    )?;
+    for icon_name in ["yggterm", YGGTERM_DESKTOP_APP_ID] {
+        let icon_path = icons_dir.join(format!("{icon_name}.png"));
+        write_if_changed(
+            &icon_path,
+            include_bytes!("../../../assets/brand/yggterm-icon-512.png"),
+        )?;
+        let scalable_icon_path = scalable_icons_dir.join(format!("{icon_name}.svg"));
+        write_if_changed(
+            &scalable_icon_path,
+            include_bytes!("../../../assets/brand/yggterm-icon.svg"),
+        )?;
+    }
     let pixmaps_icon_path = pixmaps_dir.join("yggterm.png");
     write_if_changed(
         &pixmaps_icon_path,
@@ -403,12 +406,14 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
         &direct_scalable_icon_path,
         include_bytes!("../../../assets/brand/yggterm-icon.svg"),
     )?;
-    let desktop_path = applications_dir.join("dev.yggterm.Yggterm.desktop");
+    let desktop_path = applications_dir.join(format!("{YGGTERM_DESKTOP_APP_ID}.desktop"));
     let desktop_exec_path = launcher_path.as_deref().unwrap_or(&context.executable_path);
     let desktop_contents = format!(
-        "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Yggterm\nComment=Remote-first terminal workspace\nExec={}\nTryExec={}\nIcon=yggterm\nTerminal=false\nCategories=System;TerminalEmulator;Development;\nStartupNotify=true\nStartupWMClass=yggterm\nX-Desktop-File-Install-Version=0.27\n",
+        "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Yggterm\nComment=Remote-first terminal workspace\nExec={}\nTryExec={}\nIcon={}\nTerminal=false\nCategories=System;TerminalEmulator;Development;\nStartupNotify=true\nStartupWMClass={}\nX-Desktop-File-Install-Version=0.27\n",
         desktop_exec_escape(desktop_exec_path),
         desktop_exec_escape(desktop_exec_path),
+        YGGTERM_DESKTOP_APP_ID,
+        YGGTERM_DESKTOP_APP_ID,
     );
     write_if_changed(&desktop_path, desktop_contents.as_bytes())?;
     let _ = std::process::Command::new("update-desktop-database")
