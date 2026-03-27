@@ -4531,27 +4531,11 @@ fn preview_summary_metadata_value(session: &ManagedSessionView, label: &str) -> 
         .filter(|value| !value.is_empty())
 }
 
-fn looks_like_truncated_summary(summary: &str) -> bool {
-    let trimmed = summary.trim();
-    trimmed.len() < 80
-        || (!matches!(trimmed.chars().last(), Some('.' | '!' | '?' | '…'))
-            && trimmed.len() < 180)
-}
-
 fn preview_header_summary(snapshot: &RenderSnapshot, session: &ManagedSessionView) -> String {
     let fallback = preview_summary_text(session);
     match snapshot.active_summary.clone() {
         Some(summary) if summary.trim().is_empty() => fallback,
-        Some(summary)
-            if looks_like_truncated_summary(&summary)
-                && fallback.len() > summary.len() + 64
-                && !fallback.contains("Cwd:")
-                && !fallback.contains("Messages:")
-                && !fallback.contains("user ·")
-                && !fallback.contains("assistant") =>
-        {
-            fallback
-        }
+        Some(summary) if looks_like_low_signal_generated_copy(&summary) => fallback,
         Some(summary) => summary,
         None => fallback,
     }
