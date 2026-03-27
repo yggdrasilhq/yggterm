@@ -10,8 +10,8 @@ use std::time::Instant;
 use yggterm_core::resolve_yggterm_home;
 use yggterm_server::{
     YGG_LOADING_NOTIFICATION_AFTER_MS, YggEventEnvelope, YggEventKind, YggProgress,
-    YggRequestMeta, YggSurface, YggTarget, default_endpoint, ping, request_terminal_launch,
-    shutdown, snapshot, start_local_session_at, status,
+    YggRequestMeta, YggSurface, YggTarget, default_endpoint, ping, refresh_remote_machine,
+    request_terminal_launch, shutdown, snapshot, start_local_session_at, status,
     SessionKind,
 };
 
@@ -21,6 +21,7 @@ enum Scenario {
     Ping,
     Status,
     Snapshot,
+    RefreshRemote,
     DisconnectSafe,
     ReconnectCheck,
     GracefulShutdown,
@@ -33,6 +34,7 @@ impl Scenario {
             Self::Ping => "ping",
             Self::Status => "status",
             Self::Snapshot => "snapshot",
+            Self::RefreshRemote => "refresh_remote",
             Self::DisconnectSafe => "disconnect_safe",
             Self::ReconnectCheck => "reconnect_check",
             Self::GracefulShutdown => "graceful_shutdown",
@@ -51,6 +53,7 @@ struct Config {
     cwd: Option<String>,
     title_hint: Option<String>,
     expect_path: Option<String>,
+    machine_key: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -74,6 +77,7 @@ fn parse_args(args: Vec<String>) -> Result<Config> {
     let mut cwd = None::<String>;
     let mut title_hint = None::<String>;
     let mut expect_path = None::<String>;
+    let mut machine_key = None::<String>;
 
     let mut ix = 0usize;
     while ix < args.len() {
@@ -86,6 +90,7 @@ fn parse_args(args: Vec<String>) -> Result<Config> {
                     "ping" => Scenario::Ping,
                     "status" => Scenario::Status,
                     "snapshot" => Scenario::Snapshot,
+                    "refresh-remote" => Scenario::RefreshRemote,
                     "disconnect-safe" => Scenario::DisconnectSafe,
                     "reconnect-check" => Scenario::ReconnectCheck,
                     "graceful-shutdown" => Scenario::GracefulShutdown,
@@ -154,6 +159,14 @@ fn parse_args(args: Vec<String>) -> Result<Config> {
                         .to_string(),
                 );
             }
+            "--machine-key" => {
+                ix += 1;
+                machine_key = Some(
+                    args.get(ix)
+                        .context("missing value after --machine-key")?
+                        .to_string(),
+                );
+            }
             other => bail!("unknown argument: {other}"),
         }
         ix += 1;
@@ -169,6 +182,7 @@ fn parse_args(args: Vec<String>) -> Result<Config> {
         cwd,
         title_hint,
         expect_path,
+        machine_key,
     })
 }
 
@@ -177,7 +191,7 @@ fn run_scenario(
     endpoint: &yggterm_server::ServerEndpoint,
     iteration: usize,
 ) -> Result<()> {
-    let request_id = format!("mock-yggclient-{}-{iteration}", cfg.scenario.operation_name());
+    let request_id = format!("yggterm-mock-cli-{}-{iteration}", cfg.scenario.operation_name());
     let meta = YggRequestMeta::interactive(
         request_id,
         cfg.scenario.operation_name(),
@@ -241,6 +255,24 @@ fn run_scenario(
                 "remote_machines": snap.remote_machines.len(),
                 "ssh_targets": snap.ssh_targets.len(),
                 "live_sessions": snap.live_sessions.len(),
+            }))
+        }
+        Scenario::RefreshRemote => {
+            let machine_key = cfg
+                .machine_key
+                .as_deref()
+                .context("--machine-key is required for refresh-remote")?;
+            ping(endpoint)?;
+            let (snap, message) = refresh_remote_machine(endpoint, machine_key)?;
+            let machine = snap
+                .remote_machines
+                .iter()
+                .find(|machine| machine.machine_key == machine_key);
+            Ok(json!({
+                "message": message,
+                "machine_key": machine_key,
+                "health": machine.map(|machine| &machine.health),
+                "session_count": machine.map(|machine| machine.sessions.len()).unwrap_or_default(),
             }))
         }
         Scenario::DisconnectSafe => {
