@@ -1,10 +1,10 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::fs;
 use std::io::Read;
 use std::io::Write;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::process::{Command, Stdio};
 use std::time::Duration;
 use yggterm_core::{
     ENV_YGGTERM_HOME, InstallContext, PerfSpan, SessionNode, SessionNodeKind, SessionStore,
@@ -14,14 +14,13 @@ use yggterm_core::{
 use yggterm_server::{
     PersistedDaemonState, SessionKind, YggtermServer, cleanup_legacy_daemons, default_endpoint,
     detect_ghostty_host, ping, run_attach, run_daemon, run_remote_generation_context,
-    run_remote_preview,
-    run_remote_protocol_version, run_remote_resume_codex, run_remote_scan,
-    run_remote_terminate_codex,
-    run_remote_stage_clipboard_png, run_remote_upsert_generated_copy, shutdown,
-    start_local_session, status,
+    run_remote_preview, run_remote_protocol_version, run_remote_resume_codex, run_remote_scan,
+    run_remote_stage_clipboard_png, run_remote_terminate_codex, run_remote_upsert_generated_copy,
+    shutdown, start_local_session, status,
 };
 
-const DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT_ENV: &str = "YGGTERM_DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT";
+const DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT_ENV: &str =
+    "YGGTERM_DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT";
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -57,7 +56,9 @@ fn main() -> Result<()> {
     if args.len() >= 4 && args[0] == "server" && args[1] == "remote" && args[2] == "resume-codex" {
         return run_remote_resume_codex(
             &args[3],
-            args.get(4).map(String::as_str).filter(|value| !value.is_empty()),
+            args.get(4)
+                .map(String::as_str)
+                .filter(|value| !value.is_empty()),
         );
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "remote" && args[2] == "scan" {
@@ -73,10 +74,15 @@ fn main() -> Result<()> {
     {
         return run_remote_generation_context(&args[3]);
     }
-    if args.len() == 4 && args[0] == "server" && args[1] == "remote" && args[2] == "terminate-codex" {
+    if args.len() == 4 && args[0] == "server" && args[1] == "remote" && args[2] == "terminate-codex"
+    {
         return run_remote_terminate_codex(&args[3]);
     }
-    if args.len() == 4 && args[0] == "server" && args[1] == "remote" && args[2] == "upsert-generated-copy" {
+    if args.len() == 4
+        && args[0] == "server"
+        && args[1] == "remote"
+        && args[2] == "upsert-generated-copy"
+    {
         return run_remote_upsert_generated_copy(&args[3]);
     }
     if args.as_slice() == ["server", "shutdown"] {
@@ -134,7 +140,7 @@ fn main() -> Result<()> {
     let theme = settings.theme;
     let prefer_ghostty_backend = settings.prefer_ghostty_backend;
     let endpoint = default_endpoint(store.home_dir());
-    install_signal_shutdown(endpoint.clone());
+    install_signal_shutdown(store.home_dir().to_path_buf(), endpoint.clone());
     let cleanup_span = PerfSpan::start(&startup_home, "startup", "cleanup_legacy_daemons");
     let _ = cleanup_legacy_daemons(&endpoint, &current_exe);
     cleanup_span.finish(serde_json::json!({}));
@@ -201,17 +207,15 @@ fn load_initial_server_snapshot_fast(
     let saved = fs::read_to_string(&state_path)
         .ok()
         .and_then(|json| serde_json::from_str::<PersistedDaemonState>(&json).ok())?;
-    let mut server = YggtermServer::new(
-        browser_tree,
-        prefer_ghostty_backend,
-        host.clone(),
-        theme,
-    );
+    let mut server = YggtermServer::new(browser_tree, prefer_ghostty_backend, host.clone(), theme);
     server.restore_persisted_state(saved, Some(store));
     Some(server.snapshot())
 }
 
-fn install_signal_shutdown(_endpoint: yggterm_server::ServerEndpoint) {
+fn install_signal_shutdown(
+    home_dir: std::path::PathBuf,
+    endpoint: yggterm_server::ServerEndpoint,
+) {
     static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
     if HANDLER_INSTALLED.swap(true, Ordering::SeqCst) {
         return;
@@ -223,8 +227,69 @@ fn install_signal_shutdown(_endpoint: yggterm_server::ServerEndpoint) {
         if handler_flag.swap(true, Ordering::SeqCst) {
             return;
         }
+        if let Ok(remaining_clients) = unregister_signal_client_instance(&home_dir) {
+            if remaining_clients == 0 {
+                let _ = shutdown(&endpoint);
+            }
+        }
         std::process::exit(130);
     });
+}
+
+fn signal_client_instances_dir(home_dir: &std::path::Path) -> std::path::PathBuf {
+    home_dir.join("client-instances")
+}
+
+fn signal_parse_client_pid(path: &std::path::Path) -> Option<u32> {
+    let file_name = path.file_name()?.to_str()?;
+    let pid_prefix = file_name.split('-').next()?;
+    pid_prefix.parse::<u32>().ok()
+}
+
+#[cfg(unix)]
+fn signal_process_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let result = unsafe { libc::kill(pid as i32, 0) };
+    if result == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error()
+        .raw_os_error()
+        .is_some_and(|code| code == libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn signal_process_is_alive(pid: u32) -> bool {
+    pid != 0
+}
+
+fn unregister_signal_client_instance(home_dir: &std::path::Path) -> Result<usize> {
+    let dir = signal_client_instances_dir(home_dir);
+    fs::create_dir_all(&dir)?;
+    let current_pid = std::process::id();
+    let entries =
+        fs::read_dir(&dir).with_context(|| format!("reading client instances {}", dir.display()))?;
+    let mut remaining = 0_usize;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(pid) = signal_parse_client_pid(&path) else {
+            let _ = fs::remove_file(&path);
+            continue;
+        };
+        if pid == current_pid {
+            let _ = fs::remove_file(&path);
+            continue;
+        }
+        if signal_process_is_alive(pid) {
+            remaining += 1;
+        } else {
+            let _ = fs::remove_file(&path);
+        }
+    }
+    Ok(remaining)
 }
 
 fn install_panic_logging(home_dir: &std::path::Path) {
@@ -232,7 +297,14 @@ fn install_panic_logging(home_dir: &std::path::Path) {
     std::panic::set_hook(Box::new(move |info| {
         let location = info
             .location()
-            .map(|location| format!("{}:{}:{}", location.file(), location.line(), location.column()))
+            .map(|location| {
+                format!(
+                    "{}:{}:{}",
+                    location.file(),
+                    location.line(),
+                    location.column()
+                )
+            })
             .unwrap_or_else(|| "unknown".to_string());
         let payload = info
             .payload()
