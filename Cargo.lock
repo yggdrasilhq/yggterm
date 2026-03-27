@@ -5478,7 +5478,7 @@ checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
 
 [[package]]
 name = "yggterm"
-version = "2.0.16"
+version = "2.0.17"
 dependencies = [
  "anyhow",
  "ctrlc",
@@ -5492,7 +5492,7 @@ dependencies = [
 
 [[package]]
 name = "yggterm-core"
-version = "2.0.16"
+version = "2.0.17"
 dependencies = [
  "anyhow",
  "dirs",
@@ -5512,7 +5512,7 @@ dependencies = [
 
 [[package]]
 name = "yggterm-ghostty-bridge"
-version = "2.0.16"
+version = "2.0.17"
 dependencies = [
  "anyhow",
  "thiserror 2.0.18",
@@ -5521,18 +5521,18 @@ dependencies = [
 
 [[package]]
 name = "yggterm-gtk-glue"
-version = "2.0.16"
+version = "2.0.17"
 
 [[package]]
 name = "yggterm-platform"
-version = "2.0.16"
+version = "2.0.17"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "yggterm-server"
-version = "2.0.16"
+version = "2.0.17"
 dependencies = [
  "anyhow",
  "dirs",
@@ -5551,7 +5551,7 @@ dependencies = [
 
 [[package]]
 name = "yggui"
-version = "2.0.16"
+version = "2.0.17"
 dependencies = [
  "anyhow",
  "base64",
