@@ -1,3 +1,11 @@
+yggterm (2.0.15-1) unstable; urgency=medium
+
+  * Make direct self-update install yggterm-headless alongside yggterm so direct installs actually repair SSH remote health on upgrade.
+  * Register the Linux desktop file with Icon=yggterm so KDE resolves the shipped icon consistently across the menu, panel, and launcher editor.
+  * Keep the remote transport hardened against noisy shell startup output and retain the yggterm-mock-cli rename.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 27 Mar 2026 15:42:00 +0530
+
 yggterm (2.0.14-1) unstable; urgency=medium
 
   * Ship yggterm-headless in release archives, direct installs, and the .deb so SSH remotes get the headless server binary instead of the GUI app.
