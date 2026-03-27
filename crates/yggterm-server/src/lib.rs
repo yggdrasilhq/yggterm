@@ -3083,6 +3083,17 @@ fn remote_shell_command(exec_prefix: Option<&str>, inner: &str) -> String {
     }
 }
 
+const REMOTE_OUTPUT_SENTINEL: &str = "__YGGTERM_REMOTE_PAYLOAD__";
+
+fn strip_remote_payload_noise(stdout: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stdout);
+    if let Some(ix) = text.find(REMOTE_OUTPUT_SENTINEL) {
+        let payload = &text[ix + REMOTE_OUTPUT_SENTINEL.len()..];
+        return payload.trim().to_string();
+    }
+    text.trim().to_string()
+}
+
 fn remote_cache_key(ssh_target: &str, exec_prefix: Option<&str>) -> String {
     format!("{}|{}", ssh_target, exec_prefix.unwrap_or_default())
 }
@@ -3101,11 +3112,15 @@ fn run_remote_binary_command(
     let mut cmd = Command::new("ssh");
     cmd.arg("-o").arg("ConnectTimeout=5");
     cmd.arg("-o").arg("BatchMode=yes");
-    let mut inner = String::from(binary_expr);
+    let mut binary_invocation = String::from(binary_expr);
     for arg in args {
-        inner.push(' ');
-        inner.push_str(&shell_single_quote(arg));
+        binary_invocation.push(' ');
+        binary_invocation.push_str(&shell_single_quote(arg));
     }
+    let inner = format!("printf '%s\\n' {sentinel} ; {binary_invocation}",
+        sentinel = shell_single_quote(REMOTE_OUTPUT_SENTINEL),
+        binary_invocation = binary_invocation,
+    );
     let remote = remote_shell_command(exec_prefix, &inner);
     cmd.arg(ssh_target).arg(remote);
     cmd.stdin(Stdio::piped())
@@ -3131,7 +3146,7 @@ fn run_remote_binary_command(
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(strip_remote_payload_noise(&output.stdout))
 }
 
 fn run_remote_yggterm_command(
@@ -3140,14 +3155,34 @@ fn run_remote_yggterm_command(
     args: &[&str],
     stdin_bytes: Option<&[u8]>,
 ) -> anyhow::Result<String> {
+    let cache_key = remote_cache_key(ssh_target, exec_prefix);
     let resolved = resolve_remote_yggterm_binary(ssh_target, exec_prefix)?;
-    run_remote_binary_command(
+    match run_remote_binary_command(
         ssh_target,
         exec_prefix,
         &resolved.0,
         args,
         stdin_bytes,
-    )
+    ) {
+        Ok(output) => Ok(output),
+        Err(first_error) => {
+            if !should_fallback_to_python(&first_error) {
+                return Err(first_error);
+            }
+            if let Ok(mut cache) = remote_command_cache().lock() {
+                cache.remove(&cache_key);
+            }
+            let retried = resolve_remote_yggterm_binary(ssh_target, exec_prefix)?;
+            run_remote_binary_command(
+                ssh_target,
+                exec_prefix,
+                &retried.0,
+                args,
+                stdin_bytes,
+            )
+            .with_context(|| format!("retrying remote yggterm command after cache reset: {first_error:#}"))
+        }
+    }
 }
 
 fn should_fallback_to_python(error: &anyhow::Error) -> bool {
@@ -3213,9 +3248,22 @@ fn bootstrap_remote_yggterm(ssh_target: &str, exec_prefix: Option<&str>) -> anyh
 
 fn local_remote_bootstrap_executable() -> Option<PathBuf> {
     let current = std::env::current_exe().ok()?;
-    let headless = current.with_file_name("yggterm-headless");
-    if headless.is_file() {
-        return Some(headless);
+    let current_ext = current.extension().and_then(|ext| ext.to_str()).unwrap_or_default();
+    let candidates = if current_ext.eq_ignore_ascii_case("exe") {
+        vec![
+            current.with_file_name("yggterm-headless.exe"),
+            current.with_file_name("yggterm-headless-bin.exe"),
+        ]
+    } else {
+        vec![
+            current.with_file_name("yggterm-headless"),
+            current.with_file_name("yggterm-headless-bin"),
+        ]
+    };
+    for candidate in candidates {
+        if candidate.is_file() {
+            return Some(candidate);
+        }
     }
     None
 }
@@ -5302,11 +5350,12 @@ mod tests {
     use super::{
         GhosttyHostSupport, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession,
         PersistedDaemonState, SessionKind, SessionNode, SessionNodeKind, SshConnectTarget,
-        UiTheme, WorkspaceViewMode, YggtermServer,
+        UiTheme, WorkspaceViewMode, YggtermServer, REMOTE_OUTPUT_SENTINEL,
         dedupe_remote_scanned_sessions, load_remote_machine_sessions_from_mirror,
         mirror_remote_machine_sessions,
         parse_stored_transcript, remote_resume_shell_command, remote_scanned_session_path,
         remote_ssh_launch_command, remote_command_cache, remote_cache_key,
+        strip_remote_payload_noise,
         stored_session_launch_command,
     };
     use anyhow::Result;
@@ -5378,6 +5427,12 @@ mod tests {
         assert!(command.contains("$HOME/.yggterm/bin/yggterm"));
         assert!(command.contains("'resume-codex'"));
         assert!(command.contains("'/srv/app'"));
+    }
+
+    #[test]
+    fn strip_remote_payload_noise_discards_shell_preamble() {
+        let raw = format!("alias chicago='ssh'\nwelcome\n{REMOTE_OUTPUT_SENTINEL}\n2.0.12\n");
+        assert_eq!(strip_remote_payload_noise(raw.as_bytes()), "2.0.12");
     }
 
     #[test]
