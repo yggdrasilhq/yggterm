@@ -146,7 +146,7 @@ def resolve_yggterm_pid(launcher_pid: int) -> int:
             cmdline = Path(f"/proc/{candidate}/cmdline").read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
-        if "target/debug/yggterm" in cmdline and "mock-yggclient" not in cmdline:
+        if "target/debug/yggterm" in cmdline and "yggterm-mock-cli" not in cmdline:
             return candidate
     return launcher_pid
 
