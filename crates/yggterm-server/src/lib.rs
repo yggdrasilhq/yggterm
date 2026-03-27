@@ -2636,10 +2636,39 @@ def summarize(path):
         "cached_summary": GENERATED_SUMMARIES.get(session_id),
     }
 
-codex_home = os.path.expanduser(sys.argv[1] if len(sys.argv) > 1 else "~/.codex")
-root = Path(codex_home) / "sessions"
-if root.exists():
+requested = sys.argv[1] if len(sys.argv) > 1 else "~/.codex"
+codex_home = os.path.expanduser(requested)
+
+def has_session_files(root: Path):
+    try:
+        for path in root.rglob("*.jsonl"):
+            return True
+    except Exception:
+        return False
+    return False
+
+scan_roots = [Path(codex_home)]
+if requested in ("", "~/.codex"):
+    requested_root = Path(codex_home) / "sessions"
+    if not requested_root.exists() or not has_session_files(requested_root):
+        for parent in (Path("/home"), Path("/Users")):
+            if not parent.exists():
+                continue
+            for child in parent.iterdir():
+                candidate = child / ".codex"
+                if candidate != Path(codex_home) and (candidate / "sessions").exists():
+                    scan_roots.append(candidate)
+
+seen = set()
+for codex_root in scan_roots:
+    root = codex_root / "sessions"
+    if not root.exists():
+        continue
     for path in root.rglob("*.jsonl"):
+        path_str = str(path)
+        if path_str in seen:
+            continue
+        seen.add(path_str)
         data = summarize(path)
         if data:
             print(json.dumps(data, ensure_ascii=False))
@@ -3540,7 +3569,7 @@ pub fn run_remote_terminate_codex(session_id: &str) -> anyhow::Result<()> {
 }
 
 pub fn run_remote_scan(codex_home: Option<&str>) -> anyhow::Result<()> {
-    let home = codex_home
+    let requested_home = codex_home
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
         .map(|value| {
@@ -3559,18 +3588,90 @@ pub fn run_remote_scan(codex_home: Option<&str>) -> anyhow::Result<()> {
                 .unwrap_or_else(|| std::path::PathBuf::from("."))
                 .join(".codex")
         });
-    let root = home.join("sessions");
+    let scan_roots = remote_scan_roots(&requested_home, codex_home);
     let yggterm_home = resolve_yggterm_home()?;
     let title_store = SessionTitleStore::open(&yggterm_home)?;
     let mut files = Vec::new();
-    collect_codex_session_files(&root, &mut files)?;
+    for root in scan_roots {
+        collect_codex_session_files(&root.join("sessions"), &mut files)?;
+    }
     files.sort();
+    files.dedup();
     for path in files {
         if let Some(summary) = remote_summary_for_path(&path, &title_store)? {
             println!("{}", serde_json::to_string(&summary)?);
         }
     }
     Ok(())
+}
+
+fn remote_scan_roots(
+    requested_home: &std::path::Path,
+    raw_codex_home: Option<&str>,
+) -> Vec<std::path::PathBuf> {
+    remote_scan_roots_with_parents(
+        requested_home,
+        raw_codex_home,
+        [std::path::Path::new("/home"), std::path::Path::new("/Users")],
+    )
+}
+
+fn remote_scan_roots_with_parents<'a>(
+    requested_home: &std::path::Path,
+    raw_codex_home: Option<&str>,
+    parents: impl IntoIterator<Item = &'a std::path::Path>,
+) -> Vec<std::path::PathBuf> {
+    let mut roots = Vec::new();
+    roots.push(requested_home.to_path_buf());
+
+    let default_like = raw_codex_home
+        .map(str::trim)
+        .is_none_or(|value| value.is_empty() || value == "~/.codex");
+    if !default_like {
+        return roots;
+    }
+
+    if requested_home
+        .join("sessions")
+        .is_dir()
+        && has_any_codex_session_file(&requested_home.join("sessions"))
+    {
+        return roots;
+    }
+
+    for parent in parents {
+        let Ok(entries) = fs::read_dir(parent) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path().join(".codex");
+            if path != requested_home && path.join("sessions").is_dir() {
+                roots.push(path);
+            }
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn has_any_codex_session_file(root: &std::path::Path) -> bool {
+    let Ok(entries) = fs::read_dir(root) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() && has_any_codex_session_file(&path) {
+            return true;
+        }
+        if file_type.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn run_remote_preview(path: &str) -> anyhow::Result<()> {
@@ -5354,8 +5455,8 @@ mod tests {
         dedupe_remote_scanned_sessions, load_remote_machine_sessions_from_mirror,
         mirror_remote_machine_sessions,
         parse_stored_transcript, remote_resume_shell_command, remote_scanned_session_path,
-        remote_ssh_launch_command, remote_command_cache, remote_cache_key,
-        strip_remote_payload_noise,
+        remote_scan_roots_with_parents, remote_ssh_launch_command, remote_command_cache,
+        remote_cache_key, strip_remote_payload_noise,
         stored_session_launch_command,
     };
     use anyhow::Result;
@@ -5632,5 +5733,36 @@ mod tests {
 
         assert!(server.ssh_targets().is_empty());
         assert!(server.remote_machines().is_empty());
+    }
+
+    #[test]
+    fn remote_scan_roots_falls_back_to_machine_user_codex_home() -> Result<()> {
+        let base = std::env::temp_dir().join(format!(
+            "yggterm-remote-scan-roots-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let requested = base.join("root-home").join(".codex");
+        let parent = base.join("home");
+        let machine_user_codex = parent.join("pi").join(".codex");
+        fs::create_dir_all(requested.join("sessions"))?;
+        fs::create_dir_all(machine_user_codex.join("sessions").join("2026").join("03"))?;
+        fs::write(
+            machine_user_codex
+                .join("sessions")
+                .join("2026")
+                .join("03")
+                .join("rollout.jsonl"),
+            "{}\n",
+        )?;
+
+        let roots =
+            remote_scan_roots_with_parents(&requested, Some("~/.codex"), [parent.as_path()]);
+
+        assert!(roots.contains(&requested));
+        assert!(roots.contains(&machine_user_codex));
+
+        let _ = fs::remove_dir_all(base);
+        Ok(())
     }
 }
