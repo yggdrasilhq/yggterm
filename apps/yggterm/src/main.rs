@@ -23,8 +23,10 @@ use yggterm_server::{
 const DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT_ENV: &str =
     "YGGTERM_DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT";
 const ENV_YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF: &str = "YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF";
+const ENV_YGGTERM_ENABLE_ACCESSIBILITY: &str = "YGGTERM_ENABLE_ACCESSIBILITY";
 
 fn main() -> Result<()> {
+    configure_linux_accessibility_bridge();
     tracing_subscriber::fmt()
         .with_env_filter("info")
         .with_target(false)
@@ -198,6 +200,26 @@ fn main() -> Result<()> {
         "theme": match theme { UiTheme::ZedLight => "light", UiTheme::ZedDark => "dark" },
     }));
     launch_result
+}
+
+fn configure_linux_accessibility_bridge() {
+    #[cfg(target_os = "linux")]
+    {
+        let accessibility_enabled = std::env::var(ENV_YGGTERM_ENABLE_ACCESSIBILITY)
+            .ok()
+            .is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            });
+        if accessibility_enabled || std::env::var_os("NO_AT_BRIDGE").is_some() {
+            return;
+        }
+        // WebKitGTK can crash in libatk-bridge on some KDE/Wayland sessions before the
+        // window becomes visible. Default to the safer path and leave an opt-in escape hatch.
+        unsafe { std::env::set_var("NO_AT_BRIDGE", "1") };
+    }
 }
 
 fn load_initial_server_snapshot_fast(
