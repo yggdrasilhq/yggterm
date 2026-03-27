@@ -8,18 +8,17 @@ pub use attach::{AttachMetadata, run_attach};
 pub use daemon::{
     ServerEndpoint, ServerRequest, ServerResponse, ServerRuntimeStatus, TerminalStreamChunk,
     cleanup_legacy_daemons, connect_ssh, connect_ssh_custom, default_endpoint, focus_live,
-    open_remote_session, open_stored_session, ping, raise_external_window,
-    refresh_remote_machine, remove_ssh_target, request_terminal_launch, run_daemon,
-    set_all_preview_blocks_folded, set_view_mode, shutdown, snapshot, start_command_session,
-    start_local_session, start_local_session_at, status, switch_agent_session_mode,
-    sync_external_window, sync_theme, terminal_ensure, terminal_read, terminal_resize,
-    terminal_write, toggle_preview_block,
+    open_remote_session, open_stored_session, ping, raise_external_window, refresh_remote_machine,
+    remove_ssh_target, request_terminal_launch, run_daemon, set_all_preview_blocks_folded,
+    set_view_mode, shutdown, snapshot, start_command_session, start_local_session,
+    start_local_session_at, status, switch_agent_session_mode, sync_external_window, sync_theme,
+    terminal_ensure, terminal_read, terminal_resize, terminal_write, toggle_preview_block,
 };
 pub use host::{GhosttyHostKind, GhosttyHostSupport, GhosttyTerminalHostMode, detect_ghostty_host};
 pub use protocol::{
     YGG_LOADING_NOTIFICATION_AFTER_MS, YGG_PROTOCOL_SCHEMA_VERSION, YggCachePolicy,
-    YggEventEnvelope, YggEventKind, YggOperationPriority, YggProgress, YggRequestMeta,
-    YggSurface, YggTarget,
+    YggEventEnvelope, YggEventKind, YggOperationPriority, YggProgress, YggRequestMeta, YggSurface,
+    YggTarget,
 };
 pub use terminal::{TerminalChunk, TerminalManager, TerminalReadResult};
 
@@ -390,8 +389,9 @@ impl YggtermServer {
         let Some(path) = self.active_session_path.clone() else {
             return Ok(());
         };
-        if let Some((machine_key, session_id)) = parse_remote_scanned_session_path(&path) {
-            self.refresh_remote_scanned_session_preview(machine_key, session_id)?;
+        if let Some((raw_machine_key, session_id)) = parse_remote_scanned_session_path(&path) {
+            let machine_key = normalize_machine_key(raw_machine_key);
+            self.refresh_remote_scanned_session_preview(&machine_key, session_id)?;
             return Ok(());
         }
         let Some(session) = self.sessions.get(&path).cloned() else {
@@ -400,8 +400,9 @@ impl YggtermServer {
         match session.source {
             SessionSource::Stored => self.refresh_stored_session_preview(&path, &session)?,
             SessionSource::LiveSsh => {
-                if let Some((machine_key, session_id)) = parse_remote_scanned_session_path(&path) {
-                    self.refresh_remote_scanned_session_preview(machine_key, session_id)?;
+                if let Some((raw_machine_key, session_id)) = parse_remote_scanned_session_path(&path) {
+                    let machine_key = normalize_machine_key(raw_machine_key);
+                    self.refresh_remote_scanned_session_preview(&machine_key, session_id)?;
                 }
             }
         }
@@ -581,10 +582,11 @@ impl YggtermServer {
         let mut targets = Vec::new();
         let mut seen = HashSet::<(String, String)>::new();
         for path in self.sessions.keys() {
-            let Some((machine_key, session_id)) = parse_remote_scanned_session_path(path) else {
+            let Some((raw_machine_key, session_id)) = parse_remote_scanned_session_path(path) else {
                 continue;
             };
-            let dedupe_key = (machine_key.to_string(), session_id.to_string());
+            let machine_key = normalize_machine_key(raw_machine_key);
+            let dedupe_key = (machine_key.clone(), session_id.to_string());
             if !seen.insert(dedupe_key) {
                 continue;
             }
@@ -605,6 +607,7 @@ impl YggtermServer {
     }
 
     pub fn remove_ssh_targets_for_machine(&mut self, machine_key: &str) -> usize {
+        let machine_key = normalize_machine_key(machine_key);
         let before = self.ssh_targets.len();
         self.ssh_targets
             .retain(|target| machine_key_from_ssh_target(&target.ssh_target) != machine_key);
@@ -662,11 +665,7 @@ impl YggtermServer {
 
     pub fn set_session_precis_hint(&mut self, session_path: &str, precis: &str) {
         if let Some(session) = self.sessions.get_mut(session_path) {
-            upsert_session_metadata(
-                &mut session.preview.summary,
-                "Precis",
-                precis.to_string(),
-            );
+            upsert_session_metadata(&mut session.preview.summary, "Precis", precis.to_string());
         }
         for machine in &mut self.remote_machines {
             for scanned in &mut machine.sessions {
@@ -680,11 +679,7 @@ impl YggtermServer {
 
     pub fn set_session_summary_hint(&mut self, session_path: &str, summary: &str) {
         if let Some(session) = self.sessions.get_mut(session_path) {
-            upsert_session_metadata(
-                &mut session.preview.summary,
-                "Summary",
-                summary.to_string(),
-            );
+            upsert_session_metadata(&mut session.preview.summary, "Summary", summary.to_string());
         }
         for machine in &mut self.remote_machines {
             for scanned in &mut machine.sessions {
@@ -706,23 +701,22 @@ impl YggtermServer {
             .iter()
             .filter_map(|key| self.sessions.get(key).cloned())
             .collect::<Vec<_>>();
-        if let Some(active) = self
-            .active_session()
-            .cloned()
-            .or_else(|| {
-                self.active_session_path.as_deref().and_then(|path| {
-                    synthesize_remote_active_session(
-                        path,
-                        &self.remote_machines,
-                        self.backend,
-                        self.theme,
-                        self.ghostty_host.bridge_enabled,
-                    )
-                })
+        if let Some(active) = self.active_session().cloned().or_else(|| {
+            self.active_session_path.as_deref().and_then(|path| {
+                synthesize_remote_active_session(
+                    path,
+                    &self.remote_machines,
+                    self.backend,
+                    self.theme,
+                    self.ghostty_host.bridge_enabled,
+                )
             })
-        {
+        }) {
             let active_path = active.session_path.clone();
-            if !sessions.iter().any(|session| session.session_path == active_path) {
+            if !sessions
+                .iter()
+                .any(|session| session.session_path == active_path)
+            {
                 sessions.insert(0, active);
             }
         }
@@ -737,20 +731,17 @@ impl YggtermServer {
             .cloned()
             .map(snapshot_session_view)
             .collect::<Vec<_>>();
-        let active_session = self
-            .active_session()
-            .cloned()
-            .or_else(|| {
-                self.active_session_path.as_deref().and_then(|path| {
-                    synthesize_remote_active_session(
-                        path,
-                        &self.remote_machines,
-                        self.backend,
-                        self.theme,
-                        self.ghostty_host.bridge_enabled,
-                    )
-                })
-            });
+        let active_session = self.active_session().cloned().or_else(|| {
+            self.active_session_path.as_deref().and_then(|path| {
+                synthesize_remote_active_session(
+                    path,
+                    &self.remote_machines,
+                    self.backend,
+                    self.theme,
+                    self.ghostty_host.bridge_enabled,
+                )
+            })
+        });
         if let Some(active) = active_session.clone().map(snapshot_session_view) {
             let active_path = active.session_path.clone();
             if !live_sessions
@@ -801,7 +792,11 @@ impl YggtermServer {
                 self.ghostty_host.bridge_enabled,
             )
         {
-            if !self.live_session_order.iter().any(|path| path == &active_path) {
+            if !self
+                .live_session_order
+                .iter()
+                .any(|path| path == &active_path)
+            {
                 self.live_session_order.insert(0, active_path.clone());
             }
             self.sessions.insert(active_path, session);
@@ -875,7 +870,14 @@ impl YggtermServer {
         self.ssh_targets = state
             .ssh_targets
             .into_iter()
-            .filter(|target| !is_loopback_ssh_target(&target.ssh_target))
+            .filter_map(|mut target| {
+                target.ssh_target = canonicalize_ssh_target_alias(&target.ssh_target);
+                if is_loopback_ssh_target(&target.ssh_target) {
+                    return None;
+                }
+                target.label = ssh_machine_label(&target);
+                Some(target)
+            })
             .collect();
         for target in &mut self.ssh_targets {
             target.label = ssh_machine_label(target);
@@ -883,17 +885,58 @@ impl YggtermServer {
         self.remote_machines = state
             .remote_machines
             .into_iter()
-            .filter(|machine| !is_loopback_ssh_target(&machine.ssh_target))
-            .map(|mut machine| {
-                if machine.health == RemoteMachineHealth::Healthy {
-                    machine.health = RemoteMachineHealth::Cached;
+            .filter_map(|mut machine| {
+                let legacy_machine_key = machine.machine_key.clone();
+                machine.machine_key = normalize_machine_key(&machine.machine_key);
+                machine.ssh_target = canonicalize_ssh_target_alias(&machine.ssh_target);
+                if is_loopback_ssh_target(&machine.ssh_target) {
+                    return None;
                 }
+                let mirrored_sessions = load_remote_machine_sessions_from_mirror(&machine.machine_key)
+                    .or_else(|_| {
+                        load_remote_machine_sessions_from_mirror(&legacy_machine_key)
+                    })
+                    .unwrap_or_default();
                 machine.sessions = if machine.sessions.is_empty() {
-                    load_remote_machine_sessions_from_mirror(&machine.machine_key).unwrap_or_default()
+                    mirrored_sessions
                 } else {
-                    overlay_mirrored_remote_sessions(&machine.machine_key, &machine.sessions)
+                    if !mirrored_sessions.is_empty() {
+                        machine.sessions = overlay_mirrored_remote_sessions(
+                            &machine.machine_key,
+                            &machine.sessions,
+                        );
+                    }
+                    machine
+                        .sessions
+                        .iter()
+                        .cloned()
+                        .map(|mut session| {
+                            if let Some((session_machine_key, session_id)) =
+                                parse_remote_scanned_session_path(&session.session_path)
+                            {
+                                let canonical_session_machine_key =
+                                    normalize_machine_key(session_machine_key);
+                                if canonical_session_machine_key != machine.machine_key {
+                                    session.session_path =
+                                        remote_scanned_session_path(&machine.machine_key, session_id);
+                                }
+                            }
+                            session
+                        })
+                        .collect::<Vec<_>>();
+                    if !machine.sessions.is_empty() {
+                        overlay_mirrored_remote_sessions(&machine.machine_key, &machine.sessions)
+                    } else {
+                        machine.sessions.clone()
+                    }
                 };
                 if !machine.sessions.is_empty() {
+                    machine.health = RemoteMachineHealth::Cached;
+                }
+                Some(machine)
+            })
+            .map(|mut machine| {
+                if machine.health == RemoteMachineHealth::Healthy {
                     machine.health = RemoteMachineHealth::Cached;
                 }
                 machine
@@ -912,14 +955,21 @@ impl YggtermServer {
             }
         }
         for session in state.stored_sessions {
+            let path = if let Some((machine_key, session_id)) =
+                parse_remote_scanned_session_path(&session.path)
+            {
+                remote_scanned_session_path(&normalize_machine_key(machine_key), session_id)
+            } else {
+                session.path.clone()
+            };
             let document = if session.kind == SessionKind::Document {
-                store.and_then(|store| store.load_document(&session.path).ok().flatten())
+                store.and_then(|store| store.load_document(&path).ok().flatten())
             } else {
                 None
             };
             self.open_or_focus_session(
                 session.kind,
-                &session.path,
+                &path,
                 session.session_id.as_deref(),
                 session.cwd.as_deref(),
                 session.title_hint.as_deref(),
@@ -944,10 +994,20 @@ impl YggtermServer {
         }
         self.active_view_mode = state.active_view_mode;
         if let Some(path) = desired_active_path {
-            if self.sessions.contains_key(&path) {
-                self.active_session_path = Some(path.clone());
+            let active_path = if let Some((machine_key, session_id)) =
+                parse_remote_scanned_session_path(&path)
+            {
+                remote_scanned_session_path(
+                    &normalize_machine_key(machine_key),
+                    session_id,
+                )
+            } else {
+                path
+            };
+            if self.sessions.contains_key(&active_path) {
+                self.active_session_path = Some(active_path.clone());
                 if self.active_view_mode == WorkspaceViewMode::Terminal {
-                    self.request_terminal_launch_for_path(&path);
+                    self.request_terminal_launch_for_path(&active_path);
                 }
             }
         }
@@ -983,7 +1043,7 @@ impl YggtermServer {
         target: &str,
         prefix: Option<&str>,
     ) -> anyhow::Result<(String, bool)> {
-        let ssh_target = target.trim();
+        let ssh_target = canonicalize_ssh_target_alias(target);
         if ssh_target.is_empty() {
             anyhow::bail!("enter an SSH target such as dev, pi@raspberry, or user@ip");
         }
@@ -994,12 +1054,12 @@ impl YggtermServer {
         let label = ssh_target
             .rsplit('@')
             .next()
-            .unwrap_or(ssh_target)
+            .unwrap_or(ssh_target.as_str())
             .to_string();
         let target = SshConnectTarget {
             label,
             kind: SessionKind::SshShell,
-            ssh_target: ssh_target.to_string(),
+            ssh_target,
             prefix,
             cwd: None,
         };
@@ -1067,6 +1127,7 @@ impl YggtermServer {
     }
 
     pub fn refresh_remote_machine_by_key(&mut self, machine_key: &str) -> anyhow::Result<()> {
+        let machine_key = normalize_machine_key(machine_key);
         let target = self
             .ssh_targets
             .iter()
@@ -1095,13 +1156,14 @@ impl YggtermServer {
         cwd: Option<&str>,
         title_hint: Option<&str>,
     ) -> anyhow::Result<String> {
+        let machine_key = normalize_machine_key(machine_key);
         let machine = self
             .remote_machines
             .iter()
             .find(|machine| machine.machine_key == machine_key)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("remote machine not found: {machine_key}"))?;
-        let session_path = remote_scanned_session_path(machine_key, session_id);
+        let session_path = remote_scanned_session_path(&machine_key, session_id);
         let target = SshConnectTarget {
             label: machine.label.clone(),
             kind: SessionKind::SshShell,
@@ -1124,7 +1186,13 @@ impl YggtermServer {
                     &target.ssh_target,
                     target.prefix.as_deref(),
                     &remote_binary,
-                    &["server", "remote", "resume-codex", session_id, cwd.unwrap_or("")],
+                    &[
+                        "server",
+                        "remote",
+                        "resume-codex",
+                        session_id,
+                        cwd.unwrap_or(""),
+                    ],
                 );
                 session.terminal_lines = vec![
                     format!("$ {}", session.launch_command),
@@ -1133,7 +1201,11 @@ impl YggtermServer {
                     format!("Workspace: {}", cwd.unwrap_or("<unknown>")),
                     "Daemon PTY: request main viewport terminal stream".to_string(),
                 ];
-                upsert_session_metadata(&mut session.metadata, "Source", "remote-codex".to_string());
+                upsert_session_metadata(
+                    &mut session.metadata,
+                    "Source",
+                    "remote-codex".to_string(),
+                );
                 upsert_session_metadata(&mut session.metadata, "Host", target.ssh_target.clone());
                 upsert_session_metadata(
                     &mut session.metadata,
@@ -1198,24 +1270,23 @@ impl YggtermServer {
                 &target.ssh_target,
                 target.prefix.as_deref(),
                 &remote_binary,
-                &["server", "remote", "resume-codex", session_id, cwd.unwrap_or("")],
+                &[
+                    "server",
+                    "remote",
+                    "resume-codex",
+                    session_id,
+                    cwd.unwrap_or(""),
+                ],
             );
             session.terminal_lines = vec![
                 format!("$ {}", session.launch_command),
                 format!("Queue remote Yggterm resume {session_id}"),
                 format!("Target host: {}", target.ssh_target),
-                format!(
-                    "Workspace: {}",
-                    cwd.unwrap_or("<unknown>")
-                ),
+                format!("Workspace: {}", cwd.unwrap_or("<unknown>")),
                 "Daemon PTY: request main viewport terminal stream".to_string(),
             ];
             upsert_session_metadata(&mut session.metadata, "Source", "remote-codex".to_string());
-            upsert_session_metadata(
-                &mut session.metadata,
-                "Host",
-                target.ssh_target.clone(),
-            );
+            upsert_session_metadata(&mut session.metadata, "Host", target.ssh_target.clone());
             upsert_session_metadata(
                 &mut session.metadata,
                 "Restore",
@@ -1356,7 +1427,7 @@ impl YggtermServer {
             && let Some(machine) = self
                 .remote_machines
                 .iter()
-                .find(|machine| machine.machine_key == machine_key)
+                .find(|machine| machine.machine_key == normalize_machine_key(machine_key))
                 .cloned()
             && let Some(scanned) = machine
                 .sessions
@@ -1364,6 +1435,8 @@ impl YggtermServer {
                 .find(|session| session.session_id == session_id)
                 .cloned()
         {
+            let normalized_live_key =
+                remote_scanned_session_path(&normalize_machine_key(machine_key), session_id);
             let mut session = synthesize_remote_scanned_session_view(
                 &machine,
                 &scanned,
@@ -1374,9 +1447,10 @@ impl YggtermServer {
             if !live.title.trim().is_empty() && !looks_like_generated_fallback_title(&live.title) {
                 session.title = live.title.clone();
             }
-            self.sessions.insert(live.key.clone(), session);
-            self.live_session_order.retain(|existing| existing != &live.key);
-            self.live_session_order.insert(0, live.key.clone());
+            self.sessions.insert(normalized_live_key.clone(), session);
+            self.live_session_order
+                .retain(|existing| existing != &normalized_live_key);
+            self.live_session_order.insert(0, normalized_live_key);
             return;
         }
         self.insert_live_session_with_launch(
@@ -1554,24 +1628,27 @@ impl YggtermServer {
                 {
                     let (remote_binary, remote_deploy_state) =
                         resolve_remote_yggterm_binary(&ssh_target, session.ssh_prefix.as_deref())
-                            .unwrap_or_else(|_| ("yggterm".to_string(), RemoteDeployState::Planned));
+                            .unwrap_or_else(|_| {
+                                ("yggterm".to_string(), RemoteDeployState::Planned)
+                            });
                     session.remote_deploy_state = remote_deploy_state;
-                    session.launch_command = if session.session_path.starts_with("remote-session://") {
-                        let cwd = session_metadata_value(session, "Cwd").unwrap_or_default();
-                        remote_ssh_launch_command(
-                            &ssh_target,
-                            session.ssh_prefix.as_deref(),
-                            &remote_binary,
-                            &["server", "remote", "resume-codex", &session.id, &cwd],
-                        )
-                    } else {
-                        remote_ssh_launch_command(
-                            &ssh_target,
-                            session.ssh_prefix.as_deref(),
-                            &remote_binary,
-                            &["server", "attach", &session.id],
-                        )
-                    };
+                    session.launch_command =
+                        if session.session_path.starts_with("remote-session://") {
+                            let cwd = session_metadata_value(session, "Cwd").unwrap_or_default();
+                            remote_ssh_launch_command(
+                                &ssh_target,
+                                session.ssh_prefix.as_deref(),
+                                &remote_binary,
+                                &["server", "remote", "resume-codex", &session.id, &cwd],
+                            )
+                        } else {
+                            remote_ssh_launch_command(
+                                &ssh_target,
+                                session.ssh_prefix.as_deref(),
+                                &remote_binary,
+                                &["server", "attach", &session.id],
+                            )
+                        };
                     upsert_session_metadata(
                         &mut session.metadata,
                         "Deploy",
@@ -1677,7 +1754,7 @@ impl YggtermServer {
         let cwd = session_metadata_value(existing, "Cwd");
         let title_hint = (!looks_like_generated_fallback_title(&existing.title)
             && !existing.title.trim().is_empty())
-            .then_some(existing.title.clone());
+        .then_some(existing.title.clone());
         let refreshed = build_session(
             existing.kind,
             path,
@@ -1704,7 +1781,8 @@ impl YggtermServer {
         machine_key: &str,
         session_id: &str,
     ) -> anyhow::Result<()> {
-        self.refresh_remote_machine_by_key(machine_key)?;
+        let machine_key = normalize_machine_key(machine_key);
+        self.refresh_remote_machine_by_key(&machine_key)?;
         let Some(machine) = self
             .remote_machines
             .iter()
@@ -1719,9 +1797,9 @@ impl YggtermServer {
             .find(|session| session.session_id == session_id)
             .cloned()
         else {
-            return self.refresh_remote_preview_from_active_session(machine_key, session_id);
+            return self.refresh_remote_preview_from_active_session(&machine_key, session_id);
         };
-        let path = remote_scanned_session_path(machine_key, session_id);
+        let path = remote_scanned_session_path(&machine_key, session_id);
         let mut refreshed_title = None::<String>;
         let mut refreshed_precis = None::<String>;
         let mut refreshed_summary = None::<String>;
@@ -1739,9 +1817,21 @@ impl YggtermServer {
                     refreshed_precis = payload.cached_precis.clone();
                     refreshed_summary = payload.cached_summary.clone();
                     apply_remote_preview_payload(session, payload);
-                    upsert_session_metadata(&mut session.metadata, "Source", "remote-codex".to_string());
-                    upsert_session_metadata(&mut session.metadata, "Host", machine.ssh_target.clone());
-                    upsert_session_metadata(&mut session.metadata, "UUID", scanned.session_id.clone());
+                    upsert_session_metadata(
+                        &mut session.metadata,
+                        "Source",
+                        "remote-codex".to_string(),
+                    );
+                    upsert_session_metadata(
+                        &mut session.metadata,
+                        "Host",
+                        machine.ssh_target.clone(),
+                    );
+                    upsert_session_metadata(
+                        &mut session.metadata,
+                        "UUID",
+                        scanned.session_id.clone(),
+                    );
                     upsert_session_metadata(&mut session.metadata, "Cwd", scanned.cwd.clone());
                 }
                 Err(error) => {
@@ -1772,7 +1862,8 @@ impl YggtermServer {
         machine_key: &str,
         session_id: &str,
     ) -> anyhow::Result<()> {
-        let path = remote_scanned_session_path(machine_key, session_id);
+        let machine_key = normalize_machine_key(machine_key);
+        let path = remote_scanned_session_path(&machine_key, session_id);
         let Some(session) = self.sessions.get_mut(&path) else {
             return Ok(());
         };
@@ -1799,7 +1890,11 @@ impl YggtermServer {
                 let refreshed_precis = payload.cached_precis.clone();
                 let refreshed_summary = payload.cached_summary.clone();
                 apply_remote_preview_payload(session, payload);
-                upsert_session_metadata(&mut session.metadata, "Source", "remote-codex".to_string());
+                upsert_session_metadata(
+                    &mut session.metadata,
+                    "Source",
+                    "remote-codex".to_string(),
+                );
                 upsert_session_metadata(&mut session.metadata, "Host", ssh_target);
                 upsert_session_metadata(&mut session.metadata, "UUID", session_id.to_string());
                 if let Some(title) = refreshed_title.as_deref() {
@@ -1820,7 +1915,9 @@ impl YggtermServer {
     }
 
     fn connect_ssh_like_target(&mut self, target: &SshConnectTarget) -> (Option<String>, bool) {
-        self.upsert_ssh_target(target);
+        let mut target = target.clone();
+        target.ssh_target = canonicalize_ssh_target_alias(&target.ssh_target);
+        self.upsert_ssh_target(&target);
         if let Some(existing_key) = self
             .sessions
             .iter()
@@ -1841,7 +1938,7 @@ impl YggtermServer {
             SessionKind::Shell => format!("local::{uuid}"),
             _ => format!("live::{uuid}"),
         };
-        self.insert_live_session(&key, &uuid, target.kind, target, Some(target.label.clone()));
+        self.insert_live_session(&key, &uuid, target.kind, &target, Some(target.label.clone()));
         (Some(key), false)
     }
 
@@ -1860,8 +1957,11 @@ impl YggtermServer {
             return;
         }
         self.ssh_targets.push(target.clone());
-        self.ssh_targets
-            .sort_by(|left, right| left.label.cmp(&right.label).then_with(|| left.ssh_target.cmp(&right.ssh_target)));
+        self.ssh_targets.sort_by(|left, right| {
+            left.label
+                .cmp(&right.label)
+                .then_with(|| left.ssh_target.cmp(&right.ssh_target))
+        });
         self.ensure_remote_machine_stub(target);
     }
 
@@ -1889,8 +1989,11 @@ impl YggtermServer {
             health: RemoteMachineHealth::Cached,
             sessions: Vec::new(),
         });
-        self.remote_machines
-            .sort_by(|left, right| left.label.cmp(&right.label).then_with(|| left.machine_key.cmp(&right.machine_key)));
+        self.remote_machines.sort_by(|left, right| {
+            left.label
+                .cmp(&right.label)
+                .then_with(|| left.machine_key.cmp(&right.machine_key))
+        });
         self.remote_machines
             .iter()
             .position(|machine| machine.machine_key == machine_key)
@@ -1939,19 +2042,37 @@ fn ssh_machine_label(target: &SshConnectTarget) -> String {
 }
 
 fn ssh_host_from_target(ssh_target: &str) -> &str {
-    ssh_target
-        .rsplit('@')
-        .next()
-        .unwrap_or(ssh_target)
-        .trim()
+    ssh_target.rsplit('@').next().unwrap_or(ssh_target).trim()
+}
+
+fn canonicalize_ssh_target_alias(ssh_target: &str) -> String {
+    let ssh_target = ssh_target.trim();
+    let (username, host) = match ssh_target.rsplit_once('@') {
+        Some((username, host)) => (Some(username), host),
+        None => (None, ssh_target),
+    };
+    let canonical_host = canonicalize_remote_machine_alias(host);
+    match username {
+        Some(username) => format!("{username}@{canonical_host}"),
+        None => canonical_host,
+    }
 }
 
 fn is_loopback_ssh_target(ssh_target: &str) -> bool {
-    matches!(ssh_host_from_target(ssh_target), "localhost" | "127.0.0.1" | "::1")
+    matches!(
+        ssh_host_from_target(ssh_target),
+        "localhost" | "127.0.0.1" | "::1"
+    )
 }
 
 fn machine_key_from_ssh_target(ssh_target: &str) -> String {
-    ssh_target
+    normalize_machine_key(
+        canonicalize_remote_machine_alias(ssh_host_from_target(ssh_target)).as_str(),
+    )
+}
+
+fn normalize_machine_key(raw_machine_key: &str) -> String {
+    raw_machine_key
         .chars()
         .map(|ch| {
             if ch.is_ascii_alphanumeric() {
@@ -1965,6 +2086,13 @@ fn machine_key_from_ssh_target(ssh_target: &str) -> String {
         .to_string()
 }
 
+fn canonicalize_remote_machine_alias(machine_key: &str) -> String {
+    match machine_key.trim().to_ascii_lowercase().as_str() {
+        "juju" | "jujo" => "jojo".to_string(),
+        value => value.to_string(),
+    }
+}
+
 fn remote_scanned_session_path(machine_key: &str, session_id: &str) -> String {
     format!("remote-session://{machine_key}/{session_id}")
 }
@@ -1975,15 +2103,20 @@ fn parse_remote_scanned_session_path(path: &str) -> Option<(&str, &str)> {
     Some((machine_key, session_id))
 }
 
-fn remote_resume_shell_command(session_id: &str, cwd: Option<&str>, prefix: Option<&str>) -> String {
+fn remote_resume_shell_command(
+    session_id: &str,
+    cwd: Option<&str>,
+    prefix: Option<&str>,
+) -> String {
     let base = match cwd.filter(|cwd| !cwd.trim().is_empty()) {
-        Some(cwd) => format!("cd {} && codex resume {}", shell_single_quote(cwd), shell_single_quote(session_id)),
+        Some(cwd) => format!(
+            "cd {} && codex resume {}",
+            shell_single_quote(cwd),
+            shell_single_quote(session_id)
+        ),
         None => format!("codex resume {}", shell_single_quote(session_id)),
     };
-    match prefix
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
+    match prefix.map(str::trim).filter(|value| !value.is_empty()) {
         Some(prefix) => format!("{prefix} && {base}"),
         None => base,
     }
@@ -2028,7 +2161,15 @@ fn tmux_has_session(session_name: &str) -> anyhow::Result<bool> {
 
 fn tmux_spawn_codex_session(session_name: &str, command: &str) -> anyhow::Result<()> {
     let status = Command::new("tmux")
-        .args(["new-session", "-d", "-s", session_name, "sh", "-lc", command])
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            session_name,
+            "sh",
+            "-lc",
+            command,
+        ])
         .status()
         .with_context(|| format!("creating tmux session {session_name}"))?;
     if status.success() {
@@ -2099,10 +2240,7 @@ fn remote_ssh_launch_command(
         inner.push(' ');
         inner.push_str(&shell_single_quote(arg));
     }
-    let remote = match prefix
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
+    let remote = match prefix.map(str::trim).filter(|value| !value.is_empty()) {
         Some(prefix) => format!("{prefix} && {inner}"),
         None => inner,
     };
@@ -2238,10 +2376,22 @@ fn apply_remote_scanned_session_preview(
         "{} user · {} assistant",
         scanned.user_message_count, scanned.assistant_message_count
     );
-    upsert_session_metadata(&mut session.preview.summary, "Session", scanned.session_id.clone());
-    upsert_session_metadata(&mut session.preview.summary, "Host", machine_label.to_string());
+    upsert_session_metadata(
+        &mut session.preview.summary,
+        "Session",
+        scanned.session_id.clone(),
+    );
+    upsert_session_metadata(
+        &mut session.preview.summary,
+        "Host",
+        machine_label.to_string(),
+    );
     upsert_session_metadata(&mut session.preview.summary, "Cwd", scanned.cwd.clone());
-    upsert_session_metadata(&mut session.preview.summary, "Started", scanned.started_at.clone());
+    upsert_session_metadata(
+        &mut session.preview.summary,
+        "Started",
+        scanned.started_at.clone(),
+    );
     upsert_session_metadata(&mut session.preview.summary, "Messages", messages.clone());
     upsert_session_metadata(
         &mut session.preview.summary,
@@ -2249,18 +2399,10 @@ fn apply_remote_scanned_session_preview(
         modified_epoch_display(scanned.modified_epoch),
     );
     if let Some(precis) = &scanned.cached_precis {
-        upsert_session_metadata(
-            &mut session.preview.summary,
-            "Precis",
-            precis.clone(),
-        );
+        upsert_session_metadata(&mut session.preview.summary, "Precis", precis.clone());
     }
     if let Some(summary) = &scanned.cached_summary {
-        upsert_session_metadata(
-            &mut session.preview.summary,
-            "Summary",
-            summary.clone(),
-        );
+        upsert_session_metadata(&mut session.preview.summary, "Summary", summary.clone());
     }
 
     upsert_session_metadata(&mut session.metadata, "Source", "remote-codex".to_string());
@@ -2385,7 +2527,9 @@ pub fn fetch_remote_generation_context(
                 &["server", "remote", "generation-context", storage_path],
                 None,
             )
-            .with_context(|| format!("retrying remote generation-context after bootstrap: {first_error:#}"))
+            .with_context(|| {
+                format!("retrying remote generation-context after bootstrap: {first_error:#}")
+            })
         }
     }
 }
@@ -2397,7 +2541,9 @@ fn collect_codex_session_files(
     if !root.exists() {
         return Ok(());
     }
-    for entry in fs::read_dir(root).with_context(|| format!("reading codex session dir {}", root.display()))? {
+    for entry in fs::read_dir(root)
+        .with_context(|| format!("reading codex session dir {}", root.display()))?
+    {
         let entry = entry?;
         let path = entry.path();
         let file_type = entry.file_type()?;
@@ -2419,8 +2565,8 @@ fn remote_summary_for_path(
     let Some((session_id, cwd)) = read_codex_session_identity_fields(path)? else {
         return Ok(None);
     };
-    let stat = fs::metadata(path)
-        .with_context(|| format!("reading metadata for {}", path.display()))?;
+    let stat =
+        fs::metadata(path).with_context(|| format!("reading metadata for {}", path.display()))?;
     let modified_epoch = stat
         .modified()
         .ok()
@@ -2781,8 +2927,12 @@ const REMOTE_METADATA_MIRROR_DB_FILENAME: &str = "remote-session-cache.db";
 fn open_remote_metadata_mirror_store() -> anyhow::Result<Connection> {
     let home = resolve_yggterm_home()?;
     let db_path = home.join(REMOTE_METADATA_MIRROR_DB_FILENAME);
-    let conn = Connection::open(&db_path)
-        .with_context(|| format!("failed to open remote metadata mirror {}", db_path.display()))?;
+    let conn = Connection::open(&db_path).with_context(|| {
+        format!(
+            "failed to open remote metadata mirror {}",
+            db_path.display()
+        )
+    })?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS remote_session_metadata (
             machine_key TEXT NOT NULL,
@@ -2898,27 +3048,39 @@ fn overlay_mirrored_remote_sessions(
         .into_iter()
         .map(|session| (session.session_id.clone(), session))
         .collect::<std::collections::BTreeMap<_, _>>();
-    dedupe_remote_scanned_sessions(sessions
-        .iter()
-        .cloned()
-        .map(|mut session| {
-            if let Some(mirrored) = mirrored_by_id.get(&session.session_id) {
-                if !mirrored.title_hint.trim().is_empty() {
-                    session.title_hint = mirrored.title_hint.clone();
+    dedupe_remote_scanned_sessions(
+        sessions
+            .iter()
+            .cloned()
+            .map(|mut session| {
+                if let Some(mirrored) = mirrored_by_id.get(&session.session_id) {
+                    if !mirrored.title_hint.trim().is_empty() {
+                        session.title_hint = mirrored.title_hint.clone();
+                    }
+                    if session.recent_context.trim().is_empty()
+                        && !mirrored.recent_context.trim().is_empty()
+                    {
+                        session.recent_context = mirrored.recent_context.clone();
+                    }
+                    if mirrored
+                        .cached_precis
+                        .as_ref()
+                        .is_some_and(|value| !value.trim().is_empty())
+                    {
+                        session.cached_precis = mirrored.cached_precis.clone();
+                    }
+                    if mirrored
+                        .cached_summary
+                        .as_ref()
+                        .is_some_and(|value| !value.trim().is_empty())
+                    {
+                        session.cached_summary = mirrored.cached_summary.clone();
+                    }
                 }
-                if session.recent_context.trim().is_empty() && !mirrored.recent_context.trim().is_empty() {
-                    session.recent_context = mirrored.recent_context.clone();
-                }
-                if mirrored.cached_precis.as_ref().is_some_and(|value| !value.trim().is_empty()) {
-                    session.cached_precis = mirrored.cached_precis.clone();
-                }
-                if mirrored.cached_summary.as_ref().is_some_and(|value| !value.trim().is_empty()) {
-                    session.cached_summary = mirrored.cached_summary.clone();
-                }
-            }
-            session
-        })
-        .collect())
+                session
+            })
+            .collect(),
+    )
 }
 
 fn dedupe_remote_scanned_sessions(
@@ -2935,7 +3097,11 @@ fn dedupe_remote_scanned_sessions(
                 let newer = session.modified_epoch > existing.modified_epoch
                     || (session.modified_epoch == existing.modified_epoch
                         && session.event_count > existing.event_count);
-                let mut merged = if newer { session.clone() } else { existing.clone() };
+                let mut merged = if newer {
+                    session.clone()
+                } else {
+                    existing.clone()
+                };
                 let other = if newer { existing.clone() } else { session };
 
                 if looks_like_generated_fallback_title(&merged.title_hint)
@@ -2943,10 +3109,18 @@ fn dedupe_remote_scanned_sessions(
                 {
                     merged.title_hint = other.title_hint;
                 }
-                if merged.cached_precis.as_ref().is_none_or(|value| value.trim().is_empty()) {
+                if merged
+                    .cached_precis
+                    .as_ref()
+                    .is_none_or(|value| value.trim().is_empty())
+                {
                     merged.cached_precis = other.cached_precis;
                 }
-                if merged.cached_summary.as_ref().is_none_or(|value| value.trim().is_empty()) {
+                if merged
+                    .cached_summary
+                    .as_ref()
+                    .is_none_or(|value| value.trim().is_empty())
+                {
                     merged.cached_summary = other.cached_summary;
                 }
                 if merged.recent_context.trim().is_empty()
@@ -3146,7 +3320,8 @@ fn run_remote_binary_command(
         binary_invocation.push(' ');
         binary_invocation.push_str(&shell_single_quote(arg));
     }
-    let inner = format!("printf '%s\\n' {sentinel} ; {binary_invocation}",
+    let inner = format!(
+        "printf '%s\\n' {sentinel} ; {binary_invocation}",
         sentinel = shell_single_quote(REMOTE_OUTPUT_SENTINEL),
         binary_invocation = binary_invocation,
     );
@@ -3186,13 +3361,7 @@ fn run_remote_yggterm_command(
 ) -> anyhow::Result<String> {
     let cache_key = remote_cache_key(ssh_target, exec_prefix);
     let resolved = resolve_remote_yggterm_binary(ssh_target, exec_prefix)?;
-    match run_remote_binary_command(
-        ssh_target,
-        exec_prefix,
-        &resolved.0,
-        args,
-        stdin_bytes,
-    ) {
+    match run_remote_binary_command(ssh_target, exec_prefix, &resolved.0, args, stdin_bytes) {
         Ok(output) => Ok(output),
         Err(first_error) => {
             if !should_fallback_to_python(&first_error) {
@@ -3202,14 +3371,10 @@ fn run_remote_yggterm_command(
                 cache.remove(&cache_key);
             }
             let retried = resolve_remote_yggterm_binary(ssh_target, exec_prefix)?;
-            run_remote_binary_command(
-                ssh_target,
-                exec_prefix,
-                &retried.0,
-                args,
-                stdin_bytes,
-            )
-            .with_context(|| format!("retrying remote yggterm command after cache reset: {first_error:#}"))
+            run_remote_binary_command(ssh_target, exec_prefix, &retried.0, args, stdin_bytes)
+                .with_context(|| {
+                    format!("retrying remote yggterm command after cache reset: {first_error:#}")
+                })
         }
     }
 }
@@ -3219,7 +3384,81 @@ fn should_fallback_to_python(error: &anyhow::Error) -> bool {
     message.contains("command not found")
         || message.contains("not found")
         || message.contains("No such file")
+        || message.contains("yggterm-headless only supports server subcommands")
         || message.contains("remote yggterm command failed")
+}
+
+fn looks_like_version(value: &str) -> bool {
+    let text = value.trim();
+    if text.is_empty() {
+        return false;
+    }
+    let mut saw_dot = false;
+    for ch in text.chars() {
+        if ch.is_ascii_digit() {
+            continue;
+        }
+        if ch == '.' {
+            saw_dot = true;
+            continue;
+        }
+        return false;
+    }
+    saw_dot
+}
+
+fn is_remote_protocol_probe_recoverable(output: &str) -> bool {
+    let text = output.trim();
+    if text.is_empty() {
+        return true;
+    }
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("yggterm-headless only supports server subcommands")
+        || lower.contains("supports server subcommands")
+        || lower.contains("unrecognized command")
+        || lower.contains("unknown command")
+        || lower.contains("no such command")
+        || lower.contains("not found")
+        || lower.contains("command not found")
+        || lower.contains("usage:")
+        || lower.contains("not supported")
+    {
+        return true;
+    }
+    if looks_like_version(text) && text != daemon::SERVER_PROTOCOL_VERSION {
+        return true;
+    }
+    false
+}
+
+fn check_remote_protocol_version(
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+    binary_expr: &str,
+) -> anyhow::Result<()> {
+    let version = remote_protocol_version_for_binary(ssh_target, exec_prefix, binary_expr)?;
+    let normalized = version.trim();
+    if normalized == daemon::SERVER_PROTOCOL_VERSION {
+        return Ok(());
+    }
+    if is_remote_protocol_probe_recoverable(normalized) {
+        anyhow::bail!(
+            "remote yggterm protocol mismatch for {} with {binary_expr}: expected {}, got {}",
+            ssh_target,
+            daemon::SERVER_PROTOCOL_VERSION,
+            if normalized.is_empty() {
+                "<empty>"
+            } else {
+                normalized
+            }
+        );
+    }
+    anyhow::bail!(
+        "remote yggterm protocol mismatch for {} with {binary_expr}: expected {}, got {}",
+        ssh_target,
+        daemon::SERVER_PROTOCOL_VERSION,
+        normalized
+    )
 }
 
 fn remote_protocol_version_for_binary(
@@ -3240,8 +3479,8 @@ fn bootstrap_remote_yggterm(ssh_target: &str, exec_prefix: Option<&str>) -> anyh
     let exe_path = local_remote_bootstrap_executable()
         .or_else(|| std::env::current_exe().ok())
         .context("resolving local yggterm remote executable")?;
-    let payload =
-        fs::read(&exe_path).with_context(|| format!("reading local yggterm binary {}", exe_path.display()))?;
+    let payload = fs::read(&exe_path)
+        .with_context(|| format!("reading local yggterm binary {}", exe_path.display()))?;
     let mut cmd = Command::new("ssh");
     cmd.arg("-o").arg("ConnectTimeout=10");
     cmd.arg("-o").arg("BatchMode=yes");
@@ -3277,7 +3516,10 @@ fn bootstrap_remote_yggterm(ssh_target: &str, exec_prefix: Option<&str>) -> anyh
 
 fn local_remote_bootstrap_executable() -> Option<PathBuf> {
     let current = std::env::current_exe().ok()?;
-    let current_ext = current.extension().and_then(|ext| ext.to_str()).unwrap_or_default();
+    let current_ext = current
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default();
     let candidates = if current_ext.eq_ignore_ascii_case("exe") {
         vec![
             current.with_file_name("yggterm-headless.exe"),
@@ -3302,23 +3544,37 @@ fn resolve_remote_yggterm_binary(
     exec_prefix: Option<&str>,
 ) -> anyhow::Result<(String, RemoteDeployState)> {
     let perf_home = resolve_yggterm_home().ok();
-    let perf_span = perf_home
+    let mut perf_span = perf_home
         .as_ref()
         .map(|home| PerfSpan::start(home.clone(), "remote", "resolve_yggterm_binary"));
+    let mut finish_span = |meta: serde_json::Value| {
+        if let Some(span) = perf_span.take() {
+            span.finish(meta);
+        }
+    };
     let cache_key = remote_cache_key(ssh_target, exec_prefix);
     if let Some(cached) = remote_command_cache()
         .lock()
         .ok()
         .and_then(|cache| cache.get(&cache_key).cloned())
     {
-        if let Some(span) = perf_span {
-            span.finish(serde_json::json!({
+        if check_remote_protocol_version(ssh_target, exec_prefix, &cached).is_ok() {
+            finish_span(serde_json::json!({
                 "ssh_target": ssh_target,
                 "result": "cache_hit",
                 "binary_expr": cached.clone(),
+                "protocol_version": daemon::SERVER_PROTOCOL_VERSION,
             }));
+            return Ok((cached, RemoteDeployState::Ready));
         }
-        return Ok((cached, RemoteDeployState::Ready));
+        if let Ok(mut cache) = remote_command_cache().lock() {
+            cache.remove(&cache_key);
+        }
+        finish_span(serde_json::json!({
+            "ssh_target": ssh_target,
+            "result": "cache_invalidation",
+            "binary_expr": cached,
+        }));
     }
 
     match remote_protocol_version_for_binary(ssh_target, exec_prefix, "yggterm") {
@@ -3326,16 +3582,29 @@ fn resolve_remote_yggterm_binary(
             if let Ok(mut cache) = remote_command_cache().lock() {
                 cache.insert(cache_key, "yggterm".to_string());
             }
-            if let Some(span) = perf_span {
-                span.finish(serde_json::json!({
-                    "ssh_target": ssh_target,
-                    "result": "path_match",
-                    "binary_expr": "yggterm",
-                }));
-            }
+            finish_span(serde_json::json!({
+                "ssh_target": ssh_target,
+                "result": "path_match",
+                "binary_expr": "yggterm",
+            }));
             return Ok(("yggterm".to_string(), RemoteDeployState::Ready));
         }
-        Ok(_) => {}
+        Ok(version) => {
+            if !is_remote_protocol_probe_recoverable(&version) {
+                anyhow::bail!(
+                    "remote yggterm protocol mismatch for {}: expected {}, got {}",
+                    ssh_target,
+                    daemon::SERVER_PROTOCOL_VERSION,
+                    version.trim()
+                );
+            }
+            finish_span(serde_json::json!({
+                "ssh_target": ssh_target,
+                "result": "path_protocol_mismatch",
+                "binary_expr": "yggterm",
+                "protocol_version": version.trim(),
+            }));
+        }
         Err(error) if !should_fallback_to_python(&error) => return Err(error),
         Err(_) => {}
     }
@@ -3346,16 +3615,29 @@ fn resolve_remote_yggterm_binary(
             if let Ok(mut cache) = remote_command_cache().lock() {
                 cache.insert(cache_key, installed_binary.to_string());
             }
-            if let Some(span) = perf_span {
-                span.finish(serde_json::json!({
-                    "ssh_target": ssh_target,
-                    "result": "installed_path_match",
-                    "binary_expr": installed_binary,
-                }));
-            }
+            finish_span(serde_json::json!({
+                "ssh_target": ssh_target,
+                "result": "installed_path_match",
+                "binary_expr": installed_binary,
+            }));
             return Ok((installed_binary.to_string(), RemoteDeployState::Ready));
         }
-        Ok(_) => {}
+        Ok(version) => {
+            if !is_remote_protocol_probe_recoverable(&version) {
+                anyhow::bail!(
+                    "remote yggterm protocol mismatch for {}: expected {}, got {}",
+                    ssh_target,
+                    daemon::SERVER_PROTOCOL_VERSION,
+                    version.trim()
+                );
+            }
+            finish_span(serde_json::json!({
+                "ssh_target": ssh_target,
+                "result": "installed_protocol_mismatch",
+                "binary_expr": installed_binary,
+                "protocol_version": version.trim(),
+            }));
+        }
         Err(error) if !should_fallback_to_python(&error) => return Err(error),
         Err(_) => {}
     }
@@ -3374,13 +3656,11 @@ fn resolve_remote_yggterm_binary(
     if let Ok(mut cache) = remote_command_cache().lock() {
         cache.insert(cache_key, installed.clone());
     }
-    if let Some(span) = perf_span {
-        span.finish(serde_json::json!({
-            "ssh_target": ssh_target,
-            "result": "bootstrapped",
-            "binary_expr": installed,
-        }));
-    }
+    finish_span(serde_json::json!({
+        "ssh_target": ssh_target,
+        "result": "bootstrapped",
+        "binary_expr": installed,
+    }));
     Ok((installed, RemoteDeployState::Ready))
 }
 
@@ -3414,7 +3694,10 @@ with open(path, "wb") as handle:
 print(path)
 "#;
     let inner = format!("python3 -c {}", shell_single_quote(script));
-    let remote = match exec_prefix.map(str::trim).filter(|prefix| !prefix.is_empty()) {
+    let remote = match exec_prefix
+        .map(str::trim)
+        .filter(|prefix| !prefix.is_empty())
+    {
         Some(prefix) => format!("{prefix} sh -c {}", shell_single_quote(&inner)),
         None => inner,
     };
@@ -3480,8 +3763,12 @@ fn scan_remote_machine_sessions(
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| short_session_id(&summary.id)),
             recent_context: summary.recent_context,
-            cached_precis: summary.cached_precis.filter(|value| !value.trim().is_empty()),
-            cached_summary: summary.cached_summary.filter(|value| !value.trim().is_empty()),
+            cached_precis: summary
+                .cached_precis
+                .filter(|value| !value.trim().is_empty()),
+            cached_summary: summary
+                .cached_summary
+                .filter(|value| !value.trim().is_empty()),
             storage_path: summary.rollout_path,
         });
     }
@@ -3532,7 +3819,9 @@ pub fn run_remote_resume_codex(session_id: &str, cwd: Option<&str>) -> anyhow::R
     {
         use std::os::unix::process::CommandExt;
         let error = Command::new("sh").arg("-lc").arg(command).exec();
-        Err(anyhow::anyhow!("failed to exec remote codex resume: {error}"))
+        Err(anyhow::anyhow!(
+            "failed to exec remote codex resume: {error}"
+        ))
     }
 
     #[cfg(not(unix))]
@@ -3545,7 +3834,9 @@ pub fn run_remote_resume_codex(session_id: &str, cwd: Option<&str>) -> anyhow::R
         if status.success() {
             Ok(())
         } else {
-            Err(anyhow::anyhow!("remote codex resume exited with status {status}"))
+            Err(anyhow::anyhow!(
+                "remote codex resume exited with status {status}"
+            ))
         }
     }
 }
@@ -3612,7 +3903,10 @@ fn remote_scan_roots(
     remote_scan_roots_with_parents(
         requested_home,
         raw_codex_home,
-        [std::path::Path::new("/home"), std::path::Path::new("/Users")],
+        [
+            std::path::Path::new("/home"),
+            std::path::Path::new("/Users"),
+        ],
     )
 }
 
@@ -3631,9 +3925,7 @@ fn remote_scan_roots_with_parents<'a>(
         return roots;
     }
 
-    if requested_home
-        .join("sessions")
-        .is_dir()
+    if requested_home.join("sessions").is_dir()
         && has_any_codex_session_file(&requested_home.join("sessions"))
     {
         return roots;
@@ -3729,7 +4021,11 @@ pub fn run_remote_upsert_generated_copy(payload_json: &str) -> anyhow::Result<()
             updated_at TEXT NOT NULL
         );",
     )?;
-    if let Some(title) = payload.title.as_deref().filter(|value| !value.trim().is_empty()) {
+    if let Some(title) = payload
+        .title
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
         conn.execute(
             "INSERT INTO session_titles (session_id, title, cwd, source, model, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -3749,7 +4045,11 @@ pub fn run_remote_upsert_generated_copy(payload_json: &str) -> anyhow::Result<()
             ],
         )?;
     }
-    if let Some(precis) = payload.precis.as_deref().filter(|value| !value.trim().is_empty()) {
+    if let Some(precis) = payload
+        .precis
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
         conn.execute(
             "INSERT INTO session_precis (session_id, precis, cwd, source, model, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -3769,7 +4069,11 @@ pub fn run_remote_upsert_generated_copy(payload_json: &str) -> anyhow::Result<()
             ],
         )?;
     }
-    if let Some(summary) = payload.summary.as_deref().filter(|value| !value.trim().is_empty()) {
+    if let Some(summary) = payload
+        .summary
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
         conn.execute(
             "INSERT INTO session_summaries (session_id, summary, cwd, source, model, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -4702,10 +5006,7 @@ fn synthesize_remote_scanned_session_view(
     upsert_session_metadata(
         &mut session.metadata,
         "Restore",
-        format!(
-            "yggterm server remote resume-codex {}",
-            scanned.session_id
-        ),
+        format!("yggterm server remote resume-codex {}", scanned.session_id),
     );
     upsert_session_metadata(
         &mut session.metadata,
@@ -4748,6 +5049,7 @@ fn synthesize_remote_active_session(
     ghostty_bridge_enabled: bool,
 ) -> Option<ManagedSessionView> {
     let (machine_key, session_id) = parse_remote_scanned_session_path(active_path)?;
+    let machine_key = normalize_machine_key(machine_key);
     let machine = remote_machines
         .iter()
         .find(|machine| machine.machine_key == machine_key)?;
@@ -5449,15 +5751,14 @@ fn short_session_id(session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        GhosttyHostSupport, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession,
-        PersistedDaemonState, SessionKind, SessionNode, SessionNodeKind, SshConnectTarget,
-        UiTheme, WorkspaceViewMode, YggtermServer, REMOTE_OUTPUT_SENTINEL,
+        GhosttyHostSupport, PersistedDaemonState, REMOTE_OUTPUT_SENTINEL, RemoteMachineHealth,
+        RemoteMachineSnapshot, RemoteScannedSession, SessionKind, SessionNode, SessionNodeKind,
+        SshConnectTarget, UiTheme, WorkspaceViewMode, YggtermServer,
         dedupe_remote_scanned_sessions, load_remote_machine_sessions_from_mirror,
-        mirror_remote_machine_sessions,
-        parse_stored_transcript, remote_resume_shell_command, remote_scanned_session_path,
-        remote_scan_roots_with_parents, remote_ssh_launch_command, remote_command_cache,
-        remote_cache_key, strip_remote_payload_noise,
-        stored_session_launch_command,
+        mirror_remote_machine_sessions, parse_stored_transcript, remote_cache_key,
+        remote_command_cache, remote_resume_shell_command, remote_scan_roots_with_parents,
+        remote_scanned_session_path, remote_ssh_launch_command, stored_session_launch_command,
+        strip_remote_payload_noise,
     };
     use anyhow::Result;
     use std::fs;
@@ -5577,8 +5878,8 @@ mod tests {
             .sessions
             .get_mut(&session_path)
             .expect("session")
-            .launch_command = "ssh jojo 'yggterm server attach 019d09a4-c69e-7071-bd9a-8834060029a9'"
-            .to_string();
+            .launch_command =
+            "ssh jojo 'yggterm server attach 019d09a4-c69e-7071-bd9a-8834060029a9'".to_string();
 
         let reopened = server.open_remote_scanned_session(
             "jojo",
