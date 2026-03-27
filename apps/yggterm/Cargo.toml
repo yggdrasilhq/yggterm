@@ -23,7 +23,8 @@ ghostty-ffi = ["yggterm-server/ghostty-ffi"]
 
 [dependencies]
 anyhow.workspace = true
-ctrlc = "3"
+ctrlc = { version = "3", features = ["termination"] }
+libc = "0.2"
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
