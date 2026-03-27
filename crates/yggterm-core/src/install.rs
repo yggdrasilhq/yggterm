@@ -294,6 +294,10 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
     let data_dir = dirs::data_local_dir().context("unable to resolve local data dir")?;
     let applications_dir = data_dir.join("applications");
     let pixmaps_dir = data_dir.join("pixmaps");
+    let direct_assets_dir = context
+        .managed_root
+        .clone()
+        .unwrap_or_else(|| data_dir.join("yggterm").join("direct"));
     let icons_dir = data_dir
         .join("icons")
         .join("hicolor")
@@ -306,8 +310,18 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
         .join("apps");
     fs::create_dir_all(&applications_dir)?;
     fs::create_dir_all(&pixmaps_dir)?;
+    fs::create_dir_all(&direct_assets_dir)?;
     fs::create_dir_all(&icons_dir)?;
     fs::create_dir_all(&scalable_icons_dir)?;
+
+    let launcher_path = if let Some(bin_dir) = linux_user_bin_dir() {
+        fs::create_dir_all(&bin_dir)?;
+        let shim = bin_dir.join("yggterm");
+        create_or_replace_symlink(&context.executable_path, &shim)?;
+        Some(shim)
+    } else {
+        None
+    };
 
     let icon_path = icons_dir.join("yggterm.png");
     write_if_changed(
@@ -324,12 +338,23 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
         &pixmaps_icon_path,
         include_bytes!("../../../assets/brand/yggterm-icon-512.png"),
     )?;
+    let direct_icon_path = direct_assets_dir.join("yggterm.png");
+    write_if_changed(
+        &direct_icon_path,
+        include_bytes!("../../../assets/brand/yggterm-icon-512.png"),
+    )?;
+    let direct_scalable_icon_path = direct_assets_dir.join("yggterm.svg");
+    write_if_changed(
+        &direct_scalable_icon_path,
+        include_bytes!("../../../assets/brand/yggterm-icon.svg"),
+    )?;
     let desktop_path = applications_dir.join("dev.yggterm.Yggterm.desktop");
+    let desktop_exec_path = launcher_path.as_deref().unwrap_or(&context.executable_path);
     let desktop_contents = format!(
         "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Yggterm\nComment=Remote-first terminal workspace\nExec={}\nTryExec={}\nIcon={}\nTerminal=false\nCategories=System;TerminalEmulator;Development;\nStartupNotify=true\nStartupWMClass=yggterm\nX-Desktop-File-Install-Version=0.27\n",
-        desktop_exec_escape(&context.executable_path),
-        desktop_exec_escape(&context.executable_path),
-        "yggterm",
+        desktop_exec_escape(desktop_exec_path),
+        desktop_exec_escape(desktop_exec_path),
+        desktop_exec_escape(&direct_icon_path),
     );
     write_if_changed(&desktop_path, desktop_contents.as_bytes())?;
     let _ = std::process::Command::new("update-desktop-database")
@@ -349,10 +374,7 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
     let _ = std::process::Command::new("kbuildsycoca6").status();
     let _ = std::process::Command::new("kbuildsycoca5").status();
 
-    if let Some(bin_dir) = linux_user_bin_dir() {
-        fs::create_dir_all(&bin_dir)?;
-        let shim = bin_dir.join("yggterm");
-        create_or_replace_symlink(&context.executable_path, &shim)?;
+    if launcher_path.is_some() {
         notes.push(format!(
             "desktop entry refreshed at {}",
             desktop_path.display()

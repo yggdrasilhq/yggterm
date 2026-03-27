@@ -4,6 +4,15 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.0.18
+
+### Fixed
+
+- make Linux direct installs register the desktop launcher like a direct app instead of a distro package: stable `Exec` via `~/.local/bin/yggterm` and a stable absolute `Icon` path under `~/.local/share/yggterm/direct/`
+- keep the theme/pixmaps icon copies as fallback, but stop relying on KDE theme-name resolution alone for the primary launcher icon
+- publish release checksum sidecars consistently so direct self-update does not fail on missing `.sha256` assets
+- only shut down Yggterm server sessions when the last live client closes, so closing one of multiple open windows no longer tears down the others
+
 ## 2.0.17
 
 ### Fixed
