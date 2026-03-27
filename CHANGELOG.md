@@ -4,14 +4,14 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
-## 2.0.15
+## 2.0.16
 
 ### Fixed
 
-- make direct self-update install `yggterm-headless` alongside `yggterm` so live direct installs can actually repair SSH remote health on upgrade
-- register the Linux desktop file with `Icon=yggterm` so KDE resolves the shipped icon consistently across the menu, panel, and launcher editor
-- keep the remote command transport resilient to noisy shell startup output by stripping protocol payloads after a Yggterm-owned sentinel marker
-- keep the helper binary renamed as `yggterm-mock-cli`
+- make stale `offline` SSH machines refresh again on startup instead of being treated as already-known forever
+- add a cooldown to automatic remote machine refresh retries so a bad host does not spin forever
+- refresh Linux desktop integration more aggressively for KDE by installing the themed icon into `pixmaps/` and forcing both icon and desktop menu cache updates
+- keep direct self-update installing `yggterm-headless` alongside `yggterm`
 
 ### Docs
 
