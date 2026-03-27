@@ -4,6 +4,13 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.0.17
+
+### Fixed
+
+- make remote Codex discovery resilient when an SSH target logs in as a different user than the one that owns the session archive, so default `~/.codex` scans still find machine-wide homes like `/home/pi/.codex`
+- keep `yggterm-headless` robust for root-login remotes by letting the remote scan path fall back to real machine user homes instead of reporting a misleading healthy `0 sessions`
+
 ## 2.0.16
 
 ### Fixed
