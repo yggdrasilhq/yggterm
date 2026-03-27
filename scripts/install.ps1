@@ -45,8 +45,11 @@ try {
   tar -xzf $archivePath -C $tempDir
 
   $sourceExe = Join-Path $tempDir "yggterm-$targetLabel.exe"
+  $sourceHeadlessExe = Join-Path $tempDir "yggterm-headless-$targetLabel.exe"
   $installedExe = Join-Path $versionDir "yggterm.exe"
+  $installedHeadlessExe = Join-Path $versionDir "yggterm-headless.exe"
   Copy-Item $sourceExe $installedExe -Force
+  Copy-Item $sourceHeadlessExe $installedHeadlessExe -Force
 
   $state = @{
     channel = "direct"
