@@ -14,8 +14,8 @@ name = "yggterm-headless"
 path = "src/bin/yggterm-headless.rs"
 
 [[bin]]
-name = "mock-yggclient"
-path = "src/bin/mock-yggclient.rs"
+name = "yggterm-mock-cli"
+path = "src/bin/yggterm-mock-cli.rs"
 
 [features]
 default = []
