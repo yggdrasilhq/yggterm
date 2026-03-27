@@ -20,9 +20,15 @@ Rerun the same one-liner any time to force a manual update of a direct install.
 
 ## What yggterm is
 
-Yggdrasil Terminal (`yggterm`) is a remote-first terminal workspace built in Rust. It is meant for the way people actually work with terminals now: many long-lived sessions, many machines, restored context, Codex-heavy workflows, quick notes beside the terminal, and a sidebar that remembers how everything is related.
+Yggdrasil Terminal (`yggterm`) is a remote-first terminal workspace built in Rust.
+
+The short version is:
+
+**Zen Browser for AI terminal work, with server-owned session persistence.**
 
 The product target is not “an editor with a terminal panel.” The terminal is the center. Everything else exists to help you find, restore, explain, automate, and organize terminal work without losing momentum.
+
+This project comes from a very specific pain. Modern terminal work is not one shell doing one thing. It is many long-lived sessions, many machines, many half-finished threads of thought, AI transcripts, SSH reconnects, and a constant risk that a laptop sleep or crash will erase the mental desktop that told you what was happening. Yggterm is trying to turn that mess into a workspace you can trust.
 
 That means:
 
@@ -34,7 +40,19 @@ That means:
 
 ## Why use it
 
-Yggterm is trying to solve a specific problem: terminal work is usually scattered across shell history, tmux panes, half-remembered commands, AI transcripts, scratch files, and SSH tabs. That fragmentation kills flow.
+Yggterm is trying to solve a specific problem: terminal work is usually scattered across shell history, tmux panes, GNU Screen sessions, half-remembered commands, AI transcripts, scratch files, and SSH tabs. That fragmentation kills flow.
+
+The worst part is not just losing a process. It is losing the map in your head:
+
+- what is running
+- on which machine
+- for which project
+- why that session exists
+- what the last meaningful conclusion was
+
+That is the job.
+
+Yggterm is for people doing real multi-machine work, especially AI-heavy terminal work, who are tired of rebuilding that map by hand every time life interrupts them.
 
 Yggterm keeps those things nearby:
 
@@ -44,6 +62,10 @@ Yggterm keeps those things nearby:
 - session metadata and restore state
 
 The left tree is not just a launcher. It is the workspace memory.
+
+The bigger bet is that terminal work deserves the same level of UX ambition browsers got when tabs became too important to manage casually. If Zen Browser and Arc helped people survive the chaos of 120 tabs, Yggterm should do the same for 120 terminal contexts.
+
+If that resonates, read the product thesis in [PRODUCT_THESIS.md](/home/pi/gh/yggterm/PRODUCT_THESIS.md).
 
 ## Core nouns
 
