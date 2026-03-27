@@ -1,3 +1,12 @@
+yggterm (2.0.12-1) unstable; urgency=medium
+
+  * Move remote machines onto the headless yggterm server path with reconnect-safe lifecycle probes and protocol tooling.
+  * Improve Preview with grouped chat runs, cleaner assistant prose layout, cached rendering paths, and better Open WebUI-style structure.
+  * Fix generated summary and precis refresh behavior so regenerated copy persists and wins over stale remote cache on restore.
+  * Add protocol, search, and delayed-loading groundwork for more resilient client/server UX while reducing startup and preview churn.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 27 Mar 2026 23:30:00 +0530
+
 yggterm (2.0.11-1) unstable; urgency=medium
 
   * Remove the manual session-copy generation control from settings.
