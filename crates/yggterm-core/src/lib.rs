@@ -24,7 +24,7 @@ pub use install::{
     InstallChannel, InstallContext, ReleaseUpdate, UpdatePolicy, check_for_update,
     current_asset_label, current_version, detect_install_context, direct_install_root,
     install_mode_summary, install_release_update, refresh_desktop_integration, update_command_hint,
-    write_direct_install_state, ENV_YGGTERM_DIRECT_INSTALL_ROOT,
+    write_direct_install_state, ENV_YGGTERM_DIRECT_INSTALL_ROOT, YGGTERM_DESKTOP_APP_ID,
 };
 pub use perf::{PERF_TELEMETRY_FILENAME, PerfSpan, append_perf_event, perf_telemetry_path};
 pub use titles::{
