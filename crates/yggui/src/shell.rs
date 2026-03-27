@@ -84,11 +84,13 @@ static PREVIEW_BLOCK_CACHE: OnceCell<Mutex<PreviewBlockCache>> = OnceCell::new()
 static PREVIEW_CONTENT_CACHE: OnceCell<Mutex<PreviewContentCache>> = OnceCell::new();
 static PREVIEW_RUN_CACHE: OnceCell<Mutex<PreviewRunCache>> = OnceCell::new();
 static SIDEBAR_MERGE_CACHE: OnceCell<Mutex<SidebarMergeCache>> = OnceCell::new();
+static SIDEBAR_SEARCH_CACHE: OnceCell<Mutex<SidebarSearchCache>> = OnceCell::new();
 
 const PREVIEW_BLOCK_CACHE_LIMIT: usize = 256;
 const PREVIEW_CONTENT_CACHE_LIMIT: usize = 256;
 const PREVIEW_RUN_CACHE_LIMIT: usize = 256;
 const SIDEBAR_MERGE_CACHE_LIMIT: usize = 128;
+const SIDEBAR_SEARCH_CACHE_LIMIT: usize = 256;
 const SIDE_RAIL_WIDTH: usize = 292;
 const DEFERRED_STARTUP_SYNC_MS: u64 = 8_000;
 const EDGE_RESIZE_HANDLE: usize = 5;
@@ -486,6 +488,12 @@ struct PreviewRunCache {
 
 #[derive(Default)]
 struct SidebarMergeCache {
+    order: VecDeque<u64>,
+    entries: HashMap<u64, Vec<BrowserRow>>,
+}
+
+#[derive(Default)]
+struct SidebarSearchCache {
     order: VecDeque<u64>,
     entries: HashMap<u64, Vec<BrowserRow>>,
 }
@@ -4576,6 +4584,10 @@ fn sidebar_merge_cache() -> &'static Mutex<SidebarMergeCache> {
     SIDEBAR_MERGE_CACHE.get_or_init(|| Mutex::new(SidebarMergeCache::default()))
 }
 
+fn sidebar_search_cache() -> &'static Mutex<SidebarSearchCache> {
+    SIDEBAR_SEARCH_CACHE.get_or_init(|| Mutex::new(SidebarSearchCache::default()))
+}
+
 fn preview_content_cache_key(lines: &[String]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for line in lines {
@@ -4680,6 +4692,30 @@ fn sidebar_merge_cache_key(
     for path in expanded {
         path.hash(&mut hasher);
         0xf9_u8.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn sidebar_search_cache_key(rows: &[BrowserRow], query: &str, mode: u8) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    mode.hash(&mut hasher);
+    query.hash(&mut hasher);
+    for row in rows {
+        match row.kind {
+            BrowserRowKind::Group => 1_u8,
+            BrowserRowKind::Separator => 2_u8,
+            BrowserRowKind::Session => 3_u8,
+            BrowserRowKind::Document => 4_u8,
+        }
+        .hash(&mut hasher);
+        row.full_path.hash(&mut hasher);
+        row.label.hash(&mut hasher);
+        row.detail_label.hash(&mut hasher);
+        row.session_title.hash(&mut hasher);
+        row.depth.hash(&mut hasher);
+        row.expanded.hash(&mut hasher);
+        row.descendant_sessions.hash(&mut hasher);
+        0xf8_u8.hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -5012,6 +5048,16 @@ fn filtered_sidebar_rows(rows: &[BrowserRow], query: &str) -> Vec<BrowserRow> {
     if terms.is_empty() {
         return rows.to_vec();
     }
+    let key = sidebar_search_cache_key(rows, query, 1);
+    if let Ok(mut cache) = sidebar_search_cache().lock() {
+        if let Some(hit) = cache.entries.get(&key).cloned() {
+            if let Some(ix) = cache.order.iter().position(|existing| *existing == key) {
+                cache.order.remove(ix);
+            }
+            cache.order.push_back(key);
+            return hit;
+        }
+    }
     let mut ancestor_stack = Vec::<String>::new();
     let mut ancestors_by_path = HashMap::<String, Vec<String>>::new();
     for row in rows {
@@ -5030,10 +5076,23 @@ fn filtered_sidebar_rows(rows: &[BrowserRow], query: &str) -> Vec<BrowserRow> {
             }
         }
     }
-    rows.iter()
+    let filtered = rows.iter()
         .filter(|row| keep_paths.contains(&row.full_path))
         .cloned()
-        .collect()
+        .collect::<Vec<_>>();
+    if let Ok(mut cache) = sidebar_search_cache().lock() {
+        cache.entries.insert(key, filtered.clone());
+        if let Some(ix) = cache.order.iter().position(|existing| *existing == key) {
+            cache.order.remove(ix);
+        }
+        cache.order.push_back(key);
+        while cache.order.len() > SIDEBAR_SEARCH_CACHE_LIMIT {
+            if let Some(oldest) = cache.order.pop_front() {
+                cache.entries.remove(&oldest);
+            }
+        }
+    }
+    filtered
 }
 
 fn search_expanded_paths(
@@ -5093,7 +5152,17 @@ fn search_sidebar_matches(rows: &[BrowserRow], query: &str) -> Vec<BrowserRow> {
     if terms.is_empty() {
         return Vec::new();
     }
-    filtered_sidebar_rows(rows, query)
+    let key = sidebar_search_cache_key(rows, query, 2);
+    if let Ok(mut cache) = sidebar_search_cache().lock() {
+        if let Some(hit) = cache.entries.get(&key).cloned() {
+            if let Some(ix) = cache.order.iter().position(|existing| *existing == key) {
+                cache.order.remove(ix);
+            }
+            cache.order.push_back(key);
+            return hit;
+        }
+    }
+    let matches = filtered_sidebar_rows(rows, query)
         .into_iter()
         .filter(|row| {
             matches!(
@@ -5102,7 +5171,20 @@ fn search_sidebar_matches(rows: &[BrowserRow], query: &str) -> Vec<BrowserRow> {
             )
         })
         .filter(|row| row_matches_search(row, &terms))
-        .collect()
+        .collect::<Vec<_>>();
+    if let Ok(mut cache) = sidebar_search_cache().lock() {
+        cache.entries.insert(key, matches.clone());
+        if let Some(ix) = cache.order.iter().position(|existing| *existing == key) {
+            cache.order.remove(ix);
+        }
+        cache.order.push_back(key);
+        while cache.order.len() > SIDEBAR_SEARCH_CACHE_LIMIT {
+            if let Some(oldest) = cache.order.pop_front() {
+                cache.entries.remove(&oldest);
+            }
+        }
+    }
+    matches
 }
 
 fn content_search_query(query: &str) -> Option<Vec<String>> {
