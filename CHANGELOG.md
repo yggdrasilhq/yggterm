@@ -4,14 +4,14 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
-## 2.0.14
+## 2.0.15
 
 ### Fixed
 
-- ship `yggterm-headless` in release archives, direct installs, and `.deb` packages so SSH remotes receive the headless server binary instead of the GUI app
-- make remote command transport resilient to noisy shell startup output by stripping protocol payloads after a Yggterm-owned sentinel marker
-- recover from stale cached remote-binary paths by clearing the cache and retrying remote command resolution once
-- rename `mock-yggclient` to `yggterm-mock-cli`
+- make direct self-update install `yggterm-headless` alongside `yggterm` so live direct installs can actually repair SSH remote health on upgrade
+- register the Linux desktop file with `Icon=yggterm` so KDE resolves the shipped icon consistently across the menu, panel, and launcher editor
+- keep the remote command transport resilient to noisy shell startup output by stripping protocol payloads after a Yggterm-owned sentinel marker
+- keep the helper binary renamed as `yggterm-mock-cli`
 
 ### Docs
 
