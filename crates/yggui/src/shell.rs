@@ -5407,20 +5407,23 @@ fn spawn_active_session_copy_hydration(mut state: Signal<ShellState>, session: M
         let outcome = task::spawn_blocking(move || -> Result<(Option<String>, Option<String>, Option<String>)> {
             let store = SessionStore::open_or_init()?;
             if let Some((title, precis, summary)) = remote_cached {
+                let store_title = store.resolve_title_for_session_id(&session.id)?;
+                let store_precis = store.resolve_precis_for_session_id(&session.id)?;
+                let store_summary = store.resolve_summary_for_session_id(&session.id)?;
                 let resolved_title = if title.trim().is_empty() {
-                    store.resolve_title_for_session_id(&session.id)?
+                    store_title
                 } else {
-                    Some(title)
+                    store_title.or(Some(title))
                 };
                 let resolved_precis = if precis.as_ref().is_some_and(|value| !value.trim().is_empty()) {
-                    precis
+                    store_precis.or(precis)
                 } else {
-                    store.resolve_precis_for_session_id(&session.id)?
+                    store_precis
                 };
                 let resolved_summary = if summary.as_ref().is_some_and(|value| !value.trim().is_empty()) {
-                    summary
+                    store_summary.or(summary)
                 } else {
-                    store.resolve_summary_for_session_id(&session.id)?
+                    store_summary
                 };
                 return Ok((resolved_title, resolved_precis, resolved_summary));
             }
