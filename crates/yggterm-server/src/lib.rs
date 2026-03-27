@@ -3890,7 +3890,7 @@ pub fn run_remote_scan(codex_home: Option<&str>) -> anyhow::Result<()> {
     files.dedup();
     for path in files {
         if let Some(summary) = remote_summary_for_path(&path, &title_store)? {
-            println!("{}", serde_json::to_string(&summary)?);
+            write_stdout_line(&serde_json::to_string(&summary)?)?;
         }
     }
     Ok(())
@@ -3971,7 +3971,7 @@ pub fn run_remote_preview(path: &str) -> anyhow::Result<()> {
     let title_store = SessionTitleStore::open(&yggterm_home)?;
     let payload = remote_preview_payload_for_path(std::path::Path::new(path), &title_store)?
         .with_context(|| format!("no previewable codex session at {path}"))?;
-    println!("{}", serde_json::to_string(&payload)?);
+    write_stdout_line(&serde_json::to_string(&payload)?)?;
     Ok(())
 }
 
@@ -3980,8 +3980,17 @@ pub fn run_remote_generation_context(path: &str) -> anyhow::Result<()> {
         &read_codex_transcript_messages(std::path::Path::new(path))
             .with_context(|| format!("reading remote transcript {}", path))?,
     );
-    println!("{context}");
+    write_stdout_line(&context)?;
     Ok(())
+}
+
+fn write_stdout_line(line: &str) -> anyhow::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    match writeln!(stdout, "{line}") {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub fn run_remote_upsert_generated_copy(payload_json: &str) -> anyhow::Result<()> {

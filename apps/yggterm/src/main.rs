@@ -7,9 +7,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use yggterm_core::{
-    ENV_YGGTERM_HOME, InstallContext, PerfSpan, SessionNode, SessionNodeKind, SessionStore,
-    UiTheme, UpdatePolicy, WorkspaceDocumentKind, WorkspaceGroupKind, check_for_update,
-    detect_install_context, install_release_update, refresh_desktop_integration,
+    ENV_YGGTERM_DIRECT_INSTALL_ROOT, ENV_YGGTERM_HOME, InstallContext, PerfSpan, SessionNode,
+    SessionNodeKind, SessionStore, UiTheme, UpdatePolicy, WorkspaceDocumentKind,
+    WorkspaceGroupKind, check_for_update, detect_install_context, install_release_update,
+    refresh_desktop_integration,
 };
 use yggterm_server::{
     PersistedDaemonState, SessionKind, YggtermServer, cleanup_legacy_daemons, default_endpoint,
@@ -21,6 +22,7 @@ use yggterm_server::{
 
 const DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT_ENV: &str =
     "YGGTERM_DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT";
+const ENV_YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF: &str = "YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF";
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -32,6 +34,7 @@ fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let current_exe = std::env::current_exe()?;
     let install_context = detect_install_context(&current_exe)?;
+    maybe_handoff_to_preferred_executable(&current_exe, &args, &install_context)?;
     let store = SessionStore::open_or_init()?;
     install_panic_logging(store.home_dir());
     let startup_home = store.home_dir().to_path_buf();
@@ -212,10 +215,7 @@ fn load_initial_server_snapshot_fast(
     Some(server.snapshot())
 }
 
-fn install_signal_shutdown(
-    home_dir: std::path::PathBuf,
-    endpoint: yggterm_server::ServerEndpoint,
-) {
+fn install_signal_shutdown(home_dir: std::path::PathBuf, endpoint: yggterm_server::ServerEndpoint) {
     static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
     if HANDLER_INSTALLED.swap(true, Ordering::SeqCst) {
         return;
@@ -238,6 +238,38 @@ fn install_signal_shutdown(
 
 fn signal_client_instances_dir(home_dir: &std::path::Path) -> std::path::PathBuf {
     home_dir.join("client-instances")
+}
+
+fn maybe_handoff_to_preferred_executable(
+    current_exe: &std::path::Path,
+    args: &[String],
+    install_context: &InstallContext,
+) -> Result<()> {
+    if std::env::var_os(ENV_YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF).is_some() {
+        return Ok(());
+    }
+    let Some(preferred) = install_context.preferred_executable.as_ref() else {
+        return Ok(());
+    };
+    let current = current_exe
+        .canonicalize()
+        .unwrap_or_else(|_| current_exe.to_path_buf());
+    let preferred = preferred
+        .canonicalize()
+        .unwrap_or_else(|_| preferred.to_path_buf());
+    if current == preferred || !preferred.is_file() {
+        return Ok(());
+    }
+    let mut command = Command::new(&preferred);
+    command.args(args);
+    command.env(ENV_YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF, "1");
+    if let Some(root) = install_context.managed_root.as_ref() {
+        command.env(ENV_YGGTERM_DIRECT_INSTALL_ROOT, root);
+    }
+    let status = command
+        .status()
+        .with_context(|| format!("failed to hand off launch to {}", preferred.display()))?;
+    std::process::exit(status.code().unwrap_or(0));
 }
 
 fn signal_parse_client_pid(path: &std::path::Path) -> Option<u32> {
@@ -269,8 +301,8 @@ fn unregister_signal_client_instance(home_dir: &std::path::Path) -> Result<usize
     let dir = signal_client_instances_dir(home_dir);
     fs::create_dir_all(&dir)?;
     let current_pid = std::process::id();
-    let entries =
-        fs::read_dir(&dir).with_context(|| format!("reading client instances {}", dir.display()))?;
+    let entries = fs::read_dir(&dir)
+        .with_context(|| format!("reading client instances {}", dir.display()))?;
     let mut remaining = 0_usize;
     for entry in entries {
         let entry = entry?;
