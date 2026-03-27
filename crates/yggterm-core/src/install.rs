@@ -268,7 +268,7 @@ pub fn write_direct_install_state(
 
 pub fn refresh_desktop_integration(context: &InstallContext) -> Result<Vec<String>> {
     let mut notes = Vec::new();
-    if context.channel != InstallChannel::Direct {
+    if context.channel != InstallChannel::Direct && !should_repair_linux_launcher(context) {
         return Ok(notes);
     }
 
@@ -286,6 +286,31 @@ pub fn refresh_desktop_integration(context: &InstallContext) -> Result<Vec<Strin
     }
 
     Ok(notes)
+}
+
+#[cfg(target_os = "linux")]
+fn should_repair_linux_launcher(context: &InstallContext) -> bool {
+    if context.channel == InstallChannel::Direct {
+        return true;
+    }
+
+    let data_dir = match dirs::data_local_dir() {
+        Some(path) => path,
+        None => return false,
+    };
+    let desktop_path = data_dir.join("applications").join("dev.yggterm.Yggterm.desktop");
+    let desktop_text = fs::read_to_string(&desktop_path).unwrap_or_default();
+    let launcher_target = linux_user_bin_dir()
+        .and_then(|bin_dir| fs::read_link(bin_dir.join("yggterm")).ok())
+        .unwrap_or_default();
+    launcher_target_looks_stale(&launcher_target)
+        || desktop_text.contains("/tmp/yggterm-")
+        || desktop_text.contains("Icon=yggterm")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn should_repair_linux_launcher(_context: &InstallContext) -> bool {
+    false
 }
 
 #[cfg(target_os = "linux")]
@@ -722,6 +747,16 @@ fn linux_user_bin_dir() -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
+fn launcher_target_looks_stale(path: &Path) -> bool {
+    let path_text = path.to_string_lossy();
+    path.as_os_str().is_empty()
+        || !path.exists()
+        || path_text.contains("/tmp/yggterm-update-check")
+        || path_text.contains("/tmp/yggterm-auto-update")
+        || path_text.contains("/tmp/yggterm-install-")
+}
+
+#[cfg(target_os = "linux")]
 fn create_or_replace_symlink(target: &Path, link: &Path) -> Result<()> {
     use std::os::unix::fs::symlink;
     if let Ok(existing_target) = fs::read_link(link)
@@ -743,4 +778,21 @@ fn create_or_replace_symlink(target: &Path, link: &Path) -> Result<()> {
 #[cfg(target_os = "windows")]
 fn powershell_escape(input: &str) -> String {
     input.replace('\'', "''")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launcher_target_detects_stale_temp_update_paths() {
+        assert!(launcher_target_looks_stale(Path::new(
+            "/tmp/yggterm-update-check.ABCD/direct/versions/2.0.3/yggterm"
+        )));
+        assert!(launcher_target_looks_stale(Path::new(
+            "/tmp/yggterm-auto-update-207/home/.local/bin/yggterm"
+        )));
+        assert!(!launcher_target_looks_stale(Path::new("/bin/sh")));
+    }
 }
