@@ -4,6 +4,7 @@ yggterm (2.0.18-1) unstable; urgency=medium
   * Keep the theme and pixmaps icon copies as fallback instead of relying on KDE theme-name resolution alone.
   * Keep publishing release checksum sidecars so direct self-update does not fail on missing .sha256 assets.
   * Only shut down Yggterm sessions when the last live client exits, so closing one of multiple open windows no longer tears down the others.
+  * Treat Linux termination signals like graceful close too, so KDE panel/taskbar close does not bypass daemon shutdown semantics.
 
  -- Yggdrasil HQ <avi@gour.top>  Fri, 27 Mar 2026 16:40:00 +0530
 
