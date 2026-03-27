@@ -1,3 +1,12 @@
+yggterm (2.0.18-1) unstable; urgency=medium
+
+  * Register the Linux direct-install desktop launcher like a direct app, with a stable ~/.local/bin/yggterm Exec path and a stable absolute icon path under ~/.local/share/yggterm/direct/.
+  * Keep the theme and pixmaps icon copies as fallback instead of relying on KDE theme-name resolution alone.
+  * Keep publishing release checksum sidecars so direct self-update does not fail on missing .sha256 assets.
+  * Only shut down Yggterm sessions when the last live client exits, so closing one of multiple open windows no longer tears down the others.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 27 Mar 2026 16:40:00 +0530
+
 yggterm (2.0.17-1) unstable; urgency=medium
 
   * Make remote Codex discovery resilient when an SSH target logs in as a different user than the one that owns the session archive, so default ~/.codex scans still find machine-wide homes like /home/pi/.codex.
