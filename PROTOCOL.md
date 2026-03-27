@@ -167,7 +167,7 @@ more general than tmux itself.
 
 ## Mock Client
 
-`mock-yggclient` exists to profile the protocol behavior without the full desktop shell.
+`yggterm-mock-cli` exists to profile the protocol behavior without the full desktop shell.
 
 It should be able to:
 
@@ -183,11 +183,11 @@ This makes distributed regressions easier to reproduce than relying on the full 
 Example:
 
 ```bash
-./target/debug/mock-yggclient \
+./target/debug/yggterm-mock-cli \
   --scenario startup \
   --delay-ms 4200 \
   --progress-step-ms 700 \
-  --jsonl-out /tmp/mock-yggclient.jsonl
+  --jsonl-out /tmp/yggterm-mock-cli.jsonl
 ```
 
 That should emit:
@@ -202,18 +202,18 @@ Session lifetime examples:
 
 ```bash
 # Start a live shell session, then let the mock client exit without shutdown.
-./target/debug/mock-yggclient \
+./target/debug/yggterm-mock-cli \
   --scenario disconnect-safe \
   --cwd ~/gh/yggterm \
   --title-hint "mock reconnect probe"
 
 # Reconnect from a later client process and verify the same session is still present.
-./target/debug/mock-yggclient \
+./target/debug/yggterm-mock-cli \
   --scenario reconnect-check \
   --expect-path local://<session-uuid>
 
 # Explicit shutdown should tear the session graph down.
-./target/debug/mock-yggclient \
+./target/debug/yggterm-mock-cli \
   --scenario graceful-shutdown
 ```
 
@@ -227,7 +227,7 @@ Observability:
 
 - `status` should expose whether the daemon restored from persisted cached state
 - `status` should expose the restored stored/live/remote-machine counts
-- `mock-yggclient` should emit those fields in startup and reconnect scenarios so cache-path
+- `yggterm-mock-cli` should emit those fields in startup and reconnect scenarios so cache-path
   regressions can be profiled without the desktop shell
 
 ## Search
