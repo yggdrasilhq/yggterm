@@ -33,6 +33,39 @@ need_cmd tar
 need_cmd uname
 need_cmd sed
 
+write_launcher_wrapper() {
+  bin_dir="${HOME}/.local/bin"
+  launcher_path="${bin_dir}/yggterm"
+  mkdir -p "${bin_dir}"
+  cat > "${launcher_path}" <<EOF
+#!/usr/bin/env sh
+# yggterm-direct-launcher-v2
+set -eu
+ROOT='${install_root}'
+STATE="\$ROOT/install-state.json"
+target=""
+if [ -f "\$STATE" ]; then
+  target="\$(sed -n 's/.*"active_executable"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "\$STATE" | head -n1)"
+fi
+if [ -z "\$target" ] || [ ! -x "\$target" ]; then
+  latest_version="\$(find "\$ROOT/versions" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -V | tail -n1)"
+  if [ -n "\$latest_version" ] && [ -x "\$ROOT/versions/\$latest_version/yggterm" ]; then
+    target="\$ROOT/versions/\$latest_version/yggterm"
+  fi
+fi
+if [ -z "\$target" ] || [ ! -x "\$target" ]; then
+  target='${installed_binary}'
+fi
+[ -x "\$target" ] || {
+  printf '%s\n' 'yggterm launcher: no runnable executable found' >&2
+  exit 1
+}
+export YGGTERM_DIRECT_INSTALL_ROOT='${install_root}'
+exec "\$target" "\$@"
+EOF
+  chmod 0755 "${launcher_path}" || true
+}
+
 os="$(uname -s)"
 arch="$(uname -m)"
 
@@ -90,6 +123,8 @@ if [ -n "${current_version}" ] && [ "${current_version}" = "${release_version}" 
     sed -n 's/.*"active_executable"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${state_path}" | head -n1
   )"
   if [ -n "${current_binary}" ] && [ -x "${current_binary}" ]; then
+    installed_binary="${current_binary}"
+    write_launcher_wrapper
     log "refreshing desktop integration"
     "${current_binary}" install integrate >/dev/null 2>&1 || true
     log "binary: ${current_binary}"
@@ -156,10 +191,7 @@ cat > "${install_root}/install-state.json" <<JSON
 }
 JSON
 
-bin_dir="${HOME}/.local/bin"
-mkdir -p "${bin_dir}"
-rm -f "${bin_dir}/yggterm"
-ln -s "${installed_binary}" "${bin_dir}/yggterm"
+write_launcher_wrapper
 
 log "refreshing desktop integration"
 "${installed_binary}" install integrate >/dev/null 2>&1 || true
@@ -167,6 +199,7 @@ log "refreshing desktop integration"
 log "installed yggterm ${release_version}"
 log "binary: ${installed_binary}"
 log "rerun this same install command any time to update manually"
+bin_dir="${HOME}/.local/bin"
 case ":${PATH:-}:" in
   *":${bin_dir}:"*) ;;
   *)

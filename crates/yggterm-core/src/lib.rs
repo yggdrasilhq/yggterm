@@ -24,7 +24,7 @@ pub use install::{
     InstallChannel, InstallContext, ReleaseUpdate, UpdatePolicy, check_for_update,
     current_asset_label, current_version, detect_install_context, direct_install_root,
     install_mode_summary, install_release_update, refresh_desktop_integration, update_command_hint,
-    write_direct_install_state,
+    write_direct_install_state, ENV_YGGTERM_DIRECT_INSTALL_ROOT,
 };
 pub use perf::{PERF_TELEMETRY_FILENAME, PerfSpan, append_perf_event, perf_telemetry_path};
 pub use titles::{
@@ -525,19 +525,20 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
         .get("theme_mode")
         .or_else(|| object.get("theme").filter(|value| value.is_string()))
     {
-        settings.theme = serde_json::from_value(theme_mode.clone())
-            .context("failed to parse theme_mode")?;
+        settings.theme =
+            serde_json::from_value(theme_mode.clone()).context("failed to parse theme_mode")?;
     }
     if let Some(theme_spec) = object
         .get("theme")
         .filter(|value| value.is_object())
         .or_else(|| object.get("yggui_theme"))
     {
-        settings.yggui_theme = serde_json::from_value(theme_spec.clone())
-            .context("failed to parse theme object")?;
+        settings.yggui_theme =
+            serde_json::from_value(theme_spec.clone()).context("failed to parse theme object")?;
     }
     if let Some(value) = object.get("show_tree") {
-        settings.show_tree = serde_json::from_value(value.clone()).context("failed to parse show_tree")?;
+        settings.show_tree =
+            serde_json::from_value(value.clone()).context("failed to parse show_tree")?;
     }
     if let Some(value) = object.get("show_settings") {
         settings.show_settings =
@@ -548,8 +549,8 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
             serde_json::from_value(value.clone()).context("failed to parse tree_width")?;
     }
     if let Some(value) = object.get("terminal_font_size") {
-        settings.terminal_font_size = serde_json::from_value(value.clone())
-            .context("failed to parse terminal_font_size")?;
+        settings.terminal_font_size =
+            serde_json::from_value(value.clone()).context("failed to parse terminal_font_size")?;
     }
     if let Some(value) = object.get("ui_font_size") {
         settings.ui_font_size =
@@ -560,16 +561,16 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
             .context("failed to parse prefer_ghostty_backend")?;
     }
     if let Some(value) = object.get("litellm_endpoint") {
-        settings.litellm_endpoint = serde_json::from_value(value.clone())
-            .context("failed to parse litellm_endpoint")?;
+        settings.litellm_endpoint =
+            serde_json::from_value(value.clone()).context("failed to parse litellm_endpoint")?;
     }
     if let Some(value) = object.get("litellm_api_key") {
-        settings.litellm_api_key = serde_json::from_value(value.clone())
-            .context("failed to parse litellm_api_key")?;
+        settings.litellm_api_key =
+            serde_json::from_value(value.clone()).context("failed to parse litellm_api_key")?;
     }
     if let Some(value) = object.get("interface_llm_model") {
-        settings.interface_llm_model = serde_json::from_value(value.clone())
-            .context("failed to parse interface_llm_model")?;
+        settings.interface_llm_model =
+            serde_json::from_value(value.clone()).context("failed to parse interface_llm_model")?;
     }
     if let Some(value) = object.get("default_agent_profile") {
         settings.default_agent_profile = serde_json::from_value(value.clone())
@@ -584,8 +585,8 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
             .context("failed to parse system_notifications")?;
     }
     if let Some(value) = object.get("notification_sound") {
-        settings.notification_sound = serde_json::from_value(value.clone())
-            .context("failed to parse notification_sound")?;
+        settings.notification_sound =
+            serde_json::from_value(value.clone()).context("failed to parse notification_sound")?;
     }
     if let Some(value) = object.get("selected_browser_path") {
         settings.selected_browser_path = serde_json::from_value(value.clone())
@@ -903,8 +904,7 @@ fn read_codex_session_summary(
 }
 
 pub fn read_codex_session_identity_fields(path: &Path) -> Result<Option<(String, String)>> {
-    Ok(read_codex_session_identity(path)?
-        .map(|identity| (identity.session_id, identity.cwd)))
+    Ok(read_codex_session_identity(path)?.map(|identity| (identity.session_id, identity.cwd)))
 }
 
 fn read_codex_session_identity(path: &Path) -> Result<Option<CodexSessionIdentity>> {
@@ -1259,8 +1259,7 @@ fn cmp_browser_child_node(left: &SessionNode, right: &SessionNode) -> std::cmp::
 }
 
 fn browser_child_sort_key(node: &SessionNode) -> String {
-    node
-        .path
+    node.path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(&node.name)
@@ -1377,7 +1376,17 @@ mod tests {
             Some("/workspace/machine-a/nested/session-1"),
         );
 
-        assert!(browser.rows().iter().any(|row| row.full_path == "/workspace/machine-a"));
-        assert!(!browser.rows().iter().any(|row| row.full_path == "/workspace/machine-a/nested/session-1"));
+        assert!(
+            browser
+                .rows()
+                .iter()
+                .any(|row| row.full_path == "/workspace/machine-a")
+        );
+        assert!(
+            !browser
+                .rows()
+                .iter()
+                .any(|row| row.full_path == "/workspace/machine-a/nested/session-1")
+        );
     }
 }
