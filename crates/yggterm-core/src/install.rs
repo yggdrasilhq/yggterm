@@ -322,7 +322,7 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
         "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Yggterm\nComment=Remote-first terminal workspace\nExec={}\nTryExec={}\nIcon={}\nTerminal=false\nCategories=System;TerminalEmulator;Development;\nStartupNotify=true\nStartupWMClass=yggterm\nX-Desktop-File-Install-Version=0.27\n",
         desktop_exec_escape(&context.executable_path),
         desktop_exec_escape(&context.executable_path),
-        desktop_exec_escape(&icon_path),
+        "yggterm",
     );
     write_if_changed(&desktop_path, desktop_contents.as_bytes())?;
     let _ = std::process::Command::new("update-desktop-database")
@@ -515,12 +515,23 @@ pub fn install_release_update(context: &InstallContext, update: &ReleaseUpdate) 
     } else {
         format!("yggterm-{}", context.asset_label)
     };
+    let headless_name = if cfg!(target_os = "windows") {
+        format!("yggterm-headless-{}.exe", context.asset_label)
+    } else {
+        format!("yggterm-headless-{}", context.asset_label)
+    };
     let binary_path = version_dir.join(if cfg!(target_os = "windows") {
         "yggterm.exe"
     } else {
         "yggterm"
     });
+    let headless_path = version_dir.join(if cfg!(target_os = "windows") {
+        "yggterm-headless.exe"
+    } else {
+        "yggterm-headless"
+    });
     extract_binary_from_archive(&archive, &binary_name, &binary_path)?;
+    extract_binary_from_archive(&archive, &headless_name, &headless_path)?;
     write_direct_install_state(
         root,
         &context.repo,
