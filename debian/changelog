@@ -1,3 +1,11 @@
+yggterm (2.0.22-1) unstable; urgency=medium
+
+  * Disable the crashing GTK accessibility bridge by default on Linux unless YGGTERM_ENABLE_ACCESSIBILITY=1 is set, so KDE/Wayland launches stop dying in libatk-bridge before the window appears.
+  * Install both dev.yggterm.Yggterm.desktop and yggterm.desktop, plus extra SVG icon copies, so KDE menu and launcher lookup can resolve the app icon more consistently.
+  * Ship yggterm-mock-cli in release archives, direct installs, and the .deb for native integration and daemon diagnostics.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 27 Mar 2026 19:55:00 +0530
+
 yggterm (2.0.18-1) unstable; urgency=medium
 
   * Register the Linux direct-install desktop launcher like a direct app, with a stable ~/.local/bin/yggterm Exec path and a stable absolute icon path under ~/.local/share/yggterm/direct/.
