@@ -12,6 +12,7 @@ This file tracks user-visible changes in `yggterm`.
 - keep the theme/pixmaps icon copies as fallback, but stop relying on KDE theme-name resolution alone for the primary launcher icon
 - publish release checksum sidecars consistently so direct self-update does not fail on missing `.sha256` assets
 - only shut down Yggterm server sessions when the last live client closes, so closing one of multiple open windows no longer tears down the others
+- treat Linux termination signals like a graceful close path too, so KDE panel/taskbar close does not bypass daemon shutdown semantics
 
 ## 2.0.17
 
