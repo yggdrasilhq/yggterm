@@ -293,6 +293,7 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
     let mut notes = Vec::new();
     let data_dir = dirs::data_local_dir().context("unable to resolve local data dir")?;
     let applications_dir = data_dir.join("applications");
+    let pixmaps_dir = data_dir.join("pixmaps");
     let icons_dir = data_dir
         .join("icons")
         .join("hicolor")
@@ -304,6 +305,7 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
         .join("scalable")
         .join("apps");
     fs::create_dir_all(&applications_dir)?;
+    fs::create_dir_all(&pixmaps_dir)?;
     fs::create_dir_all(&icons_dir)?;
     fs::create_dir_all(&scalable_icons_dir)?;
 
@@ -316,6 +318,11 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
     write_if_changed(
         &scalable_icon_path,
         include_bytes!("../../../assets/brand/yggterm-icon.svg"),
+    )?;
+    let pixmaps_icon_path = pixmaps_dir.join("yggterm.png");
+    write_if_changed(
+        &pixmaps_icon_path,
+        include_bytes!("../../../assets/brand/yggterm-icon-512.png"),
     )?;
     let desktop_path = applications_dir.join("dev.yggterm.Yggterm.desktop");
     let desktop_contents = format!(
@@ -332,6 +339,12 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
         .arg("-f")
         .arg("-t")
         .arg(data_dir.join("icons").join("hicolor"))
+        .status();
+    let _ = std::process::Command::new("xdg-icon-resource")
+        .arg("forceupdate")
+        .status();
+    let _ = std::process::Command::new("xdg-desktop-menu")
+        .arg("forceupdate")
         .status();
     let _ = std::process::Command::new("kbuildsycoca6").status();
     let _ = std::process::Command::new("kbuildsycoca5").status();
