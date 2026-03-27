@@ -1,3 +1,9 @@
+yggterm (2.0.23-1) unstable; urgency=medium
+
+  * Point Linux desktop entries at the shipped SVG icon directly instead of relying on theme-name lookup, so KDE panel and menu paths can render the same icon artwork as the desktop grid.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 27 Mar 2026 20:10:00 +0530
+
 yggterm (2.0.22-1) unstable; urgency=medium
 
   * Disable the crashing GTK accessibility bridge by default on Linux unless YGGTERM_ENABLE_ACCESSIBILITY=1 is set, so KDE/Wayland launches stop dying in libatk-bridge before the window appears.
