@@ -44,8 +44,11 @@ use std::thread;
 use std::time::Duration;
 use tao::event::ElementState;
 use tao::event::Event as TaoEvent;
+use tao::event_loop::EventLoopBuilder;
 use tao::keyboard::Key as TaoKey;
 use tao::keyboard::KeyCode as TaoKeyCode;
+#[cfg(target_os = "linux")]
+use tao::platform::unix::EventLoopBuilderExtUnix;
 use tao::window::ResizeDirection;
 use time::OffsetDateTime;
 use tokio::task;
@@ -57,7 +60,7 @@ use yggterm_core::{
     WorkspaceDocumentKind, WorkspaceGroupKind, YgguiThemeSpec, check_for_update,
     install_release_update, looks_like_generated_fallback_title,
     looks_like_low_signal_generated_copy, refresh_desktop_integration, save_settings_file,
-    unique_session_short_ids_for_pairs, update_command_hint,
+    unique_session_short_ids_for_pairs, update_command_hint, YGGTERM_DESKTOP_APP_ID,
 };
 use yggterm_platform::DockRect;
 use yggterm_server::{
@@ -85,6 +88,7 @@ static PREVIEW_RUN_CACHE: OnceCell<Mutex<PreviewRunCache>> = OnceCell::new();
 static SIDEBAR_MERGE_CACHE: OnceCell<Mutex<SidebarMergeCache>> = OnceCell::new();
 static SIDEBAR_SEARCH_CACHE: OnceCell<Mutex<SidebarSearchCache>> = OnceCell::new();
 static CLIENT_INSTANCE: OnceCell<ClientInstanceRegistration> = OnceCell::new();
+static SUPPRESS_DAEMON_SHUTDOWN_ON_EXIT: AtomicBool = AtomicBool::new(false);
 
 const PREVIEW_BLOCK_CACHE_LIMIT: usize = 256;
 const PREVIEW_CONTENT_CACHE_LIMIT: usize = 256;
@@ -3119,6 +3123,7 @@ fn restart_into_pending_update(mut state: Signal<ShellState>) {
         let launched = task::spawn_blocking(move || Command::new(&next_exe).spawn()).await;
         state.with_mut(|shell| match launched {
             Ok(Ok(_)) => {
+                SUPPRESS_DAEMON_SHUTDOWN_ON_EXIT.store(true, Ordering::SeqCst);
                 window().close();
             }
             Ok(Err(error)) => {
@@ -3158,64 +3163,11 @@ fn spawn_graceful_shutdown_and_close(mut state: Signal<ShellState>) {
     if state.read().closing_app {
         return;
     }
-    let endpoint = BOOTSTRAP
-        .get()
-        .expect("shell bootstrap initialized")
-        .server_endpoint
-        .clone();
-    let settings_path = state.read().bootstrap.settings_path.clone();
     state.with_mut(|shell| {
         shell.closing_app = true;
-        shell.server_busy = true;
         shell.last_action = "closing yggterm".to_string();
-        shell.push_notification(
-            NotificationTone::Info,
-            "Closing Yggterm",
-            "Closing this Yggterm window and shutting down sessions only if it is the last live client.",
-        );
     });
-    spawn(async move {
-        let outcome = task::spawn_blocking(move || {
-            maybe_shutdown_daemon_for_last_client(&settings_path, &endpoint)
-        })
-        .await;
-        state.with_mut(|shell| match outcome {
-            Ok(Ok(CloseAppMode::ShutdownDaemon)) => {
-                shell.last_action = "closed yggterm sessions".to_string();
-                let _ = window().set_visible(false);
-                std::process::exit(0);
-            }
-            Ok(Ok(CloseAppMode::CloseClientOnly { remaining_clients })) => {
-                shell.last_action = format!(
-                    "closed this yggterm window; {} other client{} remain",
-                    remaining_clients,
-                    if remaining_clients == 1 { "" } else { "s" }
-                );
-                let _ = window().set_visible(false);
-                std::process::exit(0);
-            }
-            Ok(Err(error)) => {
-                shell.closing_app = false;
-                shell.server_busy = false;
-                shell.last_action = format!("shutdown failed: {error}");
-                shell.push_notification(
-                    NotificationTone::Error,
-                    "Yggterm Close Failed",
-                    error.to_string(),
-                );
-            }
-            Err(error) => {
-                shell.closing_app = false;
-                shell.server_busy = false;
-                shell.last_action = format!("shutdown task failed: {error}");
-                shell.push_notification(
-                    NotificationTone::Error,
-                    "Yggterm Close Failed",
-                    error.to_string(),
-                );
-            }
-        });
-    });
+    let _ = window().close();
 }
 
 fn spawn_desktop_integration_refresh(mut state: Signal<ShellState>) {
@@ -7937,6 +7889,28 @@ fn maybe_shutdown_daemon_for_last_client(
     }
 }
 
+fn finalize_client_shutdown(
+    settings_path: &Path,
+    endpoint: &ServerEndpoint,
+) -> Result<CloseAppMode> {
+    if SUPPRESS_DAEMON_SHUTDOWN_ON_EXIT.swap(false, Ordering::SeqCst) {
+        let dir = client_instances_dir(settings_path);
+        let current_path = CLIENT_INSTANCE
+            .get()
+            .map(|registration| registration.path.as_path());
+        let _ = cleanup_stale_client_instances(&dir, current_path);
+        if let Some(path) = current_path {
+            let _ = fs::remove_file(path);
+        }
+        let active = cleanup_stale_client_instances(&dir, None)?;
+        return Ok(CloseAppMode::CloseClientOnly {
+            remaining_clients: active.len(),
+        });
+    }
+
+    maybe_shutdown_daemon_for_last_client(settings_path, endpoint)
+}
+
 #[derive(Clone)]
 struct GhosttyDockRequest {
     pid: Option<u32>,
@@ -8143,25 +8117,48 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
             }
         }
     }
+    let shutdown_bootstrap = bootstrap.clone();
     let _ = BOOTSTRAP.set(bootstrap);
 
-    dioxus::LaunchBuilder::desktop()
-        .with_cfg(
-            Config::new()
-                .with_window(
-                    WindowBuilder::new()
-                        .with_title("yggterm")
-                        .with_window_icon(Some(window_icon::load_window_icon()))
-                        .with_transparent(true)
-                        .with_decorations(false)
-                        .with_resizable(true)
-                        .with_inner_size(LogicalSize::new(1460.0, 920.0))
-                        .with_min_inner_size(LogicalSize::new(1024.0, 720.0)),
-                )
-                .with_close_behaviour(WindowCloseBehaviour::WindowHides)
-                .with_exits_when_last_window_closes(false),
-        )
-        .launch(app);
+    let window = WindowBuilder::new()
+        .with_title("Yggterm")
+        .with_window_icon(Some(window_icon::load_window_icon()))
+        .with_transparent(true)
+        .with_decorations(false)
+        .with_resizable(true)
+        .with_inner_size(LogicalSize::new(1460.0, 920.0))
+        .with_min_inner_size(LogicalSize::new(1024.0, 720.0));
+
+    let mut config = Config::new()
+        .with_window(window)
+        .with_close_behaviour(WindowCloseBehaviour::WindowCloses)
+        .with_exits_when_last_window_closes(true);
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut event_loop = EventLoopBuilder::with_user_event();
+        event_loop.with_app_id(YGGTERM_DESKTOP_APP_ID);
+        config = config.with_event_loop(event_loop.build());
+    }
+
+    dioxus::LaunchBuilder::desktop().with_cfg(config).launch(app);
+
+    if CLIENT_INSTANCE.get().is_some() {
+        match finalize_client_shutdown(
+            &shutdown_bootstrap.settings_path,
+            &shutdown_bootstrap.server_endpoint,
+        ) {
+            Ok(CloseAppMode::ShutdownDaemon) => {
+                info!("yggterm shutdown closed final live client and daemon");
+            }
+            Ok(CloseAppMode::CloseClientOnly { remaining_clients }) => {
+                info!(remaining_clients, "yggterm shutdown closed client");
+            }
+            Err(error) => {
+                warn!(error=%error, "failed to finalize yggterm shutdown");
+            }
+        }
+    }
 
     if let Some(registration) = CLIENT_INSTANCE.get() {
         let _ = fs::remove_file(&registration.path);
@@ -8215,7 +8212,10 @@ fn app() -> Element {
                     window_epoch.with_mut(|epoch| *epoch += 1);
                 }
                 DesktopWindowEvent::CloseRequested => {
-                    spawn_graceful_shutdown_and_close(state);
+                    state.with_mut(|shell| {
+                        shell.closing_app = true;
+                        shell.last_action = "closing yggterm".to_string();
+                    });
                 }
                 _ => {}
             }
