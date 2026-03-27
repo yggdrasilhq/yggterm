@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DIST_DIR="${ROOT_DIR}/dist"
 BIN_PATH="${ROOT_DIR}/target/release/yggterm"
+HEADLESS_BIN_PATH="${ROOT_DIR}/target/release/yggterm-headless"
 DEB_REVISION="${DEB_REVISION:-1}"
 ARCH="$(dpkg-architecture -qDEB_HOST_ARCH)"
 RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.94.0}"
@@ -16,7 +17,7 @@ STAGE_DIR="${ROOT_DIR}/.yggterm-state/deb/${PKG_NAME}_${DEB_VERSION}_${ARCH}"
 mkdir -p "$DIST_DIR"
 
 pushd "$ROOT_DIR" >/dev/null
-"${CARGO_CMD[@]}" build --release -p yggterm --no-default-features
+"${CARGO_CMD[@]}" build --release -p yggterm --bin yggterm --bin yggterm-headless --no-default-features
 popd >/dev/null
 
 rm -rf "$STAGE_DIR"
@@ -27,6 +28,7 @@ mkdir -p \
   "$STAGE_DIR/usr/share/doc/${PKG_NAME}"
 
 install -m 0755 "$BIN_PATH" "$STAGE_DIR/usr/lib/yggterm/yggterm-bin"
+install -m 0755 "$HEADLESS_BIN_PATH" "$STAGE_DIR/usr/lib/yggterm/yggterm-headless-bin"
 cat > "$STAGE_DIR/usr/bin/yggterm" <<'WRAPPER'
 #!/usr/bin/env bash
 set -euo pipefail

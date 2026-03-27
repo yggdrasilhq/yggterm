@@ -128,16 +128,22 @@ tar -xzf "${archive_path}" -C "${TMP_DIR}"
 case "${target_label}" in
   windows-*)
   binary_name="yggterm-${target_label}.exe"
+  headless_binary_name="yggterm-headless-${target_label}.exe"
   installed_binary="${version_dir}/yggterm.exe"
+  installed_headless_binary="${version_dir}/yggterm-headless.exe"
   ;;
   *)
   binary_name="yggterm-${target_label}"
+  headless_binary_name="yggterm-headless-${target_label}"
   installed_binary="${version_dir}/yggterm"
+  installed_headless_binary="${version_dir}/yggterm-headless"
   ;;
 esac
 
 cp "${TMP_DIR}/${binary_name}" "${installed_binary}"
+cp "${TMP_DIR}/${headless_binary_name}" "${installed_headless_binary}"
 chmod 0755 "${installed_binary}" || true
+chmod 0755 "${installed_headless_binary}" || true
 
 cat > "${install_root}/install-state.json" <<JSON
 {
