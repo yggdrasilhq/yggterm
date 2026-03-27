@@ -4,6 +4,12 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.0.23
+
+### Fixed
+
+- point both Linux desktop entries at the shipped SVG file directly instead of relying on icon-theme name lookup, so KDE panel and menu paths can render the same icon artwork that already shows up correctly in desktop grid views
+
 ## 2.0.22
 
 ### Fixed
