@@ -5482,6 +5482,7 @@ version = "2.0.18"
 dependencies = [
  "anyhow",
  "ctrlc",
+ "libc",
  "serde_json",
  "tracing",
  "tracing-subscriber",
