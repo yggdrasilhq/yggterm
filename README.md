@@ -18,6 +18,8 @@ Yggterm installs into a managed user-space location, wires up desktop integratio
 
 Rerun the same one-liner any time to force a manual update of a direct install.
 
+Direct installs also ship `yggterm-mock-cli`, a small diagnostic CLI for probing daemon state, startup behavior, and native integration problems from the same installed runtime.
+
 ## What yggterm is
 
 Yggdrasil Terminal (`yggterm`) is a remote-first terminal workspace built in Rust.
@@ -101,6 +103,8 @@ Package-managed installs behave differently on purpose:
 - Yggterm tells the user to update with the matching package manager instead of mutating the install behind its back
 
 This split keeps the fast-moving direct channel frictionless while respecting native platform ownership when the app was installed by a package manager.
+
+On Linux, Yggterm now defaults to `NO_AT_BRIDGE=1` unless you explicitly opt back in with `YGGTERM_ENABLE_ACCESSIBILITY=1`. That workaround exists because some KDE/Wayland + WebKitGTK setups crash in `libatk-bridge` before the app window becomes visible.
 
 ## Current product shape
 

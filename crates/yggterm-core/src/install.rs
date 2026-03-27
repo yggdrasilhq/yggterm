@@ -11,7 +11,9 @@ const DEFAULT_RELEASE_REPO: &str = "yggdrasilhq/yggterm";
 const INSTALL_STATE_FILENAME: &str = "install-state.json";
 pub const ENV_YGGTERM_DIRECT_INSTALL_ROOT: &str = "YGGTERM_DIRECT_INSTALL_ROOT";
 pub const YGGTERM_DESKTOP_APP_ID: &str = "dev.yggterm.Yggterm";
+pub const ENV_YGGTERM_ENABLE_ACCESSIBILITY: &str = "YGGTERM_ENABLE_ACCESSIBILITY";
 const LINUX_LAUNCHER_MARKER: &str = "yggterm-direct-launcher-v2";
+const MOCK_CLI_NAME: &str = "yggterm-mock-cli";
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InstallChannel {
@@ -329,14 +331,17 @@ fn should_repair_linux_launcher(context: &InstallContext) -> bool {
     let desktop_path = data_dir
         .join("applications")
         .join("dev.yggterm.Yggterm.desktop");
-    let desktop_text = fs::read_to_string(&desktop_path).unwrap_or_default();
+    let legacy_desktop_path = data_dir.join("applications").join("yggterm.desktop");
+    let desktop_text = fs::read_to_string(&desktop_path)
+        .or_else(|_| fs::read_to_string(&legacy_desktop_path))
+        .unwrap_or_default();
     let launcher_path = linux_user_bin_dir()
         .map(|bin_dir| bin_dir.join("yggterm"))
         .unwrap_or_default();
     let launcher_text = fs::read_to_string(&launcher_path).unwrap_or_default();
     launcher_file_looks_stale(&launcher_path, &launcher_text)
         || desktop_text.contains("/tmp/yggterm-")
-        || !desktop_text.contains("Icon=yggterm")
+        || !desktop_text.contains(&format!("Icon={YGGTERM_DESKTOP_APP_ID}"))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -373,7 +378,21 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
     let launcher_path = if let Some(bin_dir) = linux_user_bin_dir() {
         fs::create_dir_all(&bin_dir)?;
         let launcher = bin_dir.join("yggterm");
-        write_linux_launcher_script(context, &launcher)?;
+        write_linux_launcher_script(
+            context,
+            &launcher,
+            "yggterm",
+            &preferred_executable_for(context, "yggterm"),
+            "yggterm launcher",
+        )?;
+        let mock_launcher = bin_dir.join(MOCK_CLI_NAME);
+        write_linux_launcher_script(
+            context,
+            &mock_launcher,
+            MOCK_CLI_NAME,
+            &preferred_executable_for(context, MOCK_CLI_NAME),
+            "yggterm-mock-cli launcher",
+        )?;
         Some(launcher)
     } else {
         None
@@ -396,6 +415,11 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
         &pixmaps_icon_path,
         include_bytes!("../../../assets/brand/yggterm-icon-512.png"),
     )?;
+    let pixmaps_scalable_icon_path = pixmaps_dir.join("yggterm.svg");
+    write_if_changed(
+        &pixmaps_scalable_icon_path,
+        include_bytes!("../../../assets/brand/yggterm-icon.svg"),
+    )?;
     let direct_icon_path = direct_assets_dir.join("yggterm.png");
     write_if_changed(
         &direct_icon_path,
@@ -407,6 +431,7 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
         include_bytes!("../../../assets/brand/yggterm-icon.svg"),
     )?;
     let desktop_path = applications_dir.join(format!("{YGGTERM_DESKTOP_APP_ID}.desktop"));
+    let legacy_desktop_path = applications_dir.join("yggterm.desktop");
     let desktop_exec_path = launcher_path.as_deref().unwrap_or(&context.executable_path);
     let desktop_contents = format!(
         "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Yggterm\nComment=Remote-first terminal workspace\nExec={}\nTryExec={}\nIcon={}\nTerminal=false\nCategories=System;TerminalEmulator;Development;\nStartupNotify=true\nStartupWMClass={}\nX-Desktop-File-Install-Version=0.27\n",
@@ -416,6 +441,13 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
         YGGTERM_DESKTOP_APP_ID,
     );
     write_if_changed(&desktop_path, desktop_contents.as_bytes())?;
+    let legacy_desktop_contents = format!(
+        "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Yggterm\nComment=Remote-first terminal workspace\nExec={}\nTryExec={}\nIcon=yggterm\nTerminal=false\nCategories=System;TerminalEmulator;Development;\nStartupNotify=true\nStartupWMClass={}\nX-Desktop-File-Install-Version=0.27\n",
+        desktop_exec_escape(desktop_exec_path),
+        desktop_exec_escape(desktop_exec_path),
+        YGGTERM_DESKTOP_APP_ID,
+    );
+    write_if_changed(&legacy_desktop_path, legacy_desktop_contents.as_bytes())?;
     let _ = std::process::Command::new("update-desktop-database")
         .arg(&applications_dir)
         .status();
@@ -614,6 +646,11 @@ pub fn install_release_update(context: &InstallContext, update: &ReleaseUpdate) 
     } else {
         format!("yggterm-headless-{}", context.asset_label)
     };
+    let mock_cli_name = if cfg!(target_os = "windows") {
+        format!("{MOCK_CLI_NAME}-{}.exe", context.asset_label)
+    } else {
+        format!("{MOCK_CLI_NAME}-{}", context.asset_label)
+    };
     let binary_path = version_dir.join(if cfg!(target_os = "windows") {
         "yggterm.exe"
     } else {
@@ -624,8 +661,14 @@ pub fn install_release_update(context: &InstallContext, update: &ReleaseUpdate) 
     } else {
         "yggterm-headless"
     });
+    let mock_cli_path = version_dir.join(if cfg!(target_os = "windows") {
+        "yggterm-mock-cli.exe"
+    } else {
+        MOCK_CLI_NAME
+    });
     extract_binary_from_archive(&archive, &binary_name, &binary_path)?;
     extract_binary_from_archive(&archive, &headless_name, &headless_path)?;
+    extract_binary_from_archive(&archive, &mock_cli_name, &mock_cli_path)?;
     write_direct_install_state(
         root,
         &context.repo,
@@ -774,8 +817,14 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn write_linux_launcher_script(context: &InstallContext, launcher_path: &Path) -> Result<()> {
-    let script = linux_launcher_script(context);
+fn write_linux_launcher_script(
+    context: &InstallContext,
+    launcher_path: &Path,
+    binary_name: &str,
+    fallback_executable: &Path,
+    launcher_name: &str,
+) -> Result<()> {
+    let script = linux_launcher_script(context, binary_name, fallback_executable, launcher_name);
     if let Ok(metadata) = fs::symlink_metadata(launcher_path)
         && metadata.file_type().is_symlink()
     {
@@ -787,17 +836,24 @@ fn write_linux_launcher_script(context: &InstallContext, launcher_path: &Path) -
 }
 
 #[cfg(target_os = "linux")]
-fn linux_launcher_script(context: &InstallContext) -> String {
+fn linux_launcher_script(
+    context: &InstallContext,
+    binary_name: &str,
+    fallback_executable: &Path,
+    launcher_name: &str,
+) -> String {
     let managed_root = context
         .managed_root
         .clone()
         .unwrap_or_else(|| dirs::data_local_dir().unwrap_or_default().join("yggterm").join("direct"));
-    let fallback_executable = context
-        .preferred_executable
-        .as_ref()
-        .unwrap_or(&context.executable_path);
     let root_quoted = shell_single_quote(&managed_root.to_string_lossy());
     let fallback_quoted = shell_single_quote(&fallback_executable.to_string_lossy());
+    let binary_quoted = shell_single_quote(binary_name);
+    let launcher_quoted = launcher_name.replace('\'', "");
+    let accessibility_guard = format!(
+        "if [ \"${{{env_enable}:-0}}\" != '1' ] && [ -z \"${{NO_AT_BRIDGE+x}}\" ]; then\n  export NO_AT_BRIDGE=1\nfi\n",
+        env_enable = ENV_YGGTERM_ENABLE_ACCESSIBILITY,
+    );
     let export_root = if context.channel == InstallChannel::Direct {
         format!(
             "export {}={}\n",
@@ -808,13 +864,32 @@ fn linux_launcher_script(context: &InstallContext) -> String {
         String::new()
     };
     format!(
-        "#!/usr/bin/env sh\n# {marker}\nset -eu\nROOT={root}\nSTATE=\"$ROOT/{state_file}\"\ntarget=\"\"\nif [ -f \"$STATE\" ]; then\n  target=\"$(sed -n 's/.*\"active_executable\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$STATE\" | head -n1)\"\nfi\nif [ -z \"$target\" ] || [ ! -x \"$target\" ]; then\n  latest_version=\"$(find \"$ROOT/versions\" -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' 2>/dev/null | sort -V | tail -n1)\"\n  if [ -n \"$latest_version\" ] && [ -x \"$ROOT/versions/$latest_version/yggterm\" ]; then\n    target=\"$ROOT/versions/$latest_version/yggterm\"\n  fi\nfi\nif [ -z \"$target\" ] || [ ! -x \"$target\" ]; then\n  target={fallback}\nfi\n[ -x \"$target\" ] || {{ printf '%s\\n' 'yggterm launcher: no runnable executable found' >&2; exit 1; }}\n{export_root}exec \"$target\" \"$@\"\n",
+        "#!/usr/bin/env sh\n# {marker}\nset -eu\nROOT={root}\nSTATE=\"$ROOT/{state_file}\"\nBINARY_NAME={binary_name}\ntarget=\"\"\nif [ \"$BINARY_NAME\" = 'yggterm' ] && [ -f \"$STATE\" ]; then\n  target=\"$(sed -n 's/.*\"active_executable\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$STATE\" | head -n1)\"\nfi\nif [ -z \"$target\" ] || [ ! -x \"$target\" ]; then\n  latest_version=\"$(find \"$ROOT/versions\" -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' 2>/dev/null | sort -V | tail -n1)\"\n  if [ -n \"$latest_version\" ] && [ -x \"$ROOT/versions/$latest_version/$BINARY_NAME\" ]; then\n    target=\"$ROOT/versions/$latest_version/$BINARY_NAME\"\n  fi\nfi\nif [ -z \"$target\" ] || [ ! -x \"$target\" ]; then\n  target={fallback}\nfi\n[ -x \"$target\" ] || {{ printf '%s\\n' '{launcher_name}: no runnable executable found' >&2; exit 1; }}\n{accessibility_guard}{export_root}exec \"$target\" \"$@\"\n",
         marker = LINUX_LAUNCHER_MARKER,
         root = root_quoted,
         state_file = INSTALL_STATE_FILENAME,
+        binary_name = binary_quoted,
         fallback = fallback_quoted,
+        launcher_name = launcher_quoted,
+        accessibility_guard = accessibility_guard,
         export_root = export_root,
     )
+}
+
+fn preferred_executable_for(context: &InstallContext, binary_name: &str) -> PathBuf {
+    let preferred = context
+        .preferred_executable
+        .as_ref()
+        .unwrap_or(&context.executable_path);
+    let sibling_name = if cfg!(target_os = "windows") && !binary_name.ends_with(".exe") {
+        format!("{binary_name}.exe")
+    } else {
+        binary_name.to_string()
+    };
+    preferred
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(sibling_name)
 }
 
 #[cfg(unix)]
