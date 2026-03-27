@@ -9,6 +9,8 @@ use std::time::Duration;
 
 const DEFAULT_RELEASE_REPO: &str = "yggdrasilhq/yggterm";
 const INSTALL_STATE_FILENAME: &str = "install-state.json";
+pub const ENV_YGGTERM_DIRECT_INSTALL_ROOT: &str = "YGGTERM_DIRECT_INSTALL_ROOT";
+const LINUX_LAUNCHER_MARKER: &str = "yggterm-direct-launcher-v2";
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InstallChannel {
@@ -37,6 +39,7 @@ pub struct InstallContext {
     pub asset_label: String,
     pub current_version: String,
     pub executable_path: PathBuf,
+    pub preferred_executable: Option<PathBuf>,
     pub managed_root: Option<PathBuf>,
     pub manager_hint: Option<String>,
 }
@@ -82,7 +85,7 @@ pub fn detect_install_context(executable_path: &Path) -> Result<InstallContext> 
     let executable_path = executable_path
         .canonicalize()
         .unwrap_or_else(|_| executable_path.to_path_buf());
-    if let Some((root, state)) = find_direct_install_state(&executable_path)? {
+    if let Some((root, state)) = direct_install_state_for_executable(&executable_path)? {
         return Ok(InstallContext {
             channel: InstallChannel::Direct,
             update_policy: UpdatePolicy::Auto,
@@ -90,6 +93,7 @@ pub fn detect_install_context(executable_path: &Path) -> Result<InstallContext> 
             asset_label: state.asset_label,
             current_version: state.active_version,
             executable_path,
+            preferred_executable: Some(state.active_executable),
             managed_root: Some(root),
             manager_hint: Some("Direct install".to_string()),
         });
@@ -176,6 +180,7 @@ pub fn detect_install_context(executable_path: &Path) -> Result<InstallContext> 
         asset_label,
         current_version,
         executable_path,
+        preferred_executable: None,
         managed_root: None,
         manager_hint: Some("Development build or unmanaged install".to_string()),
     })
@@ -196,28 +201,50 @@ fn notify_only_context(
         asset_label,
         current_version,
         executable_path,
+        preferred_executable: None,
         managed_root: None,
         manager_hint: Some(hint.to_string()),
     }
+}
+
+fn direct_install_state_for_executable(
+    executable_path: &Path,
+) -> Result<Option<(PathBuf, DirectInstallState)>> {
+    if let Some(root) = std::env::var_os(ENV_YGGTERM_DIRECT_INSTALL_ROOT)
+        .map(PathBuf::from)
+        .filter(|root| root.join(INSTALL_STATE_FILENAME).is_file())
+        && let Some(state) = load_direct_install_state(&root)?
+    {
+        return Ok(Some((root, state)));
+    }
+    find_direct_install_state(executable_path)
 }
 
 fn find_direct_install_state(
     executable_path: &Path,
 ) -> Result<Option<(PathBuf, DirectInstallState)>> {
     for ancestor in executable_path.ancestors() {
-        let path = ancestor.join(INSTALL_STATE_FILENAME);
-        if !path.is_file() {
-            continue;
-        }
-        let bytes = fs::read(&path)
-            .with_context(|| format!("failed to read install state {}", path.display()))?;
-        let state: DirectInstallState = serde_json::from_slice(&bytes)
-            .with_context(|| format!("failed to parse install state {}", path.display()))?;
-        if state.channel == InstallChannel::Direct {
+        if let Some(state) = load_direct_install_state(ancestor)? {
             return Ok(Some((ancestor.to_path_buf(), state)));
         }
     }
     Ok(None)
+}
+
+fn load_direct_install_state(root: &Path) -> Result<Option<DirectInstallState>> {
+    let path = root.join(INSTALL_STATE_FILENAME);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path)
+        .with_context(|| format!("failed to read install state {}", path.display()))?;
+    let state: DirectInstallState = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse install state {}", path.display()))?;
+    if state.channel == InstallChannel::Direct {
+        Ok(Some(state))
+    } else {
+        Ok(None)
+    }
 }
 
 pub fn direct_install_root() -> Result<PathBuf> {
@@ -298,14 +325,17 @@ fn should_repair_linux_launcher(context: &InstallContext) -> bool {
         Some(path) => path,
         None => return false,
     };
-    let desktop_path = data_dir.join("applications").join("dev.yggterm.Yggterm.desktop");
+    let desktop_path = data_dir
+        .join("applications")
+        .join("dev.yggterm.Yggterm.desktop");
     let desktop_text = fs::read_to_string(&desktop_path).unwrap_or_default();
-    let launcher_target = linux_user_bin_dir()
-        .and_then(|bin_dir| fs::read_link(bin_dir.join("yggterm")).ok())
+    let launcher_path = linux_user_bin_dir()
+        .map(|bin_dir| bin_dir.join("yggterm"))
         .unwrap_or_default();
-    launcher_target_looks_stale(&launcher_target)
+    let launcher_text = fs::read_to_string(&launcher_path).unwrap_or_default();
+    launcher_file_looks_stale(&launcher_path, &launcher_text)
         || desktop_text.contains("/tmp/yggterm-")
-        || desktop_text.contains("Icon=yggterm")
+        || !desktop_text.contains("Icon=yggterm")
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -341,9 +371,9 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
 
     let launcher_path = if let Some(bin_dir) = linux_user_bin_dir() {
         fs::create_dir_all(&bin_dir)?;
-        let shim = bin_dir.join("yggterm");
-        create_or_replace_symlink(&context.executable_path, &shim)?;
-        Some(shim)
+        let launcher = bin_dir.join("yggterm");
+        write_linux_launcher_script(context, &launcher)?;
+        Some(launcher)
     } else {
         None
     };
@@ -376,10 +406,9 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
     let desktop_path = applications_dir.join("dev.yggterm.Yggterm.desktop");
     let desktop_exec_path = launcher_path.as_deref().unwrap_or(&context.executable_path);
     let desktop_contents = format!(
-        "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Yggterm\nComment=Remote-first terminal workspace\nExec={}\nTryExec={}\nIcon={}\nTerminal=false\nCategories=System;TerminalEmulator;Development;\nStartupNotify=true\nStartupWMClass=yggterm\nX-Desktop-File-Install-Version=0.27\n",
+        "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Yggterm\nComment=Remote-first terminal workspace\nExec={}\nTryExec={}\nIcon=yggterm\nTerminal=false\nCategories=System;TerminalEmulator;Development;\nStartupNotify=true\nStartupWMClass=yggterm\nX-Desktop-File-Install-Version=0.27\n",
         desktop_exec_escape(desktop_exec_path),
         desktop_exec_escape(desktop_exec_path),
-        desktop_exec_escape(&direct_icon_path),
     );
     write_if_changed(&desktop_path, desktop_contents.as_bytes())?;
     let _ = std::process::Command::new("update-desktop-database")
@@ -607,11 +636,30 @@ pub fn install_release_update(context: &InstallContext, update: &ReleaseUpdate) 
         asset_label: context.asset_label.clone(),
         current_version: update.version.clone(),
         executable_path: binary_path.clone(),
+        preferred_executable: Some(binary_path.clone()),
         managed_root: Some(root.clone()),
         manager_hint: context.manager_hint.clone(),
     };
-    let _ = refresh_desktop_integration(&updated_context);
+    if run_install_integrate_with_binary(&binary_path, root).is_err() {
+        let _ = refresh_desktop_integration(&updated_context);
+    }
     Ok(binary_path)
+}
+
+fn run_install_integrate_with_binary(binary_path: &Path, root: &Path) -> Result<()> {
+    let status = std::process::Command::new(binary_path)
+        .arg("install")
+        .arg("integrate")
+        .env(ENV_YGGTERM_DIRECT_INSTALL_ROOT, root)
+        .status()
+        .with_context(|| format!("failed to launch {} install integrate", binary_path.display()))?;
+    if !status.success() {
+        anyhow::bail!(
+            "{} install integrate exited with status {status}",
+            binary_path.display()
+        );
+    }
+    Ok(())
 }
 
 pub fn install_mode_summary(context: &InstallContext) -> String {
@@ -720,6 +768,50 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn write_linux_launcher_script(context: &InstallContext, launcher_path: &Path) -> Result<()> {
+    let script = linux_launcher_script(context);
+    if let Ok(metadata) = fs::symlink_metadata(launcher_path)
+        && metadata.file_type().is_symlink()
+    {
+        fs::remove_file(launcher_path)
+            .with_context(|| format!("failed to replace launcher {}", launcher_path.display()))?;
+    }
+    write_if_changed(launcher_path, script.as_bytes())?;
+    set_unix_executable(launcher_path)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_launcher_script(context: &InstallContext) -> String {
+    let managed_root = context
+        .managed_root
+        .clone()
+        .unwrap_or_else(|| dirs::data_local_dir().unwrap_or_default().join("yggterm").join("direct"));
+    let fallback_executable = context
+        .preferred_executable
+        .as_ref()
+        .unwrap_or(&context.executable_path);
+    let root_quoted = shell_single_quote(&managed_root.to_string_lossy());
+    let fallback_quoted = shell_single_quote(&fallback_executable.to_string_lossy());
+    let export_root = if context.channel == InstallChannel::Direct {
+        format!(
+            "export {}={}\n",
+            ENV_YGGTERM_DIRECT_INSTALL_ROOT,
+            root_quoted
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "#!/usr/bin/env sh\n# {marker}\nset -eu\nROOT={root}\nSTATE=\"$ROOT/{state_file}\"\ntarget=\"\"\nif [ -f \"$STATE\" ]; then\n  target=\"$(sed -n 's/.*\"active_executable\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$STATE\" | head -n1)\"\nfi\nif [ -z \"$target\" ] || [ ! -x \"$target\" ]; then\n  latest_version=\"$(find \"$ROOT/versions\" -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' 2>/dev/null | sort -V | tail -n1)\"\n  if [ -n \"$latest_version\" ] && [ -x \"$ROOT/versions/$latest_version/yggterm\" ]; then\n    target=\"$ROOT/versions/$latest_version/yggterm\"\n  fi\nfi\nif [ -z \"$target\" ] || [ ! -x \"$target\" ]; then\n  target={fallback}\nfi\n[ -x \"$target\" ] || {{ printf '%s\\n' 'yggterm launcher: no runnable executable found' >&2; exit 1; }}\n{export_root}exec \"$target\" \"$@\"\n",
+        marker = LINUX_LAUNCHER_MARKER,
+        root = root_quoted,
+        state_file = INSTALL_STATE_FILENAME,
+        fallback = fallback_quoted,
+        export_root = export_root,
+    )
+}
+
 #[cfg(unix)]
 fn set_unix_executable(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -747,6 +839,7 @@ fn linux_user_bin_dir() -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
+#[cfg(test)]
 fn launcher_target_looks_stale(path: &Path) -> bool {
     let path_text = path.to_string_lossy();
     path.as_os_str().is_empty()
@@ -757,27 +850,27 @@ fn launcher_target_looks_stale(path: &Path) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn create_or_replace_symlink(target: &Path, link: &Path) -> Result<()> {
-    use std::os::unix::fs::symlink;
-    if let Ok(existing_target) = fs::read_link(link)
-        && existing_target == target
-    {
-        return Ok(());
+fn launcher_file_looks_stale(path: &Path, contents: &str) -> bool {
+    if path.as_os_str().is_empty() || !path.exists() {
+        return true;
     }
-    let _ = fs::remove_file(link);
-    symlink(target, link).with_context(|| {
-        format!(
-            "failed to create symlink {} -> {}",
-            link.display(),
-            target.display()
-        )
-    })?;
-    Ok(())
+    if fs::read_link(path).is_ok() {
+        return true;
+    }
+    contents.is_empty()
+        || !contents.contains(LINUX_LAUNCHER_MARKER)
+        || contents.contains("/tmp/yggterm-update-check")
+        || contents.contains("/tmp/yggterm-auto-update")
+        || contents.contains("/tmp/yggterm-install-")
 }
 
 #[cfg(target_os = "windows")]
 fn powershell_escape(input: &str) -> String {
     input.replace('\'', "''")
+}
+
+fn shell_single_quote(input: &str) -> String {
+    format!("'{}'", input.replace('\'', "'\"'\"'"))
 }
 
 #[cfg(test)]
