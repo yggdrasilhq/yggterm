@@ -435,7 +435,7 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
     let desktop_exec_path = launcher_path.as_deref().unwrap_or(&context.executable_path);
     let desktop_icon_path = desktop_exec_escape(&direct_scalable_icon_path);
     let desktop_contents = format!(
-        "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Yggterm\nComment=Remote-first terminal workspace\nExec={}\nTryExec={}\nIcon={}\nTerminal=false\nCategories=System;TerminalEmulator;Development;\nStartupNotify=true\nStartupWMClass={}\nX-Desktop-File-Install-Version=0.27\n",
+        "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Yggterm\nComment=Remote-first terminal workspace\nExec={}\nTryExec={}\nIcon={}\nTerminal=false\nNoDisplay=true\nCategories=System;TerminalEmulator;Development;\nStartupNotify=true\nStartupWMClass={}\nX-Desktop-File-Install-Version=0.27\n",
         desktop_exec_escape(desktop_exec_path),
         desktop_exec_escape(desktop_exec_path),
         desktop_icon_path,
@@ -443,7 +443,7 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
     );
     write_if_changed(&desktop_path, desktop_contents.as_bytes())?;
     let legacy_desktop_contents = format!(
-        "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Yggterm\nComment=Remote-first terminal workspace\nExec={}\nTryExec={}\nIcon={}\nTerminal=false\nCategories=System;TerminalEmulator;Development;\nStartupNotify=true\nStartupWMClass={}\nX-Desktop-File-Install-Version=0.27\n",
+        "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Yggterm\nComment=Remote-first terminal workspace\nExec={}\nTryExec={}\nIcon={}\nTerminal=false\nNoDisplay=false\nCategories=System;TerminalEmulator;Development;\nStartupNotify=true\nStartupWMClass={}\nX-Desktop-File-Install-Version=0.27\n",
         desktop_exec_escape(desktop_exec_path),
         desktop_exec_escape(desktop_exec_path),
         desktop_icon_path,
@@ -464,8 +464,7 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
     let _ = std::process::Command::new("xdg-desktop-menu")
         .arg("forceupdate")
         .status();
-    let _ = std::process::Command::new("kbuildsycoca6").status();
-    let _ = std::process::Command::new("kbuildsycoca5").status();
+    refresh_kde_desktop_caches();
 
     if launcher_path.is_some() {
         notes.push(format!(
@@ -954,6 +953,37 @@ fn powershell_escape(input: &str) -> String {
 fn shell_single_quote(input: &str) -> String {
     format!("'{}'", input.replace('\'', "'\"'\"'"))
 }
+
+#[cfg(target_os = "linux")]
+fn refresh_kde_desktop_caches() {
+    if let Some(cache_dir) = dirs::cache_dir() {
+        let _ = fs::remove_file(cache_dir.join("icon-cache.kcache"));
+        if let Ok(entries) = fs::read_dir(&cache_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with("ksycoca") {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
+    let _ = std::process::Command::new("kbuildsycoca6")
+        .arg("--noincremental")
+        .status();
+    let _ = std::process::Command::new("kbuildsycoca5")
+        .arg("--noincremental")
+        .status();
+    let _ = std::process::Command::new("qdbus6")
+        .arg("org.kde.plasmashell")
+        .arg("/PlasmaShell")
+        .arg("org.kde.PlasmaShell.refreshCurrentShell")
+        .status();
+}
+
+#[cfg(not(target_os = "linux"))]
+fn refresh_kde_desktop_caches() {}
 
 #[cfg(test)]
 mod tests {
