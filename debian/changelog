@@ -1,3 +1,11 @@
+yggterm (2.0.13-1) unstable; urgency=medium
+
+  * Ship yggterm-headless in release archives, direct installs, and the .deb so SSH remotes get the headless server binary instead of the GUI app.
+  * Harden remote command transport against noisy shell startup output and recover from stale cached remote-binary paths.
+  * Keep the README and product docs aligned with the remote-first workspace pitch.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 27 Mar 2026 14:28:00 +0530
+
 yggterm (2.0.12-1) unstable; urgency=medium
 
   * Move remote machines onto the headless yggterm server path with reconnect-safe lifecycle probes and protocol tooling.
