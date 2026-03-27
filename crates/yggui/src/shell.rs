@@ -184,6 +184,7 @@ struct ShellState {
     remote_preview_sync_after_ms: HashMap<String, u64>,
     remote_preview_dirty_epoch: HashMap<String, u64>,
     remote_machine_refresh_requests: HashSet<String>,
+    remote_machine_refresh_retry_after_ms: HashMap<String, u64>,
     drag_paths: Vec<String>,
     drag_hover_target: Option<DragDropTarget>,
     optimistic_drag_paths: Vec<String>,
@@ -588,6 +589,7 @@ impl ShellState {
             remote_preview_sync_after_ms: HashMap::new(),
             remote_preview_dirty_epoch: HashMap::new(),
             remote_machine_refresh_requests: HashSet::new(),
+            remote_machine_refresh_retry_after_ms: HashMap::new(),
             drag_paths: Vec::new(),
             drag_hover_target: None,
             optimistic_drag_paths: Vec::new(),
@@ -3449,57 +3451,14 @@ fn maybe_spawn_missing_remote_machine_refreshes(state: Signal<ShellState>) {
         state,
         "maybe_spawn_missing_remote_machine_refreshes_read",
         |shell| {
-            let known_remote_machines = shell
-                .server
-                .remote_machines()
-                .iter()
-                .map(|machine| {
-                    (
-                        machine.machine_key.clone(),
-                        machine.health == RemoteMachineHealth::Healthy
-                            || machine.health == RemoteMachineHealth::Offline,
-                    )
-                })
-                .collect::<HashMap<_, _>>();
-
-            let mut desired_machine_keys = shell
-                .server
-                .ssh_targets()
-                .iter()
-                .map(|target| machine_key_from_labelish(&target.ssh_target))
-                .collect::<Vec<_>>();
-            desired_machine_keys.extend(
-                shell.server
-                    .live_sessions()
-                    .into_iter()
-                    .filter(|session| session.kind == SessionKind::SshShell)
-                    .filter_map(|session| {
-                        session
-                            .ssh_target
-                            .as_deref()
-                            .map(machine_key_from_labelish)
-                            .or_else(|| {
-                                if session.host_label.trim().is_empty() {
-                                    None
-                                } else {
-                                    Some(machine_key_from_labelish(&session.host_label))
-                                }
-                            })
-                    }),
-            );
-            desired_machine_keys.sort();
-            desired_machine_keys.dedup();
-            desired_machine_keys
-                .into_iter()
-                .filter(|machine_key| !machine_key.is_empty())
-                .filter(|machine_key| !shell.remote_machine_refresh_requests.contains(machine_key))
-                .filter(|machine_key| {
-                    !known_remote_machines
-                        .get(machine_key)
-                        .copied()
-                        .unwrap_or(false)
-                })
-                .collect::<Vec<_>>()
+            pending_remote_machine_refreshes(
+                shell.server.remote_machines(),
+                shell.server.ssh_targets(),
+                &shell.server.live_sessions(),
+                &shell.remote_machine_refresh_requests,
+                &shell.remote_machine_refresh_retry_after_ms,
+                current_millis(),
+            )
         },
     ) else {
         return;
@@ -3547,21 +3506,86 @@ fn spawn_background_remote_machine_refresh(state: Signal<ShellState>, machine_ke
             shell.remote_machine_refresh_requests.remove(&machine_key);
             match outcome {
                 Ok(Ok((snapshot, message))) => {
+                    shell.remote_machine_refresh_retry_after_ms.remove(&machine_key);
                     shell.server.apply_snapshot(snapshot);
                     if let Some(message) = message {
                         shell.last_action = message;
                     }
                 }
                 Ok(Err(error)) => {
+                    shell.remote_machine_refresh_retry_after_ms.insert(
+                        machine_key.clone(),
+                        current_millis() + 30_000,
+                    );
                     shell.last_action = format!("remote refresh failed: {error}");
                 }
                 Err(error) => {
+                    shell.remote_machine_refresh_retry_after_ms.insert(
+                        machine_key.clone(),
+                        current_millis() + 30_000,
+                    );
                     shell.last_action = format!("remote refresh task failed: {error}");
                 }
             }
         });
         maybe_spawn_missing_remote_machine_refreshes(state);
     });
+}
+
+fn pending_remote_machine_refreshes(
+    remote_machines: &[RemoteMachineSnapshot],
+    ssh_targets: &[SshConnectTarget],
+    live_sessions: &[ManagedSessionView],
+    in_flight: &HashSet<String>,
+    retry_after_ms: &HashMap<String, u64>,
+    now_ms: u64,
+) -> Vec<String> {
+    let known_remote_machines = remote_machines
+        .iter()
+        .map(|machine| {
+            (
+                machine.machine_key.clone(),
+                machine.health == RemoteMachineHealth::Healthy,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut desired_machine_keys = ssh_targets
+        .iter()
+        .map(|target| machine_key_from_labelish(&target.ssh_target))
+        .collect::<Vec<_>>();
+    desired_machine_keys.extend(
+        live_sessions
+            .iter()
+            .filter(|session| session.kind == SessionKind::SshShell)
+            .filter_map(|session| {
+                session
+                    .ssh_target
+                    .as_deref()
+                    .map(machine_key_from_labelish)
+                    .or_else(|| {
+                        if session.host_label.trim().is_empty() {
+                            None
+                        } else {
+                            Some(machine_key_from_labelish(&session.host_label))
+                        }
+                    })
+            }),
+    );
+    desired_machine_keys.sort();
+    desired_machine_keys.dedup();
+    desired_machine_keys
+        .into_iter()
+        .filter(|machine_key| !machine_key.is_empty())
+        .filter(|machine_key| !in_flight.contains(machine_key))
+        .filter(|machine_key| {
+            retry_after_ms
+                .get(machine_key)
+                .copied()
+                .is_none_or(|retry_after| retry_after <= now_ms)
+        })
+        .filter(|machine_key| !known_remote_machines.get(machine_key).copied().unwrap_or(false))
+        .collect::<Vec<_>>()
 }
 
 fn spawn_server_snapshot_action<F>(state: Signal<ShellState>, pending_label: String, request: F)
@@ -15915,6 +15939,67 @@ mod tests {
             search_content_hits(Some(&session), WorkspaceViewMode::Terminal, "/preview")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn pending_remote_machine_refreshes_include_stale_offline_machine() {
+        let remote_machines = vec![RemoteMachineSnapshot {
+            machine_key: "dev".to_string(),
+            label: "dev".to_string(),
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            health: RemoteMachineHealth::Offline,
+            sessions: Vec::new(),
+        }];
+        let ssh_targets = vec![SshConnectTarget {
+            label: "dev".to_string(),
+            kind: SessionKind::SshShell,
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            cwd: None,
+        }];
+
+        let pending = pending_remote_machine_refreshes(
+            &remote_machines,
+            &ssh_targets,
+            &[],
+            &HashSet::new(),
+            &HashMap::new(),
+            1_000,
+        );
+
+        assert_eq!(pending, vec!["dev".to_string()]);
+    }
+
+    #[test]
+    fn pending_remote_machine_refreshes_respect_retry_cooldown() {
+        let remote_machines = vec![RemoteMachineSnapshot {
+            machine_key: "dev".to_string(),
+            label: "dev".to_string(),
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            health: RemoteMachineHealth::Offline,
+            sessions: Vec::new(),
+        }];
+        let ssh_targets = vec![SshConnectTarget {
+            label: "dev".to_string(),
+            kind: SessionKind::SshShell,
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            cwd: None,
+        }];
+        let retry_after_ms = HashMap::from([(String::from("dev"), 5_000u64)]);
+
+        let pending = pending_remote_machine_refreshes(
+            &remote_machines,
+            &ssh_targets,
+            &[],
+            &HashSet::new(),
+            &retry_after_ms,
+            1_000,
+        );
+
+        assert!(pending.is_empty());
     }
 }
 

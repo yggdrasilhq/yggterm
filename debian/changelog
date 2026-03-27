@@ -1,3 +1,11 @@
+yggterm (2.0.16-1) unstable; urgency=medium
+
+  * Refresh stale offline SSH machines on startup again, with a retry cooldown so a bad host does not spin forever.
+  * Refresh Linux desktop integration more aggressively for KDE, including pixmaps and forced icon/menu cache updates.
+  * Keep direct self-update installing yggterm-headless alongside yggterm.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 27 Mar 2026 15:58:00 +0530
+
 yggterm (2.0.15-1) unstable; urgency=medium
 
   * Make direct self-update install yggterm-headless alongside yggterm so direct installs actually repair SSH remote health on upgrade.
