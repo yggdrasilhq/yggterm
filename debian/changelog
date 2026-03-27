@@ -1,3 +1,10 @@
+yggterm (2.0.24-1) unstable; urgency=medium
+
+  * Keep only yggterm.desktop visible in Linux menus while leaving dev.yggterm.Yggterm.desktop as a hidden compatibility entry.
+  * Refresh KDE desktop caches more aggressively by clearing stale user cache files, rebuilding sycoca with --noincremental, and nudging Plasma to refresh its shell.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 27 Mar 2026 20:24:00 +0530
+
 yggterm (2.0.23-1) unstable; urgency=medium
 
   * Point Linux desktop entries at the shipped SVG icon directly instead of relying on theme-name lookup, so KDE panel and menu paths can render the same icon artwork as the desktop grid.
