@@ -4,8 +4,8 @@ use yggterm_server::{
     cleanup_legacy_daemons, default_endpoint, detect_ghostty_host, ping, run_attach, run_daemon,
     run_remote_ensure_managed_cli, run_remote_generation_context, run_remote_preview,
     run_remote_protocol_version, run_remote_refresh_managed_cli, run_remote_resume_codex,
-    run_remote_scan, run_remote_stage_clipboard_png, run_remote_upsert_generated_copy, shutdown,
-    status,
+    run_remote_scan, run_remote_stage_clipboard_png, run_remote_upsert_generated_copy,
+    run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, status,
 };
 
 fn main() -> Result<()> {
@@ -65,6 +65,32 @@ fn main() -> Result<()> {
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "remote" && args[2] == "scan" {
         return run_remote_scan(args.get(3).map(String::as_str));
+    }
+    if args.len() >= 3 && args[0] == "server" && args[1] == "trace" && args[2] == "tail" {
+        let lines = args
+            .get(3)
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(200);
+        return run_trace_tail(lines);
+    }
+    if args.len() >= 3 && args[0] == "server" && args[1] == "trace" && args[2] == "follow" {
+        let lines = args
+            .get(3)
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(200);
+        let poll_ms = args
+            .get(4)
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(500);
+        return run_trace_follow(lines, poll_ms);
+    }
+    if args.len() >= 3 && args[0] == "server" && args[1] == "trace" && args[2] == "bundle" {
+        let lines = args
+            .get(3)
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(200);
+        let include_screenshot = args.iter().any(|value| value == "--screenshot");
+        return run_trace_bundle(lines, include_screenshot);
     }
     if args.len() == 4 && args[0] == "server" && args[1] == "remote" && args[2] == "preview" {
         return run_remote_preview(&args[3]);

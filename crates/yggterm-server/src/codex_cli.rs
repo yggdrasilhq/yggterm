@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use yggterm_core::{PerfSpan, resolve_yggterm_home};
+use yggterm_core::{PerfSpan, append_trace_event, resolve_yggterm_home};
 
 const MANAGED_NPM_DIRNAME: &str = "npm";
 const MANAGED_NPM_CACHE_DIRNAME: &str = "npm-cache";
@@ -340,6 +340,13 @@ pub(crate) fn managed_cli_shell_command(
 
 pub(crate) fn ensure_local_managed_cli(tool: ManagedCliTool) -> Result<ManagedCliToolStatus> {
     let paths = ManagedCliPaths::resolve()?;
+    append_trace_event(
+        &paths.home,
+        "server",
+        "managed_cli",
+        "ensure_begin",
+        serde_json::json!({ "tool": tool.binary_name() }),
+    );
     let before = probe_tool(&paths, tool);
     if before.available {
         let detail = match before.source {
@@ -352,7 +359,20 @@ pub(crate) fn ensure_local_managed_cli(tool: ManagedCliTool) -> Result<ManagedCl
             ),
             None => format!("{} is available.", tool.display_name()),
         };
-        return Ok(tool_status(tool, before.clone(), before, "ready", detail));
+        let status = tool_status(tool, before.clone(), before, "ready", detail);
+        append_trace_event(
+            &paths.home,
+            "server",
+            "managed_cli",
+            "ensure_end",
+            serde_json::json!({
+                "tool": tool.binary_name(),
+                "action": status.action.clone(),
+                "available": status.available,
+                "changed": status.changed,
+            }),
+        );
+        return Ok(status);
     }
 
     install_latest(&paths, &[tool], false)?;
@@ -363,7 +383,7 @@ pub(crate) fn ensure_local_managed_cli(tool: ManagedCliTool) -> Result<ManagedCl
             tool.display_name()
         );
     }
-    Ok(tool_status(
+    let status = tool_status(
         tool,
         before,
         after,
@@ -373,11 +393,31 @@ pub(crate) fn ensure_local_managed_cli(tool: ManagedCliTool) -> Result<ManagedCl
             tool.display_name(),
             paths.prefix.display()
         ),
-    ))
+    );
+    append_trace_event(
+        &paths.home,
+        "server",
+        "managed_cli",
+        "ensure_end",
+        serde_json::json!({
+            "tool": tool.binary_name(),
+            "action": status.action.clone(),
+            "available": status.available,
+            "changed": status.changed,
+        }),
+    );
+    Ok(status)
 }
 
 pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRefreshReport> {
     let paths = ManagedCliPaths::resolve()?;
+    append_trace_event(
+        &paths.home,
+        "server",
+        "managed_cli",
+        "refresh_begin",
+        serde_json::json!({ "background": background }),
+    );
     let perf = PerfSpan::start(&paths.home, "cli", "refresh_managed_codex");
     let tools = [ManagedCliTool::Codex, ManagedCliTool::CodexLiteLlm];
     let before = tools
@@ -456,18 +496,34 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
         "background": background,
         "npm_available": npm_available,
         "statuses": statuses.iter().map(|status| serde_json::json!({
-            "tool": status.binary_name,
+            "tool": status.binary_name.clone(),
             "changed": status.changed,
             "available": status.available,
-            "action": status.action,
+            "action": status.action.clone(),
         })).collect::<Vec<_>>(),
     }));
 
-    Ok(ManagedCliRefreshReport {
+    let report = ManagedCliRefreshReport {
         scope: "local".to_string(),
         background,
         statuses,
-    })
+    };
+    append_trace_event(
+        &paths.home,
+        "server",
+        "managed_cli",
+        "refresh_end",
+        serde_json::json!({
+            "background": background,
+            "statuses": report.statuses.iter().map(|status| serde_json::json!({
+                "tool": status.binary_name.clone(),
+                "action": status.action.clone(),
+                "available": status.available,
+                "changed": status.changed,
+            })).collect::<Vec<_>>(),
+        }),
+    );
+    Ok(report)
 }
 
 pub(crate) fn summarize_managed_cli_report(
