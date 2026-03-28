@@ -1,18 +1,21 @@
 mod attach;
+mod codex_cli;
 mod daemon;
 mod host;
 mod protocol;
 mod terminal;
 
 pub use attach::{AttachMetadata, run_attach};
+pub use codex_cli::{ManagedCliTool, ManagedCliToolStatus};
 pub use daemon::{
     ServerEndpoint, ServerRequest, ServerResponse, ServerRuntimeStatus, TerminalStreamChunk,
     cleanup_legacy_daemons, connect_ssh, connect_ssh_custom, default_endpoint, focus_live,
-    open_remote_session, open_stored_session, ping, raise_external_window, refresh_remote_machine,
-    remove_ssh_target, request_terminal_launch, run_daemon, set_all_preview_blocks_folded,
-    set_view_mode, shutdown, snapshot, start_command_session, start_local_session,
-    start_local_session_at, status, switch_agent_session_mode, sync_external_window, sync_theme,
-    terminal_ensure, terminal_read, terminal_resize, terminal_write, toggle_preview_block,
+    open_remote_session, open_stored_session, ping, raise_external_window, refresh_managed_cli,
+    refresh_remote_machine, remove_ssh_target, request_terminal_launch, run_daemon,
+    set_all_preview_blocks_folded, set_view_mode, shutdown, snapshot, start_command_session,
+    start_local_session, start_local_session_at, status, switch_agent_session_mode,
+    sync_external_window, sync_theme, terminal_ensure, terminal_read, terminal_resize,
+    terminal_write, toggle_preview_block,
 };
 pub use host::{GhosttyHostKind, GhosttyHostSupport, GhosttyTerminalHostMode, detect_ghostty_host};
 pub use protocol::{
@@ -23,6 +26,10 @@ pub use protocol::{
 pub use terminal::{TerminalChunk, TerminalManager, TerminalReadResult};
 
 use anyhow::Context;
+use codex_cli::{
+    ManagedCliAction, ManagedCliRefreshReport, ensure_local_managed_cli, managed_cli_shell_command,
+    refresh_local_managed_cli, summarize_managed_cli_report,
+};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -908,7 +915,7 @@ impl YggtermServer {
                             &machine.sessions,
                         );
                     }
-                    machine
+                    let _ = machine
                         .sessions
                         .iter()
                         .cloned()
@@ -1128,8 +1135,74 @@ impl YggtermServer {
 
     pub fn refresh_remote_machine_by_key(&mut self, machine_key: &str) -> anyhow::Result<()> {
         let machine_key = normalize_machine_key(machine_key);
-        let target = self
-            .ssh_targets
+        let target = self.remote_target_for_machine_key(&machine_key)?;
+        self.refresh_remote_machine_for_ssh_target(&target)
+    }
+
+    pub fn ensure_managed_cli_for_session_path(
+        &self,
+        path: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let Some(session) = self.sessions.get(path) else {
+            return Ok(None);
+        };
+        if path.starts_with("remote-session://") {
+            let ssh_target = session
+                .ssh_target
+                .as_deref()
+                .context("remote session missing ssh target")?;
+            let report = refresh_remote_managed_cli_tool(
+                ssh_target,
+                session.ssh_prefix.as_deref(),
+                ManagedCliTool::Codex,
+            )?;
+            return Ok(Some(summarize_managed_cli_report(
+                ssh_target,
+                &ManagedCliRefreshReport {
+                    scope: ssh_target.to_string(),
+                    background: false,
+                    statuses: vec![report],
+                },
+            )));
+        }
+        let Some(tool) = ManagedCliTool::from_session_kind(session.kind) else {
+            return Ok(None);
+        };
+        let status = ensure_local_managed_cli(tool)?;
+        Ok(Some(summarize_managed_cli_report(
+            "local",
+            &ManagedCliRefreshReport {
+                scope: "local".to_string(),
+                background: false,
+                statuses: vec![status],
+            },
+        )))
+    }
+
+    pub fn refresh_managed_cli(
+        &self,
+        machine_key: Option<&str>,
+        background: bool,
+    ) -> anyhow::Result<String> {
+        let (scope, report) = match machine_key.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(machine_key) => {
+                let machine_key = normalize_machine_key(machine_key);
+                let target = self.remote_target_for_machine_key(&machine_key)?;
+                let report = refresh_remote_managed_cli(
+                    &target.ssh_target,
+                    target.prefix.as_deref(),
+                    background,
+                )?;
+                (machine_key, report)
+            }
+            None => ("local".to_string(), refresh_local_managed_cli(background)?),
+        };
+        Ok(summarize_managed_cli_report(&scope, &report))
+    }
+
+    fn remote_target_for_machine_key(&self, machine_key: &str) -> anyhow::Result<SshConnectTarget> {
+        let machine_key = normalize_machine_key(machine_key);
+        self.ssh_targets
             .iter()
             .find(|target| machine_key_from_ssh_target(&target.ssh_target) == machine_key)
             .cloned()
@@ -1145,8 +1218,7 @@ impl YggtermServer {
                         cwd: None,
                     })
             })
-            .ok_or_else(|| anyhow::anyhow!("remote machine not found: {machine_key}"))?;
-        self.refresh_remote_machine_for_ssh_target(&target)
+            .ok_or_else(|| anyhow::anyhow!("remote machine not found: {machine_key}"))
     }
 
     pub fn open_remote_scanned_session(
@@ -2128,14 +2200,7 @@ fn remote_resume_shell_command(
     cwd: Option<&str>,
     prefix: Option<&str>,
 ) -> String {
-    let base = match cwd.filter(|cwd| !cwd.trim().is_empty()) {
-        Some(cwd) => format!(
-            "cd {} && codex resume {}",
-            shell_single_quote(cwd),
-            shell_single_quote(session_id)
-        ),
-        None => format!("codex resume {}", shell_single_quote(session_id)),
-    };
+    let base = agent_launch_command(SessionKind::Codex, cwd, Some(session_id));
     match prefix.map(str::trim).filter(|value| !value.is_empty()) {
         Some(prefix) => format!("{prefix} && {base}"),
         None => base,
@@ -2157,15 +2222,22 @@ fn remote_resume_picker_shell_command(
     prefix: Option<&str>,
     persistent: bool,
 ) -> String {
-    let codex_command = if persistent {
-        "exec codex resume"
-    } else {
-        "codex resume"
-    };
-    let base = match cwd.filter(|cwd| !cwd.trim().is_empty()) {
-        Some(cwd) => format!("cd {} && {}", shell_single_quote(cwd), codex_command),
-        None => codex_command.to_string(),
-    };
+    let base = managed_cli_shell_command(
+        SessionKind::Codex,
+        cwd,
+        ManagedCliAction::ResumePicker { persistent },
+    )
+    .unwrap_or_else(|_| {
+        let codex_command = if persistent {
+            "exec codex resume"
+        } else {
+            "codex resume"
+        };
+        match cwd.filter(|cwd| !cwd.trim().is_empty()) {
+            Some(cwd) => format!("cd {} && {}", shell_single_quote(cwd), codex_command),
+            None => codex_command.to_string(),
+        }
+    });
     let with_notice = format!("{}; {}", remote_resume_picker_notice(session_id), base);
     match prefix.map(str::trim).filter(|value| !value.is_empty()) {
         Some(prefix) => format!("{prefix} && {with_notice}"),
@@ -2174,14 +2246,7 @@ fn remote_resume_picker_shell_command(
 }
 
 fn remote_persistent_resume_shell_command(session_id: &str, cwd: Option<&str>) -> String {
-    match cwd.filter(|cwd| !cwd.trim().is_empty()) {
-        Some(cwd) => format!(
-            "cd {} && exec codex resume {}",
-            shell_single_quote(cwd),
-            shell_single_quote(session_id)
-        ),
-        None => format!("exec codex resume {}", shell_single_quote(session_id)),
-    }
+    persistent_agent_resume_command(SessionKind::Codex, cwd, session_id)
 }
 
 fn resolve_remote_codex_home() -> std::path::PathBuf {
@@ -3890,6 +3955,7 @@ pub fn run_remote_resume_codex(session_id: &str, cwd: Option<&str>) -> anyhow::R
             span.finish(meta);
         }
     };
+    let _ = ensure_local_managed_cli(ManagedCliTool::Codex)?;
     let tmux_ready = tmux_available()?;
     if tmux_ready {
         let session_name = remote_tmux_session_name(session_id);
@@ -3963,6 +4029,53 @@ pub fn run_remote_resume_codex(session_id: &str, cwd: Option<&str>) -> anyhow::R
     }
 }
 
+fn refresh_remote_managed_cli(
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+    background: bool,
+) -> anyhow::Result<ManagedCliRefreshReport> {
+    let output = run_remote_yggterm_command(
+        ssh_target,
+        exec_prefix,
+        &[
+            "server",
+            "remote",
+            "refresh-managed-cli",
+            if background {
+                "background"
+            } else {
+                "foreground"
+            },
+        ],
+        None,
+    )?;
+    serde_json::from_str(output.trim())
+        .with_context(|| format!("parsing remote managed cli refresh report for {ssh_target}"))
+}
+
+fn refresh_remote_managed_cli_tool(
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+    tool: ManagedCliTool,
+) -> anyhow::Result<codex_cli::ManagedCliToolStatus> {
+    let output = run_remote_yggterm_command(
+        ssh_target,
+        exec_prefix,
+        &[
+            "server",
+            "remote",
+            "ensure-managed-cli",
+            match tool {
+                ManagedCliTool::Codex => "codex",
+                ManagedCliTool::CodexLiteLlm => "codex-litellm",
+            },
+        ],
+        None,
+    )?;
+    serde_json::from_str(output.trim())
+        .with_context(|| format!("parsing remote managed cli ensure report for {ssh_target}"))
+}
+
 pub fn run_remote_terminate_codex(session_id: &str) -> anyhow::Result<()> {
     if !tmux_available()? {
         return Ok(());
@@ -3979,6 +4092,18 @@ pub fn run_remote_terminate_codex(session_id: &str) -> anyhow::Result<()> {
         }
     }
     tmux_kill_session(&session_name)
+}
+
+pub fn run_remote_refresh_managed_cli(background: bool) -> anyhow::Result<()> {
+    let report = refresh_local_managed_cli(background)?;
+    println!("{}", serde_json::to_string(&report)?);
+    Ok(())
+}
+
+pub fn run_remote_ensure_managed_cli(tool: ManagedCliTool) -> anyhow::Result<()> {
+    let status = ensure_local_managed_cli(tool)?;
+    println!("{}", serde_json::to_string(&status)?);
+    Ok(())
 }
 
 pub fn run_remote_scan(codex_home: Option<&str>) -> anyhow::Result<()> {
@@ -4817,7 +4942,7 @@ fn build_live_session(
                 RemoteDeployState::NotRequired,
             ),
             SessionKind::Codex => (
-                format!("cd {} && codex", shell_single_quote(&default_cwd)),
+                agent_launch_command(SessionKind::Codex, Some(&default_cwd), None),
                 format!("codex://{uuid}"),
                 "local-codex".to_string(),
                 default_cwd.clone(),
@@ -4825,10 +4950,7 @@ fn build_live_session(
                 RemoteDeployState::NotRequired,
             ),
             SessionKind::CodexLiteLlm => (
-                format!(
-                    "cd {} && CODEX_HOME=\"$HOME/.codex-litellm\" codex-litellm",
-                    shell_single_quote(&default_cwd)
-                ),
+                agent_launch_command(SessionKind::CodexLiteLlm, Some(&default_cwd), None),
                 format!("codex-litellm://{uuid}"),
                 "local-codex-litellm".to_string(),
                 default_cwd.clone(),
@@ -5423,18 +5545,81 @@ fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn legacy_agent_launch_command(
+    kind: SessionKind,
+    cwd: Option<&str>,
+    session_id: Option<&str>,
+) -> String {
+    match (kind, session_id) {
+        (SessionKind::Codex, Some(session_id)) => match cwd.filter(|cwd| !cwd.trim().is_empty()) {
+            Some(cwd) => format!(
+                "cd {} && codex resume {}",
+                shell_single_quote(cwd),
+                shell_single_quote(session_id)
+            ),
+            None => format!("codex resume {}", shell_single_quote(session_id)),
+        },
+        (SessionKind::CodexLiteLlm, Some(session_id)) => {
+            match cwd.filter(|cwd| !cwd.trim().is_empty()) {
+                Some(cwd) => format!(
+                    "cd {} && CODEX_HOME=\"$HOME/.codex-litellm\" codex-litellm resume {}",
+                    shell_single_quote(cwd),
+                    shell_single_quote(session_id)
+                ),
+                None => format!(
+                    "CODEX_HOME=\"$HOME/.codex-litellm\" codex-litellm resume {}",
+                    shell_single_quote(session_id)
+                ),
+            }
+        }
+        (SessionKind::Codex, None) => match cwd.filter(|cwd| !cwd.trim().is_empty()) {
+            Some(cwd) => format!("cd {} && codex", shell_single_quote(cwd)),
+            None => "codex".to_string(),
+        },
+        (SessionKind::CodexLiteLlm, None) => match cwd.filter(|cwd| !cwd.trim().is_empty()) {
+            Some(cwd) => format!(
+                "cd {} && CODEX_HOME=\"$HOME/.codex-litellm\" codex-litellm",
+                shell_single_quote(cwd)
+            ),
+            None => "CODEX_HOME=\"$HOME/.codex-litellm\" codex-litellm".to_string(),
+        },
+        _ => String::new(),
+    }
+}
+
+fn agent_launch_command(kind: SessionKind, cwd: Option<&str>, session_id: Option<&str>) -> String {
+    let action = session_id.map(|session_id| ManagedCliAction::Resume {
+        session_id,
+        persistent: false,
+    });
+    let managed = match action {
+        Some(action) => managed_cli_shell_command(kind, cwd, action),
+        None => managed_cli_shell_command(kind, cwd, ManagedCliAction::Launch),
+    };
+    managed.unwrap_or_else(|_| legacy_agent_launch_command(kind, cwd, session_id))
+}
+
+fn persistent_agent_resume_command(
+    kind: SessionKind,
+    cwd: Option<&str>,
+    session_id: &str,
+) -> String {
+    managed_cli_shell_command(
+        kind,
+        cwd,
+        ManagedCliAction::Resume {
+            session_id,
+            persistent: true,
+        },
+    )
+    .unwrap_or_else(|_| legacy_agent_launch_command(kind, cwd, Some(session_id)))
+}
+
 fn stored_session_launch_command(kind: SessionKind, cwd: &str, session_id: &str) -> String {
     match kind {
-        SessionKind::Codex => format!(
-            "cd {} && codex resume {}",
-            shell_single_quote(cwd),
-            session_id
-        ),
-        SessionKind::CodexLiteLlm => format!(
-            "cd {} && CODEX_HOME=\"$HOME/.codex-litellm\" codex-litellm resume {}",
-            shell_single_quote(cwd),
-            session_id
-        ),
+        SessionKind::Codex | SessionKind::CodexLiteLlm => {
+            agent_launch_command(kind, Some(cwd), Some(session_id))
+        }
         SessionKind::Document => "document preview".to_string(),
         SessionKind::Shell | SessionKind::SshShell => format!(
             "cd {} && codex resume {}",
@@ -5886,7 +6071,8 @@ mod tests {
             "/tmp/workspace",
             "019caa6f-b32c-7a73-b4d3-db83225663dc",
         );
-        assert!(command.contains("CODEX_HOME=\"$HOME/.codex-litellm\""));
+        assert!(command.contains("export NPM_CONFIG_PREFIX="));
+        assert!(command.contains("export CODEX_HOME="));
         assert!(command.contains("codex-litellm resume"));
     }
 
@@ -5898,7 +6084,8 @@ mod tests {
             Some("tmux new-session -A -s yggterm"),
         );
         assert!(command.contains("tmux new-session -A -s yggterm &&"));
-        assert!(command.contains("cd '/srv/workspace' && codex resume"));
+        assert!(command.contains("cd '/srv/workspace' && export NPM_CONFIG_PREFIX="));
+        assert!(command.contains("codex resume"));
         assert!(command.contains("'019caa6f-b32c-7a73-b4d3-db83225663dc'"));
     }
 
