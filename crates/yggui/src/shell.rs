@@ -9,7 +9,7 @@ use crate::drag_tree::{
     resolve_drag_drop_target as resolve_tree_drag_drop_target, resolve_tree_drop_placement,
     tree_parent_path, tree_path_contains, valid_drop_target as valid_tree_drop_target,
 };
-use crate::drag_visuals::{DragGhostCard, DragGhostPalette, TreeDropZones};
+use crate::drag_visuals::{DragGhostCard, DragGhostPalette};
 use crate::notifications::{
     TOAST_CSS, ToastCard, ToastItem as ToastNotification, ToastPalette,
     ToastTone as NotificationTone, ToastViewport,
@@ -8414,6 +8414,25 @@ fn context_menu_drop_placement(row: &BrowserRow) -> Option<WorkspaceDropPlacemen
     }
 }
 
+fn drag_drop_placement_from_pointer(row: &BrowserRow, y: f64) -> DragDropPlacement {
+    let y = y.max(0.0);
+    let can_drop_inside =
+        row.kind == BrowserRowKind::Group && row.group_kind != Some(WorkspaceGroupKind::Separator);
+    if can_drop_inside {
+        if y <= 12.0 {
+            DragDropPlacement::Before
+        } else if y >= 24.0 {
+            DragDropPlacement::After
+        } else {
+            DragDropPlacement::Into
+        }
+    } else if y <= 12.0 {
+        DragDropPlacement::Before
+    } else {
+        DragDropPlacement::After
+    }
+}
+
 fn build_workspace_reorder_plan(
     rows: &[BrowserRow],
     selected_rows: &[BrowserRow],
@@ -11486,12 +11505,12 @@ fn SidebarRow(
     let draggable = is_workspace_row(&row);
     let row_kind_label = format!("{:?}", row.kind);
     let drop_hovered = drop_target.is_some();
-    let can_drop_inside =
-        row.kind == BrowserRowKind::Group && row.group_kind != Some(WorkspaceGroupKind::Separator);
     let top_line = drop_target == Some(DragDropPlacement::Before);
     let bottom_line = drop_target == Some(DragDropPlacement::After);
     let fill_target = drop_target == Some(DragDropPlacement::Into);
     if row.kind == BrowserRowKind::Separator {
+        let row_for_enter = row.clone();
+        let row_for_move = row.clone();
         return rsx! {
             div {
                 id: "{sidebar_row_dom_id(&row.full_path)}",
@@ -11506,7 +11525,7 @@ fn SidebarRow(
                 },
                 style: format!(
                     "width:100%; display:flex; align-items:center; gap:10px; border:none; background:transparent; cursor:{}; \
-                     padding:9px 9px 9px {}px; margin:0; opacity:{}; border-radius:12px; background:{}; \
+                     padding:10px 9px 10px {}px; margin:0; opacity:{}; border-radius:12px; background:{}; \
                      box-sizing:border-box; min-width:0; overflow:hidden; user-select:none; -webkit-user-select:none; \
                      transition: transform 140ms ease, background 140ms ease, opacity 140ms ease, box-shadow 140ms ease; \
                      transform:translateY(0px); box-shadow:{}; position:relative;",
@@ -11545,19 +11564,30 @@ fn SidebarRow(
                 onmouseleave: move |evt| {
                     on_drag_leave.call(evt);
                 },
+                onmouseenter: move |evt| {
+                    if drag_active {
+                        let placement = drag_drop_placement_from_pointer(
+                            &row_for_enter,
+                            evt.element_coordinates().y,
+                        );
+                        on_drag_hover.call((placement, evt));
+                    }
+                },
+                onmousemove: move |evt| {
+                    if drag_active {
+                        let placement = drag_drop_placement_from_pointer(
+                            &row_for_move,
+                            evt.element_coordinates().y,
+                        );
+                        on_drag_hover.call((placement, evt));
+                    }
+                },
                 onmouseup: move |_| {
                     if drag_active {
                         on_drop_into_row.call(());
                         on_end_drag.call(());
                     }
                 },
-                TreeDropZones {
-                    drag_active: drag_active,
-                    can_drop_inside: false,
-                    on_drag_hover: on_drag_hover,
-                    on_drop: on_drop_into_row,
-                    on_end_drag: on_end_drag,
-                }
                 div {
                     style: format!(
                         "flex:1; min-width:0; height:{}px; background:{}; opacity:{};",
@@ -11640,6 +11670,8 @@ fn SidebarRow(
     } else {
         palette.text
     };
+    let row_for_enter = row.clone();
+    let row_for_move = row.clone();
 
     rsx! {
         div {
@@ -11655,7 +11687,7 @@ fn SidebarRow(
             },
             style: format!(
                 "width:100%; display:flex; flex-direction:column; align-items:stretch; gap:1px; \
-                 border:none; border-radius:12px; background:{}; padding:3px 9px 3px {}px; margin:0; opacity:{}; cursor:{}; \
+                 border:none; border-radius:12px; background:{}; padding:4px 9px 4px {}px; margin:0; opacity:{}; cursor:{}; \
                  box-sizing:border-box; min-width:0; overflow:hidden; user-select:none; -webkit-user-select:none; \
                  transition: transform 140ms ease, background 140ms ease, opacity 140ms ease, box-shadow 140ms ease; \
                  transform:translateY(0px); box-shadow:{}; position:relative;",
@@ -11694,19 +11726,26 @@ fn SidebarRow(
             onmouseleave: move |evt| {
                 on_drag_leave.call(evt);
             },
+            onmouseenter: move |evt| {
+                if drag_active {
+                    let placement =
+                        drag_drop_placement_from_pointer(&row_for_enter, evt.element_coordinates().y);
+                    on_drag_hover.call((placement, evt));
+                }
+            },
+            onmousemove: move |evt| {
+                if drag_active {
+                    let placement =
+                        drag_drop_placement_from_pointer(&row_for_move, evt.element_coordinates().y);
+                    on_drag_hover.call((placement, evt));
+                }
+            },
             onmouseup: move |_| {
                 if drag_active {
                     on_drop_into_row.call(());
                     on_end_drag.call(());
                 }
             },
-            TreeDropZones {
-                drag_active: drag_active,
-                can_drop_inside: can_drop_inside,
-                on_drag_hover: on_drag_hover,
-                on_drop: on_drop_into_row,
-                on_end_drag: on_end_drag,
-            }
                 div {
                     style: "display:flex; align-items:center; justify-content:space-between; gap:6px;",
                     div {
@@ -11714,7 +11753,7 @@ fn SidebarRow(
                     div {
                         "data-tree-icon": "1",
                         style: format!(
-                            "display:inline-flex; align-items:center; justify-content:center; width:18px; min-width:18px; height:18px; color:{};",
+                            "display:inline-flex; align-items:center; justify-content:center; width:19px; min-width:19px; height:19px; color:{};",
                             icon_color
                         ),
                         TreeIcon { row: row.clone() }
@@ -11749,7 +11788,7 @@ fn SidebarRow(
                     } else {
                         span {
                             style: format!(
-                                "font-size:11.5px; color:{}; font-weight:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                                "font-size:12.5px; color:{}; font-weight:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
                                 label_color,
                                 if row.kind == BrowserRowKind::Group && row.depth == 0 { 600 } else { 500 }
                             ),
@@ -16970,6 +17009,61 @@ mod tests {
         };
         assert!(!is_workspace_row(&live_group));
         assert!(is_workspace_row(&folder));
+    }
+
+    #[test]
+    fn pointer_drag_placement_uses_edges_for_separator_and_middle_for_folder() {
+        let separator = BrowserRow {
+            kind: BrowserRowKind::Separator,
+            full_path: "/home/pi/gh/notes/separator-a".to_string(),
+            label: "Separator".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: Some(WorkspaceGroupKind::Separator),
+            session_title: None,
+            depth: 3,
+            host_label: String::new(),
+            descendant_sessions: 0,
+            expanded: false,
+            session_id: None,
+            session_cwd: None,
+        };
+        let folder = BrowserRow {
+            kind: BrowserRowKind::Group,
+            full_path: "/home/pi/gh/notes/folder-a".to_string(),
+            label: "folder-a".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: Some(WorkspaceGroupKind::Folder),
+            session_title: None,
+            depth: 3,
+            host_label: String::new(),
+            descendant_sessions: 0,
+            expanded: true,
+            session_id: None,
+            session_cwd: None,
+        };
+
+        assert_eq!(
+            drag_drop_placement_from_pointer(&separator, 4.0),
+            DragDropPlacement::Before
+        );
+        assert_eq!(
+            drag_drop_placement_from_pointer(&separator, 18.0),
+            DragDropPlacement::After
+        );
+        assert_eq!(
+            drag_drop_placement_from_pointer(&folder, 4.0),
+            DragDropPlacement::Before
+        );
+        assert_eq!(
+            drag_drop_placement_from_pointer(&folder, 18.0),
+            DragDropPlacement::Into
+        );
+        assert_eq!(
+            drag_drop_placement_from_pointer(&folder, 30.0),
+            DragDropPlacement::After
+        );
     }
 
     #[test]
