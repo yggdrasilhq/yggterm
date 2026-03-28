@@ -1,12 +1,13 @@
 use anyhow::Result;
 use yggterm_core::{SessionStore, detect_install_context, refresh_desktop_integration};
 use yggterm_server::{
-    cleanup_legacy_daemons, default_endpoint, detect_ghostty_host, ping,
-    run_app_control_describe_state, run_app_control_focus_window, run_attach, run_daemon,
-    run_remote_ensure_managed_cli, run_remote_generation_context, run_remote_preview,
-    run_remote_protocol_version, run_remote_refresh_managed_cli, run_remote_resume_codex,
-    run_remote_scan, run_remote_stage_clipboard_png, run_remote_upsert_generated_copy,
-    run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, status,
+    AppControlViewMode, cleanup_legacy_daemons, default_endpoint, detect_ghostty_host, ping,
+    run_app_control_describe_rows, run_app_control_describe_state, run_app_control_focus_window,
+    run_app_control_open_path, run_attach, run_daemon, run_remote_ensure_managed_cli,
+    run_remote_generation_context, run_remote_preview, run_remote_protocol_version,
+    run_remote_refresh_managed_cli, run_remote_resume_codex, run_remote_scan,
+    run_remote_stage_clipboard_png, run_remote_upsert_generated_copy, run_screenshot_capture,
+    run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, status,
 };
 
 fn main() -> Result<()> {
@@ -132,7 +133,27 @@ fn main() -> Result<()> {
                 run_screenshot_capture("app", output_path, timeout_ms)
             }
             "state" => run_app_control_describe_state(timeout_ms),
+            "rows" => run_app_control_describe_rows(timeout_ms),
             "focus" => run_app_control_focus_window(timeout_ms),
+            "open" => {
+                let session_path = args
+                    .iter()
+                    .skip(3)
+                    .find(|value| !value.starts_with("--"))
+                    .map(String::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("missing session path for server app open"))?;
+                let view_mode = args.windows(2).find_map(|window| {
+                    if window[0] != "--view" {
+                        return None;
+                    }
+                    match window[1].as_str() {
+                        "preview" | "rendered" => Some(AppControlViewMode::Preview),
+                        "terminal" => Some(AppControlViewMode::Terminal),
+                        _ => None,
+                    }
+                });
+                run_app_control_open_path(session_path, view_mode, timeout_ms)
+            }
             other => anyhow::bail!("unsupported app control command: {other}"),
         };
     }

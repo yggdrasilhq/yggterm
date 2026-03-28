@@ -7,7 +7,7 @@ mod protocol;
 mod terminal;
 
 pub use app_control::{
-    AppControlCommand, AppControlRequest, AppControlResponse, ScreenshotTarget,
+    AppControlCommand, AppControlRequest, AppControlResponse, AppControlViewMode, ScreenshotTarget,
     app_control_captures_dir, app_control_requests_dir, app_control_responses_dir,
     complete_app_control_request, current_millis, default_screenshot_output_path,
     enqueue_app_control_request, enqueue_screenshot_request, take_next_app_control_request,
@@ -21,9 +21,9 @@ pub use daemon::{
     open_remote_session, open_stored_session, ping, raise_external_window, refresh_managed_cli,
     refresh_remote_machine, remove_ssh_target, request_terminal_launch, run_daemon,
     set_all_preview_blocks_folded, set_view_mode, shutdown, snapshot, start_command_session,
-    start_local_session, start_local_session_at, status, switch_agent_session_mode,
-    sync_external_window, sync_theme, terminal_ensure, terminal_read, terminal_resize,
-    terminal_write, toggle_preview_block,
+    start_local_session, start_local_session_at, start_ssh_session_at, status,
+    switch_agent_session_mode, sync_external_window, sync_theme, terminal_ensure, terminal_read,
+    terminal_resize, terminal_write, toggle_preview_block,
 };
 pub use host::{GhosttyHostKind, GhosttyHostSupport, GhosttyTerminalHostMode, detect_ghostty_host};
 pub use protocol::{
@@ -1063,6 +1063,52 @@ impl YggtermServer {
         let (key, reused) = self.connect_ssh_like_target(&target);
         key.map(|key| (key, reused))
             .ok_or_else(|| anyhow::anyhow!("failed to create ssh session"))
+    }
+
+    pub fn start_ssh_session(
+        &mut self,
+        target: &str,
+        prefix: Option<&str>,
+        cwd: Option<&str>,
+        title_hint: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let ssh_target = canonicalize_ssh_target_alias(target);
+        if ssh_target.is_empty() {
+            anyhow::bail!("enter an SSH target such as dev, pi@raspberry, or user@ip");
+        }
+        let prefix = prefix
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let cwd = cwd
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let title = title_hint
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| {
+                cwd.clone().unwrap_or_else(|| {
+                    ssh_target
+                        .rsplit('@')
+                        .next()
+                        .unwrap_or(ssh_target.as_str())
+                        .to_string()
+                })
+            });
+        let target = SshConnectTarget {
+            label: title.clone(),
+            kind: SessionKind::SshShell,
+            ssh_target,
+            prefix,
+            cwd,
+        };
+        self.upsert_ssh_target(&target);
+        let uuid = Uuid::new_v4().to_string();
+        let key = format!("live::{uuid}");
+        self.insert_live_session(&key, &uuid, SessionKind::SshShell, &target, Some(title));
+        Ok(key)
     }
 
     pub fn refresh_remote_machine_for_ssh_target(
@@ -4313,6 +4359,31 @@ pub fn run_app_control_describe_state(timeout_ms: u64) -> anyhow::Result<()> {
 pub fn run_app_control_focus_window(timeout_ms: u64) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
     let response = request_app_control(&home, AppControlCommand::FocusWindow, timeout_ms)?;
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    Ok(())
+}
+
+pub fn run_app_control_describe_rows(timeout_ms: u64) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(&home, AppControlCommand::DescribeRows, timeout_ms)?;
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    Ok(())
+}
+
+pub fn run_app_control_open_path(
+    session_path: &str,
+    view_mode: Option<AppControlViewMode>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::OpenPath {
+            session_path: session_path.to_string(),
+            view_mode,
+        },
+        timeout_ms,
+    )?;
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }
