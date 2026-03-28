@@ -2,12 +2,12 @@ use anyhow::Result;
 use yggterm_core::{SessionStore, detect_install_context, refresh_desktop_integration};
 use yggterm_server::{
     AppControlViewMode, cleanup_legacy_daemons, default_endpoint, detect_ghostty_host, ping,
-    run_app_control_describe_rows, run_app_control_describe_state, run_app_control_focus_window,
-    run_app_control_open_path, run_attach, run_daemon, run_remote_ensure_managed_cli,
-    run_remote_generation_context, run_remote_preview, run_remote_protocol_version,
-    run_remote_refresh_managed_cli, run_remote_resume_codex, run_remote_scan,
-    run_remote_stage_clipboard_png, run_remote_upsert_generated_copy, run_screenshot_capture,
-    run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, status,
+    run_app_control_describe_rows, run_app_control_describe_state, run_app_control_drag,
+    run_app_control_focus_window, run_app_control_open_path, run_attach, run_daemon,
+    run_remote_ensure_managed_cli, run_remote_generation_context, run_remote_preview,
+    run_remote_protocol_version, run_remote_refresh_managed_cli, run_remote_resume_codex,
+    run_remote_scan, run_remote_stage_clipboard_png, run_remote_upsert_generated_copy,
+    run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, status,
 };
 
 fn main() -> Result<()> {
@@ -153,6 +153,25 @@ fn main() -> Result<()> {
                     }
                 });
                 run_app_control_open_path(session_path, view_mode, timeout_ms)
+            }
+            "drag" => {
+                let action = args
+                    .get(3)
+                    .map(String::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("missing action for server app drag"))?;
+                let row_path = args
+                    .iter()
+                    .skip(4)
+                    .find(|value| !value.starts_with("--"))
+                    .map(String::as_str);
+                let placement = args.windows(2).find_map(|window| {
+                    if window[0] == "--placement" {
+                        Some(window[1].as_str())
+                    } else {
+                        None
+                    }
+                });
+                run_app_control_drag(action, row_path, placement, timeout_ms)
             }
             other => anyhow::bail!("unsupported app control command: {other}"),
         };

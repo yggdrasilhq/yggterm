@@ -106,6 +106,7 @@ pub fn TreeDropZones(
     };
     rsx! {
         div {
+            "data-tree-drop-zone": "before",
             style: "position:absolute; left:0; right:0; top:0; height:12px; z-index:2;",
             onmouseenter: move |evt| on_drag_hover.call((DragDropPlacement::Before, evt)),
             onmousemove: move |evt| on_drag_hover.call((DragDropPlacement::Before, evt)),
@@ -113,6 +114,7 @@ pub fn TreeDropZones(
         }
         if can_drop_inside {
             div {
+                "data-tree-drop-zone": "into",
                 style: "position:absolute; left:0; right:0; top:12px; bottom:12px; z-index:2;",
                 onmouseenter: move |evt| on_drag_hover.call((DragDropPlacement::Into, evt)),
                 onmousemove: move |evt| on_drag_hover.call((DragDropPlacement::Into, evt)),
@@ -120,6 +122,7 @@ pub fn TreeDropZones(
             }
         }
         div {
+            "data-tree-drop-zone": "after",
             style: "position:absolute; left:0; right:0; bottom:0; height:12px; z-index:2;",
             onmouseenter: move |evt| on_drag_hover.call((DragDropPlacement::After, evt)),
             onmousemove: move |evt| on_drag_hover.call((DragDropPlacement::After, evt)),

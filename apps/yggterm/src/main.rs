@@ -15,9 +15,9 @@ use yggterm_core::{
 use yggterm_server::{
     AppControlViewMode, PersistedDaemonState, SessionKind, YggtermServer, cleanup_legacy_daemons,
     default_endpoint, detect_ghostty_host, ping, run_app_control_describe_rows,
-    run_app_control_describe_state, run_app_control_focus_window, run_app_control_open_path,
-    run_attach, run_daemon, run_remote_generation_context, run_remote_preview,
-    run_remote_protocol_version, run_remote_resume_codex, run_remote_scan,
+    run_app_control_describe_state, run_app_control_drag, run_app_control_focus_window,
+    run_app_control_open_path, run_attach, run_daemon, run_remote_generation_context,
+    run_remote_preview, run_remote_protocol_version, run_remote_resume_codex, run_remote_scan,
     run_remote_stage_clipboard_png, run_remote_terminate_codex, run_remote_upsert_generated_copy,
     run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown,
     start_local_session, status,
@@ -164,6 +164,25 @@ fn main() -> Result<()> {
                     }
                 });
                 run_app_control_open_path(session_path, view_mode, timeout_ms)
+            }
+            "drag" => {
+                let action = args
+                    .get(3)
+                    .map(String::as_str)
+                    .context("missing action for server app drag")?;
+                let row_path = args
+                    .iter()
+                    .skip(4)
+                    .find(|value| !value.starts_with("--"))
+                    .map(String::as_str);
+                let placement = args.windows(2).find_map(|window| {
+                    if window[0] == "--placement" {
+                        Some(window[1].as_str())
+                    } else {
+                        None
+                    }
+                });
+                run_app_control_drag(action, row_path, placement, timeout_ms)
             }
             other => anyhow::bail!("unsupported app control command: {other}"),
         };
