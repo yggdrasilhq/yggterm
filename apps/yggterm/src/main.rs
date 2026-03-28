@@ -9,15 +9,15 @@ use std::time::Duration;
 use yggterm_core::{
     ENV_YGGTERM_DIRECT_INSTALL_ROOT, ENV_YGGTERM_HOME, InstallContext, PerfSpan, SessionNode,
     SessionNodeKind, SessionStore, UiTheme, UpdatePolicy, WorkspaceDocumentKind,
-    WorkspaceGroupKind, check_for_update, current_version, detect_install_context,
-    install_release_update, refresh_desktop_integration,
+    WorkspaceGroupKind, append_trace_event, check_for_update, current_version,
+    detect_install_context, install_release_update, refresh_desktop_integration,
 };
 use yggterm_server::{
     PersistedDaemonState, SessionKind, YggtermServer, cleanup_legacy_daemons, default_endpoint,
     detect_ghostty_host, ping, run_attach, run_daemon, run_remote_generation_context,
     run_remote_preview, run_remote_protocol_version, run_remote_resume_codex, run_remote_scan,
     run_remote_stage_clipboard_png, run_remote_terminate_codex, run_remote_upsert_generated_copy,
-    shutdown, start_local_session, status,
+    run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, start_local_session, status,
 };
 
 const DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT_ENV: &str =
@@ -40,6 +40,13 @@ fn main() -> Result<()> {
     let store = SessionStore::open_or_init()?;
     install_panic_logging(store.home_dir());
     let startup_home = store.home_dir().to_path_buf();
+    append_trace_event(
+        &startup_home,
+        "gui",
+        "startup",
+        "main_enter",
+        serde_json::json!({ "args": args.clone() }),
+    );
     let startup_span = PerfSpan::start(&startup_home, "startup", "gui_main");
     let pending_update_restart = None;
     let launch_install_context = install_context.clone();
@@ -68,6 +75,32 @@ fn main() -> Result<()> {
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "remote" && args[2] == "scan" {
         return run_remote_scan(args.get(3).map(String::as_str));
+    }
+    if args.len() >= 3 && args[0] == "server" && args[1] == "trace" && args[2] == "tail" {
+        let lines = args
+            .get(3)
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(200);
+        return run_trace_tail(lines);
+    }
+    if args.len() >= 3 && args[0] == "server" && args[1] == "trace" && args[2] == "follow" {
+        let lines = args
+            .get(3)
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(200);
+        let poll_ms = args
+            .get(4)
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(500);
+        return run_trace_follow(lines, poll_ms);
+    }
+    if args.len() >= 3 && args[0] == "server" && args[1] == "trace" && args[2] == "bundle" {
+        let lines = args
+            .get(3)
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(200);
+        let include_screenshot = args.iter().any(|value| value == "--screenshot");
+        return run_trace_bundle(lines, include_screenshot);
     }
     if args.len() == 4 && args[0] == "server" && args[1] == "remote" && args[2] == "preview" {
         return run_remote_preview(&args[3]);
@@ -199,6 +232,15 @@ fn main() -> Result<()> {
         "update_policy": format!("{:?}", install_context.update_policy),
         "theme": match theme { UiTheme::ZedLight => "light", UiTheme::ZedDark => "dark" },
     }));
+    append_trace_event(
+        &startup_home,
+        "gui",
+        "startup",
+        "main_exit",
+        serde_json::json!({
+            "ok": launch_result.is_ok(),
+        }),
+    );
     launch_result
 }
 
@@ -355,6 +397,7 @@ fn unregister_signal_client_instance(home_dir: &std::path::Path) -> Result<usize
 
 fn install_panic_logging(home_dir: &std::path::Path) {
     let panic_log_path = home_dir.join("panic.log");
+    let trace_home = home_dir.to_path_buf();
     std::panic::set_hook(Box::new(move |info| {
         let location = info
             .location()
@@ -381,6 +424,16 @@ fn install_panic_logging(home_dir: &std::path::Path) {
         let message = format!(
             "timestamp_unix: {}\nlocation: {}\npayload: {}\nbacktrace:\n{:?}\n---\n",
             timestamp, location, payload, backtrace
+        );
+        append_trace_event(
+            &trace_home,
+            "gui",
+            "panic",
+            "panic_hook",
+            serde_json::json!({
+                "location": location,
+                "payload": payload,
+            }),
         );
         eprintln!("{message}");
         if let Ok(mut file) = fs::OpenOptions::new()

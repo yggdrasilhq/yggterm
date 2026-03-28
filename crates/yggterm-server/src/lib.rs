@@ -45,9 +45,10 @@ use tracing::warn;
 use uuid::Uuid;
 use yggterm_core::{
     PerfSpan, SessionNode, SessionNodeKind, SessionStore, SessionTitleStore, TranscriptRole,
-    UiTheme, WorkspaceDocument, WorkspaceDocumentKind, generation_context_from_messages,
-    looks_like_generated_fallback_title, read_codex_session_identity_fields,
-    read_codex_transcript_messages, resolve_yggterm_home,
+    UiTheme, WorkspaceDocument, WorkspaceDocumentKind, append_trace_event, event_trace_path,
+    follow_trace_lines, generation_context_from_messages, looks_like_generated_fallback_title,
+    read_codex_session_identity_fields, read_codex_transcript_messages, read_trace_tail,
+    resolve_yggterm_home,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -557,6 +558,15 @@ impl YggtermServer {
     }
 
     pub fn request_terminal_launch_for_path(&mut self, path: &str) {
+        if let Ok(home) = resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "server",
+                "session",
+                "request_terminal_launch",
+                serde_json::json!({ "path": path }),
+            );
+        }
         self.active_session_path = Some(path.to_string());
         self.request_terminal_launch_for_active();
     }
@@ -1082,6 +1092,18 @@ impl YggtermServer {
         if is_loopback_ssh_target(&target.ssh_target) {
             return Ok(());
         }
+        if let Ok(home) = resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "server",
+                "remote_machine",
+                "refresh_begin",
+                serde_json::json!({
+                    "ssh_target": target.ssh_target.clone(),
+                    "prefix": target.prefix.clone(),
+                }),
+            );
+        }
         let machine_key = machine_key_from_ssh_target(&target.ssh_target);
         let label = ssh_machine_label(target);
         let entry_ix = self.ensure_remote_machine_stub(target);
@@ -1105,6 +1127,20 @@ impl YggtermServer {
                     health: RemoteMachineHealth::Healthy,
                     sessions,
                 };
+                if let Ok(home) = resolve_yggterm_home() {
+                    append_trace_event(
+                        &home,
+                        "server",
+                        "remote_machine",
+                        "refresh_end",
+                        serde_json::json!({
+                            "ssh_target": target.ssh_target,
+                            "machine_key": self.remote_machines[entry_ix].machine_key,
+                            "health": "healthy",
+                            "session_count": self.remote_machines[entry_ix].sessions.len(),
+                        }),
+                    );
+                }
                 Ok(())
             }
             Err(error) => {
@@ -1128,6 +1164,20 @@ impl YggtermServer {
                     },
                     sessions: existing_sessions,
                 };
+                if let Ok(home) = resolve_yggterm_home() {
+                    append_trace_event(
+                        &home,
+                        "server",
+                        "remote_machine",
+                        "refresh_error",
+                        serde_json::json!({
+                            "ssh_target": target.ssh_target,
+                            "machine_key": self.remote_machines[entry_ix].machine_key,
+                            "health": format!("{:?}", self.remote_machines[entry_ix].health),
+                            "error": error.to_string(),
+                        }),
+                    );
+                }
                 Err(error)
             }
         }
@@ -1229,6 +1279,19 @@ impl YggtermServer {
         title_hint: Option<&str>,
     ) -> anyhow::Result<String> {
         let machine_key = normalize_machine_key(machine_key);
+        if let Ok(home) = resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "server",
+                "remote_session",
+                "open",
+                serde_json::json!({
+                    "machine_key": machine_key.clone(),
+                    "session_id": session_id,
+                    "cwd": cwd,
+                }),
+            );
+        }
         let machine = self
             .remote_machines
             .iter()
@@ -4092,6 +4155,121 @@ pub fn run_remote_terminate_codex(session_id: &str) -> anyhow::Result<()> {
         }
     }
     tmux_kill_session(&session_name)
+}
+
+fn tail_text_file_lines(path: &std::path::Path, lines: usize) -> Vec<String> {
+    read_trace_tail(path, lines.max(1))
+}
+
+fn capture_trace_screenshot(home: &std::path::Path) -> Option<std::path::PathBuf> {
+    let snapshots_dir = home.join("trace-snapshots");
+    fs::create_dir_all(&snapshots_dir).ok()?;
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    let output_path = snapshots_dir.join(format!("trace-{ts_ms}.png"));
+    let mut attempts = Vec::<(&str, Vec<String>)>::new();
+    attempts.push((
+        "import",
+        vec![
+            "-window".to_string(),
+            "root".to_string(),
+            output_path.display().to_string(),
+        ],
+    ));
+    attempts.push((
+        "gnome-screenshot",
+        vec!["-f".to_string(), output_path.display().to_string()],
+    ));
+    attempts.push(("scrot", vec![output_path.display().to_string()]));
+    attempts.push(("maim", vec![output_path.display().to_string()]));
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        attempts.push(("grim", vec![output_path.display().to_string()]));
+    }
+    for (binary, args) in attempts {
+        let status = Command::new(binary)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if status.ok().is_some_and(|status| status.success())
+            && fs::metadata(&output_path)
+                .ok()
+                .is_some_and(|metadata| metadata.is_file() && metadata.len() > 0)
+        {
+            return Some(output_path.clone());
+        }
+        let _ = fs::remove_file(&output_path);
+    }
+    None
+}
+
+fn trace_bundle(lines: usize, include_screenshot: bool) -> anyhow::Result<serde_json::Value> {
+    let home = resolve_yggterm_home()?;
+    let event_path = event_trace_path(&home);
+    let perf_path = home.join(yggterm_core::PERF_TELEMETRY_FILENAME);
+    let ui_path = home.join("ui-telemetry.jsonl");
+    let panic_path = home.join("panic.log");
+    let endpoint = default_endpoint(&home);
+    let daemon_status = status(&endpoint)
+        .ok()
+        .and_then(|status| serde_json::to_value(status).ok());
+    let daemon_snapshot = snapshot(&endpoint).ok().map(|(snapshot, message)| {
+        serde_json::json!({
+            "message": message,
+            "active_session_path": snapshot.active_session_path,
+            "active_view_mode": format!("{:?}", snapshot.active_view_mode),
+            "live_sessions": snapshot.live_sessions.len(),
+            "remote_machines": snapshot.remote_machines.len(),
+            "ssh_targets": snapshot.ssh_targets.len(),
+        })
+    });
+    let screenshot_path = if include_screenshot {
+        capture_trace_screenshot(&home).map(|path| path.display().to_string())
+    } else {
+        None
+    };
+    Ok(serde_json::json!({
+        "generated_at_ms": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default(),
+        "home_dir": home.display().to_string(),
+        "display": std::env::var("DISPLAY").ok(),
+        "wayland_display": std::env::var("WAYLAND_DISPLAY").ok(),
+        "event_trace_path": event_path.display().to_string(),
+        "event_tail": tail_text_file_lines(&event_path, lines),
+        "perf_tail": tail_text_file_lines(&perf_path, lines),
+        "ui_tail": tail_text_file_lines(&ui_path, lines),
+        "panic_tail": tail_text_file_lines(&panic_path, lines.min(50)),
+        "daemon_status": daemon_status,
+        "daemon_snapshot": daemon_snapshot,
+        "screenshot_path": screenshot_path,
+    }))
+}
+
+pub fn run_trace_tail(lines: usize) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let path = event_trace_path(&home);
+    for line in tail_text_file_lines(&path, lines) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+pub fn run_trace_follow(lines: usize, poll_ms: u64) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let path = event_trace_path(&home);
+    follow_trace_lines(&path, lines, poll_ms);
+}
+
+pub fn run_trace_bundle(lines: usize, include_screenshot: bool) -> anyhow::Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&trace_bundle(lines, include_screenshot)?)?
+    );
+    Ok(())
 }
 
 pub fn run_remote_refresh_managed_cli(background: bool) -> anyhow::Result<()> {
