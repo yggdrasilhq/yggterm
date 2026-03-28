@@ -17,11 +17,24 @@ pub enum ScreenshotTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppControlViewMode {
+    Preview,
+    Terminal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AppControlCommand {
     CaptureScreenshot {
         target: ScreenshotTarget,
         output_path: String,
+    },
+    DescribeRows,
+    OpenPath {
+        session_path: String,
+        #[serde(default)]
+        view_mode: Option<AppControlViewMode>,
     },
     FocusWindow,
     DescribeState,
@@ -31,6 +44,8 @@ impl AppControlCommand {
     pub fn name(&self) -> &'static str {
         match self {
             Self::CaptureScreenshot { .. } => "capture_screenshot",
+            Self::DescribeRows => "describe_rows",
+            Self::OpenPath { .. } => "open_path",
             Self::FocusWindow => "focus_window",
             Self::DescribeState => "describe_state",
         }

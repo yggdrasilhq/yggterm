@@ -63,20 +63,21 @@ use yggterm_core::{
 };
 use yggterm_platform::DockRect;
 use yggterm_server::{
-    AppControlCommand, AppControlResponse, GhosttyTerminalHostMode, ManagedSessionView,
-    PreviewTone, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession, ServerEndpoint,
-    ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionPreviewBlock,
-    SessionRenderedSection, SshConnectTarget, TerminalBackend, WorkspaceViewMode,
-    YGG_LOADING_NOTIFICATION_AFTER_MS, YggRequestMeta, YggSurface, YggTarget, YggtermServer,
-    apply_remote_preview_payload_for_path, cleanup_legacy_daemons, complete_app_control_request,
-    connect_ssh_custom, fetch_remote_generation_context, fetch_remote_preview_payload, focus_live,
-    open_remote_session, open_stored_session, persist_remote_generated_copy, ping,
-    refresh_managed_cli, refresh_remote_machine, remove_ssh_target, request_terminal_launch,
+    AppControlCommand, AppControlResponse, AppControlViewMode, GhosttyTerminalHostMode,
+    ManagedSessionView, PreviewTone, RemoteMachineHealth, RemoteMachineSnapshot,
+    RemoteScannedSession, ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind,
+    SessionMetadataEntry, SessionPreviewBlock, SessionRenderedSection, SshConnectTarget,
+    TerminalBackend, WorkspaceViewMode, YGG_LOADING_NOTIFICATION_AFTER_MS, YggRequestMeta,
+    YggSurface, YggTarget, YggtermServer, apply_remote_preview_payload_for_path,
+    cleanup_legacy_daemons, complete_app_control_request, connect_ssh_custom,
+    fetch_remote_generation_context, fetch_remote_preview_payload, focus_live, open_remote_session,
+    open_stored_session, persist_remote_generated_copy, ping, refresh_managed_cli,
+    refresh_remote_machine, remove_ssh_target, request_terminal_launch,
     set_all_preview_blocks_folded, set_view_mode as daemon_set_view_mode,
     shutdown as daemon_shutdown, snapshot as daemon_snapshot, stage_remote_clipboard_png,
-    start_command_session, start_local_session_at, status, switch_agent_session_mode,
-    take_next_app_control_request, terminal_ensure, terminal_read, terminal_resize, terminal_write,
-    toggle_preview_block as daemon_toggle_preview_block,
+    start_command_session, start_local_session_at, start_ssh_session_at, status,
+    switch_agent_session_mode, take_next_app_control_request, terminal_ensure, terminal_read,
+    terminal_resize, terminal_write, toggle_preview_block as daemon_toggle_preview_block,
 };
 
 static BOOTSTRAP: OnceCell<ShellBootstrap> = OnceCell::new();
@@ -779,6 +780,12 @@ impl ShellState {
         );
         let search_content_hit_index =
             clamp_search_index(self.search_content_match_index, search_content_hits.len());
+        let selected_row = selected_sidebar_row_from_rows(
+            &rows,
+            &self.selected_tree_paths,
+            self.selection_anchor.as_deref(),
+            selected_path.as_deref(),
+        );
 
         RenderSnapshot {
             palette: palette,
@@ -807,7 +814,7 @@ impl ShellState {
             right_panel_mode: self.right_panel_mode,
             rows,
             selected_path,
-            selected_row: self.browser.selected_row().cloned(),
+            selected_row,
             active_session,
             active_view_mode: self.server.active_view_mode(),
             ssh_targets: self.server.ssh_targets().to_vec(),
@@ -4112,8 +4119,16 @@ fn spawn_set_view_mode(mut state: Signal<ShellState>, mode: WorkspaceViewMode) {
     );
 }
 
-fn spawn_open_session_row(mut state: Signal<ShellState>, row: BrowserRow) {
+fn spawn_open_session_row(state: Signal<ShellState>, row: BrowserRow) {
     let prefer_terminal = state.read().server.active_view_mode() == WorkspaceViewMode::Terminal;
+    spawn_open_session_row_with_mode(state, row, prefer_terminal);
+}
+
+fn spawn_open_session_row_with_mode(
+    mut state: Signal<ShellState>,
+    row: BrowserRow,
+    prefer_terminal: bool,
+) {
     let mut open_request_id = 0_u64;
     let request_meta = YggRequestMeta::interactive(
         format!("open-row-{}", current_millis()),
@@ -4204,6 +4219,14 @@ fn spawn_open_session_row(mut state: Signal<ShellState>, row: BrowserRow) {
         });
         maybe_spawn_missing_remote_machine_refreshes(state);
     });
+}
+
+fn resolve_app_control_row(shell: &ShellState, session_path: &str) -> Option<BrowserRow> {
+    shell
+        .snapshot()
+        .rows
+        .into_iter()
+        .find(|row| row.full_path == session_path)
 }
 
 fn spawn_connect_ssh_custom(mut state: Signal<ShellState>) {
@@ -4339,16 +4362,22 @@ fn current_new_session_context(
     shell: &ShellState,
     kind: SessionKind,
 ) -> (Option<String>, Option<String>) {
-    let selected_row = shell
-        .selected_workspace_rows()
-        .into_iter()
-        .next()
-        .or_else(|| shell.browser.selected_row().cloned());
+    let selected_row = current_selected_sidebar_row(shell);
     if let Some(row) = selected_row.as_ref() {
-        return (
-            group_session_cwd(row),
-            Some(group_session_title_hint(row, kind)),
-        );
+        return match row.kind {
+            BrowserRowKind::Session => (
+                row.session_cwd.clone(),
+                Some(format!("{} {}", row.label, session_kind_action_label(kind))),
+            ),
+            _ => {
+                let snapshot = shell.snapshot();
+                let context_row = resolve_creation_context_row(&snapshot.rows, row);
+                (
+                    group_session_cwd(&context_row),
+                    Some(group_session_title_hint(&context_row, kind)),
+                )
+            }
+        };
     }
     if let Some(active) = shell.server.active_session() {
         let cwd = metadata_value(active, "Cwd");
@@ -6250,7 +6279,12 @@ fn local_live_session_label(
     short_ids: &HashMap<String, String>,
 ) -> String {
     let target = metadata_value(session, "Target");
-    if !target.trim().is_empty() && target != "document" {
+    if !target.trim().is_empty()
+        && target != "document"
+        && target != "local-shell"
+        && target != "local-codex"
+        && target != "local-codex-litellm"
+    {
         return target;
     }
     let cwd = metadata_value(session, "Cwd");
@@ -6412,6 +6446,20 @@ struct SidebarRemoteMachine {
     label: String,
     health: MachineHealth,
     scanned_sessions: Vec<RemoteScannedSession>,
+}
+
+#[derive(Debug, Clone)]
+enum TerminalLaunchContext {
+    Local {
+        cwd: Option<String>,
+        title_hint: Option<String>,
+    },
+    Remote {
+        ssh_target: String,
+        prefix: Option<String>,
+        cwd: Option<String>,
+        title_hint: Option<String>,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -8357,11 +8405,125 @@ fn preview_layout_mode_label(mode: PreviewLayoutMode) -> &'static str {
     }
 }
 
+fn selected_sidebar_row_from_rows(
+    rows: &[BrowserRow],
+    selected_tree_paths: &HashSet<String>,
+    selection_anchor: Option<&str>,
+    selected_path: Option<&str>,
+) -> Option<BrowserRow> {
+    selection_anchor
+        .and_then(|path| rows.iter().find(|row| row.full_path == path))
+        .or_else(|| {
+            selected_tree_paths
+                .iter()
+                .find_map(|path| rows.iter().find(|row| row.full_path == *path))
+        })
+        .or_else(|| selected_path.and_then(|path| rows.iter().find(|row| row.full_path == path)))
+        .cloned()
+}
+
+fn current_selected_sidebar_row(shell: &ShellState) -> Option<BrowserRow> {
+    let snapshot = shell.snapshot();
+    selected_sidebar_row_from_rows(
+        &snapshot.rows,
+        &shell.selected_tree_paths,
+        shell.selection_anchor.as_deref(),
+        snapshot.selected_path.as_deref(),
+    )
+}
+
+fn remote_machine_for_sidebar_row<'a>(
+    shell: &'a ShellState,
+    row: &BrowserRow,
+) -> Option<&'a RemoteMachineSnapshot> {
+    let machine_key =
+        if let Some((machine_key, _)) = parse_remote_scanned_session_path(&row.full_path) {
+            machine_key.to_string()
+        } else if let Some(machine_key) = row.full_path.strip_prefix("__remote_machine__/") {
+            machine_key.to_string()
+        } else if let Some(rest) = row.full_path.strip_prefix("__remote_folder__/") {
+            rest.split('/').next().unwrap_or_default().to_string()
+        } else {
+            row.host_label.clone()
+        };
+    shell
+        .server
+        .remote_machines()
+        .iter()
+        .find(|machine| machine.machine_key == machine_key)
+}
+
+fn terminal_launch_context(shell: &ShellState) -> TerminalLaunchContext {
+    if let Some(row) = current_selected_sidebar_row(shell) {
+        if let Some(machine) = remote_machine_for_sidebar_row(shell, &row) {
+            let cwd = row
+                .session_cwd
+                .clone()
+                .filter(|value| !value.trim().is_empty());
+            let title_hint = Some(match row.kind {
+                BrowserRowKind::Session => format!("{} ssh", row.label),
+                _ => format!("{} ssh", machine.machine_key),
+            });
+            return TerminalLaunchContext::Remote {
+                ssh_target: machine.ssh_target.clone(),
+                prefix: machine.prefix.clone(),
+                cwd,
+                title_hint,
+            };
+        }
+        if row.kind == BrowserRowKind::Session {
+            return TerminalLaunchContext::Local {
+                cwd: row.session_cwd.clone(),
+                title_hint: Some(format!("{} terminal", row.label)),
+            };
+        }
+        let snapshot = shell.snapshot();
+        let context_row = resolve_creation_context_row(&snapshot.rows, &row);
+        return TerminalLaunchContext::Local {
+            cwd: group_session_cwd(&context_row),
+            title_hint: Some(group_session_title_hint(&context_row, SessionKind::Shell)),
+        };
+    }
+    if let Some(active) = shell.server.active_session() {
+        if let Some(machine) = remote_machine_for_session_path(&shell.server, &active.session_path)
+        {
+            let cwd = metadata_value(active, "Cwd");
+            return TerminalLaunchContext::Remote {
+                ssh_target: machine.ssh_target.clone(),
+                prefix: machine.prefix.clone(),
+                cwd: (!cwd.trim().is_empty()).then_some(cwd),
+                title_hint: Some(format!("{} ssh", machine.machine_key)),
+            };
+        }
+        let cwd = metadata_value(active, "Cwd");
+        return TerminalLaunchContext::Local {
+            cwd: (!cwd.trim().is_empty()).then_some(cwd),
+            title_hint: if active.title.trim().is_empty() {
+                None
+            } else {
+                Some(format!("{} terminal", active.title))
+            },
+        };
+    }
+    TerminalLaunchContext::Local {
+        cwd: None,
+        title_hint: None,
+    }
+}
+
+fn workspace_view_mode_from_app_control(mode: AppControlViewMode) -> WorkspaceViewMode {
+    match mode {
+        AppControlViewMode::Preview => WorkspaceViewMode::Rendered,
+        AppControlViewMode::Terminal => WorkspaceViewMode::Terminal,
+    }
+}
+
 fn describe_app_state_snapshot(
     state: &Signal<ShellState>,
     desktop: &dioxus::desktop::DesktopContext,
 ) -> Value {
     let shell = state.read();
+    let snapshot = shell.snapshot();
     let browser_metrics = shell.browser.metrics();
     let active_requests = shell
         .active_surface_requests
@@ -8385,7 +8547,12 @@ fn describe_app_state_snapshot(
         "window": describe_window(desktop),
         "browser": {
             "selected_path": shell.browser.selected_path(),
-            "selected_row": shell.browser.selected_row().map(|row| {
+            "selected_row": selected_sidebar_row_from_rows(
+                &snapshot.rows,
+                &shell.selected_tree_paths,
+                shell.selection_anchor.as_deref(),
+                snapshot.selected_path.as_deref(),
+            ).map(|row| {
                 json!({
                     "full_path": row.full_path,
                     "label": row.label,
@@ -8436,10 +8603,32 @@ fn describe_app_state_snapshot(
     })
 }
 
+fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
+    let shell = state.read();
+    let snapshot = shell.snapshot();
+    json!({
+        "row_count": snapshot.rows.len(),
+        "rows": snapshot.rows.iter().map(|row| {
+            json!({
+                "full_path": row.full_path,
+                "label": row.label,
+                "detail_label": row.detail_label,
+                "kind": format!("{:?}", row.kind),
+                "depth": row.depth,
+                "host_label": row.host_label,
+                "expanded": row.expanded,
+                "selected": shell.selected_tree_paths.contains(&row.full_path),
+                "session_id": row.session_id,
+                "session_cwd": row.session_cwd,
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
 async fn process_pending_app_control_requests(
     settings_path: &std::path::Path,
     desktop: dioxus::desktop::DesktopContext,
-    state: Signal<ShellState>,
+    mut state: Signal<ShellState>,
 ) -> Result<()> {
     let home = perf_home_dir(settings_path);
     let Some((inflight_path, request)) = take_next_app_control_request(&home, std::process::id())?
@@ -8482,6 +8671,51 @@ async fn process_pending_app_control_requests(
                 error: Some(error.to_string()),
             },
         },
+        AppControlCommand::OpenPath {
+            session_path,
+            view_mode,
+        } => {
+            let resolved_view_mode = view_mode.map(workspace_view_mode_from_app_control);
+            let maybe_row = state.with(|shell| resolve_app_control_row(shell, &session_path));
+            match maybe_row {
+                Some(row) => {
+                    if let Some(mode) = resolved_view_mode {
+                        state.with_mut(|shell| {
+                            shell.server.set_view_mode(mode);
+                        });
+                        spawn_open_session_row_with_mode(
+                            state,
+                            row.clone(),
+                            mode == WorkspaceViewMode::Terminal,
+                        );
+                    } else {
+                        spawn_open_session_row(state, row.clone());
+                    }
+                    AppControlResponse {
+                        request_id: request.request_id.clone(),
+                        handled_by_pid: std::process::id(),
+                        completed_at_ms: current_millis() as u128,
+                        output_path: None,
+                        data: Some(json!({
+                            "queued": true,
+                            "session_path": session_path,
+                            "view_mode": resolved_view_mode.map(|mode| format!("{mode:?}")),
+                        })),
+                        error: None,
+                    }
+                }
+                None => AppControlResponse {
+                    request_id: request.request_id.clone(),
+                    handled_by_pid: std::process::id(),
+                    completed_at_ms: current_millis() as u128,
+                    output_path: None,
+                    data: None,
+                    error: Some(format!(
+                        "session path is not visible in the current sidebar snapshot: {session_path}"
+                    )),
+                },
+            }
+        }
         AppControlCommand::FocusWindow => match focus_app_window(&desktop) {
             Ok(data) => AppControlResponse {
                 request_id: request.request_id.clone(),
@@ -8499,6 +8733,14 @@ async fn process_pending_app_control_requests(
                 data: None,
                 error: Some(error.to_string()),
             },
+        },
+        AppControlCommand::DescribeRows => AppControlResponse {
+            request_id: request.request_id.clone(),
+            handled_by_pid: std::process::id(),
+            completed_at_ms: current_millis() as u128,
+            output_path: None,
+            data: Some(describe_app_rows_snapshot(&state)),
+            error: None,
         },
         AppControlCommand::DescribeState => AppControlResponse {
             request_id: request.request_id.clone(),
@@ -9037,7 +9279,12 @@ fn app() -> Element {
         };
         if should_start {
             startup_sync_started.set(true);
-            let defer_sync = state.read().had_cached_startup_snapshot;
+            let defer_sync = {
+                let shell = state.read();
+                shell.had_cached_startup_snapshot
+                    && shell.server.active_session().is_none()
+                    && shell.server.active_view_mode() != WorkspaceViewMode::Terminal
+            };
             let schedule_ui = schedule_ui_update_for_sync.clone();
             spawn(async move {
                 if defer_sync {
@@ -9342,7 +9589,7 @@ fn app() -> Element {
         let (selected_row, active_session_path, server_busy) = {
             let shell = state.read();
             (
-                shell.browser.selected_row().cloned(),
+                current_selected_sidebar_row(&shell),
                 shell
                     .server
                     .active_session_path()
@@ -9689,18 +9936,38 @@ fn app() -> Element {
                         })
                     },
                     on_start_terminal: move |_| {
-                        let (cwd, title_hint) = state.with_mut(|shell| {
+                        let launch_context = state.with_mut(|shell| {
                             shell.close_titlebar_new_menu();
-                            current_new_session_context(shell, SessionKind::Shell)
+                            terminal_launch_context(shell)
                         });
-                        spawn_server_snapshot_action(state, "starting terminal".to_string(), move |endpoint| {
-                            start_local_session_at(
-                                &endpoint,
-                                SessionKind::Shell,
-                                cwd.as_deref(),
-                                title_hint.as_deref(),
-                            )
-                        })
+                        match launch_context {
+                            TerminalLaunchContext::Local { cwd, title_hint } => {
+                                spawn_server_snapshot_action(state, "starting terminal".to_string(), move |endpoint| {
+                                    start_local_session_at(
+                                        &endpoint,
+                                        SessionKind::Shell,
+                                        cwd.as_deref(),
+                                        title_hint.as_deref(),
+                                    )
+                                })
+                            }
+                            TerminalLaunchContext::Remote {
+                                ssh_target,
+                                prefix,
+                                cwd,
+                                title_hint,
+                            } => {
+                                spawn_server_snapshot_action(state, "starting ssh terminal".to_string(), move |endpoint| {
+                                    start_ssh_session_at(
+                                        &endpoint,
+                                        &ssh_target,
+                                        prefix.as_deref(),
+                                        cwd.as_deref(),
+                                        title_hint.as_deref(),
+                                    )
+                                })
+                            }
+                        }
                     },
                     on_create_paper: move |_| {
                         state.with_mut(|shell| shell.close_titlebar_new_menu());
@@ -10817,7 +11084,7 @@ fn SidebarRow(
             id: "{sidebar_row_dom_id(&row.full_path)}",
             style: format!(
                 "width:100%; display:flex; flex-direction:column; align-items:stretch; gap:1px; \
-                 border:none; border-radius:12px; background:{}; padding:3px 9px 3px {}px; margin:0; opacity:{}; cursor:{}; \
+                 border:none; border-radius:12px; background:{}; padding:2px 9px 2px {}px; margin:0; opacity:{}; cursor:{}; \
                  box-sizing:border-box; min-width:0; overflow:hidden; user-select:none; -webkit-user-select:none; \
                  transition: transform 140ms ease, background 140ms ease, opacity 140ms ease, box-shadow 140ms ease; \
                  transform:translateY(0px); box-shadow:{}; position:relative;",
@@ -10875,7 +11142,7 @@ fn SidebarRow(
                     style: "display:flex; align-items:center; gap:7px; min-width:0;",
                     div {
                         style: format!(
-                            "display:inline-flex; align-items:center; justify-content:center; width:18px; min-width:18px; height:18px; color:{};",
+                            "display:inline-flex; align-items:center; justify-content:center; width:17px; min-width:17px; height:17px; color:{};",
                             icon_color
                         ),
                         TreeIcon { row: row.clone() }
@@ -10910,7 +11177,7 @@ fn SidebarRow(
                     } else {
                         span {
                             style: format!(
-                                "font-size:11px; color:{}; font-weight:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                                "font-size:10.5px; color:{}; font-weight:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
                                 label_color,
                                 if row.kind == BrowserRowKind::Group && row.depth == 0 { 600 } else { 500 }
                             ),
@@ -11036,7 +11303,7 @@ fn TreeIcon(row: BrowserRow) -> Element {
         if row.full_path.starts_with("codex-litellm://") {
             return rsx! {
                 span {
-                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:11px; font-weight:700; line-height:1;",
+                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:10px; font-weight:700; line-height:1;",
                     "✦"
                 }
             };
@@ -11044,7 +11311,7 @@ fn TreeIcon(row: BrowserRow) -> Element {
         if row.full_path.starts_with("local://") {
             return rsx! {
                 span {
-                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:11px; font-weight:700; line-height:1;",
+                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:10px; font-weight:700; line-height:1;",
                     "⌘"
                 }
             };
@@ -11052,14 +11319,14 @@ fn TreeIcon(row: BrowserRow) -> Element {
         if row.full_path.starts_with("ssh://") {
             return rsx! {
                 span {
-                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:11px; font-weight:700; line-height:1;",
+                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:10px; font-weight:700; line-height:1;",
                     "⇄"
                 }
             };
         }
         return rsx! {
             span {
-                style: "display:inline-flex; align-items:center; justify-content:center; font-size:11px; font-weight:700; line-height:1;",
+                style: "display:inline-flex; align-items:center; justify-content:center; font-size:10px; font-weight:700; line-height:1;",
                 ">_"
             }
         };
@@ -12810,7 +13077,12 @@ fn TerminalCanvas(
                     "session_path": session_path.clone(),
                 }),
             );
-            if let Err(error) = terminal_ensure_async(endpoint.clone(), session_path.clone()).await
+            if let Err(error) = terminal_ensure_with_retry_async(
+                endpoint.clone(),
+                session_path.clone(),
+                &trace_home,
+            )
+            .await
             {
                 append_trace_event(
                     &trace_home,
@@ -13234,6 +13506,60 @@ async fn terminal_ensure_async(
     task::spawn_blocking(move || terminal_ensure(&endpoint, &session_path))
         .await
         .map_err(|error| anyhow!("joining terminal ensure task: {error}"))?
+}
+
+fn should_retry_terminal_ensure(error: &anyhow::Error) -> bool {
+    let text = error.to_string().to_ascii_lowercase();
+    text.contains("no such file or directory")
+        || text.contains("connection refused")
+        || text.contains("connecting to")
+        || text.contains("timed out")
+}
+
+async fn terminal_ensure_with_retry_async(
+    endpoint: ServerEndpoint,
+    session_path: String,
+    trace_home: &Path,
+) -> Result<Option<String>> {
+    let mut delay_ms = 160_u64;
+    let mut attempts = 0_u64;
+    loop {
+        attempts += 1;
+        match terminal_ensure_async(endpoint.clone(), session_path.clone()).await {
+            Ok(result) => {
+                if attempts > 1 {
+                    append_trace_event(
+                        trace_home,
+                        "ui",
+                        "terminal_mount",
+                        "ensure_retry_recovered",
+                        json!({
+                            "session_path": session_path,
+                            "attempts": attempts,
+                        }),
+                    );
+                }
+                return Ok(result);
+            }
+            Err(error) if attempts < 8 && should_retry_terminal_ensure(&error) => {
+                append_trace_event(
+                    trace_home,
+                    "ui",
+                    "terminal_mount",
+                    "ensure_retry",
+                    json!({
+                        "session_path": session_path,
+                        "attempt": attempts,
+                        "delay_ms": delay_ms,
+                        "error": error.to_string(),
+                    }),
+                );
+                sleep(Duration::from_millis(delay_ms)).await;
+                delay_ms = (delay_ms * 2).min(1_250);
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 async fn terminal_read_async(

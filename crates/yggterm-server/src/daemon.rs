@@ -69,6 +69,12 @@ pub enum ServerRequest {
         target: String,
         prefix: Option<String>,
     },
+    StartSshSession {
+        target: String,
+        prefix: Option<String>,
+        cwd: Option<String>,
+        title_hint: Option<String>,
+    },
     OpenRemoteSession {
         machine_key: String,
         session_id: String,
@@ -355,6 +361,33 @@ impl DaemonRuntime {
                     format!("connected {key}")
                 }))
             }
+            ServerRequest::StartSshSession {
+                target,
+                prefix,
+                cwd,
+                title_hint,
+            } => {
+                let key = self.server.start_ssh_session(
+                    &target,
+                    prefix.as_deref(),
+                    cwd.as_deref(),
+                    title_hint.as_deref(),
+                )?;
+                if let Some(target) = self
+                    .server
+                    .ssh_targets()
+                    .iter()
+                    .find(|candidate| {
+                        candidate.ssh_target == target
+                            && candidate.prefix.as_deref() == prefix.as_deref()
+                    })
+                    .cloned()
+                {
+                    let _ = self.server.refresh_remote_machine_for_ssh_target(&target);
+                }
+                self.persist()?;
+                self.snapshot_response(Some(format!("started {key}")))
+            }
             ServerRequest::OpenRemoteSession {
                 machine_key,
                 session_id,
@@ -586,6 +619,7 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::OpenStoredSession { .. } => "open_stored_session",
         ServerRequest::ConnectSsh { .. } => "connect_ssh",
         ServerRequest::ConnectSshCustom { .. } => "connect_ssh_custom",
+        ServerRequest::StartSshSession { .. } => "start_ssh_session",
         ServerRequest::OpenRemoteSession { .. } => "open_remote_session",
         ServerRequest::RefreshRemoteMachine { .. } => "refresh_remote_machine",
         ServerRequest::RefreshManagedCli { .. } => "refresh_managed_cli",
@@ -733,6 +767,24 @@ pub fn open_remote_session(
         &ServerRequest::OpenRemoteSession {
             machine_key: machine_key.to_string(),
             session_id: session_id.to_string(),
+            cwd: cwd.map(ToOwned::to_owned),
+            title_hint: title_hint.map(ToOwned::to_owned),
+        },
+    )?)
+}
+
+pub fn start_ssh_session_at(
+    endpoint: &ServerEndpoint,
+    target: &str,
+    prefix: Option<&str>,
+    cwd: Option<&str>,
+    title_hint: Option<&str>,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
+    expect_snapshot(send_request(
+        endpoint,
+        &ServerRequest::StartSshSession {
+            target: target.to_string(),
+            prefix: prefix.map(ToOwned::to_owned),
             cwd: cwd.map(ToOwned::to_owned),
             title_hint: title_hint.map(ToOwned::to_owned),
         },
