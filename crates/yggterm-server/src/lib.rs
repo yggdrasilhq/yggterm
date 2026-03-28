@@ -633,6 +633,9 @@ impl YggtermServer {
         if session.kind == SessionKind::Document {
             return recipe_terminal_spec(session).map(|_| "exit\r".to_string());
         }
+        if session.session_path.starts_with("remote-session://") {
+            return Some("/quit\r".to_string());
+        }
         match session.kind {
             SessionKind::Codex | SessionKind::CodexLiteLlm => Some("/quit\r".to_string()),
             SessionKind::Shell | SessionKind::SshShell => Some("exit\r".to_string()),
