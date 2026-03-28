@@ -2243,7 +2243,10 @@ impl ShellState {
         if let Ok(store) = SessionStore::open_or_init() {
             let path = store.home_dir().join("ui-telemetry.jsonl");
             if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-                let _ = writeln!(file, "{}", telemetry);
+                if let Ok(mut line) = serde_json::to_vec(&telemetry) {
+                    line.push(b'\n');
+                    let _ = file.write_all(&line);
+                }
             }
             append_trace_event(store.home_dir(), "ui", "ui_telemetry", event, telemetry);
         }
