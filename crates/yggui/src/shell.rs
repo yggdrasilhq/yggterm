@@ -58,8 +58,8 @@ use yggterm_core::{
     SessionBrowserState, SessionNode, SessionStore, UiTheme, WorkspaceDocumentInput,
     WorkspaceDocumentKind, WorkspaceGroupKind, YgguiThemeSpec, append_trace_event,
     check_for_update, install_release_update, looks_like_generated_fallback_title,
-    looks_like_low_signal_generated_copy, refresh_desktop_integration, save_settings_file,
-    unique_session_short_ids_for_pairs, update_command_hint,
+    looks_like_low_signal_generated_copy, refresh_desktop_integration, resolve_yggterm_home,
+    save_settings_file, unique_session_short_ids_for_pairs, update_command_hint,
 };
 use yggterm_platform::DockRect;
 use yggterm_server::{
@@ -751,6 +751,7 @@ impl ShellState {
         let selected_path = if let Some(active) = self.server.active_session() {
             if active.source == yggterm_server::SessionSource::LiveSsh
                 || active.session_path.starts_with("remote-session://")
+                || is_local_live_session_path(&active.session_path)
             {
                 Some(active.session_path.clone())
             } else {
@@ -1290,11 +1291,49 @@ impl ShellState {
         let Some(active_path) = active_path else {
             return Vec::new();
         };
-        if self.server.live_sessions().iter().any(|session| {
-            session.session_path == active_path
-                && !session.session_path.starts_with("remote-session://")
-        }) {
-            return vec!["__live_sessions__".to_string()];
+        if self
+            .server
+            .live_sessions()
+            .iter()
+            .any(|session| session.session_path == active_path && is_promoted_live_session(session))
+        {
+            let mut paths = vec!["__live_sessions__".to_string()];
+            if let Some((machine_key, _session_id)) =
+                parse_remote_scanned_session_path(&active_path)
+            {
+                paths.push(format!("__remote_machine__/{machine_key}"));
+                let active_cwd = self
+                    .server
+                    .active_session()
+                    .map(|active| metadata_value(active, "Cwd"))
+                    .unwrap_or_default();
+                if let Some(machine) = self
+                    .server
+                    .remote_machines()
+                    .iter()
+                    .find(|machine| machine.machine_key == machine_key)
+                    && !active_cwd.trim().is_empty()
+                {
+                    paths.extend(
+                        compressed_remote_folder_paths(
+                            &SidebarRemoteMachine {
+                                key: machine.machine_key.clone(),
+                                label: machine.label.clone(),
+                                health: match machine.health {
+                                    RemoteMachineHealth::Healthy => MachineHealth::Healthy,
+                                    RemoteMachineHealth::Cached => MachineHealth::Cached,
+                                    RemoteMachineHealth::Offline => MachineHealth::Offline,
+                                },
+                                scanned_sessions: machine.sessions.clone(),
+                            },
+                            &active_cwd,
+                        )
+                        .into_iter()
+                        .map(|path| format!("__remote_folder__/{machine_key}{path}")),
+                    );
+                }
+            }
+            return paths;
         }
         let Some((machine_key, session_id)) = parse_remote_scanned_session_path(&active_path)
         else {
@@ -3421,25 +3460,53 @@ fn spawn_notify_only_update_check(mut state: Signal<ShellState>) {
 pub fn initial_server_sync(
     endpoint: ServerEndpoint,
 ) -> Result<(ServerUiSnapshot, Option<ServerRuntimeStatus>, String)> {
+    let trace_home = resolve_yggterm_home().ok();
     ensure_daemon_running(&endpoint)?;
 
     let mut runtime = status(&endpoint).ok();
-    if runtime.as_ref().is_some_and(|runtime| {
-        runtime.server_version != env!("CARGO_PKG_VERSION")
-            || runtime.server_build_id != current_build_id()
-    }) {
-        restart_daemon(&endpoint)?;
-        runtime = status(&endpoint).ok();
+    if let Some(home) = trace_home.as_ref() {
+        append_trace_event(
+            home,
+            "startup",
+            "gui",
+            "daemon_reuse",
+            json!({
+                "server_version": runtime.as_ref().map(|status| status.server_version.clone()),
+                "server_build_id": runtime.as_ref().map(|status| status.server_build_id),
+            }),
+        );
     }
 
     let (mut snapshot, _) = match daemon_snapshot(&endpoint) {
         Ok(snapshot) => snapshot,
         Err(_) => {
+            if let Some(home) = trace_home.as_ref() {
+                append_trace_event(
+                    home,
+                    "startup",
+                    "gui",
+                    "daemon_restart",
+                    json!({
+                        "reason": "snapshot_failed",
+                    }),
+                );
+            }
             restart_daemon(&endpoint)?;
             daemon_snapshot(&endpoint)?
         }
     };
     if snapshot_needs_remote_restore_restart(&snapshot) {
+        if let Some(home) = trace_home.as_ref() {
+            append_trace_event(
+                home,
+                "startup",
+                "gui",
+                "daemon_restart",
+                json!({
+                    "reason": "remote_restore_missing",
+                }),
+            );
+        }
         restart_daemon(&endpoint)?;
         snapshot = daemon_snapshot(&endpoint)?.0;
         runtime = status(&endpoint).ok();
@@ -3450,16 +3517,6 @@ pub fn initial_server_sync(
         ServerEndpoint::Tcp { host, port } => format!("server connected via {host}:{port}"),
     };
     Ok((snapshot, runtime, detail))
-}
-
-fn current_build_id() -> u64 {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| std::fs::metadata(path).ok())
-        .and_then(|meta| meta.modified().ok())
-        .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|dur| dur.as_secs())
-        .unwrap_or_default()
 }
 
 fn snapshot_needs_remote_restore_restart(snapshot: &ServerUiSnapshot) -> bool {
@@ -6169,12 +6226,12 @@ fn merged_sidebar_rows_uncached(
     live_sessions: &[ManagedSessionView],
     expanded_paths: &HashSet<String>,
 ) -> Vec<BrowserRow> {
-    let local_live_sessions = live_sessions
+    let promoted_live_sessions = live_sessions
         .iter()
-        .filter(|session| is_local_live_session_path(&session.session_path))
+        .filter(|session| is_promoted_live_session(session))
         .collect::<Vec<_>>();
 
-    if ssh_targets.is_empty() && remote_machines.is_empty() && local_live_sessions.is_empty() {
+    if ssh_targets.is_empty() && remote_machines.is_empty() && promoted_live_sessions.is_empty() {
         return stored_rows.to_vec();
     }
 
@@ -6208,7 +6265,19 @@ fn merged_sidebar_rows_uncached(
         );
     }
     merge_remote_live_sessions(&mut machine_rows, ssh_targets, live_sessions);
-    push_local_live_session_rows(&mut rows, &local_live_sessions, expanded_paths);
+    let promoted_remote_paths = promoted_live_sessions
+        .iter()
+        .filter(|session| session.session_path.starts_with("remote-session://"))
+        .map(|session| session.session_path.clone())
+        .collect::<HashSet<_>>();
+    if !promoted_remote_paths.is_empty() {
+        for machine in machine_rows.values_mut() {
+            machine
+                .scanned_sessions
+                .retain(|session| !promoted_remote_paths.contains(&session.session_path));
+        }
+    }
+    push_live_session_rows(&mut rows, &promoted_live_sessions, expanded_paths);
     for machine in machine_rows.into_values() {
         push_remote_machine_rows(&mut rows, &machine, expanded_paths);
     }
@@ -6216,7 +6285,7 @@ fn merged_sidebar_rows_uncached(
     rows
 }
 
-fn push_local_live_session_rows(
+fn push_live_session_rows(
     rows: &mut Vec<BrowserRow>,
     sessions: &[&ManagedSessionView],
     expanded_paths: &HashSet<String>,
@@ -6255,7 +6324,7 @@ fn push_local_live_session_rows(
 
     for session in sessions {
         let cwd = metadata_value(session, "Cwd");
-        let label = local_live_session_label(session, &short_ids);
+        let label = live_session_label(session, &short_ids);
         rows.push(BrowserRow {
             kind: BrowserRowKind::Session,
             full_path: session.session_path.clone(),
@@ -6274,16 +6343,21 @@ fn push_local_live_session_rows(
     }
 }
 
-fn local_live_session_label(
-    session: &ManagedSessionView,
-    short_ids: &HashMap<String, String>,
-) -> String {
+fn live_session_label(session: &ManagedSessionView, short_ids: &HashMap<String, String>) -> String {
+    let title = session.title.trim();
+    if session.session_path.starts_with("remote-session://")
+        && !title.is_empty()
+        && !looks_like_generated_fallback_title(title)
+    {
+        return session.title.clone();
+    }
     let target = metadata_value(session, "Target");
     if !target.trim().is_empty()
         && target != "document"
         && target != "local-shell"
         && target != "local-codex"
         && target != "local-codex-litellm"
+        && target != session.host_label
     {
         return target;
     }
@@ -6291,7 +6365,6 @@ fn local_live_session_label(
     if !cwd.trim().is_empty() {
         return cwd;
     }
-    let title = session.title.trim();
     if !title.is_empty() && !looks_like_generated_fallback_title(title) {
         return session.title.clone();
     }
@@ -6299,6 +6372,12 @@ fn local_live_session_label(
         .get(&session.session_path)
         .cloned()
         .unwrap_or_else(|| session.id.clone())
+}
+
+fn is_promoted_live_session(session: &ManagedSessionView) -> bool {
+    session.session_path.starts_with("remote-session://")
+        || (session.kind != SessionKind::SshShell
+            && is_local_live_session_path(&session.session_path))
 }
 
 fn enrich_sidebar_rows_with_live_titles(
@@ -8524,6 +8603,7 @@ fn describe_app_state_snapshot(
 ) -> Value {
     let shell = state.read();
     let snapshot = shell.snapshot();
+    let selected_path = snapshot.selected_path.clone();
     let browser_metrics = shell.browser.metrics();
     let active_requests = shell
         .active_surface_requests
@@ -8546,12 +8626,13 @@ fn describe_app_state_snapshot(
     json!({
         "window": describe_window(desktop),
         "browser": {
-            "selected_path": shell.browser.selected_path(),
+            "selected_path": selected_path.clone(),
+            "stored_selected_path": shell.browser.selected_path(),
             "selected_row": selected_sidebar_row_from_rows(
                 &snapshot.rows,
                 &shell.selected_tree_paths,
                 shell.selection_anchor.as_deref(),
-                snapshot.selected_path.as_deref(),
+                selected_path.as_deref(),
             ).map(|row| {
                 json!({
                     "full_path": row.full_path,
@@ -8679,7 +8760,35 @@ async fn process_pending_app_control_requests(
             let maybe_row = state.with(|shell| resolve_app_control_row(shell, &session_path));
             match maybe_row {
                 Some(row) => {
-                    if let Some(mode) = resolved_view_mode {
+                    if is_live_sidebar_row(&row) {
+                        let mode = resolved_view_mode.unwrap_or(WorkspaceViewMode::Terminal);
+                        state.with_mut(|shell| {
+                            shell.server.focus_live_session(&row.full_path);
+                            shell.server.set_view_mode(mode);
+                            shell.ensure_active_session_visible();
+                        });
+                        spawn_targeted_server_snapshot_action(
+                            state,
+                            format!("focusing {}", row.label),
+                            if mode == WorkspaceViewMode::Terminal {
+                                YggTarget::Terminal {
+                                    session_path: row.full_path.clone(),
+                                }
+                            } else {
+                                YggTarget::Preview {
+                                    session_path: row.full_path.clone(),
+                                }
+                            },
+                            move |endpoint| {
+                                let focused = focus_live(&endpoint, &row.full_path)?;
+                                if mode == WorkspaceViewMode::Rendered {
+                                    daemon_set_view_mode(&endpoint, WorkspaceViewMode::Rendered)
+                                } else {
+                                    Ok(focused)
+                                }
+                            },
+                        );
+                    } else if let Some(mode) = resolved_view_mode {
                         state.with_mut(|shell| {
                             shell.server.set_view_mode(mode);
                         });
@@ -17201,6 +17310,87 @@ mod tests {
             row.full_path == "local://019cf672-8d68-70a1-bd8b-68487c4fc63d"
                 && row.label == "/home/pi/gh/yggterm"
         }));
+    }
+
+    #[test]
+    fn merged_sidebar_rows_promote_remote_live_sessions_into_live_group() {
+        let remote_path = "remote-session://oc/019cf672-8d68-70a1-bd8b-68487c4fc63d".to_string();
+        let rows = merged_sidebar_rows(
+            &[],
+            &[RemoteMachineSnapshot {
+                machine_key: "oc".to_string(),
+                label: "oc [ok]".to_string(),
+                ssh_target: "oc".to_string(),
+                prefix: None,
+                health: RemoteMachineHealth::Healthy,
+                sessions: vec![RemoteScannedSession {
+                    session_path: remote_path.clone(),
+                    session_id: "019cf672-8d68-70a1-bd8b-68487c4fc63d".to_string(),
+                    cwd: "/home/pi".to_string(),
+                    started_at: "now".to_string(),
+                    modified_epoch: 1,
+                    event_count: 1,
+                    user_message_count: 1,
+                    assistant_message_count: 1,
+                    title_hint: "Excel Shortcut Design".to_string(),
+                    recent_context: String::new(),
+                    cached_precis: None,
+                    cached_summary: None,
+                    storage_path: "/home/pi/.codex/sessions/foo.jsonl".to_string(),
+                }],
+            }],
+            &[],
+            &[ManagedSessionView {
+                id: "019cf672-8d68-70a1-bd8b-68487c4fc63d".to_string(),
+                session_path: remote_path.clone(),
+                title: "Excel Shortcut Design".to_string(),
+                kind: SessionKind::Codex,
+                host_label: "oc".to_string(),
+                source: yggterm_server::SessionSource::LiveSsh,
+                backend: TerminalBackend::Xterm,
+                bridge_available: true,
+                launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+                remote_deploy_state: yggterm_server::RemoteDeployState::Ready,
+                launch_command: String::new(),
+                status_line: String::new(),
+                terminal_lines: vec![],
+                rendered_sections: vec![],
+                preview: yggterm_server::SessionPreview {
+                    summary: vec![],
+                    blocks: vec![],
+                },
+                metadata: vec![SessionMetadataEntry {
+                    label: "Cwd",
+                    value: "/home/pi".to_string(),
+                }],
+                terminal_process_id: None,
+                terminal_window_id: None,
+                terminal_host_token: None,
+                terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+                embedded_surface_id: None,
+                embedded_surface_detail: None,
+                last_launch_error: None,
+                last_window_error: None,
+                ssh_target: Some("oc".to_string()),
+                ssh_prefix: None,
+            }],
+            &HashSet::from_iter([
+                "__live_sessions__".to_string(),
+                "__remote_machine__/oc".to_string(),
+            ]),
+        );
+
+        let promoted = rows
+            .iter()
+            .find(|row| row.full_path == remote_path)
+            .expect("promoted live row");
+        assert_eq!(promoted.depth, 1);
+        assert_eq!(promoted.host_label, "oc");
+        let promoted_count = rows
+            .iter()
+            .filter(|row| row.full_path == remote_path)
+            .count();
+        assert_eq!(promoted_count, 1);
     }
 
     #[test]
