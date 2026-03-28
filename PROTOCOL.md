@@ -231,10 +231,18 @@ Observability:
   regressions can be profiled without the desktop shell
 - `server trace tail <lines>` should dump the last trace probes from `~/.yggterm/event-trace.jsonl`
 - `server trace follow <lines> [poll_ms]` should stay attached and stream new probes as they land
+- `server app state [--timeout-ms <ms>]` should dump the live window and shell snapshot from the
+  running GUI client, so remote debugging can inspect selection, panels, requests, and geometry
+  without guessing from static logs
+- `server app focus [--timeout-ms <ms>]` should tell the running GUI client to raise and focus its
+  window, so future control actions can treat the app itself like a reachable desktop actor
+- `server app screenshot [output_path] [--timeout-ms <ms>]` should ask the running GUI client to
+  capture its visible app surface through the native app backend and return the saved png path or
+  an error
 - `server screenshot app [output_path] [--timeout-ms <ms>]` should ask a live yggterm GUI client to capture its current window and return the saved png path or an error
 - `server trace bundle <lines> --screenshot` should emit a support bundle with event trace tail,
-  perf tail, UI telemetry tail, daemon summary, and a screenshot path. Embedded app capture
-  should be preferred before falling back to external desktop capture tools
+  perf tail, UI telemetry tail, daemon summary, live app-state snapshot, and a screenshot path.
+  Embedded app capture should be preferred before falling back to external desktop capture tools
 
 ## Search
 
@@ -255,3 +263,8 @@ The envelope types are implemented in `crates/yggterm-server/src/protocol.rs`.
 
 The transport is not yet fully event-stream based, but new client features should be designed as if
 they are consuming `accepted/loading/progress/result/error` events rather than blocking RPC calls.
+
+The current app-control queue is the first concrete step toward that model. Screenshoting, window
+focus, and live shell-state inspection now flow through a shared request/response channel under
+`~/.yggterm/app-control-{requests,responses}`. Future YggUI apps should add new control verbs
+there instead of inventing one-off SSH helpers per feature.
