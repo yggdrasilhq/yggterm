@@ -1,7 +1,8 @@
 use anyhow::Result;
 use yggterm_core::{SessionStore, detect_install_context, refresh_desktop_integration};
 use yggterm_server::{
-    cleanup_legacy_daemons, default_endpoint, detect_ghostty_host, ping, run_attach, run_daemon,
+    cleanup_legacy_daemons, default_endpoint, detect_ghostty_host, ping,
+    run_app_control_describe_state, run_app_control_focus_window, run_attach, run_daemon,
     run_remote_ensure_managed_cli, run_remote_generation_context, run_remote_preview,
     run_remote_protocol_version, run_remote_refresh_managed_cli, run_remote_resume_codex,
     run_remote_scan, run_remote_stage_clipboard_png, run_remote_upsert_generated_copy,
@@ -109,6 +110,31 @@ fn main() -> Result<()> {
             .find(|value| !value.starts_with("--"))
             .map(String::as_str);
         return run_screenshot_capture(&args[2], output_path, timeout_ms);
+    }
+    if args.len() >= 3 && args[0] == "server" && args[1] == "app" {
+        let timeout_ms = args
+            .windows(2)
+            .find_map(|window| {
+                if window[0] == "--timeout-ms" {
+                    window[1].parse::<u64>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(15_000);
+        return match args[2].as_str() {
+            "screenshot" => {
+                let output_path = args
+                    .iter()
+                    .skip(3)
+                    .find(|value| !value.starts_with("--"))
+                    .map(String::as_str);
+                run_screenshot_capture("app", output_path, timeout_ms)
+            }
+            "state" => run_app_control_describe_state(timeout_ms),
+            "focus" => run_app_control_focus_window(timeout_ms),
+            other => anyhow::bail!("unsupported app control command: {other}"),
+        };
     }
     if args.len() == 4 && args[0] == "server" && args[1] == "remote" && args[2] == "preview" {
         return run_remote_preview(&args[3]);

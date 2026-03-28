@@ -1394,6 +1394,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "gdkx11"
+version = "0.18.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3caa00e14351bebbc8183b3c36690327eb77c49abc2268dd4bd36b856db3fbfe"
+dependencies = [
+ "gdk",
+ "gdkx11-sys",
+ "gio",
+ "glib",
+ "libc",
+ "x11",
+]
+
+[[package]]
 name = "gdkx11-sys"
 version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5411,6 +5425,7 @@ dependencies = [
  "dirs",
  "dpi",
  "dunce",
+ "gdkx11",
  "gtk",
  "html5ever",
  "http",
@@ -5439,6 +5454,7 @@ dependencies = [
  "windows",
  "windows-core",
  "windows-version",
+ "x11-dl",
 ]
 
 [[package]]
@@ -5575,6 +5591,7 @@ version = "2.0.29"
 dependencies = [
  "anyhow",
  "base64",
+ "cairo-rs",
  "dioxus",
  "include_dir",
  "libc",
@@ -5586,6 +5603,8 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
+ "webkit2gtk",
+ "wry",
  "yggterm-core",
  "yggterm-platform",
  "yggterm-server",
