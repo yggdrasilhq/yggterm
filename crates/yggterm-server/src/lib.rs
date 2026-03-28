@@ -4276,7 +4276,6 @@ pub fn run_remote_resume_codex(session_id: &str, cwd: Option<&str>) -> anyhow::R
             }));
         } else {
             if matches!(multiplexer, RemoteMultiplexer::Screen) {
-                std::thread::sleep(std::time::Duration::from_millis(900));
                 let _ = screen_snapshot_bytes(&session_name)
                     .and_then(|bytes| emit_terminal_snapshot(&bytes));
             }
