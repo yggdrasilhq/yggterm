@@ -400,7 +400,9 @@ impl YggtermServer {
         match session.source {
             SessionSource::Stored => self.refresh_stored_session_preview(&path, &session)?,
             SessionSource::LiveSsh => {
-                if let Some((raw_machine_key, session_id)) = parse_remote_scanned_session_path(&path) {
+                if let Some((raw_machine_key, session_id)) =
+                    parse_remote_scanned_session_path(&path)
+                {
                     let machine_key = normalize_machine_key(raw_machine_key);
                     self.refresh_remote_scanned_session_preview(&machine_key, session_id)?;
                 }
@@ -582,7 +584,8 @@ impl YggtermServer {
         let mut targets = Vec::new();
         let mut seen = HashSet::<(String, String)>::new();
         for path in self.sessions.keys() {
-            let Some((raw_machine_key, session_id)) = parse_remote_scanned_session_path(path) else {
+            let Some((raw_machine_key, session_id)) = parse_remote_scanned_session_path(path)
+            else {
                 continue;
             };
             let machine_key = normalize_machine_key(raw_machine_key);
@@ -892,11 +895,10 @@ impl YggtermServer {
                 if is_loopback_ssh_target(&machine.ssh_target) {
                     return None;
                 }
-                let mirrored_sessions = load_remote_machine_sessions_from_mirror(&machine.machine_key)
-                    .or_else(|_| {
-                        load_remote_machine_sessions_from_mirror(&legacy_machine_key)
-                    })
-                    .unwrap_or_default();
+                let mirrored_sessions =
+                    load_remote_machine_sessions_from_mirror(&machine.machine_key)
+                        .or_else(|_| load_remote_machine_sessions_from_mirror(&legacy_machine_key))
+                        .unwrap_or_default();
                 machine.sessions = if machine.sessions.is_empty() {
                     mirrored_sessions
                 } else {
@@ -917,8 +919,10 @@ impl YggtermServer {
                                 let canonical_session_machine_key =
                                     normalize_machine_key(session_machine_key);
                                 if canonical_session_machine_key != machine.machine_key {
-                                    session.session_path =
-                                        remote_scanned_session_path(&machine.machine_key, session_id);
+                                    session.session_path = remote_scanned_session_path(
+                                        &machine.machine_key,
+                                        session_id,
+                                    );
                                 }
                             }
                             session
@@ -994,16 +998,12 @@ impl YggtermServer {
         }
         self.active_view_mode = state.active_view_mode;
         if let Some(path) = desired_active_path {
-            let active_path = if let Some((machine_key, session_id)) =
-                parse_remote_scanned_session_path(&path)
-            {
-                remote_scanned_session_path(
-                    &normalize_machine_key(machine_key),
-                    session_id,
-                )
-            } else {
-                path
-            };
+            let active_path =
+                if let Some((machine_key, session_id)) = parse_remote_scanned_session_path(&path) {
+                    remote_scanned_session_path(&normalize_machine_key(machine_key), session_id)
+                } else {
+                    path
+                };
             if self.sessions.contains_key(&active_path) {
                 self.active_session_path = Some(active_path.clone());
                 if self.active_view_mode == WorkspaceViewMode::Terminal {
@@ -1410,6 +1410,12 @@ impl YggtermServer {
     }
 
     pub fn restore_live_session(&mut self, live: PersistedLiveSession) {
+        let remote_scanned_key =
+            parse_remote_scanned_session_path(&live.key).map(|(raw_machine_key, session_id)| {
+                let machine_key = normalize_machine_key(raw_machine_key);
+                let normalized_live_key = remote_scanned_session_path(&machine_key, session_id);
+                (machine_key, session_id.to_string(), normalized_live_key)
+            });
         let target = SshConnectTarget {
             label: live
                 .ssh_target
@@ -1423,20 +1429,18 @@ impl YggtermServer {
             cwd: live.cwd,
         };
         self.upsert_ssh_target(&target);
-        if let Some((machine_key, session_id)) = parse_remote_scanned_session_path(&live.key)
+        if let Some((machine_key, session_id, normalized_live_key)) = remote_scanned_key.as_ref()
             && let Some(machine) = self
                 .remote_machines
                 .iter()
-                .find(|machine| machine.machine_key == normalize_machine_key(machine_key))
+                .find(|machine| machine.machine_key == *machine_key)
                 .cloned()
             && let Some(scanned) = machine
                 .sessions
                 .iter()
-                .find(|session| session.session_id == session_id)
+                .find(|session| session.session_id == session_id.as_str())
                 .cloned()
         {
-            let normalized_live_key =
-                remote_scanned_session_path(&normalize_machine_key(machine_key), session_id);
             let mut session = synthesize_remote_scanned_session_view(
                 &machine,
                 &scanned,
@@ -1449,18 +1453,28 @@ impl YggtermServer {
             }
             self.sessions.insert(normalized_live_key.clone(), session);
             self.live_session_order
-                .retain(|existing| existing != &normalized_live_key);
-            self.live_session_order.insert(0, normalized_live_key);
+                .retain(|existing| existing != normalized_live_key);
+            self.live_session_order
+                .insert(0, normalized_live_key.clone());
             return;
         }
+        let live_key = remote_scanned_key
+            .as_ref()
+            .map(|(_, _, normalized_live_key)| normalized_live_key.as_str())
+            .unwrap_or(live.key.as_str());
         self.insert_live_session_with_launch(
-            &live.key,
+            live_key,
             &live.id,
             live.kind,
             &target,
             Some(live.title),
             false,
         );
+        if let Some((_, _, normalized_live_key)) = remote_scanned_key
+            && let Some(session) = self.sessions.get_mut(&normalized_live_key)
+        {
+            session.session_path = normalized_live_key;
+        }
     }
 
     pub fn toggle_preview_block(&mut self, block_ix: usize) {
@@ -1938,7 +1952,13 @@ impl YggtermServer {
             SessionKind::Shell => format!("local::{uuid}"),
             _ => format!("live::{uuid}"),
         };
-        self.insert_live_session(&key, &uuid, target.kind, &target, Some(target.label.clone()));
+        self.insert_live_session(
+            &key,
+            &uuid,
+            target.kind,
+            &target,
+            Some(target.label.clone()),
+        );
         (Some(key), false)
     }
 
@@ -2122,6 +2142,37 @@ fn remote_resume_shell_command(
     }
 }
 
+fn remote_resume_picker_notice(session_id: &str) -> String {
+    format!(
+        "printf '%s\\n' {} >&2",
+        shell_single_quote(&format!(
+            "yggterm: saved Codex session {session_id} was not found; opening the resume picker."
+        ))
+    )
+}
+
+fn remote_resume_picker_shell_command(
+    session_id: &str,
+    cwd: Option<&str>,
+    prefix: Option<&str>,
+    persistent: bool,
+) -> String {
+    let codex_command = if persistent {
+        "exec codex resume"
+    } else {
+        "codex resume"
+    };
+    let base = match cwd.filter(|cwd| !cwd.trim().is_empty()) {
+        Some(cwd) => format!("cd {} && {}", shell_single_quote(cwd), codex_command),
+        None => codex_command.to_string(),
+    };
+    let with_notice = format!("{}; {}", remote_resume_picker_notice(session_id), base);
+    match prefix.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(prefix) => format!("{prefix} && {with_notice}"),
+        None => with_notice,
+    }
+}
+
 fn remote_persistent_resume_shell_command(session_id: &str, cwd: Option<&str>) -> String {
     match cwd.filter(|cwd| !cwd.trim().is_empty()) {
         Some(cwd) => format!(
@@ -2131,6 +2182,31 @@ fn remote_persistent_resume_shell_command(session_id: &str, cwd: Option<&str>) -
         ),
         None => format!("exec codex resume {}", shell_single_quote(session_id)),
     }
+}
+
+fn resolve_remote_codex_home() -> std::path::PathBuf {
+    std::env::var_os("CODEX_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .map(|home| home.join(".codex"))
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from(".codex"))
+}
+
+fn remote_saved_codex_session_exists(session_id: &str) -> anyhow::Result<bool> {
+    let mut files = Vec::new();
+    collect_codex_session_files(&resolve_remote_codex_home().join("sessions"), &mut files)?;
+    for path in files {
+        if let Some((candidate_id, _cwd)) = read_codex_session_identity_fields(&path)?
+            && candidate_id == session_id
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn remote_tmux_session_name(session_id: &str) -> String {
@@ -3805,16 +3881,62 @@ pub fn run_remote_protocol_version() -> anyhow::Result<()> {
 }
 
 pub fn run_remote_resume_codex(session_id: &str, cwd: Option<&str>) -> anyhow::Result<()> {
-    if tmux_available()? {
+    let perf_home = resolve_yggterm_home().ok();
+    let mut perf_span = perf_home
+        .as_ref()
+        .map(|home| PerfSpan::start(home.clone(), "remote", "resume_codex"));
+    let mut finish_span = |meta: serde_json::Value| {
+        if let Some(span) = perf_span.take() {
+            span.finish(meta);
+        }
+    };
+    let tmux_ready = tmux_available()?;
+    if tmux_ready {
         let session_name = remote_tmux_session_name(session_id);
-        if !tmux_has_session(&session_name)? {
-            let command = remote_persistent_resume_shell_command(session_id, cwd);
+        let existing_tmux = tmux_has_session(&session_name)?;
+        if !existing_tmux {
+            let saved_session_exists = remote_saved_codex_session_exists(session_id)?;
+            let command = if saved_session_exists {
+                remote_persistent_resume_shell_command(session_id, cwd)
+            } else {
+                remote_resume_picker_shell_command(session_id, cwd, None, true)
+            };
             tmux_spawn_codex_session(&session_name, &command)?;
+            finish_span(serde_json::json!({
+                "session_id": session_id,
+                "cwd": cwd,
+                "tmux": true,
+                "tmux_session": session_name,
+                "tmux_reused": false,
+                "saved_session_exists": saved_session_exists,
+                "mode": if saved_session_exists { "resume" } else { "resume_picker" },
+            }));
+        } else {
+            finish_span(serde_json::json!({
+                "session_id": session_id,
+                "cwd": cwd,
+                "tmux": true,
+                "tmux_session": session_name,
+                "tmux_reused": true,
+                "mode": "attach_existing_tmux",
+            }));
         }
         return tmux_attach_session(&session_name);
     }
 
-    let command = remote_resume_shell_command(session_id, cwd, None);
+    let saved_session_exists = remote_saved_codex_session_exists(session_id)?;
+    let command = if saved_session_exists {
+        remote_resume_shell_command(session_id, cwd, None)
+    } else {
+        remote_resume_picker_shell_command(session_id, cwd, None, true)
+    };
+    finish_span(serde_json::json!({
+        "session_id": session_id,
+        "cwd": cwd,
+        "tmux": false,
+        "saved_session_exists": saved_session_exists,
+        "mode": if saved_session_exists { "resume" } else { "resume_picker" },
+    }));
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -5760,14 +5882,14 @@ fn short_session_id(session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        GhosttyHostSupport, PersistedDaemonState, REMOTE_OUTPUT_SENTINEL, RemoteMachineHealth,
-        RemoteMachineSnapshot, RemoteScannedSession, SessionKind, SessionNode, SessionNodeKind,
-        SshConnectTarget, UiTheme, WorkspaceViewMode, YggtermServer,
+        GhosttyHostSupport, PersistedDaemonState, PersistedLiveSession, REMOTE_OUTPUT_SENTINEL,
+        RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession, SessionKind, SessionNode,
+        SessionNodeKind, SshConnectTarget, UiTheme, WorkspaceViewMode, YggtermServer,
         dedupe_remote_scanned_sessions, load_remote_machine_sessions_from_mirror,
         mirror_remote_machine_sessions, parse_stored_transcript, remote_cache_key,
-        remote_command_cache, remote_resume_shell_command, remote_scan_roots_with_parents,
-        remote_scanned_session_path, remote_ssh_launch_command, stored_session_launch_command,
-        strip_remote_payload_noise,
+        remote_command_cache, remote_resume_shell_command, remote_saved_codex_session_exists,
+        remote_scan_roots_with_parents, remote_scanned_session_path, remote_ssh_launch_command,
+        stored_session_launch_command, strip_remote_payload_noise,
     };
     use anyhow::Result;
     use std::fs;
@@ -6073,6 +6195,88 @@ mod tests {
         assert!(roots.contains(&machine_user_codex));
 
         let _ = fs::remove_dir_all(base);
+        Ok(())
+    }
+
+    #[test]
+    fn restore_live_remote_session_preserves_remote_session_path_without_cached_scan() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.remote_machines.push(RemoteMachineSnapshot {
+            machine_key: "jojo".to_string(),
+            label: "jojo".to_string(),
+            ssh_target: "jojo".to_string(),
+            prefix: None,
+            health: RemoteMachineHealth::Cached,
+            sessions: Vec::new(),
+        });
+
+        server.restore_live_session(PersistedLiveSession {
+            key: "remote-session://jojo/abc123".to_string(),
+            id: "abc123".to_string(),
+            title: "Example".to_string(),
+            kind: SessionKind::SshShell,
+            ssh_target: "jojo".to_string(),
+            prefix: None,
+            cwd: Some("/srv/app".to_string()),
+        });
+
+        let session = server
+            .sessions
+            .get("remote-session://jojo/abc123")
+            .expect("restored session");
+        assert_eq!(session.session_path, "remote-session://jojo/abc123");
+    }
+
+    #[test]
+    fn remote_saved_codex_session_exists_checks_codex_home() -> Result<()> {
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-remote-resume-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let sessions_dir = home.join("sessions").join("2026").join("03");
+        fs::create_dir_all(&sessions_dir)?;
+        fs::write(
+            sessions_dir.join("rollout-test.jsonl"),
+            "{\"id\":\"abc123\",\"cwd\":\"/srv/app\"}\n",
+        )?;
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        unsafe {
+            std::env::set_var("CODEX_HOME", &home);
+        }
+
+        let exists = remote_saved_codex_session_exists("abc123")?;
+        let missing = remote_saved_codex_session_exists("missing")?;
+
+        if let Some(previous_codex_home) = previous_codex_home {
+            unsafe {
+                std::env::set_var("CODEX_HOME", previous_codex_home);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("CODEX_HOME");
+            }
+        }
+        let _ = fs::remove_dir_all(home);
+
+        assert!(exists);
+        assert!(!missing);
         Ok(())
     }
 }
