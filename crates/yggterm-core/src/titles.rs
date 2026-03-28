@@ -19,7 +19,7 @@ pub struct SessionTitleResolver {
 }
 
 #[derive(Debug, Clone)]
-struct GeneratedCopyRecord {
+pub(crate) struct GeneratedCopyRecord {
     value: String,
     updated_at: OffsetDateTime,
 }
