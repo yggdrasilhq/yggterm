@@ -66,9 +66,10 @@ use yggterm_platform::DockRect;
 use yggterm_server::{
     AppControlCommand, AppControlDragCommand, AppControlDragPlacement, AppControlResponse,
     AppControlViewMode, GhosttyTerminalHostMode, ManagedSessionView, PreviewTone,
-    RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession, ServerEndpoint,
-    ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionPreviewBlock,
-    SessionRenderedSection, SshConnectTarget, TerminalBackend, WorkspaceViewMode,
+    RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession,
+    ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry,
+    SessionPreviewBlock, SessionRenderedSection, SshConnectTarget, TerminalBackend,
+    WorkspaceViewMode,
     YGG_LOADING_NOTIFICATION_AFTER_MS, YggRequestMeta, YggSurface, YggTarget, YggtermServer,
     apply_remote_preview_payload_for_path, cleanup_legacy_daemons, complete_app_control_request,
     connect_ssh_custom, fetch_remote_generation_context, fetch_remote_preview_payload, focus_live,
@@ -13712,6 +13713,7 @@ fn TerminalCanvas(
         snapshot.settings.terminal_font_size,
         &snapshot.settings.terminal_theme_name,
     );
+    let terminal_placeholder = terminal_placeholder_text(&session);
     let (terminal_shell_background, terminal_shell_shadow, terminal_host_chrome) =
         match snapshot.settings.theme {
             UiTheme::ZedLight => (
@@ -13759,6 +13761,7 @@ fn TerminalCanvas(
         let host_id = future_host_id.clone();
         let title = terminal_title.clone();
         let theme = future_theme.clone();
+        let placeholder = terminal_placeholder.clone();
         let trace_home = trace_home.clone();
         let mut state = state;
         let mut terminal_has_meaningful_output = terminal_has_meaningful_output;
@@ -13833,6 +13836,8 @@ fn TerminalCanvas(
             let mut eval = document::eval(&terminal_eval_script(&host_id, &theme));
             let mut cursor = 0u64;
             let mut read_poll_ms = 120u64;
+            let mut placeholder_rendered = false;
+            let mut terminal_has_visible_output = false;
             loop {
                 tokio::select! {
                     event = eval.recv::<TerminalJsEvent>() => {
@@ -13880,12 +13885,48 @@ fn TerminalCanvas(
                                 if let Ok((next_cursor, chunks)) = terminal_read_async(endpoint.clone(), session_path.clone(), 0).await {
                                     cursor = next_cursor;
                                     read_poll_ms = if chunks.is_empty() { 140 } else { 60 };
-                                    let (batched_output, saw_meaningful_output) =
+                                    let (batched_output, saw_visible_output, saw_meaningful_output) =
                                         batch_terminal_chunks(chunks);
+                                    if saw_visible_output {
+                                        terminal_has_visible_output = true;
+                                    }
+                                    if saw_meaningful_output && placeholder_rendered {
+                                        let _ = eval.send(TerminalJsCommand::Reset {
+                                            title: title.clone(),
+                                            background: theme.background.clone(),
+                                            foreground: theme.foreground.clone(),
+                                            cursor: theme.cursor.clone(),
+                                            selection: theme.selection.clone(),
+                                            black: theme.black.clone(),
+                                            red: theme.red.clone(),
+                                            green: theme.green.clone(),
+                                            yellow: theme.yellow.clone(),
+                                            blue: theme.blue.clone(),
+                                            magenta: theme.magenta.clone(),
+                                            cyan: theme.cyan.clone(),
+                                            white: theme.white.clone(),
+                                            bright_black: theme.bright_black.clone(),
+                                            bright_red: theme.bright_red.clone(),
+                                            bright_green: theme.bright_green.clone(),
+                                            bright_yellow: theme.bright_yellow.clone(),
+                                            bright_blue: theme.bright_blue.clone(),
+                                            bright_magenta: theme.bright_magenta.clone(),
+                                            bright_cyan: theme.bright_cyan.clone(),
+                                            bright_white: theme.bright_white.clone(),
+                                            font_size: theme.font_size,
+                                        });
+                                        placeholder_rendered = false;
+                                    }
                                     if let Some(data) = batched_output {
                                         let _ = eval.send(TerminalJsCommand::Write { data });
+                                    } else if !terminal_has_visible_output
+                                        && !placeholder_rendered
+                                        && let Some(data) = placeholder.clone()
+                                    {
+                                        let _ = eval.send(TerminalJsCommand::Write { data });
+                                        placeholder_rendered = true;
                                     }
-                                    if saw_meaningful_output {
+                                    if saw_visible_output {
                                         terminal_has_meaningful_output.set(true);
                                     }
                                     if saw_meaningful_output
@@ -14059,12 +14100,48 @@ fn TerminalCanvas(
                                 } else {
                                     60
                                 };
-                                let (batched_output, saw_meaningful_output) =
+                                let (batched_output, saw_visible_output, saw_meaningful_output) =
                                     batch_terminal_chunks(chunks);
+                                if saw_visible_output {
+                                    terminal_has_visible_output = true;
+                                }
+                                if saw_meaningful_output && placeholder_rendered {
+                                    let _ = eval.send(TerminalJsCommand::Reset {
+                                        title: title.clone(),
+                                        background: theme.background.clone(),
+                                        foreground: theme.foreground.clone(),
+                                        cursor: theme.cursor.clone(),
+                                        selection: theme.selection.clone(),
+                                        black: theme.black.clone(),
+                                        red: theme.red.clone(),
+                                        green: theme.green.clone(),
+                                        yellow: theme.yellow.clone(),
+                                        blue: theme.blue.clone(),
+                                        magenta: theme.magenta.clone(),
+                                        cyan: theme.cyan.clone(),
+                                        white: theme.white.clone(),
+                                        bright_black: theme.bright_black.clone(),
+                                        bright_red: theme.bright_red.clone(),
+                                        bright_green: theme.bright_green.clone(),
+                                        bright_yellow: theme.bright_yellow.clone(),
+                                        bright_blue: theme.bright_blue.clone(),
+                                        bright_magenta: theme.bright_magenta.clone(),
+                                        bright_cyan: theme.bright_cyan.clone(),
+                                        bright_white: theme.bright_white.clone(),
+                                        font_size: theme.font_size,
+                                    });
+                                    placeholder_rendered = false;
+                                }
                                 if let Some(data) = batched_output {
                                     let _ = eval.send(TerminalJsCommand::Write { data });
+                                } else if !terminal_has_visible_output
+                                    && !placeholder_rendered
+                                    && let Some(data) = placeholder.clone()
+                                {
+                                    let _ = eval.send(TerminalJsCommand::Write { data });
+                                    placeholder_rendered = true;
                                 }
-                                if saw_meaningful_output {
+                                if saw_visible_output {
                                     terminal_has_meaningful_output.set(true);
                                 }
                                 if saw_meaningful_output
@@ -14205,21 +14282,32 @@ fn terminal_chunk_has_meaningful_output(data: &str) -> bool {
     printable >= 80 || newline_count >= 6 || normalized_lines.len() >= 4
 }
 
+fn terminal_chunk_has_visible_output(data: &str) -> bool {
+    let stripped = strip_terminal_control_sequences(data);
+    stripped
+        .chars()
+        .any(|ch| !ch.is_control() && !ch.is_whitespace())
+}
+
 fn batch_terminal_chunks(
     chunks: Vec<yggterm_server::TerminalStreamChunk>,
-) -> (Option<String>, bool) {
+) -> (Option<String>, bool, bool) {
     if chunks.is_empty() {
-        return (None, false);
+        return (None, false, false);
     }
     let mut combined = String::new();
+    let mut saw_visible_output = false;
     let mut saw_meaningful_output = false;
     for chunk in chunks {
+        if !saw_visible_output && terminal_chunk_has_visible_output(&chunk.data) {
+            saw_visible_output = true;
+        }
         if !saw_meaningful_output && terminal_chunk_has_meaningful_output(&chunk.data) {
             saw_meaningful_output = true;
         }
         combined.push_str(&chunk.data);
     }
-    (Some(combined), saw_meaningful_output)
+    (Some(combined), saw_visible_output, saw_meaningful_output)
 }
 
 fn strip_terminal_control_sequences(data: &str) -> String {
@@ -14532,6 +14620,28 @@ fn terminal_theme(
         bright_cyan: "#0598bc".to_string(),
         bright_white: "#8c959f".to_string(),
     }
+}
+
+fn terminal_placeholder_text(session: &ManagedSessionView) -> Option<String> {
+    if !session.session_path.starts_with("remote-session://") {
+        return None;
+    }
+    let mut lines = vec!["Resuming live Codex session...".to_string()];
+    if !session.host_label.trim().is_empty() {
+        lines.push(format!("Host: {}", session.host_label.trim()));
+    }
+    let cwd = metadata_value(session, "Cwd");
+    if !cwd.trim().is_empty() {
+        lines.push(format!("Workspace: {}", cwd.trim()));
+    }
+    match session.remote_deploy_state {
+        RemoteDeployState::NotRequired => {}
+        RemoteDeployState::Planned => lines.push("Deploy: planned".to_string()),
+        RemoteDeployState::CopyingBinary => lines.push("Deploy: copying yggterm".to_string()),
+        RemoteDeployState::Ready => lines.push("Deploy: ready".to_string()),
+    }
+    lines.push("Waiting for the remote terminal to paint...".to_string());
+    Some(format!("{}\r\n", lines.join("\r\n")))
 }
 
 fn xterm_assets_bootstrap_script() -> String {
@@ -14924,6 +15034,13 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
                 dioxus.send({{ kind: "resize", cols: term.cols, rows: term.rows }});
             }} catch (_error) {{}}
         }};
+        const scheduleResizeNudges = () => {{
+            [180, 700].forEach((delayMs) => {{
+                window.setTimeout(() => {{
+                    emitResize();
+                }}, delayMs);
+            }});
+        }};
         const resizeObserver = new ResizeObserver(() => emitResize());
         resizeObserver.observe(host);
         term.onData((data) => dioxus.send({{ kind: "input", data }}));
@@ -14942,6 +15059,7 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
             host.innerHTML = "";
         }};
         emitResize();
+        scheduleResizeNudges();
         {constructed_debug}
         dioxus.send({{ kind: "ready" }});
         while (true) {{
@@ -14976,6 +15094,7 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
                 }};
                 {reset_debug}
                 requestAnimationFrame(() => emitResize());
+                scheduleResizeNudges();
             }} else if (message.kind === "write") {{
                 term.write(message.data);
             }}
