@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
-use yggterm_core::{PerfSpan, SessionStore, UiTheme};
+use yggterm_core::{PerfSpan, SessionStore, UiTheme, append_trace_event};
 
 pub const SERVER_PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -285,6 +285,14 @@ impl DaemonRuntime {
     }
 
     fn handle_request(&mut self, request: ServerRequest) -> Result<ServerResponse> {
+        let request_name = server_request_name(&request);
+        append_trace_event(
+            self.store.home_dir(),
+            "daemon",
+            "request",
+            "begin",
+            serde_json::json!({ "request": request_name }),
+        );
         let response = match request {
             ServerRequest::Ping => ServerResponse::Pong,
             ServerRequest::Status => ServerResponse::Status(self.status()),
@@ -561,7 +569,45 @@ impl DaemonRuntime {
                 }
             }
         };
+        append_trace_event(
+            self.store.home_dir(),
+            "daemon",
+            "request",
+            "end",
+            serde_json::json!({ "request": request_name }),
+        );
         Ok(response)
+    }
+}
+
+fn server_request_name(request: &ServerRequest) -> &'static str {
+    match request {
+        ServerRequest::Ping => "ping",
+        ServerRequest::Status => "status",
+        ServerRequest::Snapshot => "snapshot",
+        ServerRequest::OpenStoredSession { .. } => "open_stored_session",
+        ServerRequest::ConnectSsh { .. } => "connect_ssh",
+        ServerRequest::ConnectSshCustom { .. } => "connect_ssh_custom",
+        ServerRequest::OpenRemoteSession { .. } => "open_remote_session",
+        ServerRequest::RefreshRemoteMachine { .. } => "refresh_remote_machine",
+        ServerRequest::RefreshManagedCli { .. } => "refresh_managed_cli",
+        ServerRequest::RemoveSshTarget { .. } => "remove_ssh_target",
+        ServerRequest::StartLocalSession { .. } => "start_local_session",
+        ServerRequest::SwitchAgentSessionMode { .. } => "switch_agent_session_mode",
+        ServerRequest::StartCommandSession { .. } => "start_command_session",
+        ServerRequest::FocusLive { .. } => "focus_live",
+        ServerRequest::SetViewMode { .. } => "set_view_mode",
+        ServerRequest::TogglePreviewBlock { .. } => "toggle_preview_block",
+        ServerRequest::SetAllPreviewBlocksFolded { .. } => "set_all_preview_blocks_folded",
+        ServerRequest::RequestTerminalLaunch => "request_terminal_launch",
+        ServerRequest::TerminalEnsure { .. } => "terminal_ensure",
+        ServerRequest::TerminalRead { .. } => "terminal_read",
+        ServerRequest::TerminalWrite { .. } => "terminal_write",
+        ServerRequest::TerminalResize { .. } => "terminal_resize",
+        ServerRequest::SyncExternalWindow => "sync_external_window",
+        ServerRequest::RaiseExternalWindow => "raise_external_window",
+        ServerRequest::SyncTheme { .. } => "sync_theme",
+        ServerRequest::Shutdown => "shutdown",
     }
 }
 

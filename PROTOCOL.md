@@ -229,6 +229,11 @@ Observability:
 - `status` should expose the restored stored/live/remote-machine counts
 - `yggterm-mock-cli` should emit those fields in startup and reconnect scenarios so cache-path
   regressions can be profiled without the desktop shell
+- `server trace tail <lines>` should dump the last trace probes from `~/.yggterm/event-trace.jsonl`
+- `server trace follow <lines> [poll_ms]` should stay attached and stream new probes as they land
+- `server trace bundle <lines> --screenshot` should emit a support bundle with event trace tail,
+  perf tail, UI telemetry tail, daemon summary, and a best-effort screenshot path when a display
+  capture tool is available
 
 ## Search
 

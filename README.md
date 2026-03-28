@@ -20,6 +20,16 @@ Rerun the same one-liner any time to force a manual update of a direct install.
 
 Direct installs also ship `yggterm-mock-cli`, a small diagnostic CLI for probing daemon state, startup behavior, and native integration problems from the same installed runtime.
 
+Yggterm also ships an always-on event trace so sluggish sessions can be debugged after the fact or while the app is still running:
+
+```bash
+yggterm-headless server trace tail 200
+yggterm-headless server trace follow 200 500
+yggterm-headless server trace bundle 200 --screenshot > yggterm-trace.json
+```
+
+The trace lives at `~/.yggterm/event-trace.jsonl` and is designed to stay on during dogfooding, with lightweight rotation once it gets large.
+
 ## What yggterm is
 
 Yggdrasil Terminal (`yggterm`) is a remote-first terminal workspace built in Rust.
