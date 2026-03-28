@@ -10,6 +10,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const DEFAULT_COLS: u16 = 120;
 const DEFAULT_ROWS: u16 = 36;
 const MAX_CHUNKS: usize = 4096;
+const INITIAL_ATTACH_MAX_CHUNKS: usize = 192;
+const INITIAL_ATTACH_MAX_BYTES: usize = 512 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct TerminalChunk {
@@ -231,11 +233,29 @@ impl PtySessionRuntime {
     fn read(&self, cursor: u64) -> TerminalReadResult {
         let chunks = self.chunks.lock().expect("pty chunk lock poisoned");
         let next_cursor = self.seq.load(Ordering::SeqCst);
-        let chunks = chunks
-            .iter()
-            .filter(|chunk| chunk.seq > cursor)
-            .cloned()
-            .collect();
+        let chunks = if cursor == 0 {
+            let mut selected = Vec::new();
+            let mut bytes = 0usize;
+            for chunk in chunks.iter().rev() {
+                let chunk_len = chunk.data.len();
+                if !selected.is_empty()
+                    && (selected.len() >= INITIAL_ATTACH_MAX_CHUNKS
+                        || bytes.saturating_add(chunk_len) > INITIAL_ATTACH_MAX_BYTES)
+                {
+                    break;
+                }
+                bytes = bytes.saturating_add(chunk_len);
+                selected.push(chunk.clone());
+            }
+            selected.reverse();
+            selected
+        } else {
+            chunks
+                .iter()
+                .filter(|chunk| chunk.seq > cursor)
+                .cloned()
+                .collect()
+        };
         TerminalReadResult {
             cursor: next_cursor,
             chunks,
