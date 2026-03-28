@@ -9861,6 +9861,17 @@ fn app() -> Element {
         .expect("shell bootstrap not initialized")
         .clone();
     let mut state = use_signal(|| ShellState::new(bootstrap.clone()));
+    let initial_terminal_session_path = {
+        let snapshot = state.read().snapshot();
+        if snapshot.active_view_mode == WorkspaceViewMode::Terminal {
+            snapshot
+                .active_session
+                .as_ref()
+                .map(|session| session.session_path.clone())
+        } else {
+            None
+        }
+    };
     let desktop = use_window();
     let mut hovered = use_signal(|| None::<HoveredControl>);
     let mut startup_sync_started = use_signal(|| false);
@@ -9870,7 +9881,8 @@ fn app() -> Element {
     let mut window_epoch = use_signal(|| 0_u64);
     let mut terminal_mount_epoch = use_signal(|| 0_u64);
     let async_render_epoch = use_signal(|| 0_u64);
-    let mut last_terminal_session_path = use_signal(|| None::<String>);
+    let mut last_terminal_session_path =
+        use_signal(move || initial_terminal_session_path.clone());
     let mut last_open_recovery_path = use_signal(|| None::<String>);
     let mut last_preview_refresh_marker = use_signal(|| None::<(String, u64)>);
     let mut last_sidebar_autoscroll_path = use_signal(|| None::<String>);
@@ -11440,7 +11452,10 @@ fn Sidebar(
                     }
                 }
             }
-            if snapshot.sidebar_loading && !snapshot.show_loading_tree {
+            if snapshot.sidebar_loading
+                && !snapshot.show_loading_tree
+                && snapshot.active_view_mode != WorkspaceViewMode::Terminal
+            {
                 div {
                     style: "padding:8px 12px 0 12px; display:flex; justify-content:flex-start;",
                     LoadingStateChip {
