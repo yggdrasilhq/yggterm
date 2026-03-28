@@ -1,6 +1,7 @@
 use crate::drag_tree::DragDropPlacement;
 use dioxus::html::input_data::MouseButton;
 use dioxus::prelude::*;
+use std::env;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DragGhostPalette {
@@ -8,6 +9,20 @@ pub struct DragGhostPalette {
     pub muted: &'static str,
     pub accent: &'static str,
     pub accent_soft: &'static str,
+}
+
+fn linux_kde_wayland_safe_mode() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        env::var_os("WAYLAND_DISPLAY").is_some()
+            && env::var("XDG_CURRENT_DESKTOP")
+                .map(|value| value.to_ascii_lowercase().contains("kde"))
+                .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
 }
 
 #[component]
@@ -19,6 +34,11 @@ pub fn DragGhostCard(
     target_hint: Option<String>,
     palette: DragGhostPalette,
 ) -> Element {
+    let blur_style = if linux_kde_wayland_safe_mode() {
+        "backdrop-filter:none; -webkit-backdrop-filter:none;"
+    } else {
+        "backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);"
+    };
     rsx! {
         div {
             style: format!(
@@ -48,9 +68,9 @@ pub fn DragGhostCard(
                 style: format!(
                     "position:relative; min-width:150px; max-width:260px; padding:10px 12px; border-radius:12px; \
                      background:rgba(255,255,255,0.92); color:{}; box-shadow:0 18px 42px rgba(72, 101, 128, 0.22), \
-                     inset 0 0 0 1px rgba(201, 216, 230, 0.92); backdrop-filter: blur(12px); \
-                     -webkit-backdrop-filter: blur(12px);",
-                    palette.text
+                     inset 0 0 0 1px rgba(201, 216, 230, 0.92); {}",
+                    palette.text,
+                    blur_style
                 ),
                 div {
                     style: "display:flex; align-items:center; gap:8px;",
