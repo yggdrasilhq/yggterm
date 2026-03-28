@@ -78,7 +78,7 @@ use yggterm_server::{
     set_all_preview_blocks_folded, set_view_mode as daemon_set_view_mode,
     shutdown as daemon_shutdown, snapshot as daemon_snapshot, stage_remote_clipboard_png,
     start_command_session, start_local_session_at, start_ssh_session_at, status,
-    switch_agent_session_mode, take_next_app_control_request, terminal_ensure, terminal_read,
+    take_next_app_control_request, terminal_ensure, terminal_read,
     terminal_resize, terminal_write, toggle_preview_block as daemon_toggle_preview_block,
 };
 
@@ -113,6 +113,7 @@ const BACKGROUND_COPY_RETRY_MS: u64 = 300_000;
 const BACKGROUND_COPY_CONTINUE_MS: u64 = 15_000;
 const BACKGROUND_COPY_IDLE_MS: u64 = 120_000;
 const BACKGROUND_REFRESH_NOTICE_MS: u64 = 12_000;
+const BACKGROUND_REFRESH_STARTUP_DEFER_MS: u64 = 12_000;
 const THEME_EDITOR_PAD_SIZE: f64 = 286.0;
 const SEARCH_INPUT_ID: &str = "yggterm-search-input";
 const PREVIEW_HEADER_SEARCH_HIT_ID: &str = "__preview_header__";
@@ -166,6 +167,7 @@ struct ShellState {
     notifications: Vec<ToastNotification>,
     next_notification_id: u64,
     titlebar_new_menu_open: bool,
+    titlebar_session_menu_open: bool,
     selected_tree_paths: HashSet<String>,
     selection_anchor: Option<String>,
     context_menu_row: Option<BrowserRow>,
@@ -215,6 +217,7 @@ struct ShellState {
     background_copy_scan_in_flight: bool,
     next_background_copy_scan_after_ms: u64,
     browser_tree_loading_in_flight: bool,
+    background_refresh_after_ms: u64,
     recent_ui_telemetry: HashMap<String, (String, u64)>,
     had_cached_startup_snapshot: bool,
     latest_open_request_id: u64,
@@ -324,6 +327,7 @@ struct RenderSnapshot {
     always_on_top: bool,
     notifications: Vec<ToastNotification>,
     titlebar_new_menu_open: bool,
+    titlebar_session_menu_open: bool,
     selected_tree_paths: Vec<String>,
     context_menu_row: Option<BrowserRow>,
     context_menu_position: Option<(f64, f64)>,
@@ -621,6 +625,7 @@ impl ShellState {
             notifications: Vec::new(),
             next_notification_id: 1,
             titlebar_new_menu_open: false,
+            titlebar_session_menu_open: false,
             selected_tree_paths: HashSet::new(),
             selection_anchor: None,
             context_menu_row: None,
@@ -670,6 +675,7 @@ impl ShellState {
             background_copy_scan_in_flight: false,
             next_background_copy_scan_after_ms: 0,
             browser_tree_loading_in_flight: !browser_tree_loaded,
+            background_refresh_after_ms: current_millis() + BACKGROUND_REFRESH_STARTUP_DEFER_MS,
             recent_ui_telemetry: HashMap::new(),
             had_cached_startup_snapshot: has_initial_server_snapshot,
             latest_open_request_id: 0,
@@ -837,6 +843,7 @@ impl ShellState {
             always_on_top: self.always_on_top,
             notifications: self.notifications.clone(),
             titlebar_new_menu_open: self.titlebar_new_menu_open,
+            titlebar_session_menu_open: self.titlebar_session_menu_open,
             selected_tree_paths: self.selected_tree_paths.iter().cloned().collect(),
             context_menu_row: self.context_menu_row.clone(),
             context_menu_position: self.context_menu_position,
@@ -2269,11 +2276,21 @@ impl ShellState {
     }
 
     fn toggle_titlebar_new_menu(&mut self) {
+        self.titlebar_session_menu_open = false;
         self.titlebar_new_menu_open = !self.titlebar_new_menu_open;
     }
 
     fn close_titlebar_new_menu(&mut self) {
         self.titlebar_new_menu_open = false;
+    }
+
+    fn toggle_titlebar_session_menu(&mut self) {
+        self.titlebar_new_menu_open = false;
+        self.titlebar_session_menu_open = !self.titlebar_session_menu_open;
+    }
+
+    fn close_titlebar_session_menu(&mut self) {
+        self.titlebar_session_menu_open = false;
     }
 
     fn push_notification(
@@ -3813,7 +3830,9 @@ fn maybe_spawn_missing_remote_machine_refreshes(state: Signal<ShellState>) {
     if safe_shell_read(
         state,
         "maybe_spawn_missing_remote_machine_refreshes_gate",
-        terminal_attach_blocks_background_work,
+        |shell| {
+            terminal_attach_blocks_background_work(shell) || background_refreshes_deferred(shell)
+        },
     )
     .unwrap_or(false)
     {
@@ -3823,7 +3842,8 @@ fn maybe_spawn_missing_remote_machine_refreshes(state: Signal<ShellState>) {
         state,
         "maybe_spawn_missing_remote_machine_refreshes_read",
         |shell| {
-            if terminal_attach_blocks_background_work(shell) {
+            if terminal_attach_blocks_background_work(shell) || background_refreshes_deferred(shell)
+            {
                 return Vec::new();
             }
             pending_remote_machine_refreshes(
@@ -3871,7 +3891,9 @@ fn maybe_spawn_missing_managed_cli_refreshes(state: Signal<ShellState>) {
     if safe_shell_read(
         state,
         "maybe_spawn_missing_managed_cli_refreshes_gate",
-        terminal_attach_blocks_background_work,
+        |shell| {
+            terminal_attach_blocks_background_work(shell) || background_refreshes_deferred(shell)
+        },
     )
     .unwrap_or(false)
     {
@@ -3881,7 +3903,8 @@ fn maybe_spawn_missing_managed_cli_refreshes(state: Signal<ShellState>) {
         state,
         "maybe_spawn_missing_managed_cli_refreshes_read",
         |shell| {
-            if terminal_attach_blocks_background_work(shell) {
+            if terminal_attach_blocks_background_work(shell) || background_refreshes_deferred(shell)
+            {
                 return Vec::new();
             }
             pending_managed_cli_refreshes(
@@ -3915,6 +3938,10 @@ fn terminal_attach_blocks_background_work(shell: &ShellState) -> bool {
         && shell.terminal_attach_in_flight.contains(active_path)
 }
 
+fn background_refreshes_deferred(shell: &ShellState) -> bool {
+    current_millis() < shell.background_refresh_after_ms
+}
+
 fn spawn_background_managed_cli_refresh(state: Signal<ShellState>, scope_key: String) {
     let endpoint = state.read().bootstrap.server_endpoint.clone();
     let mut request_meta = if scope_key == "local" {
@@ -3942,18 +3969,6 @@ fn spawn_background_managed_cli_refresh(state: Signal<ShellState>, scope_key: St
             false,
         );
     });
-    spawn_loading_notice(
-        state,
-        request_meta.clone(),
-        "Codex Tool Refresh Still Running",
-        if scope_key == "local" {
-            "Yggterm is still checking and updating the managed Codex toolchain for this machine. The rest of the UI stays interactive while the refresh continues.".to_string()
-        } else {
-            format!(
-                "Yggterm is still checking and updating the managed Codex toolchain on {scope_key}. The rest of the UI stays interactive while the refresh continues."
-            )
-        },
-    );
     spawn(async move {
         let request_scope = scope_key.clone();
         let outcome = task::spawn_blocking(move || {
@@ -4053,14 +4068,6 @@ fn spawn_background_remote_machine_refresh(state: Signal<ShellState>, machine_ke
             false,
         );
     });
-    spawn_loading_notice(
-        state,
-        request_meta.clone(),
-        "Remote Machine Still Refreshing",
-        format!(
-            "{machine_key} is still syncing. Yggterm is keeping the rest of the shell interactive while the sidebar refresh continues."
-        ),
-    );
     spawn(async move {
         maybe_debug_request_delay().await;
         let request_machine_key = machine_key.clone();
@@ -4595,27 +4602,6 @@ fn spawn_connect_ssh_custom(mut state: Signal<ShellState>) {
                 );
             }
         });
-    });
-}
-
-fn spawn_switch_agent_session_mode(
-    mut state: Signal<ShellState>,
-    path: String,
-    target_kind: SessionKind,
-) {
-    state.with_mut(|shell| {
-        shell.server_busy = true;
-        shell.last_action = format!(
-            "switching to {}",
-            match target_kind {
-                SessionKind::Codex => "codex",
-                SessionKind::CodexLiteLlm => "codex-litellm",
-                _ => "session",
-            }
-        );
-    });
-    spawn_server_snapshot_action(state, "switching agent mode".to_string(), move |endpoint| {
-        switch_agent_session_mode(&endpoint, &path, target_kind)
     });
 }
 
@@ -5366,6 +5352,18 @@ fn resolved_session_summary(shell: &ShellState, session: &ManagedSessionView) ->
         .filter(|summary| !looks_like_low_signal_generated_copy(summary))
 }
 
+fn titlebar_summary_text(
+    snapshot: &RenderSnapshot,
+    session: &ManagedSessionView,
+) -> Option<String> {
+    snapshot
+        .active_summary
+        .clone()
+        .or_else(|| preview_summary_metadata_value(session, "Summary"))
+        .filter(|summary| !summary.trim().is_empty())
+        .filter(|summary| !looks_like_low_signal_generated_copy(summary))
+}
+
 fn preview_summary_metadata_value(session: &ManagedSessionView, label: &str) -> Option<String> {
     session
         .preview
@@ -5374,25 +5372,6 @@ fn preview_summary_metadata_value(session: &ManagedSessionView, label: &str) -> 
         .find(|entry| entry.label == label)
         .map(|entry| entry.value.trim().to_string())
         .filter(|value| !value.is_empty())
-}
-
-fn preview_header_summary(snapshot: &RenderSnapshot, session: &ManagedSessionView) -> String {
-    let fallback = preview_summary_text(session);
-    match snapshot.active_summary.clone() {
-        Some(summary) if summary.trim().is_empty() => fallback,
-        Some(summary) if looks_like_low_signal_generated_copy(&summary) => fallback,
-        Some(summary) => summary,
-        None => fallback,
-    }
-}
-
-fn preview_header_precis(snapshot: &RenderSnapshot, session: &ManagedSessionView) -> String {
-    snapshot
-        .active_precis
-        .clone()
-        .or_else(|| preview_summary_metadata_value(session, "Precis"))
-        .filter(|precis| !looks_like_low_signal_generated_copy(precis))
-        .unwrap_or_else(|| preview_header_summary(snapshot, session))
 }
 
 fn is_placeholder_rendered_section_title(title: &str) -> bool {
@@ -9863,6 +9842,7 @@ fn app() -> Element {
     let mut hovered = use_signal(|| None::<HoveredControl>);
     let mut startup_sync_started = use_signal(|| false);
     let mut browser_tree_load_started = use_signal(|| false);
+    let mut background_refresh_defer_started = use_signal(|| false);
     let mut update_check_started = use_signal(|| false);
     let mut dock_pulse_started = use_signal(|| false);
     let mut window_epoch = use_signal(|| 0_u64);
@@ -9968,6 +9948,23 @@ fn app() -> Element {
                 async_render_epoch,
             );
         }
+    });
+    use_effect(move || {
+        if *background_refresh_defer_started.read() {
+            return;
+        }
+        background_refresh_defer_started.set(true);
+        let defer_ms = state
+            .read()
+            .background_refresh_after_ms
+            .saturating_sub(current_millis());
+        spawn(async move {
+            if defer_ms > 0 {
+                sleep(Duration::from_millis(defer_ms)).await;
+            }
+            maybe_spawn_missing_remote_machine_refreshes(state);
+            maybe_spawn_missing_managed_cli_refreshes(state);
+        });
     });
     use_effect(move || {
         if *update_check_started.read() {
@@ -10380,7 +10377,12 @@ fn app() -> Element {
                  -webkit-backdrop-filter:{};",
                 shell_radius, snapshot.shell_tint, snapshot.shell_gradient, shell_backdrop, shell_backdrop
             ),
-            onclick: move |_| state.with_mut(|shell| shell.close_titlebar_new_menu()),
+            onclick: move |_| {
+                state.with_mut(|shell| {
+                    shell.close_titlebar_new_menu();
+                    shell.close_titlebar_session_menu();
+                })
+            },
             onmouseup: move |_| {
                 if !state.read().drag_paths.is_empty() {
                     queue_drop_current_drag_target(state);
@@ -10584,6 +10586,7 @@ fn app() -> Element {
                     },
                     on_hover_control: move |control: Option<HoveredControl>| hovered.set(control),
                     on_set_view_mode: move |mode: WorkspaceViewMode| spawn_set_view_mode(state, mode),
+                    on_toggle_session_menu: move |_| state.with_mut(|shell| shell.toggle_titlebar_session_menu()),
                     on_toggle_new_menu: move |_| state.with_mut(|shell| shell.toggle_titlebar_new_menu()),
                     on_start_session: move |_| {
                         let (cwd, title_hint) = state.with_mut(|shell| {
@@ -10636,6 +10639,14 @@ fn app() -> Element {
                     on_create_paper: move |_| {
                         state.with_mut(|shell| shell.close_titlebar_new_menu());
                         queue_new_document(state)
+                    },
+                    on_refresh_title: move |_| {
+                        spawn_deferred_active_session_title_generation(state, true)
+                    },
+                    on_refresh_summary: move |_| {
+                        if let Some(session) = state.read().server.active_session().cloned() {
+                            spawn_summary_generation(state, session, true);
+                        }
                     },
                     on_toggle_meta: move || state.with_mut(|shell| shell.toggle_metadata_panel()),
                     on_toggle_settings: move || state.with_mut(|shell| shell.toggle_settings_panel()),
@@ -10798,42 +10809,6 @@ fn app() -> Element {
                                     AfterSaveAction::RunHere
                                 },
                             )
-                        },
-                        on_switch_agent_mode: move |kind: SessionKind| {
-                            let (active_session, active_path) = {
-                                let shell = state.read();
-                                (
-                                    shell.server.active_session().cloned(),
-                                    shell.server.active_session_path().map(ToOwned::to_owned),
-                                )
-                            };
-                            if let (Some(session), Some(active_path)) = (active_session, active_path) {
-                                if session.kind != kind {
-                                    state.with_mut(|shell| {
-                                        shell.settings.default_agent_profile = match kind {
-                                            SessionKind::CodexLiteLlm => AgentSessionProfile::CodexLiteLlm,
-                                            _ => AgentSessionProfile::Codex,
-                                        };
-                                        shell.persist_settings();
-                                    });
-                                    spawn_switch_agent_session_mode(state, active_path, kind);
-                                }
-                            }
-                        },
-                        on_refresh_title: move |_| {
-                            spawn_deferred_active_session_title_generation(state, true)
-                        },
-                        on_refresh_precis: move |_| {
-                            let session = { state.read().server.active_session().cloned() };
-                            if let Some(session) = session {
-                                spawn_precis_generation(state, session, true);
-                            }
-                        },
-                        on_refresh_summary: move |_| {
-                            let session = { state.read().server.active_session().cloned() };
-                            if let Some(session) = session {
-                                spawn_summary_generation(state, session, true);
-                            }
                         },
                     }
                     if metadata_snapshot.right_panel_mode != RightPanelMode::Hidden {
@@ -11031,10 +11006,13 @@ fn Titlebar(
     on_next_search_content: EventHandler<()>,
     on_hover_control: EventHandler<Option<HoveredControl>>,
     on_set_view_mode: EventHandler<WorkspaceViewMode>,
+    on_toggle_session_menu: EventHandler<()>,
     on_toggle_new_menu: EventHandler<()>,
     on_start_session: EventHandler<()>,
     on_start_terminal: EventHandler<()>,
     on_create_paper: EventHandler<()>,
+    on_refresh_title: EventHandler<()>,
+    on_refresh_summary: EventHandler<()>,
     on_toggle_meta: EventHandler<()>,
     on_toggle_settings: EventHandler<()>,
     on_toggle_connect: EventHandler<()>,
@@ -11047,6 +11025,23 @@ fn Titlebar(
 ) -> Element {
     let command_mode_active = snapshot.command_mode_active;
     let search_query = snapshot.search_query.clone();
+    let active_title = snapshot.active_session.as_ref().map(|session| {
+        snapshot
+            .active_title
+            .clone()
+            .unwrap_or_else(|| session.title.clone())
+    });
+    let active_summary = snapshot
+        .active_session
+        .as_ref()
+        .and_then(|session| titlebar_summary_text(&snapshot, session));
+    let titlebar_loading_label = if snapshot.active_view_mode == WorkspaceViewMode::Rendered {
+        snapshot.preview_loading.then_some("Refreshing preview…".to_string())
+    } else {
+        snapshot
+            .terminal_loading
+            .then_some("Resuming terminal…".to_string())
+    };
     rsx! {
         TitlebarChrome {
             background: snapshot.palette.titlebar.to_string(),
@@ -11137,10 +11132,93 @@ fn Titlebar(
             },
             center: rsx! {
                 div {
-                    style: "flex:1; display:flex; align-items:center; justify-content:center; gap:10px; padding:0 16px;",
-                    div { style: "flex:1; min-width:84px; height:100%;" }
+                    style: "flex:1; display:flex; align-items:center; justify-content:center; gap:12px; padding:0 16px; min-width:0;",
+                    if let Some(active_title) = active_title.clone() {
+                        div {
+                            style: "position:relative; display:flex; align-items:center; flex:0 1 340px; min-width:180px; max-width:360px;",
+                            onmousedown: |evt| evt.stop_propagation(),
+                            onclick: |evt| evt.stop_propagation(),
+                            ondoubleclick: |evt| evt.stop_propagation(),
+                            button {
+                                title: active_summary
+                                    .clone()
+                                    .unwrap_or_else(|| "Summary not generated yet.".to_string()),
+                                style: format!(
+                                    "display:flex; align-items:center; gap:8px; width:100%; height:32px; padding:0 12px; border:none; border-radius:10px; \
+                                     background:rgba(255,255,255,0.74); color:{}; box-shadow: inset 0 0 0 1px rgba(190,206,222,0.5); \
+                                     font-size:12px; font-weight:700; cursor:pointer; min-width:0;",
+                                    snapshot.palette.text
+                                ),
+                                onclick: move |_| on_toggle_session_menu.call(()),
+                                span {
+                                    style: "min-width:0; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; text-align:left;",
+                                    "{active_title}"
+                                }
+                                if let Some(loading_label) = titlebar_loading_label.clone() {
+                                    span {
+                                        style: format!(
+                                            "display:inline-flex; align-items:center; gap:5px; flex:0 0 auto; font-size:10px; font-weight:700; color:{};",
+                                            snapshot.palette.muted
+                                        ),
+                                        span {
+                                            style: format!(
+                                                "width:6px; height:6px; border-radius:999px; background:{}; animation:yggterm-tree-loading-dot 1.05s ease-in-out infinite;",
+                                                snapshot.palette.accent
+                                            )
+                                        }
+                                        "{loading_label}"
+                                    }
+                                }
+                                span {
+                                    style: format!(
+                                        "font-size:10px; color:{}; flex:0 0 auto;",
+                                        if snapshot.titlebar_session_menu_open {
+                                            snapshot.palette.accent
+                                        } else {
+                                            snapshot.palette.muted
+                                        }
+                                    ),
+                                    "▾"
+                                }
+                            }
+                            if snapshot.titlebar_session_menu_open {
+                                div {
+                                    style: format!(
+                                        "position:absolute; left:0; top:38px; z-index:210; width:min(420px, 70vw); padding:12px 14px; border-radius:16px; \
+                                         background:rgba(255,255,255,0.97); box-shadow:0 20px 48px rgba(74,93,122,0.18), \
+                                         inset 0 0 0 1px rgba(198,212,226,0.86); display:flex; flex-direction:column; gap:10px;",
+                                    ),
+                                    onmousedown: |evt| evt.stop_propagation(),
+                                    div {
+                                        style: format!("font-size:13px; font-weight:800; color:{};", snapshot.palette.text),
+                                        "{active_title}"
+                                    }
+                                    div {
+                                        style: format!(
+                                            "font-size:12px; line-height:1.65; color:{}; max-height:180px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere;",
+                                            snapshot.palette.muted
+                                        ),
+                                        {active_summary.clone().unwrap_or_else(|| "Summary not generated yet.".to_string())}
+                                    }
+                                    div {
+                                        style: "display:flex; align-items:center; gap:8px;",
+                                        button {
+                                            style: titlebar_new_action_style(snapshot.palette),
+                                            onclick: move |_| on_refresh_title.call(()),
+                                            "Regenerate Title"
+                                        }
+                                        button {
+                                            style: titlebar_new_action_style(snapshot.palette),
+                                            onclick: move |_| on_refresh_summary.call(()),
+                                            "Regenerate Summary"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     div {
-                        style: "display:flex; flex-direction:column; align-items:stretch; gap:4px; flex:1; max-width:520px; min-width:220px;",
+                        style: "display:flex; flex-direction:column; align-items:stretch; gap:4px; flex:0 1 520px; max-width:520px; min-width:220px;",
                         div {
                             style: "display:flex; align-items:center; gap:8px;",
                             input {
@@ -11240,7 +11318,6 @@ fn Titlebar(
                             "Restart to Use {update.version}"
                         }
                     }
-                    div { style: "flex:1; min-width:84px; height:100%;" }
                 }
             },
             right: rsx! {
@@ -12189,10 +12266,6 @@ fn MainSurface(
     on_set_preview_layout: EventHandler<PreviewLayoutMode>,
     on_save_document: EventHandler<(String, WorkspaceDocumentInput)>,
     on_run_recipe_document: EventHandler<(String, WorkspaceDocumentInput, bool)>,
-    on_switch_agent_mode: EventHandler<SessionKind>,
-    on_refresh_title: EventHandler<()>,
-    on_refresh_precis: EventHandler<()>,
-    on_refresh_summary: EventHandler<()>,
 ) -> Element {
     let active_session_path = snapshot
         .active_session
@@ -12262,41 +12335,11 @@ fn MainSurface(
                         visible_blocks.clone()
                     };
                     let grouped_runs = group_preview_runs(&rendered_blocks, hidden_block_count);
-                    let preview_header_collapsed =
-                        *preview_scroll_top.read() > 72.0 && !snapshot.search_active;
-                    let preview_subtitle = if preview_header_collapsed {
-                        preview_header_precis(&snapshot, &session)
-                    } else {
-                        preview_header_summary(&snapshot, &session)
-                    };
                     rsx! {
                         div {
                             style: "display:flex; flex-direction:column; min-width:0; min-height:0; width:100%; height:100%;",
                             div {
-                                style: "display:flex; align-items:flex-start; justify-content:space-between; gap:16px; padding:22px 26px 14px 26px; border-bottom:1px solid rgba(170,190,212,0.16);",
-                                div {
-                                    style: "display:flex; flex-direction:column; gap:16px; min-width:0; flex:1;",
-                                    SessionHeaderCopy {
-                                        title: snapshot
-                                            .active_title
-                                            .clone()
-                                            .unwrap_or_else(|| session.title.clone()),
-                                        subtitle: preview_subtitle,
-                                        allow_subtitle_scroll: true,
-                                        palette: snapshot.palette,
-                                        loading_label: snapshot
-                                            .preview_loading
-                                            .then_some("Refreshing preview…".to_string()),
-                                        on_refresh_title: move |_| on_refresh_title.call(()),
-                                        on_refresh_subtitle: move |_| {
-                                            if preview_header_collapsed {
-                                                on_refresh_precis.call(());
-                                            } else {
-                                                on_refresh_summary.call(());
-                                            }
-                                        },
-                                    }
-                                }
+                                style: "display:flex; align-items:flex-start; justify-content:flex-end; gap:16px; padding:14px 18px 2px 18px;",
                                 PreviewToolbar {
                                     palette: snapshot.palette,
                                     preview_layout: snapshot.preview_layout,
@@ -12366,34 +12409,6 @@ fn MainSurface(
                 div {
                     key: "{session.session_path}:{snapshot.settings.terminal_font_size}:{snapshot.active_view_mode as u8}:{terminal_mount_epoch}",
                     style: "display:flex; flex-direction:column; min-width:0; min-height:0; width:100%; height:100%;",
-                    div {
-                        style: "display:flex; align-items:flex-start; justify-content:space-between; gap:16px; padding:22px 26px 14px 26px; border-bottom:1px solid rgba(170,190,212,0.16);",
-                        SessionHeaderCopy {
-                            title: snapshot
-                                .active_title
-                                .clone()
-                                .unwrap_or_else(|| session.title.clone()),
-                            subtitle: snapshot
-                                .active_precis
-                                .clone()
-                                .unwrap_or_else(|| terminal_precis(&session)),
-                            allow_subtitle_scroll: true,
-                            palette: snapshot.palette,
-                            loading_label: snapshot
-                                .terminal_loading
-                                .then_some("Resuming terminal…".to_string()),
-                            on_refresh_title: move |_| on_refresh_title.call(()),
-                            on_refresh_subtitle: move |_| on_refresh_precis.call(()),
-                        }
-                        if session.kind.is_agent() {
-                            AgentModeSelector {
-                                selected: session.kind,
-                                palette: snapshot.palette,
-                                disabled: snapshot.server_busy,
-                                on_select: on_switch_agent_mode,
-                            }
-                        }
-                    }
                     TerminalCanvas {
                         key: "{terminal_instance_key(&session.session_path, snapshot.settings.terminal_font_size)}:{terminal_mount_epoch}",
                         session: session.clone(),
@@ -13777,16 +13792,14 @@ fn TerminalCanvas(
                     .to_string(),
                 "inset 0 0 0 1px rgba(148,163,184,0.34), 0 18px 38px rgba(148,163,184,0.18)"
                     .to_string(),
-                "border-radius:14px; box-shadow: inset 0 0 0 1px rgba(148,163,184,0.36), 0 1px 0 rgba(255,255,255,0.94);"
-                    .to_string(),
+                "border-radius:14px;".to_string(),
             ),
             UiTheme::ZedDark => (
                 "linear-gradient(180deg, rgba(12,17,24,0.94) 0%, rgba(8,12,18,0.98) 100%)"
                     .to_string(),
                 "inset 0 0 0 1px rgba(71,85,105,0.42), 0 18px 38px rgba(2,6,23,0.42)"
                     .to_string(),
-                "border-radius:14px; box-shadow: inset 0 0 0 1px rgba(71,85,105,0.24);"
-                    .to_string(),
+                "border-radius:14px;".to_string(),
             ),
         };
     let future_theme = theme.clone();
