@@ -36,7 +36,8 @@ pub use terminal::{TerminalChunk, TerminalManager, TerminalReadResult};
 use anyhow::Context;
 use codex_cli::{
     ManagedCliAction, ManagedCliRefreshReport, ensure_local_managed_cli, managed_cli_shell_command,
-    refresh_local_managed_cli, summarize_managed_cli_report,
+    refresh_local_managed_cli, summarize_managed_cli_report, sync_terminal_identity_env,
+    terminal_identity_shell_exports,
 };
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -358,6 +359,7 @@ impl YggtermServer {
     ) -> Self {
         let _ = prefer_ghostty_backend;
         let backend = TerminalBackend::Xterm;
+        sync_terminal_identity_env(theme);
 
         let mut this = Self {
             sessions: BTreeMap::new(),
@@ -432,6 +434,7 @@ impl YggtermServer {
             return;
         }
         self.theme = theme;
+        sync_terminal_identity_env(theme);
         for session in self.sessions.values_mut() {
             let appearance = match theme {
                 UiTheme::ZedDark => "dark",
@@ -2489,6 +2492,12 @@ fn remote_ssh_launch_command(
         inner.push(' ');
         inner.push_str(&shell_single_quote(arg));
     }
+    let env_exports = terminal_identity_shell_exports().join(" && ");
+    let inner = if env_exports.is_empty() {
+        inner
+    } else {
+        format!("{env_exports} && {inner}")
+    };
     let remote = match prefix.map(str::trim).filter(|value| !value.is_empty()) {
         Some(prefix) => format!("{prefix} && {inner}"),
         None => inner,

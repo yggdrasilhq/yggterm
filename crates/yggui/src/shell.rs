@@ -9020,11 +9020,24 @@ async fn capture_dom_debug_snapshot() -> Value {
                     height: Math.round(rect.height),
                 };
             });
-            const hostDetails = terminalHosts.map((host) => ({
-                id: host.id,
-                child_count: host.childElementCount,
-                text_sample: String(host.innerText || "").slice(0, 160),
-            }));
+            const hostDetails = terminalHosts.map((host) => {
+                const style = window.getComputedStyle(host);
+                const screen = host.querySelector('.xterm-screen');
+                const viewport = host.querySelector('.xterm-viewport');
+                const screenStyle = screen ? window.getComputedStyle(screen) : null;
+                const viewportStyle = viewport ? window.getComputedStyle(viewport) : null;
+                return {
+                    id: host.id,
+                    child_count: host.childElementCount,
+                    text_sample: String(host.innerText || "").slice(0, 160),
+                    background_color: style.backgroundColor,
+                    foreground_color: style.color,
+                    font_family: style.fontFamily,
+                    screen_background_color: screenStyle ? screenStyle.backgroundColor : null,
+                    viewport_background_color: viewportStyle ? viewportStyle.backgroundColor : null,
+                    canvas_count: host.querySelectorAll('canvas').length,
+                };
+            });
             dioxus.send({
                 terminal_host_count: terminalHosts.length,
                 terminal_hosts: hostDetails,
@@ -13838,6 +13851,8 @@ fn TerminalCanvas(
             let mut read_poll_ms = 120u64;
             let mut placeholder_rendered = false;
             let mut terminal_has_visible_output = false;
+            let mut traced_first_output = false;
+            let mut traced_first_meaningful_output = false;
             loop {
                 tokio::select! {
                     event = eval.recv::<TerminalJsEvent>() => {
@@ -13918,15 +13933,54 @@ fn TerminalCanvas(
                                         placeholder_rendered = false;
                                     }
                                     if let Some(data) = batched_output {
+                                        if !traced_first_output {
+                                            append_trace_event(
+                                                &trace_home,
+                                                "ui",
+                                                "terminal_mount",
+                                                "first_output",
+                                                json!({
+                                                    "session_path": session_path.clone(),
+                                                    "cursor": cursor,
+                                                    "bytes": data.len(),
+                                                    "meaningful": saw_meaningful_output,
+                                                }),
+                                            );
+                                            traced_first_output = true;
+                                        }
                                         let _ = eval.send(TerminalJsCommand::Write { data });
                                     } else if !terminal_has_visible_output
                                         && !placeholder_rendered
                                         && let Some(data) = placeholder.clone()
                                     {
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "placeholder_write",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "cursor": cursor,
+                                                "bytes": data.len(),
+                                            }),
+                                        );
                                         let _ = eval.send(TerminalJsCommand::Write { data });
                                         placeholder_rendered = true;
                                     }
-                                    if saw_visible_output {
+                                    if saw_meaningful_output {
+                                        if !traced_first_meaningful_output {
+                                            append_trace_event(
+                                                &trace_home,
+                                                "ui",
+                                                "terminal_mount",
+                                                "first_meaningful_output",
+                                                json!({
+                                                    "session_path": session_path.clone(),
+                                                    "cursor": cursor,
+                                                }),
+                                            );
+                                            traced_first_meaningful_output = true;
+                                        }
                                         terminal_has_meaningful_output.set(true);
                                     }
                                     if saw_meaningful_output
@@ -14133,15 +14187,54 @@ fn TerminalCanvas(
                                     placeholder_rendered = false;
                                 }
                                 if let Some(data) = batched_output {
+                                    if !traced_first_output {
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "first_output",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "cursor": cursor,
+                                                "bytes": data.len(),
+                                                "meaningful": saw_meaningful_output,
+                                            }),
+                                        );
+                                        traced_first_output = true;
+                                    }
                                     let _ = eval.send(TerminalJsCommand::Write { data });
                                 } else if !terminal_has_visible_output
                                     && !placeholder_rendered
                                     && let Some(data) = placeholder.clone()
                                 {
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "placeholder_write",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "cursor": cursor,
+                                            "bytes": data.len(),
+                                        }),
+                                    );
                                     let _ = eval.send(TerminalJsCommand::Write { data });
                                     placeholder_rendered = true;
                                 }
-                                if saw_visible_output {
+                                if saw_meaningful_output {
+                                    if !traced_first_meaningful_output {
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "first_meaningful_output",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "cursor": cursor,
+                                            }),
+                                        );
+                                        traced_first_meaningful_output = true;
+                                    }
                                     terminal_has_meaningful_output.set(true);
                                 }
                                 if saw_meaningful_output
@@ -14945,7 +15038,7 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
             fontSize: {font_size},
             fontWeight: "500",
             fontWeightBold: "700",
-            minimumContrastRatio: 7.0,
+            minimumContrastRatio: 4.5,
             scrollback: 5000,
             theme: {{
                 background: {background},
