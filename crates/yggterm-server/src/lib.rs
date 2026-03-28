@@ -4022,14 +4022,7 @@ fn remote_scan_roots(
     requested_home: &std::path::Path,
     raw_codex_home: Option<&str>,
 ) -> Vec<std::path::PathBuf> {
-    remote_scan_roots_with_parents(
-        requested_home,
-        raw_codex_home,
-        [
-            std::path::Path::new("/home"),
-            std::path::Path::new("/Users"),
-        ],
-    )
+    remote_scan_roots_with_parents(requested_home, raw_codex_home, std::iter::empty())
 }
 
 fn remote_scan_roots_with_parents<'a>(
@@ -4046,46 +4039,8 @@ fn remote_scan_roots_with_parents<'a>(
     if !default_like {
         return roots;
     }
-
-    if requested_home.join("sessions").is_dir()
-        && has_any_codex_session_file(&requested_home.join("sessions"))
-    {
-        return roots;
-    }
-
-    for parent in parents {
-        let Ok(entries) = fs::read_dir(parent) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path().join(".codex");
-            if path != requested_home && path.join("sessions").is_dir() {
-                roots.push(path);
-            }
-        }
-    }
-    roots.sort();
-    roots.dedup();
+    let _ = parents.into_iter().count();
     roots
-}
-
-fn has_any_codex_session_file(root: &std::path::Path) -> bool {
-    let Ok(entries) = fs::read_dir(root) else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_dir() && has_any_codex_session_file(&path) {
-            return true;
-        }
-        if file_type.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
-            return true;
-        }
-    }
-    false
 }
 
 pub fn run_remote_preview(path: &str) -> anyhow::Result<()> {
@@ -6168,7 +6123,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_scan_roots_falls_back_to_machine_user_codex_home() -> Result<()> {
+    fn remote_scan_roots_stays_scoped_to_requested_user_home() -> Result<()> {
         let base = std::env::temp_dir().join(format!(
             "yggterm-remote-scan-roots-{}-{}",
             std::process::id(),
@@ -6191,8 +6146,7 @@ mod tests {
         let roots =
             remote_scan_roots_with_parents(&requested, Some("~/.codex"), [parent.as_path()]);
 
-        assert!(roots.contains(&requested));
-        assert!(roots.contains(&machine_user_codex));
+        assert_eq!(roots, vec![requested]);
 
         let _ = fs::remove_dir_all(base);
         Ok(())
