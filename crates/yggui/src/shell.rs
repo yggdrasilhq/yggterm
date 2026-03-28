@@ -64,16 +64,16 @@ use yggterm_core::{
 };
 use yggterm_platform::DockRect;
 use yggterm_server::{
-    AppControlCommand, AppControlResponse, AppControlViewMode, GhosttyTerminalHostMode,
-    ManagedSessionView, PreviewTone, RemoteMachineHealth, RemoteMachineSnapshot,
-    RemoteScannedSession, ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind,
-    SessionMetadataEntry, SessionPreviewBlock, SessionRenderedSection, SshConnectTarget,
-    TerminalBackend, WorkspaceViewMode, YGG_LOADING_NOTIFICATION_AFTER_MS, YggRequestMeta,
-    YggSurface, YggTarget, YggtermServer, apply_remote_preview_payload_for_path,
-    cleanup_legacy_daemons, complete_app_control_request, connect_ssh_custom,
-    fetch_remote_generation_context, fetch_remote_preview_payload, focus_live, open_remote_session,
-    open_stored_session, persist_remote_generated_copy, ping, refresh_managed_cli,
-    refresh_remote_machine, remove_ssh_target, request_terminal_launch,
+    AppControlCommand, AppControlDragCommand, AppControlDragPlacement, AppControlResponse,
+    AppControlViewMode, GhosttyTerminalHostMode, ManagedSessionView, PreviewTone,
+    RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession, ServerEndpoint,
+    ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionPreviewBlock,
+    SessionRenderedSection, SshConnectTarget, TerminalBackend, WorkspaceViewMode,
+    YGG_LOADING_NOTIFICATION_AFTER_MS, YggRequestMeta, YggSurface, YggTarget, YggtermServer,
+    apply_remote_preview_payload_for_path, cleanup_legacy_daemons, complete_app_control_request,
+    connect_ssh_custom, fetch_remote_generation_context, fetch_remote_preview_payload, focus_live,
+    open_remote_session, open_stored_session, persist_remote_generated_copy, ping,
+    refresh_managed_cli, refresh_remote_machine, remove_ssh_target, request_terminal_launch,
     set_all_preview_blocks_folded, set_view_mode as daemon_set_view_mode,
     shutdown as daemon_shutdown, snapshot as daemon_snapshot, stage_remote_clipboard_png,
     start_command_session, start_local_session_at, start_ssh_session_at, status,
@@ -4496,6 +4496,16 @@ fn resolve_app_control_row(shell: &ShellState, session_path: &str) -> Option<Bro
         .find(|row| row.full_path == session_path)
 }
 
+fn app_control_drag_pointer(row: &BrowserRow, placement: Option<DragDropPlacement>) -> (f64, f64) {
+    let y = 72.0 + (row.depth as f64 * 12.0);
+    let x = match placement {
+        Some(DragDropPlacement::Into) => 180.0 + (row.depth as f64 * 12.0),
+        Some(DragDropPlacement::After) => 120.0,
+        _ => 96.0,
+    };
+    (x, y)
+}
+
 fn spawn_connect_ssh_custom(mut state: Signal<ShellState>) {
     let target = state.read().ssh_connect_target.trim().to_string();
     let prefix = state.read().ssh_connect_prefix.trim().to_string();
@@ -8807,6 +8817,14 @@ fn workspace_view_mode_from_app_control(mode: AppControlViewMode) -> WorkspaceVi
     }
 }
 
+fn drag_drop_placement_from_app_control(placement: AppControlDragPlacement) -> DragDropPlacement {
+    match placement {
+        AppControlDragPlacement::Before => DragDropPlacement::Before,
+        AppControlDragPlacement::Into => DragDropPlacement::Into,
+        AppControlDragPlacement::After => DragDropPlacement::After,
+    }
+}
+
 fn describe_app_state_snapshot(
     state: &Signal<ShellState>,
     desktop: &dioxus::desktop::DesktopContext,
@@ -8877,6 +8895,14 @@ fn describe_app_state_snapshot(
             "needs_initial_server_sync": shell.needs_initial_server_sync,
             "latest_open_request_id": shell.latest_open_request_id,
             "last_action": shell.last_action,
+            "drag_paths": shell.drag_paths.iter().cloned().collect::<Vec<_>>(),
+            "drag_hover_target": shell.drag_hover_target.as_ref().map(|target| {
+                json!({
+                    "path": target.path,
+                    "placement": format!("{:?}", target.placement),
+                })
+            }),
+            "drag_pointer": shell.drag_pointer.map(|(x, y)| json!({ "x": x, "y": y })),
             "terminal_attach_in_flight": shell
                 .terminal_attach_in_flight
                 .iter()
@@ -8913,12 +8939,15 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
                 "label": row.label,
                 "detail_label": row.detail_label,
                 "kind": format!("{:?}", row.kind),
+                "group_kind": row.group_kind.map(|group_kind| format!("{group_kind:?}")),
                 "depth": row.depth,
                 "host_label": row.host_label,
                 "expanded": row.expanded,
                 "selected": shell.selected_tree_paths.contains(&row.full_path),
                 "session_id": row.session_id,
                 "session_cwd": row.session_cwd,
+                "draggable": is_workspace_row(row),
+                "drop_target_row": is_drop_target_row(row),
             })
         }).collect::<Vec<_>>(),
     })
@@ -8929,6 +8958,34 @@ async fn capture_dom_debug_snapshot() -> Value {
         (async () => {
             const terminalHosts = Array.from(document.querySelectorAll('[id^="yggterm-terminal-"]'));
             const previewScrolls = Array.from(document.querySelectorAll('[data-preview-scroll="1"]'));
+            const sidebarScroller = document.querySelector('[data-sidebar-scroll="1"]');
+            const sidebarRows = Array.from(document.querySelectorAll('[data-sidebar-row-path]'));
+            const visibleSidebarRows = sidebarRows
+                .map((row) => {
+                    const rect = row.getBoundingClientRect();
+                    const icon = row.querySelector('[data-tree-icon]');
+                    return {
+                        path: row.getAttribute('data-sidebar-row-path'),
+                        kind: row.getAttribute('data-sidebar-row-kind'),
+                        selected: row.getAttribute('data-selected') === 'true',
+                        drop_target: row.getAttribute('data-drop-target'),
+                        icon_text: String(icon?.textContent || '').trim(),
+                        label: String(row.textContent || '').trim().slice(0, 140),
+                        top: Math.round(rect.top),
+                        height: Math.round(rect.height),
+                    };
+                })
+                .filter((row) => row.height > 0 && row.top > -120 && row.top < window.innerHeight + 120);
+            const dropZones = Array.from(document.querySelectorAll('[data-tree-drop-zone]')).map((el) => {
+                const rect = el.getBoundingClientRect();
+                return {
+                    zone: el.getAttribute('data-tree-drop-zone'),
+                    top: Math.round(rect.top),
+                    left: Math.round(rect.left),
+                    width: Math.round(rect.width),
+                    height: Math.round(rect.height),
+                };
+            });
             const hostDetails = terminalHosts.map((host) => ({
                 id: host.id,
                 child_count: host.childElementCount,
@@ -8940,6 +8997,11 @@ async fn capture_dom_debug_snapshot() -> Value {
                 preview_scroll_count: previewScrolls.length,
                 preview_text_sample: String(previewScrolls[0]?.innerText || "").slice(0, 240),
                 shell_text_sample: String(document.getElementById("yggterm-shell-root")?.innerText || "").slice(0, 240),
+                sidebar_scroll_top: sidebarScroller ? Math.round(sidebarScroller.scrollTop) : null,
+                sidebar_visible_row_count: visibleSidebarRows.length,
+                sidebar_visible_rows: visibleSidebarRows.slice(0, 24),
+                drop_zone_count: dropZones.length,
+                drop_zones: dropZones.slice(0, 24),
             });
             await new Promise((resolve) => setTimeout(resolve, 25));
         })();
@@ -9001,6 +9063,161 @@ async fn process_pending_app_control_requests(
                 data: None,
                 error: Some(error.to_string()),
             },
+        },
+        AppControlCommand::Drag { command } => match command {
+            AppControlDragCommand::Begin { row_path } => {
+                let maybe_row = state.with(|shell| resolve_app_control_row(shell, &row_path));
+                match maybe_row {
+                    Some(row) => {
+                        if !is_workspace_row(&row) {
+                            AppControlResponse {
+                                request_id: request.request_id.clone(),
+                                handled_by_pid: std::process::id(),
+                                completed_at_ms: current_millis() as u128,
+                                output_path: None,
+                                data: Some(json!({
+                                    "accepted": false,
+                                    "action": "begin",
+                                    "reason": "row_not_draggable",
+                                    "row_path": row_path,
+                                    "row_kind": format!("{:?}", row.kind),
+                                })),
+                                error: None,
+                            }
+                        } else {
+                            let pointer = app_control_drag_pointer(&row, None);
+                            state.with_mut(|shell| shell.begin_drag(&row, pointer));
+                            let shell = state.read();
+                            AppControlResponse {
+                                request_id: request.request_id.clone(),
+                                handled_by_pid: std::process::id(),
+                                completed_at_ms: current_millis() as u128,
+                                output_path: None,
+                                data: Some(json!({
+                                    "accepted": true,
+                                    "action": "begin",
+                                    "row_path": row_path,
+                                    "drag_paths": shell.drag_paths.clone(),
+                                    "drag_pointer": shell.drag_pointer.map(|(x, y)| json!({ "x": x, "y": y })),
+                                })),
+                                error: None,
+                            }
+                        }
+                    }
+                    None => AppControlResponse {
+                        request_id: request.request_id.clone(),
+                        handled_by_pid: std::process::id(),
+                        completed_at_ms: current_millis() as u128,
+                        output_path: None,
+                        data: None,
+                        error: Some(format!(
+                            "drag row is not visible in the current sidebar snapshot: {row_path}"
+                        )),
+                    },
+                }
+            }
+            AppControlDragCommand::Hover {
+                row_path,
+                placement,
+            } => {
+                if state.read().drag_paths.is_empty() {
+                    AppControlResponse {
+                        request_id: request.request_id.clone(),
+                        handled_by_pid: std::process::id(),
+                        completed_at_ms: current_millis() as u128,
+                        output_path: None,
+                        data: Some(json!({
+                            "accepted": false,
+                            "action": "hover",
+                            "reason": "no_active_drag",
+                            "row_path": row_path,
+                        })),
+                        error: None,
+                    }
+                } else {
+                    let maybe_row = state.with(|shell| resolve_app_control_row(shell, &row_path));
+                    match maybe_row {
+                        Some(row) => {
+                            let placement = drag_drop_placement_from_app_control(placement);
+                            let pointer = app_control_drag_pointer(&row, Some(placement));
+                            state.with_mut(|shell| {
+                                shell.set_drag_hover_target(&row, pointer, placement)
+                            });
+                            let shell = state.read();
+                            AppControlResponse {
+                                request_id: request.request_id.clone(),
+                                handled_by_pid: std::process::id(),
+                                completed_at_ms: current_millis() as u128,
+                                output_path: None,
+                                data: Some(json!({
+                                    "accepted": shell.drag_hover_target.is_some(),
+                                    "action": "hover",
+                                    "row_path": row_path,
+                                    "placement": format!("{placement:?}").to_ascii_lowercase(),
+                                    "drag_hover_target": shell.drag_hover_target.as_ref().map(|target| json!({
+                                        "path": target.path,
+                                        "placement": format!("{:?}", target.placement).to_ascii_lowercase(),
+                                    })),
+                                })),
+                                error: None,
+                            }
+                        }
+                        None => AppControlResponse {
+                            request_id: request.request_id.clone(),
+                            handled_by_pid: std::process::id(),
+                            completed_at_ms: current_millis() as u128,
+                            output_path: None,
+                            data: None,
+                            error: Some(format!(
+                                "drag hover row is not visible in the current sidebar snapshot: {row_path}"
+                            )),
+                        },
+                    }
+                }
+            }
+            AppControlDragCommand::Drop => {
+                if state.read().drag_paths.is_empty() {
+                    AppControlResponse {
+                        request_id: request.request_id.clone(),
+                        handled_by_pid: std::process::id(),
+                        completed_at_ms: current_millis() as u128,
+                        output_path: None,
+                        data: Some(json!({
+                            "accepted": false,
+                            "action": "drop",
+                            "reason": "no_active_drag",
+                        })),
+                        error: None,
+                    }
+                } else {
+                    queue_drop_current_drag_target(state);
+                    AppControlResponse {
+                        request_id: request.request_id.clone(),
+                        handled_by_pid: std::process::id(),
+                        completed_at_ms: current_millis() as u128,
+                        output_path: None,
+                        data: Some(json!({
+                            "accepted": true,
+                            "action": "drop",
+                        })),
+                        error: None,
+                    }
+                }
+            }
+            AppControlDragCommand::Clear => {
+                state.with_mut(|shell| shell.clear_drag_state());
+                AppControlResponse {
+                    request_id: request.request_id.clone(),
+                    handled_by_pid: std::process::id(),
+                    completed_at_ms: current_millis() as u128,
+                    output_path: None,
+                    data: Some(json!({
+                        "accepted": true,
+                        "action": "clear",
+                    })),
+                    error: None,
+                }
+            }
         },
         AppControlCommand::OpenPath {
             session_path,
@@ -11070,6 +11287,7 @@ fn Sidebar(
     rsx! {
         div {
             id: "yggterm-sidebar",
+            "data-sidebar-open": if snapshot.sidebar_open { "true" } else { "false" },
             style: format!(
                 "width:{}px; min-width:{}px; max-width:{}px; display:flex; flex-direction:column; \
                  background:{}; overflow:hidden; transition: opacity 180ms ease, transform 180ms ease; \
@@ -11121,6 +11339,7 @@ fn Sidebar(
                 }
             }
             div {
+                "data-sidebar-scroll": "1",
                 style: "flex:1; min-height:0; overflow:auto; padding:12px 12px 12px 12px;",
                 onmousemove: move |evt| {
                     if drag_active {
@@ -11265,6 +11484,7 @@ fn SidebarRow(
 ) -> Element {
     let indent = row.depth * 12 + 12;
     let draggable = is_workspace_row(&row);
+    let row_kind_label = format!("{:?}", row.kind);
     let drop_hovered = drop_target.is_some();
     let can_drop_inside =
         row.kind == BrowserRowKind::Group && row.group_kind != Some(WorkspaceGroupKind::Separator);
@@ -11275,9 +11495,18 @@ fn SidebarRow(
         return rsx! {
             div {
                 id: "{sidebar_row_dom_id(&row.full_path)}",
+                "data-sidebar-row-path": "{row.full_path}",
+                "data-sidebar-row-kind": "Separator",
+                "data-selected": if selected { "true" } else { "false" },
+                "data-drop-target": match drop_target {
+                    Some(DragDropPlacement::Before) => "before",
+                    Some(DragDropPlacement::Into) => "into",
+                    Some(DragDropPlacement::After) => "after",
+                    None => "none",
+                },
                 style: format!(
                     "width:100%; display:flex; align-items:center; gap:10px; border:none; background:transparent; cursor:{}; \
-                     padding:8px 9px 8px {}px; margin:0; opacity:{}; border-radius:12px; background:{}; \
+                     padding:9px 9px 9px {}px; margin:0; opacity:{}; border-radius:12px; background:{}; \
                      box-sizing:border-box; min-width:0; overflow:hidden; user-select:none; -webkit-user-select:none; \
                      transition: transform 140ms ease, background 140ms ease, opacity 140ms ease, box-shadow 140ms ease; \
                      transform:translateY(0px); box-shadow:{}; position:relative;",
@@ -11367,7 +11596,7 @@ fn SidebarRow(
                 } else {
                     span {
                         style: format!(
-                            "min-width:0; font-size:10.5px; font-weight:700; letter-spacing:0.04em; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                            "min-width:0; font-size:11.5px; font-weight:700; letter-spacing:0.04em; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
                             if drop_hovered || selected { palette.accent } else { palette.muted }
                         ),
                         "{row.label}"
@@ -11415,9 +11644,18 @@ fn SidebarRow(
     rsx! {
         div {
             id: "{sidebar_row_dom_id(&row.full_path)}",
+            "data-sidebar-row-path": "{row.full_path}",
+            "data-sidebar-row-kind": "{row_kind_label}",
+            "data-selected": if selected { "true" } else { "false" },
+            "data-drop-target": match drop_target {
+                Some(DragDropPlacement::Before) => "before",
+                Some(DragDropPlacement::Into) => "into",
+                Some(DragDropPlacement::After) => "after",
+                None => "none",
+            },
             style: format!(
                 "width:100%; display:flex; flex-direction:column; align-items:stretch; gap:1px; \
-                 border:none; border-radius:12px; background:{}; padding:2px 9px 2px {}px; margin:0; opacity:{}; cursor:{}; \
+                 border:none; border-radius:12px; background:{}; padding:3px 9px 3px {}px; margin:0; opacity:{}; cursor:{}; \
                  box-sizing:border-box; min-width:0; overflow:hidden; user-select:none; -webkit-user-select:none; \
                  transition: transform 140ms ease, background 140ms ease, opacity 140ms ease, box-shadow 140ms ease; \
                  transform:translateY(0px); box-shadow:{}; position:relative;",
@@ -11472,10 +11710,11 @@ fn SidebarRow(
                 div {
                     style: "display:flex; align-items:center; justify-content:space-between; gap:6px;",
                     div {
-                    style: "display:flex; align-items:center; gap:7px; min-width:0;",
+                    style: "display:flex; align-items:center; gap:8px; min-width:0;",
                     div {
+                        "data-tree-icon": "1",
                         style: format!(
-                            "display:inline-flex; align-items:center; justify-content:center; width:17px; min-width:17px; height:17px; color:{};",
+                            "display:inline-flex; align-items:center; justify-content:center; width:18px; min-width:18px; height:18px; color:{};",
                             icon_color
                         ),
                         TreeIcon { row: row.clone() }
@@ -11510,7 +11749,7 @@ fn SidebarRow(
                     } else {
                         span {
                             style: format!(
-                                "font-size:10.5px; color:{}; font-weight:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                                "font-size:11.5px; color:{}; font-weight:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
                                 label_color,
                                 if row.kind == BrowserRowKind::Group && row.depth == 0 { 600 } else { 500 }
                             ),
@@ -11532,7 +11771,7 @@ fn SidebarRow(
                 }
                 if row.kind == BrowserRowKind::Group {
                     span {
-                        style: format!("font-size:10px; color:{};", palette.muted),
+                        style: format!("font-size:10.5px; color:{};", palette.muted),
                         "{row.descendant_sessions}"
                     }
                 }
@@ -11540,7 +11779,7 @@ fn SidebarRow(
             if row.kind == BrowserRowKind::Group && !row.detail_label.is_empty() {
                 div {
                     style: format!(
-                        "font-size:10px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                        "font-size:10.5px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
                         palette.muted
                     ),
                     "{row.detail_label}"
@@ -11626,7 +11865,7 @@ fn TreeIcon(row: BrowserRow) -> Element {
     if row.kind == BrowserRowKind::Separator {
         return rsx! {
             span {
-                style: "display:inline-flex; align-items:center; justify-content:center; font-size:10px; font-weight:700; line-height:1;",
+                style: "display:inline-flex; align-items:center; justify-content:center; font-size:11px; font-weight:700; line-height:1;",
                 "—"
             }
         };
@@ -11636,7 +11875,7 @@ fn TreeIcon(row: BrowserRow) -> Element {
         if row.full_path.starts_with("codex-litellm://") {
             return rsx! {
                 span {
-                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:10px; font-weight:700; line-height:1;",
+                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:11px; font-weight:700; line-height:1;",
                     "✦"
                 }
             };
@@ -11644,7 +11883,7 @@ fn TreeIcon(row: BrowserRow) -> Element {
         if row.full_path.starts_with("local://") {
             return rsx! {
                 span {
-                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:10px; font-weight:700; line-height:1;",
+                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:11px; font-weight:700; line-height:1;",
                     "⌘"
                 }
             };
@@ -11652,14 +11891,14 @@ fn TreeIcon(row: BrowserRow) -> Element {
         if row.full_path.starts_with("ssh://") {
             return rsx! {
                 span {
-                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:10px; font-weight:700; line-height:1;",
+                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:11px; font-weight:700; line-height:1;",
                     "⇄"
                 }
             };
         }
         return rsx! {
             span {
-                style: "display:inline-flex; align-items:center; justify-content:center; font-size:10px; font-weight:700; line-height:1;",
+                style: "display:inline-flex; align-items:center; justify-content:center; font-size:11px; font-weight:700; line-height:1;",
                 ">_"
             }
         };
@@ -11667,8 +11906,8 @@ fn TreeIcon(row: BrowserRow) -> Element {
         if row.document_kind == Some(WorkspaceDocumentKind::TerminalRecipe) {
             return rsx! {
                 svg {
-                    width: "17",
-                    height: "17",
+                    width: "18",
+                    height: "18",
                     view_box: "0 0 18 18",
                     fill: "none",
                     xmlns: "http://www.w3.org/2000/svg",
@@ -11680,8 +11919,8 @@ fn TreeIcon(row: BrowserRow) -> Element {
         }
         return rsx! {
             svg {
-                width: "17",
-                height: "17",
+                width: "18",
+                height: "18",
                 view_box: "0 0 18 18",
                 fill: "none",
                 xmlns: "http://www.w3.org/2000/svg",
@@ -11704,8 +11943,8 @@ fn TreeIcon(row: BrowserRow) -> Element {
         }
         return rsx! {
             svg {
-                width: "17",
-                height: "17",
+                width: "18",
+                height: "18",
                 view_box: "0 0 18 18",
                 fill: "none",
                 xmlns: "http://www.w3.org/2000/svg",
@@ -11737,8 +11976,8 @@ fn TreeIcon(row: BrowserRow) -> Element {
     if row.expanded {
         rsx! {
             svg {
-                width: "17",
-                height: "17",
+                width: "18",
+                height: "18",
                 view_box: "0 0 16 16",
                 fill: "none",
                 xmlns: "http://www.w3.org/2000/svg",
@@ -11759,8 +11998,8 @@ fn TreeIcon(row: BrowserRow) -> Element {
     } else {
         rsx! {
             svg {
-                width: "17",
-                height: "17",
+                width: "18",
+                height: "18",
                 view_box: "0 0 18 18",
                 fill: "none",
                 xmlns: "http://www.w3.org/2000/svg",
