@@ -302,7 +302,10 @@ fn looks_like_generation_noise(text: &str, role: TranscriptRole) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{TranscriptMessage, TranscriptRole, generation_context_from_messages, read_codex_transcript_messages};
+    use super::{
+        TranscriptMessage, TranscriptRole, generation_context_from_messages,
+        read_codex_transcript_messages,
+    };
     use anyhow::Result;
     use std::fs;
 

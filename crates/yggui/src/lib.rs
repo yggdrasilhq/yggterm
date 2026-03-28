@@ -3,13 +3,13 @@ pub mod drag_tree;
 pub mod drag_visuals;
 pub mod notifications;
 pub mod rails;
-pub mod theme;
 mod shell;
+pub mod theme;
 mod window_icon;
 
 pub use chrome::{
-    ChromeControlIcon, ChromePalette, HoveredChromeControl, TitlebarChrome,
-    WindowControlsStrip, search_input_style,
+    ChromeControlIcon, ChromePalette, HoveredChromeControl, TitlebarChrome, WindowControlsStrip,
+    search_input_style,
 };
 pub use drag_tree::{
     DragDropPlacement, DragDropTarget, TreeDropPlacement, TreeReorderItem, TreeReorderPlanItem,
@@ -25,3 +25,4 @@ pub use theme::{
     MAX_THEME_STOPS, THEME_EDITOR_SWATCHES, append_theme_stop, clamp_theme_spec,
     default_theme_editor_spec, dominant_accent, gradient_css, preview_surface_css, shell_tint,
 };
+pub use window_icon::{load_window_icon_from_png, load_yggterm_window_icon};

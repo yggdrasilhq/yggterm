@@ -31,6 +31,14 @@ yggterm-headless server trace bundle 200 --screenshot > yggterm-trace.json
 
 The screenshot command asks a live Yggterm window to capture itself, and the trace bundle now prefers that embedded app capture before falling back to desktop screenshot tools. The trace lives at `~/.yggterm/event-trace.jsonl` and is designed to stay on during dogfooding, with lightweight rotation once it gets large.
 
+For apps built on `yggui`, keep one canonical SVG icon in-repo and regenerate the runtime PNG from it instead of hand-editing both assets. This repo uses:
+
+```bash
+./scripts/render-icon-assets.sh
+```
+
+That keeps the window icon, direct-install desktop assets, and packaged integrations on the same artwork.
+
 ## What yggterm is
 
 Yggdrasil Terminal (`yggterm`) is a remote-first terminal workspace built in Rust.

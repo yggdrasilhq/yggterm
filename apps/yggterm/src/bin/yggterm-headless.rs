@@ -5,8 +5,7 @@ use yggterm_server::{
     run_remote_ensure_managed_cli, run_remote_generation_context, run_remote_preview,
     run_remote_protocol_version, run_remote_refresh_managed_cli, run_remote_resume_codex,
     run_remote_scan, run_remote_stage_clipboard_png, run_remote_upsert_generated_copy,
-    run_screenshot_capture,
-    run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, status,
+    run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, status,
 };
 
 fn main() -> Result<()> {

@@ -131,7 +131,11 @@ fn WindowControlButton(
 ) -> Element {
     let is_close = hover_tone == HoveredChromeControl::Close;
     let background = if hovered {
-        if is_close { palette.close_hover } else { palette.control_hover }
+        if is_close {
+            palette.close_hover
+        } else {
+            palette.control_hover
+        }
     } else {
         "transparent"
     };
