@@ -1,3 +1,10 @@
+yggterm (2.1.0-1) unstable; urgency=medium
+
+  * Add server app state, server app focus, and server app screenshot as the first SSH-reachable YggUI control verbs.
+  * Replace the Linux app screenshot path with native WebKitGTK surface capture.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sat, 28 Mar 2026 15:10:00 +0530
+
 yggterm (2.0.29-1) unstable; urgency=medium
 
   * Switch the light xterm theme to a VS Code-style light palette so Codex input regions regain visible contrast.
