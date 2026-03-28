@@ -13788,9 +13788,9 @@ fn TerminalCanvas(
     let (terminal_shell_background, terminal_shell_shadow, terminal_host_chrome) =
         match snapshot.settings.theme {
             UiTheme::ZedLight => (
-                "linear-gradient(180deg, rgba(235,240,246,0.98) 0%, rgba(225,232,241,1.0) 100%)"
+                "linear-gradient(180deg, rgba(225,234,244,0.99) 0%, rgba(214,225,237,1.0) 100%)"
                     .to_string(),
-                "inset 0 0 0 1px rgba(148,163,184,0.34), 0 18px 38px rgba(148,163,184,0.18)"
+                "inset 0 1px 0 rgba(255,255,255,0.88), inset 0 0 0 1px rgba(130,148,173,0.34), 0 18px 42px rgba(138,154,180,0.22)"
                     .to_string(),
                 "border-radius:14px;".to_string(),
             ),
@@ -14386,7 +14386,7 @@ fn TerminalCanvas(
             div {
                 style: format!(
                     "display:flex; flex-direction:column; min-height:0; height:100%; gap:0; border-radius:11px; \
-                     background:{}; box-shadow:{}; overflow:hidden; padding:9px 10px 7px; position:relative;",
+                     background:{}; box-shadow:{}; overflow:hidden; padding:10px 11px 9px; position:relative;",
                     terminal_shell_background,
                     terminal_shell_shadow,
                 ),
@@ -15128,7 +15128,7 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
             fontSize: {font_size},
             fontWeight: "500",
             fontWeightBold: "700",
-            minimumContrastRatio: 4.5,
+            minimumContrastRatio: 6,
             scrollback: 5000,
             theme: {{
                 background: {background},
