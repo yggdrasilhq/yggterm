@@ -242,12 +242,10 @@ impl DaemonRuntime {
         let Some((launch_command, cwd)) = self.server.terminal_spec(path) else {
             bail!("no terminal spec for session: {path}");
         };
-        let force_restart = path.starts_with("remote-session://");
         if self.terminals.has_session(path) {
-            if force_restart
-                || !self
-                    .terminals
-                    .session_matches_spec(path, &launch_command, cwd.as_deref())
+            if !self
+                .terminals
+                .session_matches_spec(path, &launch_command, cwd.as_deref())
             {
                 let stop_command = self.server.terminal_stop_command(path);
                 self.terminals.restart_session(

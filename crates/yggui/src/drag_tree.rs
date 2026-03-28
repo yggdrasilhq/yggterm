@@ -116,10 +116,7 @@ pub fn valid_drop_target<K>(drag_paths: &[String], target_row: &TreeReorderItem<
     drag_paths.iter().all(|path| {
         path != &target_row.path
             && !tree_path_contains(path, &target_row.path)
-            && match target_row.accepts_drop_inside {
-                true => tree_parent_path(path).as_deref() != Some(target_row.path.as_str()),
-                false => tree_parent_path(path).is_some(),
-            }
+            && tree_parent_path(path).is_some()
     })
 }
 
@@ -340,5 +337,39 @@ mod tests {
             .find(|item| item.from_path == gg.path)
             .expect("gg plan item");
         assert_eq!(gg_plan.final_path, "/home/pi/gh/notes/0001-untitled-gg");
+    }
+
+    #[test]
+    fn same_parent_folder_is_valid_into_target_for_reorder() {
+        let folder = TreeReorderItem {
+            kind: "group",
+            path: "/home/pi/gh/notes".to_string(),
+            parent_path: Some("/home/pi/gh".to_string()),
+            accepts_drop_inside: true,
+            droppable: true,
+        };
+        let separator = TreeReorderItem {
+            kind: "sep",
+            path: "/home/pi/gh/notes/separator-a".to_string(),
+            parent_path: Some("/home/pi/gh/notes".to_string()),
+            accepts_drop_inside: false,
+            droppable: true,
+        };
+
+        assert!(valid_drop_target(
+            std::slice::from_ref(&separator.path),
+            &folder,
+        ));
+
+        let target = resolve_drag_drop_target(
+            &[folder.clone(), separator.clone()],
+            std::slice::from_ref(&separator.path),
+            &folder,
+            DragDropPlacement::Into,
+        )
+        .expect("target");
+
+        assert_eq!(target.path, folder.path);
+        assert_eq!(target.placement, DragDropPlacement::Into);
     }
 }
