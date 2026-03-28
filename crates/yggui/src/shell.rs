@@ -1276,9 +1276,7 @@ impl ShellState {
             self.selected_tree_paths.clear();
             self.selected_tree_paths.insert(active.session_path.clone());
             self.selection_anchor = Some(active.session_path.clone());
-            if !active.session_path.starts_with("remote-session://") {
-                self.browser.select_path(active.session_path.clone());
-            }
+            self.browser.select_path(active.session_path.clone());
         }
     }
 
@@ -13632,6 +13630,7 @@ async fn terminal_ensure_with_retry_async(
 ) -> Result<Option<String>> {
     let mut delay_ms = 160_u64;
     let mut attempts = 0_u64;
+    let mut daemon_checked = false;
     loop {
         attempts += 1;
         match terminal_ensure_async(endpoint.clone(), session_path.clone()).await {
@@ -13651,6 +13650,54 @@ async fn terminal_ensure_with_retry_async(
                 return Ok(result);
             }
             Err(error) if attempts < 8 && should_retry_terminal_ensure(&error) => {
+                if !daemon_checked {
+                    daemon_checked = true;
+                    append_trace_event(
+                        trace_home,
+                        "ui",
+                        "terminal_mount",
+                        "daemon_ensure_begin",
+                        json!({
+                            "session_path": session_path,
+                            "attempt": attempts,
+                        }),
+                    );
+                    let daemon_result = {
+                        let endpoint = endpoint.clone();
+                        task::spawn_blocking(move || ensure_daemon_running(&endpoint))
+                            .await
+                            .map_err(|join_error| {
+                                anyhow!("joining daemon ensure task: {join_error}")
+                            })?
+                    };
+                    match daemon_result {
+                        Ok(()) => {
+                            append_trace_event(
+                                trace_home,
+                                "ui",
+                                "terminal_mount",
+                                "daemon_ensure_end",
+                                json!({
+                                    "session_path": session_path,
+                                    "attempt": attempts,
+                                }),
+                            );
+                        }
+                        Err(daemon_error) => {
+                            append_trace_event(
+                                trace_home,
+                                "ui",
+                                "terminal_mount",
+                                "daemon_ensure_error",
+                                json!({
+                                    "session_path": session_path,
+                                    "attempt": attempts,
+                                    "error": daemon_error.to_string(),
+                                }),
+                            );
+                        }
+                    }
+                }
                 append_trace_event(
                     trace_home,
                     "ui",
