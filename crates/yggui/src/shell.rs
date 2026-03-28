@@ -54,8 +54,8 @@ use tracing::{info, warn};
 use yggterm_core::{
     AgentSessionProfile, AppSettings, BrowserRow, BrowserRowKind, InstallContext, PerfSpan,
     SessionBrowserState, SessionNode, SessionStore, UiTheme, WorkspaceDocumentInput,
-    WorkspaceDocumentKind, WorkspaceGroupKind, YgguiThemeSpec, check_for_update,
-    install_release_update, looks_like_generated_fallback_title,
+    WorkspaceDocumentKind, WorkspaceGroupKind, YgguiThemeSpec, append_trace_event,
+    check_for_update, install_release_update, looks_like_generated_fallback_title,
     looks_like_low_signal_generated_copy, refresh_desktop_integration, save_settings_file,
     unique_session_short_ids_for_pairs, update_command_hint,
 };
@@ -1069,6 +1069,22 @@ impl ShellState {
         label: String,
         global_busy: bool,
     ) {
+        if let Ok(store) = SessionStore::open_or_init() {
+            append_trace_event(
+                store.home_dir(),
+                "ui",
+                "surface_request",
+                "begin",
+                json!({
+                    "request_id": request_meta.request_id.clone(),
+                    "operation": request_meta.operation.clone(),
+                    "surface": format!("{:?}", request_meta.surface),
+                    "target": request_meta.target.clone(),
+                    "global_busy": global_busy,
+                    "label": label.clone(),
+                }),
+            );
+        }
         if global_busy {
             self.busy_request_id = Some(request_meta.request_id.clone());
             self.server_busy = true;
@@ -1088,6 +1104,15 @@ impl ShellState {
     }
 
     fn finish_busy_request_for(&mut self, request_id: &str) {
+        if let Ok(store) = SessionStore::open_or_init() {
+            append_trace_event(
+                store.home_dir(),
+                "ui",
+                "surface_request",
+                "end",
+                json!({ "request_id": request_id }),
+            );
+        }
         if self.busy_request_id.as_deref() == Some(request_id) {
             self.busy_request_id = None;
         }
@@ -2075,6 +2100,7 @@ impl ShellState {
             if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
                 let _ = writeln!(file, "{}", telemetry);
             }
+            append_trace_event(store.home_dir(), "ui", "ui_telemetry", event, telemetry);
         }
     }
 
