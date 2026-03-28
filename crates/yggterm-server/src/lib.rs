@@ -47,7 +47,7 @@ use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 use time::{OffsetDateTime, UtcOffset, macros::format_description};
 use tracing::warn;
@@ -76,6 +76,9 @@ struct RemoteCommandCacheEntry {
 
 static REMOTE_YGGTERM_COMMAND_CACHE: OnceLock<
     Mutex<std::collections::HashMap<String, RemoteCommandCacheEntry>>,
+> = OnceLock::new();
+static REMOTE_YGGTERM_COMMAND_RESOLVE_LOCKS: OnceLock<
+    Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>,
 > = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,6 +202,10 @@ pub struct RemoteMachineSnapshot {
     pub label: String,
     pub ssh_target: String,
     pub prefix: Option<String>,
+    #[serde(default)]
+    pub remote_binary_expr: Option<String>,
+    #[serde(default = "default_remote_machine_deploy_state")]
+    pub remote_deploy_state: RemoteDeployState,
     pub health: RemoteMachineHealth,
     pub sessions: Vec<RemoteScannedSession>,
 }
@@ -314,6 +321,10 @@ pub struct PersistedDaemonState {
 
 fn default_workspace_view_mode() -> WorkspaceViewMode {
     WorkspaceViewMode::Rendered
+}
+
+fn default_remote_machine_deploy_state() -> RemoteDeployState {
+    RemoteDeployState::Planned
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1175,6 +1186,14 @@ impl YggtermServer {
         let machine_key = machine_key_from_ssh_target(&target.ssh_target);
         let label = ssh_machine_label(target);
         let entry_ix = self.ensure_remote_machine_stub(target);
+        let resolved_remote_launch =
+            resolve_remote_yggterm_binary(&target.ssh_target, target.prefix.as_deref()).ok();
+        let remote_binary_expr = resolved_remote_launch
+            .as_ref()
+            .map(|(binary_expr, _)| binary_expr.clone());
+        let remote_deploy_state = resolved_remote_launch
+            .map(|(_, deploy_state)| deploy_state)
+            .unwrap_or(RemoteDeployState::Planned);
         match scan_remote_machine_sessions(target) {
             Ok(mut sessions) => {
                 sessions.sort_by(|left, right| {
@@ -1192,6 +1211,8 @@ impl YggtermServer {
                     label,
                     ssh_target: target.ssh_target.clone(),
                     prefix: target.prefix.clone(),
+                    remote_binary_expr,
+                    remote_deploy_state,
                     health: RemoteMachineHealth::Healthy,
                     sessions,
                 };
@@ -1225,6 +1246,8 @@ impl YggtermServer {
                     label,
                     ssh_target: target.ssh_target.clone(),
                     prefix: target.prefix.clone(),
+                    remote_binary_expr,
+                    remote_deploy_state,
                     health: if existing_sessions.is_empty() {
                         RemoteMachineHealth::Offline
                     } else {
@@ -1326,6 +1349,24 @@ impl YggtermServer {
                     })
             })
             .ok_or_else(|| anyhow::anyhow!("remote machine not found: {machine_key}"))
+    }
+
+    fn cached_remote_launch_for_target(
+        &self,
+        ssh_target: &str,
+        prefix: Option<&str>,
+    ) -> Option<(String, RemoteDeployState)> {
+        self.remote_machines
+            .iter()
+            .find(|machine| {
+                machine.ssh_target == ssh_target && machine.prefix.as_deref() == prefix
+            })
+            .and_then(|machine| {
+                machine
+                    .remote_binary_expr
+                    .clone()
+                    .map(|binary_expr| (binary_expr, machine.remote_deploy_state))
+            })
     }
 
     pub fn open_remote_scanned_session(
@@ -1698,6 +1739,18 @@ impl YggtermServer {
         let Some(path) = self.active_session_path.as_ref() else {
             return;
         };
+        let cached_live_ssh_launch = self.sessions.get(path).and_then(|session| {
+            if session.kind != SessionKind::SshShell || session.source != SessionSource::LiveSsh {
+                return None;
+            }
+            let ssh_target = session.ssh_target.clone()?;
+            let ssh_prefix = session.ssh_prefix.clone();
+            Some((
+                ssh_target.clone(),
+                ssh_prefix.clone(),
+                self.cached_remote_launch_for_target(&ssh_target, ssh_prefix.as_deref()),
+            ))
+        });
         let Some(session) = self.sessions.get_mut(path) else {
             return;
         };
@@ -1832,25 +1885,38 @@ impl YggtermServer {
                 if session.kind == SessionKind::SshShell
                     && let Some(ssh_target) = session.ssh_target.clone()
                 {
+                    let (cached_ssh_target, cached_ssh_prefix, cached_launch) =
+                        cached_live_ssh_launch.clone().unwrap_or((
+                            ssh_target.clone(),
+                            session.ssh_prefix.clone(),
+                            None,
+                        ));
+                    let ssh_prefix = if cached_ssh_target == ssh_target {
+                        cached_ssh_prefix
+                    } else {
+                        session.ssh_prefix.clone()
+                    };
                     let (remote_binary, remote_deploy_state) =
-                        resolve_remote_yggterm_binary(&ssh_target, session.ssh_prefix.as_deref())
-                            .unwrap_or_else(|_| {
-                                ("yggterm".to_string(), RemoteDeployState::Planned)
-                            });
+                        cached_launch.unwrap_or_else(|| {
+                            resolve_remote_yggterm_binary(&ssh_target, ssh_prefix.as_deref())
+                                .unwrap_or_else(|_| {
+                                    ("yggterm".to_string(), RemoteDeployState::Planned)
+                                })
+                        });
                     session.remote_deploy_state = remote_deploy_state;
                     session.launch_command =
                         if session.session_path.starts_with("remote-session://") {
                             let cwd = session_metadata_value(session, "Cwd").unwrap_or_default();
                             remote_ssh_launch_command(
                                 &ssh_target,
-                                session.ssh_prefix.as_deref(),
+                                ssh_prefix.as_deref(),
                                 &remote_binary,
                                 &["server", "remote", "resume-codex", &session.id, &cwd],
                             )
                         } else {
                             remote_ssh_launch_command(
                                 &ssh_target,
-                                session.ssh_prefix.as_deref(),
+                                ssh_prefix.as_deref(),
                                 &remote_binary,
                                 &["server", "attach", &session.id],
                             )
@@ -2198,6 +2264,8 @@ impl YggtermServer {
             label: ssh_machine_label(target),
             ssh_target: target.ssh_target.clone(),
             prefix: target.prefix.clone(),
+            remote_binary_expr: None,
+            remote_deploy_state: RemoteDeployState::Planned,
             health: RemoteMachineHealth::Cached,
             sessions: Vec::new(),
         });
@@ -3745,6 +3813,21 @@ fn remote_command_cache() -> &'static Mutex<std::collections::HashMap<String, Re
     REMOTE_YGGTERM_COMMAND_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
+fn remote_command_resolve_locks(
+) -> &'static Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>> {
+    REMOTE_YGGTERM_COMMAND_RESOLVE_LOCKS
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn remote_command_resolve_lock(cache_key: &str) -> Arc<Mutex<()>> {
+    remote_command_resolve_locks()
+        .lock()
+        .expect("remote command resolve locks poisoned")
+        .entry(cache_key.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
 fn run_remote_binary_command(
     ssh_target: &str,
     exec_prefix: Option<&str>,
@@ -3824,6 +3907,10 @@ fn should_fallback_to_python(error: &anyhow::Error) -> bool {
     message.contains("command not found")
         || message.contains("not found")
         || message.contains("No such file")
+        || message.contains("Permission denied")
+        || message.contains("permission denied")
+        || message.contains("cannot execute")
+        || message.contains("Exec format error")
         || message.contains("yggterm-headless only supports server subcommands")
         || message.contains("remote yggterm command failed")
 }
@@ -3936,7 +4023,7 @@ fn bootstrap_remote_yggterm(ssh_target: &str, exec_prefix: Option<&str>) -> anyh
     let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to start remote bootstrap for {ssh_target}"))?;
-    if let Some(stdin) = child.stdin.as_mut() {
+    if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(&payload)
             .with_context(|| format!("failed to upload yggterm binary to {ssh_target}"))?;
@@ -3993,6 +4080,10 @@ fn resolve_remote_yggterm_binary(
         }
     };
     let cache_key = remote_cache_key(ssh_target, exec_prefix);
+    let resolve_lock = remote_command_resolve_lock(&cache_key);
+    let _resolve_guard = resolve_lock
+        .lock()
+        .expect("remote command resolve guard poisoned");
     if let Some(cached) = remote_command_cache()
         .lock()
         .ok()
@@ -4029,11 +4120,6 @@ fn resolve_remote_yggterm_binary(
         if let Ok(mut cache) = remote_command_cache().lock() {
             cache.remove(&cache_key);
         }
-        finish_span(serde_json::json!({
-            "ssh_target": ssh_target,
-            "result": "cache_invalidation",
-            "binary_expr": cached.binary_expr,
-        }));
     }
 
     let installed_binary = "$HOME/.yggterm/bin/yggterm";
@@ -4052,6 +4138,7 @@ fn resolve_remote_yggterm_binary(
                 "ssh_target": ssh_target,
                 "result": "installed_path_match",
                 "binary_expr": installed_binary,
+                "protocol_version": version.trim(),
             }));
             return Ok((installed_binary.to_string(), RemoteDeployState::Ready));
         }
@@ -4064,12 +4151,6 @@ fn resolve_remote_yggterm_binary(
                     version.trim()
                 );
             }
-            finish_span(serde_json::json!({
-                "ssh_target": ssh_target,
-                "result": "installed_protocol_mismatch",
-                "binary_expr": installed_binary,
-                "protocol_version": version.trim(),
-            }));
         }
         Err(error) if !should_fallback_to_python(&error) => return Err(error),
         Err(_) => {}
@@ -4090,6 +4171,7 @@ fn resolve_remote_yggterm_binary(
                 "ssh_target": ssh_target,
                 "result": "path_match",
                 "binary_expr": "yggterm",
+                "protocol_version": version.trim(),
             }));
             return Ok(("yggterm".to_string(), RemoteDeployState::Ready));
         }
@@ -4102,12 +4184,6 @@ fn resolve_remote_yggterm_binary(
                     version.trim()
                 );
             }
-            finish_span(serde_json::json!({
-                "ssh_target": ssh_target,
-                "result": "path_protocol_mismatch",
-                "binary_expr": "yggterm",
-                "protocol_version": version.trim(),
-            }));
         }
         Err(error) if !should_fallback_to_python(&error) => return Err(error),
         Err(_) => {}
@@ -4137,6 +4213,7 @@ fn resolve_remote_yggterm_binary(
         "ssh_target": ssh_target,
         "result": "bootstrapped",
         "binary_expr": installed,
+        "protocol_version": installed_version.trim(),
     }));
     Ok((installed, RemoteDeployState::Ready))
 }
@@ -5874,9 +5951,15 @@ fn synthesize_remote_scanned_session_view(
         theme,
         ghostty_bridge_enabled,
     );
-    let (remote_binary, remote_deploy_state) =
-        resolve_remote_yggterm_binary(&target.ssh_target, target.prefix.as_deref())
-            .unwrap_or_else(|_| ("yggterm".to_string(), RemoteDeployState::Planned));
+    let (remote_binary, remote_deploy_state) = machine
+        .remote_binary_expr
+        .clone()
+        .map(|binary_expr| (binary_expr, machine.remote_deploy_state))
+        .unwrap_or_else(|| {
+            resolve_remote_yggterm_binary(&target.ssh_target, target.prefix.as_deref())
+                .unwrap_or_else(|_| ("yggterm".to_string(), RemoteDeployState::Planned))
+        });
+    session.remote_deploy_state = remote_deploy_state;
     session.session_path = scanned.session_path.clone();
     session.host_label = machine.label.clone();
     session.title = if scanned.title_hint.trim().is_empty() {
@@ -6718,13 +6801,16 @@ fn short_session_id(session_id: &str) -> String {
 mod tests {
     use super::{
         GhosttyHostSupport, PersistedDaemonState, PersistedLiveSession, REMOTE_OUTPUT_SENTINEL,
-        RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession, SessionKind, SessionNode,
-        SessionNodeKind, SshConnectTarget, UiTheme, WorkspaceViewMode, YggtermServer,
+        RemoteCommandCacheEntry, RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot,
+        RemoteScannedSession, SessionKind, SessionNode, SessionNodeKind, SshConnectTarget,
+        TerminalBackend, UiTheme, WorkspaceViewMode, YggtermServer, current_millis_u64,
         dedupe_remote_scanned_sessions, load_remote_machine_sessions_from_mirror,
-        mirror_remote_machine_sessions, parse_stored_transcript, remote_cache_key,
-        remote_command_cache, remote_resume_shell_command, remote_saved_codex_session_exists,
-        remote_scan_roots_with_parents, remote_scanned_session_path, remote_ssh_launch_command,
-        parse_screen_session_ref, stored_session_launch_command, strip_remote_payload_noise,
+        mirror_remote_machine_sessions, parse_screen_session_ref, parse_stored_transcript,
+        remote_cache_key, remote_command_cache, remote_resume_shell_command,
+        remote_saved_codex_session_exists, remote_scan_roots_with_parents,
+        remote_scanned_session_path, remote_ssh_launch_command, should_fallback_to_python,
+        stored_session_launch_command, strip_remote_payload_noise,
+        synthesize_remote_scanned_session_view,
     };
     use anyhow::Result;
     use std::fs;
@@ -6847,6 +6933,8 @@ mod tests {
             label: "jojo".to_string(),
             ssh_target: "jojo".to_string(),
             prefix: None,
+            remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+            remote_deploy_state: RemoteDeployState::Ready,
             health: RemoteMachineHealth::Healthy,
             sessions: Vec::new(),
         });
@@ -7006,6 +7094,8 @@ mod tests {
                     label: "localhost".to_string(),
                     ssh_target: "localhost".to_string(),
                     prefix: None,
+                    remote_binary_expr: None,
+                    remote_deploy_state: RemoteDeployState::Planned,
                     health: RemoteMachineHealth::Cached,
                     sessions: Vec::new(),
                 }],
@@ -7055,6 +7145,8 @@ mod tests {
                     label: "dev".to_string(),
                     ssh_target: "dev".to_string(),
                     prefix: None,
+                    remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+                    remote_deploy_state: RemoteDeployState::Ready,
                     health: RemoteMachineHealth::Healthy,
                     sessions: vec![RemoteScannedSession {
                         session_path: active_path.clone(),
@@ -7138,6 +7230,8 @@ mod tests {
             label: "jojo".to_string(),
             ssh_target: "jojo".to_string(),
             prefix: None,
+            remote_binary_expr: None,
+            remote_deploy_state: RemoteDeployState::Planned,
             health: RemoteMachineHealth::Cached,
             sessions: Vec::new(),
         });
@@ -7157,6 +7251,54 @@ mod tests {
             .get("remote-session://jojo/abc123")
             .expect("restored session");
         assert_eq!(session.session_path, "remote-session://jojo/abc123");
+    }
+
+    #[test]
+    fn synthesize_remote_scanned_session_uses_machine_launch_metadata() {
+        let machine = RemoteMachineSnapshot {
+            machine_key: "oc".to_string(),
+            label: "oc".to_string(),
+            ssh_target: "oc".to_string(),
+            prefix: None,
+            remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+            remote_deploy_state: RemoteDeployState::Ready,
+            health: RemoteMachineHealth::Healthy,
+            sessions: Vec::new(),
+        };
+        let scanned = RemoteScannedSession {
+            session_path: remote_scanned_session_path("oc", "abc123"),
+            session_id: "abc123".to_string(),
+            cwd: "/srv/app".to_string(),
+            started_at: "2026-03-29T00:00:00Z".to_string(),
+            modified_epoch: 1,
+            event_count: 4,
+            user_message_count: 2,
+            assistant_message_count: 2,
+            title_hint: "Example".to_string(),
+            recent_context: "USER: example".to_string(),
+            cached_precis: None,
+            cached_summary: None,
+            storage_path: "/home/pi/.codex/sessions/example.jsonl".to_string(),
+        };
+
+        let session = synthesize_remote_scanned_session_view(
+            &machine,
+            &scanned,
+            TerminalBackend::Xterm,
+            UiTheme::ZedLight,
+            false,
+        );
+
+        assert!(session.launch_command.contains("$HOME/.yggterm/bin/yggterm"));
+        assert_eq!(session.remote_deploy_state, RemoteDeployState::Ready);
+    }
+
+    #[test]
+    fn remote_command_permission_denied_is_recoverable() {
+        let error = anyhow::anyhow!(
+            "remote yggterm command failed for oc: sh: 1: /home/pi/.yggterm/bin/yggterm: Permission denied"
+        );
+        assert!(should_fallback_to_python(&error));
     }
 
     #[test]
