@@ -13697,6 +13697,25 @@ fn TerminalCanvas(
         snapshot.settings.terminal_font_size,
         &snapshot.settings.terminal_theme_name,
     );
+    let (terminal_shell_background, terminal_shell_shadow, terminal_host_chrome) =
+        match snapshot.settings.theme {
+            UiTheme::ZedLight => (
+                "linear-gradient(180deg, rgba(246,248,250,0.96) 0%, rgba(241,245,249,0.98) 100%)"
+                    .to_string(),
+                "inset 0 0 0 1px rgba(191,219,254,0.46), 0 14px 30px rgba(148,163,184,0.10)"
+                    .to_string(),
+                "border-radius:14px; box-shadow: inset 0 0 0 1px rgba(191,219,254,0.30);"
+                    .to_string(),
+            ),
+            UiTheme::ZedDark => (
+                "linear-gradient(180deg, rgba(12,17,24,0.94) 0%, rgba(8,12,18,0.98) 100%)"
+                    .to_string(),
+                "inset 0 0 0 1px rgba(71,85,105,0.42), 0 18px 38px rgba(2,6,23,0.42)"
+                    .to_string(),
+                "border-radius:14px; box-shadow: inset 0 0 0 1px rgba(71,85,105,0.24);"
+                    .to_string(),
+            ),
+        };
     let future_theme = theme.clone();
     let trace_home = perf_home_dir(&state.read().bootstrap.settings_path);
     let is_remote_resume_session = session.session_path.starts_with("remote-session://");
@@ -13846,13 +13865,13 @@ fn TerminalCanvas(
                                 if let Ok((next_cursor, chunks)) = terminal_read_async(endpoint.clone(), session_path.clone(), 0).await {
                                     cursor = next_cursor;
                                     read_poll_ms = if chunks.is_empty() { 140 } else { 60 };
-                                    let mut saw_meaningful_output = false;
-                                    for chunk in chunks {
-                                        if terminal_chunk_has_meaningful_output(&chunk.data) {
-                                            terminal_has_meaningful_output.set(true);
-                                            saw_meaningful_output = true;
-                                        }
-                                        let _ = eval.send(TerminalJsCommand::Write { data: chunk.data });
+                                    let (batched_output, saw_meaningful_output) =
+                                        batch_terminal_chunks(chunks);
+                                    if let Some(data) = batched_output {
+                                        let _ = eval.send(TerminalJsCommand::Write { data });
+                                    }
+                                    if saw_meaningful_output {
+                                        terminal_has_meaningful_output.set(true);
                                     }
                                     if saw_meaningful_output
                                         && session_path.starts_with("remote-session://")
@@ -14025,13 +14044,13 @@ fn TerminalCanvas(
                                 } else {
                                     60
                                 };
-                                let mut saw_meaningful_output = false;
-                                for chunk in chunks {
-                                    if terminal_chunk_has_meaningful_output(&chunk.data) {
-                                        terminal_has_meaningful_output.set(true);
-                                        saw_meaningful_output = true;
-                                    }
-                                    let _ = eval.send(TerminalJsCommand::Write { data: chunk.data });
+                                let (batched_output, saw_meaningful_output) =
+                                    batch_terminal_chunks(chunks);
+                                if let Some(data) = batched_output {
+                                    let _ = eval.send(TerminalJsCommand::Write { data });
+                                }
+                                if saw_meaningful_output {
+                                    terminal_has_meaningful_output.set(true);
                                 }
                                 if saw_meaningful_output
                                     && session_path.starts_with("remote-session://")
@@ -14094,15 +14113,17 @@ fn TerminalCanvas(
             div {
                 style: format!(
                     "display:flex; flex-direction:column; min-height:0; height:100%; gap:0; border-radius:11px; \
-                     background:{}; overflow:hidden; padding:0 4px; position:relative;",
-                    theme.background
+                     background:{}; box-shadow:{}; overflow:hidden; padding:10px 12px 8px; position:relative;",
+                    terminal_shell_background,
+                    terminal_shell_shadow,
                 ),
                 div {
                     key: "{host_id}",
                     id: "{host_id}",
                     style: format!(
-                        "flex:1; min-width:0; min-height:0; height:100%; background:{}; overflow:hidden;",
-                        theme.background
+                        "flex:1; min-width:0; min-height:0; height:100%; background:{}; overflow:hidden; {};",
+                        theme.background,
+                        terminal_host_chrome,
                     )
                 }
                 if show_resume_overlay {
@@ -14167,6 +14188,23 @@ fn terminal_chunk_has_meaningful_output(data: &str) -> bool {
         .filter(|ch| *ch == '\n' || *ch == '\r')
         .count();
     printable >= 80 || newline_count >= 6 || normalized_lines.len() >= 4
+}
+
+fn batch_terminal_chunks(
+    chunks: Vec<yggterm_server::TerminalStreamChunk>,
+) -> (Option<String>, bool) {
+    if chunks.is_empty() {
+        return (None, false);
+    }
+    let mut combined = String::new();
+    let mut saw_meaningful_output = false;
+    for chunk in chunks {
+        if !saw_meaningful_output && terminal_chunk_has_meaningful_output(&chunk.data) {
+            saw_meaningful_output = true;
+        }
+        combined.push_str(&chunk.data);
+    }
+    (Some(combined), saw_meaningful_output)
 }
 
 fn strip_terminal_control_sequences(data: &str) -> String {
@@ -14457,27 +14495,27 @@ fn terminal_theme(
         };
     }
     TerminalTheme {
-        background: "#ffffff".to_string(),
-        foreground: "#333333".to_string(),
-        cursor: "#007acc".to_string(),
+        background: "#f6f8fa".to_string(),
+        foreground: "#1f2328".to_string(),
+        cursor: "#0969da".to_string(),
         font_size: font_size.max(5.0),
-        selection: "rgba(173,214,255,0.45)".to_string(),
-        black: "#000000".to_string(),
-        red: "#cd3131".to_string(),
-        green: "#00bc00".to_string(),
-        yellow: "#949800".to_string(),
-        blue: "#0451a5".to_string(),
-        magenta: "#bc05bc".to_string(),
-        cyan: "#0598bc".to_string(),
-        white: "#555555".to_string(),
-        bright_black: "#666666".to_string(),
-        bright_red: "#cd3131".to_string(),
-        bright_green: "#14ce14".to_string(),
-        bright_yellow: "#b5ba00".to_string(),
-        bright_blue: "#0451a5".to_string(),
-        bright_magenta: "#bc05bc".to_string(),
-        bright_cyan: "#0598bc".to_string(),
-        bright_white: "#a5a5a5".to_string(),
+        selection: "rgba(9,105,218,0.18)".to_string(),
+        black: "#24292f".to_string(),
+        red: "#cf222e".to_string(),
+        green: "#1a7f37".to_string(),
+        yellow: "#9a6700".to_string(),
+        blue: "#0969da".to_string(),
+        magenta: "#8250df".to_string(),
+        cyan: "#1b7c83".to_string(),
+        white: "#57606a".to_string(),
+        bright_black: "#6e7781".to_string(),
+        bright_red: "#ff6a69".to_string(),
+        bright_green: "#2da44e".to_string(),
+        bright_yellow: "#bf8700".to_string(),
+        bright_blue: "#218bff".to_string(),
+        bright_magenta: "#a475f9".to_string(),
+        bright_cyan: "#3192aa".to_string(),
+        bright_white: "#8c959f".to_string(),
     }
 }
 
