@@ -3,6 +3,7 @@ mod codex_cli;
 mod daemon;
 mod host;
 mod protocol;
+mod screenshot;
 mod terminal;
 
 pub use attach::{AttachMetadata, run_attach};
@@ -22,6 +23,12 @@ pub use protocol::{
     YGG_LOADING_NOTIFICATION_AFTER_MS, YGG_PROTOCOL_SCHEMA_VERSION, YggCachePolicy,
     YggEventEnvelope, YggEventKind, YggOperationPriority, YggProgress, YggRequestMeta, YggSurface,
     YggTarget,
+};
+pub use screenshot::{
+    ScreenshotRequest, ScreenshotResponse, ScreenshotTarget, complete_screenshot_request,
+    default_screenshot_output_path, enqueue_screenshot_request, screenshot_captures_dir,
+    screenshot_requests_dir, screenshot_responses_dir, take_next_screenshot_request,
+    wait_for_screenshot_response,
 };
 pub use terminal::{TerminalChunk, TerminalManager, TerminalReadResult};
 
@@ -4161,6 +4168,19 @@ fn tail_text_file_lines(path: &std::path::Path, lines: usize) -> Vec<String> {
     read_trace_tail(path, lines.max(1))
 }
 
+fn capture_embedded_app_screenshot(
+    home: &std::path::Path,
+    output_path: Option<std::path::PathBuf>,
+    timeout_ms: u64,
+) -> anyhow::Result<ScreenshotResponse> {
+    let request = enqueue_screenshot_request(home, ScreenshotTarget::App, output_path)?;
+    wait_for_screenshot_response(
+        home,
+        &request.request_id,
+        std::time::Duration::from_millis(timeout_ms.max(250)),
+    )
+}
+
 fn capture_trace_screenshot(home: &std::path::Path) -> Option<std::path::PathBuf> {
     let snapshots_dir = home.join("trace-snapshots");
     fs::create_dir_all(&snapshots_dir).ok()?;
@@ -4226,7 +4246,10 @@ fn trace_bundle(lines: usize, include_screenshot: bool) -> anyhow::Result<serde_
         })
     });
     let screenshot_path = if include_screenshot {
-        capture_trace_screenshot(&home).map(|path| path.display().to_string())
+        capture_embedded_app_screenshot(&home, None, 10_000)
+            .ok()
+            .and_then(|response| response.output_path)
+            .or_else(|| capture_trace_screenshot(&home).map(|path| path.display().to_string()))
     } else {
         None
     };
@@ -4269,6 +4292,24 @@ pub fn run_trace_bundle(lines: usize, include_screenshot: bool) -> anyhow::Resul
         "{}",
         serde_json::to_string_pretty(&trace_bundle(lines, include_screenshot)?)?
     );
+    Ok(())
+}
+
+pub fn run_screenshot_capture(
+    target: &str,
+    output_path: Option<&str>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = match target {
+        "app" => capture_embedded_app_screenshot(
+            &home,
+            output_path.map(std::path::PathBuf::from),
+            timeout_ms,
+        )?,
+        other => anyhow::bail!("unsupported screenshot target: {other}"),
+    };
+    println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }
 
