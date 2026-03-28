@@ -4279,6 +4279,12 @@ fn spawn_surface_snapshot_action<F>(
 }
 
 fn spawn_set_view_mode(mut state: Signal<ShellState>, mode: WorkspaceViewMode) {
+    let remote_preview_path = state.with(|shell| {
+        (mode == WorkspaceViewMode::Rendered)
+            .then(|| shell.server.active_session_path().map(str::to_string))
+            .flatten()
+            .filter(|path| path.starts_with("remote-session://"))
+    });
     state.with_mut(|shell| {
         shell.server.set_view_mode(mode);
     });
@@ -4304,6 +4310,16 @@ fn spawn_set_view_mode(mut state: Signal<ShellState>, mode: WorkspaceViewMode) {
             }
         },
     );
+    if let Some(session_path) = remote_preview_path {
+        let should_sync = state.with_mut(|shell| {
+            shell.remote_preview_dirty_epoch
+                .insert(session_path.clone(), current_millis());
+            schedule_remote_preview_sync(shell, &session_path, 350)
+        });
+        if should_sync {
+            spawn_remote_preview_payload_sync(state, session_path, "preview_toggle_sync");
+        }
+    }
 }
 
 fn spawn_open_session_row(state: Signal<ShellState>, row: BrowserRow) {
@@ -4316,6 +4332,7 @@ fn spawn_focus_live_session_row(
     row: BrowserRow,
     mode: WorkspaceViewMode,
 ) {
+    let mut open_request_id = 0_u64;
     let request_meta = YggRequestMeta::interactive(
         format!("focus-live-{}", current_millis()),
         "focus_live",
@@ -4335,6 +4352,8 @@ fn spawn_focus_live_session_row(
         },
     );
     state.with_mut(|shell| {
+        shell.latest_open_request_id = shell.latest_open_request_id.saturating_add(1);
+        open_request_id = shell.latest_open_request_id;
         shell.server.focus_live_session(&row.full_path);
         shell.server.set_view_mode(mode);
         shell.browser.select_path(row.full_path.clone());
@@ -4358,7 +4377,7 @@ fn spawn_focus_live_session_row(
     );
     let endpoint = state.read().bootstrap.server_endpoint.clone();
     let request_id = request_meta.request_id.clone();
-    let pending_label = format!("focusing {}", row.label);
+        let pending_label = format!("focusing {}", row.label);
     spawn(async move {
         maybe_debug_request_delay().await;
         let row_path = row.full_path.clone();
@@ -4374,8 +4393,13 @@ fn spawn_focus_live_session_row(
         let _ = safe_shell_mut(
             state,
             "focus_live_session_row_complete",
-            |shell| match outcome {
-                Ok(result) => shell.apply_daemon_snapshot_result_for(&request_id, result),
+            |shell| {
+                if open_request_id != shell.latest_open_request_id {
+                    shell.finish_busy_request_for(&request_id);
+                    return;
+                }
+                match outcome {
+                    Ok(result) => shell.apply_daemon_snapshot_result_for(&request_id, result),
                 Err(error) => {
                     shell.finish_busy_request_for(&request_id);
                     shell.last_action = format!("{pending_label} task failed: {error}");
@@ -4384,6 +4408,7 @@ fn spawn_focus_live_session_row(
                         "Open Session Failed",
                         error.to_string(),
                     );
+                    }
                 }
             },
         );
@@ -8940,6 +8965,7 @@ fn describe_app_state_snapshot(
                 .iter()
                 .cloned()
                 .collect::<Vec<_>>(),
+            "notifications_count": shell.notifications.len(),
         },
         "generation": {
             "title_requests_in_flight": shell.title_requests_in_flight.len(),
@@ -10112,7 +10138,7 @@ fn app() -> Element {
         }
         let needs_refresh = remote_preview_needs_refresh(&session);
         let refresh_marker = (session.session_path.clone(), dirty_epoch);
-        if *last_preview_refresh_marker.read() == Some(refresh_marker.clone()) && !needs_refresh {
+        if *last_preview_refresh_marker.read() == Some(refresh_marker.clone()) {
             return;
         }
         state.with_mut(|shell| {
@@ -10154,29 +10180,22 @@ fn app() -> Element {
                     }
                     Ok(Err(error)) => {
                         warn!(path=%path_for_task, error=%error, "failed to fetch remote preview payload from ui");
-                        if needs_refresh {
-                            spawn_server_snapshot_action(
-                                state,
-                                "refreshing preview".to_string(),
-                                move |endpoint| {
-                                    daemon_set_view_mode(&endpoint, WorkspaceViewMode::Rendered)
-                                },
-                            );
-                        }
+                        let _ = safe_shell_mut(state, "preview_refresh_fetch_failed", |shell| {
+                            shell.record_preview_issue_telemetry("preview_refresh_fetch_failed");
+                            shell.last_action =
+                                format!("preview sync deferred for {}", path_for_task);
+                        });
                     }
                     Err(error) => {
                         warn!(path=%path_for_task, error=%error, "preview payload task join failed");
+                        let _ = safe_shell_mut(state, "preview_refresh_join_failed", |shell| {
+                            shell.record_preview_issue_telemetry("preview_refresh_join_failed");
+                        });
                     }
                 }
             });
-        } else {
-            if needs_refresh {
-                spawn_server_snapshot_action(
-                    state,
-                    "refreshing preview".to_string(),
-                    move |endpoint| daemon_set_view_mode(&endpoint, WorkspaceViewMode::Rendered),
-                );
-            }
+        } else if needs_refresh {
+            state.with_mut(|shell| shell.record_preview_issue_telemetry("preview_refresh_no_target"));
         }
     });
     use_effect(move || {
@@ -13787,39 +13806,13 @@ fn TerminalCanvas(
         &snapshot.settings.terminal_theme_name,
     );
     let terminal_placeholder = terminal_placeholder_text(&session);
-    let unstyled_light_terminal =
-        snapshot.settings.theme == UiTheme::ZedLight && snapshot.settings.terminal_theme_name == "VS Code Light+";
-    let (terminal_shell_background, terminal_shell_shadow, terminal_shell_padding, terminal_shell_radius, terminal_host_chrome) =
-        if unstyled_light_terminal {
-            (
-                "transparent".to_string(),
-                "none".to_string(),
-                "0".to_string(),
-                "0".to_string(),
-                "border-radius:0; box-shadow:none !important; outline:none !important;".to_string(),
-            )
-        } else {
-            match snapshot.settings.theme {
-                UiTheme::ZedLight => (
-                    "linear-gradient(180deg, rgba(225,234,244,0.99) 0%, rgba(214,225,237,1.0) 100%)"
-                        .to_string(),
-                    "inset 0 1px 0 rgba(255,255,255,0.88), inset 0 0 0 1px rgba(130,148,173,0.34), 0 18px 42px rgba(138,154,180,0.22)"
-                        .to_string(),
-                    "10px 11px 9px".to_string(),
-                    "11px".to_string(),
-                    "border-radius:14px;".to_string(),
-                ),
-                UiTheme::ZedDark => (
-                    "linear-gradient(180deg, rgba(12,17,24,0.94) 0%, rgba(8,12,18,0.98) 100%)"
-                        .to_string(),
-                    "inset 0 0 0 1px rgba(71,85,105,0.42), 0 18px 38px rgba(2,6,23,0.42)"
-                        .to_string(),
-                    "10px 11px 9px".to_string(),
-                    "11px".to_string(),
-                    "border-radius:14px;".to_string(),
-                ),
-            }
-        };
+    let terminal_shell_background = "transparent".to_string();
+    let terminal_shell_shadow = "none".to_string();
+    let terminal_shell_padding = "0".to_string();
+    let terminal_shell_radius = "0".to_string();
+    let terminal_host_chrome =
+        "border-radius:0; box-shadow:none !important; outline:none !important;".to_string();
+    let resume_overlay_blur = overlay_backdrop_style("blur(1px)");
     let future_theme = theme.clone();
     let trace_home = perf_home_dir(&state.read().bootstrap.settings_path);
     let is_remote_resume_session = session.session_path.starts_with("remote-session://");
@@ -14421,7 +14414,13 @@ fn TerminalCanvas(
                 }
                 if show_resume_overlay {
                     div {
-                        style: "position:absolute; inset:0; z-index:2; display:flex; align-items:center; justify-content:center; pointer-events:none; background:linear-gradient(180deg, rgba(255,255,255,0.72) 0%, rgba(255,255,255,0.38) 100%); backdrop-filter:blur(1px);",
+                        "data-terminal-resume-overlay": "true",
+                        style: format!(
+                            "position:absolute; inset:0; z-index:2; display:flex; align-items:center; justify-content:center; pointer-events:none; \
+                             background:linear-gradient(180deg, rgba(255,255,255,0.72) 0%, rgba(255,255,255,0.38) 100%); \
+                             backdrop-filter:{}; -webkit-backdrop-filter:{};",
+                            resume_overlay_blur, resume_overlay_blur
+                        ),
                         div {
                             style: "display:flex; flex-direction:column; align-items:center; gap:10px; padding:18px 20px; border-radius:18px; background:rgba(255,255,255,0.82); box-shadow:0 18px 44px rgba(148,163,184,0.18), inset 0 0 0 1px rgba(170,190,212,0.18); min-width:280px;",
                             div {
@@ -15977,6 +15976,7 @@ fn ContextMenuOverlay(
 ) -> Element {
     let placement = context_menu_placement(position, window_size, (224.0, 420.0));
     let placement_style = context_menu_position_style(placement);
+    let menu_blur = overlay_backdrop_style("blur(20px) saturate(150%)");
     let drag_paths = if selected_tree_paths.is_empty() {
         selected_row
             .as_ref()
@@ -16006,8 +16006,10 @@ fn ContextMenuOverlay(
                 style: format!(
                     "position:absolute; {}; min-width:188px; max-width:220px; max-height:calc(100vh - 24px); overflow:auto; padding:6px; border-radius:10px; \
                      background:rgba(248,249,252,0.98); box-shadow: 0 18px 38px rgba(57,78,98,0.18), inset 0 0 0 1px rgba(214,220,228,0.9); \
-                     backdrop-filter: blur(20px) saturate(150%); -webkit-backdrop-filter: blur(20px) saturate(150%);",
-                    placement_style
+                     backdrop-filter: {}; -webkit-backdrop-filter: {};",
+                    placement_style,
+                    menu_blur,
+                    menu_blur
                 ),
                 onmousedown: |evt| evt.stop_propagation(),
                 onclick: |evt| evt.stop_propagation(),
@@ -16114,9 +16116,15 @@ fn DeleteConfirmOverlay(
     let deleting_ssh_targets = !pending.ssh_machine_keys.is_empty()
         && pending.document_paths.is_empty()
         && pending.group_paths.is_empty();
+    let overlay_blur = overlay_backdrop_style("blur(18px) saturate(130%)");
     rsx! {
         div {
-            style: "position:fixed; inset:0; z-index:95; display:flex; align-items:center; justify-content:center; background:rgba(230,239,248,0.28); backdrop-filter: blur(18px) saturate(130%); -webkit-backdrop-filter: blur(18px) saturate(130%);",
+            style: format!(
+                "position:fixed; inset:0; z-index:95; display:flex; align-items:center; justify-content:center; \
+                 background:rgba(230,239,248,0.28); backdrop-filter:{}; -webkit-backdrop-filter:{};",
+                overlay_blur,
+                overlay_blur
+            ),
             onclick: move |evt| on_cancel.call(evt),
             div {
                 style: format!(
@@ -17016,10 +17024,32 @@ fn palette(theme: UiTheme) -> Palette {
 }
 
 fn shell_backdrop_style(maximized: bool) -> &'static str {
-    if maximized {
+    if maximized || linux_kde_wayland_safe_mode() {
         "none"
     } else {
         "blur(10px) saturate(135%)"
+    }
+}
+
+fn linux_kde_wayland_safe_mode() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::env::var_os("WAYLAND_DISPLAY").is_some()
+            && std::env::var("XDG_CURRENT_DESKTOP")
+                .map(|value| value.to_ascii_lowercase().contains("kde"))
+                .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+fn overlay_backdrop_style(default_style: &'static str) -> &'static str {
+    if linux_kde_wayland_safe_mode() {
+        "none"
+    } else {
+        default_style
     }
 }
 
