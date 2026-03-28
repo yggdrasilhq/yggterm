@@ -59,8 +59,8 @@ use yggterm_core::{
     SessionBrowserState, SessionNode, SessionStore, UiTheme, WorkspaceDocumentInput,
     WorkspaceDocumentKind, WorkspaceGroupKind, YgguiThemeSpec, append_trace_event,
     check_for_update, install_release_update, looks_like_generated_fallback_title,
-    looks_like_low_signal_generated_copy, refresh_desktop_integration, resolve_yggterm_home,
-    save_settings_file, unique_session_short_ids_for_pairs, update_command_hint,
+    looks_like_low_signal_generated_copy, resolve_yggterm_home, save_settings_file,
+    unique_session_short_ids_for_pairs, update_command_hint,
 };
 use yggterm_platform::DockRect;
 use yggterm_server::{
@@ -3351,25 +3351,6 @@ fn spawn_graceful_shutdown_and_close(mut state: Signal<ShellState>) {
         shell.last_action = "closing yggterm".to_string();
     });
     let _ = window().close();
-}
-
-fn spawn_desktop_integration_refresh(mut state: Signal<ShellState>) {
-    let install_context = state.read().bootstrap.install_context.clone();
-    let perf_home = perf_home_dir(&state.read().bootstrap.settings_path);
-    spawn(async move {
-        let perf = PerfSpan::start(&perf_home, "startup", "refresh_desktop_integration");
-        let outcome =
-            task::spawn_blocking(move || refresh_desktop_integration(&install_context)).await;
-        perf.finish(json!({
-            "ok": outcome.as_ref().is_ok_and(|result| result.is_ok()),
-        }));
-        if let Ok(Err(error)) = outcome {
-            warn!(error=%error, "desktop integration refresh failed");
-            state.with_mut(|shell| {
-                shell.last_action = format!("desktop integration refresh failed: {error}");
-            });
-        }
-    });
 }
 
 fn spawn_auto_update_install_check(mut state: Signal<ShellState>) {
@@ -9790,7 +9771,7 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
     let window = WindowBuilder::new()
         .with_title("Yggterm")
         .with_window_icon(Some(window_icon::load_yggterm_window_icon()))
-        .with_transparent(!cfg!(target_os = "linux"))
+        .with_transparent(true)
         .with_decorations(false)
         .with_resizable(true)
         .with_inner_size(LogicalSize::new(1460.0, 920.0))
@@ -9839,7 +9820,6 @@ fn app() -> Element {
     let mut startup_sync_started = use_signal(|| false);
     let mut browser_tree_load_started = use_signal(|| false);
     let mut update_check_started = use_signal(|| false);
-    let mut desktop_refresh_started = use_signal(|| false);
     let mut dock_pulse_started = use_signal(|| false);
     let mut window_epoch = use_signal(|| 0_u64);
     let mut terminal_mount_epoch = use_signal(|| 0_u64);
@@ -9943,13 +9923,6 @@ fn app() -> Element {
                 async_render_epoch,
             );
         }
-    });
-    use_effect(move || {
-        if *desktop_refresh_started.read() {
-            return;
-        }
-        desktop_refresh_started.set(true);
-        spawn_desktop_integration_refresh(state);
     });
     use_effect(move || {
         if *update_check_started.read() {
