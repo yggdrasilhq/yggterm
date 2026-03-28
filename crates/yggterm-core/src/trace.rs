@@ -47,7 +47,10 @@ pub fn append_trace_event(
         payload,
     };
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{}", json!(record));
+        if let Ok(mut line) = serde_json::to_vec(&record) {
+            line.push(b'\n');
+            let _ = file.write_all(&line);
+        }
     }
 }
 
