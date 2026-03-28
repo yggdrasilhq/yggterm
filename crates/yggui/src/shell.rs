@@ -12438,7 +12438,16 @@ fn MainSurface(
                     "flex:1; min-height:0; overflow:{}; padding:{}; background:{}; border-radius:11px; box-shadow:{};",
                     if snapshot.active_view_mode == WorkspaceViewMode::Terminal { "hidden" } else { "auto" },
                     if snapshot.active_view_mode == WorkspaceViewMode::Terminal { "0" } else { "24px" },
-                    snapshot.palette.panel, snapshot.palette.panel_shadow
+                    if snapshot.active_view_mode == WorkspaceViewMode::Terminal {
+                        "transparent"
+                    } else {
+                        snapshot.palette.panel
+                    },
+                    if snapshot.active_view_mode == WorkspaceViewMode::Terminal {
+                        "none"
+                    } else {
+                        snapshot.palette.panel_shadow
+                    }
                 ),
                 {body}
             }
@@ -13780,11 +13789,11 @@ fn TerminalCanvas(
     let (terminal_shell_background, terminal_shell_shadow, terminal_host_chrome) =
         match snapshot.settings.theme {
             UiTheme::ZedLight => (
-                "linear-gradient(180deg, rgba(234,239,245,0.94) 0%, rgba(225,232,240,0.98) 100%)"
+                "linear-gradient(180deg, rgba(235,240,246,0.98) 0%, rgba(225,232,241,1.0) 100%)"
                     .to_string(),
-                "inset 0 0 0 1px rgba(148,163,184,0.26), 0 16px 34px rgba(148,163,184,0.16)"
+                "inset 0 0 0 1px rgba(148,163,184,0.34), 0 18px 38px rgba(148,163,184,0.18)"
                     .to_string(),
-                "border-radius:14px; box-shadow: inset 0 0 0 1px rgba(148,163,184,0.24), 0 0 0 1px rgba(255,255,255,0.72);"
+                "border-radius:14px; box-shadow: inset 0 0 0 1px rgba(148,163,184,0.36), 0 1px 0 rgba(255,255,255,0.94);"
                     .to_string(),
             ),
             UiTheme::ZedDark => (
@@ -17344,7 +17353,7 @@ mod tests {
     #[test]
     fn terminal_theme_uses_vscode_light_by_default() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
-        assert_eq!(theme.background, "#f7f8fa");
+        assert_eq!(theme.background, "#ffffff");
         assert_eq!(theme.foreground, "#1f2328");
         assert_eq!(theme.blue, "#0451a5");
     }
