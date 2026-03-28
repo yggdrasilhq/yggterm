@@ -41,8 +41,9 @@ pub fn TitlebarChrome(
     rsx! {
         div {
             style: format!(
-                "display:flex; align-items:center; justify-content:space-between; height:44px; \
-                 padding:0 12px; background:{}; zoom:{}%; user-select:none; -webkit-user-select:none;",
+                "display:grid; grid-template-columns:minmax(0,1fr) auto minmax(0,1fr); align-items:center; \
+                 gap:12px; height:44px; padding:0 12px; background:{}; zoom:{}%; user-select:none; \
+                 -webkit-user-select:none;",
                 background, zoom_percent
             ),
             onmousedown: move |_| drag_armed.set(true),
@@ -58,9 +59,18 @@ pub fn TitlebarChrome(
                 drag_armed.set(false);
                 on_toggle_maximized.call(());
             },
-            {left}
-            {center}
-            {right}
+            div {
+                style: "min-width:0; display:flex; align-items:center; justify-content:flex-start;",
+                {left}
+            }
+            div {
+                style: "min-width:0; display:flex; align-items:center; justify-content:center;",
+                {center}
+            }
+            div {
+                style: "min-width:0; display:flex; align-items:center; justify-content:flex-end;",
+                {right}
+            }
         }
     }
 }
