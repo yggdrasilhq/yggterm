@@ -1,3 +1,4 @@
+use crate::app_capture::{capture_visible_app_surface, describe_window, focus_app_window};
 use crate::chrome::{
     ChromePalette, HoveredChromeControl as HoveredControl, TitlebarChrome, WindowControlsStrip,
     search_input_style,
@@ -21,7 +22,6 @@ use crate::theme::{
 };
 use crate::window_icon;
 use anyhow::{Context, Result, anyhow};
-use base64::Engine;
 use dioxus::desktop::{
     Config, LogicalSize, WindowBuilder, WindowCloseBehaviour, WindowEvent as DesktopWindowEvent,
     use_window, use_wry_event_handler, window,
@@ -63,20 +63,19 @@ use yggterm_core::{
 };
 use yggterm_platform::DockRect;
 use yggterm_server::{
-    GhosttyTerminalHostMode, ManagedSessionView, PreviewTone, RemoteMachineHealth,
-    RemoteMachineSnapshot, RemoteScannedSession, ScreenshotResponse, ScreenshotTarget,
-    ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry,
-    SessionPreviewBlock, SessionRenderedSection, SshConnectTarget, TerminalBackend,
-    WorkspaceViewMode, YGG_LOADING_NOTIFICATION_AFTER_MS, YggRequestMeta, YggSurface, YggTarget,
-    YggtermServer, apply_remote_preview_payload_for_path, cleanup_legacy_daemons,
-    complete_screenshot_request, connect_ssh_custom, default_screenshot_output_path,
-    fetch_remote_generation_context, fetch_remote_preview_payload, focus_live, open_remote_session,
-    open_stored_session, persist_remote_generated_copy, ping, refresh_managed_cli,
-    refresh_remote_machine, remove_ssh_target, request_terminal_launch,
+    AppControlCommand, AppControlResponse, GhosttyTerminalHostMode, ManagedSessionView,
+    PreviewTone, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession, ServerEndpoint,
+    ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionPreviewBlock,
+    SessionRenderedSection, SshConnectTarget, TerminalBackend, WorkspaceViewMode,
+    YGG_LOADING_NOTIFICATION_AFTER_MS, YggRequestMeta, YggSurface, YggTarget, YggtermServer,
+    apply_remote_preview_payload_for_path, cleanup_legacy_daemons, complete_app_control_request,
+    connect_ssh_custom, fetch_remote_generation_context, fetch_remote_preview_payload, focus_live,
+    open_remote_session, open_stored_session, persist_remote_generated_copy, ping,
+    refresh_managed_cli, refresh_remote_machine, remove_ssh_target, request_terminal_launch,
     set_all_preview_blocks_folded, set_view_mode as daemon_set_view_mode,
     shutdown as daemon_shutdown, snapshot as daemon_snapshot, stage_remote_clipboard_png,
     start_command_session, start_local_session_at, status, switch_agent_session_mode,
-    take_next_screenshot_request, terminal_ensure, terminal_read, terminal_resize, terminal_write,
+    take_next_app_control_request, terminal_ensure, terminal_read, terminal_resize, terminal_write,
     toggle_preview_block as daemon_toggle_preview_block,
 };
 
@@ -469,13 +468,6 @@ enum TerminalJsEvent {
     ClipboardImageRequest,
     ClipboardError { action: String, message: String },
     Debug { message: String },
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum ScreenshotJsEvent {
-    PngDataUrl { data_url: String },
-    Error { message: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8348,197 +8340,190 @@ fn client_instances_dir(settings_path: &std::path::Path, endpoint: &ServerEndpoi
         .join(client_instance_scope(endpoint))
 }
 
-async fn process_pending_screenshot_requests(settings_path: &std::path::Path) -> Result<()> {
+fn right_panel_mode_label(mode: RightPanelMode) -> &'static str {
+    match mode {
+        RightPanelMode::Hidden => "hidden",
+        RightPanelMode::Metadata => "metadata",
+        RightPanelMode::Settings => "settings",
+        RightPanelMode::Connect => "connect",
+        RightPanelMode::Notifications => "notifications",
+    }
+}
+
+fn preview_layout_mode_label(mode: PreviewLayoutMode) -> &'static str {
+    match mode {
+        PreviewLayoutMode::Chat => "chat",
+        PreviewLayoutMode::Graph => "graph",
+    }
+}
+
+fn describe_app_state_snapshot(
+    state: &Signal<ShellState>,
+    desktop: &dioxus::desktop::DesktopContext,
+) -> Value {
+    let shell = state.read();
+    let browser_metrics = shell.browser.metrics();
+    let active_requests = shell
+        .active_surface_requests
+        .iter()
+        .map(|(surface, request)| {
+            json!({
+                "surface": format!("{surface:?}"),
+                "request_id": request.request_id,
+                "operation": request.operation,
+                "target": serde_json::to_value(&request.target).unwrap_or(Value::Null),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut selected_tree_paths = shell
+        .selected_tree_paths
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    selected_tree_paths.sort();
+    json!({
+        "window": describe_window(desktop),
+        "browser": {
+            "selected_path": shell.browser.selected_path(),
+            "selected_row": shell.browser.selected_row().map(|row| {
+                json!({
+                    "full_path": row.full_path,
+                    "label": row.label,
+                    "detail_label": row.detail_label,
+                    "session_title": row.session_title,
+                    "kind": format!("{:?}", row.kind),
+                })
+            }),
+            "expanded_paths": shell.browser.expanded_paths(),
+            "metrics": {
+                "row_count": browser_metrics.row_count,
+                "rebuild_count": browser_metrics.rebuild_count,
+                "last_rebuild_ms": browser_metrics.last_rebuild_ms,
+            },
+        },
+        "shell": {
+            "sidebar_open": shell.sidebar_open,
+            "right_panel_mode": right_panel_mode_label(shell.right_panel_mode),
+            "preview_layout": preview_layout_mode_label(shell.preview_layout),
+            "search_query": shell.search_query,
+            "search_focused": shell.search_focused,
+            "selected_tree_paths": selected_tree_paths,
+            "selection_anchor": shell.selection_anchor,
+            "tree_rename_path": shell.tree_rename_path,
+            "theme_editor_open": shell.theme_editor_open,
+            "titlebar_new_menu_open": shell.titlebar_new_menu_open,
+            "server_busy": shell.server_busy,
+            "needs_initial_server_sync": shell.needs_initial_server_sync,
+            "latest_open_request_id": shell.latest_open_request_id,
+            "last_action": shell.last_action,
+        },
+        "generation": {
+            "title_requests_in_flight": shell.title_requests_in_flight.len(),
+            "precis_requests_in_flight": shell.precis_requests_in_flight.len(),
+            "summary_requests_in_flight": shell.summary_requests_in_flight.len(),
+            "rows_with_labels": shell.browser.rows().iter().filter(|row| !row.label.trim().is_empty()).count(),
+            "generated_precis": shell.generated_precis.len(),
+            "generated_summaries": shell.generated_summaries.len(),
+        },
+        "remote": {
+            "machine_refresh_requests": shell.remote_machine_refresh_requests.len(),
+            "preview_sync_after": shell.remote_preview_sync_after_ms.len(),
+            "preview_dirty_epoch": shell.remote_preview_dirty_epoch.len(),
+            "managed_cli_refresh_requests": shell.managed_cli_refresh_requests.len(),
+            "managed_cli_refresh_completed": shell.managed_cli_refresh_completed.len(),
+        },
+        "active_surface_requests": active_requests,
+    })
+}
+
+async fn process_pending_app_control_requests(
+    settings_path: &std::path::Path,
+    desktop: dioxus::desktop::DesktopContext,
+    state: Signal<ShellState>,
+) -> Result<()> {
     let home = perf_home_dir(settings_path);
-    let Some((inflight_path, request)) = take_next_screenshot_request(&home, std::process::id())?
+    let Some((inflight_path, request)) = take_next_app_control_request(&home, std::process::id())?
     else {
         return Ok(());
     };
     append_trace_event(
         &home,
         "ui",
-        "screenshot",
+        "app_control",
         "request_begin",
         json!({
             "request_id": request.request_id,
-            "target": request.target,
-            "output_path": request.output_path,
+            "command": request.command,
         }),
     );
-    let result = match request.target {
-        ScreenshotTarget::App => {
-            capture_app_window_screenshot(Path::new(&request.output_path)).await
-        }
-    };
-    let response = match result {
-        Ok(output_path) => ScreenshotResponse {
-            request_id: request.request_id.clone(),
-            handled_by_pid: std::process::id(),
-            completed_at_ms: current_millis() as u128,
-            output_path: Some(output_path.display().to_string()),
-            error: None,
+    let command = request.command.clone();
+    let response = match command {
+        AppControlCommand::CaptureScreenshot {
+            target: _,
+            output_path,
+        } => match capture_visible_app_surface(&desktop, Path::new(&output_path)).await {
+            Ok(output_path) => AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: Some(output_path.display().to_string()),
+                data: Some(json!({
+                    "command": "capture_screenshot",
+                    "window": describe_window(&desktop),
+                })),
+                error: None,
+            },
+            Err(error) => AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: None,
+                error: Some(error.to_string()),
+            },
         },
-        Err(error) => ScreenshotResponse {
+        AppControlCommand::FocusWindow => match focus_app_window(&desktop) {
+            Ok(data) => AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(data),
+                error: None,
+            },
+            Err(error) => AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: None,
+                error: Some(error.to_string()),
+            },
+        },
+        AppControlCommand::DescribeState => AppControlResponse {
             request_id: request.request_id.clone(),
             handled_by_pid: std::process::id(),
             completed_at_ms: current_millis() as u128,
             output_path: None,
-            error: Some(error.to_string()),
+            data: Some(describe_app_state_snapshot(&state, &desktop)),
+            error: None,
         },
     };
-    complete_screenshot_request(&home, &inflight_path, &response)?;
+    complete_app_control_request(&home, &inflight_path, &response)?;
     append_trace_event(
         &home,
         "ui",
-        "screenshot",
+        "app_control",
         "request_end",
         json!({
             "request_id": response.request_id,
             "handled_by_pid": response.handled_by_pid,
             "output_path": response.output_path,
+            "data": response.data,
             "error": response.error,
         }),
     );
     Ok(())
-}
-
-async fn capture_app_window_screenshot(output_path: &Path) -> Result<PathBuf> {
-    if capture_app_window_screenshot_native(output_path)? {
-        return Ok(output_path.to_path_buf());
-    }
-    let mut eval = document::eval(&app_screenshot_eval_script());
-    let event = tokio::time::timeout(Duration::from_secs(15), eval.recv::<ScreenshotJsEvent>())
-        .await
-        .context("timed out waiting for screenshot payload")?
-        .context("receiving screenshot payload from webview")?;
-    match event {
-        ScreenshotJsEvent::PngDataUrl { data_url } => {
-            let encoded = data_url
-                .split_once(',')
-                .map(|(_, payload)| payload)
-                .unwrap_or(data_url.as_str());
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(encoded)
-                .context("decoding screenshot png payload")?;
-            if bytes.is_empty() {
-                anyhow::bail!("screenshot payload was empty");
-            }
-            let final_path = if output_path.as_os_str().is_empty() {
-                default_screenshot_output_path(Path::new("."), "empty-path")
-            } else {
-                output_path.to_path_buf()
-            };
-            if let Some(parent) = final_path.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("creating screenshot dir {}", parent.display()))?;
-            }
-            fs::write(&final_path, bytes)
-                .with_context(|| format!("writing screenshot {}", final_path.display()))?;
-            Ok(final_path)
-        }
-        ScreenshotJsEvent::Error { message } => anyhow::bail!(message),
-    }
-}
-
-fn capture_app_window_screenshot_native(output_path: &Path) -> Result<bool> {
-    if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating screenshot dir {}", parent.display()))?;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let attempts = [
-            (
-                "spectacle",
-                vec![
-                    "--background".to_string(),
-                    "--nonotify".to_string(),
-                    "--activewindow".to_string(),
-                    "--output".to_string(),
-                    output_path.display().to_string(),
-                ],
-            ),
-            (
-                "gnome-screenshot",
-                vec![
-                    "-w".to_string(),
-                    "-f".to_string(),
-                    output_path.display().to_string(),
-                ],
-            ),
-            (
-                "import",
-                vec![
-                    "-window".to_string(),
-                    "root".to_string(),
-                    output_path.display().to_string(),
-                ],
-            ),
-            ("scrot", vec![output_path.display().to_string()]),
-            ("maim", vec![output_path.display().to_string()]),
-            ("grim", vec![output_path.display().to_string()]),
-        ];
-        for (binary, args) in attempts {
-            let status = Command::new(binary)
-                .args(args)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            if status.ok().is_some_and(|status| status.success())
-                && fs::metadata(output_path)
-                    .ok()
-                    .is_some_and(|metadata| metadata.is_file() && metadata.len() > 0)
-            {
-                return Ok(true);
-            }
-            let _ = fs::remove_file(output_path);
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let status = Command::new("screencapture")
-            .args(["-x", output_path.to_string_lossy().as_ref()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        if status.ok().is_some_and(|status| status.success())
-            && fs::metadata(output_path)
-                .ok()
-                .is_some_and(|metadata| metadata.is_file() && metadata.len() > 0)
-        {
-            return Ok(true);
-        }
-        let _ = fs::remove_file(output_path);
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let escaped = output_path.display().to_string().replace('\'', "''");
-        let script = format!(
-            "Add-Type -AssemblyName System.Windows.Forms; \
-             Add-Type -AssemblyName System.Drawing; \
-             $bounds=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds; \
-             $bmp=New-Object System.Drawing.Bitmap($bounds.Width,$bounds.Height); \
-             $gfx=[System.Drawing.Graphics]::FromImage($bmp); \
-             $gfx.CopyFromScreen($bounds.Location,[System.Drawing.Point]::Empty,$bounds.Size); \
-             $bmp.Save('{escaped}', [System.Drawing.Imaging.ImageFormat]::Png); \
-             $gfx.Dispose(); \
-             $bmp.Dispose();"
-        );
-        let status = Command::new("powershell")
-            .args(["-NoProfile", "-Command", &script])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        if status.ok().is_some_and(|status| status.success())
-            && fs::metadata(output_path)
-                .ok()
-                .is_some_and(|metadata| metadata.is_file() && metadata.len() > 0)
-        {
-            return Ok(true);
-        }
-        let _ = fs::remove_file(output_path);
-    }
-    Ok(false)
 }
 
 fn parse_client_instance_pid(path: &Path) -> Option<u32> {
@@ -8996,12 +8981,19 @@ fn app() -> Element {
     });
     {
         let settings_path = bootstrap.settings_path.clone();
+        let desktop = desktop.clone();
+        let state = state;
         use_future(move || {
             let settings_path = settings_path.clone();
+            let desktop = desktop.clone();
+            let state = state;
             async move {
                 loop {
-                    if let Err(error) = process_pending_screenshot_requests(&settings_path).await {
-                        warn!(error=%error, "failed to process screenshot request");
+                    if let Err(error) =
+                        process_pending_app_control_requests(&settings_path, desktop.clone(), state)
+                            .await
+                    {
+                        warn!(error=%error, "failed to process app control request");
                     }
                     sleep(Duration::from_millis(SCREENSHOT_REQUEST_POLL_MS)).await;
                 }
@@ -13540,132 +13532,6 @@ fn apply_active_terminal_zoom(state: Signal<ShellState>) {
         "applying live terminal zoom"
     );
     let _ = document::eval(&terminal_apply_script(&host_id, &theme));
-}
-
-fn app_screenshot_eval_script() -> String {
-    r#"
-    (async function() {
-        const escapeXml = (value) => String(value || "")
-            .replace(/&/g, "&amp;")
-            .replace(/</g, "&lt;")
-            .replace(/>/g, "&gt;");
-        const copyFormState = (sourceRoot, cloneRoot) => {
-            const sourceNodes = sourceRoot.querySelectorAll('input, textarea, select');
-            const cloneNodes = cloneRoot.querySelectorAll('input, textarea, select');
-            for (let i = 0; i < Math.min(sourceNodes.length, cloneNodes.length); i++) {
-                const source = sourceNodes[i];
-                const clone = cloneNodes[i];
-                if (source instanceof HTMLInputElement) {
-                    clone.setAttribute('value', source.value || '');
-                    if (source.checked) {
-                        clone.setAttribute('checked', 'checked');
-                    } else {
-                        clone.removeAttribute('checked');
-                    }
-                } else if (source instanceof HTMLTextAreaElement) {
-                    clone.textContent = source.value || '';
-                } else if (source instanceof HTMLSelectElement) {
-                    const sourceOptions = source.querySelectorAll('option');
-                    const cloneOptions = clone.querySelectorAll('option');
-                    for (let ix = 0; ix < Math.min(sourceOptions.length, cloneOptions.length); ix++) {
-                        if (sourceOptions[ix].selected) {
-                            cloneOptions[ix].setAttribute('selected', 'selected');
-                        } else {
-                            cloneOptions[ix].removeAttribute('selected');
-                        }
-                    }
-                }
-            }
-        };
-        const replaceCanvasElements = (sourceRoot, cloneRoot) => {
-            const sourceCanvases = sourceRoot.querySelectorAll('canvas');
-            const cloneCanvases = cloneRoot.querySelectorAll('canvas');
-            for (let i = 0; i < Math.min(sourceCanvases.length, cloneCanvases.length); i++) {
-                const source = sourceCanvases[i];
-                const clone = cloneCanvases[i];
-                try {
-                    const img = document.createElement('img');
-                    img.setAttribute('src', source.toDataURL('image/png'));
-                    const rect = source.getBoundingClientRect();
-                    img.setAttribute('width', String(source.width || Math.ceil(rect.width)));
-                    img.setAttribute('height', String(source.height || Math.ceil(rect.height)));
-                    img.setAttribute('style', [
-                        'display:block',
-                        `width:${Math.ceil(rect.width)}px`,
-                        `height:${Math.ceil(rect.height)}px`,
-                    ].join(';'));
-                    clone.replaceWith(img);
-                } catch (_error) {}
-            }
-        };
-        const collectCssRules = () => {
-            const rules = [];
-            for (const sheet of Array.from(document.styleSheets || [])) {
-                try {
-                    for (const rule of Array.from(sheet.cssRules || [])) {
-                        rules.push(rule.cssText);
-                    }
-                } catch (_error) {}
-            }
-            return rules.join('\n');
-        };
-        const target = document.body;
-        const clone = target.cloneNode(true);
-        copyFormState(target, clone);
-        replaceCanvasElements(target, clone);
-        const width = Math.max(
-            document.documentElement ? document.documentElement.clientWidth : 0,
-            window.innerWidth || 0,
-            target ? target.clientWidth : 0
-        );
-        const height = Math.max(
-            document.documentElement ? document.documentElement.clientHeight : 0,
-            window.innerHeight || 0,
-            target ? target.clientHeight : 0
-        );
-        const css = collectCssRules();
-        const markup = new XMLSerializer().serializeToString(clone);
-        const svg = `
-            <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
-              <foreignObject x="0" y="0" width="100%" height="100%">
-                <div xmlns="http://www.w3.org/1999/xhtml" style="margin:0;padding:0;width:${width}px;height:${height}px;overflow:hidden;">
-                  <style>${escapeXml(css)}</style>
-                  ${markup}
-                </div>
-              </foreignObject>
-            </svg>
-        `;
-        const blob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' });
-        const url = URL.createObjectURL(blob);
-        try {
-            const image = await new Promise((resolve, reject) => {
-                const img = new Image();
-                img.onload = () => resolve(img);
-                img.onerror = (error) => reject(error);
-                img.src = url;
-            });
-            const ratio = Math.max(window.devicePixelRatio || 1, 1);
-            const canvas = document.createElement('canvas');
-            canvas.width = Math.max(1, Math.ceil(width * ratio));
-            canvas.height = Math.max(1, Math.ceil(height * ratio));
-            const ctx = canvas.getContext('2d');
-            if (!ctx) {
-                throw new Error('Canvas 2D context is unavailable.');
-            }
-            ctx.scale(ratio, ratio);
-            ctx.drawImage(image, 0, 0, width, height);
-            dioxus.send({ kind: 'png_data_url', data_url: canvas.toDataURL('image/png') });
-        } finally {
-            URL.revokeObjectURL(url);
-        }
-    })().catch((error) => {
-        dioxus.send({
-            kind: 'error',
-            message: error && error.message ? error.message : String(error),
-        });
-    });
-    "#
-    .to_string()
 }
 
 fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
