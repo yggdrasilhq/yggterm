@@ -78,6 +78,10 @@ pub enum ServerRequest {
     RefreshRemoteMachine {
         machine_key: String,
     },
+    RefreshManagedCli {
+        machine_key: Option<String>,
+        background: bool,
+    },
     RemoveSshTarget {
         machine_key: String,
     },
@@ -232,7 +236,8 @@ impl DaemonRuntime {
         }
     }
 
-    fn ensure_terminal_for_path(&mut self, path: &str) -> Result<()> {
+    fn ensure_terminal_for_path(&mut self, path: &str) -> Result<Option<String>> {
+        let prepare_message = self.server.ensure_managed_cli_for_session_path(path)?;
         self.server.request_terminal_launch_for_path(path);
         let Some((launch_command, cwd)) = self.server.terminal_spec(path) else {
             bail!("no terminal spec for session: {path}");
@@ -252,17 +257,19 @@ impl DaemonRuntime {
                     stop_command.as_deref(),
                 )?;
             }
-            return Ok(());
+            return Ok(prepare_message);
         }
-        self.terminals.ensure_session(path, &launch_command, cwd.as_deref())?;
-        Ok(())
+        self.terminals
+            .ensure_session(path, &launch_command, cwd.as_deref())?;
+        Ok(prepare_message)
     }
 
     fn ensure_terminal_for_active(&mut self) -> Result<()> {
         let Some(path) = self.server.active_session_path().map(ToOwned::to_owned) else {
             bail!("no active session");
         };
-        self.ensure_terminal_for_path(&path)
+        let _ = self.ensure_terminal_for_path(&path)?;
+        Ok(())
     }
 
     fn persist(&self) -> Result<()> {
@@ -327,7 +334,10 @@ impl DaemonRuntime {
                     .server
                     .ssh_targets()
                     .iter()
-                    .find(|candidate| candidate.ssh_target == target && candidate.prefix.as_deref() == prefix.as_deref())
+                    .find(|candidate| {
+                        candidate.ssh_target == target
+                            && candidate.prefix.as_deref() == prefix.as_deref()
+                    })
                     .cloned()
                 {
                     let _ = self.server.refresh_remote_machine_for_ssh_target(&target);
@@ -358,6 +368,17 @@ impl DaemonRuntime {
                 self.server.refresh_remote_machine_by_key(&machine_key)?;
                 self.persist()?;
                 self.snapshot_response(Some(format!("refreshed {machine_key}")))
+            }
+            ServerRequest::RefreshManagedCli {
+                machine_key,
+                background,
+            } => {
+                let message = self
+                    .server
+                    .refresh_managed_cli(machine_key.as_deref(), background)?;
+                ServerResponse::Ack {
+                    message: Some(message),
+                }
             }
             ServerRequest::RemoveSshTarget { machine_key } => {
                 let removed = self.server.remove_ssh_targets_for_machine(&machine_key);
@@ -469,10 +490,8 @@ impl DaemonRuntime {
                 self.snapshot_response(Some("requested terminal".to_string()))
             }
             ServerRequest::TerminalEnsure { path } => {
-                self.ensure_terminal_for_path(&path)?;
-                ServerResponse::Ack {
-                    message: Some("terminal ready".to_string()),
-                }
+                let message = self.ensure_terminal_for_path(&path)?;
+                ServerResponse::Ack { message }
             }
             ServerRequest::TerminalRead { path, cursor } => {
                 let stream = self.terminals.read(&path, cursor)?;
@@ -518,10 +537,8 @@ impl DaemonRuntime {
                 for (machine, session_id) in remote_targets {
                     match terminate_remote_codex_session(&machine, &session_id) {
                         Ok(()) => remote_stopped += 1,
-                        Err(error) => remote_errors.push(format!(
-                            "{}:{}: {}",
-                            machine.machine_key, session_id, error
-                        )),
+                        Err(error) => remote_errors
+                            .push(format!("{}:{}: {}", machine.machine_key, session_id, error)),
                     }
                 }
                 let summary = self
@@ -533,15 +550,12 @@ impl DaemonRuntime {
                     message: Some(if total_errors == 0 {
                         format!(
                             "stopped {} terminal sessions and {} remote persistent sessions",
-                            summary.stopped,
-                            remote_stopped
+                            summary.stopped, remote_stopped
                         )
                     } else {
                         format!(
                             "stopped {} terminal sessions and {} remote persistent sessions, {} errors",
-                            summary.stopped,
-                            remote_stopped,
-                            total_errors
+                            summary.stopped, remote_stopped, total_errors
                         )
                     }),
                 }
@@ -689,6 +703,20 @@ pub fn refresh_remote_machine(
         endpoint,
         &ServerRequest::RefreshRemoteMachine {
             machine_key: machine_key.to_string(),
+        },
+    )?)
+}
+
+pub fn refresh_managed_cli(
+    endpoint: &ServerEndpoint,
+    machine_key: Option<&str>,
+    background: bool,
+) -> Result<Option<String>> {
+    expect_ack(send_request(
+        endpoint,
+        &ServerRequest::RefreshManagedCli {
+            machine_key: machine_key.map(ToOwned::to_owned),
+            background,
         },
     )?)
 }
