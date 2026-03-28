@@ -92,7 +92,9 @@ pub fn terminal_theme_names() -> Vec<String> {
 }
 
 pub fn terminal_theme_by_name(name: &str) -> Option<&'static NamedTerminalTheme> {
-    terminal_theme_catalog().iter().find(|theme| theme.name == name)
+    terminal_theme_catalog()
+        .iter()
+        .find(|theme| theme.name == name)
 }
 
 fn parse_ghostty_theme(contents: &str) -> Option<TerminalPaletteSpec> {
