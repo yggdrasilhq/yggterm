@@ -59,9 +59,9 @@ pub fn append_theme_stop(spec: &YgguiThemeSpec, color: Option<&str>) -> YgguiThe
     if next.colors.len() >= MAX_THEME_STOPS {
         return next;
     }
-    let swatch = color
-        .map(str::to_string)
-        .unwrap_or_else(|| THEME_EDITOR_SWATCHES[next.colors.len() % THEME_EDITOR_SWATCHES.len()].to_string());
+    let swatch = color.map(str::to_string).unwrap_or_else(|| {
+        THEME_EDITOR_SWATCHES[next.colors.len() % THEME_EDITOR_SWATCHES.len()].to_string()
+    });
     let spread = next.colors.len() as f32;
     next.colors.push(YgguiThemeColorStop {
         color: swatch,
@@ -156,9 +156,9 @@ fn grain_layer(theme: UiTheme, grain: f32) -> String {
     }
     let alpha = 0.015 + grain * 0.05;
     match theme {
-        UiTheme::ZedLight => format!(
-            "radial-gradient(circle, rgba(70,88,104,{alpha:.3}) 0.7px, transparent 0.8px)"
-        ),
+        UiTheme::ZedLight => {
+            format!("radial-gradient(circle, rgba(70,88,104,{alpha:.3}) 0.7px, transparent 0.8px)")
+        }
         UiTheme::ZedDark => format!(
             "radial-gradient(circle, rgba(255,255,255,{alpha:.3}) 0.7px, transparent 0.8px)"
         ),

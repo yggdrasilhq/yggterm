@@ -741,7 +741,9 @@ fn simplify_workspace_order_part(part: &str) -> String {
     let mut kept_order_prefix = None;
     while rest.len() > 5
         && rest.as_bytes().get(4) == Some(&b'-')
-        && rest.as_bytes()[0..4].iter().all(|byte| byte.is_ascii_digit())
+        && rest.as_bytes()[0..4]
+            .iter()
+            .all(|byte| byte.is_ascii_digit())
     {
         let candidate = &rest[..5];
         if kept_order_prefix.is_none() {

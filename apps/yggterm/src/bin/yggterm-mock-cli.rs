@@ -9,10 +9,9 @@ use std::time::Duration;
 use std::time::Instant;
 use yggterm_core::resolve_yggterm_home;
 use yggterm_server::{
-    YGG_LOADING_NOTIFICATION_AFTER_MS, YggEventEnvelope, YggEventKind, YggProgress,
+    SessionKind, YGG_LOADING_NOTIFICATION_AFTER_MS, YggEventEnvelope, YggEventKind, YggProgress,
     YggRequestMeta, YggSurface, YggTarget, default_endpoint, ping, refresh_remote_machine,
     request_terminal_launch, shutdown, snapshot, start_local_session_at, status,
-    SessionKind,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,7 +190,10 @@ fn run_scenario(
     endpoint: &yggterm_server::ServerEndpoint,
     iteration: usize,
 ) -> Result<()> {
-    let request_id = format!("yggterm-mock-cli-{}-{iteration}", cfg.scenario.operation_name());
+    let request_id = format!(
+        "yggterm-mock-cli-{}-{iteration}",
+        cfg.scenario.operation_name()
+    );
     let meta = YggRequestMeta::interactive(
         request_id,
         cfg.scenario.operation_name(),
@@ -294,9 +296,9 @@ fn run_scenario(
                 .as_deref()
                 .is_some_and(|path| path == session_path)
                 || snap
-                .live_sessions
-                .iter()
-                .any(|session| session.session_path == session_path);
+                    .live_sessions
+                    .iter()
+                    .any(|session| session.session_path == session_path);
             Ok(json!({
                 "session_path": session_path,
                 "active_view_mode": snap.active_view_mode,
@@ -353,7 +355,9 @@ fn run_scenario(
             cfg,
             YggEventEnvelope::new(meta.clone(), YggEventKind::Progress)
                 .with_elapsed_ms(elapsed_ms)
-                .with_message("loading threshold exceeded; stale-or-local UI should stay interactive")
+                .with_message(
+                    "loading threshold exceeded; stale-or-local UI should stay interactive",
+                )
                 .with_progress(YggProgress {
                     step: "waiting".to_string(),
                     current: None,
@@ -406,7 +410,10 @@ fn maybe_emit_artificial_delay(cfg: &Config, meta: &YggRequestMeta) -> Result<()
                     step: "delayed".to_string(),
                     current: Some(elapsed.div_ceil(step_ms)),
                     total: Some(total_steps),
-                    message: Some(format!("simulating a slow server path for {}ms", cfg.delay_ms)),
+                    message: Some(format!(
+                        "simulating a slow server path for {}ms",
+                        cfg.delay_ms
+                    )),
                 }),
         )?;
     }
