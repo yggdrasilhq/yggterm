@@ -66,8 +66,17 @@ pub enum WorkspaceViewMode {
     Rendered,
 }
 
-static REMOTE_YGGTERM_COMMAND_CACHE: OnceLock<Mutex<std::collections::HashMap<String, String>>> =
-    OnceLock::new();
+const REMOTE_COMMAND_CACHE_VERIFY_TTL_MS: u64 = 60_000;
+
+#[derive(Debug, Clone)]
+struct RemoteCommandCacheEntry {
+    binary_expr: String,
+    verified_at_ms: u64,
+}
+
+static REMOTE_YGGTERM_COMMAND_CACHE: OnceLock<
+    Mutex<std::collections::HashMap<String, RemoteCommandCacheEntry>>,
+> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TerminalBackend {
@@ -3731,7 +3740,8 @@ fn remote_cache_key(ssh_target: &str, exec_prefix: Option<&str>) -> String {
     format!("{}|{}", ssh_target, exec_prefix.unwrap_or_default())
 }
 
-fn remote_command_cache() -> &'static Mutex<std::collections::HashMap<String, String>> {
+fn remote_command_cache() -> &'static Mutex<std::collections::HashMap<String, RemoteCommandCacheEntry>>
+{
     REMOTE_YGGTERM_COMMAND_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -3988,14 +3998,33 @@ fn resolve_remote_yggterm_binary(
         .ok()
         .and_then(|cache| cache.get(&cache_key).cloned())
     {
-        if check_remote_protocol_version(ssh_target, exec_prefix, &cached).is_ok() {
+        let now_ms = current_millis_u64();
+        if now_ms.saturating_sub(cached.verified_at_ms) <= REMOTE_COMMAND_CACHE_VERIFY_TTL_MS {
             finish_span(serde_json::json!({
                 "ssh_target": ssh_target,
                 "result": "cache_hit",
-                "binary_expr": cached.clone(),
+                "binary_expr": cached.binary_expr.clone(),
                 "protocol_version": daemon::SERVER_PROTOCOL_VERSION,
             }));
-            return Ok((cached, RemoteDeployState::Ready));
+            return Ok((cached.binary_expr, RemoteDeployState::Ready));
+        }
+        if check_remote_protocol_version(ssh_target, exec_prefix, &cached.binary_expr).is_ok() {
+            if let Ok(mut cache) = remote_command_cache().lock() {
+                cache.insert(
+                    cache_key.clone(),
+                    RemoteCommandCacheEntry {
+                        binary_expr: cached.binary_expr.clone(),
+                        verified_at_ms: now_ms,
+                    },
+                );
+            }
+            finish_span(serde_json::json!({
+                "ssh_target": ssh_target,
+                "result": "cache_revalidated",
+                "binary_expr": cached.binary_expr.clone(),
+                "protocol_version": daemon::SERVER_PROTOCOL_VERSION,
+            }));
+            return Ok((cached.binary_expr, RemoteDeployState::Ready));
         }
         if let Ok(mut cache) = remote_command_cache().lock() {
             cache.remove(&cache_key);
@@ -4003,7 +4032,7 @@ fn resolve_remote_yggterm_binary(
         finish_span(serde_json::json!({
             "ssh_target": ssh_target,
             "result": "cache_invalidation",
-            "binary_expr": cached,
+            "binary_expr": cached.binary_expr,
         }));
     }
 
@@ -4011,7 +4040,13 @@ fn resolve_remote_yggterm_binary(
     match remote_protocol_version_for_binary(ssh_target, exec_prefix, installed_binary) {
         Ok(version) if version.trim() == daemon::SERVER_PROTOCOL_VERSION => {
             if let Ok(mut cache) = remote_command_cache().lock() {
-                cache.insert(cache_key, installed_binary.to_string());
+                cache.insert(
+                    cache_key,
+                    RemoteCommandCacheEntry {
+                        binary_expr: installed_binary.to_string(),
+                        verified_at_ms: current_millis_u64(),
+                    },
+                );
             }
             finish_span(serde_json::json!({
                 "ssh_target": ssh_target,
@@ -4043,7 +4078,13 @@ fn resolve_remote_yggterm_binary(
     match remote_protocol_version_for_binary(ssh_target, exec_prefix, "yggterm") {
         Ok(version) if version.trim() == daemon::SERVER_PROTOCOL_VERSION => {
             if let Ok(mut cache) = remote_command_cache().lock() {
-                cache.insert(cache_key, "yggterm".to_string());
+                cache.insert(
+                    cache_key,
+                    RemoteCommandCacheEntry {
+                        binary_expr: "yggterm".to_string(),
+                        verified_at_ms: current_millis_u64(),
+                    },
+                );
             }
             finish_span(serde_json::json!({
                 "ssh_target": ssh_target,
@@ -4084,7 +4125,13 @@ fn resolve_remote_yggterm_binary(
         );
     }
     if let Ok(mut cache) = remote_command_cache().lock() {
-        cache.insert(cache_key, installed.clone());
+        cache.insert(
+            cache_key,
+            RemoteCommandCacheEntry {
+                binary_expr: installed.clone(),
+                verified_at_ms: current_millis_u64(),
+            },
+        );
     }
     finish_span(serde_json::json!({
         "ssh_target": ssh_target,
@@ -6770,7 +6817,13 @@ mod tests {
     #[test]
     fn reopening_remote_scanned_session_refreshes_stale_launch_command() -> Result<()> {
         if let Ok(mut cache) = remote_command_cache().lock() {
-            cache.insert(remote_cache_key("jojo", None), "yggterm".to_string());
+            cache.insert(
+                remote_cache_key("jojo", None),
+                RemoteCommandCacheEntry {
+                    binary_expr: "yggterm".to_string(),
+                    verified_at_ms: current_millis_u64(),
+                },
+            );
         }
         let tree = SessionNode {
             kind: SessionNodeKind::Group,
