@@ -75,9 +75,9 @@ use yggterm_server::{
     refresh_remote_machine, remove_ssh_target, request_terminal_launch,
     set_all_preview_blocks_folded, set_view_mode as daemon_set_view_mode,
     shutdown as daemon_shutdown, snapshot as daemon_snapshot, stage_remote_clipboard_png,
-    start_command_session, start_local_session_at, status,
-    switch_agent_session_mode, take_next_screenshot_request, terminal_ensure, terminal_read,
-    terminal_resize, terminal_write, toggle_preview_block as daemon_toggle_preview_block,
+    start_command_session, start_local_session_at, status, switch_agent_session_mode,
+    take_next_screenshot_request, terminal_ensure, terminal_read, terminal_resize, terminal_write,
+    toggle_preview_block as daemon_toggle_preview_block,
 };
 
 static BOOTSTRAP: OnceCell<ShellBootstrap> = OnceCell::new();
@@ -1169,7 +1169,11 @@ impl ShellState {
                 if was_initial_sync {
                     self.seed_dynamic_top_level_expansions();
                 }
-                self.ensure_active_session_visible();
+                self.ensure_active_session_expanded();
+                if was_initial_sync || self.selected_tree_paths.is_empty() {
+                    self.sync_active_session_selection();
+                }
+                self.sync_browser_settings();
                 self.refresh_search_state("apply_daemon_snapshot_result");
                 self.record_restore_issue_telemetry("apply_daemon_snapshot_result");
                 self.record_preview_issue_telemetry("apply_daemon_snapshot_result");
@@ -1200,7 +1204,8 @@ impl ShellState {
         let was_initial_sync = self.needs_initial_server_sync;
         match result {
             Ok((snapshot, message)) => {
-                let snapshot = self.reconcile_snapshot_for_interactive_request(request_id, snapshot);
+                let snapshot =
+                    self.reconcile_snapshot_for_interactive_request(request_id, snapshot);
                 self.server.apply_snapshot(snapshot);
                 self.hydrate_generated_copy_from_remote_cache();
                 self.finish_busy_request_for(request_id);
@@ -1252,12 +1257,21 @@ impl ShellState {
     }
 
     fn ensure_active_session_visible(&mut self) {
+        self.ensure_active_session_expanded();
+        self.sync_active_session_selection();
+        self.sync_browser_settings();
+    }
+
+    fn ensure_active_session_expanded(&mut self) {
         let remote_paths = self.active_session_visibility_paths();
         if !remote_paths.is_empty() {
             self.browser.ensure_expanded_paths(remote_paths);
         } else if let Some(active) = self.server.active_session().cloned() {
             self.browser.ensure_visible_path(&active.session_path);
         }
+    }
+
+    fn sync_active_session_selection(&mut self) {
         if let Some(active) = self.server.active_session().cloned() {
             self.selected_tree_paths.clear();
             self.selected_tree_paths.insert(active.session_path.clone());
@@ -1266,30 +1280,27 @@ impl ShellState {
                 self.browser.select_path(active.session_path.clone());
             }
         }
-        self.sync_browser_settings();
     }
 
-fn active_session_visibility_paths(&self) -> Vec<String> {
-    let active_path = self
-        .server
-        .active_session()
-        .map(|session| session.session_path.clone())
+    fn active_session_visibility_paths(&self) -> Vec<String> {
+        let active_path = self
+            .server
+            .active_session()
+            .map(|session| session.session_path.clone())
             .or_else(|| self.server.active_session_path().map(ToOwned::to_owned));
-    let Some(active_path) = active_path else {
-        return Vec::new();
-    };
-    if self
-        .server
-        .live_sessions()
-        .iter()
-        .any(|session| session.session_path == active_path && !session.session_path.starts_with("remote-session://"))
-    {
-        return vec!["__live_sessions__".to_string()];
-    }
-    let Some((machine_key, session_id)) = parse_remote_scanned_session_path(&active_path)
-    else {
-        return Vec::new();
-    };
+        let Some(active_path) = active_path else {
+            return Vec::new();
+        };
+        if self.server.live_sessions().iter().any(|session| {
+            session.session_path == active_path
+                && !session.session_path.starts_with("remote-session://")
+        }) {
+            return vec!["__live_sessions__".to_string()];
+        }
+        let Some((machine_key, session_id)) = parse_remote_scanned_session_path(&active_path)
+        else {
+            return Vec::new();
+        };
         let mut paths = vec![format!("__remote_machine__/{machine_key}")];
         let active_cwd = self
             .server
@@ -4332,7 +4343,10 @@ fn spawn_start_group_session(mut state: Signal<ShellState>, row: BrowserRow, kin
     });
 }
 
-fn current_new_session_context(shell: &ShellState, kind: SessionKind) -> (Option<String>, Option<String>) {
+fn current_new_session_context(
+    shell: &ShellState,
+    kind: SessionKind,
+) -> (Option<String>, Option<String>) {
     let selected_row = shell
         .selected_workspace_rows()
         .into_iter()
@@ -4350,7 +4364,11 @@ fn current_new_session_context(shell: &ShellState, kind: SessionKind) -> (Option
         let title = if active.title.trim().is_empty() {
             None
         } else {
-            Some(format!("{} {}", active.title, session_kind_action_label(kind)))
+            Some(format!(
+                "{} {}",
+                active.title,
+                session_kind_action_label(kind)
+            ))
         };
         return (cwd, title);
     }
@@ -12749,6 +12767,7 @@ fn TerminalCanvas(
         &snapshot.settings.terminal_theme_name,
     );
     let future_theme = theme.clone();
+    let trace_home = perf_home_dir(&state.read().bootstrap.settings_path);
     let is_remote_resume_session = session.session_path.starts_with("remote-session://");
     let terminal_has_meaningful_output = use_signal(|| !is_remote_resume_session);
     let resume_overlay_expired = use_signal(|| !is_remote_resume_session);
@@ -12775,14 +12794,54 @@ fn TerminalCanvas(
         let host_id = future_host_id.clone();
         let title = terminal_title.clone();
         let theme = future_theme.clone();
+        let trace_home = trace_home.clone();
         let mut state = state;
         let mut terminal_has_meaningful_output = terminal_has_meaningful_output;
         async move {
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "terminal_mount",
+                "begin",
+                json!({
+                    "session_path": session_path.clone(),
+                    "host_id": host_id.clone(),
+                    "mount_epoch": mount_epoch,
+                }),
+            );
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "terminal_mount",
+                "ensure_begin",
+                json!({
+                    "session_path": session_path.clone(),
+                }),
+            );
             if let Err(error) = terminal_ensure_async(endpoint.clone(), session_path.clone()).await
             {
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "terminal_mount",
+                    "ensure_error",
+                    json!({
+                        "session_path": session_path.clone(),
+                        "error": error.to_string(),
+                    }),
+                );
                 warn!(session=%session_path, error=%error, "failed to ensure terminal");
                 return;
             }
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "terminal_mount",
+                "ensure_end",
+                json!({
+                    "session_path": session_path.clone(),
+                }),
+            );
             let mut eval = document::eval(&terminal_eval_script(&host_id, &theme));
             let _ = eval.send(TerminalJsCommand::Reset {
                 title,
@@ -12815,6 +12874,16 @@ fn TerminalCanvas(
                     event = eval.recv::<TerminalJsEvent>() => {
                         match event {
                             Ok(TerminalJsEvent::Ready) => {
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "terminal_mount",
+                                    "js_ready",
+                                    json!({
+                                        "session_path": session_path.clone(),
+                                        "host_id": host_id.clone(),
+                                    }),
+                                );
                                 if let Ok((next_cursor, chunks)) = terminal_read_async(endpoint.clone(), session_path.clone(), 0).await {
                                     cursor = next_cursor;
                                     read_poll_ms = if chunks.is_empty() { 140 } else { 60 };
@@ -12958,6 +13027,16 @@ fn TerminalCanvas(
                                 }
                             }
                             Err(error) => {
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "terminal_mount",
+                                    "js_bridge_closed",
+                                    json!({
+                                        "session_path": session_path.clone(),
+                                        "error": error.to_string(),
+                                    }),
+                                );
                                 warn!(session=%session_path, error=%error, "terminal eval bridge closed");
                                 break;
                             }
@@ -13008,6 +13087,16 @@ fn TerminalCanvas(
                                 }
                             }
                             Err(error) => {
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "terminal_mount",
+                                    "read_error",
+                                    json!({
+                                        "session_path": session_path.clone(),
+                                        "error": error.to_string(),
+                                    }),
+                                );
                                 warn!(session=%session_path, error=%error, "terminal read failed");
                                 break;
                             }
