@@ -2,6 +2,7 @@ mod browser;
 mod install;
 mod perf;
 mod titles;
+mod trace;
 mod transcript;
 mod workspace;
 
@@ -21,14 +22,18 @@ pub use browser::{
     unique_session_short_ids_for_pairs,
 };
 pub use install::{
-    InstallChannel, InstallContext, ReleaseUpdate, UpdatePolicy, check_for_update,
-    current_asset_label, current_version, detect_install_context, direct_install_root,
-    install_mode_summary, install_release_update, refresh_desktop_integration, update_command_hint,
-    write_direct_install_state, ENV_YGGTERM_DIRECT_INSTALL_ROOT, YGGTERM_DESKTOP_APP_ID,
+    ENV_YGGTERM_DIRECT_INSTALL_ROOT, InstallChannel, InstallContext, ReleaseUpdate, UpdatePolicy,
+    YGGTERM_DESKTOP_APP_ID, check_for_update, current_asset_label, current_version,
+    detect_install_context, direct_install_root, install_mode_summary, install_release_update,
+    refresh_desktop_integration, update_command_hint, write_direct_install_state,
 };
 pub use perf::{PERF_TELEMETRY_FILENAME, PerfSpan, append_perf_event, perf_telemetry_path};
 pub use titles::{
     SessionTitleStore, looks_like_generated_fallback_title, looks_like_low_signal_generated_copy,
+};
+pub use trace::{
+    EVENT_TRACE_FILENAME, EventTraceRecord, EventTraceSpan, append_trace_event, event_trace_path,
+    follow_trace_lines, read_trace_tail,
 };
 pub use transcript::{
     TranscriptMessage, TranscriptRole, generation_context_from_messages,
