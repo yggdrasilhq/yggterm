@@ -67,7 +67,9 @@ pub fn canonical_tree_leaf_name(path: &str) -> String {
     let mut stripped = unanchored.trim_start_matches('!');
     while stripped.len() > 5
         && stripped.as_bytes().get(4) == Some(&b'-')
-        && stripped.as_bytes()[0..4].iter().all(|byte| byte.is_ascii_digit())
+        && stripped.as_bytes()[0..4]
+            .iter()
+            .all(|byte| byte.is_ascii_digit())
     {
         stripped = &stripped[5..];
     }
@@ -198,7 +200,10 @@ pub fn build_tree_reorder_plan<K: Clone>(
     let mut siblings_by_parent = BTreeMap::<String, Vec<TreeReorderItem<K>>>::new();
     for row in items.iter() {
         if let Some(parent) = row.parent_path.clone() {
-            siblings_by_parent.entry(parent).or_default().push(row.clone());
+            siblings_by_parent
+                .entry(parent)
+                .or_default()
+                .push(row.clone());
         }
     }
 
@@ -247,7 +252,8 @@ pub fn build_tree_reorder_plan<K: Clone>(
                 continue;
             }
             let original_parent = row.parent_path.clone().unwrap_or_else(|| parent.clone());
-            let temp_path = staging_tree_child_path(&original_parent, &row.path, temp_token, temp_index);
+            let temp_path =
+                staging_tree_child_path(&original_parent, &row.path, temp_token, temp_index);
             temp_index += 1;
             plan.push(TreeReorderPlanItem {
                 kind: row.kind.clone(),
@@ -327,9 +333,8 @@ mod tests {
             },
         )
         .expect("placement");
-        let plan =
-            build_tree_reorder_plan(&items, std::slice::from_ref(&gg), &placement, "test")
-                .expect("plan");
+        let plan = build_tree_reorder_plan(&items, std::slice::from_ref(&gg), &placement, "test")
+            .expect("plan");
         let gg_plan = plan
             .iter()
             .find(|item| item.from_path == gg.path)

@@ -1,3 +1,4 @@
+use crate::{YGGTERM_ICON_ASSETS, install_linux_icon_assets};
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -341,7 +342,8 @@ fn should_repair_linux_launcher(context: &InstallContext) -> bool {
     let launcher_text = fs::read_to_string(&launcher_path).unwrap_or_default();
     launcher_file_looks_stale(&launcher_path, &launcher_text)
         || desktop_text.contains("/tmp/yggterm-")
-        || !desktop_text.contains(&format!("Icon={YGGTERM_DESKTOP_APP_ID}"))
+        || !desktop_text.contains("Icon=")
+        || !desktop_text.contains("yggterm.svg")
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -354,26 +356,11 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
     let mut notes = Vec::new();
     let data_dir = dirs::data_local_dir().context("unable to resolve local data dir")?;
     let applications_dir = data_dir.join("applications");
-    let pixmaps_dir = data_dir.join("pixmaps");
     let direct_assets_dir = context
         .managed_root
         .clone()
         .unwrap_or_else(|| data_dir.join("yggterm").join("direct"));
-    let icons_dir = data_dir
-        .join("icons")
-        .join("hicolor")
-        .join("512x512")
-        .join("apps");
-    let scalable_icons_dir = data_dir
-        .join("icons")
-        .join("hicolor")
-        .join("scalable")
-        .join("apps");
     fs::create_dir_all(&applications_dir)?;
-    fs::create_dir_all(&pixmaps_dir)?;
-    fs::create_dir_all(&direct_assets_dir)?;
-    fs::create_dir_all(&icons_dir)?;
-    fs::create_dir_all(&scalable_icons_dir)?;
 
     let launcher_path = if let Some(bin_dir) = linux_user_bin_dir() {
         fs::create_dir_all(&bin_dir)?;
@@ -398,42 +385,16 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
         None
     };
 
-    for icon_name in ["yggterm", YGGTERM_DESKTOP_APP_ID] {
-        let icon_path = icons_dir.join(format!("{icon_name}.png"));
-        write_if_changed(
-            &icon_path,
-            include_bytes!("../../../assets/brand/yggterm-icon-512.png"),
-        )?;
-        let scalable_icon_path = scalable_icons_dir.join(format!("{icon_name}.svg"));
-        write_if_changed(
-            &scalable_icon_path,
-            include_bytes!("../../../assets/brand/yggterm-icon.svg"),
-        )?;
-    }
-    let pixmaps_icon_path = pixmaps_dir.join("yggterm.png");
-    write_if_changed(
-        &pixmaps_icon_path,
-        include_bytes!("../../../assets/brand/yggterm-icon-512.png"),
-    )?;
-    let pixmaps_scalable_icon_path = pixmaps_dir.join("yggterm.svg");
-    write_if_changed(
-        &pixmaps_scalable_icon_path,
-        include_bytes!("../../../assets/brand/yggterm-icon.svg"),
-    )?;
-    let direct_icon_path = direct_assets_dir.join("yggterm.png");
-    write_if_changed(
-        &direct_icon_path,
-        include_bytes!("../../../assets/brand/yggterm-icon-512.png"),
-    )?;
-    let direct_scalable_icon_path = direct_assets_dir.join("yggterm.svg");
-    write_if_changed(
-        &direct_scalable_icon_path,
-        include_bytes!("../../../assets/brand/yggterm-icon.svg"),
+    let installed_icons = install_linux_icon_assets(
+        &data_dir,
+        &direct_assets_dir,
+        &["yggterm", YGGTERM_DESKTOP_APP_ID],
+        YGGTERM_ICON_ASSETS,
     )?;
     let desktop_path = applications_dir.join(format!("{YGGTERM_DESKTOP_APP_ID}.desktop"));
     let legacy_desktop_path = applications_dir.join("yggterm.desktop");
     let desktop_exec_path = launcher_path.as_deref().unwrap_or(&context.executable_path);
-    let desktop_icon_path = desktop_exec_escape(&direct_scalable_icon_path);
+    let desktop_icon_path = desktop_exec_escape(&installed_icons.direct_svg_path);
     let desktop_contents = format!(
         "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Yggterm\nComment=Remote-first terminal workspace\nExec={}\nTryExec={}\nIcon={}\nTerminal=false\nNoDisplay=true\nCategories=System;TerminalEmulator;Development;\nStartupNotify=true\nStartupWMClass={}\nX-Desktop-File-Install-Version=0.27\n",
         desktop_exec_escape(desktop_exec_path),
@@ -503,7 +464,7 @@ fn refresh_macos_integration(context: &InstallContext) -> Result<Vec<String>> {
     )?;
     write_if_changed(
         &resources_dir.join("yggterm.png"),
-        include_bytes!("../../../assets/brand/yggterm-icon-512.png"),
+        YGGTERM_ICON_ASSETS.png_512_bytes,
     )?;
     notes.push(format!("app bundle refreshed at {}", app_dir.display()));
     Ok(notes)
@@ -701,7 +662,12 @@ fn run_install_integrate_with_binary(binary_path: &Path, root: &Path) -> Result<
         .arg("integrate")
         .env(ENV_YGGTERM_DIRECT_INSTALL_ROOT, root)
         .status()
-        .with_context(|| format!("failed to launch {} install integrate", binary_path.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to launch {} install integrate",
+                binary_path.display()
+            )
+        })?;
     if !status.success() {
         anyhow::bail!(
             "{} install integrate exited with status {status}",
@@ -843,10 +809,12 @@ fn linux_launcher_script(
     fallback_executable: &Path,
     launcher_name: &str,
 ) -> String {
-    let managed_root = context
-        .managed_root
-        .clone()
-        .unwrap_or_else(|| dirs::data_local_dir().unwrap_or_default().join("yggterm").join("direct"));
+    let managed_root = context.managed_root.clone().unwrap_or_else(|| {
+        dirs::data_local_dir()
+            .unwrap_or_default()
+            .join("yggterm")
+            .join("direct")
+    });
     let root_quoted = shell_single_quote(&managed_root.to_string_lossy());
     let fallback_quoted = shell_single_quote(&fallback_executable.to_string_lossy());
     let binary_quoted = shell_single_quote(binary_name);
@@ -858,8 +826,7 @@ fn linux_launcher_script(
     let export_root = if context.channel == InstallChannel::Direct {
         format!(
             "export {}={}\n",
-            ENV_YGGTERM_DIRECT_INSTALL_ROOT,
-            root_quoted
+            ENV_YGGTERM_DIRECT_INSTALL_ROOT, root_quoted
         )
     } else {
         String::new()

@@ -1,12 +1,7 @@
 use dioxus::prelude::*;
 
 #[component]
-pub fn SideRailShell(
-    visible: bool,
-    width_px: usize,
-    zoom_percent: f32,
-    body: Element,
-) -> Element {
+pub fn SideRailShell(visible: bool, width_px: usize, zoom_percent: f32, body: Element) -> Element {
     let rail_width = if visible { width_px } else { 0 };
     let opacity = if visible { "1" } else { "0" };
     let translate = if visible {
@@ -31,10 +26,7 @@ pub fn SideRailShell(
 }
 
 #[component]
-pub fn RailHeader(
-    title: String,
-    color: String,
-) -> Element {
+pub fn RailHeader(title: String, color: String) -> Element {
     rsx! {
         div {
             style: format!(
@@ -48,9 +40,7 @@ pub fn RailHeader(
 }
 
 #[component]
-pub fn RailScrollBody(
-    content: Element,
-) -> Element {
+pub fn RailScrollBody(content: Element) -> Element {
     rsx! {
         div {
             style: "flex:1; overflow:auto; padding:10px 16px 14px 16px; display:flex; flex-direction:column; gap:14px; \
@@ -61,10 +51,7 @@ pub fn RailScrollBody(
 }
 
 #[component]
-pub fn RailSectionTitle(
-    title: String,
-    muted_color: String,
-) -> Element {
+pub fn RailSectionTitle(title: String, muted_color: String) -> Element {
     rsx! {
         div {
             style: format!(

@@ -176,9 +176,7 @@ impl SessionBrowserState {
     pub fn ensure_visible_path(&mut self, path: &str) {
         let mut changed = false;
         for ancestor in Path::new(path).ancestors().skip(1) {
-            changed |= self
-                .expanded_paths
-                .insert(ancestor.display().to_string());
+            changed |= self.expanded_paths.insert(ancestor.display().to_string());
         }
         if changed {
             self.rebuild_rows();
@@ -540,7 +538,9 @@ fn unique_session_short_ids(root: &SessionNode) -> HashMap<String, String> {
 /// Keep this rule portable: `codex-session-tui` and any future browser/tree UI
 /// should use the same widening behavior so placeholder hash titles never
 /// collide in one visible list.
-pub fn unique_session_short_ids_for_pairs(sessions: &[(String, String)]) -> HashMap<String, String> {
+pub fn unique_session_short_ids_for_pairs(
+    sessions: &[(String, String)],
+) -> HashMap<String, String> {
     let mut out = HashMap::new();
 
     for (path, session_id) in sessions {

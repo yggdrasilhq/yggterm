@@ -55,10 +55,18 @@ pub fn enqueue_screenshot_request(
 ) -> Result<ScreenshotRequest> {
     let requests_dir = screenshot_requests_dir(home);
     let captures_dir = screenshot_captures_dir(home);
-    fs::create_dir_all(&requests_dir)
-        .with_context(|| format!("creating screenshot requests dir {}", requests_dir.display()))?;
-    fs::create_dir_all(&captures_dir)
-        .with_context(|| format!("creating screenshot captures dir {}", captures_dir.display()))?;
+    fs::create_dir_all(&requests_dir).with_context(|| {
+        format!(
+            "creating screenshot requests dir {}",
+            requests_dir.display()
+        )
+    })?;
+    fs::create_dir_all(&captures_dir).with_context(|| {
+        format!(
+            "creating screenshot captures dir {}",
+            captures_dir.display()
+        )
+    })?;
     let request_id = Uuid::new_v4().to_string();
     let request = ScreenshotRequest {
         output_path: output_path
@@ -83,8 +91,12 @@ pub fn take_next_screenshot_request(
     worker_pid: u32,
 ) -> Result<Option<(PathBuf, ScreenshotRequest)>> {
     let requests_dir = screenshot_requests_dir(home);
-    fs::create_dir_all(&requests_dir)
-        .with_context(|| format!("creating screenshot requests dir {}", requests_dir.display()))?;
+    fs::create_dir_all(&requests_dir).with_context(|| {
+        format!(
+            "creating screenshot requests dir {}",
+            requests_dir.display()
+        )
+    })?;
     let mut entries = fs::read_dir(&requests_dir)?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -98,7 +110,10 @@ pub fn take_next_screenshot_request(
         .collect::<Vec<_>>();
     entries.sort();
     for path in entries {
-        let file_name = path.file_name().and_then(|value| value.to_str()).unwrap_or("request.json");
+        let file_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("request.json");
         let inflight_path = requests_dir.join(format!("inflight-{worker_pid}-{file_name}"));
         if fs::rename(&path, &inflight_path).is_err() {
             continue;
@@ -143,11 +158,13 @@ pub fn wait_for_screenshot_response(
     let started = std::time::Instant::now();
     while started.elapsed() <= timeout {
         if response_path.is_file() {
-            let bytes = fs::read(&response_path)
-                .with_context(|| format!("reading screenshot response {}", response_path.display()))?;
-            let response = serde_json::from_slice::<ScreenshotResponse>(&bytes).with_context(|| {
-                format!("parsing screenshot response {}", response_path.display())
+            let bytes = fs::read(&response_path).with_context(|| {
+                format!("reading screenshot response {}", response_path.display())
             })?;
+            let response =
+                serde_json::from_slice::<ScreenshotResponse>(&bytes).with_context(|| {
+                    format!("parsing screenshot response {}", response_path.display())
+                })?;
             let _ = fs::remove_file(&response_path);
             return Ok(response);
         }

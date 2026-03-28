@@ -1,3 +1,11 @@
+yggterm (2.0.27-1) unstable; urgency=medium
+
+  * Add an embedded app screenshot command so a live Yggterm window can capture itself for remote debugging and support bundles.
+  * Make the screenshot capture path cross-platform across Linux, macOS, and Windows backends.
+  * Centralize icon assets around one canonical SVG plus generated PNG workflow, and expose a reusable yggui window-icon loader for future apps.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sat, 28 Mar 2026 13:10:00 +0530
+
 yggterm (2.0.25-1) unstable; urgency=medium
 
   * Scope remote Codex discovery to the actual SSH login user's ~/.codex so Yggterm does not advertise sessions from a different account that cannot be resumed.

@@ -35,7 +35,11 @@ pub struct PerfSpan {
 }
 
 impl PerfSpan {
-    pub fn start(home: impl Into<PathBuf>, category: impl Into<String>, name: impl Into<String>) -> Self {
+    pub fn start(
+        home: impl Into<PathBuf>,
+        category: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Self {
         Self {
             home: home.into(),
             category: category.into(),

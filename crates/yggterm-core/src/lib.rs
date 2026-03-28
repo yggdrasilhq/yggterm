@@ -1,4 +1,5 @@
 mod browser;
+mod icon;
 mod install;
 mod perf;
 mod titles;
@@ -20,6 +21,9 @@ use titles::{SessionTitleResolver, settings_ready as litellm_settings_ready};
 pub use browser::{
     BrowserMetrics, BrowserRow, BrowserRowKind, SessionBrowserState,
     unique_session_short_ids_for_pairs,
+};
+pub use icon::{
+    AppIconAssets, LinuxInstalledIconSet, YGGTERM_ICON_ASSETS, install_linux_icon_assets,
 };
 pub use install::{
     ENV_YGGTERM_DIRECT_INSTALL_ROOT, InstallChannel, InstallContext, ReleaseUpdate, UpdatePolicy,

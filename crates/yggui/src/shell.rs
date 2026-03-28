@@ -63,21 +63,20 @@ use yggterm_core::{
 use yggterm_platform::DockRect;
 use yggterm_server::{
     GhosttyTerminalHostMode, ManagedSessionView, PreviewTone, RemoteMachineHealth,
-    RemoteMachineSnapshot, RemoteScannedSession, ServerEndpoint, ServerRuntimeStatus,
-    ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionPreviewBlock,
-    SessionRenderedSection, ScreenshotResponse, ScreenshotTarget, SshConnectTarget,
-    TerminalBackend, WorkspaceViewMode, YGG_LOADING_NOTIFICATION_AFTER_MS, YggRequestMeta,
-    YggSurface, YggTarget, YggtermServer, complete_screenshot_request,
-    apply_remote_preview_payload_for_path, cleanup_legacy_daemons, connect_ssh_custom,
-    default_screenshot_output_path,
+    RemoteMachineSnapshot, RemoteScannedSession, ScreenshotResponse, ScreenshotTarget,
+    ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry,
+    SessionPreviewBlock, SessionRenderedSection, SshConnectTarget, TerminalBackend,
+    WorkspaceViewMode, YGG_LOADING_NOTIFICATION_AFTER_MS, YggRequestMeta, YggSurface, YggTarget,
+    YggtermServer, apply_remote_preview_payload_for_path, cleanup_legacy_daemons,
+    complete_screenshot_request, connect_ssh_custom, default_screenshot_output_path,
     fetch_remote_generation_context, fetch_remote_preview_payload, focus_live, open_remote_session,
     open_stored_session, persist_remote_generated_copy, ping, refresh_managed_cli,
-    refresh_remote_machine, remove_ssh_target, request_terminal_launch, take_next_screenshot_request,
+    refresh_remote_machine, remove_ssh_target, request_terminal_launch,
     set_all_preview_blocks_folded, set_view_mode as daemon_set_view_mode,
     shutdown as daemon_shutdown, snapshot as daemon_snapshot, stage_remote_clipboard_png,
     start_command_session, start_local_session, start_local_session_at, status,
-    switch_agent_session_mode, terminal_ensure, terminal_read, terminal_resize, terminal_write,
-    toggle_preview_block as daemon_toggle_preview_block,
+    switch_agent_session_mode, take_next_screenshot_request, terminal_ensure, terminal_read,
+    terminal_resize, terminal_write, toggle_preview_block as daemon_toggle_preview_block,
 };
 
 static BOOTSTRAP: OnceCell<ShellBootstrap> = OnceCell::new();
@@ -8057,7 +8056,9 @@ async fn process_pending_screenshot_requests(settings_path: &std::path::Path) ->
         }),
     );
     let result = match request.target {
-        ScreenshotTarget::App => capture_app_window_screenshot(Path::new(&request.output_path)).await,
+        ScreenshotTarget::App => {
+            capture_app_window_screenshot(Path::new(&request.output_path)).await
+        }
     };
     let response = match result {
         Ok(output_path) => ScreenshotResponse {
@@ -8555,7 +8556,7 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
 
     let window = WindowBuilder::new()
         .with_title("Yggterm")
-        .with_window_icon(Some(window_icon::load_window_icon()))
+        .with_window_icon(Some(window_icon::load_yggterm_window_icon()))
         .with_transparent(true)
         .with_decorations(false)
         .with_resizable(true)

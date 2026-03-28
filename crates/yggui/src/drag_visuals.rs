@@ -1,6 +1,6 @@
 use crate::drag_tree::DragDropPlacement;
-use dioxus::prelude::*;
 use dioxus::html::input_data::MouseButton;
+use dioxus::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DragGhostPalette {
@@ -129,10 +129,7 @@ pub fn TreeDropZones(
 }
 
 #[component]
-pub fn DragStartHandle(
-    draggable: bool,
-    on_start_drag: EventHandler<MouseEvent>,
-) -> Element {
+pub fn DragStartHandle(draggable: bool, on_start_drag: EventHandler<MouseEvent>) -> Element {
     rsx! {
         div {
             style: "position:absolute; inset:0; z-index:1; background:transparent;",

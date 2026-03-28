@@ -72,10 +72,15 @@ impl SessionTitleStore {
     }
 
     pub fn get_precis(&self, session_id: &str) -> Result<Option<String>> {
-        Ok(self.get_precis_record(session_id)?.map(|record| record.value))
+        Ok(self
+            .get_precis_record(session_id)?
+            .map(|record| record.value))
     }
 
-    pub fn get_precis_record(&self, session_id: &str) -> Result<Option<GeneratedCopyRecord>> {
+    pub(crate) fn get_precis_record(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<GeneratedCopyRecord>> {
         let mut stmt = self
             .conn
             .prepare("SELECT precis, updated_at FROM session_precis WHERE session_id = ?1")?;
@@ -92,10 +97,15 @@ impl SessionTitleStore {
     }
 
     pub fn get_summary(&self, session_id: &str) -> Result<Option<String>> {
-        Ok(self.get_summary_record(session_id)?.map(|record| record.value))
+        Ok(self
+            .get_summary_record(session_id)?
+            .map(|record| record.value))
     }
 
-    pub fn get_summary_record(&self, session_id: &str) -> Result<Option<GeneratedCopyRecord>> {
+    pub(crate) fn get_summary_record(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<GeneratedCopyRecord>> {
         let mut stmt = self
             .conn
             .prepare("SELECT summary, updated_at FROM session_summaries WHERE session_id = ?1")?;
@@ -259,7 +269,12 @@ impl SessionTitleResolver {
         context: &str,
         force: bool,
     ) -> Result<Option<String>> {
-        info!(session_id, force, context_chars = context.len(), "resolving context title");
+        info!(
+            session_id,
+            force,
+            context_chars = context.len(),
+            "resolving context title"
+        );
         if !force {
             if let Some(title) = self.store.get_title(session_id)? {
                 if !looks_like_generated_fallback_title(&title) {
@@ -553,7 +568,9 @@ pub fn settings_ready(settings: &AppSettings) -> bool {
 }
 
 fn extract_tail_context(path: &Path) -> Result<String> {
-    Ok(generation_context_from_messages(&read_codex_transcript_messages(path)?))
+    Ok(generation_context_from_messages(
+        &read_codex_transcript_messages(path)?,
+    ))
 }
 
 fn request_litellm_title(settings: &AppSettings, context: &str) -> Result<String> {
@@ -789,7 +806,11 @@ fn sanitize_generated_precis(raw: &str) -> Option<String> {
         return None;
     }
     let without_aux = strip_auxiliary_image_sentences(sanitized);
-    let final_text = if without_aux.is_empty() { sanitized } else { without_aux.as_str() };
+    let final_text = if without_aux.is_empty() {
+        sanitized
+    } else {
+        without_aux.as_str()
+    };
     Some(final_text.chars().take(180).collect::<String>())
 }
 
@@ -813,15 +834,16 @@ fn sanitize_generated_summary(raw: &str) -> Option<String> {
         sanitized_owned
     };
     const MAX_SUMMARY_CHARS: usize = 560;
-    let bounded = sanitized.chars().take(MAX_SUMMARY_CHARS).collect::<String>();
+    let bounded = sanitized
+        .chars()
+        .take(MAX_SUMMARY_CHARS)
+        .collect::<String>();
     if sanitized.chars().count() <= MAX_SUMMARY_CHARS {
         return Some(bounded);
     }
-    if let Some(ix) = bounded
-        .char_indices()
-        .rev()
-        .find_map(|(ix, ch)| ((ch == '.' || ch == '!' || ch == '?') && ix >= 160).then_some(ix + ch.len_utf8()))
-    {
+    if let Some(ix) = bounded.char_indices().rev().find_map(|(ix, ch)| {
+        ((ch == '.' || ch == '!' || ch == '?') && ix >= 160).then_some(ix + ch.len_utf8())
+    }) {
         return Some(bounded[..ix].trim().to_string());
     }
     if let Some(ix) = bounded
@@ -894,8 +916,8 @@ mod tests {
 
     #[test]
     fn sanitize_generated_summary_compacts_lines() {
-        let summary = sanitize_generated_summary("\"First line.\n\nSecond line.\"\n")
-            .expect("summary");
+        let summary =
+            sanitize_generated_summary("\"First line.\n\nSecond line.\"\n").expect("summary");
         assert_eq!(summary, "First line. Second line.");
     }
 
@@ -1072,10 +1094,7 @@ pub fn looks_like_generated_fallback_title(title: &str) -> bool {
     let compact = title.trim();
     (compact.len() == 7 || compact.len() == 8)
         && compact.starts_with('Q')
-        && compact
-            .chars()
-            .skip(1)
-            .all(|ch| ch.is_ascii_hexdigit())
+        && compact.chars().skip(1).all(|ch| ch.is_ascii_hexdigit())
 }
 
 pub fn looks_like_low_signal_generated_copy(text: &str) -> bool {
