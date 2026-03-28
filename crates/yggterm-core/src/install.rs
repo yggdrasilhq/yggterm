@@ -13,6 +13,7 @@ const INSTALL_STATE_FILENAME: &str = "install-state.json";
 pub const ENV_YGGTERM_DIRECT_INSTALL_ROOT: &str = "YGGTERM_DIRECT_INSTALL_ROOT";
 pub const YGGTERM_DESKTOP_APP_ID: &str = "dev.yggterm.Yggterm";
 pub const ENV_YGGTERM_ENABLE_ACCESSIBILITY: &str = "YGGTERM_ENABLE_ACCESSIBILITY";
+pub const ENV_YGGTERM_ENABLE_WEBKIT_COMPOSITING: &str = "YGGTERM_ENABLE_WEBKIT_COMPOSITING";
 const LINUX_LAUNCHER_MARKER: &str = "yggterm-direct-launcher-v2";
 const MOCK_CLI_NAME: &str = "yggterm-mock-cli";
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -823,6 +824,10 @@ fn linux_launcher_script(
         "if [ \"${{{env_enable}:-0}}\" != '1' ] && [ -z \"${{NO_AT_BRIDGE+x}}\" ]; then\n  export NO_AT_BRIDGE=1\nfi\n",
         env_enable = ENV_YGGTERM_ENABLE_ACCESSIBILITY,
     );
+    let webkit_guard = format!(
+        "if [ \"${{{env_enable}:-0}}\" != '1' ] && [ -z \"${{WEBKIT_DISABLE_COMPOSITING_MODE+x}}\" ]; then\n  export WEBKIT_DISABLE_COMPOSITING_MODE=1\nfi\n",
+        env_enable = ENV_YGGTERM_ENABLE_WEBKIT_COMPOSITING,
+    );
     let export_root = if context.channel == InstallChannel::Direct {
         format!(
             "export {}={}\n",
@@ -832,7 +837,7 @@ fn linux_launcher_script(
         String::new()
     };
     format!(
-        "#!/usr/bin/env sh\n# {marker}\nset -eu\nROOT={root}\nSTATE=\"$ROOT/{state_file}\"\nBINARY_NAME={binary_name}\ntarget=\"\"\nif [ \"$BINARY_NAME\" = 'yggterm' ] && [ -f \"$STATE\" ]; then\n  target=\"$(sed -n 's/.*\"active_executable\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$STATE\" | head -n1)\"\nfi\nif [ -z \"$target\" ] || [ ! -x \"$target\" ]; then\n  latest_version=\"$(find \"$ROOT/versions\" -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' 2>/dev/null | sort -V | tail -n1)\"\n  if [ -n \"$latest_version\" ] && [ -x \"$ROOT/versions/$latest_version/$BINARY_NAME\" ]; then\n    target=\"$ROOT/versions/$latest_version/$BINARY_NAME\"\n  fi\nfi\nif [ -z \"$target\" ] || [ ! -x \"$target\" ]; then\n  target={fallback}\nfi\n[ -x \"$target\" ] || {{ printf '%s\\n' '{launcher_name}: no runnable executable found' >&2; exit 1; }}\n{accessibility_guard}{export_root}exec \"$target\" \"$@\"\n",
+        "#!/usr/bin/env sh\n# {marker}\nset -eu\nROOT={root}\nSTATE=\"$ROOT/{state_file}\"\nBINARY_NAME={binary_name}\ntarget=\"\"\nif [ \"$BINARY_NAME\" = 'yggterm' ] && [ -f \"$STATE\" ]; then\n  target=\"$(sed -n 's/.*\"active_executable\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$STATE\" | head -n1)\"\nfi\nif [ -z \"$target\" ] || [ ! -x \"$target\" ]; then\n  latest_version=\"$(find \"$ROOT/versions\" -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' 2>/dev/null | sort -V | tail -n1)\"\n  if [ -n \"$latest_version\" ] && [ -x \"$ROOT/versions/$latest_version/$BINARY_NAME\" ]; then\n    target=\"$ROOT/versions/$latest_version/$BINARY_NAME\"\n  fi\nfi\nif [ -z \"$target\" ] || [ ! -x \"$target\" ]; then\n  target={fallback}\nfi\n[ -x \"$target\" ] || {{ printf '%s\\n' '{launcher_name}: no runnable executable found' >&2; exit 1; }}\n{accessibility_guard}{webkit_guard}{export_root}exec \"$target\" \"$@\"\n",
         marker = LINUX_LAUNCHER_MARKER,
         root = root_quoted,
         state_file = INSTALL_STATE_FILENAME,
@@ -840,6 +845,7 @@ fn linux_launcher_script(
         fallback = fallback_quoted,
         launcher_name = launcher_quoted,
         accessibility_guard = accessibility_guard,
+        webkit_guard = webkit_guard,
         export_root = export_root,
     )
 }
