@@ -16,6 +16,7 @@ use yggterm_server::{
     PersistedDaemonState, SessionKind, YggtermServer, cleanup_legacy_daemons, default_endpoint,
     detect_ghostty_host, ping, run_attach, run_daemon, run_remote_generation_context,
     run_remote_preview, run_remote_protocol_version, run_remote_resume_codex, run_remote_scan,
+    run_screenshot_capture,
     run_remote_stage_clipboard_png, run_remote_terminate_codex, run_remote_upsert_generated_copy,
     run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, start_local_session, status,
 };
@@ -101,6 +102,24 @@ fn main() -> Result<()> {
             .unwrap_or(200);
         let include_screenshot = args.iter().any(|value| value == "--screenshot");
         return run_trace_bundle(lines, include_screenshot);
+    }
+    if args.len() >= 3 && args[0] == "server" && args[1] == "screenshot" {
+        let timeout_ms = args
+            .windows(2)
+            .find_map(|window| {
+                if window[0] == "--timeout-ms" {
+                    window[1].parse::<u64>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(15_000);
+        let output_path = args
+            .iter()
+            .skip(3)
+            .find(|value| !value.starts_with("--"))
+            .map(String::as_str);
+        return run_screenshot_capture(&args[2], output_path, timeout_ms);
     }
     if args.len() == 4 && args[0] == "server" && args[1] == "remote" && args[2] == "preview" {
         return run_remote_preview(&args[3]);

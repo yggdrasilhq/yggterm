@@ -231,9 +231,10 @@ Observability:
   regressions can be profiled without the desktop shell
 - `server trace tail <lines>` should dump the last trace probes from `~/.yggterm/event-trace.jsonl`
 - `server trace follow <lines> [poll_ms]` should stay attached and stream new probes as they land
+- `server screenshot app [output_path] [--timeout-ms <ms>]` should ask a live yggterm GUI client to capture its current window and return the saved png path or an error
 - `server trace bundle <lines> --screenshot` should emit a support bundle with event trace tail,
-  perf tail, UI telemetry tail, daemon summary, and a best-effort screenshot path when a display
-  capture tool is available
+  perf tail, UI telemetry tail, daemon summary, and a screenshot path. Embedded app capture
+  should be preferred before falling back to external desktop capture tools
 
 ## Search
 
