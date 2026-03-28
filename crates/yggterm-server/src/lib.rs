@@ -7,11 +7,11 @@ mod protocol;
 mod terminal;
 
 pub use app_control::{
-    AppControlCommand, AppControlRequest, AppControlResponse, AppControlViewMode, ScreenshotTarget,
-    app_control_captures_dir, app_control_requests_dir, app_control_responses_dir,
-    complete_app_control_request, current_millis, default_screenshot_output_path,
-    enqueue_app_control_request, enqueue_screenshot_request, take_next_app_control_request,
-    wait_for_app_control_response,
+    AppControlCommand, AppControlDragCommand, AppControlDragPlacement, AppControlRequest,
+    AppControlResponse, AppControlViewMode, ScreenshotTarget, app_control_captures_dir,
+    app_control_requests_dir, app_control_responses_dir, complete_app_control_request,
+    current_millis, default_screenshot_output_path, enqueue_app_control_request,
+    enqueue_screenshot_request, take_next_app_control_request, wait_for_app_control_response,
 };
 pub use attach::{AttachMetadata, run_attach};
 pub use codex_cli::{ManagedCliTool, ManagedCliToolStatus};
@@ -579,8 +579,19 @@ impl YggtermServer {
         self.request_terminal_launch_for_active();
     }
 
+    fn resolve_session_storage_key<'a>(&'a self, path: &'a str) -> Option<&'a str> {
+        if self.sessions.contains_key(path) {
+            return Some(path);
+        }
+        self.sessions
+            .iter()
+            .find(|(_, session)| session.session_path == path)
+            .map(|(key, _)| key.as_str())
+    }
+
     pub fn terminal_spec(&self, path: &str) -> Option<(String, Option<String>)> {
-        self.sessions.get(path).and_then(|session| {
+        let key = self.resolve_session_storage_key(path)?;
+        self.sessions.get(key).and_then(|session| {
             if session.kind == SessionKind::Document {
                 return recipe_terminal_spec(session);
             }
@@ -594,7 +605,8 @@ impl YggtermServer {
     }
 
     pub fn terminal_stop_command(&self, path: &str) -> Option<String> {
-        let session = self.sessions.get(path)?;
+        let key = self.resolve_session_storage_key(path)?;
+        let session = self.sessions.get(key)?;
         if session.kind == SessionKind::Document {
             return recipe_terminal_spec(session).map(|_| "exit\r".to_string());
         }
@@ -1237,7 +1249,10 @@ impl YggtermServer {
         &self,
         path: &str,
     ) -> anyhow::Result<Option<String>> {
-        let Some(session) = self.sessions.get(path) else {
+        let Some(key) = self.resolve_session_storage_key(path) else {
+            return Ok(None);
+        };
+        let Some(session) = self.sessions.get(key) else {
             return Ok(None);
         };
         if path.starts_with("remote-session://") {
@@ -4218,6 +4233,15 @@ fn request_app_control(
     )
 }
 
+fn parse_app_control_drag_placement(value: &str) -> Option<AppControlDragPlacement> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "before" => Some(AppControlDragPlacement::Before),
+        "into" | "inside" => Some(AppControlDragPlacement::Into),
+        "after" => Some(AppControlDragPlacement::After),
+        _ => None,
+    }
+}
+
 fn capture_embedded_app_screenshot(
     home: &std::path::Path,
     output_path: Option<std::path::PathBuf>,
@@ -4471,6 +4495,45 @@ pub fn run_app_control_open_path(
         },
         timeout_ms,
     )?;
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    Ok(())
+}
+
+pub fn run_app_control_drag(
+    action: &str,
+    row_path: Option<&str>,
+    placement: Option<&str>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let command = match action {
+        "begin" => AppControlCommand::Drag {
+            command: AppControlDragCommand::Begin {
+                row_path: row_path
+                    .context("missing row path for server app drag begin")?
+                    .to_string(),
+            },
+        },
+        "hover" => AppControlCommand::Drag {
+            command: AppControlDragCommand::Hover {
+                row_path: row_path
+                    .context("missing row path for server app drag hover")?
+                    .to_string(),
+                placement: parse_app_control_drag_placement(
+                    placement.context("missing placement for server app drag hover")?,
+                )
+                .context("unsupported drag placement; use before, into, or after")?,
+            },
+        },
+        "drop" => AppControlCommand::Drag {
+            command: AppControlDragCommand::Drop,
+        },
+        "clear" | "cancel" => AppControlCommand::Drag {
+            command: AppControlDragCommand::Clear,
+        },
+        other => anyhow::bail!("unsupported app drag action: {other}"),
+    };
+    let response = request_app_control(&home, command, timeout_ms)?;
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }
