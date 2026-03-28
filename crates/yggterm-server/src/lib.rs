@@ -2394,6 +2394,12 @@ fn remote_tmux_session_name(session_id: &str) -> String {
     format!("yggterm-{suffix}")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteMultiplexer {
+    Tmux,
+    Screen,
+}
+
 fn tmux_available() -> anyhow::Result<bool> {
     Ok(Command::new("sh")
         .arg("-lc")
@@ -2401,6 +2407,25 @@ fn tmux_available() -> anyhow::Result<bool> {
         .status()
         .context("checking tmux availability")?
         .success())
+}
+
+fn screen_available() -> anyhow::Result<bool> {
+    Ok(Command::new("sh")
+        .arg("-lc")
+        .arg("command -v screen >/dev/null 2>&1")
+        .status()
+        .context("checking screen availability")?
+        .success())
+}
+
+fn preferred_remote_multiplexer() -> anyhow::Result<Option<RemoteMultiplexer>> {
+    if tmux_available()? {
+        return Ok(Some(RemoteMultiplexer::Tmux));
+    }
+    if screen_available()? {
+        return Ok(Some(RemoteMultiplexer::Screen));
+    }
+    Ok(None)
 }
 
 fn tmux_has_session(session_name: &str) -> anyhow::Result<bool> {
@@ -2479,6 +2504,153 @@ fn tmux_kill_session(session_name: &str) -> anyhow::Result<()> {
     } else {
         anyhow::bail!("tmux kill-session failed for {session_name}: {status}");
     }
+}
+
+fn parse_screen_session_ref(screen_ls_output: &str, session_name: &str) -> Option<String> {
+    for line in screen_ls_output.lines() {
+        let token = line.split_whitespace().next()?.trim();
+        if token == session_name || token.ends_with(&format!(".{session_name}")) {
+            return Some(token.to_string());
+        }
+    }
+    None
+}
+
+fn screen_session_ref(session_name: &str) -> anyhow::Result<Option<String>> {
+    let output = Command::new("screen")
+        .args(["-ls", session_name])
+        .output()
+        .with_context(|| format!("listing screen sessions for {session_name}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Ok(parse_screen_session_ref(&format!("{stdout}\n{stderr}"), session_name))
+}
+
+fn screen_has_session(session_name: &str) -> anyhow::Result<bool> {
+    Ok(screen_session_ref(session_name)?.is_some())
+}
+
+fn screen_spawn_codex_session(session_name: &str, command: &str) -> anyhow::Result<()> {
+    let status = Command::new("screen")
+        .args(["-DmS", session_name, "sh", "-lc", command])
+        .status()
+        .with_context(|| format!("creating screen session {session_name}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("screen failed to create session {session_name}: {status}");
+    }
+}
+
+fn screen_attach_session(session_name: &str) -> anyhow::Result<()> {
+    let target = screen_session_ref(session_name)?.unwrap_or_else(|| session_name.to_string());
+    let attach_command = format!(
+        "(sleep 0.2; \
+            screen -S {} -X redisplay >/dev/null 2>&1 || true; \
+            screen -S {} -X stuff \"$(printf '\\f')\" >/dev/null 2>&1 || true) \
+         & exec screen -D -RR {}",
+        shell_single_quote(&target),
+        shell_single_quote(&target),
+        shell_single_quote(&target)
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let error = Command::new("sh").args(["-lc", &attach_command]).exec();
+        Err(anyhow::anyhow!(
+            "failed to exec screen attach for {target}: {error}"
+        ))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let status = Command::new("sh")
+            .args(["-lc", &attach_command])
+            .status()
+            .with_context(|| format!("attaching screen session {target}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            anyhow::bail!("screen attach failed for {target}: {status}");
+        }
+    }
+}
+
+fn screen_send_keys(session_name: &str, text: &str) -> anyhow::Result<()> {
+    let target = screen_session_ref(session_name)?.unwrap_or_else(|| session_name.to_string());
+    let payload = format!("{text}\r");
+    let status = Command::new("screen")
+        .args(["-S", &target, "-X", "stuff", &payload])
+        .status()
+        .with_context(|| format!("sending screen keys to {target}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("screen stuff failed for {target}: {status}");
+    }
+}
+
+fn screen_kill_session(session_name: &str) -> anyhow::Result<()> {
+    let Some(target) = screen_session_ref(session_name)? else {
+        return Ok(());
+    };
+    let status = Command::new("screen")
+        .args(["-S", &target, "-X", "quit"])
+        .status()
+        .with_context(|| format!("killing screen session {target}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("screen quit failed for {target}: {status}");
+    }
+}
+
+fn sanitize_terminal_snapshot(bytes: &[u8]) -> Vec<u8> {
+    bytes.iter()
+        .copied()
+        .filter(|byte| {
+            matches!(byte, b'\n' | b'\r' | b'\t')
+                || (0x20..=0x7e).contains(byte)
+        })
+        .collect()
+}
+
+fn screen_snapshot_bytes(session_name: &str) -> anyhow::Result<Vec<u8>> {
+    let Some(target) = screen_session_ref(session_name)? else {
+        return Ok(Vec::new());
+    };
+    let path = std::env::temp_dir().join(format!(
+        "yggterm-screen-{}-{}.txt",
+        current_millis_u64(),
+        Uuid::new_v4().simple()
+    ));
+    let status = Command::new("screen")
+        .args(["-S", &target, "-X", "hardcopy", "-h"])
+        .arg(&path)
+        .status()
+        .with_context(|| format!("capturing screen hardcopy for {target}"))?;
+    if !status.success() {
+        anyhow::bail!("screen hardcopy failed for {target}: {status}");
+    }
+    let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    let _ = fs::remove_file(&path);
+    Ok(sanitize_terminal_snapshot(&bytes))
+}
+
+fn emit_terminal_snapshot(bytes: &[u8]) -> anyhow::Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let mut stdout = std::io::stdout();
+    stdout
+        .write_all(b"\x1b[2J\x1b[H")
+        .context("clearing terminal before snapshot emit")?;
+    stdout
+        .write_all(bytes)
+        .context("writing terminal snapshot")?;
+    stdout.flush().context("flushing terminal snapshot")?;
+    Ok(())
 }
 
 fn remote_ssh_launch_command(
@@ -3835,38 +4007,6 @@ fn resolve_remote_yggterm_binary(
         }));
     }
 
-    match remote_protocol_version_for_binary(ssh_target, exec_prefix, "yggterm") {
-        Ok(version) if version.trim() == daemon::SERVER_PROTOCOL_VERSION => {
-            if let Ok(mut cache) = remote_command_cache().lock() {
-                cache.insert(cache_key, "yggterm".to_string());
-            }
-            finish_span(serde_json::json!({
-                "ssh_target": ssh_target,
-                "result": "path_match",
-                "binary_expr": "yggterm",
-            }));
-            return Ok(("yggterm".to_string(), RemoteDeployState::Ready));
-        }
-        Ok(version) => {
-            if !is_remote_protocol_probe_recoverable(&version) {
-                anyhow::bail!(
-                    "remote yggterm protocol mismatch for {}: expected {}, got {}",
-                    ssh_target,
-                    daemon::SERVER_PROTOCOL_VERSION,
-                    version.trim()
-                );
-            }
-            finish_span(serde_json::json!({
-                "ssh_target": ssh_target,
-                "result": "path_protocol_mismatch",
-                "binary_expr": "yggterm",
-                "protocol_version": version.trim(),
-            }));
-        }
-        Err(error) if !should_fallback_to_python(&error) => return Err(error),
-        Err(_) => {}
-    }
-
     let installed_binary = "$HOME/.yggterm/bin/yggterm";
     match remote_protocol_version_for_binary(ssh_target, exec_prefix, installed_binary) {
         Ok(version) if version.trim() == daemon::SERVER_PROTOCOL_VERSION => {
@@ -3893,6 +4033,38 @@ fn resolve_remote_yggterm_binary(
                 "ssh_target": ssh_target,
                 "result": "installed_protocol_mismatch",
                 "binary_expr": installed_binary,
+                "protocol_version": version.trim(),
+            }));
+        }
+        Err(error) if !should_fallback_to_python(&error) => return Err(error),
+        Err(_) => {}
+    }
+
+    match remote_protocol_version_for_binary(ssh_target, exec_prefix, "yggterm") {
+        Ok(version) if version.trim() == daemon::SERVER_PROTOCOL_VERSION => {
+            if let Ok(mut cache) = remote_command_cache().lock() {
+                cache.insert(cache_key, "yggterm".to_string());
+            }
+            finish_span(serde_json::json!({
+                "ssh_target": ssh_target,
+                "result": "path_match",
+                "binary_expr": "yggterm",
+            }));
+            return Ok(("yggterm".to_string(), RemoteDeployState::Ready));
+        }
+        Ok(version) => {
+            if !is_remote_protocol_probe_recoverable(&version) {
+                anyhow::bail!(
+                    "remote yggterm protocol mismatch for {}: expected {}, got {}",
+                    ssh_target,
+                    daemon::SERVER_PROTOCOL_VERSION,
+                    version.trim()
+                );
+            }
+            finish_span(serde_json::json!({
+                "ssh_target": ssh_target,
+                "result": "path_protocol_mismatch",
+                "binary_expr": "yggterm",
                 "protocol_version": version.trim(),
             }));
         }
@@ -4073,38 +4245,57 @@ pub fn run_remote_resume_codex(session_id: &str, cwd: Option<&str>) -> anyhow::R
         }
     };
     let _ = ensure_local_managed_cli(ManagedCliTool::Codex)?;
-    let tmux_ready = tmux_available()?;
-    if tmux_ready {
+    if let Some(multiplexer) = preferred_remote_multiplexer()? {
         let session_name = remote_tmux_session_name(session_id);
-        let existing_tmux = tmux_has_session(&session_name)?;
-        if !existing_tmux {
+        let existing_session = match multiplexer {
+            RemoteMultiplexer::Tmux => tmux_has_session(&session_name)?,
+            RemoteMultiplexer::Screen => screen_has_session(&session_name)?,
+        };
+        if !existing_session {
             let saved_session_exists = remote_saved_codex_session_exists(session_id)?;
             let command = if saved_session_exists {
                 remote_persistent_resume_shell_command(session_id, cwd)
             } else {
                 remote_resume_picker_shell_command(session_id, cwd, None, true)
             };
-            tmux_spawn_codex_session(&session_name, &command)?;
+            match multiplexer {
+                RemoteMultiplexer::Tmux => tmux_spawn_codex_session(&session_name, &command)?,
+                RemoteMultiplexer::Screen => screen_spawn_codex_session(&session_name, &command)?,
+            }
             finish_span(serde_json::json!({
                 "session_id": session_id,
                 "cwd": cwd,
-                "tmux": true,
-                "tmux_session": session_name,
-                "tmux_reused": false,
+                "multiplexer": match multiplexer {
+                    RemoteMultiplexer::Tmux => "tmux",
+                    RemoteMultiplexer::Screen => "screen",
+                },
+                "mux_session": session_name,
+                "mux_reused": false,
                 "saved_session_exists": saved_session_exists,
                 "mode": if saved_session_exists { "resume" } else { "resume_picker" },
             }));
         } else {
+            if matches!(multiplexer, RemoteMultiplexer::Screen) {
+                std::thread::sleep(std::time::Duration::from_millis(900));
+                let _ = screen_snapshot_bytes(&session_name)
+                    .and_then(|bytes| emit_terminal_snapshot(&bytes));
+            }
             finish_span(serde_json::json!({
                 "session_id": session_id,
                 "cwd": cwd,
-                "tmux": true,
-                "tmux_session": session_name,
-                "tmux_reused": true,
-                "mode": "attach_existing_tmux",
+                "multiplexer": match multiplexer {
+                    RemoteMultiplexer::Tmux => "tmux",
+                    RemoteMultiplexer::Screen => "screen",
+                },
+                "mux_session": session_name,
+                "mux_reused": true,
+                "mode": "attach_existing_multiplexer",
             }));
         }
-        return tmux_attach_session(&session_name);
+        return match multiplexer {
+            RemoteMultiplexer::Tmux => tmux_attach_session(&session_name),
+            RemoteMultiplexer::Screen => screen_attach_session(&session_name),
+        };
     }
 
     let saved_session_exists = remote_saved_codex_session_exists(session_id)?;
@@ -4171,21 +4362,36 @@ fn refresh_remote_managed_cli(
 }
 
 pub fn run_remote_terminate_codex(session_id: &str) -> anyhow::Result<()> {
-    if !tmux_available()? {
-        return Ok(());
-    }
     let session_name = remote_tmux_session_name(session_id);
-    if !tmux_has_session(&session_name)? {
-        return Ok(());
-    }
-    let _ = tmux_send_keys(&session_name, "/quit");
-    for _ in 0..10 {
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        if !tmux_has_session(&session_name)? {
-            return Ok(());
+    match preferred_remote_multiplexer()? {
+        Some(RemoteMultiplexer::Tmux) => {
+            if !tmux_has_session(&session_name)? {
+                return Ok(());
+            }
+            let _ = tmux_send_keys(&session_name, "/quit");
+            for _ in 0..10 {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                if !tmux_has_session(&session_name)? {
+                    return Ok(());
+                }
+            }
+            tmux_kill_session(&session_name)
         }
+        Some(RemoteMultiplexer::Screen) => {
+            if !screen_has_session(&session_name)? {
+                return Ok(());
+            }
+            let _ = screen_send_keys(&session_name, "/quit");
+            for _ in 0..10 {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                if !screen_has_session(&session_name)? {
+                    return Ok(());
+                }
+            }
+            screen_kill_session(&session_name)
+        }
+        None => Ok(()),
     }
-    tmux_kill_session(&session_name)
 }
 
 fn tail_text_file_lines(path: &std::path::Path, lines: usize) -> Vec<String> {
@@ -4813,7 +5019,11 @@ pub fn terminate_remote_codex_session(
         Err(_) => {
             let session_name = remote_tmux_session_name(session_id);
             let command = format!(
-                "if command -v tmux >/dev/null 2>&1 && tmux has-session -t {} 2>/dev/null; then tmux send-keys -t {} /quit Enter >/dev/null 2>&1 || true; sleep 2; tmux kill-session -t {} >/dev/null 2>&1 || true; fi",
+                "if command -v tmux >/dev/null 2>&1 && tmux has-session -t {} 2>/dev/null; then tmux send-keys -t {} /quit Enter >/dev/null 2>&1 || true; sleep 2; tmux kill-session -t {} >/dev/null 2>&1 || true; \
+                 elif command -v screen >/dev/null 2>&1 && screen -ls {} 2>/dev/null | grep -q '\\\\.'; then screen -S {} -X stuff '/quit\\015' >/dev/null 2>&1 || true; sleep 2; screen -S {} -X quit >/dev/null 2>&1 || true; fi",
+                shell_single_quote(&session_name),
+                shell_single_quote(&session_name),
+                shell_single_quote(&session_name),
                 shell_single_quote(&session_name),
                 shell_single_quote(&session_name),
                 shell_single_quote(&session_name),
@@ -6468,7 +6678,7 @@ mod tests {
         mirror_remote_machine_sessions, parse_stored_transcript, remote_cache_key,
         remote_command_cache, remote_resume_shell_command, remote_saved_codex_session_exists,
         remote_scan_roots_with_parents, remote_scanned_session_path, remote_ssh_launch_command,
-        stored_session_launch_command, strip_remote_payload_noise,
+        parse_screen_session_ref, stored_session_launch_command, strip_remote_payload_noise,
     };
     use anyhow::Result;
     use std::fs;
@@ -6547,6 +6757,15 @@ mod tests {
     fn strip_remote_payload_noise_discards_shell_preamble() {
         let raw = format!("alias chicago='ssh'\nwelcome\n{REMOTE_OUTPUT_SENTINEL}\n2.0.12\n");
         assert_eq!(strip_remote_payload_noise(raw.as_bytes()), "2.0.12");
+    }
+
+    #[test]
+    fn parse_screen_session_ref_matches_named_session_suffix() {
+        let listing = "There are screens on:\n\t4046775.yggterm-abc123\t(03/28/26 21:42:13)\t(Detached)\n1 Socket in /run/screen/S-pi.\n";
+        assert_eq!(
+            parse_screen_session_ref(listing, "yggterm-abc123"),
+            Some("4046775.yggterm-abc123".to_string())
+        );
     }
 
     #[test]
