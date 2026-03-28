@@ -37,6 +37,9 @@ set -euo pipefail
 if [[ "${YGGTERM_ENABLE_ACCESSIBILITY:-0}" != "1" && -z "${NO_AT_BRIDGE+x}" ]]; then
   export NO_AT_BRIDGE=1
 fi
+if [[ "${YGGTERM_ENABLE_WEBKIT_COMPOSITING:-0}" != "1" && -z "${WEBKIT_DISABLE_COMPOSITING_MODE+x}" ]]; then
+  export WEBKIT_DISABLE_COMPOSITING_MODE=1
+fi
 exec /usr/lib/yggterm/yggterm-bin "$@"
 WRAPPER
 chmod 0755 "$STAGE_DIR/usr/bin/yggterm"
@@ -45,6 +48,9 @@ cat > "$STAGE_DIR/usr/bin/yggterm-mock-cli" <<'WRAPPER'
 set -euo pipefail
 if [[ "${YGGTERM_ENABLE_ACCESSIBILITY:-0}" != "1" && -z "${NO_AT_BRIDGE+x}" ]]; then
   export NO_AT_BRIDGE=1
+fi
+if [[ "${YGGTERM_ENABLE_WEBKIT_COMPOSITING:-0}" != "1" && -z "${WEBKIT_DISABLE_COMPOSITING_MODE+x}" ]]; then
+  export WEBKIT_DISABLE_COMPOSITING_MODE=1
 fi
 exec /usr/lib/yggterm/yggterm-mock-cli-bin "$@"
 WRAPPER
