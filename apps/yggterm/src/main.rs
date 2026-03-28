@@ -13,8 +13,9 @@ use yggterm_core::{
     detect_install_context, install_release_update, refresh_desktop_integration,
 };
 use yggterm_server::{
-    PersistedDaemonState, SessionKind, YggtermServer, cleanup_legacy_daemons, default_endpoint,
-    detect_ghostty_host, ping, run_app_control_describe_state, run_app_control_focus_window,
+    AppControlViewMode, PersistedDaemonState, SessionKind, YggtermServer, cleanup_legacy_daemons,
+    default_endpoint, detect_ghostty_host, ping, run_app_control_describe_rows,
+    run_app_control_describe_state, run_app_control_focus_window, run_app_control_open_path,
     run_attach, run_daemon, run_remote_generation_context, run_remote_preview,
     run_remote_protocol_version, run_remote_resume_codex, run_remote_scan,
     run_remote_stage_clipboard_png, run_remote_terminate_codex, run_remote_upsert_generated_copy,
@@ -143,7 +144,27 @@ fn main() -> Result<()> {
                 run_screenshot_capture("app", output_path, timeout_ms)
             }
             "state" => run_app_control_describe_state(timeout_ms),
+            "rows" => run_app_control_describe_rows(timeout_ms),
             "focus" => run_app_control_focus_window(timeout_ms),
+            "open" => {
+                let session_path = args
+                    .iter()
+                    .skip(3)
+                    .find(|value| !value.starts_with("--"))
+                    .map(String::as_str)
+                    .context("missing session path for server app open")?;
+                let view_mode = args.windows(2).find_map(|window| {
+                    if window[0] != "--view" {
+                        return None;
+                    }
+                    match window[1].as_str() {
+                        "preview" | "rendered" => Some(AppControlViewMode::Preview),
+                        "terminal" => Some(AppControlViewMode::Terminal),
+                        _ => None,
+                    }
+                });
+                run_app_control_open_path(session_path, view_mode, timeout_ms)
+            }
             other => anyhow::bail!("unsupported app control command: {other}"),
         };
     }
