@@ -12,6 +12,7 @@ yggterm-server = { path = "../yggterm-server" }
 anyhow.workspace = true
 base64 = "0.22"
 dioxus = { version = "0.7.3", features = ["desktop"] }
+include_dir = "0.7"
 once_cell = "1"
 png = "0.17"
 libc = "0.2"
