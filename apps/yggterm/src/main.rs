@@ -16,11 +16,11 @@ use yggterm_server::{
     AppControlViewMode, PersistedDaemonState, SessionKind, YggtermServer, cleanup_legacy_daemons,
     default_endpoint, detect_ghostty_host, ping, run_app_control_describe_rows,
     run_app_control_describe_state, run_app_control_drag, run_app_control_focus_window,
-    run_app_control_open_path, run_attach, run_daemon, run_remote_generation_context,
-    run_remote_preview, run_remote_protocol_version, run_remote_resume_codex, run_remote_scan,
-    run_remote_stage_clipboard_png, run_remote_terminate_codex, run_remote_upsert_generated_copy,
-    run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown,
-    start_local_session, status,
+    run_app_control_open_path, run_app_control_set_fullscreen, run_attach, run_daemon,
+    run_remote_generation_context, run_remote_preview, run_remote_protocol_version,
+    run_remote_resume_codex, run_remote_scan, run_remote_stage_clipboard_png,
+    run_remote_terminate_codex, run_remote_upsert_generated_copy, run_screenshot_capture,
+    run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, start_local_session, status,
 };
 
 const DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT_ENV: &str =
@@ -149,6 +149,33 @@ fn main() -> Result<()> {
             "state" => run_app_control_describe_state(timeout_ms),
             "rows" => run_app_control_describe_rows(timeout_ms),
             "focus" => run_app_control_focus_window(timeout_ms),
+            "fullscreen" => {
+                let action = args
+                    .iter()
+                    .skip(3)
+                    .find(|value| !value.starts_with("--"))
+                    .map(String::as_str)
+                    .unwrap_or("toggle");
+                let current_state = yggterm_server::request_app_control(
+                    store.home_dir(),
+                    yggterm_server::AppControlCommand::DescribeState,
+                    timeout_ms,
+                )?;
+                let currently_fullscreen = current_state
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("shell"))
+                    .and_then(|shell| shell.get("fullscreen"))
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+                let enabled = match action {
+                    "on" | "true" | "1" => true,
+                    "off" | "false" | "0" => false,
+                    "toggle" => !currently_fullscreen,
+                    other => anyhow::bail!("unsupported fullscreen action: {other}"),
+                };
+                run_app_control_set_fullscreen(enabled, timeout_ms)
+            }
             "open" => {
                 let session_path = args
                     .iter()
