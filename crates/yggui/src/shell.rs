@@ -3248,8 +3248,22 @@ fn spawn_initial_server_sync(
         );
         async_render_epoch.with_mut(|epoch| *epoch += 1);
         schedule_ui();
-        maybe_spawn_missing_remote_machine_refreshes(state);
-        maybe_spawn_missing_managed_cli_refreshes(state);
+        let should_prioritize_active_terminal = safe_shell_read(
+            state,
+            "initial_server_sync_background_gate",
+            |shell| {
+                shell.server.active_view_mode() == WorkspaceViewMode::Terminal
+                    && shell
+                        .server
+                        .active_session_path()
+                        .is_some_and(|path| path.starts_with("remote-session://"))
+            },
+        )
+        .unwrap_or(false);
+        if !should_prioritize_active_terminal {
+            maybe_spawn_missing_remote_machine_refreshes(state);
+            maybe_spawn_missing_managed_cli_refreshes(state);
+        }
     });
 }
 
@@ -3792,6 +3806,15 @@ async fn maybe_debug_request_delay() {
 }
 
 fn maybe_spawn_missing_remote_machine_refreshes(state: Signal<ShellState>) {
+    if safe_shell_read(
+        state,
+        "maybe_spawn_missing_remote_machine_refreshes_gate",
+        terminal_attach_blocks_background_work,
+    )
+    .unwrap_or(false)
+    {
+        return;
+    }
     let Some(pending) = safe_shell_read(
         state,
         "maybe_spawn_missing_remote_machine_refreshes_read",
@@ -3841,6 +3864,15 @@ fn managed_cli_refresh_scope_keys(
 }
 
 fn maybe_spawn_missing_managed_cli_refreshes(state: Signal<ShellState>) {
+    if safe_shell_read(
+        state,
+        "maybe_spawn_missing_managed_cli_refreshes_gate",
+        terminal_attach_blocks_background_work,
+    )
+    .unwrap_or(false)
+    {
+        return;
+    }
     let Some(pending) = safe_shell_read(
         state,
         "maybe_spawn_missing_managed_cli_refreshes_read",
@@ -13858,11 +13890,6 @@ fn TerminalCanvas(
                     event = eval.recv::<TerminalJsEvent>() => {
                         match event {
                             Ok(TerminalJsEvent::Ready) => {
-                                let _ = safe_shell_mut(state, "terminal_attach_ready", |shell| {
-                                    shell.terminal_attach_in_flight.remove(&session_path);
-                                });
-                                maybe_spawn_missing_remote_machine_refreshes(state);
-                                maybe_spawn_missing_managed_cli_refreshes(state);
                                 append_trace_event(
                                     &trace_home,
                                     "ui",
@@ -13897,7 +13924,15 @@ fn TerminalCanvas(
                                     bright_white: theme.bright_white.clone(),
                                     font_size: theme.font_size,
                                 });
-                                if let Ok((next_cursor, chunks)) = terminal_read_async(endpoint.clone(), session_path.clone(), 0).await {
+                                if let Ok((next_cursor, chunks)) =
+                                    terminal_read_async(
+                                        endpoint.clone(),
+                                        session_path.clone(),
+                                        0,
+                                        &trace_home,
+                                    )
+                                    .await
+                                {
                                     cursor = next_cursor;
                                     read_poll_ms = if chunks.is_empty() { 140 } else { 60 };
                                     let (batched_output, saw_visible_output, saw_meaningful_output) =
@@ -13980,6 +14015,17 @@ fn TerminalCanvas(
                                                 }),
                                             );
                                             traced_first_meaningful_output = true;
+                                            let _ = safe_shell_mut(
+                                                state,
+                                                "terminal_attach_meaningful_output",
+                                                |shell| {
+                                                    shell.terminal_attach_in_flight.remove(
+                                                        &session_path,
+                                                    );
+                                                },
+                                            );
+                                            maybe_spawn_missing_remote_machine_refreshes(state);
+                                            maybe_spawn_missing_managed_cli_refreshes(state);
                                         }
                                         terminal_has_meaningful_output.set(true);
                                     }
@@ -14146,7 +14192,14 @@ fn TerminalCanvas(
                         }
                     }
                     _ = sleep(Duration::from_millis(read_poll_ms)) => {
-                        match terminal_read_async(endpoint.clone(), session_path.clone(), cursor).await {
+                        match terminal_read_async(
+                            endpoint.clone(),
+                            session_path.clone(),
+                            cursor,
+                            &trace_home,
+                        )
+                        .await
+                        {
                             Ok((next_cursor, chunks)) => {
                                 cursor = next_cursor;
                                 read_poll_ms = if chunks.is_empty() {
@@ -14234,6 +14287,17 @@ fn TerminalCanvas(
                                             }),
                                         );
                                         traced_first_meaningful_output = true;
+                                        let _ = safe_shell_mut(
+                                            state,
+                                            "terminal_attach_meaningful_output",
+                                            |shell| {
+                                                shell.terminal_attach_in_flight.remove(
+                                                    &session_path,
+                                                );
+                                            },
+                                        );
+                                        maybe_spawn_missing_remote_machine_refreshes(state);
+                                        maybe_spawn_missing_managed_cli_refreshes(state);
                                     }
                                     terminal_has_meaningful_output.set(true);
                                 }
@@ -14597,10 +14661,12 @@ async fn terminal_read_async(
     endpoint: ServerEndpoint,
     session_path: String,
     cursor: u64,
+    trace_home: &Path,
 ) -> Result<(u64, Vec<yggterm_server::TerminalStreamChunk>)> {
-    task::spawn_blocking(move || terminal_read(&endpoint, &session_path, cursor))
-        .await
-        .map_err(|error| anyhow!("joining terminal read task: {error}"))?
+    run_dedicated_terminal_io("terminal_read", trace_home, move || {
+        terminal_read(&endpoint, &session_path, cursor)
+    })
+    .await
 }
 
 async fn terminal_write_async(
