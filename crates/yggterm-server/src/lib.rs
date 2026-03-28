@@ -1001,6 +1001,24 @@ impl YggtermServer {
                 } else {
                     path
                 };
+            if !self.sessions.contains_key(&active_path)
+                && let Some(session) = synthesize_remote_active_session(
+                    &active_path,
+                    &self.remote_machines,
+                    self.backend,
+                    self.theme,
+                    self.ghostty_host.bridge_enabled,
+                )
+            {
+                if !self
+                    .live_session_order
+                    .iter()
+                    .any(|existing| existing == &active_path)
+                {
+                    self.live_session_order.insert(0, active_path.clone());
+                }
+                self.sessions.insert(active_path.clone(), session);
+            }
             if self.sessions.contains_key(&active_path) {
                 self.active_session_path = Some(active_path.clone());
                 if self.active_view_mode == WorkspaceViewMode::Terminal {
@@ -6601,6 +6619,71 @@ mod tests {
 
         assert!(server.ssh_targets().is_empty());
         assert!(server.remote_machines().is_empty());
+    }
+
+    #[test]
+    fn restore_persisted_state_rehydrates_remote_active_session_into_live_order() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let active_path = remote_scanned_session_path("dev", "abc123");
+        server.restore_persisted_state(
+            PersistedDaemonState {
+                active_session_path: Some(active_path.clone()),
+                active_view_mode: WorkspaceViewMode::Terminal,
+                ssh_targets: vec![SshConnectTarget {
+                    label: "dev".to_string(),
+                    kind: SessionKind::SshShell,
+                    ssh_target: "dev".to_string(),
+                    prefix: None,
+                    cwd: Some("/home/pi/gh/yggterm".to_string()),
+                }],
+                remote_machines: vec![RemoteMachineSnapshot {
+                    machine_key: "dev".to_string(),
+                    label: "dev".to_string(),
+                    ssh_target: "dev".to_string(),
+                    prefix: None,
+                    health: RemoteMachineHealth::Healthy,
+                    sessions: vec![RemoteScannedSession {
+                        session_path: active_path.clone(),
+                        session_id: "abc123".to_string(),
+                        cwd: "/home/pi/gh/yggterm".to_string(),
+                        started_at: "2026-03-28T12:00:00Z".to_string(),
+                        modified_epoch: 1,
+                        event_count: 8,
+                        user_message_count: 4,
+                        assistant_message_count: 4,
+                        title_hint: "Restore Live Remote".to_string(),
+                        recent_context: "USER: restore".to_string(),
+                        cached_precis: Some("precis".to_string()),
+                        cached_summary: Some("summary".to_string()),
+                        storage_path: "/home/pi/.codex/sessions/abc123.jsonl".to_string(),
+                    }],
+                }],
+                stored_sessions: Vec::new(),
+                live_sessions: Vec::new(),
+            },
+            None,
+        );
+
+        let live_sessions = server.live_sessions();
+        assert_eq!(server.active_session_path(), Some(active_path.as_str()));
+        assert_eq!(live_sessions.len(), 1);
+        assert_eq!(live_sessions[0].session_path, active_path);
     }
 
     #[test]
