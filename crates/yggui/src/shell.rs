@@ -11049,7 +11049,7 @@ fn Titlebar(
             on_toggle_maximized: on_toggle_maximized,
             left: rsx! {
                 div {
-                    style: "display:flex; align-items:center; gap:12px; width:340px; min-width:340px;",
+                    style: "display:flex; align-items:center; gap:12px; min-width:0; width:100%;",
                     button {
                         style: icon_button_style(snapshot.palette),
                         onmousedown: |evt| evt.stop_propagation(),
@@ -11127,15 +11127,9 @@ fn Titlebar(
                             }
                         }
                     }
-                    div { style: "flex:1; min-width:56px; height:100%;" }
-                }
-            },
-            center: rsx! {
-                div {
-                    style: "flex:1; display:flex; align-items:center; justify-content:center; gap:12px; padding:0 16px; min-width:0;",
                     if let Some(active_title) = active_title.clone() {
                         div {
-                            style: "position:relative; display:flex; align-items:center; flex:0 1 340px; min-width:180px; max-width:360px;",
+                            style: "position:relative; display:flex; align-items:center; flex:1 1 220px; min-width:0; max-width:360px;",
                             onmousedown: |evt| evt.stop_propagation(),
                             onclick: |evt| evt.stop_propagation(),
                             ondoubleclick: |evt| evt.stop_propagation(),
@@ -11157,7 +11151,8 @@ fn Titlebar(
                                 if let Some(loading_label) = titlebar_loading_label.clone() {
                                     span {
                                         style: format!(
-                                            "display:inline-flex; align-items:center; gap:5px; flex:0 0 auto; font-size:10px; font-weight:700; color:{};",
+                                            "display:inline-flex; align-items:center; gap:5px; flex:0 1 auto; min-width:0; \
+                                             font-size:10px; font-weight:700; color:{};",
                                             snapshot.palette.muted
                                         ),
                                         span {
@@ -11166,7 +11161,10 @@ fn Titlebar(
                                                 snapshot.palette.accent
                                             )
                                         }
-                                        "{loading_label}"
+                                        span {
+                                            style: "min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;",
+                                            "{loading_label}"
+                                        }
                                     }
                                 }
                                 span {
@@ -11217,93 +11215,100 @@ fn Titlebar(
                             }
                         }
                     }
+                }
+            },
+            center: rsx! {
+                div {
+                    style: "display:flex; flex-direction:column; align-items:stretch; gap:4px; width:min(560px, 100%); min-width:280px;",
                     div {
-                        style: "display:flex; flex-direction:column; align-items:stretch; gap:4px; flex:0 1 520px; max-width:520px; min-width:220px;",
-                        div {
-                            style: "display:flex; align-items:center; gap:8px;",
-                            input {
-                                id: SEARCH_INPUT_ID,
-                                r#type: "text",
-                                value: "{snapshot.search_query}",
-                                placeholder: "Search sessions…",
-                                style: search_input_style(snapshot.palette.text),
-                                onmousedown: |evt| evt.stop_propagation(),
-                                ondoubleclick: |evt| evt.stop_propagation(),
-                                onfocus: move |_| on_set_search_focus.call(true),
-                                onblur: move |_| on_set_search_focus.call(false),
-                                oninput: move |evt| on_search.call(evt.value()),
-                                onkeydown: move |evt| {
-                                    if evt.key() == Key::Enter && command_mode_active {
-                                        evt.prevent_default();
-                                        on_execute_search_command.call(search_query.clone());
-                                    }
-                                },
-                            }
-                            if snapshot.search_active
-                                && matches!(
-                                    snapshot.active_view_mode,
-                                    WorkspaceViewMode::Rendered | WorkspaceViewMode::Terminal
-                                )
-                            {
-                                button {
-                                    title: "Previous search hit",
-                                    style: chip_style(snapshot.palette, false),
-                                    onclick: move |_| on_prev_search_content.call(()),
-                                    "↑"
+                        style: "display:flex; align-items:center; gap:8px;",
+                        input {
+                            id: SEARCH_INPUT_ID,
+                            r#type: "text",
+                            value: "{snapshot.search_query}",
+                            placeholder: "Search sessions…",
+                            style: search_input_style(snapshot.palette.text),
+                            onmousedown: |evt| evt.stop_propagation(),
+                            ondoubleclick: |evt| evt.stop_propagation(),
+                            onfocus: move |_| on_set_search_focus.call(true),
+                            onblur: move |_| on_set_search_focus.call(false),
+                            oninput: move |evt| on_search.call(evt.value()),
+                            onkeydown: move |evt| {
+                                if evt.key() == Key::Enter && command_mode_active {
+                                    evt.prevent_default();
+                                    on_execute_search_command.call(search_query.clone());
                                 }
-                                button {
-                                    title: "Next search hit",
-                                    style: chip_style(snapshot.palette, false),
-                                    onclick: move |_| on_next_search_content.call(()),
-                                    "↓"
-                                }
-                                div {
-                                    style: format!("font-size:11px; color:{}; min-width:62px; text-align:right;", snapshot.palette.muted),
-                                    if let Some(ix) = snapshot.search_content_hit_index {
-                                        {format!("{}/{}", ix + 1, snapshot.search_content_hits.len())}
-                                    } else {
-                                        "0/0"
-                                    }
-                                }
-                            }
+                            },
                         }
-                        if snapshot.command_mode_active {
-                            div {
-                                style: "display:flex; flex-direction:column; gap:4px;",
-                                div {
-                                    style: format!("font-size:10px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", snapshot.palette.muted),
-                                    "Press Enter to run a yggterm command"
-                                }
-                                for suggestion in snapshot.search_command_suggestions.iter().take(5) {
-                                    button {
-                                        style: format!(
-                                            "display:flex; align-items:center; justify-content:space-between; gap:12px; \
-                                             height:28px; border:none; border-radius:10px; padding:0 10px; cursor:pointer; \
-                                             background:rgba(255,255,255,0.72); color:{}; box-shadow: inset 0 0 0 1px rgba(196,210,224,0.45);",
-                                            snapshot.palette.text
-                                        ),
-                                        onclick: {
-                                            let command = suggestion.command.clone();
-                                            move |_| on_execute_search_command.call(command.clone())
-                                        },
-                                        span {
-                                            style: "font-size:11px; font-weight:700;",
-                                            "{suggestion.command}"
-                                        }
-                                        span {
-                                            style: format!("font-size:10px; color:{};", snapshot.palette.muted),
-                                            "{suggestion.description}"
-                                        }
-                                    }
-                                }
+                        if snapshot.search_active
+                            && matches!(
+                                snapshot.active_view_mode,
+                                WorkspaceViewMode::Rendered | WorkspaceViewMode::Terminal
+                            )
+                        {
+                            button {
+                                title: "Previous search hit",
+                                style: chip_style(snapshot.palette, false),
+                                onclick: move |_| on_prev_search_content.call(()),
+                                "↑"
                             }
-                        } else if snapshot.search_focused || snapshot.search_active {
+                            button {
+                                title: "Next search hit",
+                                style: chip_style(snapshot.palette, false),
+                                onclick: move |_| on_next_search_content.call(()),
+                                "↓"
+                            }
                             div {
-                                style: format!("font-size:10px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", snapshot.palette.muted),
-                                "Prefix '/' for yggterm commands · Ctrl+Shift+P focuses search"
+                                style: format!("font-size:11px; color:{}; min-width:62px; text-align:right;", snapshot.palette.muted),
+                                if let Some(ix) = snapshot.search_content_hit_index {
+                                    {format!("{}/{}", ix + 1, snapshot.search_content_hits.len())}
+                                } else {
+                                    "0/0"
+                                }
                             }
                         }
                     }
+                    if snapshot.command_mode_active {
+                        div {
+                            style: "display:flex; flex-direction:column; gap:4px;",
+                            div {
+                                style: format!("font-size:10px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", snapshot.palette.muted),
+                                "Press Enter to run a yggterm command"
+                            }
+                            for suggestion in snapshot.search_command_suggestions.iter().take(5) {
+                                button {
+                                    style: format!(
+                                        "display:flex; align-items:center; justify-content:space-between; gap:12px; \
+                                         height:28px; border:none; border-radius:10px; padding:0 10px; cursor:pointer; \
+                                         background:rgba(255,255,255,0.72); color:{}; box-shadow: inset 0 0 0 1px rgba(196,210,224,0.45);",
+                                        snapshot.palette.text
+                                    ),
+                                    onclick: {
+                                        let command = suggestion.command.clone();
+                                        move |_| on_execute_search_command.call(command.clone())
+                                    },
+                                    span {
+                                        style: "font-size:11px; font-weight:700;",
+                                        "{suggestion.command}"
+                                    }
+                                    span {
+                                        style: format!("font-size:10px; color:{};", snapshot.palette.muted),
+                                        "{suggestion.description}"
+                                    }
+                                }
+                            }
+                        }
+                    } else if snapshot.search_focused || snapshot.search_active {
+                        div {
+                            style: format!("font-size:10px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", snapshot.palette.muted),
+                            "Prefix '/' for yggterm commands · Ctrl+Shift+P focuses search"
+                        }
+                    }
+                }
+            },
+            right: rsx! {
+                div {
+                    style: "display:flex; align-items:center; justify-content:flex-end; gap:10px; min-width:0; width:100%;",
                     if let Some(update) = snapshot.pending_update_restart.clone() {
                         button {
                             style: format!(
@@ -11318,11 +11323,6 @@ fn Titlebar(
                             "Restart to Use {update.version}"
                         }
                     }
-                }
-            },
-            right: rsx! {
-                div {
-                    style: "display:flex; align-items:center; justify-content:flex-end; gap:10px; width:372px; min-width:372px;",
                     button {
                         style: connect_button_style(
                             snapshot.palette,
@@ -11364,7 +11364,7 @@ fn Titlebar(
                         onclick: move |_| on_toggle_meta.call(()),
                         "ⓘ"
                     }
-                    div { style: "flex:1; min-width:48px; height:100%;" }
+                    div { style: "flex:1; min-width:24px; max-width:40px; height:100%;" }
                     WindowControlsStrip {
                         palette: ChromePalette {
                             titlebar: snapshot.palette.titlebar,
