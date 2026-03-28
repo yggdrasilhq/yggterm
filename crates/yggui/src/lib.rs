@@ -1,3 +1,4 @@
+mod app_capture;
 pub mod chrome;
 pub mod drag_tree;
 pub mod drag_visuals;
