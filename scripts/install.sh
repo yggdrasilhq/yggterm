@@ -63,6 +63,9 @@ fi
 if [ "${YGGTERM_ENABLE_ACCESSIBILITY:-0}" != "1" ] && [ -z "${NO_AT_BRIDGE+x}" ]; then
   export NO_AT_BRIDGE=1
 fi
+if [ "${YGGTERM_ENABLE_WEBKIT_COMPOSITING:-0}" != "1" ] && [ -z "${WEBKIT_DISABLE_COMPOSITING_MODE+x}" ]; then
+  export WEBKIT_DISABLE_COMPOSITING_MODE=1
+fi
 export YGGTERM_DIRECT_INSTALL_ROOT='${install_root}'
 exec "\$target" "\$@"
 EOF
@@ -92,6 +95,9 @@ fi
 }
 if [ "${YGGTERM_ENABLE_ACCESSIBILITY:-0}" != "1" ] && [ -z "${NO_AT_BRIDGE+x}" ]; then
   export NO_AT_BRIDGE=1
+fi
+if [ "${YGGTERM_ENABLE_WEBKIT_COMPOSITING:-0}" != "1" ] && [ -z "${WEBKIT_DISABLE_COMPOSITING_MODE+x}" ]; then
+  export WEBKIT_DISABLE_COMPOSITING_MODE=1
 fi
 export YGGTERM_DIRECT_INSTALL_ROOT='${install_root}'
 exec "\$target" "\$@"

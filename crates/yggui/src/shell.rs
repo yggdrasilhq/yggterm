@@ -9790,7 +9790,7 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
     let window = WindowBuilder::new()
         .with_title("Yggterm")
         .with_window_icon(Some(window_icon::load_yggterm_window_icon()))
-        .with_transparent(true)
+        .with_transparent(!cfg!(target_os = "linux"))
         .with_decorations(false)
         .with_resizable(true)
         .with_inner_size(LogicalSize::new(1460.0, 920.0))
@@ -14537,27 +14537,27 @@ fn terminal_theme(
         };
     }
     TerminalTheme {
-        background: "#ffffff".to_string(),
-        foreground: "#343434".to_string(),
+        background: "#f7f8fa".to_string(),
+        foreground: "#1f2328".to_string(),
         cursor: "#005fb8".to_string(),
         font_size: font_size.max(5.0),
-        selection: "rgba(173, 214, 255, 0.42)".to_string(),
-        black: "#000000".to_string(),
+        selection: "rgba(9, 105, 218, 0.20)".to_string(),
+        black: "#24292f".to_string(),
         red: "#cd3131".to_string(),
         green: "#00bc00".to_string(),
         yellow: "#949800".to_string(),
         blue: "#0451a5".to_string(),
         magenta: "#bc05bc".to_string(),
         cyan: "#0598bc".to_string(),
-        white: "#555555".to_string(),
-        bright_black: "#666666".to_string(),
+        white: "#57606a".to_string(),
+        bright_black: "#6e7781".to_string(),
         bright_red: "#cd3131".to_string(),
         bright_green: "#14ce14".to_string(),
         bright_yellow: "#b5ba00".to_string(),
         bright_blue: "#0451a5".to_string(),
         bright_magenta: "#bc05bc".to_string(),
         bright_cyan: "#0598bc".to_string(),
-        bright_white: "#a5a5a5".to_string(),
+        bright_white: "#8c959f".to_string(),
     }
 }
 
@@ -14855,11 +14855,14 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
         }}
         host.innerHTML = "";
         const term = new window.Terminal({{
-            allowTransparency: true,
+            allowTransparency: false,
             convertEol: true,
             cursorBlink: true,
             fontFamily: "'JetBrains Mono', 'Iosevka Term', 'Fira Code', monospace",
             fontSize: {font_size},
+            fontWeight: "500",
+            fontWeightBold: "700",
+            minimumContrastRatio: 7.0,
             scrollback: 5000,
             theme: {{
                 background: {background},
@@ -17072,8 +17075,8 @@ mod tests {
     #[test]
     fn terminal_theme_uses_vscode_light_by_default() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
-        assert_eq!(theme.background, "#ffffff");
-        assert_eq!(theme.foreground, "#333333");
+        assert_eq!(theme.background, "#f7f8fa");
+        assert_eq!(theme.foreground, "#1f2328");
         assert_eq!(theme.blue, "#0451a5");
     }
 
