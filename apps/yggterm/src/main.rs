@@ -27,9 +27,12 @@ const DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT_ENV: &str =
     "YGGTERM_DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT";
 const ENV_YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF: &str = "YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF";
 const ENV_YGGTERM_ENABLE_ACCESSIBILITY: &str = "YGGTERM_ENABLE_ACCESSIBILITY";
+const ENV_YGGTERM_ENABLE_WEBKIT_COMPOSITING: &str = "YGGTERM_ENABLE_WEBKIT_COMPOSITING";
+const ENV_YGGTERM_ALLOW_MULTI_WINDOW: &str = "YGGTERM_ALLOW_MULTI_WINDOW";
 
 fn main() -> Result<()> {
     configure_linux_accessibility_bridge();
+    configure_linux_webkit_compositing();
     tracing_subscriber::fmt()
         .with_env_filter("info")
         .with_target(false)
@@ -43,6 +46,7 @@ fn main() -> Result<()> {
     let store = SessionStore::open_or_init()?;
     install_panic_logging(store.home_dir());
     let startup_home = store.home_dir().to_path_buf();
+    maybe_focus_existing_client(store.home_dir(), &args)?;
     append_trace_event(
         &startup_home,
         "gui",
@@ -349,6 +353,20 @@ fn configure_linux_accessibility_bridge() {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn configure_linux_webkit_compositing() {
+    let compositing_enabled = std::env::var_os(ENV_YGGTERM_ENABLE_WEBKIT_COMPOSITING).is_some();
+    if compositing_enabled || std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_some() {
+        return;
+    }
+    // Jojo has repeated Mesa/WebKitGTK EGL crashes on the GPU compositing path.
+    // Default to software compositing unless the user opts back in explicitly.
+    unsafe { std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1") };
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_linux_webkit_compositing() {}
+
 fn load_initial_server_snapshot_fast(
     store: &SessionStore,
     browser_tree: &SessionNode,
@@ -383,7 +401,7 @@ fn install_signal_shutdown(home_dir: std::path::PathBuf, endpoint: yggterm_serve
         if handler_flag.swap(true, Ordering::SeqCst) {
             return;
         }
-        if let Ok(remaining_clients) = unregister_signal_client_instance(&home_dir) {
+        if let Ok(remaining_clients) = unregister_signal_client_instance(&home_dir, &endpoint) {
             if remaining_clients == 0 {
                 let _ = shutdown(&endpoint);
             }
@@ -392,8 +410,47 @@ fn install_signal_shutdown(home_dir: std::path::PathBuf, endpoint: yggterm_serve
     });
 }
 
-fn signal_client_instances_dir(home_dir: &std::path::Path) -> std::path::PathBuf {
-    home_dir.join("client-instances")
+fn signal_client_instance_scope(endpoint: &yggterm_server::ServerEndpoint) -> String {
+    let raw = match endpoint {
+        #[cfg(unix)]
+        yggterm_server::ServerEndpoint::UnixSocket(path) => format!("unix-{}", path.display()),
+        yggterm_server::ServerEndpoint::Tcp { host, port } => format!("tcp-{host}-{port}"),
+    };
+    raw.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn signal_client_instances_dir(
+    home_dir: &std::path::Path,
+    endpoint: &yggterm_server::ServerEndpoint,
+) -> std::path::PathBuf {
+    home_dir
+        .join("client-instances")
+        .join(signal_client_instance_scope(endpoint))
+}
+
+fn maybe_focus_existing_client(home_dir: &std::path::Path, args: &[String]) -> Result<()> {
+    if !args.is_empty()
+        || std::env::var_os(ENV_YGGTERM_ALLOW_MULTI_WINDOW).is_some()
+        || std::env::var_os(ENV_YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF).is_some()
+    {
+        return Ok(());
+    }
+    let endpoint = default_endpoint(home_dir);
+    if live_signal_client_count(home_dir, &endpoint)? == 0 {
+        return Ok(());
+    }
+    if run_app_control_focus_window(3_000).is_ok() {
+        std::process::exit(0);
+    }
+    Ok(())
 }
 
 fn maybe_handoff_to_preferred_executable(
@@ -453,8 +510,11 @@ fn signal_process_is_alive(pid: u32) -> bool {
     pid != 0
 }
 
-fn unregister_signal_client_instance(home_dir: &std::path::Path) -> Result<usize> {
-    let dir = signal_client_instances_dir(home_dir);
+fn unregister_signal_client_instance(
+    home_dir: &std::path::Path,
+    endpoint: &yggterm_server::ServerEndpoint,
+) -> Result<usize> {
+    let dir = signal_client_instances_dir(home_dir, endpoint);
     fs::create_dir_all(&dir)?;
     let current_pid = std::process::id();
     let entries = fs::read_dir(&dir)
@@ -478,6 +538,31 @@ fn unregister_signal_client_instance(home_dir: &std::path::Path) -> Result<usize
         }
     }
     Ok(remaining)
+}
+
+fn live_signal_client_count(
+    home_dir: &std::path::Path,
+    endpoint: &yggterm_server::ServerEndpoint,
+) -> Result<usize> {
+    let dir = signal_client_instances_dir(home_dir, endpoint);
+    fs::create_dir_all(&dir)?;
+    let entries = fs::read_dir(&dir)
+        .with_context(|| format!("reading client instances {}", dir.display()))?;
+    let mut live = 0_usize;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(pid) = signal_parse_client_pid(&path) else {
+            let _ = fs::remove_file(&path);
+            continue;
+        };
+        if signal_process_is_alive(pid) {
+            live += 1;
+        } else {
+            let _ = fs::remove_file(&path);
+        }
+    }
+    Ok(live)
 }
 
 fn install_panic_logging(home_dir: &std::path::Path) {
