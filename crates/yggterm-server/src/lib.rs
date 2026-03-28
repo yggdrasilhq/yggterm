@@ -7306,6 +7306,54 @@ mod tests {
     }
 
     #[test]
+    fn local_terminal_stop_commands_match_session_kind() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.restore_live_session(PersistedLiveSession {
+            key: "local://codex".to_string(),
+            id: "codex".to_string(),
+            title: "Codex".to_string(),
+            kind: SessionKind::Codex,
+            ssh_target: String::new(),
+            prefix: None,
+            cwd: Some("/home/pi/gh".to_string()),
+        });
+        server.restore_live_session(PersistedLiveSession {
+            key: "local://shell".to_string(),
+            id: "shell".to_string(),
+            title: "Shell".to_string(),
+            kind: SessionKind::Shell,
+            ssh_target: String::new(),
+            prefix: None,
+            cwd: Some("/home/pi".to_string()),
+        });
+
+        assert_eq!(
+            server.terminal_stop_command("local://codex"),
+            Some("/quit\r".to_string())
+        );
+        assert_eq!(
+            server.terminal_stop_command("local://shell"),
+            Some("exit\r".to_string())
+        );
+    }
+
+    #[test]
     fn synthesize_remote_scanned_session_uses_machine_launch_metadata() {
         let machine = RemoteMachineSnapshot {
             machine_key: "oc".to_string(),
