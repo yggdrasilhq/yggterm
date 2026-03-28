@@ -1,3 +1,11 @@
+yggterm (2.0.25-1) unstable; urgency=medium
+
+  * Scope remote Codex discovery to the actual SSH login user's ~/.codex so Yggterm does not advertise sessions from a different account that cannot be resumed.
+  * Keep restored remote-session tabs on the remote resume path even when the cached session disappeared.
+  * Fall back to the interactive Codex resume picker when a saved remote session ID no longer exists, instead of closing the SSH tab.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sat, 28 Mar 2026 13:15:00 +0530
+
 yggterm (2.0.24-1) unstable; urgency=medium
 
   * Keep only yggterm.desktop visible in Linux menus while leaving dev.yggterm.Yggterm.desktop as a hidden compatibility entry.
