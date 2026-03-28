@@ -11025,16 +11025,18 @@ fn Titlebar(
 ) -> Element {
     let command_mode_active = snapshot.command_mode_active;
     let search_query = snapshot.search_query.clone();
-    let active_title = snapshot.active_session.as_ref().map(|session| {
+    let active_title = snapshot.active_title.clone().or_else(|| {
         snapshot
-            .active_title
-            .clone()
-            .unwrap_or_else(|| session.title.clone())
+            .active_session
+            .as_ref()
+            .map(|session| session.title.clone())
     });
-    let active_summary = snapshot
-        .active_session
-        .as_ref()
-        .and_then(|session| titlebar_summary_text(&snapshot, session));
+    let active_summary = snapshot.active_summary.clone().or_else(|| {
+        snapshot
+            .active_session
+            .as_ref()
+            .and_then(|session| titlebar_summary_text(&snapshot, session))
+    });
     let titlebar_loading_label = if snapshot.active_view_mode == WorkspaceViewMode::Rendered {
         snapshot.preview_loading.then_some("Refreshing preview…".to_string())
     } else {
@@ -13785,22 +13787,38 @@ fn TerminalCanvas(
         &snapshot.settings.terminal_theme_name,
     );
     let terminal_placeholder = terminal_placeholder_text(&session);
-    let (terminal_shell_background, terminal_shell_shadow, terminal_host_chrome) =
-        match snapshot.settings.theme {
-            UiTheme::ZedLight => (
-                "linear-gradient(180deg, rgba(225,234,244,0.99) 0%, rgba(214,225,237,1.0) 100%)"
-                    .to_string(),
-                "inset 0 1px 0 rgba(255,255,255,0.88), inset 0 0 0 1px rgba(130,148,173,0.34), 0 18px 42px rgba(138,154,180,0.22)"
-                    .to_string(),
-                "border-radius:14px;".to_string(),
-            ),
-            UiTheme::ZedDark => (
-                "linear-gradient(180deg, rgba(12,17,24,0.94) 0%, rgba(8,12,18,0.98) 100%)"
-                    .to_string(),
-                "inset 0 0 0 1px rgba(71,85,105,0.42), 0 18px 38px rgba(2,6,23,0.42)"
-                    .to_string(),
-                "border-radius:14px;".to_string(),
-            ),
+    let unstyled_light_terminal =
+        snapshot.settings.theme == UiTheme::ZedLight && snapshot.settings.terminal_theme_name == "VS Code Light+";
+    let (terminal_shell_background, terminal_shell_shadow, terminal_shell_padding, terminal_shell_radius, terminal_host_chrome) =
+        if unstyled_light_terminal {
+            (
+                "transparent".to_string(),
+                "none".to_string(),
+                "0".to_string(),
+                "0".to_string(),
+                "border-radius:0; box-shadow:none !important; outline:none !important;".to_string(),
+            )
+        } else {
+            match snapshot.settings.theme {
+                UiTheme::ZedLight => (
+                    "linear-gradient(180deg, rgba(225,234,244,0.99) 0%, rgba(214,225,237,1.0) 100%)"
+                        .to_string(),
+                    "inset 0 1px 0 rgba(255,255,255,0.88), inset 0 0 0 1px rgba(130,148,173,0.34), 0 18px 42px rgba(138,154,180,0.22)"
+                        .to_string(),
+                    "10px 11px 9px".to_string(),
+                    "11px".to_string(),
+                    "border-radius:14px;".to_string(),
+                ),
+                UiTheme::ZedDark => (
+                    "linear-gradient(180deg, rgba(12,17,24,0.94) 0%, rgba(8,12,18,0.98) 100%)"
+                        .to_string(),
+                    "inset 0 0 0 1px rgba(71,85,105,0.42), 0 18px 38px rgba(2,6,23,0.42)"
+                        .to_string(),
+                    "10px 11px 9px".to_string(),
+                    "11px".to_string(),
+                    "border-radius:14px;".to_string(),
+                ),
+            }
         };
     let future_theme = theme.clone();
     let trace_home = perf_home_dir(&state.read().bootstrap.settings_path);
@@ -14385,10 +14403,12 @@ fn TerminalCanvas(
             style: "display:flex; flex-direction:column; min-height:0; height:100%;",
             div {
                 style: format!(
-                    "display:flex; flex-direction:column; min-height:0; height:100%; gap:0; border-radius:11px; \
-                     background:{}; box-shadow:{}; overflow:hidden; padding:10px 11px 9px; position:relative;",
+                    "display:flex; flex-direction:column; min-height:0; height:100%; gap:0; border-radius:{}; \
+                     background:{}; box-shadow:{}; overflow:hidden; padding:{}; position:relative;",
+                    terminal_shell_radius,
                     terminal_shell_background,
                     terminal_shell_shadow,
+                    terminal_shell_padding,
                 ),
                 div {
                     key: "{host_id}",
