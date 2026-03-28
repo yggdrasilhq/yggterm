@@ -38,21 +38,11 @@ pub enum YggSurface {
 pub enum YggTarget {
     App,
     ActiveSession,
-    Session {
-        session_path: String,
-    },
-    Terminal {
-        session_path: String,
-    },
-    Preview {
-        session_path: String,
-    },
-    RemoteMachine {
-        machine_key: String,
-    },
-    Search {
-        query: String,
-    },
+    Session { session_path: String },
+    Terminal { session_path: String },
+    Preview { session_path: String },
+    RemoteMachine { machine_key: String },
+    Search { query: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

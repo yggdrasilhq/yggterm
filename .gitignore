@@ -1,6 +1,7 @@
 /target/
 /dist/
 /.yggterm-state/
+run.log
 *.swp
 *.swo
 .DS_Store
