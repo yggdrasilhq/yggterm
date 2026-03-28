@@ -144,6 +144,7 @@ pub struct AppSettings {
     pub show_settings: bool,
     pub tree_width: f32,
     pub terminal_font_size: f32,
+    pub terminal_theme_name: String,
     pub ui_font_size: f32,
     pub prefer_ghostty_backend: bool,
     pub litellm_endpoint: String,
@@ -166,6 +167,7 @@ impl Default for AppSettings {
             show_settings: false,
             tree_width: 300.0,
             terminal_font_size: 13.0,
+            terminal_theme_name: String::new(),
             ui_font_size: 14.0,
             prefer_ghostty_backend: true,
             litellm_endpoint: String::new(),
@@ -561,6 +563,10 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
         settings.terminal_font_size =
             serde_json::from_value(value.clone()).context("failed to parse terminal_font_size")?;
     }
+    if let Some(value) = object.get("terminal_theme_name") {
+        settings.terminal_theme_name = serde_json::from_value(value.clone())
+            .context("failed to parse terminal_theme_name")?;
+    }
     if let Some(value) = object.get("ui_font_size") {
         settings.ui_font_size =
             serde_json::from_value(value.clone()).context("failed to parse ui_font_size")?;
@@ -616,6 +622,7 @@ fn serialize_settings_value(settings: &AppSettings) -> Value {
         "show_settings": settings.show_settings,
         "tree_width": settings.tree_width,
         "terminal_font_size": settings.terminal_font_size,
+        "terminal_theme_name": settings.terminal_theme_name,
         "ui_font_size": settings.ui_font_size,
         "prefer_ghostty_backend": settings.prefer_ghostty_backend,
         "litellm_endpoint": settings.litellm_endpoint,
