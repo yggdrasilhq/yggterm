@@ -90,6 +90,7 @@ static SIDEBAR_MERGE_CACHE: OnceCell<Mutex<SidebarMergeCache>> = OnceCell::new()
 static SIDEBAR_SEARCH_CACHE: OnceCell<Mutex<SidebarSearchCache>> = OnceCell::new();
 static CLIENT_INSTANCE: OnceCell<ClientInstanceRegistration> = OnceCell::new();
 static SUPPRESS_DAEMON_SHUTDOWN_ON_EXIT: AtomicBool = AtomicBool::new(false);
+static INTENTIONAL_CLIENT_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 const PREVIEW_BLOCK_CACHE_LIMIT: usize = 256;
 const PREVIEW_CONTENT_CACHE_LIMIT: usize = 256;
@@ -3344,6 +3345,7 @@ fn spawn_graceful_shutdown_and_close(mut state: Signal<ShellState>) {
     if state.read().closing_app {
         return;
     }
+    INTENTIONAL_CLIENT_SHUTDOWN.store(true, Ordering::SeqCst);
     state.with_mut(|shell| {
         shell.closing_app = true;
         shell.last_action = "closing yggterm".to_string();
@@ -9493,6 +9495,34 @@ fn finalize_client_shutdown(
         });
     }
 
+    if !INTENTIONAL_CLIENT_SHUTDOWN.swap(false, Ordering::SeqCst) {
+        let dir = client_instances_dir(settings_path, endpoint);
+        let current_path = CLIENT_INSTANCE
+            .get()
+            .map(|registration| registration.path.as_path());
+        let _ = cleanup_stale_client_instances(&dir, current_path);
+        if let Some(path) = current_path {
+            let _ = fs::remove_file(path);
+        }
+        let active = cleanup_stale_client_instances(&dir, None)?;
+        append_trace_event(
+            &perf_home_dir(settings_path),
+            "client",
+            "gui",
+            "shutdown_unintentional",
+            json!({
+                "remaining_clients": active.len(),
+                "active_paths": active
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>(),
+            }),
+        );
+        return Ok(CloseAppMode::CloseClientOnly {
+            remaining_clients: active.len(),
+        });
+    }
+
     maybe_shutdown_daemon_for_last_client(settings_path, endpoint)
 }
 
@@ -9835,6 +9865,7 @@ fn app() -> Element {
                     window_epoch.with_mut(|epoch| *epoch += 1);
                 }
                 DesktopWindowEvent::CloseRequested => {
+                    INTENTIONAL_CLIENT_SHUTDOWN.store(true, Ordering::SeqCst);
                     state.with_mut(|shell| {
                         shell.closing_app = true;
                         shell.last_action = "closing yggterm".to_string();
