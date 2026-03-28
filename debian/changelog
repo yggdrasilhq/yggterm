@@ -1,3 +1,13 @@
+yggterm (2.1.2-1) unstable; urgency=medium
+
+  * Prioritize active remote terminal restore over background refresh churn so live SSH and Codex sessions paint first on relaunch.
+  * Remove duplicate startup terminal remounts and hide the sidebar loading chip while terminal mode is already usable.
+  * Trim GNU Screen remote resume delay and cache remote yggterm binary probes across startup bursts.
+  * Make perf, trace, and UI telemetry appends atomic so diagnostic JSONL logs stay parseable under load.
+  * Strengthen the light terminal palette for clearer Codex contrast in the desktop shell.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sat, 28 Mar 2026 23:10:00 +0530
+
 yggterm (2.1.0-1) unstable; urgency=medium
 
   * Add server app state, server app focus, and server app screenshot as the first SSH-reachable YggUI control verbs.
