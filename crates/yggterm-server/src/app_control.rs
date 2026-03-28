@@ -161,6 +161,7 @@ pub fn take_next_app_control_request(
             requests_dir.display()
         )
     })?;
+    recover_stale_inflight_requests(&requests_dir)?;
     let mut entries = fs::read_dir(&requests_dir)?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -187,7 +188,7 @@ pub fn take_next_app_control_request(
         };
         if request
             .preferred_pid
-            .is_some_and(|preferred_pid| preferred_pid != worker_pid)
+            .is_some_and(|preferred_pid| preferred_pid != worker_pid && process_is_alive(preferred_pid))
         {
             continue;
         }
@@ -202,6 +203,56 @@ pub fn take_next_app_control_request(
         return Ok(Some((inflight_path, request)));
     }
     Ok(None)
+}
+
+fn recover_stale_inflight_requests(requests_dir: &Path) -> Result<()> {
+    for entry in fs::read_dir(requests_dir)? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("inflight-") || path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(worker_pid) = parse_inflight_worker_pid(name) else {
+            let _ = fs::remove_file(&path);
+            continue;
+        };
+        if process_is_alive(worker_pid) {
+            continue;
+        }
+        let Some(original_name) = name.splitn(3, '-').nth(2) else {
+            let _ = fs::remove_file(&path);
+            continue;
+        };
+        let recovered_path = requests_dir.join(original_name);
+        if recovered_path.exists() {
+            let _ = fs::remove_file(&path);
+            continue;
+        }
+        let _ = fs::rename(&path, &recovered_path);
+    }
+    Ok(())
+}
+
+fn parse_inflight_worker_pid(file_name: &str) -> Option<u32> {
+    let rest = file_name.strip_prefix("inflight-")?;
+    let pid = rest.split('-').next()?;
+    pid.parse().ok()
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    pid != 0 && Path::new(&format!("/proc/{pid}")).exists()
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(pid: u32) -> bool {
+    pid != 0
 }
 
 pub fn complete_app_control_request(
