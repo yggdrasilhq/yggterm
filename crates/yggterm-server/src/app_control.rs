@@ -52,6 +52,9 @@ pub enum AppControlCommand {
         target: ScreenshotTarget,
         output_path: String,
     },
+    SetFullscreen {
+        enabled: bool,
+    },
     Drag {
         command: AppControlDragCommand,
     },
@@ -69,6 +72,7 @@ impl AppControlCommand {
     pub fn name(&self) -> &'static str {
         match self {
             Self::CaptureScreenshot { .. } => "capture_screenshot",
+            Self::SetFullscreen { .. } => "set_fullscreen",
             Self::Drag { .. } => "drag",
             Self::DescribeRows => "describe_rows",
             Self::OpenPath { .. } => "open_path",
