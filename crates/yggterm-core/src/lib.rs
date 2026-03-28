@@ -564,8 +564,8 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
             serde_json::from_value(value.clone()).context("failed to parse terminal_font_size")?;
     }
     if let Some(value) = object.get("terminal_theme_name") {
-        settings.terminal_theme_name = serde_json::from_value(value.clone())
-            .context("failed to parse terminal_theme_name")?;
+        settings.terminal_theme_name =
+            serde_json::from_value(value.clone()).context("failed to parse terminal_theme_name")?;
     }
     if let Some(value) = object.get("ui_font_size") {
         settings.ui_font_size =
