@@ -56,6 +56,8 @@ impl AppControlCommand {
 pub struct AppControlRequest {
     pub request_id: String,
     pub created_at_ms: u128,
+    #[serde(default)]
+    pub preferred_pid: Option<u32>,
     pub command: AppControlCommand,
 }
 
@@ -91,6 +93,7 @@ pub fn default_screenshot_output_path(home: &Path, request_id: &str) -> PathBuf 
 pub fn enqueue_app_control_request(
     home: &Path,
     command: AppControlCommand,
+    preferred_pid: Option<u32>,
 ) -> Result<AppControlRequest> {
     let requests_dir = app_control_requests_dir(home);
     let captures_dir = app_control_captures_dir(home);
@@ -109,6 +112,7 @@ pub fn enqueue_app_control_request(
     let request = AppControlRequest {
         request_id: Uuid::new_v4().to_string(),
         created_at_ms: current_millis(),
+        preferred_pid,
         command,
     };
     let final_path = requests_dir.join(format!("{}.json", request.request_id));
@@ -144,6 +148,23 @@ pub fn take_next_app_control_request(
         .collect::<Vec<_>>();
     entries.sort();
     for path in entries {
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        let request = match serde_json::from_slice::<AppControlRequest>(&bytes) {
+            Ok(request) => request,
+            Err(_) => {
+                let _ = fs::remove_file(&path);
+                continue;
+            }
+        };
+        if request
+            .preferred_pid
+            .is_some_and(|preferred_pid| preferred_pid != worker_pid)
+        {
+            continue;
+        }
         let file_name = path
             .file_name()
             .and_then(|value| value.to_str())
@@ -152,10 +173,6 @@ pub fn take_next_app_control_request(
         if fs::rename(&path, &inflight_path).is_err() {
             continue;
         }
-        let bytes = fs::read(&inflight_path)
-            .with_context(|| format!("reading app control request {}", inflight_path.display()))?;
-        let request = serde_json::from_slice::<AppControlRequest>(&bytes)
-            .with_context(|| format!("parsing app control request {}", inflight_path.display()))?;
         return Ok(Some((inflight_path, request)));
     }
     Ok(None)
@@ -219,6 +236,7 @@ pub fn enqueue_screenshot_request(
     home: &Path,
     target: ScreenshotTarget,
     output_path: Option<PathBuf>,
+    preferred_pid: Option<u32>,
 ) -> Result<AppControlRequest> {
     let request_id = Uuid::new_v4().to_string();
     let output_path = output_path
@@ -228,6 +246,7 @@ pub fn enqueue_screenshot_request(
     let request = AppControlRequest {
         request_id,
         created_at_ms: current_millis(),
+        preferred_pid,
         command: AppControlCommand::CaptureScreenshot {
             target,
             output_path,

@@ -44,7 +44,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
@@ -4210,7 +4210,7 @@ fn request_app_control(
     command: AppControlCommand,
     timeout_ms: u64,
 ) -> anyhow::Result<AppControlResponse> {
-    let request = enqueue_app_control_request(home, command)?;
+    let request = enqueue_app_control_request(home, command, preferred_app_control_pid(home))?;
     wait_for_app_control_response(
         home,
         &request.request_id,
@@ -4223,12 +4223,81 @@ fn capture_embedded_app_screenshot(
     output_path: Option<std::path::PathBuf>,
     timeout_ms: u64,
 ) -> anyhow::Result<AppControlResponse> {
-    let request = enqueue_screenshot_request(home, ScreenshotTarget::App, output_path)?;
+    let request = enqueue_screenshot_request(
+        home,
+        ScreenshotTarget::App,
+        output_path,
+        preferred_app_control_pid(home),
+    )?;
     wait_for_app_control_response(
         home,
         &request.request_id,
         std::time::Duration::from_millis(timeout_ms.max(250)),
     )
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientInstanceRecord {
+    pid: u32,
+    started_at_ms: u128,
+}
+
+fn client_instance_scope(endpoint: &ServerEndpoint) -> String {
+    let raw = match endpoint {
+        #[cfg(unix)]
+        ServerEndpoint::UnixSocket(path) => format!("unix-{}", path.display()),
+        ServerEndpoint::Tcp { host, port } => format!("tcp-{host}-{port}"),
+    };
+    raw.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn client_instances_dir(home: &Path, endpoint: &ServerEndpoint) -> PathBuf {
+    home.join("client-instances")
+        .join(client_instance_scope(endpoint))
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    pid != 0 && Path::new(&format!("/proc/{pid}")).exists()
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(pid: u32) -> bool {
+    pid != 0
+}
+
+fn preferred_app_control_pid(home: &Path) -> Option<u32> {
+    let endpoint = default_endpoint(home);
+    let dir = client_instances_dir(home, &endpoint);
+    let entries = fs::read_dir(dir).ok()?;
+    let mut newest: Option<ClientInstanceRecord> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_slice::<ClientInstanceRecord>(&bytes) else {
+            continue;
+        };
+        if !process_is_alive(record.pid) {
+            continue;
+        }
+        if newest
+            .as_ref()
+            .is_none_or(|candidate| record.started_at_ms > candidate.started_at_ms)
+        {
+            newest = Some(record);
+        }
+    }
+    newest.map(|record| record.pid)
 }
 
 fn capture_trace_screenshot(home: &std::path::Path) -> Option<std::path::PathBuf> {
