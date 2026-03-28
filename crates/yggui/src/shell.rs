@@ -14,6 +14,7 @@ use crate::notifications::{
     ToastTone as NotificationTone, ToastViewport,
 };
 use crate::rails::{RailHeader, RailScrollBody, RailSectionTitle, SideRailShell};
+use crate::terminal_themes::{terminal_theme_by_name, terminal_theme_names};
 use crate::theme::{
     THEME_EDITOR_SWATCHES, append_theme_stop, clamp_theme_spec, default_theme_editor_spec,
     dominant_accent, gradient_css, preview_surface_css, shell_tint,
@@ -74,7 +75,7 @@ use yggterm_server::{
     refresh_remote_machine, remove_ssh_target, request_terminal_launch,
     set_all_preview_blocks_folded, set_view_mode as daemon_set_view_mode,
     shutdown as daemon_shutdown, snapshot as daemon_snapshot, stage_remote_clipboard_png,
-    start_command_session, start_local_session, start_local_session_at, status,
+    start_command_session, start_local_session_at, status,
     switch_agent_session_mode, take_next_screenshot_request, terminal_ensure, terminal_read,
     terminal_resize, terminal_write, toggle_preview_block as daemon_toggle_preview_block,
 };
@@ -160,6 +161,7 @@ struct ShellState {
     always_on_top: bool,
     notifications: Vec<ToastNotification>,
     next_notification_id: u64,
+    titlebar_new_menu_open: bool,
     selected_tree_paths: HashSet<String>,
     selection_anchor: Option<String>,
     context_menu_row: Option<BrowserRow>,
@@ -224,6 +226,18 @@ struct DockSignature {
 #[derive(Debug, Clone)]
 struct ClientInstanceRegistration {
     path: PathBuf,
+}
+
+struct DaemonSpawnLock {
+    path: Option<PathBuf>,
+}
+
+impl Drop for DaemonSpawnLock {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.as_ref() {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -304,6 +318,7 @@ struct RenderSnapshot {
     maximized: bool,
     always_on_top: bool,
     notifications: Vec<ToastNotification>,
+    titlebar_new_menu_open: bool,
     selected_tree_paths: Vec<String>,
     context_menu_row: Option<BrowserRow>,
     context_menu_position: Option<(f64, f64)>,
@@ -512,6 +527,7 @@ struct SearchContentHit {
 struct ActiveSurfaceRequest {
     request_id: String,
     operation: String,
+    target: YggTarget,
 }
 
 #[derive(Default)]
@@ -606,6 +622,7 @@ impl ShellState {
             always_on_top: false,
             notifications: Vec::new(),
             next_notification_id: 1,
+            titlebar_new_menu_open: false,
             selected_tree_paths: HashSet::new(),
             selection_anchor: None,
             context_menu_row: None,
@@ -813,6 +830,7 @@ impl ShellState {
             maximized: self.maximized,
             always_on_top: self.always_on_top,
             notifications: self.notifications.clone(),
+            titlebar_new_menu_open: self.titlebar_new_menu_open,
             selected_tree_paths: self.selected_tree_paths.iter().cloned().collect(),
             context_menu_row: self.context_menu_row.clone(),
             context_menu_position: self.context_menu_position,
@@ -1104,6 +1122,7 @@ impl ShellState {
             ActiveSurfaceRequest {
                 request_id: request_meta.request_id,
                 operation: request_meta.operation,
+                target: request_meta.target,
             },
         );
         self.last_action = label;
@@ -1181,6 +1200,7 @@ impl ShellState {
         let was_initial_sync = self.needs_initial_server_sync;
         match result {
             Ok((snapshot, message)) => {
+                let snapshot = self.reconcile_snapshot_for_interactive_request(request_id, snapshot);
                 self.server.apply_snapshot(snapshot);
                 self.hydrate_generated_copy_from_remote_cache();
                 self.finish_busy_request_for(request_id);
@@ -1249,19 +1269,27 @@ impl ShellState {
         self.sync_browser_settings();
     }
 
-    fn active_session_visibility_paths(&self) -> Vec<String> {
-        let active_path = self
-            .server
-            .active_session()
-            .map(|session| session.session_path.clone())
+fn active_session_visibility_paths(&self) -> Vec<String> {
+    let active_path = self
+        .server
+        .active_session()
+        .map(|session| session.session_path.clone())
             .or_else(|| self.server.active_session_path().map(ToOwned::to_owned));
-        let Some(active_path) = active_path else {
-            return Vec::new();
-        };
-        let Some((machine_key, session_id)) = parse_remote_scanned_session_path(&active_path)
-        else {
-            return Vec::new();
-        };
+    let Some(active_path) = active_path else {
+        return Vec::new();
+    };
+    if self
+        .server
+        .live_sessions()
+        .iter()
+        .any(|session| session.session_path == active_path && !session.session_path.starts_with("remote-session://"))
+    {
+        return vec!["__live_sessions__".to_string()];
+    }
+    let Some((machine_key, session_id)) = parse_remote_scanned_session_path(&active_path)
+    else {
+        return Vec::new();
+    };
         let mut paths = vec![format!("__remote_machine__/{machine_key}")];
         let active_cwd = self
             .server
@@ -1473,6 +1501,13 @@ impl ShellState {
         );
     }
 
+    fn set_terminal_theme_name(&mut self, value: String) {
+        self.settings.terminal_theme_name = value;
+        self.persist_settings();
+        let selected = self.effective_terminal_theme_name();
+        self.last_action = format!("terminal theme {selected}");
+    }
+
     fn set_ui_theme(&mut self, theme: UiTheme) {
         self.settings.theme = theme;
         self.persist_settings();
@@ -1480,6 +1515,54 @@ impl ShellState {
             UiTheme::ZedLight => "light theme".to_string(),
             UiTheme::ZedDark => "dark theme".to_string(),
         };
+    }
+
+    fn effective_terminal_theme_name(&self) -> String {
+        if !self.settings.terminal_theme_name.trim().is_empty() {
+            return self.settings.terminal_theme_name.clone();
+        }
+        match self.settings.theme {
+            UiTheme::ZedLight => "VS Code Light+".to_string(),
+            UiTheme::ZedDark => "Dark+".to_string(),
+        }
+    }
+
+    fn reconcile_snapshot_for_interactive_request(
+        &self,
+        request_id: &str,
+        mut snapshot: ServerUiSnapshot,
+    ) -> ServerUiSnapshot {
+        let preferred_path = self
+            .active_surface_requests
+            .values()
+            .find(|request| request.request_id == request_id)
+            .and_then(|request| match &request.target {
+                YggTarget::Session { session_path }
+                | YggTarget::Terminal { session_path }
+                | YggTarget::Preview { session_path } => Some(session_path.clone()),
+                _ => None,
+            });
+        let Some(preferred_path) = preferred_path else {
+            return snapshot;
+        };
+        let Some(preferred_session) = snapshot
+            .live_sessions
+            .iter()
+            .find(|session| session.session_path == preferred_path)
+            .cloned()
+            .or_else(|| {
+                snapshot
+                    .active_session
+                    .as_ref()
+                    .filter(|session| session.session_path == preferred_path)
+                    .cloned()
+            })
+        else {
+            return snapshot;
+        };
+        snapshot.active_session_path = Some(preferred_path);
+        snapshot.active_session = Some(preferred_session);
+        snapshot
     }
 
     fn open_theme_editor(&mut self) {
@@ -2127,6 +2210,14 @@ impl ShellState {
         self.settings.selected_browser_path = self.browser.selected_path().map(ToOwned::to_owned);
         self.settings.expanded_browser_paths = self.browser.expanded_paths();
         self.persist_settings();
+    }
+
+    fn toggle_titlebar_new_menu(&mut self) {
+        self.titlebar_new_menu_open = !self.titlebar_new_menu_open;
+    }
+
+    fn close_titlebar_new_menu(&mut self) {
+        self.titlebar_new_menu_open = false;
     }
 
     fn push_notification(
@@ -3378,6 +3469,10 @@ fn ensure_daemon_running(endpoint: &ServerEndpoint) -> Result<()> {
     }
     let mut last_error = None;
     for _ in 0..3 {
+        let spawn_lock = acquire_daemon_spawn_lock(endpoint)?;
+        if ping(endpoint).is_ok() {
+            return Ok(());
+        }
         prepare_current_endpoint_for_spawn(endpoint)?;
         spawn_daemon_process(endpoint)?;
         match wait_for_daemon(endpoint) {
@@ -3385,6 +3480,7 @@ fn ensure_daemon_running(endpoint: &ServerEndpoint) -> Result<()> {
             Err(error) => {
                 last_error = Some(error);
                 let _ = daemon_shutdown(endpoint);
+                drop(spawn_lock);
                 thread::sleep(Duration::from_millis(250));
             }
         }
@@ -3399,6 +3495,7 @@ fn restart_daemon(endpoint: &ServerEndpoint) -> Result<()> {
     thread::sleep(Duration::from_millis(200));
     let mut last_error = None;
     for _ in 0..3 {
+        let spawn_lock = acquire_daemon_spawn_lock(endpoint)?;
         prepare_current_endpoint_for_spawn(endpoint)?;
         spawn_daemon_process(endpoint)?;
         match wait_for_daemon(endpoint) {
@@ -3406,6 +3503,7 @@ fn restart_daemon(endpoint: &ServerEndpoint) -> Result<()> {
             Err(error) => {
                 last_error = Some(error);
                 let _ = daemon_shutdown(endpoint);
+                drop(spawn_lock);
                 thread::sleep(Duration::from_millis(250));
             }
         }
@@ -3469,6 +3567,39 @@ fn daemon_startup_log_file(endpoint: &ServerEndpoint) -> Result<std::fs::File> {
         .create(true)
         .append(true)
         .open(path)?)
+}
+
+fn daemon_spawn_lock_path(endpoint: &ServerEndpoint) -> PathBuf {
+    match endpoint {
+        #[cfg(unix)]
+        ServerEndpoint::UnixSocket(path) => path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("daemon.spawn.lock"),
+        ServerEndpoint::Tcp { .. } => PathBuf::from("daemon.spawn.lock"),
+    }
+}
+
+fn acquire_daemon_spawn_lock(endpoint: &ServerEndpoint) -> Result<DaemonSpawnLock> {
+    let path = daemon_spawn_lock_path(endpoint);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    for _ in 0..120 {
+        match OpenOptions::new().create_new(true).write(true).open(&path) {
+            Ok(_) => {
+                return Ok(DaemonSpawnLock { path: Some(path) });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if ping(endpoint).is_ok() {
+                    return Ok(DaemonSpawnLock { path: None });
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    anyhow::bail!("timed out waiting for daemon spawn lock {}", path.display())
 }
 
 fn daemon_startup_log_path(endpoint: &ServerEndpoint) -> PathBuf {
@@ -3760,11 +3891,15 @@ fn spawn_background_remote_machine_refresh(state: Signal<ShellState>, machine_ke
             shell.finish_busy_request_for(&request_id);
             shell.remote_machine_refresh_requests.remove(&machine_key);
             match outcome {
-                Ok(Ok((snapshot, message))) => {
+                Ok(Ok((mut snapshot, message))) => {
                     shell
                         .remote_machine_refresh_retry_after_ms
                         .remove(&machine_key);
+                    preserve_client_focus_for_background_snapshot(shell, &mut snapshot);
                     shell.server.apply_snapshot(snapshot);
+                    shell.refresh_search_state("remote_machine_refresh_complete");
+                    shell.record_restore_issue_telemetry("remote_machine_refresh_complete");
+                    shell.record_preview_issue_telemetry("remote_machine_refresh_complete");
                     if let Some(message) = message {
                         shell.last_action = message;
                     }
@@ -3875,6 +4010,17 @@ fn spawn_server_snapshot_action<F>(state: Signal<ShellState>, pending_label: Str
 where
     F: FnOnce(ServerEndpoint) -> Result<(ServerUiSnapshot, Option<String>)> + Send + 'static,
 {
+    spawn_targeted_server_snapshot_action(state, pending_label, YggTarget::App, request);
+}
+
+fn spawn_targeted_server_snapshot_action<F>(
+    state: Signal<ShellState>,
+    pending_label: String,
+    target: YggTarget,
+    request: F,
+) where
+    F: FnOnce(ServerEndpoint) -> Result<(ServerUiSnapshot, Option<String>)> + Send + 'static,
+{
     spawn_surface_snapshot_action(
         state,
         pending_label,
@@ -3882,7 +4028,7 @@ where
             format!("server-action-{}", current_millis()),
             "server_action",
             YggSurface::App,
-            YggTarget::App,
+            target,
         ),
         true,
         request,
@@ -4184,6 +4330,31 @@ fn spawn_start_group_session(mut state: Signal<ShellState>, row: BrowserRow, kin
     spawn_server_snapshot_action(state, pending, move |endpoint| {
         start_local_session_at(&endpoint, kind, cwd.as_deref(), title_hint.as_deref())
     });
+}
+
+fn current_new_session_context(shell: &ShellState, kind: SessionKind) -> (Option<String>, Option<String>) {
+    let selected_row = shell
+        .selected_workspace_rows()
+        .into_iter()
+        .next()
+        .or_else(|| shell.browser.selected_row().cloned());
+    if let Some(row) = selected_row.as_ref() {
+        return (
+            group_session_cwd(row),
+            Some(group_session_title_hint(row, kind)),
+        );
+    }
+    if let Some(active) = shell.server.active_session() {
+        let cwd = metadata_value(active, "Cwd");
+        let cwd = (!cwd.trim().is_empty()).then_some(cwd);
+        let title = if active.title.trim().is_empty() {
+            None
+        } else {
+            Some(format!("{} {}", active.title, session_kind_action_label(kind)))
+        };
+        return (cwd, title);
+    }
+    (None, None)
 }
 
 fn preferred_agent_session_kind(settings: &AppSettings) -> SessionKind {
@@ -5959,7 +6130,12 @@ fn merged_sidebar_rows_uncached(
     live_sessions: &[ManagedSessionView],
     expanded_paths: &HashSet<String>,
 ) -> Vec<BrowserRow> {
-    if ssh_targets.is_empty() && remote_machines.is_empty() {
+    let local_live_sessions = live_sessions
+        .iter()
+        .filter(|session| is_local_live_session_path(&session.session_path))
+        .collect::<Vec<_>>();
+
+    if ssh_targets.is_empty() && remote_machines.is_empty() && local_live_sessions.is_empty() {
         return stored_rows.to_vec();
     }
 
@@ -5993,11 +6169,92 @@ fn merged_sidebar_rows_uncached(
         );
     }
     merge_remote_live_sessions(&mut machine_rows, ssh_targets, live_sessions);
+    push_local_live_session_rows(&mut rows, &local_live_sessions, expanded_paths);
     for machine in machine_rows.into_values() {
         push_remote_machine_rows(&mut rows, &machine, expanded_paths);
     }
     rows.extend_from_slice(stored_rows);
     rows
+}
+
+fn push_local_live_session_rows(
+    rows: &mut Vec<BrowserRow>,
+    sessions: &[&ManagedSessionView],
+    expanded_paths: &HashSet<String>,
+) {
+    if sessions.is_empty() {
+        return;
+    }
+
+    let group_path = "__live_sessions__".to_string();
+    let expanded = expanded_paths.contains(&group_path);
+    rows.push(BrowserRow {
+        kind: BrowserRowKind::Group,
+        full_path: group_path.clone(),
+        label: "Live Sessions".to_string(),
+        detail_label: String::new(),
+        document_kind: None,
+        group_kind: None,
+        session_title: None,
+        depth: 0,
+        host_label: "live".to_string(),
+        descendant_sessions: sessions.len(),
+        expanded,
+        session_id: None,
+        session_cwd: None,
+    });
+    if !expanded {
+        return;
+    }
+
+    let short_ids = unique_session_short_ids_for_pairs(
+        &sessions
+            .iter()
+            .map(|session| (session.session_path.clone(), session.id.clone()))
+            .collect::<Vec<_>>(),
+    );
+
+    for session in sessions {
+        let cwd = metadata_value(session, "Cwd");
+        let label = local_live_session_label(session, &short_ids);
+        rows.push(BrowserRow {
+            kind: BrowserRowKind::Session,
+            full_path: session.session_path.clone(),
+            label: label.clone(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: Some(label),
+            depth: 1,
+            host_label: session.host_label.clone(),
+            descendant_sessions: 1,
+            expanded: true,
+            session_id: Some(session.id.clone()),
+            session_cwd: (!cwd.trim().is_empty()).then_some(cwd),
+        });
+    }
+}
+
+fn local_live_session_label(
+    session: &ManagedSessionView,
+    short_ids: &HashMap<String, String>,
+) -> String {
+    let target = metadata_value(session, "Target");
+    if !target.trim().is_empty() && target != "document" {
+        return target;
+    }
+    let cwd = metadata_value(session, "Cwd");
+    if !cwd.trim().is_empty() {
+        return cwd;
+    }
+    let title = session.title.trim();
+    if !title.is_empty() && !looks_like_generated_fallback_title(title) {
+        return session.title.clone();
+    }
+    short_ids
+        .get(&session.session_path)
+        .cloned()
+        .unwrap_or_else(|| session.id.clone())
 }
 
 fn enrich_sidebar_rows_with_live_titles(
@@ -6092,6 +6349,13 @@ fn merge_remote_live_sessions(
                 session,
             ));
     }
+}
+
+fn is_local_live_session_path(path: &str) -> bool {
+    path.starts_with("local://")
+        || path.starts_with("codex://")
+        || path.starts_with("codex-litellm://")
+        || path.starts_with("document://")
 }
 
 fn remote_scanned_session_from_live(
@@ -8043,8 +8307,27 @@ fn perf_home_dir(settings_path: &std::path::Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn client_instances_dir(settings_path: &std::path::Path) -> PathBuf {
-    perf_home_dir(settings_path).join("client-instances")
+fn client_instance_scope(endpoint: &ServerEndpoint) -> String {
+    let raw = match endpoint {
+        #[cfg(unix)]
+        ServerEndpoint::UnixSocket(path) => format!("unix-{}", path.display()),
+        ServerEndpoint::Tcp { host, port } => format!("tcp-{host}-{port}"),
+    };
+    raw.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn client_instances_dir(settings_path: &std::path::Path, endpoint: &ServerEndpoint) -> PathBuf {
+    perf_home_dir(settings_path)
+        .join("client-instances")
+        .join(client_instance_scope(endpoint))
 }
 
 async fn process_pending_screenshot_requests(settings_path: &std::path::Path) -> Result<()> {
@@ -8291,8 +8574,11 @@ fn cleanup_stale_client_instances(dir: &Path, keep_path: Option<&Path>) -> Resul
     Ok(active)
 }
 
-fn register_client_instance(settings_path: &Path) -> Result<ClientInstanceRegistration> {
-    let dir = client_instances_dir(settings_path);
+fn register_client_instance(
+    settings_path: &Path,
+    endpoint: &ServerEndpoint,
+) -> Result<ClientInstanceRegistration> {
+    let dir = client_instances_dir(settings_path, endpoint);
     let _ = cleanup_stale_client_instances(&dir, None);
     let pid = std::process::id();
     let started_at_ms = current_millis();
@@ -8306,6 +8592,17 @@ fn register_client_instance(settings_path: &Path) -> Result<ClientInstanceRegist
     let payload = serde_json::to_vec(&record)?;
     file.write_all(&payload)
         .with_context(|| format!("writing client instance {}", path.display()))?;
+    append_trace_event(
+        &perf_home_dir(settings_path),
+        "client",
+        "gui",
+        "register",
+        json!({
+            "pid": pid,
+            "path": path.display().to_string(),
+            "started_at_ms": started_at_ms,
+        }),
+    );
     Ok(ClientInstanceRegistration { path })
 }
 
@@ -8313,7 +8610,7 @@ fn maybe_shutdown_daemon_for_last_client(
     settings_path: &Path,
     endpoint: &ServerEndpoint,
 ) -> Result<CloseAppMode> {
-    let dir = client_instances_dir(settings_path);
+    let dir = client_instances_dir(settings_path, endpoint);
     let current_path = CLIENT_INSTANCE
         .get()
         .map(|registration| registration.path.as_path());
@@ -8322,6 +8619,20 @@ fn maybe_shutdown_daemon_for_last_client(
         let _ = fs::remove_file(path);
     }
     let active = cleanup_stale_client_instances(&dir, None)?;
+    append_trace_event(
+        &perf_home_dir(settings_path),
+        "client",
+        "gui",
+        "shutdown_check",
+        json!({
+            "current_path": current_path.map(|path| path.display().to_string()),
+            "remaining_clients": active.len(),
+            "active_paths": active
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>(),
+        }),
+    );
     if active.is_empty() {
         let _ = daemon_shutdown(endpoint)?;
         Ok(CloseAppMode::ShutdownDaemon)
@@ -8337,7 +8648,7 @@ fn finalize_client_shutdown(
     endpoint: &ServerEndpoint,
 ) -> Result<CloseAppMode> {
     if SUPPRESS_DAEMON_SHUTDOWN_ON_EXIT.swap(false, Ordering::SeqCst) {
-        let dir = client_instances_dir(settings_path);
+        let dir = client_instances_dir(settings_path, endpoint);
         let current_path = CLIENT_INSTANCE
             .get()
             .map(|registration| registration.path.as_path());
@@ -8346,12 +8657,46 @@ fn finalize_client_shutdown(
             let _ = fs::remove_file(path);
         }
         let active = cleanup_stale_client_instances(&dir, None)?;
+        append_trace_event(
+            &perf_home_dir(settings_path),
+            "client",
+            "gui",
+            "shutdown_suppressed",
+            json!({
+                "remaining_clients": active.len(),
+                "active_paths": active
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>(),
+            }),
+        );
         return Ok(CloseAppMode::CloseClientOnly {
             remaining_clients: active.len(),
         });
     }
 
     maybe_shutdown_daemon_for_last_client(settings_path, endpoint)
+}
+
+fn preserve_client_focus_for_background_snapshot(
+    shell: &ShellState,
+    snapshot: &mut ServerUiSnapshot,
+) {
+    let preserved_view_mode = shell.server.active_view_mode();
+    let preserved_active_path = shell.server.active_session_path().map(ToOwned::to_owned);
+    snapshot.active_view_mode = preserved_view_mode;
+    snapshot.active_session_path = preserved_active_path.clone();
+    snapshot.active_session = match preserved_active_path.as_deref() {
+        Some(path)
+            if snapshot
+                .active_session
+                .as_ref()
+                .is_some_and(|session| session.session_path == path) =>
+        {
+            snapshot.active_session.clone()
+        }
+        _ => None,
+    };
 }
 
 #[derive(Clone)]
@@ -8551,7 +8896,7 @@ fn ghostty_dock_request(
 
 pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
     if CLIENT_INSTANCE.get().is_none() {
-        match register_client_instance(&bootstrap.settings_path) {
+        match register_client_instance(&bootstrap.settings_path, &bootstrap.server_endpoint) {
             Ok(registration) => {
                 let _ = CLIENT_INSTANCE.set(registration);
             }
@@ -9114,6 +9459,7 @@ fn app() -> Element {
                  -webkit-backdrop-filter:{};",
                 shell_radius, snapshot.shell_tint, snapshot.shell_gradient, shell_backdrop, shell_backdrop
             ),
+            onclick: move |_| state.with_mut(|shell| shell.close_titlebar_new_menu()),
             onmouseup: move |_| {
                 if !state.read().drag_paths.is_empty() {
                     queue_drop_current_drag_target(state);
@@ -9317,6 +9663,39 @@ fn app() -> Element {
                     },
                     on_hover_control: move |control: Option<HoveredControl>| hovered.set(control),
                     on_set_view_mode: move |mode: WorkspaceViewMode| spawn_set_view_mode(state, mode),
+                    on_toggle_new_menu: move |_| state.with_mut(|shell| shell.toggle_titlebar_new_menu()),
+                    on_start_session: move |_| {
+                        let (cwd, title_hint) = state.with_mut(|shell| {
+                            shell.close_titlebar_new_menu();
+                            current_new_session_context(shell, preferred_agent_kind)
+                        });
+                        spawn_server_snapshot_action(state, "starting session".to_string(), move |endpoint| {
+                            start_local_session_at(
+                                &endpoint,
+                                preferred_agent_kind,
+                                cwd.as_deref(),
+                                title_hint.as_deref(),
+                            )
+                        })
+                    },
+                    on_start_terminal: move |_| {
+                        let (cwd, title_hint) = state.with_mut(|shell| {
+                            shell.close_titlebar_new_menu();
+                            current_new_session_context(shell, SessionKind::Shell)
+                        });
+                        spawn_server_snapshot_action(state, "starting terminal".to_string(), move |endpoint| {
+                            start_local_session_at(
+                                &endpoint,
+                                SessionKind::Shell,
+                                cwd.as_deref(),
+                                title_hint.as_deref(),
+                            )
+                        })
+                    },
+                    on_create_paper: move |_| {
+                        state.with_mut(|shell| shell.close_titlebar_new_menu());
+                        queue_new_document(state)
+                    },
                     on_toggle_meta: move || state.with_mut(|shell| shell.toggle_metadata_panel()),
                     on_toggle_settings: move || state.with_mut(|shell| shell.toggle_settings_panel()),
                     on_toggle_connect: move || state.with_mut(|shell| shell.toggle_connect_panel()),
@@ -9331,17 +9710,6 @@ fn app() -> Element {
                     style: "display: flex; flex: 1; min-height: 0; overflow: hidden;",
                     Sidebar {
                         snapshot: sidebar_snapshot,
-                        on_start_session: move |_| spawn_server_snapshot_action(
-                            state,
-                            "starting session".to_string(),
-                            move |endpoint| start_local_session(&endpoint, preferred_agent_kind),
-                        ),
-                        on_start_terminal: move |_| spawn_server_snapshot_action(
-                            state,
-                            "starting terminal".to_string(),
-                            move |endpoint| start_local_session(&endpoint, SessionKind::Shell),
-                        ),
-                        on_create_paper: move |_| queue_new_document(state),
                         on_prev_search_row: move |_| {
                             if let Some(row) = state.with_mut(|shell| shell.next_search_sidebar_row(-1)) {
                                 spawn_open_session_row(state, row);
@@ -9376,9 +9744,16 @@ fn app() -> Element {
                                     return;
                                 }
                                 if is_live_sidebar_row(&row) {
-                                    spawn_server_snapshot_action(
+                                    state.with_mut(|shell| {
+                                        shell.server.focus_live_session(&row.full_path);
+                                        shell.ensure_active_session_visible();
+                                    });
+                                    spawn_targeted_server_snapshot_action(
                                         state,
                                         format!("focusing {}", row.label),
+                                        YggTarget::Terminal {
+                                            session_path: row.full_path.clone(),
+                                        },
                                         move |endpoint| focus_live(&endpoint, &row.full_path),
                                     );
                                     return;
@@ -9542,6 +9917,9 @@ fn app() -> Element {
                             on_adjust_main_zoom: move |delta: i32| {
                                 state.with_mut(|shell| shell.adjust_main_zoom(delta));
                                 apply_active_terminal_zoom(state);
+                            },
+                            on_set_terminal_theme_name: move |value: String| {
+                                state.with_mut(|shell| shell.set_terminal_theme_name(value));
                             },
                             on_connect_ssh_custom: move |_| spawn_connect_ssh_custom(state),
                             on_ssh_target_change: move |value: String| state.with_mut(|shell| shell.update_ssh_connect_target(value)),
@@ -9716,6 +10094,10 @@ fn Titlebar(
     on_next_search_content: EventHandler<()>,
     on_hover_control: EventHandler<Option<HoveredControl>>,
     on_set_view_mode: EventHandler<WorkspaceViewMode>,
+    on_toggle_new_menu: EventHandler<()>,
+    on_start_session: EventHandler<()>,
+    on_start_terminal: EventHandler<()>,
+    on_create_paper: EventHandler<()>,
     on_toggle_meta: EventHandler<()>,
     on_toggle_settings: EventHandler<()>,
     on_toggle_connect: EventHandler<()>,
@@ -9763,6 +10145,54 @@ fn Titlebar(
                             ondoubleclick: |evt| evt.stop_propagation(),
                             onclick: move |_| on_set_view_mode.call(WorkspaceViewMode::Terminal),
                             "Terminal"
+                        }
+                    }
+                    div {
+                        style: "position:relative; display:flex; align-items:center;",
+                        onmousedown: |evt| evt.stop_propagation(),
+                        onclick: |evt| evt.stop_propagation(),
+                        ondoubleclick: |evt| evt.stop_propagation(),
+                        button {
+                            style: format!(
+                                "display:inline-flex; align-items:center; gap:6px; height:30px; padding:0 11px; border:none; border-radius:10px; \
+                                 background:rgba(255,255,255,0.78); color:{}; font-size:11px; font-weight:800; cursor:pointer; \
+                                 box-shadow: inset 0 0 0 1px rgba(190,206,222,0.52); white-space:nowrap;",
+                                if snapshot.titlebar_new_menu_open { snapshot.palette.accent } else { snapshot.palette.text }
+                            ),
+                            onclick: move |_| on_toggle_new_menu.call(()),
+                            "+"
+                            span {
+                                style: format!(
+                                    "font-size:10px; color:{};",
+                                    if snapshot.titlebar_new_menu_open { snapshot.palette.accent } else { snapshot.palette.muted }
+                                ),
+                                "▾"
+                            }
+                        }
+                        if snapshot.titlebar_new_menu_open {
+                            div {
+                                style: format!(
+                                    "position:absolute; left:0; top:38px; z-index:210; min-width:176px; padding:8px; border-radius:14px; \
+                                     background:rgba(255,255,255,0.96); box-shadow:0 18px 46px rgba(74,93,122,0.22), \
+                                     inset 0 0 0 1px rgba(198,212,226,0.82); display:flex; flex-direction:column; gap:6px;",
+                                ),
+                                onmousedown: |evt| evt.stop_propagation(),
+                                button {
+                                    style: titlebar_new_action_style(snapshot.palette),
+                                    onclick: move |_| on_start_session.call(()),
+                                    "New Session"
+                                }
+                                button {
+                                    style: titlebar_new_action_style(snapshot.palette),
+                                    onclick: move |_| on_start_terminal.call(()),
+                                    "New Terminal"
+                                }
+                                button {
+                                    style: titlebar_new_action_style(snapshot.palette),
+                                    onclick: move |_| on_create_paper.call(()),
+                                    "New Paper"
+                                }
+                            }
                         }
                     }
                     div { style: "flex:1; min-width:56px; height:100%;" }
@@ -9999,9 +10429,6 @@ fn ResizeHandle(style: String, direction: ResizeDirection) -> Element {
 #[component]
 fn Sidebar(
     snapshot: SharedSnapshot,
-    on_start_session: EventHandler<MouseEvent>,
-    on_start_terminal: EventHandler<MouseEvent>,
-    on_create_paper: EventHandler<MouseEvent>,
     on_prev_search_row: EventHandler<()>,
     on_next_search_row: EventHandler<()>,
     on_select_row: EventHandler<(BrowserRow, TreeSelectionMode)>,
@@ -10049,27 +10476,9 @@ fn Sidebar(
                     on_delete_selected_items.call(false);
                 }
             },
-            div {
-                style: "padding:12px 12px 0 12px; display:flex; gap:8px;",
-                SidebarQuickAction {
-                    label: "+Session".to_string(),
-                    palette: snapshot.palette,
-                    onclick: on_start_session,
-                }
-                SidebarQuickAction {
-                    label: "+Terminal".to_string(),
-                    palette: snapshot.palette,
-                    onclick: on_start_terminal,
-                }
-                SidebarQuickAction {
-                    label: "+Paper".to_string(),
-                    palette: snapshot.palette,
-                    onclick: on_create_paper,
-                }
-            }
             if snapshot.search_active {
                 div {
-                    style: "padding:8px 12px 0 12px; display:flex; align-items:center; gap:8px;",
+                    style: "padding:12px 12px 0 12px; display:flex; align-items:center; gap:8px;",
                     button {
                         title: "Previous matching session",
                         style: chip_style(snapshot.palette, false),
@@ -10398,7 +10807,7 @@ fn SidebarRow(
             id: "{sidebar_row_dom_id(&row.full_path)}",
             style: format!(
                 "width:100%; display:flex; flex-direction:column; align-items:stretch; gap:1px; \
-                 border:none; border-radius:12px; background:{}; padding:4px 9px 4px {}px; margin:0; opacity:{}; cursor:{}; \
+                 border:none; border-radius:12px; background:{}; padding:3px 9px 3px {}px; margin:0; opacity:{}; cursor:{}; \
                  box-sizing:border-box; min-width:0; overflow:hidden; user-select:none; -webkit-user-select:none; \
                  transition: transform 140ms ease, background 140ms ease, opacity 140ms ease, box-shadow 140ms ease; \
                  transform:translateY(0px); box-shadow:{}; position:relative;",
@@ -10603,30 +11012,11 @@ fn DragGhost(snapshot: SharedSnapshot) -> Element {
 }
 
 #[component]
-fn SidebarQuickAction(
-    label: String,
-    palette: Palette,
-    onclick: EventHandler<MouseEvent>,
-) -> Element {
-    rsx! {
-        button {
-            style: format!(
-                "flex:1; height:28px; border:none; border-radius:10px; background:{}; color:{}; \
-                 font-size:11px; font-weight:700; white-space:nowrap;",
-                palette.panel_alt, palette.text
-            ),
-            onclick: move |evt| onclick.call(evt),
-            "{label}"
-        }
-    }
-}
-
-#[component]
 fn TreeIcon(row: BrowserRow) -> Element {
     if row.kind == BrowserRowKind::Separator {
         return rsx! {
             span {
-                style: "display:inline-flex; align-items:center; justify-content:center; font-size:11px; font-weight:700; line-height:1;",
+                style: "display:inline-flex; align-items:center; justify-content:center; font-size:10px; font-weight:700; line-height:1;",
                 "—"
             }
         };
@@ -10636,7 +11026,7 @@ fn TreeIcon(row: BrowserRow) -> Element {
         if row.full_path.starts_with("codex-litellm://") {
             return rsx! {
                 span {
-                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; line-height:1;",
+                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:11px; font-weight:700; line-height:1;",
                     "✦"
                 }
             };
@@ -10644,7 +11034,7 @@ fn TreeIcon(row: BrowserRow) -> Element {
         if row.full_path.starts_with("local://") {
             return rsx! {
                 span {
-                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; line-height:1;",
+                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:11px; font-weight:700; line-height:1;",
                     "⌘"
                 }
             };
@@ -10652,14 +11042,14 @@ fn TreeIcon(row: BrowserRow) -> Element {
         if row.full_path.starts_with("ssh://") {
             return rsx! {
                 span {
-                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; line-height:1;",
+                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:11px; font-weight:700; line-height:1;",
                     "⇄"
                 }
             };
         }
         return rsx! {
             span {
-                style: "display:inline-flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; line-height:1;",
+                style: "display:inline-flex; align-items:center; justify-content:center; font-size:11px; font-weight:700; line-height:1;",
                 ">_"
             }
         };
@@ -10697,7 +11087,7 @@ fn TreeIcon(row: BrowserRow) -> Element {
         if row.full_path == "__live_sessions__" {
             return rsx! {
                 span {
-                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; line-height:1;",
+                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:11px; font-weight:700; line-height:1;",
                     "◉"
                 }
             };
@@ -12356,6 +12746,7 @@ fn TerminalCanvas(
         snapshot.settings.theme,
         snapshot.palette,
         snapshot.settings.terminal_font_size,
+        &snapshot.settings.terminal_theme_name,
     );
     let future_theme = theme.clone();
     let is_remote_resume_session = session.session_path.starts_with("remote-session://");
@@ -12822,54 +13213,67 @@ struct TerminalTheme {
     bright_white: String,
 }
 
-fn terminal_theme(ui_theme: UiTheme, _palette: Palette, font_size: f32) -> TerminalTheme {
-    match ui_theme {
-        UiTheme::ZedLight => TerminalTheme {
-            background: "#ffffff".to_string(),
-            foreground: "#333333".to_string(),
-            cursor: "#007acc".to_string(),
+fn terminal_theme(
+    ui_theme: UiTheme,
+    _palette: Palette,
+    font_size: f32,
+    requested_name: &str,
+) -> TerminalTheme {
+    let fallback_name = if requested_name.trim().is_empty() {
+        match ui_theme {
+            UiTheme::ZedLight => "VS Code Light+",
+            UiTheme::ZedDark => "Dark+",
+        }
+    } else {
+        requested_name
+    };
+    if let Some(theme) = terminal_theme_by_name(fallback_name) {
+        return TerminalTheme {
+            background: theme.palette.background.clone(),
+            foreground: theme.palette.foreground.clone(),
+            cursor: theme.palette.cursor.clone(),
             font_size: font_size.max(5.0),
-            selection: "rgba(173, 214, 255, 0.45)".to_string(),
-            black: "#000000".to_string(),
-            red: "#cd3131".to_string(),
-            green: "#00bc00".to_string(),
-            yellow: "#949800".to_string(),
-            blue: "#0451a5".to_string(),
-            magenta: "#bc05bc".to_string(),
-            cyan: "#0598bc".to_string(),
-            white: "#555555".to_string(),
-            bright_black: "#666666".to_string(),
-            bright_red: "#cd3131".to_string(),
-            bright_green: "#14ce14".to_string(),
-            bright_yellow: "#b5ba00".to_string(),
-            bright_blue: "#0451a5".to_string(),
-            bright_magenta: "#bc05bc".to_string(),
-            bright_cyan: "#0598bc".to_string(),
-            bright_white: "#a5a5a5".to_string(),
-        },
-        UiTheme::ZedDark => TerminalTheme {
-            background: "#1f2329".to_string(),
-            foreground: "#abb2bf".to_string(),
-            cursor: "#61afef".to_string(),
-            font_size: font_size.max(5.0),
-            selection: "rgba(97,175,239,0.24)".to_string(),
-            black: "#282c34".to_string(),
-            red: "#e06c75".to_string(),
-            green: "#98c379".to_string(),
-            yellow: "#e5c07b".to_string(),
-            blue: "#61afef".to_string(),
-            magenta: "#c678dd".to_string(),
-            cyan: "#56b6c2".to_string(),
-            white: "#dcdfe4".to_string(),
-            bright_black: "#5c6370".to_string(),
-            bright_red: "#e06c75".to_string(),
-            bright_green: "#98c379".to_string(),
-            bright_yellow: "#e5c07b".to_string(),
-            bright_blue: "#61afef".to_string(),
-            bright_magenta: "#c678dd".to_string(),
-            bright_cyan: "#56b6c2".to_string(),
-            bright_white: "#ffffff".to_string(),
-        },
+            selection: theme.palette.selection.clone(),
+            black: theme.palette.black.clone(),
+            red: theme.palette.red.clone(),
+            green: theme.palette.green.clone(),
+            yellow: theme.palette.yellow.clone(),
+            blue: theme.palette.blue.clone(),
+            magenta: theme.palette.magenta.clone(),
+            cyan: theme.palette.cyan.clone(),
+            white: theme.palette.white.clone(),
+            bright_black: theme.palette.bright_black.clone(),
+            bright_red: theme.palette.bright_red.clone(),
+            bright_green: theme.palette.bright_green.clone(),
+            bright_yellow: theme.palette.bright_yellow.clone(),
+            bright_blue: theme.palette.bright_blue.clone(),
+            bright_magenta: theme.palette.bright_magenta.clone(),
+            bright_cyan: theme.palette.bright_cyan.clone(),
+            bright_white: theme.palette.bright_white.clone(),
+        };
+    }
+    TerminalTheme {
+        background: "#ffffff".to_string(),
+        foreground: "#333333".to_string(),
+        cursor: "#007acc".to_string(),
+        font_size: font_size.max(5.0),
+        selection: "rgba(173,214,255,0.45)".to_string(),
+        black: "#000000".to_string(),
+        red: "#cd3131".to_string(),
+        green: "#00bc00".to_string(),
+        yellow: "#949800".to_string(),
+        blue: "#0451a5".to_string(),
+        magenta: "#bc05bc".to_string(),
+        cyan: "#0598bc".to_string(),
+        white: "#555555".to_string(),
+        bright_black: "#666666".to_string(),
+        bright_red: "#cd3131".to_string(),
+        bright_green: "#14ce14".to_string(),
+        bright_yellow: "#b5ba00".to_string(),
+        bright_blue: "#0451a5".to_string(),
+        bright_magenta: "#bc05bc".to_string(),
+        bright_cyan: "#0598bc".to_string(),
+        bright_white: "#a5a5a5".to_string(),
     }
 }
 
@@ -13038,6 +13442,7 @@ fn apply_active_terminal_zoom(state: Signal<ShellState>) {
         snapshot.settings.theme,
         snapshot.palette,
         snapshot.settings.terminal_font_size,
+        &snapshot.settings.terminal_theme_name,
     );
     info!(
         session=%session.session_path,
@@ -13652,6 +14057,7 @@ fn RightRail(
     on_set_notification_sound: EventHandler<bool>,
     on_adjust_ui_zoom: EventHandler<i32>,
     on_adjust_main_zoom: EventHandler<i32>,
+    on_set_terminal_theme_name: EventHandler<String>,
     on_connect_ssh_custom: EventHandler<MouseEvent>,
     on_ssh_target_change: EventHandler<String>,
     on_ssh_prefix_change: EventHandler<String>,
@@ -13679,6 +14085,7 @@ fn RightRail(
                     on_set_notification_sound,
                     on_adjust_ui_zoom,
                     on_adjust_main_zoom,
+                    on_set_terminal_theme_name,
                 }
             } else if snapshot.right_panel_mode == RightPanelMode::Connect {
                 ConnectRailBody {
@@ -13745,7 +14152,17 @@ fn SettingsRailBody(
     on_set_notification_sound: EventHandler<bool>,
     on_adjust_ui_zoom: EventHandler<i32>,
     on_adjust_main_zoom: EventHandler<i32>,
+    on_set_terminal_theme_name: EventHandler<String>,
 ) -> Element {
+    let terminal_theme_options = terminal_theme_names();
+    let selected_terminal_theme = if snapshot.settings.terminal_theme_name.trim().is_empty() {
+        match snapshot.settings.theme {
+            UiTheme::ZedLight => "VS Code Light+".to_string(),
+            UiTheme::ZedDark => "Dark+".to_string(),
+        }
+    } else {
+        snapshot.settings.terminal_theme_name.clone()
+    };
     rsx! {
         RailHeader { title: "Interface Settings".to_string(), color: snapshot.palette.text.to_string() }
         RailScrollBody {
@@ -13827,6 +14244,12 @@ fn SettingsRailBody(
                 palette: snapshot.palette,
                 on_decrease: move |_| on_adjust_main_zoom.call(-1),
                 on_increase: move |_| on_adjust_main_zoom.call(1),
+            }
+            TerminalThemeSettingRow {
+                palette: snapshot.palette,
+                value: selected_terminal_theme,
+                options: terminal_theme_options,
+                on_change: on_set_terminal_theme_name,
             }
             if cfg!(debug_assertions) {
                 MetadataGroup {
@@ -14981,6 +15404,80 @@ fn ZoomSettingRow(
 }
 
 #[component]
+fn TerminalThemeSettingRow(
+    palette: Palette,
+    value: String,
+    options: Vec<String>,
+    on_change: EventHandler<String>,
+) -> Element {
+    let mut open = use_signal(|| false);
+    rsx! {
+        div {
+            style: "display:flex; flex-direction:column; gap:6px; position:relative;",
+            div {
+                style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", palette.muted),
+                "Terminal Theme"
+            }
+            button {
+                style: format!(
+                    "width:100%; height:34px; border:none; border-radius:10px; padding:0 10px; \
+                     background:rgba(255,255,255,0.72); color:{}; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.34); \
+                     font-size:12px; font-weight:600; display:flex; align-items:center; justify-content:space-between; gap:10px;",
+                    palette.text
+                ),
+                onclick: move |_| open.set(!open()),
+                span {
+                    style: "min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                    "{value}"
+                }
+                span {
+                    style: format!("font-size:11px; color:{};", palette.muted),
+                    if open() { "▴" } else { "▾" }
+                }
+            }
+            if open() {
+                div {
+                    style: format!(
+                        "position:absolute; left:0; right:0; top:58px; z-index:35; display:flex; flex-direction:column; \
+                         max-height:220px; overflow:auto; padding:6px; border-radius:12px; background:{}; \
+                         box-shadow:0 18px 44px rgba(55,72,92,0.18), inset 0 0 0 1px rgba(211,223,233,0.92);",
+                        palette.panel
+                    ),
+                    for option in options {
+                        button {
+                            key: "{option}",
+                            style: format!(
+                                "display:flex; align-items:center; justify-content:space-between; min-height:30px; border:none; \
+                                 border-radius:8px; padding:0 10px; background:{}; color:{}; font-size:12px; font-weight:600;",
+                                if option == value { palette.accent_soft } else { "transparent" },
+                                if option == value { palette.accent } else { palette.text }
+                            ),
+                            onclick: {
+                                let option = option.clone();
+                                move |_| {
+                                    on_change.call(option.clone());
+                                    open.set(false);
+                                }
+                            },
+                            span {
+                                style: "min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                                "{option}"
+                            }
+                            if option == value {
+                                span {
+                                    style: format!("font-size:11px; color:{};", palette.accent),
+                                    "✓"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
 fn MetadataGroup(title: String, entries: Vec<SessionMetadataEntry>, palette: Palette) -> Element {
     rsx! {
         div {
@@ -15139,6 +15636,15 @@ fn chip_style(palette: Palette, selected: bool) -> String {
         } else {
             palette.muted
         }
+    )
+}
+
+fn titlebar_new_action_style(palette: Palette) -> String {
+    format!(
+        "display:flex; align-items:center; width:100%; height:30px; border:none; border-radius:10px; padding:0 10px; \
+         background:transparent; color:{}; font-size:11px; font-weight:700; text-align:left; cursor:pointer; \
+         white-space:nowrap;",
+        palette.text
     )
 }
 
@@ -15364,16 +15870,16 @@ mod tests {
 
     #[test]
     fn terminal_theme_uses_requested_font_size_down_to_floor() {
-        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 5.0);
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 5.0, "");
         assert_eq!(theme.font_size, 5.0);
 
-        let clamped = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 2.0);
+        let clamped = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 2.0, "");
         assert_eq!(clamped.font_size, 5.0);
     }
 
     #[test]
     fn terminal_eval_script_bakes_font_size_into_xterm_constructor() {
-        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0);
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script = terminal_eval_script("yggterm-terminal-test", &theme);
         assert!(script.contains("fontSize: 13"));
         assert!(script.contains("brightWhite"));
@@ -15381,7 +15887,7 @@ mod tests {
 
     #[test]
     fn terminal_apply_script_updates_live_xterm_font_size() {
-        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 5.0);
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 5.0, "");
         let script = terminal_apply_script("yggterm-terminal-test", &theme);
         assert!(script.contains("entry.term.options.fontSize = 5"));
         assert!(script.contains("brightBlack"));
@@ -15389,10 +15895,18 @@ mod tests {
 
     #[test]
     fn terminal_theme_uses_one_dark_palette_for_dark_mode() {
-        let theme = terminal_theme(UiTheme::ZedDark, palette(UiTheme::ZedDark), 13.0);
-        assert_eq!(theme.background, "#1f2329");
-        assert_eq!(theme.foreground, "#abb2bf");
-        assert_eq!(theme.blue, "#61afef");
+        let theme = terminal_theme(UiTheme::ZedDark, palette(UiTheme::ZedDark), 13.0, "");
+        assert_eq!(theme.background, "#1e1e1e");
+        assert_eq!(theme.foreground, "#cccccc");
+        assert_eq!(theme.blue, "#2472c8");
+    }
+
+    #[test]
+    fn terminal_theme_uses_vscode_light_by_default() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        assert_eq!(theme.background, "#ffffff");
+        assert_eq!(theme.foreground, "#333333");
+        assert_eq!(theme.blue, "#0451a5");
     }
 
     #[test]
@@ -15624,6 +16138,23 @@ mod tests {
         assert!(!stale_path.exists());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn client_instances_dir_is_scoped_by_endpoint() {
+        let settings_path = PathBuf::from("/tmp/yggterm/settings.json");
+        #[cfg(unix)]
+        {
+            let a = client_instances_dir(
+                &settings_path,
+                &ServerEndpoint::UnixSocket(PathBuf::from("/tmp/server-2-0-29.sock")),
+            );
+            let b = client_instances_dir(
+                &settings_path,
+                &ServerEndpoint::UnixSocket(PathBuf::from("/tmp/server-2-0-30.sock")),
+            );
+            assert_ne!(a, b);
+        }
     }
 
     #[test]
@@ -16339,6 +16870,56 @@ mod tests {
                 .any(|row| row.full_path
                     == "remote-session://oc/019cf672-8d68-70a1-bd8b-68487c4fc63d")
         );
+    }
+
+    #[test]
+    fn merged_sidebar_rows_include_local_live_sessions_group_and_rows() {
+        let rows = merged_sidebar_rows(
+            &[],
+            &[],
+            &[],
+            &[ManagedSessionView {
+                id: "019cf672-8d68-70a1-bd8b-68487c4fc63d".to_string(),
+                session_path: "local://019cf672-8d68-70a1-bd8b-68487c4fc63d".to_string(),
+                title: "Project shell".to_string(),
+                kind: SessionKind::Shell,
+                host_label: "local".to_string(),
+                source: yggterm_server::SessionSource::Stored,
+                backend: TerminalBackend::Xterm,
+                bridge_available: true,
+                launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+                remote_deploy_state: yggterm_server::RemoteDeployState::NotRequired,
+                launch_command: String::new(),
+                status_line: String::new(),
+                terminal_lines: vec![],
+                rendered_sections: vec![],
+                preview: yggterm_server::SessionPreview {
+                    summary: vec![],
+                    blocks: vec![],
+                },
+                metadata: vec![SessionMetadataEntry {
+                    label: "Cwd",
+                    value: "/home/pi/gh/yggterm".to_string(),
+                }],
+                terminal_process_id: None,
+                terminal_window_id: None,
+                terminal_host_token: None,
+                terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+                embedded_surface_id: None,
+                embedded_surface_detail: None,
+                last_launch_error: None,
+                last_window_error: None,
+                ssh_target: None,
+                ssh_prefix: None,
+            }],
+            &HashSet::from_iter(["__live_sessions__".to_string()]),
+        );
+
+        assert!(rows.iter().any(|row| row.full_path == "__live_sessions__"));
+        assert!(rows.iter().any(|row| {
+            row.full_path == "local://019cf672-8d68-70a1-bd8b-68487c4fc63d"
+                && row.label == "/home/pi/gh/yggterm"
+        }));
     }
 
     #[test]

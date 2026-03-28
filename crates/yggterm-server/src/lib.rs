@@ -723,35 +723,16 @@ impl YggtermServer {
     }
 
     pub fn live_sessions(&self) -> Vec<ManagedSessionView> {
-        let mut sessions = self
+        let sessions = self
             .live_session_order
             .iter()
             .filter_map(|key| self.sessions.get(key).cloned())
             .collect::<Vec<_>>();
-        if let Some(active) = self.active_session().cloned().or_else(|| {
-            self.active_session_path.as_deref().and_then(|path| {
-                synthesize_remote_active_session(
-                    path,
-                    &self.remote_machines,
-                    self.backend,
-                    self.theme,
-                    self.ghostty_host.bridge_enabled,
-                )
-            })
-        }) {
-            let active_path = active.session_path.clone();
-            if !sessions
-                .iter()
-                .any(|session| session.session_path == active_path)
-            {
-                sessions.insert(0, active);
-            }
-        }
         sessions
     }
 
     pub fn snapshot(&self) -> ServerUiSnapshot {
-        let mut live_sessions = self
+        let live_sessions = self
             .live_session_order
             .iter()
             .filter_map(|key| self.sessions.get(key))
@@ -769,15 +750,6 @@ impl YggtermServer {
                 )
             })
         });
-        if let Some(active) = active_session.clone().map(snapshot_session_view) {
-            let active_path = active.session_path.clone();
-            if !live_sessions
-                .iter()
-                .any(|session| session.session_path == active_path)
-            {
-                live_sessions.insert(0, active);
-            }
-        }
         ServerUiSnapshot {
             active_session_path: self.active_session_path.clone(),
             active_session: active_session.map(snapshot_session_view),
