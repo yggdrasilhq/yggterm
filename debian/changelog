@@ -1,3 +1,10 @@
+yggterm (2.0.29-1) unstable; urgency=medium
+
+  * Switch the light xterm theme to a VS Code-style light palette so Codex input regions regain visible contrast.
+  * Tighten sidebar row spacing and slightly reduce tree icon size for denser session browsing.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sat, 28 Mar 2026 14:30:00 +0530
+
 yggterm (2.0.28-1) unstable; urgency=medium
 
   * Center in-app notifications properly instead of biasing them left when a right rail is open.

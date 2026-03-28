@@ -10397,8 +10397,8 @@ fn SidebarRow(
         div {
             id: "{sidebar_row_dom_id(&row.full_path)}",
             style: format!(
-                "width:100%; display:flex; flex-direction:column; align-items:stretch; gap:2px; \
-                 border:none; border-radius:12px; background:{}; padding:6px 9px 6px {}px; margin:0; opacity:{}; cursor:{}; \
+                "width:100%; display:flex; flex-direction:column; align-items:stretch; gap:1px; \
+                 border:none; border-radius:12px; background:{}; padding:4px 9px 4px {}px; margin:0; opacity:{}; cursor:{}; \
                  box-sizing:border-box; min-width:0; overflow:hidden; user-select:none; -webkit-user-select:none; \
                  transition: transform 140ms ease, background 140ms ease, opacity 140ms ease, box-shadow 140ms ease; \
                  transform:translateY(0px); box-shadow:{}; position:relative;",
@@ -10450,13 +10450,13 @@ fn SidebarRow(
                 on_drop: on_drop_into_row,
                 on_end_drag: on_end_drag,
             }
-            div {
-                style: "display:flex; align-items:center; justify-content:space-between; gap:8px;",
                 div {
-                    style: "display:flex; align-items:center; gap:8px; min-width:0;",
+                    style: "display:flex; align-items:center; justify-content:space-between; gap:6px;",
+                    div {
+                    style: "display:flex; align-items:center; gap:7px; min-width:0;",
                     div {
                         style: format!(
-                            "display:inline-flex; align-items:center; justify-content:center; width:19px; min-width:19px; height:19px; color:{};",
+                            "display:inline-flex; align-items:center; justify-content:center; width:18px; min-width:18px; height:18px; color:{};",
                             icon_color
                         ),
                         TreeIcon { row: row.clone() }
@@ -10626,7 +10626,7 @@ fn TreeIcon(row: BrowserRow) -> Element {
     if row.kind == BrowserRowKind::Separator {
         return rsx! {
             span {
-                style: "display:inline-flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; line-height:1;",
+                style: "display:inline-flex; align-items:center; justify-content:center; font-size:11px; font-weight:700; line-height:1;",
                 "—"
             }
         };
@@ -10636,7 +10636,7 @@ fn TreeIcon(row: BrowserRow) -> Element {
         if row.full_path.starts_with("codex-litellm://") {
             return rsx! {
                 span {
-                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:13px; font-weight:700; line-height:1;",
+                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; line-height:1;",
                     "✦"
                 }
             };
@@ -10644,7 +10644,7 @@ fn TreeIcon(row: BrowserRow) -> Element {
         if row.full_path.starts_with("local://") {
             return rsx! {
                 span {
-                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:13px; font-weight:700; line-height:1;",
+                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; line-height:1;",
                     "⌘"
                 }
             };
@@ -10652,14 +10652,14 @@ fn TreeIcon(row: BrowserRow) -> Element {
         if row.full_path.starts_with("ssh://") {
             return rsx! {
                 span {
-                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:13px; font-weight:700; line-height:1;",
+                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; line-height:1;",
                     "⇄"
                 }
             };
         }
         return rsx! {
             span {
-                style: "display:inline-flex; align-items:center; justify-content:center; font-size:13px; font-weight:700; line-height:1;",
+                style: "display:inline-flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; line-height:1;",
                 ">_"
             }
         };
@@ -10667,8 +10667,8 @@ fn TreeIcon(row: BrowserRow) -> Element {
         if row.document_kind == Some(WorkspaceDocumentKind::TerminalRecipe) {
             return rsx! {
                 svg {
-                    width: "18",
-                    height: "18",
+                    width: "17",
+                    height: "17",
                     view_box: "0 0 18 18",
                     fill: "none",
                     xmlns: "http://www.w3.org/2000/svg",
@@ -10680,8 +10680,8 @@ fn TreeIcon(row: BrowserRow) -> Element {
         }
         return rsx! {
             svg {
-                width: "18",
-                height: "18",
+                width: "17",
+                height: "17",
                 view_box: "0 0 18 18",
                 fill: "none",
                 xmlns: "http://www.w3.org/2000/svg",
@@ -10697,15 +10697,15 @@ fn TreeIcon(row: BrowserRow) -> Element {
         if row.full_path == "__live_sessions__" {
             return rsx! {
                 span {
-                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:13px; font-weight:700; line-height:1;",
+                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; line-height:1;",
                     "◉"
                 }
             };
         }
         return rsx! {
             svg {
-                width: "18",
-                height: "18",
+                width: "17",
+                height: "17",
                 view_box: "0 0 18 18",
                 fill: "none",
                 xmlns: "http://www.w3.org/2000/svg",
@@ -10737,8 +10737,8 @@ fn TreeIcon(row: BrowserRow) -> Element {
     if row.expanded {
         rsx! {
             svg {
-                width: "18",
-                height: "18",
+                width: "17",
+                height: "17",
                 view_box: "0 0 16 16",
                 fill: "none",
                 xmlns: "http://www.w3.org/2000/svg",
@@ -10759,8 +10759,8 @@ fn TreeIcon(row: BrowserRow) -> Element {
     } else {
         rsx! {
             svg {
-                width: "18",
-                height: "18",
+                width: "17",
+                height: "17",
                 view_box: "0 0 18 18",
                 fill: "none",
                 xmlns: "http://www.w3.org/2000/svg",
@@ -12826,26 +12826,26 @@ fn terminal_theme(ui_theme: UiTheme, _palette: Palette, font_size: f32) -> Termi
     match ui_theme {
         UiTheme::ZedLight => TerminalTheme {
             background: "#ffffff".to_string(),
-            foreground: "#24292f".to_string(),
-            cursor: "#0969da".to_string(),
+            foreground: "#333333".to_string(),
+            cursor: "#007acc".to_string(),
             font_size: font_size.max(5.0),
-            selection: "rgba(9,105,218,0.20)".to_string(),
-            black: "#24292f".to_string(),
-            red: "#cf222e".to_string(),
-            green: "#1a7f37".to_string(),
-            yellow: "#9a6700".to_string(),
-            blue: "#0969da".to_string(),
-            magenta: "#8250df".to_string(),
-            cyan: "#1b7c83".to_string(),
-            white: "#d0d7de".to_string(),
-            bright_black: "#57606a".to_string(),
-            bright_red: "#fa4549".to_string(),
-            bright_green: "#2da44e".to_string(),
-            bright_yellow: "#bf8700".to_string(),
-            bright_blue: "#218bff".to_string(),
-            bright_magenta: "#a475f9".to_string(),
-            bright_cyan: "#3192aa".to_string(),
-            bright_white: "#f6f8fa".to_string(),
+            selection: "rgba(173, 214, 255, 0.45)".to_string(),
+            black: "#000000".to_string(),
+            red: "#cd3131".to_string(),
+            green: "#00bc00".to_string(),
+            yellow: "#949800".to_string(),
+            blue: "#0451a5".to_string(),
+            magenta: "#bc05bc".to_string(),
+            cyan: "#0598bc".to_string(),
+            white: "#555555".to_string(),
+            bright_black: "#666666".to_string(),
+            bright_red: "#cd3131".to_string(),
+            bright_green: "#14ce14".to_string(),
+            bright_yellow: "#b5ba00".to_string(),
+            bright_blue: "#0451a5".to_string(),
+            bright_magenta: "#bc05bc".to_string(),
+            bright_cyan: "#0598bc".to_string(),
+            bright_white: "#a5a5a5".to_string(),
         },
         UiTheme::ZedDark => TerminalTheme {
             background: "#1f2329".to_string(),
