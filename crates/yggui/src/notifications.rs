@@ -1,4 +1,5 @@
 use dioxus::prelude::*;
+use std::env;
 
 pub const TOAST_CSS: &str = r#"
 @keyframes yggterm-toast-stack-in {
@@ -42,6 +43,20 @@ pub struct ToastPalette {
     pub text: &'static str,
     pub muted: &'static str,
     pub accent: &'static str,
+}
+
+fn linux_kde_wayland_safe_mode() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        env::var_os("WAYLAND_DISPLAY").is_some()
+            && env::var("XDG_CURRENT_DESKTOP")
+                .map(|value| value.to_ascii_lowercase().contains("kde"))
+                .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
 }
 
 #[component]
@@ -100,11 +115,18 @@ pub fn ToastCard(
     on_clear: EventHandler<MouseEvent>,
 ) -> Element {
     let (tone_accent, tone_fg) = toast_tone_colors(item.tone, palette);
+    let blur_style = if linux_kde_wayland_safe_mode() {
+        "backdrop-filter:none; -webkit-backdrop-filter:none;"
+    } else {
+        "backdrop-filter: blur(28px) saturate(165%); -webkit-backdrop-filter: blur(28px) saturate(165%);"
+    };
     rsx! {
         div {
-            style: "display:flex; flex-direction:column; gap:7px; padding:12px 12px 11px 12px; border-radius:14px; \
-                    background:rgba(249,250,252,0.86); backdrop-filter: blur(28px) saturate(165%); \
-                    -webkit-backdrop-filter: blur(28px) saturate(165%); box-shadow: 0 18px 38px rgba(49,67,82,0.14), inset 0 0 0 1px rgba(255,255,255,0.72);",
+            style: format!(
+                "display:flex; flex-direction:column; gap:7px; padding:12px 12px 11px 12px; border-radius:14px; \
+                 background:rgba(249,250,252,0.86); {} box-shadow: 0 18px 38px rgba(49,67,82,0.14), inset 0 0 0 1px rgba(255,255,255,0.72);",
+                blur_style
+            ),
             div {
                 style: "display:flex; align-items:center; justify-content:space-between; gap:8px;",
                 div {
