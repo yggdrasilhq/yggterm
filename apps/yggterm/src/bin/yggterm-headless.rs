@@ -2,9 +2,10 @@ use anyhow::Result;
 use yggterm_core::{SessionStore, detect_install_context, refresh_desktop_integration};
 use yggterm_server::{
     cleanup_legacy_daemons, default_endpoint, detect_ghostty_host, ping, run_attach, run_daemon,
-    run_remote_generation_context, run_remote_preview, run_remote_protocol_version,
-    run_remote_resume_codex, run_remote_scan, run_remote_stage_clipboard_png,
-    run_remote_upsert_generated_copy, shutdown, status,
+    run_remote_ensure_managed_cli, run_remote_generation_context, run_remote_preview,
+    run_remote_protocol_version, run_remote_refresh_managed_cli, run_remote_resume_codex,
+    run_remote_scan, run_remote_stage_clipboard_png, run_remote_upsert_generated_copy, shutdown,
+    status,
 };
 
 fn main() -> Result<()> {
@@ -38,8 +39,29 @@ fn main() -> Result<()> {
     if args.len() >= 4 && args[0] == "server" && args[1] == "remote" && args[2] == "resume-codex" {
         return run_remote_resume_codex(
             &args[3],
-            args.get(4).map(String::as_str).filter(|value| !value.is_empty()),
+            args.get(4)
+                .map(String::as_str)
+                .filter(|value| !value.is_empty()),
         );
+    }
+    if args.len() >= 4
+        && args[0] == "server"
+        && args[1] == "remote"
+        && args[2] == "refresh-managed-cli"
+    {
+        return run_remote_refresh_managed_cli(args[3] == "background");
+    }
+    if args.len() >= 4
+        && args[0] == "server"
+        && args[1] == "remote"
+        && args[2] == "ensure-managed-cli"
+    {
+        let tool = match args[3].as_str() {
+            "codex" => yggterm_server::ManagedCliTool::Codex,
+            "codex-litellm" => yggterm_server::ManagedCliTool::CodexLiteLlm,
+            other => anyhow::bail!("unknown managed cli tool: {other}"),
+        };
+        return run_remote_ensure_managed_cli(tool);
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "remote" && args[2] == "scan" {
         return run_remote_scan(args.get(3).map(String::as_str));
@@ -54,7 +76,11 @@ fn main() -> Result<()> {
     {
         return run_remote_generation_context(&args[3]);
     }
-    if args.len() == 4 && args[0] == "server" && args[1] == "remote" && args[2] == "upsert-generated-copy" {
+    if args.len() == 4
+        && args[0] == "server"
+        && args[1] == "remote"
+        && args[2] == "upsert-generated-copy"
+    {
         return run_remote_upsert_generated_copy(&args[3]);
     }
     if args.as_slice() == ["server", "shutdown"] {

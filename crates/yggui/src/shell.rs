@@ -44,11 +44,8 @@ use std::thread;
 use std::time::Duration;
 use tao::event::ElementState;
 use tao::event::Event as TaoEvent;
-use tao::event_loop::EventLoopBuilder;
 use tao::keyboard::Key as TaoKey;
 use tao::keyboard::KeyCode as TaoKeyCode;
-#[cfg(target_os = "linux")]
-use tao::platform::unix::EventLoopBuilderExtUnix;
 use tao::window::ResizeDirection;
 use time::OffsetDateTime;
 use tokio::task;
@@ -60,7 +57,7 @@ use yggterm_core::{
     WorkspaceDocumentKind, WorkspaceGroupKind, YgguiThemeSpec, check_for_update,
     install_release_update, looks_like_generated_fallback_title,
     looks_like_low_signal_generated_copy, refresh_desktop_integration, save_settings_file,
-    unique_session_short_ids_for_pairs, update_command_hint, YGGTERM_DESKTOP_APP_ID,
+    unique_session_short_ids_for_pairs, update_command_hint,
 };
 use yggterm_platform::DockRect;
 use yggterm_server::{
@@ -71,12 +68,12 @@ use yggterm_server::{
     YGG_LOADING_NOTIFICATION_AFTER_MS, YggRequestMeta, YggSurface, YggTarget, YggtermServer,
     apply_remote_preview_payload_for_path, cleanup_legacy_daemons, connect_ssh_custom,
     fetch_remote_generation_context, fetch_remote_preview_payload, focus_live, open_remote_session,
-    open_stored_session, persist_remote_generated_copy, ping, refresh_remote_machine,
-    remove_ssh_target, request_terminal_launch, set_all_preview_blocks_folded,
-    set_view_mode as daemon_set_view_mode, shutdown as daemon_shutdown,
-    snapshot as daemon_snapshot, stage_remote_clipboard_png, start_command_session,
-    start_local_session, start_local_session_at, status, switch_agent_session_mode,
-    terminal_ensure, terminal_read, terminal_resize, terminal_write,
+    open_stored_session, persist_remote_generated_copy, ping, refresh_managed_cli,
+    refresh_remote_machine, remove_ssh_target, request_terminal_launch,
+    set_all_preview_blocks_folded, set_view_mode as daemon_set_view_mode,
+    shutdown as daemon_shutdown, snapshot as daemon_snapshot, stage_remote_clipboard_png,
+    start_command_session, start_local_session, start_local_session_at, status,
+    switch_agent_session_mode, terminal_ensure, terminal_read, terminal_resize, terminal_write,
     toggle_preview_block as daemon_toggle_preview_block,
 };
 
@@ -189,6 +186,9 @@ struct ShellState {
     remote_preview_dirty_epoch: HashMap<String, u64>,
     remote_machine_refresh_requests: HashSet<String>,
     remote_machine_refresh_retry_after_ms: HashMap<String, u64>,
+    managed_cli_refresh_requests: HashSet<String>,
+    managed_cli_refresh_completed: HashSet<String>,
+    managed_cli_refresh_retry_after_ms: HashMap<String, u64>,
     drag_paths: Vec<String>,
     drag_hover_target: Option<DragDropTarget>,
     optimistic_drag_paths: Vec<String>,
@@ -625,6 +625,9 @@ impl ShellState {
             remote_preview_dirty_epoch: HashMap::new(),
             remote_machine_refresh_requests: HashSet::new(),
             remote_machine_refresh_retry_after_ms: HashMap::new(),
+            managed_cli_refresh_requests: HashSet::new(),
+            managed_cli_refresh_completed: HashSet::new(),
+            managed_cli_refresh_retry_after_ms: HashMap::new(),
             drag_paths: Vec::new(),
             drag_hover_target: None,
             optimistic_drag_paths: Vec::new(),
@@ -3067,6 +3070,7 @@ fn spawn_initial_server_sync(
         async_render_epoch.with_mut(|epoch| *epoch += 1);
         schedule_ui();
         maybe_spawn_missing_remote_machine_refreshes(state);
+        maybe_spawn_missing_managed_cli_refreshes(state);
     });
 }
 
@@ -3502,6 +3506,184 @@ fn maybe_spawn_missing_remote_machine_refreshes(state: Signal<ShellState>) {
     }
 }
 
+fn managed_cli_refresh_scope_keys(
+    remote_machines: &[RemoteMachineSnapshot],
+    ssh_targets: &[SshConnectTarget],
+) -> Vec<String> {
+    let mut keys = vec!["local".to_string()];
+    for machine in remote_machines {
+        if !keys.contains(&machine.machine_key) {
+            keys.push(machine.machine_key.clone());
+        }
+    }
+    for target in ssh_targets {
+        let machine_key = machine_key_from_labelish(&target.ssh_target);
+        if !keys.contains(&machine_key) {
+            keys.push(machine_key);
+        }
+    }
+    keys
+}
+
+fn maybe_spawn_missing_managed_cli_refreshes(state: Signal<ShellState>) {
+    let Some(pending) = safe_shell_read(
+        state,
+        "maybe_spawn_missing_managed_cli_refreshes_read",
+        |shell| {
+            pending_managed_cli_refreshes(
+                shell.server.remote_machines(),
+                shell.server.ssh_targets(),
+                &shell.managed_cli_refresh_requests,
+                &shell.managed_cli_refresh_completed,
+                &shell.managed_cli_refresh_retry_after_ms,
+                current_millis(),
+            )
+        },
+    ) else {
+        return;
+    };
+    for scope_key in pending {
+        let _ = safe_shell_mut(state, "queue_managed_cli_refresh", |shell| {
+            shell.managed_cli_refresh_requests.insert(scope_key.clone());
+        });
+        spawn_background_managed_cli_refresh(state, scope_key);
+    }
+}
+
+fn spawn_background_managed_cli_refresh(state: Signal<ShellState>, scope_key: String) {
+    let endpoint = state.read().bootstrap.server_endpoint.clone();
+    let request_meta = if scope_key == "local" {
+        YggRequestMeta::background(
+            format!("managed-cli-refresh-local-{}", current_millis()),
+            "refresh_managed_cli",
+            YggSurface::Notifications,
+            YggTarget::App,
+        )
+    } else {
+        YggRequestMeta::background(
+            format!("managed-cli-refresh-{}-{}", scope_key, current_millis()),
+            "refresh_managed_cli",
+            YggSurface::Notifications,
+            YggTarget::RemoteMachine {
+                machine_key: scope_key.clone(),
+            },
+        )
+    };
+    safe_upsert_job_notification(
+        state,
+        format!("managed-cli-refresh:{scope_key}"),
+        NotificationTone::Info,
+        if scope_key == "local" {
+            "Updating Codex Tools".to_string()
+        } else {
+            format!("Updating Codex Tools on {scope_key}")
+        },
+        if scope_key == "local" {
+            "Preparing managed Codex and Codex-LiteLLM binaries for future sessions. Running sessions stay on their current version until restarted.".to_string()
+        } else {
+            format!(
+                "Preparing managed Codex and Codex-LiteLLM binaries on {scope_key}. Running sessions stay on their current version until restarted."
+            )
+        },
+        Some(0.15),
+        false,
+    );
+    let _ = safe_shell_mut(state, "managed_cli_refresh_begin", |shell| {
+        shell.begin_surface_request(
+            request_meta.clone(),
+            format!("refreshing codex tools for {scope_key}"),
+            false,
+        );
+    });
+    spawn_loading_notice(
+        state,
+        request_meta.clone(),
+        "Codex Tool Refresh Still Running",
+        if scope_key == "local" {
+            "Yggterm is still checking and updating the managed Codex toolchain for this machine. The rest of the UI stays interactive while the refresh continues.".to_string()
+        } else {
+            format!(
+                "Yggterm is still checking and updating the managed Codex toolchain on {scope_key}. The rest of the UI stays interactive while the refresh continues."
+            )
+        },
+    );
+    spawn(async move {
+        let request_scope = scope_key.clone();
+        let outcome = task::spawn_blocking(move || {
+            refresh_managed_cli(
+                &endpoint,
+                (request_scope != "local").then_some(request_scope.as_str()),
+                true,
+            )
+        })
+        .await;
+        let request_id = request_meta.request_id.clone();
+        let _ = safe_shell_mut(state, "managed_cli_refresh_complete", |shell| {
+            shell.finish_busy_request_for(&request_id);
+            shell.managed_cli_refresh_requests.remove(&scope_key);
+            match outcome {
+                Ok(Ok(message)) => {
+                    shell.managed_cli_refresh_retry_after_ms.remove(&scope_key);
+                    shell
+                        .managed_cli_refresh_completed
+                        .insert(scope_key.clone());
+                    shell.last_action = message
+                        .clone()
+                        .unwrap_or_else(|| format!("codex tools checked for {scope_key}"));
+                    shell.finish_job_notification(
+                        &format!("managed-cli-refresh:{scope_key}"),
+                        NotificationTone::Success,
+                        if scope_key == "local" {
+                            "Codex Tools Ready"
+                        } else {
+                            "Remote Codex Tools Ready"
+                        },
+                        message.unwrap_or_else(|| {
+                            format!("Finished refreshing the managed Codex tools for {scope_key}.")
+                        }),
+                        false,
+                    );
+                }
+                Ok(Err(error)) => {
+                    shell
+                        .managed_cli_refresh_retry_after_ms
+                        .insert(scope_key.clone(), current_millis() + 300_000);
+                    shell.last_action = format!("codex tool refresh failed: {error}");
+                    shell.finish_job_notification(
+                        &format!("managed-cli-refresh:{scope_key}"),
+                        NotificationTone::Warning,
+                        if scope_key == "local" {
+                            "Codex Tool Refresh Failed"
+                        } else {
+                            "Remote Codex Tool Refresh Failed"
+                        },
+                        error.to_string(),
+                        true,
+                    );
+                }
+                Err(error) => {
+                    shell
+                        .managed_cli_refresh_retry_after_ms
+                        .insert(scope_key.clone(), current_millis() + 300_000);
+                    shell.last_action = format!("codex tool refresh task failed: {error}");
+                    shell.finish_job_notification(
+                        &format!("managed-cli-refresh:{scope_key}"),
+                        NotificationTone::Warning,
+                        if scope_key == "local" {
+                            "Codex Tool Refresh Failed"
+                        } else {
+                            "Remote Codex Tool Refresh Failed"
+                        },
+                        error.to_string(),
+                        true,
+                    );
+                }
+            }
+        });
+        maybe_spawn_missing_managed_cli_refreshes(state);
+    });
+}
+
 fn spawn_background_remote_machine_refresh(state: Signal<ShellState>, machine_key: String) {
     let endpoint = state.read().bootstrap.server_endpoint.clone();
     let request_meta = YggRequestMeta::background(
@@ -3566,6 +3748,7 @@ fn spawn_background_remote_machine_refresh(state: Signal<ShellState>, machine_ke
             }
         });
         maybe_spawn_missing_remote_machine_refreshes(state);
+        maybe_spawn_missing_managed_cli_refreshes(state);
     });
 }
 
@@ -3626,6 +3809,28 @@ fn pending_remote_machine_refreshes(
                 .get(machine_key)
                 .copied()
                 .unwrap_or(false)
+        })
+        .collect::<Vec<_>>()
+}
+
+fn pending_managed_cli_refreshes(
+    remote_machines: &[RemoteMachineSnapshot],
+    ssh_targets: &[SshConnectTarget],
+    in_flight: &HashSet<String>,
+    completed: &HashSet<String>,
+    retry_after_ms: &HashMap<String, u64>,
+    now_ms: u64,
+) -> Vec<String> {
+    managed_cli_refresh_scope_keys(remote_machines, ssh_targets)
+        .into_iter()
+        .filter(|scope_key| !scope_key.is_empty())
+        .filter(|scope_key| !in_flight.contains(scope_key))
+        .filter(|scope_key| !completed.contains(scope_key))
+        .filter(|scope_key| {
+            retry_after_ms
+                .get(scope_key)
+                .copied()
+                .is_none_or(|retry_after| retry_after <= now_ms)
         })
         .collect::<Vec<_>>()
 }
@@ -8129,19 +8334,14 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
         .with_inner_size(LogicalSize::new(1460.0, 920.0))
         .with_min_inner_size(LogicalSize::new(1024.0, 720.0));
 
-    let mut config = Config::new()
+    let config = Config::new()
         .with_window(window)
         .with_close_behaviour(WindowCloseBehaviour::WindowCloses)
         .with_exits_when_last_window_closes(true);
 
-    #[cfg(target_os = "linux")]
-    {
-        let mut event_loop = EventLoopBuilder::with_user_event();
-        event_loop.with_app_id(YGGTERM_DESKTOP_APP_ID);
-        config = config.with_event_loop(event_loop.build());
-    }
-
-    dioxus::LaunchBuilder::desktop().with_cfg(config).launch(app);
+    dioxus::LaunchBuilder::desktop()
+        .with_cfg(config)
+        .launch(app);
 
     if CLIENT_INSTANCE.get().is_some() {
         match finalize_client_shutdown(
@@ -16381,6 +16581,36 @@ mod tests {
         );
 
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn pending_managed_cli_refreshes_include_local_and_new_machine() {
+        let remote_machines = vec![RemoteMachineSnapshot {
+            machine_key: "dev".to_string(),
+            label: "dev".to_string(),
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            health: RemoteMachineHealth::Healthy,
+            sessions: Vec::new(),
+        }];
+        let ssh_targets = vec![SshConnectTarget {
+            label: "dev".to_string(),
+            kind: SessionKind::SshShell,
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            cwd: None,
+        }];
+
+        let pending = pending_managed_cli_refreshes(
+            &remote_machines,
+            &ssh_targets,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            1_000,
+        );
+
+        assert_eq!(pending, vec!["local".to_string(), "dev".to_string()]);
     }
 }
 
