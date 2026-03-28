@@ -1,3 +1,4 @@
+use crate::codex_cli::terminal_identity_env_pairs;
 use anyhow::{Context, Result, bail};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::{HashMap, VecDeque};
@@ -330,6 +331,9 @@ fn shell_command(launch_command: &str, cwd: Option<&str>) -> CommandBuilder {
         let mut command = CommandBuilder::new("cmd.exe");
         command.arg("/C");
         command.arg(launch_command);
+        for (key, value) in terminal_identity_env_pairs() {
+            command.env(key, value);
+        }
         if let Some(cwd) = cwd {
             command.cwd(cwd);
         }
@@ -340,6 +344,9 @@ fn shell_command(launch_command: &str, cwd: Option<&str>) -> CommandBuilder {
     let mut command = CommandBuilder::new(shell);
     command.arg("-lc");
     command.arg(launch_command);
+    for (key, value) in terminal_identity_env_pairs() {
+        command.env(key, value);
+    }
     if let Some(cwd) = cwd {
         command.cwd(cwd);
     }
