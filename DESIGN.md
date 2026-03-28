@@ -176,6 +176,9 @@ If a user says “this does not look like a button”, that is a design failure.
 - If the product has a global or sidebar search, the default preference is a centered search field in the titlebar.
 - The search field should feel like part of the shell, not a floating badge.
 - Search should generally be the visual anchor of the center titlebar slot.
+- When an app has an active primary artifact such as a session, terminal, paper, or preview, its title should live in the titlebar to the left of the search field rather than consuming a duplicate header inside the main canvas.
+- Hovering the title control should expose the summary via tooltip, and clicking it may open a compact dropdown with the fuller summary and related actions.
+- Avoid showing both a titlebar title and a second in-canvas title card for the same artifact unless the inner canvas is itself an editor that must edit the title as content.
 
 #### Context menus
 
