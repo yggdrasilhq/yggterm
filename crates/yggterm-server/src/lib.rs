@@ -634,7 +634,7 @@ impl YggtermServer {
             return recipe_terminal_spec(session).map(|_| "exit\r".to_string());
         }
         if session.session_path.starts_with("remote-session://") {
-            return Some("/quit\r".to_string());
+            return None;
         }
         match session.kind {
             SessionKind::Codex | SessionKind::CodexLiteLlm => Some("/quit\r".to_string()),
@@ -4524,7 +4524,7 @@ fn tail_text_file_lines(path: &std::path::Path, lines: usize) -> Vec<String> {
     read_trace_tail(path, lines.max(1))
 }
 
-fn request_app_control(
+pub fn request_app_control(
     home: &std::path::Path,
     command: AppControlCommand,
     timeout_ms: u64,
@@ -4797,6 +4797,13 @@ pub fn run_app_control_describe_state(timeout_ms: u64) -> anyhow::Result<()> {
 pub fn run_app_control_focus_window(timeout_ms: u64) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
     let response = request_app_control(&home, AppControlCommand::FocusWindow, timeout_ms)?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_set_fullscreen(enabled: bool, timeout_ms: u64) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(&home, AppControlCommand::SetFullscreen { enabled }, timeout_ms)?;
     write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
     Ok(())
 }
@@ -7254,6 +7261,48 @@ mod tests {
             .get("remote-session://jojo/abc123")
             .expect("restored session");
         assert_eq!(session.session_path, "remote-session://jojo/abc123");
+    }
+
+    #[test]
+    fn remote_session_stop_command_does_not_send_quit_into_attached_terminal() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.remote_machines.push(RemoteMachineSnapshot {
+            machine_key: "dev".to_string(),
+            label: "dev".to_string(),
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            remote_binary_expr: None,
+            remote_deploy_state: RemoteDeployState::Ready,
+            health: RemoteMachineHealth::Healthy,
+            sessions: Vec::new(),
+        });
+        server.restore_live_session(PersistedLiveSession {
+            key: "remote-session://dev/abc123".to_string(),
+            id: "abc123".to_string(),
+            title: "Remote session".to_string(),
+            kind: SessionKind::SshShell,
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            cwd: Some("/home/pi/gh".to_string()),
+        });
+
+        assert_eq!(server.terminal_stop_command("remote-session://dev/abc123"), None);
     }
 
     #[test]
