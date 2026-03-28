@@ -163,6 +163,7 @@ struct ShellState {
     right_panel_mode: RightPanelMode,
     last_action: String,
     maximized: bool,
+    fullscreen: bool,
     always_on_top: bool,
     notifications: Vec<ToastNotification>,
     next_notification_id: u64,
@@ -324,6 +325,7 @@ struct RenderSnapshot {
     settings: AppSettings,
     install_context: InstallContext,
     maximized: bool,
+    fullscreen: bool,
     always_on_top: bool,
     notifications: Vec<ToastNotification>,
     titlebar_new_menu_open: bool,
@@ -621,6 +623,7 @@ impl ShellState {
             right_panel_mode,
             last_action: "ready".to_string(),
             maximized: false,
+            fullscreen: false,
             always_on_top: false,
             notifications: Vec::new(),
             next_notification_id: 1,
@@ -840,6 +843,7 @@ impl ShellState {
             settings: self.settings.clone(),
             install_context: self.bootstrap.install_context.clone(),
             maximized: self.maximized,
+            fullscreen: self.fullscreen,
             always_on_top: self.always_on_top,
             notifications: self.notifications.clone(),
             titlebar_new_menu_open: self.titlebar_new_menu_open,
@@ -1748,6 +1752,16 @@ impl ShellState {
     fn toggle_maximized(&mut self) {
         window().toggle_maximized();
         self.maximized = !self.maximized;
+    }
+
+    fn toggle_fullscreen(&mut self) {
+        self.fullscreen = !self.fullscreen;
+        window().set_fullscreen(self.fullscreen);
+        self.last_action = if self.fullscreen {
+            "fullscreen enabled".to_string()
+        } else {
+            "fullscreen disabled".to_string()
+        };
     }
 
     fn toggle_always_on_top(&mut self) {
@@ -8948,6 +8962,7 @@ fn describe_app_state_snapshot(
             "tree_rename_path": shell.tree_rename_path,
             "theme_editor_open": shell.theme_editor_open,
             "titlebar_new_menu_open": shell.titlebar_new_menu_open,
+            "fullscreen": shell.fullscreen,
             "server_busy": shell.server_busy,
             "needs_initial_server_sync": shell.needs_initial_server_sync,
             "latest_open_request_id": shell.latest_open_request_id,
@@ -9135,6 +9150,24 @@ async fn process_pending_app_control_requests(
                 error: Some(error.to_string()),
             },
         },
+        AppControlCommand::SetFullscreen { enabled } => {
+            state.with_mut(|shell| {
+                if shell.fullscreen != enabled {
+                    shell.toggle_fullscreen();
+                }
+            });
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(json!({
+                    "enabled": enabled,
+                    "window": describe_window(&desktop),
+                })),
+                error: None,
+            }
+        }
         AppControlCommand::Drag { command } => match command {
             AppControlDragCommand::Begin { row_path } => {
                 let maybe_row = state.with(|shell| resolve_app_control_row(shell, &row_path));
@@ -10379,8 +10412,9 @@ fn app() -> Element {
     let metadata_snapshot = snapshot.clone();
     let preferred_agent_kind = preferred_agent_session_kind(&snapshot.settings);
     let maximized = snapshot.maximized;
-    let shell_radius = if maximized { 0 } else { 11 };
-    let shell_backdrop = shell_backdrop_style(maximized);
+    let fullscreen = snapshot.fullscreen;
+    let shell_radius = if maximized || fullscreen { 0 } else { 11 };
+    let shell_backdrop = shell_backdrop_style(maximized || fullscreen);
     let context_menu_overlay = snapshot.context_menu_row.clone().map(|row| {
         let context_row = resolve_creation_context_row(&snapshot.rows, &row);
         (row, context_row)
@@ -10513,169 +10547,203 @@ fn app() -> Element {
                     shell_radius,
                     &snapshot.shell_tint,
                     &snapshot.shell_gradient,
-                    maximized,
+                    maximized || fullscreen,
                 ),
-                WindowResizeHandles {}
-                Titlebar {
-                    snapshot: titlebar_snapshot,
-                    hovered: hovered,
-                    on_toggle_sidebar: move || state.with_mut(|shell| shell.toggle_sidebar()),
-                    on_search: move |value: String| state.with_mut(|shell| shell.set_search(value)),
-                    on_execute_search_command: move |command: String| execute_search_command(state, command),
-                    on_set_search_focus: move |focused: bool| state.with_mut(|shell| shell.set_search_focus(focused)),
+                if !fullscreen {
+                    WindowResizeHandles {}
+                }
+                if !fullscreen {
+                    Titlebar {
+                        snapshot: titlebar_snapshot,
+                        hovered: hovered,
+                        on_toggle_sidebar: move || state.with_mut(|shell| shell.toggle_sidebar()),
+                        on_search: move |value: String| state.with_mut(|shell| shell.set_search(value)),
+                        on_execute_search_command: move |command: String| execute_search_command(state, command),
+                        on_set_search_focus: move |focused: bool| state.with_mut(|shell| shell.set_search_focus(focused)),
                             on_prev_search_content: move |_| {
-                        if let Some(dom_id) = state.with_mut(|shell| shell.next_search_content_dom_id(-1)) {
-                            if let Some(line_index) = dom_id.strip_prefix("__terminal_line__:") {
-                                let host_id = state
-                                    .read()
-                                    .server
-                                    .active_session()
-                                    .map(|session| terminal_host_id(&session.session_path));
-                                if let (Some(host_id), Ok(line_index)) = (host_id, line_index.parse::<usize>()) {
+                            if let Some(dom_id) = state.with_mut(|shell| shell.next_search_content_dom_id(-1)) {
+                                if let Some(line_index) = dom_id.strip_prefix("__terminal_line__:") {
+                                    let host_id = state
+                                        .read()
+                                        .server
+                                        .active_session()
+                                        .map(|session| terminal_host_id(&session.session_path));
+                                    if let (Some(host_id), Ok(line_index)) = (host_id, line_index.parse::<usize>()) {
+                                        let _ = document::eval(&format!(
+                                            "(function() {{
+                                                const registry = window.__yggtermXtermHosts || {{}};
+                                                const entry = registry[{host_id:?}];
+                                                if (!entry || !entry.term) return;
+                                                const target = Math.max(0, {line_index} - Math.floor((entry.term.rows || 1) / 2));
+                                                try {{ entry.term.scrollToLine(target); }} catch (_error) {{}}
+                                            }})();"
+                                        ));
+                                    }
+                                } else if dom_id == PREVIEW_HEADER_SEARCH_HIT_ID {
+                                    let _ = document::eval(
+                                        "(function() {
+                                            const scroller = document.querySelector('[data-preview-scroll=\"1\"]');
+                                            if (scroller) {
+                                                scroller.scrollTo({ top: 0, behavior: 'smooth' });
+                                            }
+                                        })();",
+                                    );
+                                } else {
                                     let _ = document::eval(&format!(
                                         "(function() {{
-                                            const registry = window.__yggtermXtermHosts || {{}};
-                                            const entry = registry[{host_id:?}];
-                                            if (!entry || !entry.term) return;
-                                            const target = Math.max(0, {line_index} - Math.floor((entry.term.rows || 1) / 2));
-                                            try {{ entry.term.scrollToLine(target); }} catch (_error) {{}}
+                                            const el = document.getElementById({dom_id:?});
+                                            if (el) {{
+                                                el.scrollIntoView({{ block: 'center', inline: 'nearest', behavior: 'smooth' }});
+                                            }}
                                         }})();"
                                     ));
                                 }
-                            } else if dom_id == PREVIEW_HEADER_SEARCH_HIT_ID {
-                                let _ = document::eval(
-                                    "(function() {
-                                        const scroller = document.querySelector('[data-preview-scroll=\"1\"]');
-                                        if (scroller) {
-                                            scroller.scrollTo({ top: 0, behavior: 'smooth' });
-                                        }
-                                    })();",
-                                );
-                            } else {
-                                let _ = document::eval(&format!(
-                                    "(function() {{
-                                        const el = document.getElementById({dom_id:?});
-                                        if (el) {{
-                                            el.scrollIntoView({{ block: 'center', inline: 'nearest', behavior: 'smooth' }});
-                                        }}
-                                    }})();"
-                                ));
                             }
-                        }
-                    },
-                    on_next_search_content: move |_| {
-                        if let Some(dom_id) = state.with_mut(|shell| shell.next_search_content_dom_id(1)) {
-                            if let Some(line_index) = dom_id.strip_prefix("__terminal_line__:") {
-                                let host_id = state
-                                    .read()
-                                    .server
-                                    .active_session()
-                                    .map(|session| terminal_host_id(&session.session_path));
-                                if let (Some(host_id), Ok(line_index)) = (host_id, line_index.parse::<usize>()) {
+                        },
+                        on_next_search_content: move |_| {
+                            if let Some(dom_id) = state.with_mut(|shell| shell.next_search_content_dom_id(1)) {
+                                if let Some(line_index) = dom_id.strip_prefix("__terminal_line__:") {
+                                    let host_id = state
+                                        .read()
+                                        .server
+                                        .active_session()
+                                        .map(|session| terminal_host_id(&session.session_path));
+                                    if let (Some(host_id), Ok(line_index)) = (host_id, line_index.parse::<usize>()) {
+                                        let _ = document::eval(&format!(
+                                            "(function() {{
+                                                const registry = window.__yggtermXtermHosts || {{}};
+                                                const entry = registry[{host_id:?}];
+                                                if (!entry || !entry.term) return;
+                                                const target = Math.max(0, {line_index} - Math.floor((entry.term.rows || 1) / 2));
+                                                try {{ entry.term.scrollToLine(target); }} catch (_error) {{}}
+                                            }})();"
+                                        ));
+                                    }
+                                } else if dom_id == PREVIEW_HEADER_SEARCH_HIT_ID {
+                                    let _ = document::eval(
+                                        "(function() {
+                                            const scroller = document.querySelector('[data-preview-scroll=\"1\"]');
+                                            if (scroller) {
+                                                scroller.scrollTo({ top: 0, behavior: 'smooth' });
+                                            }
+                                        })();",
+                                    );
+                                } else {
                                     let _ = document::eval(&format!(
                                         "(function() {{
-                                            const registry = window.__yggtermXtermHosts || {{}};
-                                            const entry = registry[{host_id:?}];
-                                            if (!entry || !entry.term) return;
-                                            const target = Math.max(0, {line_index} - Math.floor((entry.term.rows || 1) / 2));
-                                            try {{ entry.term.scrollToLine(target); }} catch (_error) {{}}
+                                            const el = document.getElementById({dom_id:?});
+                                            if (el) {{
+                                                el.scrollIntoView({{ block: 'center', inline: 'nearest', behavior: 'smooth' }});
+                                            }}
                                         }})();"
                                     ));
                                 }
-                            } else if dom_id == PREVIEW_HEADER_SEARCH_HIT_ID {
-                                let _ = document::eval(
-                                    "(function() {
-                                        const scroller = document.querySelector('[data-preview-scroll=\"1\"]');
-                                        if (scroller) {
-                                            scroller.scrollTo({ top: 0, behavior: 'smooth' });
-                                        }
-                                    })();",
-                                );
-                            } else {
-                                let _ = document::eval(&format!(
-                                    "(function() {{
-                                        const el = document.getElementById({dom_id:?});
-                                        if (el) {{
-                                            el.scrollIntoView({{ block: 'center', inline: 'nearest', behavior: 'smooth' }});
-                                        }}
-                                    }})();"
-                                ));
                             }
-                        }
-                    },
-                    on_hover_control: move |control: Option<HoveredControl>| hovered.set(control),
-                    on_set_view_mode: move |mode: WorkspaceViewMode| spawn_set_view_mode(state, mode),
-                    on_toggle_session_menu: move |_| state.with_mut(|shell| shell.toggle_titlebar_session_menu()),
-                    on_toggle_new_menu: move |_| state.with_mut(|shell| shell.toggle_titlebar_new_menu()),
-                    on_start_session: move |_| {
-                        let (cwd, title_hint) = state.with_mut(|shell| {
-                            shell.close_titlebar_new_menu();
-                            current_new_session_context(shell, preferred_agent_kind)
-                        });
-                        spawn_server_snapshot_action(state, "starting session".to_string(), move |endpoint| {
-                            start_local_session_at(
-                                &endpoint,
-                                preferred_agent_kind,
-                                cwd.as_deref(),
-                                title_hint.as_deref(),
-                            )
-                        })
-                    },
-                    on_start_terminal: move |_| {
-                        let launch_context = state.with_mut(|shell| {
-                            shell.close_titlebar_new_menu();
-                            terminal_launch_context(shell)
-                        });
-                        match launch_context {
-                            TerminalLaunchContext::Local { cwd, title_hint } => {
-                                spawn_server_snapshot_action(state, "starting terminal".to_string(), move |endpoint| {
-                                    start_local_session_at(
-                                        &endpoint,
-                                        SessionKind::Shell,
-                                        cwd.as_deref(),
-                                        title_hint.as_deref(),
-                                    )
-                                })
+                        },
+                        on_hover_control: move |control: Option<HoveredControl>| hovered.set(control),
+                        on_set_view_mode: move |mode: WorkspaceViewMode| spawn_set_view_mode(state, mode),
+                        on_toggle_session_menu: move |_| state.with_mut(|shell| shell.toggle_titlebar_session_menu()),
+                        on_toggle_new_menu: move |_| state.with_mut(|shell| shell.toggle_titlebar_new_menu()),
+                        on_start_session: move |_| {
+                            let (cwd, title_hint) = state.with_mut(|shell| {
+                                shell.close_titlebar_new_menu();
+                                current_new_session_context(shell, preferred_agent_kind)
+                            });
+                            spawn_server_snapshot_action(state, "starting session".to_string(), move |endpoint| {
+                                start_local_session_at(
+                                    &endpoint,
+                                    preferred_agent_kind,
+                                    cwd.as_deref(),
+                                    title_hint.as_deref(),
+                                )
+                            })
+                        },
+                        on_start_terminal: move |_| {
+                            let launch_context = state.with_mut(|shell| {
+                                shell.close_titlebar_new_menu();
+                                terminal_launch_context(shell)
+                            });
+                            match launch_context {
+                                TerminalLaunchContext::Local { cwd, title_hint } => {
+                                    spawn_server_snapshot_action(state, "starting terminal".to_string(), move |endpoint| {
+                                        start_local_session_at(
+                                            &endpoint,
+                                            SessionKind::Shell,
+                                            cwd.as_deref(),
+                                            title_hint.as_deref(),
+                                        )
+                                    })
+                                }
+                                TerminalLaunchContext::Remote {
+                                    ssh_target,
+                                    prefix,
+                                    cwd,
+                                    title_hint,
+                                } => {
+                                    spawn_server_snapshot_action(state, "starting ssh terminal".to_string(), move |endpoint| {
+                                        start_ssh_session_at(
+                                            &endpoint,
+                                            &ssh_target,
+                                            prefix.as_deref(),
+                                            cwd.as_deref(),
+                                            title_hint.as_deref(),
+                                        )
+                                    })
+                                }
                             }
-                            TerminalLaunchContext::Remote {
-                                ssh_target,
-                                prefix,
-                                cwd,
-                                title_hint,
-                            } => {
-                                spawn_server_snapshot_action(state, "starting ssh terminal".to_string(), move |endpoint| {
-                                    start_ssh_session_at(
-                                        &endpoint,
-                                        &ssh_target,
-                                        prefix.as_deref(),
-                                        cwd.as_deref(),
-                                        title_hint.as_deref(),
-                                    )
-                                })
+                        },
+                        on_create_paper: move |_| {
+                            state.with_mut(|shell| shell.close_titlebar_new_menu());
+                            queue_new_document(state)
+                        },
+                        on_refresh_title: move |_| {
+                            spawn_deferred_active_session_title_generation(state, true)
+                        },
+                        on_refresh_summary: move |_| {
+                            if let Some(session) = state.read().server.active_session().cloned() {
+                                spawn_summary_generation(state, session, true);
                             }
+                        },
+                        on_toggle_meta: move || state.with_mut(|shell| shell.toggle_metadata_panel()),
+                        on_toggle_settings: move || state.with_mut(|shell| shell.toggle_settings_panel()),
+                        on_toggle_connect: move || state.with_mut(|shell| shell.toggle_connect_panel()),
+                        on_toggle_notifications: move || state.with_mut(|shell| shell.toggle_notifications_panel()),
+                        on_restart_update: move || restart_into_pending_update(state),
+                        on_toggle_maximized: move || state.with_mut(|shell| shell.toggle_maximized()),
+                        on_toggle_fullscreen: move || state.with_mut(|shell| shell.toggle_fullscreen()),
+                        on_toggle_always_on_top: move || state.with_mut(|shell| shell.toggle_always_on_top()),
+                        on_close_app: move || spawn_graceful_shutdown_and_close(state),
+                        maximized: maximized,
+                        fullscreen: fullscreen,
+                    }
+                }
+                if fullscreen {
+                    div {
+                        style: "position:absolute; top:12px; right:14px; z-index:180;",
+                        onmousedown: |evt| evt.stop_propagation(),
+                        onclick: |evt| evt.stop_propagation(),
+                        WindowControlsStrip {
+                            palette: ChromePalette {
+                                titlebar: snapshot.palette.titlebar,
+                                text: snapshot.palette.text,
+                                muted: snapshot.palette.muted,
+                                accent: snapshot.palette.accent,
+                                close_hover: snapshot.palette.close_hover,
+                                control_hover: snapshot.palette.control_hover,
+                            },
+                            hovered: hovered(),
+                            on_hover_control: move |control: Option<HoveredControl>| hovered.set(control),
+                            on_toggle_maximized: move || state.with_mut(|shell| shell.toggle_maximized()),
+                            on_toggle_fullscreen: move || state.with_mut(|shell| shell.toggle_fullscreen()),
+                            on_toggle_always_on_top: move || state.with_mut(|shell| shell.toggle_always_on_top()),
+                            on_close_app: move || spawn_graceful_shutdown_and_close(state),
+                            maximized: maximized,
+                            fullscreen: fullscreen,
+                            always_on_top: snapshot.always_on_top,
+                            show_fullscreen_button: false,
+                            overlay: true,
                         }
-                    },
-                    on_create_paper: move |_| {
-                        state.with_mut(|shell| shell.close_titlebar_new_menu());
-                        queue_new_document(state)
-                    },
-                    on_refresh_title: move |_| {
-                        spawn_deferred_active_session_title_generation(state, true)
-                    },
-                    on_refresh_summary: move |_| {
-                        if let Some(session) = state.read().server.active_session().cloned() {
-                            spawn_summary_generation(state, session, true);
-                        }
-                    },
-                    on_toggle_meta: move || state.with_mut(|shell| shell.toggle_metadata_panel()),
-                    on_toggle_settings: move || state.with_mut(|shell| shell.toggle_settings_panel()),
-                    on_toggle_connect: move || state.with_mut(|shell| shell.toggle_connect_panel()),
-                    on_toggle_notifications: move || state.with_mut(|shell| shell.toggle_notifications_panel()),
-                    on_restart_update: move || restart_into_pending_update(state),
-                    on_toggle_maximized: move || state.with_mut(|shell| shell.toggle_maximized()),
-                    on_toggle_always_on_top: move || state.with_mut(|shell| shell.toggle_always_on_top()),
-                    on_close_app: move || spawn_graceful_shutdown_and_close(state),
-                    maximized: maximized,
+                    }
                 }
                 div {
                     style: "display: flex; flex: 1; min-height: 0; overflow: hidden;",
@@ -11038,9 +11106,11 @@ fn Titlebar(
     on_toggle_notifications: EventHandler<()>,
     on_restart_update: EventHandler<()>,
     on_toggle_maximized: EventHandler<()>,
+    on_toggle_fullscreen: EventHandler<()>,
     on_toggle_always_on_top: EventHandler<()>,
     on_close_app: EventHandler<()>,
     maximized: bool,
+    fullscreen: bool,
 ) -> Element {
     let command_mode_active = snapshot.command_mode_active;
     let search_query = snapshot.search_query.clone();
@@ -11398,10 +11468,14 @@ fn Titlebar(
                         hovered: hovered(),
                         on_hover_control: on_hover_control,
                         on_toggle_maximized: on_toggle_maximized,
+                        on_toggle_fullscreen: on_toggle_fullscreen,
                         on_toggle_always_on_top: on_toggle_always_on_top,
                         on_close_app: on_close_app,
                         maximized: maximized,
+                        fullscreen: fullscreen,
                         always_on_top: snapshot.always_on_top,
+                        show_fullscreen_button: true,
+                        overlay: false,
                     }
                 }
             },
@@ -13806,12 +13880,14 @@ fn TerminalCanvas(
         &snapshot.settings.terminal_theme_name,
     );
     let terminal_placeholder = terminal_placeholder_text(&session);
-    let terminal_shell_background = "transparent".to_string();
+    let terminal_shell_background = theme.background.clone();
     let terminal_shell_shadow = "none".to_string();
-    let terminal_shell_padding = "0".to_string();
-    let terminal_shell_radius = "0".to_string();
-    let terminal_host_chrome =
-        "border-radius:0; box-shadow:none !important; outline:none !important;".to_string();
+    let terminal_shell_padding = "6px".to_string();
+    let terminal_shell_radius = "10px".to_string();
+    let terminal_host_chrome = format!(
+        "border-radius:8px; box-shadow:none !important; outline:none !important; background:{};",
+        theme.background
+    );
     let resume_overlay_blur = overlay_backdrop_style("blur(1px)");
     let future_theme = theme.clone();
     let trace_home = perf_home_dir(&state.read().bootstrap.settings_path);

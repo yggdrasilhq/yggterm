@@ -6,6 +6,7 @@ pub enum HoveredChromeControl {
     AlwaysOnTop,
     Minimize,
     Maximize,
+    Fullscreen,
     Close,
 }
 
@@ -15,6 +16,8 @@ pub enum ChromeControlIcon {
     Minimize,
     Maximize,
     Restore,
+    Fullscreen,
+    ExitFullscreen,
     Close,
 }
 
@@ -80,21 +83,33 @@ pub fn WindowControlsStrip(
     palette: ChromePalette,
     hovered: Option<HoveredChromeControl>,
     maximized: bool,
+    fullscreen: bool,
     always_on_top: bool,
+    show_fullscreen_button: bool,
+    overlay: bool,
     on_hover_control: EventHandler<Option<HoveredChromeControl>>,
     on_toggle_maximized: EventHandler<()>,
+    on_toggle_fullscreen: EventHandler<()>,
     on_toggle_always_on_top: EventHandler<()>,
     on_close_app: EventHandler<()>,
 ) -> Element {
+    let container_style = if overlay {
+        "display:flex; align-items:stretch; gap:6px; padding:8px; border-radius:14px; \
+         background:rgba(255,255,255,0.78); box-shadow:0 16px 36px rgba(96,124,158,0.18), \
+         inset 0 0 0 1px rgba(198,212,226,0.72); backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px);"
+    } else {
+        "display:flex; align-items:stretch; gap:0;"
+    };
     rsx! {
         div {
-            style: "display:flex; align-items:stretch; gap:0;",
+            style: container_style,
             WindowControlButton {
                 icon: ChromeControlIcon::AlwaysOnTop,
                 hovered: hovered == Some(HoveredChromeControl::AlwaysOnTop),
                 active: always_on_top,
                 hover_tone: HoveredChromeControl::AlwaysOnTop,
                 palette: palette,
+                overlay: overlay,
                 on_hover_control: on_hover_control,
                 on_press: move |_| on_toggle_always_on_top.call(()),
             }
@@ -104,17 +119,43 @@ pub fn WindowControlsStrip(
                 active: false,
                 hover_tone: HoveredChromeControl::Minimize,
                 palette: palette,
+                overlay: overlay,
                 on_hover_control: on_hover_control,
                 on_press: move |_| window().set_minimized(true),
             }
             WindowControlButton {
-                icon: if maximized { ChromeControlIcon::Restore } else { ChromeControlIcon::Maximize },
+                icon: if fullscreen {
+                    ChromeControlIcon::ExitFullscreen
+                } else if maximized {
+                    ChromeControlIcon::Restore
+                } else {
+                    ChromeControlIcon::Maximize
+                },
                 hovered: hovered == Some(HoveredChromeControl::Maximize),
                 active: false,
                 hover_tone: HoveredChromeControl::Maximize,
                 palette: palette,
+                overlay: overlay,
                 on_hover_control: on_hover_control,
-                on_press: move |_| on_toggle_maximized.call(()),
+                on_press: move |_| {
+                    if fullscreen {
+                        on_toggle_fullscreen.call(());
+                    } else {
+                        on_toggle_maximized.call(());
+                    }
+                },
+            }
+            if show_fullscreen_button {
+                WindowControlButton {
+                    icon: ChromeControlIcon::Fullscreen,
+                    hovered: hovered == Some(HoveredChromeControl::Fullscreen),
+                    active: fullscreen,
+                    hover_tone: HoveredChromeControl::Fullscreen,
+                    palette: palette,
+                    overlay: overlay,
+                    on_hover_control: on_hover_control,
+                    on_press: move |_| on_toggle_fullscreen.call(()),
+                }
             }
             WindowControlButton {
                 icon: ChromeControlIcon::Close,
@@ -122,6 +163,7 @@ pub fn WindowControlsStrip(
                 active: false,
                 hover_tone: HoveredChromeControl::Close,
                 palette: palette,
+                overlay: overlay,
                 on_hover_control: on_hover_control,
                 on_press: move |_| on_close_app.call(()),
             }
@@ -136,6 +178,7 @@ fn WindowControlButton(
     active: bool,
     hover_tone: HoveredChromeControl,
     palette: ChromePalette,
+    overlay: bool,
     on_hover_control: EventHandler<Option<HoveredChromeControl>>,
     on_press: EventHandler<MouseEvent>,
 ) -> Element {
@@ -156,14 +199,24 @@ fn WindowControlButton(
     } else {
         palette.text
     };
+    let button_style = if overlay {
+        format!(
+            "width:32px; height:30px; border:none; border-radius:10px; background:{}; color:{}; \
+             display:flex; align-items:center; justify-content:center; font-size:13px; font-weight:600; \
+             user-select:none; -webkit-user-select:none;",
+            background, color
+        )
+    } else {
+        format!(
+            "width:34px; height:30px; border:none; border-radius:0; background:{}; color:{}; \
+             display:flex; align-items:center; justify-content:center; font-size:13px; font-weight:600; \
+             user-select:none; -webkit-user-select:none;",
+            background, color
+        )
+    };
     rsx! {
         button {
-            style: format!(
-                "width:34px; height:30px; border:none; border-radius:0; background:{}; color:{}; \
-                 display:flex; align-items:center; justify-content:center; font-size:13px; font-weight:600; \
-                 user-select:none; -webkit-user-select:none;",
-                background, color
-            ),
+            style: button_style,
             onmousedown: |evt| evt.stop_propagation(),
             ondoubleclick: |evt| evt.stop_propagation(),
             onmouseenter: move |_| on_hover_control.call(Some(hover_tone)),
@@ -197,6 +250,22 @@ fn WindowControlGlyph(icon: ChromeControlIcon) -> Element {
             svg { width: "11", height: "11", view_box: "0 0 10 10", fill: "none", xmlns: "http://www.w3.org/2000/svg",
                 path { d: "M3.2 2.1H7.7V6.6", stroke: "currentColor", stroke_width: "1.1", stroke_linejoin: "round" }
                 path { d: "M2.3 3.4H6.8V7.9H2.3V3.4Z", stroke: "currentColor", stroke_width: "1.1", stroke_linejoin: "round" }
+            }
+        },
+        ChromeControlIcon::Fullscreen => rsx! {
+            svg { width: "11", height: "11", view_box: "0 0 10 10", fill: "none", xmlns: "http://www.w3.org/2000/svg",
+                path { d: "M3.3 2.2H2.2V4.2", stroke: "currentColor", stroke_width: "1.1", stroke_linecap: "round", stroke_linejoin: "round" }
+                path { d: "M6.7 2.2H7.8V4.2", stroke: "currentColor", stroke_width: "1.1", stroke_linecap: "round", stroke_linejoin: "round" }
+                path { d: "M7.8 5.8V7.8H5.8", stroke: "currentColor", stroke_width: "1.1", stroke_linecap: "round", stroke_linejoin: "round" }
+                path { d: "M4.2 7.8H2.2V5.8", stroke: "currentColor", stroke_width: "1.1", stroke_linecap: "round", stroke_linejoin: "round" }
+            }
+        },
+        ChromeControlIcon::ExitFullscreen => rsx! {
+            svg { width: "11", height: "11", view_box: "0 0 10 10", fill: "none", xmlns: "http://www.w3.org/2000/svg",
+                path { d: "M4.2 2.4H2.4V4.2", stroke: "currentColor", stroke_width: "1.1", stroke_linecap: "round", stroke_linejoin: "round" }
+                path { d: "M5.8 2.4H7.6V4.2", stroke: "currentColor", stroke_width: "1.1", stroke_linecap: "round", stroke_linejoin: "round" }
+                path { d: "M7.6 5.8V7.6H5.8", stroke: "currentColor", stroke_width: "1.1", stroke_linecap: "round", stroke_linejoin: "round" }
+                path { d: "M4.2 7.6H2.4V5.8", stroke: "currentColor", stroke_width: "1.1", stroke_linecap: "round", stroke_linejoin: "round" }
             }
         },
         ChromeControlIcon::Close => rsx! {
