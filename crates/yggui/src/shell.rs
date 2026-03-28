@@ -50,6 +50,7 @@ use tao::keyboard::Key as TaoKey;
 use tao::keyboard::KeyCode as TaoKeyCode;
 use tao::window::ResizeDirection;
 use time::OffsetDateTime;
+use tokio::sync::oneshot;
 use tokio::task;
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -13213,31 +13214,17 @@ fn TerminalCanvas(
                     "session_path": session_path.clone(),
                 }),
             );
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "terminal_mount",
+                "js_wait_begin",
+                json!({
+                    "session_path": session_path.clone(),
+                    "host_id": host_id.clone(),
+                }),
+            );
             let mut eval = document::eval(&terminal_eval_script(&host_id, &theme));
-            let _ = eval.send(TerminalJsCommand::Reset {
-                title,
-                background: theme.background.clone(),
-                foreground: theme.foreground.clone(),
-                cursor: theme.cursor.clone(),
-                selection: theme.selection.clone(),
-                black: theme.black.clone(),
-                red: theme.red.clone(),
-                green: theme.green.clone(),
-                yellow: theme.yellow.clone(),
-                blue: theme.blue.clone(),
-                magenta: theme.magenta.clone(),
-                cyan: theme.cyan.clone(),
-                white: theme.white.clone(),
-                bright_black: theme.bright_black.clone(),
-                bright_red: theme.bright_red.clone(),
-                bright_green: theme.bright_green.clone(),
-                bright_yellow: theme.bright_yellow.clone(),
-                bright_blue: theme.bright_blue.clone(),
-                bright_magenta: theme.bright_magenta.clone(),
-                bright_cyan: theme.bright_cyan.clone(),
-                bright_white: theme.bright_white.clone(),
-                font_size: theme.font_size,
-            });
             let mut cursor = 0u64;
             let mut read_poll_ms = 120u64;
             loop {
@@ -13255,6 +13242,30 @@ fn TerminalCanvas(
                                         "host_id": host_id.clone(),
                                     }),
                                 );
+                                let _ = eval.send(TerminalJsCommand::Reset {
+                                    title: title.clone(),
+                                    background: theme.background.clone(),
+                                    foreground: theme.foreground.clone(),
+                                    cursor: theme.cursor.clone(),
+                                    selection: theme.selection.clone(),
+                                    black: theme.black.clone(),
+                                    red: theme.red.clone(),
+                                    green: theme.green.clone(),
+                                    yellow: theme.yellow.clone(),
+                                    blue: theme.blue.clone(),
+                                    magenta: theme.magenta.clone(),
+                                    cyan: theme.cyan.clone(),
+                                    white: theme.white.clone(),
+                                    bright_black: theme.bright_black.clone(),
+                                    bright_red: theme.bright_red.clone(),
+                                    bright_green: theme.bright_green.clone(),
+                                    bright_yellow: theme.bright_yellow.clone(),
+                                    bright_blue: theme.bright_blue.clone(),
+                                    bright_magenta: theme.bright_magenta.clone(),
+                                    bright_cyan: theme.bright_cyan.clone(),
+                                    bright_white: theme.bright_white.clone(),
+                                    font_size: theme.font_size,
+                                });
                                 if let Ok((next_cursor, chunks)) = terminal_read_async(endpoint.clone(), session_path.clone(), 0).await {
                                     cursor = next_cursor;
                                     read_poll_ms = if chunks.is_empty() { 140 } else { 60 };
@@ -13393,6 +13404,16 @@ fn TerminalCanvas(
                                 );
                             }
                             Ok(TerminalJsEvent::Debug { message }) => {
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "terminal_mount",
+                                    "js_debug",
+                                    json!({
+                                        "session_path": session_path.clone(),
+                                        "message": message.clone(),
+                                    }),
+                                );
                                 if message.contains("error") || message.contains("failed") {
                                     warn!(session=%session_path, %message, "terminal js debug");
                                 }
@@ -13609,10 +13630,12 @@ fn strip_terminal_control_sequences(data: &str) -> String {
 async fn terminal_ensure_async(
     endpoint: ServerEndpoint,
     session_path: String,
+    trace_home: &Path,
 ) -> Result<Option<String>> {
-    task::spawn_blocking(move || terminal_ensure(&endpoint, &session_path))
-        .await
-        .map_err(|error| anyhow!("joining terminal ensure task: {error}"))?
+    run_dedicated_terminal_io("terminal_ensure", trace_home, move || {
+        terminal_ensure(&endpoint, &session_path)
+    })
+    .await
 }
 
 fn should_retry_terminal_ensure(error: &anyhow::Error) -> bool {
@@ -13633,7 +13656,7 @@ async fn terminal_ensure_with_retry_async(
     let mut daemon_checked = false;
     loop {
         attempts += 1;
-        match terminal_ensure_async(endpoint.clone(), session_path.clone()).await {
+        match terminal_ensure_async(endpoint.clone(), session_path.clone(), trace_home).await {
             Ok(result) => {
                 if attempts > 1 {
                     append_trace_event(
@@ -13664,11 +13687,10 @@ async fn terminal_ensure_with_retry_async(
                     );
                     let daemon_result = {
                         let endpoint = endpoint.clone();
-                        task::spawn_blocking(move || ensure_daemon_running(&endpoint))
-                            .await
-                            .map_err(|join_error| {
-                                anyhow!("joining daemon ensure task: {join_error}")
-                            })?
+                        run_dedicated_terminal_io("daemon_ensure", trace_home, move || {
+                            ensure_daemon_running(&endpoint)
+                        })
+                        .await
                     };
                     match daemon_result {
                         Ok(()) => {
@@ -13716,6 +13738,38 @@ async fn terminal_ensure_with_retry_async(
             Err(error) => return Err(error),
         }
     }
+}
+
+async fn run_dedicated_terminal_io<T, F>(label: &str, trace_home: &Path, work: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    let queued_at_ms = current_millis();
+    let (tx, rx) = oneshot::channel();
+    let worker_name = format!("yggterm-{label}-{queued_at_ms}");
+    thread::Builder::new()
+        .name(worker_name.clone())
+        .spawn(move || {
+            let started_at_ms = current_millis();
+            let result = work();
+            let _ = tx.send((started_at_ms, result));
+        })
+        .with_context(|| format!("spawning dedicated terminal worker {worker_name}"))?;
+    let (started_at_ms, result) = rx
+        .await
+        .map_err(|error| anyhow!("waiting for dedicated terminal worker {label}: {error}"))?;
+    append_trace_event(
+        trace_home,
+        "ui",
+        "terminal_io",
+        "dispatch",
+        json!({
+            "label": label,
+            "queue_delay_ms": started_at_ms.saturating_sub(queued_at_ms),
+        }),
+    );
+    result
 }
 
 async fn terminal_read_async(
@@ -14064,7 +14118,9 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
         r#"
         const hostId = {host_id:?};
         const host = document.getElementById(hostId);
+        dioxus.send({{ kind: "debug", message: `bootstrap host=${{hostId}} present=${{!!host}}` }});
         if (!host) {{
+            dioxus.send({{ kind: "debug", message: `bootstrap host missing for ${{hostId}}` }});
             dioxus.send({{ kind: "ready" }});
             return;
         }}
@@ -14108,6 +14164,10 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
             }}
         }};
         const assetsReady = await ensureXtermAssets();
+        dioxus.send({{
+            kind: "debug",
+            message: `assets host=${{hostId}} ready=${{assetsReady}} terminal=${{!!window.Terminal}} fit=${{!!(window.FitAddon && window.FitAddon.FitAddon)}} bootstrap=${{window.__yggtermXtermBootstrapError || "none"}}`
+        }});
         if (!assetsReady || !window.Terminal || !window.FitAddon || !window.FitAddon.FitAddon) {{
             const details = [
               window.Terminal ? "Terminal:ok" : "Terminal:missing",
@@ -14211,6 +14271,10 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
         }});
         window.__yggtermXtermHosts = window.__yggtermXtermHosts || {{}};
         window.__yggtermXtermHosts[hostId] = {{ term, fitAddon }};
+        dioxus.send({{
+            kind: "debug",
+            message: `constructed host=${{hostId}} cols=${{term.cols}} rows=${{term.rows}}`
+        }});
         const emitResize = () => {{
             try {{
                 fitAddon.fit();
