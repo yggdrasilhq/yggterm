@@ -1756,11 +1756,10 @@ impl ShellState {
 
     fn toggle_fullscreen(&mut self) {
         self.fullscreen = !self.fullscreen;
-        window().set_fullscreen(self.fullscreen);
         self.last_action = if self.fullscreen {
-            "fullscreen enabled".to_string()
+            "distraction-free mode enabled".to_string()
         } else {
-            "fullscreen disabled".to_string()
+            "distraction-free mode disabled".to_string()
         };
     }
 
@@ -10413,8 +10412,8 @@ fn app() -> Element {
     let preferred_agent_kind = preferred_agent_session_kind(&snapshot.settings);
     let maximized = snapshot.maximized;
     let fullscreen = snapshot.fullscreen;
-    let shell_radius = if maximized || fullscreen { 0 } else { 11 };
-    let shell_backdrop = shell_backdrop_style(maximized || fullscreen);
+    let shell_radius = if maximized { 0 } else { 11 };
+    let shell_backdrop = shell_backdrop_style(maximized);
     let context_menu_overlay = snapshot.context_menu_row.clone().map(|row| {
         let context_row = resolve_creation_context_row(&snapshot.rows, &row);
         (row, context_row)
@@ -10496,6 +10495,11 @@ fn app() -> Element {
                         ));
                         return;
                     }
+                    if state.read().fullscreen {
+                        evt.prevent_default();
+                        state.with_mut(|shell| shell.toggle_fullscreen());
+                        return;
+                    }
                 }
                 if !is_accel && matches!(evt.key(), Key::Character(ref key) if key == "[" || key == "]") {
                     let has_search = !state.read().search_query.trim().is_empty();
@@ -10547,7 +10551,7 @@ fn app() -> Element {
                     shell_radius,
                     &snapshot.shell_tint,
                     &snapshot.shell_gradient,
-                    maximized || fullscreen,
+                    maximized,
                 ),
                 if !fullscreen {
                     WindowResizeHandles {}
@@ -10747,7 +10751,8 @@ fn app() -> Element {
                 }
                 div {
                     style: "display: flex; flex: 1; min-height: 0; overflow: hidden;",
-                    Sidebar {
+                    if !fullscreen {
+                        Sidebar {
                         snapshot: sidebar_snapshot,
                         on_prev_search_row: move |_| {
                             if let Some(row) = state.with_mut(|shell| shell.next_search_sidebar_row(-1)) {
@@ -10836,6 +10841,7 @@ fn app() -> Element {
                         },
                         on_cancel_rename: move |_| state.with_mut(|shell| shell.cancel_tree_rename()),
                     }
+                    }
                     MainSurface {
                         state,
                         snapshot: main_snapshot,
@@ -10898,7 +10904,7 @@ fn app() -> Element {
                             )
                         },
                     }
-                    if metadata_snapshot.right_panel_mode != RightPanelMode::Hidden {
+                    if !fullscreen && metadata_snapshot.right_panel_mode != RightPanelMode::Hidden {
                         RightRail {
                             snapshot: metadata_snapshot,
                             on_endpoint_change: move |value: String| state.with_mut(|shell| shell.update_litellm_endpoint(value)),
@@ -12524,12 +12530,13 @@ fn MainSurface(
         div {
             key: "{surface_key}",
             style: format!(
-                "flex:1; min-width:0; min-height:0; display:flex; flex-direction:column; background:transparent; padding:12px 12px 10px 0;",
+                "flex:1; min-width:0; min-height:0; display:flex; flex-direction:column; background:transparent; padding:{};",
+                if snapshot.fullscreen { "0" } else { "12px 12px 10px 0" }
             ),
             div {
                 key: "{surface_key}-body",
                 style: format!(
-                    "flex:1; min-height:0; overflow:{}; padding:{}; background:{}; border-radius:11px; box-shadow:{};",
+                    "flex:1; min-height:0; overflow:{}; padding:{}; background:{}; border-radius:{}; box-shadow:{};",
                     if snapshot.active_view_mode == WorkspaceViewMode::Terminal { "hidden" } else { "auto" },
                     if snapshot.active_view_mode == WorkspaceViewMode::Terminal { "0" } else { "24px" },
                     if snapshot.active_view_mode == WorkspaceViewMode::Terminal {
@@ -12537,6 +12544,7 @@ fn MainSurface(
                     } else {
                         snapshot.palette.panel
                     },
+                    if snapshot.fullscreen { "0" } else { "11px" },
                     if snapshot.active_view_mode == WorkspaceViewMode::Terminal {
                         "none"
                     } else {

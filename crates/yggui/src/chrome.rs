@@ -113,6 +113,22 @@ pub fn WindowControlsStrip(
                 on_hover_control: on_hover_control,
                 on_press: move |_| on_toggle_always_on_top.call(()),
             }
+            if show_fullscreen_button {
+                WindowControlButton {
+                    icon: if fullscreen {
+                        ChromeControlIcon::ExitFullscreen
+                    } else {
+                        ChromeControlIcon::Fullscreen
+                    },
+                    hovered: hovered == Some(HoveredChromeControl::Fullscreen),
+                    active: fullscreen,
+                    hover_tone: HoveredChromeControl::Fullscreen,
+                    palette: palette,
+                    overlay: overlay,
+                    on_hover_control: on_hover_control,
+                    on_press: move |_| on_toggle_fullscreen.call(()),
+                }
+            }
             WindowControlButton {
                 icon: ChromeControlIcon::Minimize,
                 hovered: hovered == Some(HoveredChromeControl::Minimize),
@@ -124,9 +140,7 @@ pub fn WindowControlsStrip(
                 on_press: move |_| window().set_minimized(true),
             }
             WindowControlButton {
-                icon: if fullscreen {
-                    ChromeControlIcon::ExitFullscreen
-                } else if maximized {
+                icon: if maximized {
                     ChromeControlIcon::Restore
                 } else {
                     ChromeControlIcon::Maximize
@@ -137,25 +151,7 @@ pub fn WindowControlsStrip(
                 palette: palette,
                 overlay: overlay,
                 on_hover_control: on_hover_control,
-                on_press: move |_| {
-                    if fullscreen {
-                        on_toggle_fullscreen.call(());
-                    } else {
-                        on_toggle_maximized.call(());
-                    }
-                },
-            }
-            if show_fullscreen_button {
-                WindowControlButton {
-                    icon: ChromeControlIcon::Fullscreen,
-                    hovered: hovered == Some(HoveredChromeControl::Fullscreen),
-                    active: fullscreen,
-                    hover_tone: HoveredChromeControl::Fullscreen,
-                    palette: palette,
-                    overlay: overlay,
-                    on_hover_control: on_hover_control,
-                    on_press: move |_| on_toggle_fullscreen.call(()),
-                }
+                on_press: move |_| on_toggle_maximized.call(()),
             }
             WindowControlButton {
                 icon: ChromeControlIcon::Close,
@@ -254,18 +250,18 @@ fn WindowControlGlyph(icon: ChromeControlIcon) -> Element {
         },
         ChromeControlIcon::Fullscreen => rsx! {
             svg { width: "11", height: "11", view_box: "0 0 10 10", fill: "none", xmlns: "http://www.w3.org/2000/svg",
-                path { d: "M3.3 2.2H2.2V4.2", stroke: "currentColor", stroke_width: "1.1", stroke_linecap: "round", stroke_linejoin: "round" }
-                path { d: "M6.7 2.2H7.8V4.2", stroke: "currentColor", stroke_width: "1.1", stroke_linecap: "round", stroke_linejoin: "round" }
-                path { d: "M7.8 5.8V7.8H5.8", stroke: "currentColor", stroke_width: "1.1", stroke_linecap: "round", stroke_linejoin: "round" }
-                path { d: "M4.2 7.8H2.2V5.8", stroke: "currentColor", stroke_width: "1.1", stroke_linecap: "round", stroke_linejoin: "round" }
+                path { d: "M4.1 3.1L2.5 1.5", stroke: "currentColor", stroke_width: "1.1", stroke_linecap: "round", stroke_linejoin: "round" }
+                path { d: "M2.5 3.5V1.5H4.5", stroke: "currentColor", stroke_width: "1.1", stroke_linecap: "round", stroke_linejoin: "round" }
+                path { d: "M5.9 6.9L7.5 8.5", stroke: "currentColor", stroke_width: "1.1", stroke_linecap: "round", stroke_linejoin: "round" }
+                path { d: "M5.5 8.5H7.5V6.5", stroke: "currentColor", stroke_width: "1.1", stroke_linecap: "round", stroke_linejoin: "round" }
             }
         },
         ChromeControlIcon::ExitFullscreen => rsx! {
             svg { width: "11", height: "11", view_box: "0 0 10 10", fill: "none", xmlns: "http://www.w3.org/2000/svg",
-                path { d: "M4.2 2.4H2.4V4.2", stroke: "currentColor", stroke_width: "1.1", stroke_linecap: "round", stroke_linejoin: "round" }
-                path { d: "M5.8 2.4H7.6V4.2", stroke: "currentColor", stroke_width: "1.1", stroke_linecap: "round", stroke_linejoin: "round" }
-                path { d: "M7.6 5.8V7.6H5.8", stroke: "currentColor", stroke_width: "1.1", stroke_linecap: "round", stroke_linejoin: "round" }
-                path { d: "M4.2 7.6H2.4V5.8", stroke: "currentColor", stroke_width: "1.1", stroke_linecap: "round", stroke_linejoin: "round" }
+                path { d: "M2.7 3.3L4.3 4.9", stroke: "currentColor", stroke_width: "1.1", stroke_linecap: "round", stroke_linejoin: "round" }
+                path { d: "M2.7 4.9H4.3V3.3", stroke: "currentColor", stroke_width: "1.1", stroke_linecap: "round", stroke_linejoin: "round" }
+                path { d: "M7.3 6.7L5.7 5.1", stroke: "currentColor", stroke_width: "1.1", stroke_linecap: "round", stroke_linejoin: "round" }
+                path { d: "M5.7 6.7H7.3V5.1", stroke: "currentColor", stroke_width: "1.1", stroke_linecap: "round", stroke_linejoin: "round" }
             }
         },
         ChromeControlIcon::Close => rsx! {
