@@ -1,11 +1,18 @@
+mod app_control;
 mod attach;
 mod codex_cli;
 mod daemon;
 mod host;
 mod protocol;
-mod screenshot;
 mod terminal;
 
+pub use app_control::{
+    AppControlCommand, AppControlRequest, AppControlResponse, ScreenshotTarget,
+    app_control_captures_dir, app_control_requests_dir, app_control_responses_dir,
+    complete_app_control_request, current_millis, default_screenshot_output_path,
+    enqueue_app_control_request, enqueue_screenshot_request, take_next_app_control_request,
+    wait_for_app_control_response,
+};
 pub use attach::{AttachMetadata, run_attach};
 pub use codex_cli::{ManagedCliTool, ManagedCliToolStatus};
 pub use daemon::{
@@ -23,12 +30,6 @@ pub use protocol::{
     YGG_LOADING_NOTIFICATION_AFTER_MS, YGG_PROTOCOL_SCHEMA_VERSION, YggCachePolicy,
     YggEventEnvelope, YggEventKind, YggOperationPriority, YggProgress, YggRequestMeta, YggSurface,
     YggTarget,
-};
-pub use screenshot::{
-    ScreenshotRequest, ScreenshotResponse, ScreenshotTarget, complete_screenshot_request,
-    default_screenshot_output_path, enqueue_screenshot_request, screenshot_captures_dir,
-    screenshot_requests_dir, screenshot_responses_dir, take_next_screenshot_request,
-    wait_for_screenshot_response,
 };
 pub use terminal::{TerminalChunk, TerminalManager, TerminalReadResult};
 
@@ -4140,13 +4141,26 @@ fn tail_text_file_lines(path: &std::path::Path, lines: usize) -> Vec<String> {
     read_trace_tail(path, lines.max(1))
 }
 
+fn request_app_control(
+    home: &std::path::Path,
+    command: AppControlCommand,
+    timeout_ms: u64,
+) -> anyhow::Result<AppControlResponse> {
+    let request = enqueue_app_control_request(home, command)?;
+    wait_for_app_control_response(
+        home,
+        &request.request_id,
+        std::time::Duration::from_millis(timeout_ms.max(250)),
+    )
+}
+
 fn capture_embedded_app_screenshot(
     home: &std::path::Path,
     output_path: Option<std::path::PathBuf>,
     timeout_ms: u64,
-) -> anyhow::Result<ScreenshotResponse> {
+) -> anyhow::Result<AppControlResponse> {
     let request = enqueue_screenshot_request(home, ScreenshotTarget::App, output_path)?;
-    wait_for_screenshot_response(
+    wait_for_app_control_response(
         home,
         &request.request_id,
         std::time::Duration::from_millis(timeout_ms.max(250)),
@@ -4217,6 +4231,9 @@ fn trace_bundle(lines: usize, include_screenshot: bool) -> anyhow::Result<serde_
             "ssh_targets": snapshot.ssh_targets.len(),
         })
     });
+    let app_state = request_app_control(&home, AppControlCommand::DescribeState, 5_000)
+        .ok()
+        .and_then(|response| response.data);
     let screenshot_path = if include_screenshot {
         capture_embedded_app_screenshot(&home, None, 10_000)
             .ok()
@@ -4240,6 +4257,7 @@ fn trace_bundle(lines: usize, include_screenshot: bool) -> anyhow::Result<serde_
         "panic_tail": tail_text_file_lines(&panic_path, lines.min(50)),
         "daemon_status": daemon_status,
         "daemon_snapshot": daemon_snapshot,
+        "app_state": app_state,
         "screenshot_path": screenshot_path,
     }))
 }
@@ -4281,6 +4299,20 @@ pub fn run_screenshot_capture(
         )?,
         other => anyhow::bail!("unsupported screenshot target: {other}"),
     };
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    Ok(())
+}
+
+pub fn run_app_control_describe_state(timeout_ms: u64) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(&home, AppControlCommand::DescribeState, timeout_ms)?;
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    Ok(())
+}
+
+pub fn run_app_control_focus_window(timeout_ms: u64) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(&home, AppControlCommand::FocusWindow, timeout_ms)?;
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }
