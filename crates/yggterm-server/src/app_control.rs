@@ -23,12 +23,37 @@ pub enum AppControlViewMode {
     Terminal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppControlDragPlacement {
+    Before,
+    Into,
+    After,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum AppControlDragCommand {
+    Begin {
+        row_path: String,
+    },
+    Hover {
+        row_path: String,
+        placement: AppControlDragPlacement,
+    },
+    Drop,
+    Clear,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AppControlCommand {
     CaptureScreenshot {
         target: ScreenshotTarget,
         output_path: String,
+    },
+    Drag {
+        command: AppControlDragCommand,
     },
     DescribeRows,
     OpenPath {
@@ -44,6 +69,7 @@ impl AppControlCommand {
     pub fn name(&self) -> &'static str {
         match self {
             Self::CaptureScreenshot { .. } => "capture_screenshot",
+            Self::Drag { .. } => "drag",
             Self::DescribeRows => "describe_rows",
             Self::OpenPath { .. } => "open_path",
             Self::FocusWindow => "focus_window",
