@@ -112,6 +112,7 @@ const TREE_LOADING_DOT_CSS: &str = "@keyframes yggterm-tree-loading-dot { 0%, 80
 const BACKGROUND_COPY_RETRY_MS: u64 = 300_000;
 const BACKGROUND_COPY_CONTINUE_MS: u64 = 15_000;
 const BACKGROUND_COPY_IDLE_MS: u64 = 120_000;
+const BACKGROUND_REFRESH_NOTICE_MS: u64 = 12_000;
 const THEME_EDITOR_PAD_SIZE: f64 = 286.0;
 const SEARCH_INPUT_ID: &str = "yggterm-search-input";
 const PREVIEW_HEADER_SEARCH_HIT_ID: &str = "__preview_header__";
@@ -3916,7 +3917,7 @@ fn terminal_attach_blocks_background_work(shell: &ShellState) -> bool {
 
 fn spawn_background_managed_cli_refresh(state: Signal<ShellState>, scope_key: String) {
     let endpoint = state.read().bootstrap.server_endpoint.clone();
-    let request_meta = if scope_key == "local" {
+    let mut request_meta = if scope_key == "local" {
         YggRequestMeta::background(
             format!("managed-cli-refresh-local-{}", current_millis()),
             "refresh_managed_cli",
@@ -3933,25 +3934,7 @@ fn spawn_background_managed_cli_refresh(state: Signal<ShellState>, scope_key: St
             },
         )
     };
-    safe_upsert_job_notification(
-        state,
-        format!("managed-cli-refresh:{scope_key}"),
-        NotificationTone::Info,
-        if scope_key == "local" {
-            "Updating Codex Tools".to_string()
-        } else {
-            format!("Updating Codex Tools on {scope_key}")
-        },
-        if scope_key == "local" {
-            "Preparing managed Codex and Codex-LiteLLM binaries for future sessions. Running sessions stay on their current version until restarted.".to_string()
-        } else {
-            format!(
-                "Preparing managed Codex and Codex-LiteLLM binaries on {scope_key}. Running sessions stay on their current version until restarted."
-            )
-        },
-        Some(0.15),
-        false,
-    );
+    request_meta.notify_loading_after_ms = BACKGROUND_REFRESH_NOTICE_MS;
     let _ = safe_shell_mut(state, "managed_cli_refresh_begin", |shell| {
         shell.begin_surface_request(
             request_meta.clone(),
@@ -4050,7 +4033,7 @@ fn spawn_background_managed_cli_refresh(state: Signal<ShellState>, scope_key: St
 
 fn spawn_background_remote_machine_refresh(state: Signal<ShellState>, machine_key: String) {
     let endpoint = state.read().bootstrap.server_endpoint.clone();
-    let request_meta = YggRequestMeta::background(
+    let mut request_meta = YggRequestMeta::background(
         format!(
             "remote-machine-refresh-{}-{}",
             machine_key,
@@ -4062,6 +4045,7 @@ fn spawn_background_remote_machine_refresh(state: Signal<ShellState>, machine_ke
             machine_key: machine_key.clone(),
         },
     );
+    request_meta.notify_loading_after_ms = BACKGROUND_REFRESH_NOTICE_MS;
     let _ = safe_shell_mut(state, "remote_machine_refresh_begin", |shell| {
         shell.begin_surface_request(
             request_meta.clone(),
