@@ -188,6 +188,7 @@ struct ShellState {
     passive_copy_failures: HashSet<String>,
     copy_retry_after_ms: HashMap<String, u64>,
     terminal_image_paste_ms: HashMap<String, u64>,
+    terminal_attach_in_flight: HashSet<String>,
     remote_preview_sync_after_ms: HashMap<String, u64>,
     remote_preview_dirty_epoch: HashMap<String, u64>,
     remote_machine_refresh_requests: HashSet<String>,
@@ -642,6 +643,7 @@ impl ShellState {
             passive_copy_failures: HashSet::new(),
             copy_retry_after_ms: HashMap::new(),
             terminal_image_paste_ms: HashMap::new(),
+            terminal_attach_in_flight: HashSet::new(),
             remote_preview_sync_after_ms: HashMap::new(),
             remote_preview_dirty_epoch: HashMap::new(),
             remote_machine_refresh_requests: HashSet::new(),
@@ -3527,23 +3529,116 @@ fn snapshot_needs_remote_restore_restart(snapshot: &ServerUiSnapshot) -> bool {
             .any(|session| session.kind == SessionKind::SshShell)
 }
 
-fn ensure_daemon_running(endpoint: &ServerEndpoint) -> Result<()> {
+fn current_spawn_executable() -> Result<PathBuf> {
     let current_exe = std::env::current_exe()?;
+    if current_exe.exists() {
+        return Ok(current_exe);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(link_target) = std::fs::read_link("/proc/self/exe") {
+            if link_target.exists() {
+                return Ok(link_target);
+            }
+            let target_text = link_target.to_string_lossy();
+            if let Some(stripped) = target_text.strip_suffix(" (deleted)") {
+                let recovered = PathBuf::from(stripped);
+                if recovered.exists() {
+                    return Ok(recovered);
+                }
+            }
+        }
+    }
+    Ok(current_exe)
+}
+
+fn trace_daemon_step(endpoint: &ServerEndpoint, name: &str, payload: serde_json::Value) {
+    if let Ok(home) = resolve_yggterm_home() {
+        append_trace_event(
+            &home,
+            "ui",
+            "daemon_recovery",
+            name,
+            json!({
+                "endpoint": match endpoint {
+                    #[cfg(unix)]
+                    ServerEndpoint::UnixSocket(path) => path.display().to_string(),
+                    ServerEndpoint::Tcp { host, port } => format!("{host}:{port}"),
+                },
+                "payload": payload,
+            }),
+        );
+    }
+}
+
+fn ensure_daemon_running(endpoint: &ServerEndpoint) -> Result<()> {
+    let current_exe = current_spawn_executable()?;
+    trace_daemon_step(
+        endpoint,
+        "current_exe",
+        json!({ "path": current_exe.display().to_string() }),
+    );
     cleanup_legacy_daemons(endpoint, &current_exe)?;
+    trace_daemon_step(endpoint, "cleanup_legacy_daemons_ok", json!({}));
     if ping(endpoint).is_ok() {
+        trace_daemon_step(endpoint, "ping_ok_existing", json!({}));
         return Ok(());
     }
     let mut last_error = None;
-    for _ in 0..3 {
+    for attempt in 0..3 {
+        trace_daemon_step(
+            endpoint,
+            "spawn_attempt_begin",
+            json!({ "attempt": attempt + 1 }),
+        );
         let spawn_lock = acquire_daemon_spawn_lock(endpoint)?;
+        trace_daemon_step(
+            endpoint,
+            "spawn_lock_acquired",
+            json!({ "attempt": attempt + 1 }),
+        );
         if ping(endpoint).is_ok() {
+            trace_daemon_step(
+                endpoint,
+                "ping_ok_after_lock",
+                json!({ "attempt": attempt + 1 }),
+            );
             return Ok(());
         }
         prepare_current_endpoint_for_spawn(endpoint)?;
-        spawn_daemon_process(endpoint)?;
+        trace_daemon_step(
+            endpoint,
+            "prepare_current_endpoint_ok",
+            json!({ "attempt": attempt + 1 }),
+        );
+        if let Err(error) = spawn_daemon_process(endpoint) {
+            trace_daemon_step(
+                endpoint,
+                "spawn_daemon_error",
+                json!({ "attempt": attempt + 1, "error": error.to_string() }),
+            );
+            return Err(error);
+        }
+        trace_daemon_step(
+            endpoint,
+            "spawn_daemon_ok",
+            json!({ "attempt": attempt + 1 }),
+        );
         match wait_for_daemon(endpoint) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                trace_daemon_step(
+                    endpoint,
+                    "wait_for_daemon_ok",
+                    json!({ "attempt": attempt + 1 }),
+                );
+                return Ok(());
+            }
             Err(error) => {
+                trace_daemon_step(
+                    endpoint,
+                    "wait_for_daemon_error",
+                    json!({ "attempt": attempt + 1, "error": error.to_string() }),
+                );
                 last_error = Some(error);
                 let _ = daemon_shutdown(endpoint);
                 drop(spawn_lock);
@@ -3555,7 +3650,7 @@ fn ensure_daemon_running(endpoint: &ServerEndpoint) -> Result<()> {
 }
 
 fn restart_daemon(endpoint: &ServerEndpoint) -> Result<()> {
-    let current_exe = std::env::current_exe()?;
+    let current_exe = current_spawn_executable()?;
     cleanup_legacy_daemons(endpoint, &current_exe)?;
     let _ = daemon_shutdown(endpoint);
     thread::sleep(Duration::from_millis(200));
@@ -3588,7 +3683,7 @@ fn prepare_current_endpoint_for_spawn(endpoint: &ServerEndpoint) -> Result<()> {
 }
 
 fn spawn_daemon_process(endpoint: &ServerEndpoint) -> Result<()> {
-    let current_exe = std::env::current_exe()?;
+    let current_exe = current_spawn_executable()?;
     let log_file = daemon_startup_log_file(endpoint)?;
     let mut command = Command::new(current_exe);
     command
@@ -3717,6 +3812,9 @@ fn maybe_spawn_missing_remote_machine_refreshes(state: Signal<ShellState>) {
         state,
         "maybe_spawn_missing_remote_machine_refreshes_read",
         |shell| {
+            if terminal_attach_blocks_background_work(shell) {
+                return Vec::new();
+            }
             pending_remote_machine_refreshes(
                 shell.server.remote_machines(),
                 shell.server.ssh_targets(),
@@ -3763,6 +3861,9 @@ fn maybe_spawn_missing_managed_cli_refreshes(state: Signal<ShellState>) {
         state,
         "maybe_spawn_missing_managed_cli_refreshes_read",
         |shell| {
+            if terminal_attach_blocks_background_work(shell) {
+                return Vec::new();
+            }
             pending_managed_cli_refreshes(
                 shell.server.remote_machines(),
                 shell.server.ssh_targets(),
@@ -3781,6 +3882,17 @@ fn maybe_spawn_missing_managed_cli_refreshes(state: Signal<ShellState>) {
         });
         spawn_background_managed_cli_refresh(state, scope_key);
     }
+}
+
+fn terminal_attach_blocks_background_work(shell: &ShellState) -> bool {
+    if shell.server.active_view_mode() != WorkspaceViewMode::Terminal {
+        return false;
+    }
+    let Some(active_path) = shell.server.active_session_path() else {
+        return false;
+    };
+    active_path.starts_with("remote-session://")
+        && shell.terminal_attach_in_flight.contains(active_path)
 }
 
 fn spawn_background_managed_cli_refresh(state: Signal<ShellState>, scope_key: String) {
@@ -3958,6 +4070,15 @@ fn spawn_background_remote_machine_refresh(state: Signal<ShellState>, machine_ke
             shell.remote_machine_refresh_requests.remove(&machine_key);
             match outcome {
                 Ok(Ok((mut snapshot, message))) => {
+                    if terminal_attach_blocks_background_work(shell) {
+                        shell
+                            .remote_machine_refresh_retry_after_ms
+                            .insert(machine_key.clone(), current_millis() + 2_000);
+                        shell.last_action = format!(
+                            "deferred {machine_key} refresh until terminal attach completes"
+                        );
+                        return;
+                    }
                     shell
                         .remote_machine_refresh_retry_after_ms
                         .remove(&machine_key);
@@ -4180,11 +4301,101 @@ fn spawn_open_session_row(state: Signal<ShellState>, row: BrowserRow) {
     spawn_open_session_row_with_mode(state, row, prefer_terminal);
 }
 
+fn spawn_focus_live_session_row(
+    mut state: Signal<ShellState>,
+    row: BrowserRow,
+    mode: WorkspaceViewMode,
+) {
+    let request_meta = YggRequestMeta::interactive(
+        format!("focus-live-{}", current_millis()),
+        "focus_live",
+        if mode == WorkspaceViewMode::Terminal {
+            YggSurface::Terminal
+        } else {
+            YggSurface::Preview
+        },
+        if mode == WorkspaceViewMode::Terminal {
+            YggTarget::Terminal {
+                session_path: row.full_path.clone(),
+            }
+        } else {
+            YggTarget::Preview {
+                session_path: row.full_path.clone(),
+            }
+        },
+    );
+    state.with_mut(|shell| {
+        shell.server.focus_live_session(&row.full_path);
+        shell.server.set_view_mode(mode);
+        shell.browser.select_path(row.full_path.clone());
+        shell.context_menu_row = None;
+        shell.sync_browser_settings();
+        shell.ensure_active_session_visible();
+        shell.begin_surface_request(
+            request_meta.clone(),
+            format!("focusing {}", row.label),
+            false,
+        );
+    });
+    spawn_loading_notice(
+        state,
+        request_meta.clone(),
+        "Session Still Loading",
+        format!(
+            "{} is still loading. Yggterm is keeping the rest of the shell interactive while that session catches up.",
+            row.label
+        ),
+    );
+    let endpoint = state.read().bootstrap.server_endpoint.clone();
+    let request_id = request_meta.request_id.clone();
+    let pending_label = format!("focusing {}", row.label);
+    spawn(async move {
+        maybe_debug_request_delay().await;
+        let row_path = row.full_path.clone();
+        let outcome = task::spawn_blocking(move || {
+            let _ = focus_live(&endpoint, &row_path)?;
+            if mode == WorkspaceViewMode::Terminal {
+                request_terminal_launch(&endpoint)
+            } else {
+                daemon_set_view_mode(&endpoint, WorkspaceViewMode::Rendered)
+            }
+        })
+        .await;
+        let _ = safe_shell_mut(
+            state,
+            "focus_live_session_row_complete",
+            |shell| match outcome {
+                Ok(result) => shell.apply_daemon_snapshot_result_for(&request_id, result),
+                Err(error) => {
+                    shell.finish_busy_request_for(&request_id);
+                    shell.last_action = format!("{pending_label} task failed: {error}");
+                    shell.push_notification(
+                        NotificationTone::Error,
+                        "Open Session Failed",
+                        error.to_string(),
+                    );
+                }
+            },
+        );
+        maybe_spawn_missing_remote_machine_refreshes(state);
+        maybe_spawn_missing_managed_cli_refreshes(state);
+    });
+}
+
 fn spawn_open_session_row_with_mode(
     mut state: Signal<ShellState>,
     row: BrowserRow,
     prefer_terminal: bool,
 ) {
+    if is_live_sidebar_row(&row) {
+        let mode = if prefer_terminal {
+            WorkspaceViewMode::Terminal
+        } else {
+            WorkspaceViewMode::Rendered
+        };
+        spawn_focus_live_session_row(state, row, mode);
+        return;
+    }
     let mut open_request_id = 0_u64;
     let request_meta = YggRequestMeta::interactive(
         format!("open-row-{}", current_millis()),
@@ -8624,6 +8835,9 @@ fn describe_app_state_snapshot(
     selected_tree_paths.sort();
     json!({
         "window": describe_window(desktop),
+        "active_view_mode": format!("{:?}", snapshot.active_view_mode),
+        "active_session_path": snapshot.active_session.as_ref().map(|session| session.session_path.clone()),
+        "active_session_source": snapshot.active_session.as_ref().map(|session| format!("{:?}", session.source)),
         "browser": {
             "selected_path": selected_path.clone(),
             "stored_selected_path": shell.browser.selected_path(),
@@ -8663,6 +8877,11 @@ fn describe_app_state_snapshot(
             "needs_initial_server_sync": shell.needs_initial_server_sync,
             "latest_open_request_id": shell.latest_open_request_id,
             "last_action": shell.last_action,
+            "terminal_attach_in_flight": shell
+                .terminal_attach_in_flight
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
         },
         "generation": {
             "title_requests_in_flight": shell.title_requests_in_flight.len(),
@@ -8705,6 +8924,35 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
     })
 }
 
+async fn capture_dom_debug_snapshot() -> Value {
+    let script = r#"
+        (async () => {
+            const terminalHosts = Array.from(document.querySelectorAll('[id^="yggterm-terminal-"]'));
+            const previewScrolls = Array.from(document.querySelectorAll('[data-preview-scroll="1"]'));
+            const hostDetails = terminalHosts.map((host) => ({
+                id: host.id,
+                child_count: host.childElementCount,
+                text_sample: String(host.innerText || "").slice(0, 160),
+            }));
+            dioxus.send({
+                terminal_host_count: terminalHosts.length,
+                terminal_hosts: hostDetails,
+                preview_scroll_count: previewScrolls.length,
+                preview_text_sample: String(previewScrolls[0]?.innerText || "").slice(0, 240),
+                shell_text_sample: String(document.getElementById("yggterm-shell-root")?.innerText || "").slice(0, 240),
+            });
+            await new Promise((resolve) => setTimeout(resolve, 25));
+        })();
+    "#;
+    let mut eval = document::eval(script);
+    match eval.recv::<Value>().await {
+        Ok(value) => value,
+        Err(error) => json!({
+            "error": error.to_string(),
+        }),
+    }
+}
+
 async fn process_pending_app_control_requests(
     settings_path: &std::path::Path,
     desktop: dioxus::desktop::DesktopContext,
@@ -8739,6 +8987,9 @@ async fn process_pending_app_control_requests(
                 data: Some(json!({
                     "command": "capture_screenshot",
                     "window": describe_window(&desktop),
+                    "active_view_mode": format!("{:?}", state.read().server.active_view_mode()),
+                    "active_session_path": state.read().server.active_session_path(),
+                    "dom": capture_dom_debug_snapshot().await,
                 })),
                 error: None,
             },
@@ -8759,35 +9010,7 @@ async fn process_pending_app_control_requests(
             let maybe_row = state.with(|shell| resolve_app_control_row(shell, &session_path));
             match maybe_row {
                 Some(row) => {
-                    if is_live_sidebar_row(&row) {
-                        let mode = resolved_view_mode.unwrap_or(WorkspaceViewMode::Terminal);
-                        state.with_mut(|shell| {
-                            shell.server.focus_live_session(&row.full_path);
-                            shell.server.set_view_mode(mode);
-                            shell.ensure_active_session_visible();
-                        });
-                        spawn_targeted_server_snapshot_action(
-                            state,
-                            format!("focusing {}", row.label),
-                            if mode == WorkspaceViewMode::Terminal {
-                                YggTarget::Terminal {
-                                    session_path: row.full_path.clone(),
-                                }
-                            } else {
-                                YggTarget::Preview {
-                                    session_path: row.full_path.clone(),
-                                }
-                            },
-                            move |endpoint| {
-                                let focused = focus_live(&endpoint, &row.full_path)?;
-                                if mode == WorkspaceViewMode::Rendered {
-                                    daemon_set_view_mode(&endpoint, WorkspaceViewMode::Rendered)
-                                } else {
-                                    Ok(focused)
-                                }
-                            },
-                        );
-                    } else if let Some(mode) = resolved_view_mode {
+                    if let Some(mode) = resolved_view_mode {
                         state.with_mut(|shell| {
                             shell.server.set_view_mode(mode);
                         });
@@ -8855,7 +9078,13 @@ async fn process_pending_app_control_requests(
             handled_by_pid: std::process::id(),
             completed_at_ms: current_millis() as u128,
             output_path: None,
-            data: Some(describe_app_state_snapshot(&state, &desktop)),
+            data: Some({
+                let mut snapshot = describe_app_state_snapshot(&state, &desktop);
+                if let Some(map) = snapshot.as_object_mut() {
+                    map.insert("dom".to_string(), capture_dom_debug_snapshot().await);
+                }
+                snapshot
+            }),
             error: None,
         },
     };
@@ -10129,17 +10358,13 @@ fn app() -> Element {
                                     return;
                                 }
                                 if is_live_sidebar_row(&row) {
-                                    state.with_mut(|shell| {
-                                        shell.server.focus_live_session(&row.full_path);
-                                        shell.ensure_active_session_visible();
-                                    });
-                                    spawn_targeted_server_snapshot_action(
+                                    let prefer_terminal =
+                                        state.read().server.active_view_mode()
+                                            == WorkspaceViewMode::Terminal;
+                                    spawn_open_session_row_with_mode(
                                         state,
-                                        format!("focusing {}", row.label),
-                                        YggTarget::Terminal {
-                                            session_path: row.full_path.clone(),
-                                        },
-                                        move |endpoint| focus_live(&endpoint, &row.full_path),
+                                        row.clone(),
+                                        prefer_terminal,
                                     );
                                     return;
                                 }
@@ -11601,12 +11826,40 @@ fn MainSurface(
         .active_session
         .as_ref()
         .map(|session| session.session_path.clone());
+    let surface_view_key = match snapshot.active_view_mode {
+        WorkspaceViewMode::Rendered => "preview",
+        WorkspaceViewMode::Terminal => "terminal",
+    };
+    let surface_key = format!(
+        "{}:{surface_view_key}:{terminal_mount_epoch}",
+        active_session_path
+            .clone()
+            .unwrap_or_else(|| "__empty__".to_string())
+    );
     let mut preview_block_limit = use_signal(|| PREVIEW_BLOCK_WINDOW);
     let mut preview_scroll_top = use_signal(|| 0.0_f64);
+    let preview_reset_session_path = active_session_path.clone();
     use_effect(move || {
-        let _ = active_session_path.clone();
+        let _ = preview_reset_session_path.clone();
         preview_block_limit.set(PREVIEW_BLOCK_WINDOW);
         preview_scroll_top.set(0.0);
+    });
+    let render_trace_session_path = active_session_path.clone();
+    let render_trace_surface_key = surface_key.clone();
+    let render_trace_view_mode = snapshot.active_view_mode;
+    use_effect(move || {
+        let trace_home = perf_home_dir(&state.read().bootstrap.settings_path);
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "main_surface",
+            "render",
+            json!({
+                "surface_key": render_trace_surface_key,
+                "active_view_mode": format!("{:?}", render_trace_view_mode),
+                "active_session_path": render_trace_session_path,
+            }),
+        );
     });
     let body = if let Some(session) = snapshot.active_session.clone() {
         match snapshot.active_view_mode {
@@ -11787,10 +12040,12 @@ fn MainSurface(
 
     rsx! {
         div {
+            key: "{surface_key}",
             style: format!(
                 "flex:1; min-width:0; min-height:0; display:flex; flex-direction:column; background:transparent; padding:12px 12px 10px 0;",
             ),
             div {
+                key: "{surface_key}-body",
                 style: format!(
                     "flex:1; min-height:0; overflow:{}; padding:{}; background:{}; border-radius:11px; box-shadow:{};",
                     if snapshot.active_view_mode == WorkspaceViewMode::Terminal { "hidden" } else { "auto" },
@@ -13165,6 +13420,9 @@ fn TerminalCanvas(
         let mut state = state;
         let mut terminal_has_meaningful_output = terminal_has_meaningful_output;
         async move {
+            let _ = safe_shell_mut(state, "terminal_attach_begin", |shell| {
+                shell.terminal_attach_in_flight.insert(session_path.clone());
+            });
             append_trace_event(
                 &trace_home,
                 "ui",
@@ -13192,6 +13450,11 @@ fn TerminalCanvas(
             )
             .await
             {
+                let _ = safe_shell_mut(state, "terminal_attach_ensure_error", |shell| {
+                    shell.terminal_attach_in_flight.remove(&session_path);
+                });
+                maybe_spawn_missing_remote_machine_refreshes(state);
+                maybe_spawn_missing_managed_cli_refreshes(state);
                 append_trace_event(
                     &trace_home,
                     "ui",
@@ -13232,6 +13495,11 @@ fn TerminalCanvas(
                     event = eval.recv::<TerminalJsEvent>() => {
                         match event {
                             Ok(TerminalJsEvent::Ready) => {
+                                let _ = safe_shell_mut(state, "terminal_attach_ready", |shell| {
+                                    shell.terminal_attach_in_flight.remove(&session_path);
+                                });
+                                maybe_spawn_missing_remote_machine_refreshes(state);
+                                maybe_spawn_missing_managed_cli_refreshes(state);
                                 append_trace_event(
                                     &trace_home,
                                     "ui",
@@ -13419,6 +13687,11 @@ fn TerminalCanvas(
                                 }
                             }
                             Err(error) => {
+                                let _ = safe_shell_mut(state, "terminal_attach_bridge_closed", |shell| {
+                                    shell.terminal_attach_in_flight.remove(&session_path);
+                                });
+                                maybe_spawn_missing_remote_machine_refreshes(state);
+                                maybe_spawn_missing_managed_cli_refreshes(state);
                                 append_trace_event(
                                     &trace_home,
                                     "ui",
@@ -13479,6 +13752,11 @@ fn TerminalCanvas(
                                 }
                             }
                             Err(error) => {
+                                let _ = safe_shell_mut(state, "terminal_attach_read_error", |shell| {
+                                    shell.terminal_attach_in_flight.remove(&session_path);
+                                });
+                                maybe_spawn_missing_remote_machine_refreshes(state);
+                                maybe_spawn_missing_managed_cli_refreshes(state);
                                 append_trace_event(
                                     &trace_home,
                                     "ui",
