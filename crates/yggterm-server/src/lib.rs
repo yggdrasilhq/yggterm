@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -1256,23 +1256,9 @@ impl YggtermServer {
             return Ok(None);
         };
         if path.starts_with("remote-session://") {
-            let ssh_target = session
-                .ssh_target
-                .as_deref()
-                .context("remote session missing ssh target")?;
-            let report = refresh_remote_managed_cli_tool(
-                ssh_target,
-                session.ssh_prefix.as_deref(),
-                ManagedCliTool::Codex,
-            )?;
-            return Ok(Some(summarize_managed_cli_report(
-                ssh_target,
-                &ManagedCliRefreshReport {
-                    scope: ssh_target.to_string(),
-                    background: false,
-                    statuses: vec![report],
-                },
-            )));
+            // Remote session attach must stay fast. Background machine refreshes keep the managed
+            // Codex toolchain current; PTY restore should not block on a synchronous SSH upgrade.
+            return Ok(None);
         }
         let Some(tool) = ManagedCliTool::from_session_kind(session.kind) else {
             return Ok(None);
@@ -4175,29 +4161,6 @@ fn refresh_remote_managed_cli(
         .with_context(|| format!("parsing remote managed cli refresh report for {ssh_target}"))
 }
 
-fn refresh_remote_managed_cli_tool(
-    ssh_target: &str,
-    exec_prefix: Option<&str>,
-    tool: ManagedCliTool,
-) -> anyhow::Result<codex_cli::ManagedCliToolStatus> {
-    let output = run_remote_yggterm_command(
-        ssh_target,
-        exec_prefix,
-        &[
-            "server",
-            "remote",
-            "ensure-managed-cli",
-            match tool {
-                ManagedCliTool::Codex => "codex",
-                ManagedCliTool::CodexLiteLlm => "codex-litellm",
-            },
-        ],
-        None,
-    )?;
-    serde_json::from_str(output.trim())
-        .with_context(|| format!("parsing remote managed cli ensure report for {ssh_target}"))
-}
-
 pub fn run_remote_terminate_codex(session_id: &str) -> anyhow::Result<()> {
     if !tmux_available()? {
         return Ok(());
@@ -4231,6 +4194,29 @@ fn request_app_control(
         &request.request_id,
         std::time::Duration::from_millis(timeout_ms.max(250)),
     )
+}
+
+fn write_stdout_payload(payload: &str) -> anyhow::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    if let Err(error) = stdout.write_all(payload.as_bytes()) {
+        if error.kind() == ErrorKind::BrokenPipe {
+            return Ok(());
+        }
+        return Err(error.into());
+    }
+    if let Err(error) = stdout.write_all(b"\n") {
+        if error.kind() == ErrorKind::BrokenPipe {
+            return Ok(());
+        }
+        return Err(error.into());
+    }
+    if let Err(error) = stdout.flush() {
+        if error.kind() == ErrorKind::BrokenPipe {
+            return Ok(());
+        }
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 fn parse_app_control_drag_placement(value: &str) -> Option<AppControlDragPlacement> {
@@ -4456,28 +4442,28 @@ pub fn run_screenshot_capture(
         )?,
         other => anyhow::bail!("unsupported screenshot target: {other}"),
     };
-    println!("{}", serde_json::to_string_pretty(&response)?);
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
     Ok(())
 }
 
 pub fn run_app_control_describe_state(timeout_ms: u64) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
     let response = request_app_control(&home, AppControlCommand::DescribeState, timeout_ms)?;
-    println!("{}", serde_json::to_string_pretty(&response)?);
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
     Ok(())
 }
 
 pub fn run_app_control_focus_window(timeout_ms: u64) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
     let response = request_app_control(&home, AppControlCommand::FocusWindow, timeout_ms)?;
-    println!("{}", serde_json::to_string_pretty(&response)?);
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
     Ok(())
 }
 
 pub fn run_app_control_describe_rows(timeout_ms: u64) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
     let response = request_app_control(&home, AppControlCommand::DescribeRows, timeout_ms)?;
-    println!("{}", serde_json::to_string_pretty(&response)?);
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
     Ok(())
 }
 
@@ -4495,7 +4481,7 @@ pub fn run_app_control_open_path(
         },
         timeout_ms,
     )?;
-    println!("{}", serde_json::to_string_pretty(&response)?);
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
     Ok(())
 }
 
@@ -4534,19 +4520,19 @@ pub fn run_app_control_drag(
         other => anyhow::bail!("unsupported app drag action: {other}"),
     };
     let response = request_app_control(&home, command, timeout_ms)?;
-    println!("{}", serde_json::to_string_pretty(&response)?);
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
     Ok(())
 }
 
 pub fn run_remote_refresh_managed_cli(background: bool) -> anyhow::Result<()> {
     let report = refresh_local_managed_cli(background)?;
-    println!("{}", serde_json::to_string(&report)?);
+    write_stdout_payload(&serde_json::to_string(&report)?)?;
     Ok(())
 }
 
 pub fn run_remote_ensure_managed_cli(tool: ManagedCliTool) -> anyhow::Result<()> {
     let status = ensure_local_managed_cli(tool)?;
-    println!("{}", serde_json::to_string(&status)?);
+    write_stdout_payload(&serde_json::to_string(&status)?)?;
     Ok(())
 }
 
