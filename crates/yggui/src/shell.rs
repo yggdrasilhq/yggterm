@@ -4886,6 +4886,14 @@ fn generation_context_for_target(target: &CopyGenerationTarget) -> Option<String
         .map(ToOwned::to_owned)
 }
 
+fn target_can_fetch_remote_generation_context(target: &CopyGenerationTarget) -> bool {
+    target.remote_machine.is_some()
+        && target
+            .storage_path
+            .as_deref()
+            .is_some_and(|path| !path.trim().is_empty())
+}
+
 fn remote_preview_fetch_target(
     server: &YggtermServer,
     session: &ManagedSessionView,
@@ -5288,7 +5296,14 @@ fn remote_generated_copy(
     server: &YggtermServer,
     session_path: &str,
 ) -> Option<(String, Option<String>, Option<String>)> {
-    server.remote_machines().iter().find_map(|machine| {
+    remote_generated_copy_from_machines(server.remote_machines(), session_path)
+}
+
+fn remote_generated_copy_from_machines(
+    remote_machines: &[RemoteMachineSnapshot],
+    session_path: &str,
+) -> Option<(String, Option<String>, Option<String>)> {
+    remote_machines.iter().find_map(|machine| {
         machine.sessions.iter().find_map(|session| {
             (session.session_path == session_path).then(|| {
                 (
@@ -6499,7 +6514,12 @@ fn merged_sidebar_rows_uncached(
                 .retain(|session| !promoted_remote_paths.contains(&session.session_path));
         }
     }
-    push_live_session_rows(&mut rows, &promoted_live_sessions, expanded_paths);
+    push_live_session_rows(
+        &mut rows,
+        &promoted_live_sessions,
+        remote_machines,
+        expanded_paths,
+    );
     for machine in machine_rows.into_values() {
         push_remote_machine_rows(&mut rows, &machine, expanded_paths);
     }
@@ -6510,6 +6530,7 @@ fn merged_sidebar_rows_uncached(
 fn push_live_session_rows(
     rows: &mut Vec<BrowserRow>,
     sessions: &[&ManagedSessionView],
+    remote_machines: &[RemoteMachineSnapshot],
     expanded_paths: &HashSet<String>,
 ) {
     if sessions.is_empty() {
@@ -6546,7 +6567,7 @@ fn push_live_session_rows(
 
     for session in sessions {
         let cwd = metadata_value(session, "Cwd");
-        let label = live_session_label(session, &short_ids);
+        let label = live_session_label(remote_machines, session, &short_ids);
         rows.push(BrowserRow {
             kind: BrowserRowKind::Session,
             full_path: session.session_path.clone(),
@@ -6565,13 +6586,23 @@ fn push_live_session_rows(
     }
 }
 
-fn live_session_label(session: &ManagedSessionView, short_ids: &HashMap<String, String>) -> String {
+fn live_session_label(
+    remote_machines: &[RemoteMachineSnapshot],
+    session: &ManagedSessionView,
+    short_ids: &HashMap<String, String>,
+) -> String {
     let title = session.title.trim();
     if session.session_path.starts_with("remote-session://")
         && !title.is_empty()
         && !looks_like_generated_fallback_title(title)
     {
         return session.title.clone();
+    }
+    if let Some(remote_title) = remote_generated_copy_from_machines(remote_machines, &session.session_path)
+        .map(|(title, _, _)| title)
+        .filter(|title| !title.trim().is_empty() && !looks_like_generated_fallback_title(title))
+    {
+        return remote_title;
     }
     let target = metadata_value(session, "Target");
     if !target.trim().is_empty()
@@ -9994,19 +10025,27 @@ fn app() -> Element {
         if !has_good_title || !has_precis || !has_summary || precis_stale || summary_stale {
             spawn_active_session_copy_hydration(state, session.clone());
         }
-        let has_generation_context =
-            copy_generation_target_for_session(&state.read().server, &session)
-                .and_then(|target| target.remote_context)
-                .is_some_and(|context| !context.trim().is_empty())
-                || preview_context_from_session(&session).is_some();
+        let generation_target = copy_generation_target_for_session(&state.read().server, &session);
+        let has_generation_context = generation_target
+            .as_ref()
+            .and_then(|target| target.remote_context.as_deref())
+            .is_some_and(|context| !context.trim().is_empty())
+            || preview_context_from_session(&session).is_some();
+        let can_fetch_remote_generation_context = generation_target
+            .as_ref()
+            .is_some_and(target_can_fetch_remote_generation_context);
         if supports_generated_session_copy(&session)
             && !has_good_title
-            && (!session.session_path.starts_with("remote-session://") || has_generation_context)
+            && (!session.session_path.starts_with("remote-session://")
+                || has_generation_context
+                || can_fetch_remote_generation_context)
         {
             queue_active_session_title_generation(state, false);
         }
         if (!has_precis || precis_stale)
-            && (!session.session_path.starts_with("remote-session://") || has_generation_context)
+            && (!session.session_path.starts_with("remote-session://")
+                || has_generation_context
+                || can_fetch_remote_generation_context)
         {
             spawn_precis_generation(state, session.clone(), precis_stale);
         }
@@ -10015,7 +10054,10 @@ fn app() -> Element {
             maybe_spawn_background_copy_generation(state);
             return;
         }
-        if session.session_path.starts_with("remote-session://") && !has_generation_context {
+        if session.session_path.starts_with("remote-session://")
+            && !has_generation_context
+            && !can_fetch_remote_generation_context
+        {
             state.with_mut(|shell| shell.next_background_copy_scan_after_ms = current_millis());
             maybe_spawn_background_copy_generation(state);
             return;
@@ -11556,7 +11598,7 @@ fn SidebarRow(
                 },
                 style: format!(
                     "width:100%; display:flex; align-items:center; gap:10px; border:none; background:transparent; cursor:{}; \
-                     padding:10px 9px 10px {}px; margin:0; opacity:{}; border-radius:12px; background:{}; \
+                     padding:11px 9px 11px {}px; margin:0; opacity:{}; border-radius:12px; background:{}; \
                      box-sizing:border-box; min-width:0; overflow:hidden; user-select:none; -webkit-user-select:none; \
                      transition: transform 140ms ease, background 140ms ease, opacity 140ms ease, box-shadow 140ms ease; \
                      transform:translateY(0px); box-shadow:{}; position:relative;",
@@ -11630,8 +11672,8 @@ fn SidebarRow(
                 if renaming {
                     input {
                         style: format!(
-                            "width:140px; height:28px; border:none; border-radius:10px; background:rgba(255,255,255,0.92); \
-                             color:{}; font-size:11px; font-weight:600; padding:0 10px; box-shadow: inset 0 0 0 1px rgba(204,214,224,0.9);",
+                            "width:140px; height:29px; border:none; border-radius:10px; background:rgba(255,255,255,0.92); \
+                             color:{}; font-size:12px; font-weight:600; padding:0 10px; box-shadow: inset 0 0 0 1px rgba(204,214,224,0.9);",
                             palette.text
                         ),
                         value: rename_value,
@@ -11657,7 +11699,7 @@ fn SidebarRow(
                 } else {
                     span {
                         style: format!(
-                            "min-width:0; font-size:11.5px; font-weight:700; letter-spacing:0.04em; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                            "min-width:0; font-size:12.25px; font-weight:700; letter-spacing:0.04em; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
                             if drop_hovered || selected { palette.accent } else { palette.muted }
                         ),
                         "{row.label}"
@@ -11718,7 +11760,7 @@ fn SidebarRow(
             },
             style: format!(
                 "width:100%; display:flex; flex-direction:column; align-items:stretch; gap:1px; \
-                 border:none; border-radius:12px; background:{}; padding:4px 9px 4px {}px; margin:0; opacity:{}; cursor:{}; \
+                 border:none; border-radius:12px; background:{}; padding:5px 9px 5px {}px; margin:0; opacity:{}; cursor:{}; \
                  box-sizing:border-box; min-width:0; overflow:hidden; user-select:none; -webkit-user-select:none; \
                  transition: transform 140ms ease, background 140ms ease, opacity 140ms ease, box-shadow 140ms ease; \
                  transform:translateY(0px); box-shadow:{}; position:relative;",
@@ -11784,7 +11826,7 @@ fn SidebarRow(
                     div {
                         "data-tree-icon": "1",
                         style: format!(
-                            "display:inline-flex; align-items:center; justify-content:center; width:19px; min-width:19px; height:19px; color:{};",
+                            "display:inline-flex; align-items:center; justify-content:center; width:20px; min-width:20px; height:20px; color:{};",
                             icon_color
                         ),
                         TreeIcon { row: row.clone() }
@@ -11792,8 +11834,8 @@ fn SidebarRow(
                     if renaming {
                         input {
                             style: format!(
-                                "flex:1; min-width:0; height:28px; border:none; border-radius:10px; background:rgba(255,255,255,0.92); \
-                                 color:{}; font-size:11px; font-weight:600; padding:0 10px; box-shadow: inset 0 0 0 1px rgba(204,214,224,0.9);",
+                                "flex:1; min-width:0; height:29px; border:none; border-radius:10px; background:rgba(255,255,255,0.92); \
+                                 color:{}; font-size:12px; font-weight:600; padding:0 10px; box-shadow: inset 0 0 0 1px rgba(204,214,224,0.9);",
                                 palette.text
                             ),
                             value: rename_value,
@@ -11819,7 +11861,7 @@ fn SidebarRow(
                     } else {
                         span {
                             style: format!(
-                                "font-size:12.5px; color:{}; font-weight:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                                "font-size:13px; color:{}; font-weight:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
                                 label_color,
                                 if row.kind == BrowserRowKind::Group && row.depth == 0 { 600 } else { 500 }
                             ),
@@ -11849,7 +11891,7 @@ fn SidebarRow(
             if row.kind == BrowserRowKind::Group && !row.detail_label.is_empty() {
                 div {
                     style: format!(
-                        "font-size:10.5px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                        "font-size:11px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
                         palette.muted
                     ),
                     "{row.detail_label}"
@@ -11934,10 +11976,10 @@ fn DragGhost(snapshot: SharedSnapshot) -> Element {
 fn TreeIcon(row: BrowserRow) -> Element {
     if row.kind == BrowserRowKind::Separator {
         return rsx! {
-            span {
-                style: "display:inline-flex; align-items:center; justify-content:center; font-size:11px; font-weight:700; line-height:1;",
-                "—"
-            }
+                span {
+                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; line-height:1;",
+                    "—"
+                }
         };
     }
 
@@ -11945,7 +11987,7 @@ fn TreeIcon(row: BrowserRow) -> Element {
         if row.full_path.starts_with("codex-litellm://") {
             return rsx! {
                 span {
-                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:11px; font-weight:700; line-height:1;",
+                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; line-height:1;",
                     "✦"
                 }
             };
@@ -11953,7 +11995,7 @@ fn TreeIcon(row: BrowserRow) -> Element {
         if row.full_path.starts_with("local://") {
             return rsx! {
                 span {
-                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:11px; font-weight:700; line-height:1;",
+                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; line-height:1;",
                     "⌘"
                 }
             };
@@ -11961,14 +12003,14 @@ fn TreeIcon(row: BrowserRow) -> Element {
         if row.full_path.starts_with("ssh://") {
             return rsx! {
                 span {
-                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:11px; font-weight:700; line-height:1;",
+                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; line-height:1;",
                     "⇄"
                 }
             };
         }
         return rsx! {
             span {
-                style: "display:inline-flex; align-items:center; justify-content:center; font-size:11px; font-weight:700; line-height:1;",
+                style: "display:inline-flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; line-height:1;",
                 ">_"
             }
         };
@@ -11976,8 +12018,8 @@ fn TreeIcon(row: BrowserRow) -> Element {
         if row.document_kind == Some(WorkspaceDocumentKind::TerminalRecipe) {
             return rsx! {
                 svg {
-                    width: "18",
-                    height: "18",
+                    width: "19",
+                    height: "19",
                     view_box: "0 0 18 18",
                     fill: "none",
                     xmlns: "http://www.w3.org/2000/svg",
@@ -11989,8 +12031,8 @@ fn TreeIcon(row: BrowserRow) -> Element {
         }
         return rsx! {
             svg {
-                width: "18",
-                height: "18",
+                width: "19",
+                height: "19",
                 view_box: "0 0 18 18",
                 fill: "none",
                 xmlns: "http://www.w3.org/2000/svg",
@@ -12006,15 +12048,15 @@ fn TreeIcon(row: BrowserRow) -> Element {
         if row.full_path == "__live_sessions__" {
             return rsx! {
                 span {
-                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:11px; font-weight:700; line-height:1;",
+                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; line-height:1;",
                     "◉"
                 }
             };
         }
         return rsx! {
             svg {
-                width: "18",
-                height: "18",
+                width: "19",
+                height: "19",
                 view_box: "0 0 18 18",
                 fill: "none",
                 xmlns: "http://www.w3.org/2000/svg",
@@ -12046,8 +12088,8 @@ fn TreeIcon(row: BrowserRow) -> Element {
     if row.expanded {
         rsx! {
             svg {
-                width: "18",
-                height: "18",
+                width: "19",
+                height: "19",
                 view_box: "0 0 16 16",
                 fill: "none",
                 xmlns: "http://www.w3.org/2000/svg",
@@ -12068,8 +12110,8 @@ fn TreeIcon(row: BrowserRow) -> Element {
     } else {
         rsx! {
             svg {
-                width: "18",
-                height: "18",
+                width: "19",
+                height: "19",
                 view_box: "0 0 18 18",
                 fill: "none",
                 xmlns: "http://www.w3.org/2000/svg",
@@ -13700,11 +13742,11 @@ fn TerminalCanvas(
     let (terminal_shell_background, terminal_shell_shadow, terminal_host_chrome) =
         match snapshot.settings.theme {
             UiTheme::ZedLight => (
-                "linear-gradient(180deg, rgba(246,248,250,0.96) 0%, rgba(241,245,249,0.98) 100%)"
+                "linear-gradient(180deg, rgba(234,239,245,0.94) 0%, rgba(225,232,240,0.98) 100%)"
                     .to_string(),
-                "inset 0 0 0 1px rgba(191,219,254,0.46), 0 14px 30px rgba(148,163,184,0.10)"
+                "inset 0 0 0 1px rgba(148,163,184,0.26), 0 16px 34px rgba(148,163,184,0.16)"
                     .to_string(),
-                "border-radius:14px; box-shadow: inset 0 0 0 1px rgba(191,219,254,0.30);"
+                "border-radius:14px; box-shadow: inset 0 0 0 1px rgba(148,163,184,0.24), 0 0 0 1px rgba(255,255,255,0.72);"
                     .to_string(),
             ),
             UiTheme::ZedDark => (
@@ -14113,7 +14155,7 @@ fn TerminalCanvas(
             div {
                 style: format!(
                     "display:flex; flex-direction:column; min-height:0; height:100%; gap:0; border-radius:11px; \
-                     background:{}; box-shadow:{}; overflow:hidden; padding:10px 12px 8px; position:relative;",
+                     background:{}; box-shadow:{}; overflow:hidden; padding:9px 10px 7px; position:relative;",
                     terminal_shell_background,
                     terminal_shell_shadow,
                 ),
@@ -14495,27 +14537,27 @@ fn terminal_theme(
         };
     }
     TerminalTheme {
-        background: "#f6f8fa".to_string(),
-        foreground: "#1f2328".to_string(),
-        cursor: "#0969da".to_string(),
+        background: "#ffffff".to_string(),
+        foreground: "#343434".to_string(),
+        cursor: "#005fb8".to_string(),
         font_size: font_size.max(5.0),
-        selection: "rgba(9,105,218,0.18)".to_string(),
-        black: "#24292f".to_string(),
-        red: "#cf222e".to_string(),
-        green: "#1a7f37".to_string(),
-        yellow: "#9a6700".to_string(),
-        blue: "#0969da".to_string(),
-        magenta: "#8250df".to_string(),
-        cyan: "#1b7c83".to_string(),
-        white: "#57606a".to_string(),
-        bright_black: "#6e7781".to_string(),
-        bright_red: "#ff6a69".to_string(),
-        bright_green: "#2da44e".to_string(),
-        bright_yellow: "#bf8700".to_string(),
-        bright_blue: "#218bff".to_string(),
-        bright_magenta: "#a475f9".to_string(),
-        bright_cyan: "#3192aa".to_string(),
-        bright_white: "#8c959f".to_string(),
+        selection: "rgba(173, 214, 255, 0.42)".to_string(),
+        black: "#000000".to_string(),
+        red: "#cd3131".to_string(),
+        green: "#00bc00".to_string(),
+        yellow: "#949800".to_string(),
+        blue: "#0451a5".to_string(),
+        magenta: "#bc05bc".to_string(),
+        cyan: "#0598bc".to_string(),
+        white: "#555555".to_string(),
+        bright_black: "#666666".to_string(),
+        bright_red: "#cd3131".to_string(),
+        bright_green: "#14ce14".to_string(),
+        bright_yellow: "#b5ba00".to_string(),
+        bright_blue: "#0451a5".to_string(),
+        bright_magenta: "#bc05bc".to_string(),
+        bright_cyan: "#0598bc".to_string(),
+        bright_white: "#a5a5a5".to_string(),
     }
 }
 
@@ -18041,6 +18083,7 @@ mod tests {
                 ssh_prefix: None,
             }],
             &HashSet::from_iter([
+                "__live_sessions__".to_string(),
                 "__remote_machine__/oc".to_string(),
                 "__remote_folder__/oc/home/pi".to_string(),
             ]),
@@ -18264,6 +18307,7 @@ mod tests {
                 ssh_prefix: None,
             }],
             &HashSet::from_iter([
+                "__live_sessions__".to_string(),
                 "__remote_machine__/oc".to_string(),
                 "__remote_folder__/oc/home/pi".to_string(),
             ]),
@@ -18275,6 +18319,100 @@ mod tests {
             .expect("remote row");
         assert_eq!(session_row.label, "Excel Shortcut Design");
         assert_eq!(search_sidebar_matches(&rows, "excel design").len(), 1);
+    }
+
+    #[test]
+    fn live_session_label_prefers_remote_cached_generated_title() {
+        let remote_machines = vec![RemoteMachineSnapshot {
+            machine_key: "dev".to_string(),
+            label: "dev".to_string(),
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            health: RemoteMachineHealth::Healthy,
+            sessions: vec![RemoteScannedSession {
+                session_path: "remote-session://dev/019caa6f-b32c-7a73-b4d3-db83225663dc"
+                    .to_string(),
+                session_id: "019caa6f-b32c-7a73-b4d3-db83225663dc".to_string(),
+                cwd: "/home/pi/gh".to_string(),
+                started_at: "now".to_string(),
+                modified_epoch: 1,
+                event_count: 1,
+                user_message_count: 1,
+                assistant_message_count: 1,
+                title_hint: "Stabilize daemon resume path".to_string(),
+                recent_context: "USER: debug startup\nASSISTANT: found daemon race".to_string(),
+                cached_precis: None,
+                cached_summary: None,
+                storage_path: "/home/pi/.codex/sessions/foo.jsonl".to_string(),
+            }],
+        }];
+        let session = ManagedSessionView {
+            id: "019caa6f-b32c-7a73-b4d3-db83225663dc".to_string(),
+            session_path: "remote-session://dev/019caa6f-b32c-7a73-b4d3-db83225663dc"
+                .to_string(),
+            title: "25663dc".to_string(),
+            kind: SessionKind::Codex,
+            host_label: "dev".to_string(),
+            source: yggterm_server::SessionSource::LiveSsh,
+            backend: TerminalBackend::Xterm,
+            bridge_available: true,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: yggterm_server::RemoteDeployState::Ready,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: vec![],
+            rendered_sections: vec![],
+            preview: yggterm_server::SessionPreview {
+                summary: vec![],
+                blocks: vec![],
+            },
+            metadata: vec![SessionMetadataEntry {
+                label: "Cwd",
+                value: "/home/pi/gh".to_string(),
+            }],
+            terminal_process_id: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: Some("dev".to_string()),
+            ssh_prefix: None,
+        };
+
+        let label = live_session_label(&remote_machines, &session, &HashMap::new());
+        assert_eq!(label, "Stabilize daemon resume path");
+    }
+
+    #[test]
+    fn remote_generation_fetch_gate_requires_machine_and_storage() {
+        let mut target = CopyGenerationTarget {
+            session_path: "remote-session://dev/1".to_string(),
+            session_id: "1".to_string(),
+            cwd: "/home/pi".to_string(),
+            title: "1".to_string(),
+            source_updated_at: None,
+            remote_context: None,
+            remote_machine: None,
+            storage_path: None,
+        };
+
+        assert!(!target_can_fetch_remote_generation_context(&target));
+
+        target.remote_machine = Some(RemoteMachineSnapshot {
+            machine_key: "dev".to_string(),
+            label: "dev".to_string(),
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            health: RemoteMachineHealth::Healthy,
+            sessions: vec![],
+        });
+        assert!(!target_can_fetch_remote_generation_context(&target));
+
+        target.storage_path = Some("/home/pi/.codex/sessions/foo.jsonl".to_string());
+        assert!(target_can_fetch_remote_generation_context(&target));
     }
 
     #[test]
