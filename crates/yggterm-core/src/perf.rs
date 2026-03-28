@@ -23,7 +23,10 @@ pub fn append_perf_event(home: &Path, category: &str, name: &str, payload: Value
         "payload": payload,
     });
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{event}");
+        if let Ok(mut line) = serde_json::to_vec(&event) {
+            line.push(b'\n');
+            let _ = file.write_all(&line);
+        }
     }
 }
 
