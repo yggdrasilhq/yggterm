@@ -234,8 +234,14 @@ Observability:
 - `server app state [--timeout-ms <ms>]` should dump the live window and shell snapshot from the
   running GUI client, so remote debugging can inspect selection, panels, requests, and geometry
   without guessing from static logs
+- `server app rows [--timeout-ms <ms>]` should dump the merged visible sidebar rows from the
+  running GUI client, including depth, labels, host binding, and selection state, so debugging a
+  live tree never depends on guessing from screenshots alone
 - `server app focus [--timeout-ms <ms>]` should tell the running GUI client to raise and focus its
   window, so future control actions can treat the app itself like a reachable desktop actor
+- `server app open <session_path> [--view preview|terminal] [--timeout-ms <ms>]` should queue the
+  currently visible row into the requested viewport mode, so SSH-driven debugging can move the app
+  into the exact broken state before taking a screenshot
 - `server app screenshot [output_path] [--timeout-ms <ms>]` should ask the running GUI client to
   capture its visible app surface through the native app backend and return the saved png path or
   an error
