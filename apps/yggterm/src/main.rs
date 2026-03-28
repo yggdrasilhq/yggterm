@@ -58,7 +58,6 @@ fn main() -> Result<()> {
     let pending_update_restart = None;
     let launch_install_context = install_context.clone();
     if args.as_slice() == ["server", "daemon"] {
-        let _ = refresh_desktop_integration(&install_context);
         let endpoint = default_endpoint(store.home_dir());
         let host = detect_ghostty_host();
         return run_daemon(&endpoint, host);
