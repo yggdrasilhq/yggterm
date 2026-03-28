@@ -6,10 +6,13 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use yggterm_core::{PerfSpan, append_trace_event, resolve_yggterm_home};
+use yggterm_core::{PerfSpan, UiTheme, append_trace_event, resolve_yggterm_home};
 
 const MANAGED_NPM_DIRNAME: &str = "npm";
 const MANAGED_NPM_CACHE_DIRNAME: &str = "npm-cache";
+const EXPORTED_TERM_PROGRAM: &str = "vscode";
+const YGGTERM_TERM_PROGRAM: &str = "yggterm";
+const YGGTERM_TERM_PROGRAM_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -142,7 +145,8 @@ impl ManagedCliPaths {
     }
 
     fn shell_exports(&self, tool: ManagedCliTool) -> String {
-        let mut exports = vec![
+        let mut exports = terminal_identity_shell_exports();
+        exports.extend([
             format!(
                 "export NPM_CONFIG_PREFIX={}",
                 shell_single_quote(&self.prefix.display().to_string())
@@ -155,7 +159,7 @@ impl ManagedCliPaths {
                 "export PATH={}:\"$PATH\"",
                 shell_single_quote(&self.bin_dir.display().to_string())
             ),
-        ];
+        ]);
         if tool == ManagedCliTool::CodexLiteLlm {
             let codex_home = dirs::home_dir()
                 .map(|path| path.join(".codex-litellm"))
@@ -166,6 +170,64 @@ impl ManagedCliPaths {
             ));
         }
         exports.join(" && ")
+    }
+}
+
+fn ambient_terminal_appearance() -> String {
+    env::var("YGGTERM_APPEARANCE")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| matches!(value.as_str(), "light" | "dark"))
+        .unwrap_or_else(|| "light".to_string())
+}
+
+fn colorfgbg_for_appearance(appearance: &str) -> &'static str {
+    match appearance {
+        "dark" => "15;0",
+        _ => "0;15",
+    }
+}
+
+pub(crate) fn terminal_identity_env_pairs() -> Vec<(&'static str, String)> {
+    let appearance = ambient_terminal_appearance();
+    vec![
+        ("TERM", "xterm-256color".to_string()),
+        ("COLORTERM", "truecolor".to_string()),
+        // Codex already knows how to style itself well inside VS Code's terminal surface.
+        // Keep a Yggterm-specific identity alongside that so our own integrations stay explicit.
+        ("TERM_PROGRAM", EXPORTED_TERM_PROGRAM.to_string()),
+        (
+            "TERM_PROGRAM_VERSION",
+            YGGTERM_TERM_PROGRAM_VERSION.to_string(),
+        ),
+        ("YGGTERM_TERM_PROGRAM", YGGTERM_TERM_PROGRAM.to_string()),
+        ("YGGTERM_APPEARANCE", appearance.clone()),
+        ("COLORFGBG", colorfgbg_for_appearance(&appearance).to_string()),
+    ]
+}
+
+pub(crate) fn terminal_identity_shell_exports() -> Vec<String> {
+    terminal_identity_env_pairs()
+        .into_iter()
+        .map(|(key, value)| format!("export {key}={}", shell_single_quote(&value)))
+        .collect()
+}
+
+pub(crate) fn sync_terminal_identity_env(theme: UiTheme) {
+    let appearance = match theme {
+        UiTheme::ZedLight => "light",
+        UiTheme::ZedDark => "dark",
+    };
+    // The daemon owns terminal launch commands and needs a process-wide identity for child PTYs
+    // and remote shell command synthesis. This is updated on startup/theme changes only.
+    unsafe {
+        env::set_var("TERM", "xterm-256color");
+        env::set_var("COLORTERM", "truecolor");
+        env::set_var("TERM_PROGRAM", EXPORTED_TERM_PROGRAM);
+        env::set_var("TERM_PROGRAM_VERSION", YGGTERM_TERM_PROGRAM_VERSION);
+        env::set_var("YGGTERM_TERM_PROGRAM", YGGTERM_TERM_PROGRAM);
+        env::set_var("YGGTERM_APPEARANCE", appearance);
+        env::set_var("COLORFGBG", colorfgbg_for_appearance(appearance));
     }
 }
 
