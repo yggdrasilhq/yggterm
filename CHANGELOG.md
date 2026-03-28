@@ -4,6 +4,8 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.0
+
 ### Added
 
 - add `server app state`, `server app focus`, and `server app screenshot` as the first SSH-reachable YggUI app-control verbs, so a running desktop client can be inspected and driven through its own control plane instead of external desktop guesswork
