@@ -4881,6 +4881,15 @@ fn preview_header_summary(snapshot: &RenderSnapshot, session: &ManagedSessionVie
     }
 }
 
+fn preview_header_precis(snapshot: &RenderSnapshot, session: &ManagedSessionView) -> String {
+    snapshot
+        .active_precis
+        .clone()
+        .or_else(|| preview_summary_metadata_value(session, "Precis"))
+        .filter(|precis| !looks_like_low_signal_generated_copy(precis))
+        .unwrap_or_else(|| preview_header_summary(snapshot, session))
+}
+
 fn is_placeholder_rendered_section_title(title: &str) -> bool {
     title.eq_ignore_ascii_case("Rendered Session")
         || title.eq_ignore_ascii_case("Server Notes")
@@ -8614,6 +8623,7 @@ fn app() -> Element {
     let mut last_terminal_session_path = use_signal(|| None::<String>);
     let mut last_open_recovery_path = use_signal(|| None::<String>);
     let mut last_preview_refresh_marker = use_signal(|| None::<(String, u64)>);
+    let mut last_sidebar_autoscroll_path = use_signal(|| None::<String>);
     let schedule_ui_update = schedule_update();
     use_effect(move || {
         if XTERM_ASSETS_BOOTSTRAPPED.get().is_none() {
@@ -8917,14 +8927,20 @@ fn app() -> Element {
             (active_path, active_visible, snapshot.show_loading_tree)
         };
         if show_loading_tree {
+            last_sidebar_autoscroll_path.set(None);
             return;
         }
         let Some(active_path) = active_path else {
+            last_sidebar_autoscroll_path.set(None);
             return;
         };
         if !active_visible {
             return;
         }
+        if *last_sidebar_autoscroll_path.read() == Some(active_path.clone()) {
+            return;
+        }
+        last_sidebar_autoscroll_path.set(Some(active_path.clone()));
         let row_id = sidebar_row_dom_id(&active_path);
         let _ = document::eval(&format!(
             "(function() {{
@@ -10811,9 +10827,11 @@ fn MainSurface(
         .as_ref()
         .map(|session| session.session_path.clone());
     let mut preview_block_limit = use_signal(|| PREVIEW_BLOCK_WINDOW);
+    let mut preview_scroll_top = use_signal(|| 0.0_f64);
     use_effect(move || {
         let _ = active_session_path.clone();
         preview_block_limit.set(PREVIEW_BLOCK_WINDOW);
+        preview_scroll_top.set(0.0);
     });
     let body = if let Some(session) = snapshot.active_session.clone() {
         match snapshot.active_view_mode {
@@ -10844,6 +10862,13 @@ fn MainSurface(
                         visible_blocks.clone()
                     };
                     let grouped_runs = group_preview_runs(&rendered_blocks, hidden_block_count);
+                    let preview_header_collapsed =
+                        *preview_scroll_top.read() > 72.0 && !snapshot.search_active;
+                    let preview_subtitle = if preview_header_collapsed {
+                        preview_header_precis(&snapshot, &session)
+                    } else {
+                        preview_header_summary(&snapshot, &session)
+                    };
                     rsx! {
                         div {
                             style: "display:flex; flex-direction:column; min-width:0; min-height:0; width:100%; height:100%;",
@@ -10856,14 +10881,20 @@ fn MainSurface(
                                             .active_title
                                             .clone()
                                             .unwrap_or_else(|| session.title.clone()),
-                                        subtitle: preview_header_summary(&snapshot, &session),
+                                        subtitle: preview_subtitle,
                                         allow_subtitle_scroll: true,
                                         palette: snapshot.palette,
                                         loading_label: snapshot
                                             .preview_loading
                                             .then_some("Refreshing preview…".to_string()),
                                         on_refresh_title: move |_| on_refresh_title.call(()),
-                                        on_refresh_subtitle: move |_| on_refresh_summary.call(()),
+                                        on_refresh_subtitle: move |_| {
+                                            if preview_header_collapsed {
+                                                on_refresh_precis.call(());
+                                            } else {
+                                                on_refresh_summary.call(());
+                                            }
+                                        },
                                     }
                                 }
                                 PreviewToolbar {
@@ -10880,6 +10911,9 @@ fn MainSurface(
                                 "data-preview-scroll": "1",
                                 style: "display:flex; flex-direction:column; gap:18px; min-width:0; min-height:0; overflow:auto; padding:24px; \
                                         overscroll-behavior:contain; scrollbar-gutter:stable; contain:layout paint style;",
+                                onscroll: move |evt: ScrollEvent| {
+                                    preview_scroll_top.set(evt.data().scroll_top());
+                                },
                                 if snapshot.preview_layout == PreviewLayoutMode::Chat {
                                     div {
                                         style: "display:flex; flex-direction:column; gap:16px; min-width:0; width:min(1020px, 100%); margin:0 auto; \
@@ -12788,30 +12822,30 @@ struct TerminalTheme {
     bright_white: String,
 }
 
-fn terminal_theme(ui_theme: UiTheme, palette: Palette, font_size: f32) -> TerminalTheme {
+fn terminal_theme(ui_theme: UiTheme, _palette: Palette, font_size: f32) -> TerminalTheme {
     match ui_theme {
         UiTheme::ZedLight => TerminalTheme {
-            background: "#f6f8fb".to_string(),
-            foreground: palette.text.to_string(),
-            cursor: palette.accent.to_string(),
+            background: "#ffffff".to_string(),
+            foreground: "#24292f".to_string(),
+            cursor: "#0969da".to_string(),
             font_size: font_size.max(5.0),
-            selection: "rgba(107,165,255,0.18)".to_string(),
-            black: "#2f3a46".to_string(),
-            red: "#d14d5a".to_string(),
-            green: "#2f9d68".to_string(),
-            yellow: "#b57f00".to_string(),
-            blue: "#2f7cf6".to_string(),
-            magenta: "#8b5cf6".to_string(),
-            cyan: "#0f8fa6".to_string(),
-            white: "#dbe4ec".to_string(),
-            bright_black: "#697785".to_string(),
-            bright_red: "#ea5f6c".to_string(),
-            bright_green: "#44b57f".to_string(),
-            bright_yellow: "#d89d18".to_string(),
-            bright_blue: "#4a90ff".to_string(),
-            bright_magenta: "#a77cff".to_string(),
-            bright_cyan: "#2ab3cc".to_string(),
-            bright_white: "#ffffff".to_string(),
+            selection: "rgba(9,105,218,0.20)".to_string(),
+            black: "#24292f".to_string(),
+            red: "#cf222e".to_string(),
+            green: "#1a7f37".to_string(),
+            yellow: "#9a6700".to_string(),
+            blue: "#0969da".to_string(),
+            magenta: "#8250df".to_string(),
+            cyan: "#1b7c83".to_string(),
+            white: "#d0d7de".to_string(),
+            bright_black: "#57606a".to_string(),
+            bright_red: "#fa4549".to_string(),
+            bright_green: "#2da44e".to_string(),
+            bright_yellow: "#bf8700".to_string(),
+            bright_blue: "#218bff".to_string(),
+            bright_magenta: "#a475f9".to_string(),
+            bright_cyan: "#3192aa".to_string(),
+            bright_white: "#f6f8fa".to_string(),
         },
         UiTheme::ZedDark => TerminalTheme {
             background: "#1f2329".to_string(),
@@ -14734,11 +14768,8 @@ fn ThemeDialogButton(
 }
 
 fn toast_center_offset(right_panel_mode: RightPanelMode) -> i32 {
-    if right_panel_mode == RightPanelMode::Hidden {
-        0
-    } else {
-        -146
-    }
+    let _ = right_panel_mode;
+    0
 }
 
 fn normalize_theme_editor_axis(value: f64) -> f32 {

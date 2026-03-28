@@ -1,3 +1,12 @@
+yggterm (2.0.28-1) unstable; urgency=medium
+
+  * Center in-app notifications properly instead of biasing them left when a right rail is open.
+  * Collapse preview header summaries down to the precis after the preview body scrolls.
+  * Stop repeatedly auto-scrolling the sidebar tree to the active session while the user is browsing elsewhere.
+  * Retune the light xterm palette so Codex composer regions regain visible contrast.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sat, 28 Mar 2026 13:55:00 +0530
+
 yggterm (2.0.27-1) unstable; urgency=medium
 
   * Add an embedded app screenshot command so a live Yggterm window can capture itself for remote debugging and support bundles.
