@@ -16,9 +16,9 @@ use yggterm_server::{
     PersistedDaemonState, SessionKind, YggtermServer, cleanup_legacy_daemons, default_endpoint,
     detect_ghostty_host, ping, run_attach, run_daemon, run_remote_generation_context,
     run_remote_preview, run_remote_protocol_version, run_remote_resume_codex, run_remote_scan,
-    run_screenshot_capture,
     run_remote_stage_clipboard_png, run_remote_terminate_codex, run_remote_upsert_generated_copy,
-    run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, start_local_session, status,
+    run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown,
+    start_local_session, status,
 };
 
 const DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT_ENV: &str =

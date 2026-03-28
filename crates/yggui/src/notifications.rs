@@ -185,10 +185,7 @@ fn ToastProgressBar(progress: Option<f32>, tone: ToastTone) -> Element {
     }
 }
 
-pub fn toast_tone_colors(
-    tone: ToastTone,
-    palette: ToastPalette,
-) -> (&'static str, &'static str) {
+pub fn toast_tone_colors(tone: ToastTone, palette: ToastPalette) -> (&'static str, &'static str) {
     match tone {
         ToastTone::Info => (palette.accent, "#315066"),
         ToastTone::Success => ("#2f9e62", "#315066"),
