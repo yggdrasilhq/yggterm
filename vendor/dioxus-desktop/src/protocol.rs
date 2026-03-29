@@ -152,6 +152,27 @@ fn module_loader(root_id: &str, headless: bool, edit_state: &WebviewEdits) -> St
 
     format!(
         r#"
+<script>
+    (function() {{
+        var initializeSent = false;
+        function sendEarlyInitialize() {{
+            if (initializeSent) return;
+            if (!window.ipc || typeof window.ipc.postMessage !== "function") return;
+            initializeSent = true;
+            try {{
+                window.ipc.postMessage(JSON.stringify({{ method: "initialize", params: null }}));
+            }} catch (_error) {{
+                initializeSent = false;
+            }}
+        }}
+        if (window.addEventListener) {{
+            window.addEventListener("DOMContentLoaded", sendEarlyInitialize, false);
+            window.addEventListener("load", sendEarlyInitialize, false);
+        }} else {{
+            window.onload = sendEarlyInitialize;
+        }}
+    }})();
+</script>
 <script type="module">
     // Bring the sledgehammer code
     {SLEDGEHAMMER_JS}
