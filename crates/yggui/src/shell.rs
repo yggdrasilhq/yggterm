@@ -9974,6 +9974,7 @@ fn app() -> Element {
     let mut last_preview_refresh_marker = use_signal(|| None::<(String, u64)>);
     let mut last_sidebar_autoscroll_path = use_signal(|| None::<String>);
     let schedule_ui_update = schedule_update();
+    let desktop_for_root_effect = desktop.clone();
     use_effect(move || {
         if !APP_ROOT_EFFECT_TRACED.swap(true, Ordering::SeqCst) {
             append_trace_event(
@@ -9989,9 +9990,9 @@ fn app() -> Element {
         #[cfg(target_os = "macos")]
         {
             if !APP_ROOT_MAC_WINDOW_FORCED.swap(true, Ordering::SeqCst) {
-                desktop.set_visible(true);
-                desktop.set_minimized(false);
-                desktop.set_focus();
+                desktop_for_root_effect.set_visible(true);
+                desktop_for_root_effect.set_minimized(false);
+                desktop_for_root_effect.set_focus();
                 append_trace_event(
                     &trace_home,
                     "ui",
