@@ -253,7 +253,7 @@ impl App {
             .expect("Config should be set before initialization");
 
         self.is_visible_before_start = cfg.window.window.visible;
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
         {
             cfg.window = cfg.window.with_visible(false);
         }
