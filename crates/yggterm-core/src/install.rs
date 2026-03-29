@@ -496,7 +496,9 @@ fn refresh_macos_integration(context: &InstallContext) -> Result<Vec<String>> {
     write_if_changed(
         &contents_dir.join("Info.plist"),
         format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>CFBundleName</key><string>Yggterm</string><key>CFBundleDisplayName</key><string>Yggterm</string><key>CFBundleIdentifier</key><string>dev.yggterm.Yggterm</string><key>CFBundleExecutable</key><string>yggterm</string><key>CFBundlePackageType</key><string>APPL</string><key>LSBackgroundOnly</key><false/></dict></plist>\n"
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>CFBundleName</key><string>Yggterm</string><key>CFBundleDisplayName</key><string>Yggterm</string><key>CFBundleIdentifier</key><string>dev.yggterm.Yggterm</string><key>CFBundleExecutable</key><string>yggterm</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleVersion</key><string>{}</string><key>CFBundleShortVersionString</key><string>{}</string><key>LSBackgroundOnly</key><false/><key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/><key>NSAllowsArbitraryLoadsInWebContent</key><true/></dict></plist>\n",
+            env!("CARGO_PKG_VERSION"),
+            env!("CARGO_PKG_VERSION")
         )
         .as_bytes(),
     )?;
