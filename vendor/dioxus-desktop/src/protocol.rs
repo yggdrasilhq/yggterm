@@ -176,6 +176,29 @@ fn module_loader(root_id: &str, headless: bool, edit_state: &WebviewEdits) -> St
                 img.src = "{BASE_URI}__probe/" + stage + "?ts=" + Date.now();
             }} catch (_error) {{}}
         }}
+        function encodePart(value) {{
+            try {{
+                return encodeURIComponent(String(value));
+            }} catch (_error) {{
+                return "encode-failed";
+            }}
+        }}
+        if (window.addEventListener) {{
+            window.addEventListener("error", function(event) {{
+                var detail = "message=" + encodePart(event && event.message)
+                    + "&filename=" + encodePart(event && event.filename)
+                    + "&lineno=" + encodePart(event && event.lineno)
+                    + "&colno=" + encodePart(event && event.colno);
+                probe("js-error?" + detail);
+            }});
+            window.addEventListener("unhandledrejection", function(event) {{
+                var reason = event && event.reason;
+                var detail = "reason=" + encodePart(
+                    reason && reason.message ? reason.message : reason
+                );
+                probe("js-rejection?" + detail);
+            }});
+        }}
         function sendEarlyInitialize() {{
             probe("plain-script-onload");
             if (initializeSent) return;
@@ -210,16 +233,40 @@ fn module_loader(root_id: &str, headless: bool, edit_state: &WebviewEdits) -> St
     {NATIVE_JS}
 
     // The native interpreter extends the sledgehammer interpreter with a few extra methods that we use for IPC
-    window.interpreter = new NativeInterpreter("{BASE_URI}", {headless});
+    try {{
+        window.interpreter = new NativeInterpreter("{BASE_URI}", {headless});
+        fetch("{BASE_URI}__probe/module-interpreter-created?ts=" + Date.now()).catch(() => {{}});
+    }} catch (error) {{
+        fetch("{BASE_URI}__probe/module-interpreter-failed?message=" + encodeURIComponent(String(error)) + "&ts=" + Date.now()).catch(() => {{}});
+        throw error;
+    }}
 
     // Wait for the page to load before sending the initialize message
     window.onload = function() {{
         let root_element = window.document.getElementById("{root_id}");
         if (root_element != null) {{
-            window.interpreter.initialize(root_element);
-            window.interpreter.sendIpcMessage("initialize");
+            try {{
+                window.interpreter.initialize(root_element);
+                fetch("{BASE_URI}__probe/module-interpreter-initialize?ts=" + Date.now()).catch(() => {{}});
+            }} catch (error) {{
+                fetch("{BASE_URI}__probe/module-interpreter-initialize-failed?message=" + encodeURIComponent(String(error)) + "&ts=" + Date.now()).catch(() => {{}});
+                throw error;
+            }}
+            try {{
+                window.interpreter.sendIpcMessage("initialize");
+                fetch("{BASE_URI}__probe/module-interpreter-ipc?ts=" + Date.now()).catch(() => {{}});
+            }} catch (error) {{
+                fetch("{BASE_URI}__probe/module-interpreter-ipc-failed?message=" + encodeURIComponent(String(error)) + "&ts=" + Date.now()).catch(() => {{}});
+                throw error;
+            }}
         }}
-        window.interpreter.waitForRequest("{edits_path}", "{expected_key}");
+        try {{
+            window.interpreter.waitForRequest("{edits_path}", "{expected_key}");
+            fetch("{BASE_URI}__probe/module-wait-for-request?ts=" + Date.now()).catch(() => {{}});
+        }} catch (error) {{
+            fetch("{BASE_URI}__probe/module-wait-for-request-failed?message=" + encodeURIComponent(String(error)) + "&ts=" + Date.now()).catch(() => {{}});
+            throw error;
+        }}
     }}
 </script>
 <script type="module">
