@@ -9838,6 +9838,17 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
     let shutdown_bootstrap = bootstrap.clone();
     let _ = BOOTSTRAP.set(bootstrap);
 
+    #[cfg(target_os = "macos")]
+    let window = WindowBuilder::new()
+        .with_title("Yggterm")
+        .with_window_icon(Some(window_icon::load_yggterm_window_icon()))
+        .with_transparent(false)
+        .with_decorations(true)
+        .with_resizable(true)
+        .with_inner_size(LogicalSize::new(1460.0, 920.0))
+        .with_min_inner_size(LogicalSize::new(1024.0, 720.0));
+
+    #[cfg(not(target_os = "macos"))]
     let window = WindowBuilder::new()
         .with_title("Yggterm")
         .with_window_icon(Some(window_icon::load_yggterm_window_icon()))
