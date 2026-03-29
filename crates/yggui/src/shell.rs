@@ -9903,6 +9903,7 @@ fn app() -> Element {
     let mut background_refresh_defer_started = use_signal(|| false);
     let mut update_check_started = use_signal(|| false);
     let mut dock_pulse_started = use_signal(|| false);
+    let mut app_control_loop_started = use_signal(|| false);
     let mut window_epoch = use_signal(|| 0_u64);
     let mut terminal_mount_epoch = use_signal(|| 0_u64);
     let async_render_epoch = use_signal(|| 0_u64);
@@ -9922,21 +9923,45 @@ fn app() -> Element {
         let settings_path = bootstrap.settings_path.clone();
         let desktop = desktop.clone();
         let state = state;
-        use_future(move || {
+        use_effect(move || {
+            if *app_control_loop_started.read() {
+                return;
+            }
+            app_control_loop_started.set(true);
             let settings_path = settings_path.clone();
             let desktop = desktop.clone();
             let state = state;
-            async move {
+            let trace_home = perf_home_dir(&settings_path);
+            spawn(async move {
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "app_control",
+                    "loop_spawned",
+                    json!({
+                        "pid": std::process::id(),
+                    }),
+                );
                 loop {
                     if let Err(error) =
                         process_pending_app_control_requests(&settings_path, desktop.clone(), state)
                             .await
                     {
+                        append_trace_event(
+                            &trace_home,
+                            "ui",
+                            "app_control",
+                            "loop_error",
+                            json!({
+                                "pid": std::process::id(),
+                                "error": error.to_string(),
+                            }),
+                        );
                         warn!(error=%error, "failed to process app control request");
                     }
                     sleep(Duration::from_millis(SCREENSHOT_REQUEST_POLL_MS)).await;
                 }
-            }
+            });
         });
     }
     use_wry_event_handler(move |event, _| {
