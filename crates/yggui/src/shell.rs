@@ -9882,11 +9882,6 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
         .with_window_icon(Some(window_icon::load_yggterm_window_icon()))
         .with_transparent(false)
         .with_decorations(true)
-        .with_titlebar_transparent(true)
-        .with_fullsize_content_view(true)
-        .with_title_hidden(true)
-        .with_movable_by_window_background(true)
-        .with_traffic_light_inset(Position::Logical(LogicalPosition::new(14.0, 14.0)))
         .with_resizable(true)
         .with_inner_size(LogicalSize::new(1460.0, 920.0))
         .with_min_inner_size(LogicalSize::new(1024.0, 720.0));

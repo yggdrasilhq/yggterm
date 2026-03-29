@@ -59,6 +59,32 @@ struct DirectInstallState {
     icon_revision: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct DirectInstallStateCompat {
+    #[serde(default = "default_install_channel_direct")]
+    channel: InstallChannel,
+    #[serde(default = "default_release_repo_string")]
+    repo: String,
+    #[serde(default = "default_asset_label_string")]
+    asset_label: String,
+    active_version: String,
+    active_executable: PathBuf,
+    #[serde(default)]
+    icon_revision: String,
+}
+
+fn default_install_channel_direct() -> InstallChannel {
+    InstallChannel::Direct
+}
+
+fn default_release_repo_string() -> String {
+    DEFAULT_RELEASE_REPO.to_string()
+}
+
+fn default_asset_label_string() -> String {
+    current_asset_label().unwrap_or_else(|_| "unknown".to_string())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseUpdate {
     pub version: String,
@@ -243,8 +269,20 @@ fn load_direct_install_state(root: &Path) -> Result<Option<DirectInstallState>> 
     }
     let bytes = fs::read(&path)
         .with_context(|| format!("failed to read install state {}", path.display()))?;
-    let state: DirectInstallState = serde_json::from_slice(&bytes)
+    let compat: DirectInstallStateCompat = serde_json::from_slice(&bytes)
         .with_context(|| format!("failed to parse install state {}", path.display()))?;
+    let state = DirectInstallState {
+        channel: compat.channel,
+        repo: compat.repo,
+        asset_label: compat.asset_label,
+        active_version: compat.active_version.clone(),
+        active_executable: compat.active_executable,
+        icon_revision: if compat.icon_revision.is_empty() {
+            compat.active_version
+        } else {
+            compat.icon_revision
+        },
+    };
     if state.channel == InstallChannel::Direct {
         Ok(Some(state))
     } else {
