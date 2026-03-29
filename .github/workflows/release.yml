@@ -13,6 +13,8 @@ jobs:
   package:
     name: Package ${{ matrix.label }}
     runs-on: ${{ matrix.runs_on }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "10.15"
     strategy:
       fail-fast: false
       matrix:
@@ -24,7 +26,7 @@ jobs:
             runs_on: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
           - label: macos-x86_64
-            runs_on: macos-13
+            runs_on: macos-15-intel
             target: x86_64-apple-darwin
           - label: macos-aarch64
             runs_on: macos-14
