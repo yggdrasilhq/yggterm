@@ -251,7 +251,10 @@ fn parse_inflight_worker_pid(file_name: &str) -> Option<u32> {
 
 #[cfg(unix)]
 fn process_is_alive(pid: u32) -> bool {
-    pid != 0 && Path::new(&format!("/proc/{pid}")).exists()
+    if pid == 0 {
+        return false;
+    }
+    unsafe { libc::kill(pid as i32, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
 }
 
 #[cfg(not(unix))]

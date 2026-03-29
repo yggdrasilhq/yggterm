@@ -12,6 +12,7 @@ ghostty-ffi = ["yggterm-ghostty-bridge/ghostty-ffi"]
 [dependencies]
 anyhow.workspace = true
 dirs.workspace = true
+libc = "0.2"
 portable-pty = "0.9"
 serde.workspace = true
 serde_json.workspace = true

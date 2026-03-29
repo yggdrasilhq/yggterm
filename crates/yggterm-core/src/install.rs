@@ -450,12 +450,11 @@ fn refresh_macos_integration(context: &InstallContext) -> Result<Vec<String>> {
     fs::create_dir_all(&resources_dir)?;
 
     let launcher = macos_dir.join("yggterm");
-    let script = format!(
-        "#!/bin/sh\nexec \"{}\" \"$@\"\n",
-        context.executable_path.display()
-    );
-    write_if_changed(&launcher, script.as_bytes())?;
-    set_unix_executable(&launcher)?;
+    let target = context
+        .preferred_executable
+        .as_ref()
+        .unwrap_or(&context.executable_path);
+    refresh_macos_launcher(&launcher, target)?;
     write_if_changed(
         &contents_dir.join("Info.plist"),
         format!(
@@ -469,6 +468,35 @@ fn refresh_macos_integration(context: &InstallContext) -> Result<Vec<String>> {
     )?;
     notes.push(format!("app bundle refreshed at {}", app_dir.display()));
     Ok(notes)
+}
+
+#[cfg(target_os = "macos")]
+fn refresh_macos_launcher(launcher_path: &Path, target: &Path) -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    if let Ok(metadata) = fs::symlink_metadata(launcher_path) {
+        if metadata.file_type().is_dir() {
+            fs::remove_dir_all(launcher_path).with_context(|| {
+                format!(
+                    "failed to replace existing launcher directory {}",
+                    launcher_path.display()
+                )
+            })?;
+        } else {
+            fs::remove_file(launcher_path).with_context(|| {
+                format!("failed to replace launcher {}", launcher_path.display())
+            })?;
+        }
+    }
+
+    symlink(target, launcher_path).with_context(|| {
+        format!(
+            "failed to create macOS app launcher {} -> {}",
+            launcher_path.display(),
+            target.display()
+        )
+    })?;
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
