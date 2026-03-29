@@ -1,4 +1,6 @@
-use crate::app_capture::{capture_visible_app_surface, describe_window, focus_app_window};
+use crate::app_capture::{
+    capture_visible_app_surface, describe_window, focus_app_window, record_visible_app_surface,
+};
 use crate::chrome::{
     ChromePalette, HoveredChromeControl as HoveredControl, TitlebarChrome, WindowControlsStrip,
     search_input_style,
@@ -49,6 +51,11 @@ use tao::event::Event as TaoEvent;
 use tao::keyboard::Key as TaoKey;
 use tao::keyboard::KeyCode as TaoKeyCode;
 use tao::window::ResizeDirection;
+#[cfg(target_os = "macos")]
+use tao::{
+    dpi::{LogicalPosition, Position},
+    platform::macos::WindowBuilderExtMacOS,
+};
 use time::OffsetDateTime;
 use tokio::sync::oneshot;
 use tokio::task;
@@ -62,7 +69,7 @@ use yggterm_core::{
     looks_like_low_signal_generated_copy, resolve_yggterm_home, save_settings_file,
     unique_session_short_ids_for_pairs, update_command_hint,
 };
-use yggterm_platform::DockRect;
+use yggterm_platform::{DockRect, send_user_notification};
 use yggterm_server::{
     AppControlCommand, AppControlDragCommand, AppControlDragPlacement, AppControlResponse,
     AppControlViewMode, GhosttyTerminalHostMode, ManagedSessionView, PreviewTone,
@@ -9149,6 +9156,34 @@ async fn process_pending_app_control_requests(
                 error: Some(error.to_string()),
             },
         },
+        AppControlCommand::CaptureScreenRecording {
+            output_path,
+            duration_secs,
+        } => match record_visible_app_surface(&desktop, Path::new(&output_path), duration_secs).await
+        {
+            Ok(output_path) => AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: Some(output_path.display().to_string()),
+                data: Some(json!({
+                    "command": "capture_screen_recording",
+                    "duration_secs": duration_secs,
+                    "window": describe_window(&desktop),
+                    "active_view_mode": format!("{:?}", state.read().server.active_view_mode()),
+                    "active_session_path": state.read().server.active_session_path(),
+                })),
+                error: None,
+            },
+            Err(error) => AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: None,
+                error: Some(error.to_string()),
+            },
+        },
         AppControlCommand::SetFullscreen { enabled } => {
             state.with_mut(|shell| {
                 if shell.fullscreen != enabled {
@@ -9844,6 +9879,11 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
         .with_window_icon(Some(window_icon::load_yggterm_window_icon()))
         .with_transparent(false)
         .with_decorations(true)
+        .with_titlebar_transparent(true)
+        .with_fullsize_content_view(true)
+        .with_title_hidden(true)
+        .with_movable_by_window_background(true)
+        .with_traffic_light_inset(Position::Logical(LogicalPosition::new(14.0, 14.0)))
         .with_resizable(true)
         .with_inner_size(LogicalSize::new(1460.0, 920.0))
         .with_min_inner_size(LogicalSize::new(1024.0, 720.0));
@@ -10780,7 +10820,9 @@ fn app() -> Element {
                             maximized: maximized,
                             fullscreen: fullscreen,
                             always_on_top: snapshot.always_on_top,
+                            show_always_on_top_button: true,
                             show_fullscreen_button: true,
+                            show_window_buttons: true,
                             overlay: true,
                         }
                     }
@@ -11156,6 +11198,8 @@ fn Titlebar(
 ) -> Element {
     let command_mode_active = snapshot.command_mode_active;
     let search_query = snapshot.search_query.clone();
+    let native_macos_titlebar = cfg!(target_os = "macos");
+    let titlebar_leading_inset = if native_macos_titlebar { 76 } else { 0 };
     let active_title = snapshot.active_title.clone().or_else(|| {
         snapshot
             .active_session
@@ -11182,7 +11226,10 @@ fn Titlebar(
             on_toggle_maximized: on_toggle_maximized,
             left: rsx! {
                 div {
-                    style: "display:flex; align-items:center; gap:12px; min-width:0; width:100%;",
+                    style: format!(
+                        "display:flex; align-items:center; gap:12px; min-width:0; width:100%; padding-left:{}px;",
+                        titlebar_leading_inset
+                    ),
                     button {
                         style: icon_button_style(snapshot.palette),
                         onmousedown: |evt| evt.stop_propagation(),
@@ -11498,26 +11545,54 @@ fn Titlebar(
                         "ⓘ"
                     }
                     div { style: "flex:1; min-width:24px; max-width:40px; height:100%;" }
-                    WindowControlsStrip {
-                        palette: ChromePalette {
-                            titlebar: snapshot.palette.titlebar,
-                            text: snapshot.palette.text,
-                            muted: snapshot.palette.muted,
-                            accent: snapshot.palette.accent,
-                            close_hover: snapshot.palette.close_hover,
-                            control_hover: snapshot.palette.control_hover,
-                        },
-                        hovered: hovered(),
-                        on_hover_control: on_hover_control,
-                        on_toggle_maximized: on_toggle_maximized,
-                        on_toggle_fullscreen: on_toggle_fullscreen,
-                        on_toggle_always_on_top: on_toggle_always_on_top,
-                        on_close_app: on_close_app,
-                        maximized: maximized,
-                        fullscreen: fullscreen,
-                        always_on_top: snapshot.always_on_top,
-                        show_fullscreen_button: true,
-                        overlay: false,
+                    if native_macos_titlebar {
+                        WindowControlsStrip {
+                            palette: ChromePalette {
+                                titlebar: snapshot.palette.titlebar,
+                                text: snapshot.palette.text,
+                                muted: snapshot.palette.muted,
+                                accent: snapshot.palette.accent,
+                                close_hover: snapshot.palette.close_hover,
+                                control_hover: snapshot.palette.control_hover,
+                            },
+                            hovered: hovered(),
+                            on_hover_control: on_hover_control,
+                            on_toggle_maximized: on_toggle_maximized,
+                            on_toggle_fullscreen: on_toggle_fullscreen,
+                            on_toggle_always_on_top: on_toggle_always_on_top,
+                            on_close_app: on_close_app,
+                            maximized: maximized,
+                            fullscreen: fullscreen,
+                            always_on_top: snapshot.always_on_top,
+                            show_always_on_top_button: true,
+                            show_fullscreen_button: true,
+                            show_window_buttons: false,
+                            overlay: false,
+                        }
+                    } else {
+                        WindowControlsStrip {
+                            palette: ChromePalette {
+                                titlebar: snapshot.palette.titlebar,
+                                text: snapshot.palette.text,
+                                muted: snapshot.palette.muted,
+                                accent: snapshot.palette.accent,
+                                close_hover: snapshot.palette.close_hover,
+                                control_hover: snapshot.palette.control_hover,
+                            },
+                            hovered: hovered(),
+                            on_hover_control: on_hover_control,
+                            on_toggle_maximized: on_toggle_maximized,
+                            on_toggle_fullscreen: on_toggle_fullscreen,
+                            on_toggle_always_on_top: on_toggle_always_on_top,
+                            on_close_app: on_close_app,
+                            maximized: maximized,
+                            fullscreen: fullscreen,
+                            always_on_top: snapshot.always_on_top,
+                            show_always_on_top_button: true,
+                            show_fullscreen_button: true,
+                            show_window_buttons: true,
+                            overlay: false,
+                        }
                     }
                 }
             },
@@ -15115,31 +15190,7 @@ fn emit_notification_chime() {
 }
 
 fn emit_system_notification(title: &str, message: &str) {
-    #[cfg(target_os = "linux")]
-    {
-        let _ = Command::new("notify-send")
-            .arg(title)
-            .arg(message)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let script = format!(
-            "display notification {} with title {}",
-            serde_json::to_string(message).unwrap_or_else(|_| "\"\"".to_string()),
-            serde_json::to_string(title).unwrap_or_else(|_| "\"Yggterm\"".to_string())
-        );
-        let _ = Command::new("osascript")
-            .arg("-e")
-            .arg(script)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-    }
+    let _ = send_user_notification(title, message);
 }
 
 fn apply_active_terminal_zoom(state: Signal<ShellState>) {
