@@ -3,6 +3,7 @@ use crate::{
     edits::EditWebsocket,
     event_handlers::WindowEventHandlers,
     ipc::{IpcMessage, UserWindowEvent},
+    protocol::record_protocol_probe,
     query::QueryResult,
     shortcut::ShortcutRegistry,
     webview::{PendingWebview, WebviewInstance},
@@ -284,6 +285,7 @@ impl App {
     ///
     /// Let's rebuild it and then start polling it
     pub fn handle_initialize_msg(&mut self, id: WindowId) {
+        record_protocol_probe("rust-handle-initialize-msg");
         let view = self.webviews.get_mut(&id).unwrap();
 
         view.edits
