@@ -8,6 +8,10 @@ use std::path::{Path, PathBuf};
 use webkit2gtk::{SnapshotOptions, SnapshotRegion, WebViewExt};
 #[cfg(target_os = "linux")]
 use wry::WebViewExtUnix;
+#[cfg(target_os = "macos")]
+use tao::platform::macos::WindowExtMacOS;
+#[cfg(target_os = "macos")]
+use yggterm_platform::{capture_macos_window_recording, capture_macos_window_screenshot};
 
 pub async fn capture_visible_app_surface(
     desktop: &DesktopContext,
@@ -22,6 +26,24 @@ pub async fn capture_visible_app_surface(
         .with_context(|| format!("reading screenshot metadata {}", output_path.display()))?;
     if !metadata.is_file() || metadata.len() == 0 {
         anyhow::bail!("native screenshot capture produced no file output");
+    }
+    Ok(output_path.to_path_buf())
+}
+
+pub async fn record_visible_app_surface(
+    desktop: &DesktopContext,
+    output_path: &Path,
+    duration_secs: u64,
+) -> Result<PathBuf> {
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating recording dir {}", parent.display()))?;
+    }
+    platform_record_visible_app_surface(desktop, output_path, duration_secs).await?;
+    let metadata = fs::metadata(output_path)
+        .with_context(|| format!("reading recording metadata {}", output_path.display()))?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        anyhow::bail!("native screen recording produced no file output");
     }
     Ok(output_path.to_path_buf())
 }
@@ -82,8 +104,51 @@ async fn platform_capture_visible_app_surface(
 
 #[cfg(not(target_os = "linux"))]
 async fn platform_capture_visible_app_surface(
+    desktop: &DesktopContext,
+    output_path: &Path,
+) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        return capture_macos_window_screenshot(desktop.window.ns_window().cast(), output_path);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = desktop;
+        let _ = output_path;
+        anyhow::bail!("native app screenshot capture is not implemented for this platform yet")
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn platform_record_visible_app_surface(
     _desktop: &DesktopContext,
     _output_path: &Path,
+    _duration_secs: u64,
 ) -> Result<()> {
-    anyhow::bail!("native app screenshot capture is not implemented for this platform yet")
+    anyhow::bail!("native app screen recording is not implemented for Linux yet")
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn platform_record_visible_app_surface(
+    desktop: &DesktopContext,
+    output_path: &Path,
+    duration_secs: u64,
+) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        return capture_macos_window_recording(
+            desktop.window.ns_window().cast(),
+            output_path,
+            duration_secs,
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = desktop;
+        let _ = output_path;
+        let _ = duration_secs;
+        anyhow::bail!("native app screen recording is not implemented for this platform yet")
+    }
 }

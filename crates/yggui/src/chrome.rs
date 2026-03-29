@@ -85,7 +85,9 @@ pub fn WindowControlsStrip(
     maximized: bool,
     fullscreen: bool,
     always_on_top: bool,
+    show_always_on_top_button: bool,
     show_fullscreen_button: bool,
+    show_window_buttons: bool,
     overlay: bool,
     on_hover_control: EventHandler<Option<HoveredChromeControl>>,
     on_toggle_maximized: EventHandler<()>,
@@ -103,15 +105,17 @@ pub fn WindowControlsStrip(
     rsx! {
         div {
             style: container_style,
-            WindowControlButton {
-                icon: ChromeControlIcon::AlwaysOnTop,
-                hovered: hovered == Some(HoveredChromeControl::AlwaysOnTop),
-                active: always_on_top,
-                hover_tone: HoveredChromeControl::AlwaysOnTop,
-                palette: palette,
-                overlay: overlay,
-                on_hover_control: on_hover_control,
-                on_press: move |_| on_toggle_always_on_top.call(()),
+            if show_always_on_top_button {
+                WindowControlButton {
+                    icon: ChromeControlIcon::AlwaysOnTop,
+                    hovered: hovered == Some(HoveredChromeControl::AlwaysOnTop),
+                    active: always_on_top,
+                    hover_tone: HoveredChromeControl::AlwaysOnTop,
+                    palette: palette,
+                    overlay: overlay,
+                    on_hover_control: on_hover_control,
+                    on_press: move |_| on_toggle_always_on_top.call(()),
+                }
             }
             if show_fullscreen_button {
                 WindowControlButton {
@@ -129,39 +133,41 @@ pub fn WindowControlsStrip(
                     on_press: move |_| on_toggle_fullscreen.call(()),
                 }
             }
-            WindowControlButton {
-                icon: ChromeControlIcon::Minimize,
-                hovered: hovered == Some(HoveredChromeControl::Minimize),
-                active: false,
-                hover_tone: HoveredChromeControl::Minimize,
-                palette: palette,
-                overlay: overlay,
-                on_hover_control: on_hover_control,
-                on_press: move |_| window().set_minimized(true),
-            }
-            WindowControlButton {
-                icon: if maximized {
-                    ChromeControlIcon::Restore
-                } else {
-                    ChromeControlIcon::Maximize
-                },
-                hovered: hovered == Some(HoveredChromeControl::Maximize),
-                active: false,
-                hover_tone: HoveredChromeControl::Maximize,
-                palette: palette,
-                overlay: overlay,
-                on_hover_control: on_hover_control,
-                on_press: move |_| on_toggle_maximized.call(()),
-            }
-            WindowControlButton {
-                icon: ChromeControlIcon::Close,
-                hovered: hovered == Some(HoveredChromeControl::Close),
-                active: false,
-                hover_tone: HoveredChromeControl::Close,
-                palette: palette,
-                overlay: overlay,
-                on_hover_control: on_hover_control,
-                on_press: move |_| on_close_app.call(()),
+            if show_window_buttons {
+                WindowControlButton {
+                    icon: ChromeControlIcon::Minimize,
+                    hovered: hovered == Some(HoveredChromeControl::Minimize),
+                    active: false,
+                    hover_tone: HoveredChromeControl::Minimize,
+                    palette: palette,
+                    overlay: overlay,
+                    on_hover_control: on_hover_control,
+                    on_press: move |_| window().set_minimized(true),
+                }
+                WindowControlButton {
+                    icon: if maximized {
+                        ChromeControlIcon::Restore
+                    } else {
+                        ChromeControlIcon::Maximize
+                    },
+                    hovered: hovered == Some(HoveredChromeControl::Maximize),
+                    active: false,
+                    hover_tone: HoveredChromeControl::Maximize,
+                    palette: palette,
+                    overlay: overlay,
+                    on_hover_control: on_hover_control,
+                    on_press: move |_| on_toggle_maximized.call(()),
+                }
+                WindowControlButton {
+                    icon: ChromeControlIcon::Close,
+                    hovered: hovered == Some(HoveredChromeControl::Close),
+                    active: false,
+                    hover_tone: HoveredChromeControl::Close,
+                    palette: palette,
+                    overlay: overlay,
+                    on_hover_control: on_hover_control,
+                    on_press: move |_| on_close_app.call(()),
+                }
             }
         }
     }

@@ -7,8 +7,8 @@ use yggterm_server::{
     run_attach, run_daemon, run_remote_ensure_managed_cli, run_remote_generation_context,
     run_remote_preview, run_remote_protocol_version, run_remote_refresh_managed_cli,
     run_remote_resume_codex, run_remote_scan, run_remote_stage_clipboard_png,
-    run_remote_upsert_generated_copy, run_screenshot_capture, run_trace_bundle, run_trace_follow,
-    run_trace_tail, shutdown, status,
+    run_remote_upsert_generated_copy, run_screenshot_capture, run_screenrecord_capture,
+    run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, status,
 };
 
 fn main() -> Result<()> {
@@ -113,6 +113,34 @@ fn main() -> Result<()> {
             .map(String::as_str);
         return run_screenshot_capture(&args[2], output_path, timeout_ms);
     }
+    if args.len() >= 3 && args[0] == "server" && args[1] == "screenrecord" {
+        let duration_secs = args
+            .windows(2)
+            .find_map(|window| {
+                if window[0] == "--duration-sec" {
+                    window[1].parse::<u64>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(10);
+        let timeout_ms = args
+            .windows(2)
+            .find_map(|window| {
+                if window[0] == "--timeout-ms" {
+                    window[1].parse::<u64>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(duration_secs.saturating_mul(1_000) + 15_000);
+        let output_path = args
+            .iter()
+            .skip(3)
+            .find(|value| !value.starts_with("--"))
+            .map(String::as_str);
+        return run_screenrecord_capture(&args[2], output_path, timeout_ms, duration_secs);
+    }
     if args.len() >= 3 && args[0] == "server" && args[1] == "app" {
         let timeout_ms = args
             .windows(2)
@@ -132,6 +160,24 @@ fn main() -> Result<()> {
                     .find(|value| !value.starts_with("--"))
                     .map(String::as_str);
                 run_screenshot_capture("app", output_path, timeout_ms)
+            }
+            "screenrecord" => {
+                let duration_secs = args
+                    .windows(2)
+                    .find_map(|window| {
+                        if window[0] == "--duration-sec" {
+                            window[1].parse::<u64>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(10);
+                let output_path = args
+                    .iter()
+                    .skip(3)
+                    .find(|value| !value.starts_with("--"))
+                    .map(String::as_str);
+                run_screenrecord_capture("app", output_path, timeout_ms, duration_secs)
             }
             "state" => run_app_control_describe_state(timeout_ms),
             "rows" => run_app_control_describe_rows(timeout_ms),

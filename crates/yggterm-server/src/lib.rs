@@ -10,8 +10,9 @@ pub use app_control::{
     AppControlCommand, AppControlDragCommand, AppControlDragPlacement, AppControlRequest,
     AppControlResponse, AppControlViewMode, ScreenshotTarget, app_control_captures_dir,
     app_control_requests_dir, app_control_responses_dir, complete_app_control_request,
-    current_millis, default_screenshot_output_path, enqueue_app_control_request,
-    enqueue_screenshot_request, take_next_app_control_request, wait_for_app_control_response,
+    current_millis, default_recording_output_path, default_screenshot_output_path,
+    enqueue_app_control_request, enqueue_screen_recording_request, enqueue_screenshot_request,
+    take_next_app_control_request, wait_for_app_control_response,
 };
 pub use attach::{AttachMetadata, run_attach};
 pub use codex_cli::{ManagedCliTool, ManagedCliToolStatus};
@@ -4587,6 +4588,25 @@ fn capture_embedded_app_screenshot(
     )
 }
 
+fn capture_embedded_app_screen_recording(
+    home: &std::path::Path,
+    output_path: Option<std::path::PathBuf>,
+    duration_secs: u64,
+    timeout_ms: u64,
+) -> anyhow::Result<AppControlResponse> {
+    let request = enqueue_screen_recording_request(
+        home,
+        output_path,
+        duration_secs,
+        preferred_app_control_pid(home),
+    )?;
+    wait_for_app_control_response(
+        home,
+        &request.request_id,
+        std::time::Duration::from_millis(timeout_ms.max(duration_secs.saturating_mul(1_000) + 1_000)),
+    )
+}
+
 #[derive(Debug, Deserialize)]
 struct ClientInstanceRecord {
     pid: u32,
@@ -4785,6 +4805,26 @@ pub fn run_screenshot_capture(
             timeout_ms,
         )?,
         other => anyhow::bail!("unsupported screenshot target: {other}"),
+    };
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_screenrecord_capture(
+    target: &str,
+    output_path: Option<&str>,
+    timeout_ms: u64,
+    duration_secs: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = match target {
+        "app" => capture_embedded_app_screen_recording(
+            &home,
+            output_path.map(std::path::PathBuf::from),
+            duration_secs.max(1),
+            timeout_ms,
+        )?,
+        other => anyhow::bail!("unsupported screenrecord target: {other}"),
     };
     write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
     Ok(())

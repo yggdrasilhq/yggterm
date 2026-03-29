@@ -28,13 +28,14 @@ yggterm server app rows --timeout-ms 5000
 yggterm server app focus --timeout-ms 5000
 yggterm server app open "remote-session://dev/<session-id>" --view terminal --timeout-ms 8000
 yggterm server app screenshot /tmp/yggterm-shot.png --timeout-ms 10000
+yggterm server app screenrecord /tmp/yggterm-shot.mov --duration-sec 12 --timeout-ms 25000
 yggterm server screenshot app /tmp/yggterm-shot.png
 yggterm-headless server trace tail 200
 yggterm-headless server trace follow 200 500
 yggterm-headless server trace bundle 200 --screenshot > yggterm-trace.json
 ```
 
-`server app ...` is the SSH-reachable YggUI control plane. `state` returns the live shell/window snapshot, `rows` dumps the merged visible sidebar tree exactly as the running app sees it, `open` queues a specific visible row into preview or terminal mode, `focus` raises the running window, and `screenshot` asks the app to capture itself. On Linux, that screenshot now comes from the embedded WebKitGTK surface instead of `spectacle`, `import`, or DOM-to-canvas hacks. `server screenshot app ...` remains as a compatibility alias, and `trace bundle --screenshot` now includes the live app-state snapshot before falling back to external desktop tools when there is no app response. The trace lives at `~/.yggterm/event-trace.jsonl` and is designed to stay on during dogfooding, with lightweight rotation once it gets large.
+`server app ...` is the SSH-reachable YggUI control plane. `state` returns the live shell/window snapshot, `rows` dumps the merged visible sidebar tree exactly as the running app sees it, `open` queues a specific visible row into preview or terminal mode, `focus` raises the running window, `screenshot` asks the app to capture itself, and `screenrecord` captures a timed recording of the live app window through the native app backend. On Linux, app screenshots come from the embedded WebKitGTK surface instead of `spectacle`, `import`, or DOM-to-canvas hacks. On macOS, app screenshots and recordings are routed through the native `screencapture` window path tied to the live NSWindow. `server screenshot app ...` remains as a compatibility alias, and `trace bundle --screenshot` now includes the live app-state snapshot before falling back to external desktop tools when there is no app response. The trace lives at `~/.yggterm/event-trace.jsonl` and is designed to stay on during dogfooding, with lightweight rotation once it gets large.
 
 For apps built on `yggui`, keep one canonical SVG icon in-repo and regenerate the runtime PNG from it instead of hand-editing both assets. This repo uses:
 
