@@ -1,6 +1,11 @@
 use anyhow::{Context, Result, bail};
 use std::process::{Command, Stdio};
 
+#[cfg(target_os = "macos")]
+use objc2::{msg_send, runtime::AnyObject};
+#[cfg(target_os = "macos")]
+use std::path::Path;
+
 #[derive(Debug, Clone, Copy)]
 pub enum HostPlatform {
     Linux,
@@ -39,6 +44,109 @@ pub struct DockRect {
 #[derive(Debug, Clone)]
 pub struct DockedGhosttyWindow {
     pub window_id: String,
+}
+
+pub fn send_user_notification(title: &str, message: &str) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("notify-send")
+            .arg(title)
+            .arg(message)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("spawning notify-send")?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            "display notification {} with title {}",
+            serde_json::to_string(message).unwrap_or_else(|_| "\"\"".to_string()),
+            serde_json::to_string(title).unwrap_or_else(|_| "\"Yggterm\"".to_string())
+        );
+        Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("spawning macOS notification")?;
+        return Ok(());
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = title;
+        let _ = message;
+        bail!("native notifications are not implemented for this platform yet");
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn capture_macos_window_screenshot(
+    ns_window_ptr: *mut std::ffi::c_void,
+    output_path: &Path,
+) -> Result<()> {
+    let window_number = macos_window_number(ns_window_ptr)?;
+    let status = Command::new("screencapture")
+        .arg("-x")
+        .arg("-o")
+        .arg("-l")
+        .arg(window_number.to_string())
+        .arg(output_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("running macOS screencapture for window screenshot")?;
+    if !status.success() {
+        bail!("screencapture exited with status {status}");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub fn capture_macos_window_recording(
+    ns_window_ptr: *mut std::ffi::c_void,
+    output_path: &Path,
+    duration_secs: u64,
+) -> Result<()> {
+    let window_number = macos_window_number(ns_window_ptr)?;
+    let duration_secs = duration_secs.max(1);
+    let status = Command::new("screencapture")
+        .arg("-x")
+        .arg("-v")
+        .arg("-l")
+        .arg(window_number.to_string())
+        .arg("-V")
+        .arg(duration_secs.to_string())
+        .arg(output_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("running macOS screencapture for window recording")?;
+    if !status.success() {
+        bail!("screencapture video capture exited with status {status}");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_window_number(ns_window_ptr: *mut std::ffi::c_void) -> Result<i64> {
+    if ns_window_ptr.is_null() {
+        bail!("tao returned a null NSWindow pointer");
+    }
+    let ns_window = ns_window_ptr.cast::<AnyObject>();
+    let window_number: i64 = unsafe { msg_send![ns_window, windowNumber] };
+    if window_number <= 0 {
+        bail!("invalid NSWindow windowNumber {window_number}");
+    }
+    Ok(window_number)
 }
 
 pub fn host_platform() -> HostPlatform {

@@ -9,6 +9,7 @@ use uuid::Uuid;
 const APP_CONTROL_REQUESTS_DIR: &str = "app-control-requests";
 const APP_CONTROL_RESPONSES_DIR: &str = "app-control-responses";
 const APP_CONTROL_CAPTURES_DIR: &str = "screenshots";
+const APP_CONTROL_RECORDINGS_DIR: &str = "recordings";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -52,6 +53,10 @@ pub enum AppControlCommand {
         target: ScreenshotTarget,
         output_path: String,
     },
+    CaptureScreenRecording {
+        output_path: String,
+        duration_secs: u64,
+    },
     SetFullscreen {
         enabled: bool,
     },
@@ -72,6 +77,7 @@ impl AppControlCommand {
     pub fn name(&self) -> &'static str {
         match self {
             Self::CaptureScreenshot { .. } => "capture_screenshot",
+            Self::CaptureScreenRecording { .. } => "capture_screen_recording",
             Self::SetFullscreen { .. } => "set_fullscreen",
             Self::Drag { .. } => "drag",
             Self::DescribeRows => "describe_rows",
@@ -116,8 +122,16 @@ pub fn app_control_captures_dir(home: &Path) -> PathBuf {
     home.join(APP_CONTROL_CAPTURES_DIR)
 }
 
+pub fn app_control_recordings_dir(home: &Path) -> PathBuf {
+    home.join(APP_CONTROL_RECORDINGS_DIR)
+}
+
 pub fn default_screenshot_output_path(home: &Path, request_id: &str) -> PathBuf {
     app_control_captures_dir(home).join(format!("app-{request_id}.png"))
+}
+
+pub fn default_recording_output_path(home: &Path, request_id: &str) -> PathBuf {
+    app_control_recordings_dir(home).join(format!("app-{request_id}.mov"))
 }
 
 pub fn enqueue_app_control_request(
@@ -127,6 +141,7 @@ pub fn enqueue_app_control_request(
 ) -> Result<AppControlRequest> {
     let requests_dir = app_control_requests_dir(home);
     let captures_dir = app_control_captures_dir(home);
+    let recordings_dir = app_control_recordings_dir(home);
     fs::create_dir_all(&requests_dir).with_context(|| {
         format!(
             "creating app control requests dir {}",
@@ -137,6 +152,12 @@ pub fn enqueue_app_control_request(
         format!(
             "creating app control captures dir {}",
             captures_dir.display()
+        )
+    })?;
+    fs::create_dir_all(&recordings_dir).with_context(|| {
+        format!(
+            "creating app control recordings dir {}",
+            recordings_dir.display()
         )
     })?;
     let request = AppControlRequest {
@@ -348,6 +369,49 @@ pub fn enqueue_screenshot_request(
         format!(
             "creating app control captures dir {}",
             captures_dir.display()
+        )
+    })?;
+    let final_path = requests_dir.join(format!("{}.json", request.request_id));
+    let temp_path = requests_dir.join(format!("{}.json.tmp", request.request_id));
+    fs::write(&temp_path, serde_json::to_vec_pretty(&request)?)
+        .with_context(|| format!("writing app control request {}", temp_path.display()))?;
+    fs::rename(&temp_path, &final_path)
+        .with_context(|| format!("publishing app control request {}", final_path.display()))?;
+    Ok(request)
+}
+
+pub fn enqueue_screen_recording_request(
+    home: &Path,
+    output_path: Option<PathBuf>,
+    duration_secs: u64,
+    preferred_pid: Option<u32>,
+) -> Result<AppControlRequest> {
+    let request_id = Uuid::new_v4().to_string();
+    let output_path = output_path
+        .unwrap_or_else(|| default_recording_output_path(home, &request_id))
+        .display()
+        .to_string();
+    let request = AppControlRequest {
+        request_id,
+        created_at_ms: current_millis(),
+        preferred_pid,
+        command: AppControlCommand::CaptureScreenRecording {
+            output_path,
+            duration_secs: duration_secs.max(1),
+        },
+    };
+    let requests_dir = app_control_requests_dir(home);
+    let recordings_dir = app_control_recordings_dir(home);
+    fs::create_dir_all(&requests_dir).with_context(|| {
+        format!(
+            "creating app control requests dir {}",
+            requests_dir.display()
+        )
+    })?;
+    fs::create_dir_all(&recordings_dir).with_context(|| {
+        format!(
+            "creating app control recordings dir {}",
+            recordings_dir.display()
         )
     })?;
     let final_path = requests_dir.join(format!("{}.json", request.request_id));
