@@ -245,6 +245,9 @@ Observability:
 - `server app screenshot [output_path] [--timeout-ms <ms>]` should ask the running GUI client to
   capture its visible app surface through the native app backend and return the saved png path or
   an error
+- `server app screenrecord [output_path] [--duration-sec <seconds>] [--timeout-ms <ms>]` should
+  ask the running GUI client to capture a timed recording of its visible app surface through the
+  native app backend and return the saved movie path or an error
 - `server screenshot app [output_path] [--timeout-ms <ms>]` should ask a live yggterm GUI client to capture its current window and return the saved png path or an error
 - `server trace bundle <lines> --screenshot` should emit a support bundle with event trace tail,
   perf tail, UI telemetry tail, daemon summary, live app-state snapshot, and a screenshot path.
