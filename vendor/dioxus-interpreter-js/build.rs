@@ -29,6 +29,15 @@ fn postprocess_js(path: impl AsRef<Path>) {
         "class NativeInterpreter extends JSChannel_{constructor(baseUri,headless){super();",
         "class NativeInterpreter extends JSChannel_{constructor(baseUri,headless){super();this.queuedBytes=[];",
     );
+    js = js.replace(
+        "target2.value??target2.textContent??\"\"",
+        "(target2.value!=null?target2.value:(target2.textContent!=null?target2.textContent:\"\"))",
+    );
+    js = js.replace(
+        "item.getAsFile()?.name||\"\"",
+        "((()=>{let __file=item.getAsFile();return __file?__file.name:\"\"})())",
+    );
+    js = js.replace("this.queuedBytes=[];this.queuedBytes=[];", "this.queuedBytes=[];");
 
     fs::write(path, js).expect("failed to write generated js");
 }
