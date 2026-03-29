@@ -230,7 +230,7 @@ fn module_loader(root_id: &str, headless: bool, edit_state: &WebviewEdits) -> St
     )
 }
 
-fn record_protocol_probe(stage: &str) {
+pub(crate) fn record_protocol_probe(stage: &str) {
     let mut path = std::env::temp_dir();
     path.push("yggterm-dioxus-probe.log");
     let ts_ms = SystemTime::now()
