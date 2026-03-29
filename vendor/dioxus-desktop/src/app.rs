@@ -301,6 +301,24 @@ impl App {
                 .set_visible(self.is_visible_before_start);
         }
 
+        #[cfg(target_os = "macos")]
+        {
+            use cocoa::base::{id, nil};
+            use objc::{msg_send, sel, sel_impl};
+            use tao::platform::macos::WindowExtMacOS;
+
+            view.desktop_context.window.set_minimized(false);
+            view.desktop_context.window.set_focus();
+
+            unsafe {
+                let ns_window: id = view.desktop_context.window.ns_window() as id;
+                let _: () = msg_send![ns_window, orderFrontRegardless];
+                let _: () = msg_send![ns_window, makeKeyAndOrderFront: nil];
+            }
+
+            record_protocol_probe("rust-macos-window-forced-front");
+        }
+
         _ = self.shared.proxy.send_event(UserWindowEvent::Poll(id));
     }
 
