@@ -1,4 +1,9 @@
-use std::path::PathBuf;
+use std::{
+    fs::OpenOptions,
+    io::Write,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crate::{assets::*, webview::WebviewEdits};
 use crate::{document::NATIVE_EVAL_JS, file_upload::FileDialogRequest};
@@ -70,6 +75,16 @@ pub(super) fn desktop_handler(
         }
 
         return;
+    }
+
+    if let Some(stage) = trimmed_uri.strip_prefix("__probe/") {
+        record_protocol_probe(stage);
+        return responder.respond(
+            Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(Vec::new())
+                .unwrap(),
+        );
     }
 
     // todo: we want to move the custom assets onto a different protocol or something
@@ -155,16 +170,30 @@ fn module_loader(root_id: &str, headless: bool, edit_state: &WebviewEdits) -> St
 <script>
     (function() {{
         var initializeSent = false;
+        function probe(stage) {{
+            try {{
+                var img = new Image();
+                img.src = "{BASE_URI}__probe/" + stage + "?ts=" + Date.now();
+            }} catch (_error) {{}}
+        }}
         function sendEarlyInitialize() {{
+            probe("plain-script-onload");
             if (initializeSent) return;
-            if (!window.ipc || typeof window.ipc.postMessage !== "function") return;
+            if (!window.ipc || typeof window.ipc.postMessage !== "function") {{
+                probe("ipc-missing");
+                return;
+            }}
+            probe("ipc-ready");
             initializeSent = true;
             try {{
                 window.ipc.postMessage(JSON.stringify({{ method: "initialize", params: null }}));
+                probe("ipc-initialize-sent");
             }} catch (_error) {{
                 initializeSent = false;
+                probe("ipc-initialize-failed");
             }}
         }}
+        probe("plain-script-start");
         if (window.addEventListener) {{
             window.addEventListener("DOMContentLoaded", sendEarlyInitialize, false);
             window.addEventListener("load", sendEarlyInitialize, false);
@@ -199,6 +228,18 @@ fn module_loader(root_id: &str, headless: bool, edit_state: &WebviewEdits) -> St
 </script>
 "#
     )
+}
+
+fn record_protocol_probe(stage: &str) {
+    let mut path = std::env::temp_dir();
+    path.push("yggterm-dioxus-probe.log");
+    let ts_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{ts_ms}\t{stage}");
+    }
 }
 
 fn file_dialog_responder_sync(
