@@ -5564,6 +5564,8 @@ name = "yggterm-platform"
 version = "2.1.4"
 dependencies = [
  "anyhow",
+ "objc2",
+ "serde_json",
 ]
 
 [[package]]
