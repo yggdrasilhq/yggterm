@@ -37,6 +37,14 @@ fn postprocess_js(path: impl AsRef<Path>) {
         "item.getAsFile()?.name||\"\"",
         "((()=>{let __file=item.getAsFile();return __file?__file.name:\"\"})())",
     );
+    js = js.replace(
+        "data.arrayBuffer().then((buffer)=>{this.rafEdits(buffer)})",
+        "(typeof data.arrayBuffer===\"function\"?data.arrayBuffer():new Promise((resolve,reject)=>{let reader=new FileReader;reader.onload=()=>resolve(reader.result);reader.onerror=()=>reject(reader.error||new Error(\"FileReader failed\"));reader.readAsArrayBuffer(data)})).then((buffer)=>{this.rafEdits(buffer)})",
+    );
+    js = js.replace(
+        "await file.arrayBuffer()",
+        "await (typeof file.arrayBuffer===\"function\"?file.arrayBuffer():new Promise((resolve,reject)=>{let reader=new FileReader;reader.onload=()=>resolve(reader.result);reader.onerror=()=>reject(reader.error||new Error(\"FileReader failed\"));reader.readAsArrayBuffer(file)}))",
+    );
     js = js.replace("this.queuedBytes=[];this.queuedBytes=[];", "this.queuedBytes=[];");
 
     fs::write(path, js).expect("failed to write generated js");
