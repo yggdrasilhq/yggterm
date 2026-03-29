@@ -32,3 +32,7 @@ incremental = true
 
 [profile.dev.package."*"]
 opt-level = 2
+
+[patch.crates-io]
+dioxus-desktop = { path = "vendor/dioxus-desktop" }
+dioxus-interpreter-js = { path = "vendor/dioxus-interpreter-js" }
