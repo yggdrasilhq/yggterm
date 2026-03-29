@@ -99,6 +99,9 @@ static SIDEBAR_SEARCH_CACHE: OnceCell<Mutex<SidebarSearchCache>> = OnceCell::new
 static CLIENT_INSTANCE: OnceCell<ClientInstanceRegistration> = OnceCell::new();
 static SUPPRESS_DAEMON_SHUTDOWN_ON_EXIT: AtomicBool = AtomicBool::new(false);
 static INTENTIONAL_CLIENT_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+static APP_ROOT_RENDER_TRACED: AtomicBool = AtomicBool::new(false);
+static APP_ROOT_EFFECT_TRACED: AtomicBool = AtomicBool::new(false);
+static APP_ROOT_MAC_WINDOW_FORCED: AtomicBool = AtomicBool::new(false);
 
 const PREVIEW_BLOCK_CACHE_LIMIT: usize = 256;
 const PREVIEW_CONTENT_CACHE_LIMIT: usize = 256;
@@ -9935,6 +9938,18 @@ fn app() -> Element {
         .get()
         .expect("shell bootstrap not initialized")
         .clone();
+    let trace_home = perf_home_dir(&bootstrap.settings_path);
+    if !APP_ROOT_RENDER_TRACED.swap(true, Ordering::SeqCst) {
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "startup",
+            "app_root_render",
+            json!({
+                "pid": std::process::id(),
+            }),
+        );
+    }
     let mut state = use_signal(|| ShellState::new(bootstrap.clone()));
     let initial_terminal_session_path = {
         let snapshot = state.read().snapshot();
@@ -9965,6 +9980,34 @@ fn app() -> Element {
     let mut last_sidebar_autoscroll_path = use_signal(|| None::<String>);
     let schedule_ui_update = schedule_update();
     use_effect(move || {
+        if !APP_ROOT_EFFECT_TRACED.swap(true, Ordering::SeqCst) {
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "startup",
+                "app_root_effect",
+                json!({
+                    "pid": std::process::id(),
+                }),
+            );
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if !APP_ROOT_MAC_WINDOW_FORCED.swap(true, Ordering::SeqCst) {
+                desktop.set_visible(true);
+                desktop.set_minimized(false);
+                desktop.set_focus();
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "startup",
+                    "mac_window_forced_visible",
+                    json!({
+                        "pid": std::process::id(),
+                    }),
+                );
+            }
+        }
         if XTERM_ASSETS_BOOTSTRAPPED.get().is_none() {
             let _ = XTERM_ASSETS_BOOTSTRAPPED.set(());
             let _ = document::eval(&xterm_assets_bootstrap_script());
