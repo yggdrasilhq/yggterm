@@ -78,7 +78,12 @@ pub(super) fn desktop_handler(
     }
 
     if let Some(stage) = trimmed_uri.strip_prefix("__probe/") {
-        record_protocol_probe(stage);
+        let full_stage = if let Some(query) = request.uri().query() {
+            format!("{stage}?{query}")
+        } else {
+            stage.to_string()
+        };
+        record_protocol_probe(&full_stage);
         return responder.respond(
             Response::builder()
                 .status(StatusCode::NO_CONTENT)
