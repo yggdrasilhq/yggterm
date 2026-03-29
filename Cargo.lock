@@ -5572,6 +5572,7 @@ version = "2.1.4"
 dependencies = [
  "anyhow",
  "dirs",
+ "libc",
  "portable-pty",
  "rusqlite",
  "serde",
