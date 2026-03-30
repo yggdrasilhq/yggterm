@@ -112,6 +112,14 @@ impl TerminalManager {
         Ok(())
     }
 
+    pub fn remove_session(&mut self, key: &str, stop_command: Option<&str>) -> Result<bool> {
+        let Some(runtime) = self.sessions.remove(key) else {
+            return Ok(false);
+        };
+        runtime.shutdown(stop_command)?;
+        Ok(true)
+    }
+
     pub fn shutdown_all<F>(&mut self, stop_command: F) -> TerminalShutdownSummary
     where
         F: Fn(&str) -> Option<String>,
@@ -342,13 +350,32 @@ fn shell_command(launch_command: &str, cwd: Option<&str>) -> CommandBuilder {
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
     let mut command = CommandBuilder::new(shell);
-    command.arg("-lc");
+    command.arg("-c");
     command.arg(launch_command);
     for (key, value) in terminal_identity_env_pairs() {
         command.env(key, value);
     }
     if let Some(cwd) = cwd {
+        if shell_uses_bash_prompt_cwd() {
+            command.env("YGGTERM_START_CWD", cwd);
+            command.env(
+                "PROMPT_COMMAND",
+                r#"cd -- "$YGGTERM_START_CWD"; unset PROMPT_COMMAND"#,
+            );
+        }
         command.cwd(cwd);
     }
     command
+}
+
+fn shell_uses_bash_prompt_cwd() -> bool {
+    std::env::var("SHELL")
+        .ok()
+        .and_then(|value| {
+            std::path::Path::new(&value)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.eq_ignore_ascii_case("bash"))
+        })
+        .unwrap_or(true)
 }

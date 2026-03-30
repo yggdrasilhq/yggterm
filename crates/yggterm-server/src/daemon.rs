@@ -100,6 +100,9 @@ pub enum ServerRequest {
     RemoveSshTarget {
         machine_key: String,
     },
+    RemoveSession {
+        path: String,
+    },
     StartLocalSession {
         session_kind: SessionKind,
         cwd: Option<String>,
@@ -278,6 +281,19 @@ impl DaemonRuntime {
         let Some((launch_command, cwd)) = self.server.terminal_spec(path) else {
             bail!("no terminal spec for session: {path}");
         };
+        if let Ok(home) = crate::resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "server",
+                "terminal_spec",
+                "resolved",
+                serde_json::json!({
+                    "path": path,
+                    "cwd": cwd,
+                    "launch_command": launch_command,
+                }),
+            );
+        }
         if self.terminals.has_session(path) {
             if !self
                 .terminals
@@ -365,11 +381,7 @@ impl DaemonRuntime {
                 self.snapshot_response(Some(format!("opened {path}")))
             }
             ServerRequest::ConnectSsh { target_ix } => {
-                let target = self.server.ssh_targets().get(target_ix).cloned();
                 let (key, reused) = self.server.connect_ssh_target(target_ix);
-                if let Some(target) = target.as_ref() {
-                    let _ = self.server.refresh_remote_machine_for_ssh_target(target);
-                }
                 self.persist()?;
                 self.snapshot_response(key.map(|key| {
                     if reused {
@@ -381,18 +393,6 @@ impl DaemonRuntime {
             }
             ServerRequest::ConnectSshCustom { target, prefix } => {
                 let (key, reused) = self.server.connect_ssh_custom(&target, prefix.as_deref())?;
-                if let Some(target) = self
-                    .server
-                    .ssh_targets()
-                    .iter()
-                    .find(|candidate| {
-                        candidate.ssh_target == target
-                            && candidate.prefix.as_deref() == prefix.as_deref()
-                    })
-                    .cloned()
-                {
-                    let _ = self.server.refresh_remote_machine_for_ssh_target(&target);
-                }
                 self.persist()?;
                 self.snapshot_response(Some(if reused {
                     format!("focused existing {key}")
@@ -412,18 +412,6 @@ impl DaemonRuntime {
                     cwd.as_deref(),
                     title_hint.as_deref(),
                 )?;
-                if let Some(target) = self
-                    .server
-                    .ssh_targets()
-                    .iter()
-                    .find(|candidate| {
-                        candidate.ssh_target == target
-                            && candidate.prefix.as_deref() == prefix.as_deref()
-                    })
-                    .cloned()
-                {
-                    let _ = self.server.refresh_remote_machine_for_ssh_target(&target);
-                }
                 self.persist()?;
                 self.snapshot_response(Some(format!("started {key}")))
             }
@@ -474,6 +462,21 @@ impl DaemonRuntime {
                     format!("removed saved ssh target for {machine_key}")
                 } else {
                     format!("removed {removed} saved ssh targets for {machine_key}")
+                }))
+            }
+            ServerRequest::RemoveSession { path } => {
+                let stop_command = self.server.terminal_stop_command(&path);
+                let removed_terminal = self.terminals.remove_session(&path, stop_command.as_deref())?;
+                let removed_session = self.server.remove_live_session(&path)?;
+                self.persist()?;
+                self.snapshot_response(Some(if removed_session {
+                    if removed_terminal {
+                        format!("removed {path}")
+                    } else {
+                        format!("removed metadata for {path}")
+                    }
+                } else {
+                    format!("no live session for {path}")
                 }))
             }
             ServerRequest::StartLocalSession {
@@ -924,6 +927,7 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::RefreshRemoteMachine { .. } => "refresh_remote_machine",
         ServerRequest::RefreshManagedCli { .. } => "refresh_managed_cli",
         ServerRequest::RemoveSshTarget { .. } => "remove_ssh_target",
+        ServerRequest::RemoveSession { .. } => "remove_session",
         ServerRequest::StartLocalSession { .. } => "start_local_session",
         ServerRequest::SwitchAgentSessionMode { .. } => "switch_agent_session_mode",
         ServerRequest::StartCommandSession { .. } => "start_command_session",
@@ -1150,6 +1154,18 @@ pub fn remove_ssh_target(
         endpoint,
         &ServerRequest::RemoveSshTarget {
             machine_key: machine_key.to_string(),
+        },
+    )?)
+}
+
+pub fn remove_session(
+    endpoint: &ServerEndpoint,
+    path: &str,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
+    expect_snapshot(send_request(
+        endpoint,
+        &ServerRequest::RemoveSession {
+            path: path.to_string(),
         },
     )?)
 }
