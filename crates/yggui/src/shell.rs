@@ -66,7 +66,8 @@ use yggterm_core::{
     SessionBrowserState, SessionNode, SessionStore, UiTheme, WorkspaceDocumentInput,
     WorkspaceDocumentKind, WorkspaceGroupKind, YgguiThemeSpec, append_trace_event,
     check_for_update, install_release_update, looks_like_generated_fallback_title,
-    looks_like_low_signal_generated_copy, resolve_yggterm_home, save_settings_file,
+    looks_like_low_signal_generated_copy, read_codex_session_identity_fields,
+    resolve_yggterm_home, save_settings_file,
     unique_session_short_ids_for_pairs, update_command_hint,
 };
 use yggterm_platform::{DockRect, send_user_notification};
@@ -76,7 +77,7 @@ use yggterm_server::{
     RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession,
     ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry,
     SessionPreviewBlock, SessionRenderedSection, SshConnectTarget, TerminalBackend,
-    WorkspaceViewMode,
+    WorkspaceViewMode, YggOperationPriority,
     YGG_LOADING_NOTIFICATION_AFTER_MS, YggRequestMeta, YggSurface, YggTarget, YggtermServer,
     apply_remote_preview_payload_for_path, cleanup_legacy_daemons, complete_app_control_request,
     connect_ssh_custom, fetch_remote_generation_context, fetch_remote_preview_payload,
@@ -124,7 +125,7 @@ const BACKGROUND_COPY_RETRY_MS: u64 = 300_000;
 const BACKGROUND_COPY_CONTINUE_MS: u64 = 15_000;
 const BACKGROUND_COPY_IDLE_MS: u64 = 120_000;
 const BACKGROUND_REFRESH_NOTICE_MS: u64 = 12_000;
-const BACKGROUND_REFRESH_STARTUP_DEFER_MS: u64 = 12_000;
+const BACKGROUND_REFRESH_STARTUP_DEFER_MS: u64 = 30_000;
 const THEME_EDITOR_PAD_SIZE: f64 = 286.0;
 const SEARCH_INPUT_ID: &str = "yggterm-search-input";
 const PREVIEW_HEADER_SEARCH_HIT_ID: &str = "__preview_header__";
@@ -1124,6 +1125,11 @@ impl ShellState {
         label: String,
         global_busy: bool,
     ) {
+        if request_meta.priority == YggOperationPriority::Interactive {
+            self.background_refresh_after_ms = self
+                .background_refresh_after_ms
+                .max(current_millis() + BACKGROUND_REFRESH_STARTUP_DEFER_MS);
+        }
         if let Ok(store) = SessionStore::open_or_init() {
             append_trace_event(
                 store.home_dir(),
@@ -1190,6 +1196,7 @@ impl ShellState {
         match result {
             Ok((snapshot, message)) => {
                 self.server.apply_snapshot(snapshot);
+                self.prune_terminal_attach_in_flight();
                 self.hydrate_generated_copy_from_remote_cache();
                 self.needs_initial_server_sync = false;
                 self.next_background_copy_scan_after_ms = 0;
@@ -1234,6 +1241,7 @@ impl ShellState {
                 let snapshot =
                     self.reconcile_snapshot_for_interactive_request(request_id, snapshot);
                 self.server.apply_snapshot(snapshot);
+                self.prune_terminal_attach_in_flight();
                 self.hydrate_generated_copy_from_remote_cache();
                 self.finish_busy_request_for(request_id);
                 self.needs_initial_server_sync = false;
@@ -1287,6 +1295,19 @@ impl ShellState {
         self.ensure_active_session_expanded();
         self.sync_active_session_selection();
         self.sync_browser_settings();
+    }
+
+    fn prune_terminal_attach_in_flight(&mut self) {
+        if self.server.active_view_mode() != WorkspaceViewMode::Terminal {
+            self.terminal_attach_in_flight.clear();
+            return;
+        }
+        let Some(active_path) = self.server.active_session_path().map(str::to_owned) else {
+            self.terminal_attach_in_flight.clear();
+            return;
+        };
+        self.terminal_attach_in_flight
+            .retain(|session_path| session_path == &active_path);
     }
 
     fn ensure_active_session_expanded(&mut self) {
@@ -4320,13 +4341,19 @@ fn spawn_surface_snapshot_action<F>(
 
     spawn(async move {
         maybe_debug_request_delay().await;
-        let outcome = task::spawn_blocking(move || request(endpoint)).await;
+        let trace_home = resolve_yggterm_home().unwrap_or_else(|_| PathBuf::from("."));
+        let outcome = run_dedicated_interactive_request_io(
+            "server_snapshot_action",
+            trace_home.as_path(),
+            move || request(endpoint),
+        )
+        .await;
         let request_id = request_meta.request_id.clone();
         let _ = safe_shell_mut(
             state,
             "server_snapshot_action_complete",
             |shell| match outcome {
-                Ok(result) => shell.apply_daemon_snapshot_result_for(&request_id, result),
+                Ok(result) => shell.apply_daemon_snapshot_result_for(&request_id, Ok(result)),
                 Err(error) => {
                     shell.finish_busy_request_for(&request_id);
                     shell.last_action = format!("server task failed: {error}");
@@ -4445,10 +4472,14 @@ fn spawn_focus_live_session_row(
     spawn(async move {
         maybe_debug_request_delay().await;
         let row_path = row.full_path.clone();
-        let outcome = task::spawn_blocking(
+        let trace_home = resolve_yggterm_home().unwrap_or_else(|_| PathBuf::from("."));
+        let outcome = run_dedicated_interactive_request_io(
+            "focus_live_session_row",
+            trace_home.as_path(),
             move || -> Result<(ServerUiSnapshot, Option<String>)> {
-            focus_live_with_view(&endpoint, &row_path, Some(mode))
-        })
+                focus_live_with_view(&endpoint, &row_path, Some(mode))
+            },
+        )
         .await;
         let _ = safe_shell_mut(
             state,
@@ -4459,7 +4490,7 @@ fn spawn_focus_live_session_row(
                     return;
                 }
                 match outcome {
-                    Ok(result) => shell.apply_daemon_snapshot_result_for(&request_id, result),
+                    Ok(result) => shell.apply_daemon_snapshot_result_for(&request_id, Ok(result)),
                 Err(error) => {
                     shell.finish_busy_request_for(&request_id);
                     shell.last_action = format!("{pending_label} task failed: {error}");
@@ -4530,39 +4561,43 @@ fn spawn_open_session_row_with_mode(
     spawn(async move {
         maybe_debug_request_delay().await;
         let row_for_request = row.clone();
-        let outcome = task::spawn_blocking(
+        let trace_home = resolve_yggterm_home().unwrap_or_else(|_| PathBuf::from("."));
+        let outcome = run_dedicated_interactive_request_io(
+            "open_session_row",
+            trace_home.as_path(),
             move || -> Result<(ServerUiSnapshot, Option<String>)> {
-            if let Some((machine_key, session_id)) =
-                parse_remote_scanned_session_path(&row_for_request.full_path)
-            {
-                open_remote_session_with_view(
-                    &endpoint,
-                    machine_key,
-                    session_id,
-                    row_for_request.session_cwd.as_deref(),
-                    Some(row_for_request.label.as_str()),
-                    Some(if prefer_terminal {
-                        WorkspaceViewMode::Terminal
-                    } else {
-                        WorkspaceViewMode::Rendered
-                    }),
-                )
-            } else {
-                open_stored_session_with_view(
-                    &endpoint,
-                    session_kind_for_row(row_for_request.kind),
-                    &row_for_request.full_path,
-                    row_for_request.session_id.as_deref(),
-                    row_for_request.session_cwd.as_deref(),
-                    Some(row_for_request.label.as_str()),
-                    Some(if prefer_terminal {
-                        WorkspaceViewMode::Terminal
-                    } else {
-                        WorkspaceViewMode::Rendered
-                    }),
-                )
-            }
-        })
+                if let Some((machine_key, session_id)) =
+                    parse_remote_scanned_session_path(&row_for_request.full_path)
+                {
+                    open_remote_session_with_view(
+                        &endpoint,
+                        machine_key,
+                        session_id,
+                        row_for_request.session_cwd.as_deref(),
+                        Some(row_for_request.label.as_str()),
+                        Some(if prefer_terminal {
+                            WorkspaceViewMode::Terminal
+                        } else {
+                            WorkspaceViewMode::Rendered
+                        }),
+                    )
+                } else {
+                    open_stored_session_with_view(
+                        &endpoint,
+                        session_kind_for_row(row_for_request.kind),
+                        &row_for_request.full_path,
+                        row_for_request.session_id.as_deref(),
+                        row_for_request.session_cwd.as_deref(),
+                        Some(row_for_request.label.as_str()),
+                        Some(if prefer_terminal {
+                            WorkspaceViewMode::Terminal
+                        } else {
+                            WorkspaceViewMode::Rendered
+                        }),
+                    )
+                }
+            },
+        )
         .await;
         let request_id = request_meta.request_id.clone();
         let _ = safe_shell_mut(state, "open_session_row_complete", |shell| {
@@ -4571,7 +4606,7 @@ fn spawn_open_session_row_with_mode(
                 return;
             }
             match outcome {
-                Ok(result) => shell.apply_daemon_snapshot_result_for(&request_id, result),
+                Ok(result) => shell.apply_daemon_snapshot_result_for(&request_id, Ok(result)),
                 Err(error) => {
                     shell.finish_busy_request_for(&request_id);
                     shell.last_action = format!("{pending_label} task failed: {error}");
@@ -4588,11 +4623,167 @@ fn spawn_open_session_row_with_mode(
 }
 
 fn resolve_app_control_row(shell: &ShellState, session_path: &str) -> Option<BrowserRow> {
-    shell
-        .snapshot()
+    let snapshot = shell.snapshot();
+    if let Some(row) = snapshot
         .rows
         .into_iter()
         .find(|row| row.full_path == session_path)
+    {
+        return Some(row);
+    }
+
+    let stored_rows = shell.browser.search_rows();
+    let expanded_paths = search_expanded_paths(
+        &stored_rows,
+        shell.server.remote_machines(),
+        shell.server.ssh_targets(),
+        &shell.server.live_sessions(),
+        &shell.browser.expanded_path_set(),
+    );
+    let mut merged_rows = merged_sidebar_rows(
+        &stored_rows,
+        shell.server.remote_machines(),
+        shell.server.ssh_targets(),
+        &shell.server.live_sessions(),
+        &expanded_paths,
+    );
+    enrich_sidebar_rows_with_live_titles(
+        &mut merged_rows,
+        &shell.server.live_sessions(),
+        shell.server.remote_machines(),
+    );
+    filtered_sidebar_rows(&merged_rows, "")
+        .into_iter()
+        .find(|row| row.full_path == session_path)
+        .or_else(|| synthesize_app_control_row(shell, session_path))
+}
+
+fn synthesize_app_control_row(shell: &ShellState, session_path: &str) -> Option<BrowserRow> {
+    if let Some(session) = shell
+        .server
+        .active_session()
+        .filter(|session| session.session_path == session_path)
+        .cloned()
+        .or_else(|| {
+            shell.server.live_sessions().into_iter().find(|session| {
+                session.session_path == session_path
+                    || normalize_live_session_path(&session.session_path) == session_path
+            })
+        })
+    {
+        let label = if session.title.trim().is_empty() {
+            fallback_label_for_session_path(session_path)
+        } else {
+            session.title.clone()
+        };
+        return Some(BrowserRow {
+            kind: if session.kind == SessionKind::Document {
+                BrowserRowKind::Document
+            } else {
+                BrowserRowKind::Session
+            },
+            full_path: normalize_live_session_path(session_path),
+            label: label.clone(),
+            detail_label: String::new(),
+            document_kind: (session.kind == SessionKind::Document)
+                .then_some(WorkspaceDocumentKind::Note),
+            group_kind: None,
+            session_title: Some(label),
+            depth: 0,
+            host_label: session.host_label.clone(),
+            descendant_sessions: 0,
+            expanded: false,
+            session_id: Some(session.id.clone()),
+            session_cwd: session_cwd_for_managed_session(&session),
+        });
+    }
+
+    if let Some((machine_key, session_id)) = parse_remote_scanned_session_path(session_path)
+        && let Some(machine) = shell
+            .server
+            .remote_machines()
+            .iter()
+            .find(|machine| machine.machine_key == machine_key)
+        && let Some(scanned) = machine
+            .sessions
+            .iter()
+            .find(|scanned| scanned.session_path == session_path || scanned.session_id == session_id)
+    {
+        let label = if scanned.title_hint.trim().is_empty() {
+            fallback_label_for_session_path(session_path)
+        } else {
+            scanned.title_hint.clone()
+        };
+        return Some(BrowserRow {
+            kind: BrowserRowKind::Session,
+            full_path: session_path.to_string(),
+            label: label.clone(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: Some(label),
+            depth: 0,
+            host_label: machine.machine_key.clone(),
+            descendant_sessions: 0,
+            expanded: false,
+            session_id: Some(scanned.session_id.clone()),
+            session_cwd: Some(scanned.cwd.clone()),
+        });
+    }
+
+    let path = Path::new(session_path);
+    let codex_identity = read_codex_session_identity_fields(path).ok().flatten();
+    let label = fallback_label_for_session_path(session_path);
+    Some(BrowserRow {
+        kind: if codex_identity.is_some() {
+            BrowserRowKind::Session
+        } else {
+            BrowserRowKind::Document
+        },
+        full_path: session_path.to_string(),
+        label: label.clone(),
+        detail_label: String::new(),
+        document_kind: codex_identity.is_none().then_some(WorkspaceDocumentKind::Note),
+        group_kind: None,
+        session_title: Some(label),
+        depth: 0,
+        host_label: String::new(),
+        descendant_sessions: 0,
+        expanded: false,
+        session_id: codex_identity.as_ref().map(|(session_id, _)| session_id.clone()),
+        session_cwd: codex_identity
+            .map(|(_, cwd)| cwd)
+            .or_else(|| path.parent().map(|parent| parent.display().to_string())),
+    })
+}
+
+fn session_cwd_for_managed_session(session: &ManagedSessionView) -> Option<String> {
+    let cwd = metadata_value(session, "Cwd");
+    if !cwd.trim().is_empty() {
+        return Some(cwd);
+    }
+    session
+        .metadata
+        .iter()
+        .find(|entry| entry.label == "Path")
+        .map(|entry| entry.value.clone())
+        .or_else(|| session.ssh_target.clone())
+}
+
+fn fallback_label_for_session_path(session_path: &str) -> String {
+    Path::new(session_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .map(|name| name.trim_end_matches(".jsonl").to_string())
+        .unwrap_or_else(|| session_path.to_string())
+}
+
+fn normalize_live_session_path(session_path: &str) -> String {
+    session_path
+        .strip_prefix("local::")
+        .map(|id| format!("local://{id}"))
+        .unwrap_or_else(|| session_path.to_string())
 }
 
 fn app_control_drag_pointer(row: &BrowserRow, placement: Option<DragDropPlacement>) -> (f64, f64) {
@@ -9358,6 +9549,25 @@ async fn process_pending_app_control_requests(
         } => {
             let resolved_view_mode = view_mode.map(workspace_view_mode_from_app_control);
             let maybe_row = state.with(|shell| resolve_app_control_row(shell, &session_path));
+            append_trace_event(
+                &home,
+                "ui",
+                "app_control",
+                "open_path_resolve",
+                json!({
+                    "request_id": request.request_id,
+                    "session_path": session_path,
+                    "resolved": maybe_row.as_ref().map(|row| {
+                        json!({
+                            "path": row.full_path,
+                            "label": row.label,
+                            "kind": format!("{:?}", row.kind),
+                            "session_id": row.session_id,
+                            "cwd": row.session_cwd,
+                        })
+                    }),
+                }),
+            );
             match maybe_row {
                 Some(row) => {
                     if let Some(mode) = resolved_view_mode {
@@ -14131,6 +14341,7 @@ fn TerminalCanvas(
             let mut terminal_has_visible_output = false;
             let mut traced_first_output = false;
             let mut traced_first_meaningful_output = false;
+            let mut traced_attach_ready = false;
             loop {
                 tokio::select! {
                     event = eval.recv::<TerminalJsEvent>() => {
@@ -14248,6 +14459,37 @@ fn TerminalCanvas(
                                         let _ = eval.send(TerminalJsCommand::Write { data });
                                         placeholder_rendered = true;
                                     }
+                                    let attach_ready =
+                                        saw_meaningful_output
+                                            || (!is_remote_resume_session && saw_visible_output);
+                                    if attach_ready {
+                                        if !traced_attach_ready {
+                                            append_trace_event(
+                                                &trace_home,
+                                                "ui",
+                                                "terminal_mount",
+                                                "attach_ready",
+                                                json!({
+                                                    "session_path": session_path.clone(),
+                                                    "cursor": cursor,
+                                                    "meaningful": saw_meaningful_output,
+                                                    "visible": saw_visible_output,
+                                                }),
+                                            );
+                                            traced_attach_ready = true;
+                                            let _ = safe_shell_mut(
+                                                state,
+                                                "terminal_attach_ready",
+                                                |shell| {
+                                                    shell.terminal_attach_in_flight.remove(
+                                                        &session_path,
+                                                    );
+                                                },
+                                            );
+                                            maybe_spawn_missing_remote_machine_refreshes(state);
+                                            maybe_spawn_missing_managed_cli_refreshes(state);
+                                        }
+                                    }
                                     if saw_meaningful_output {
                                         if !traced_first_meaningful_output {
                                             append_trace_event(
@@ -14261,17 +14503,6 @@ fn TerminalCanvas(
                                                 }),
                                             );
                                             traced_first_meaningful_output = true;
-                                            let _ = safe_shell_mut(
-                                                state,
-                                                "terminal_attach_meaningful_output",
-                                                |shell| {
-                                                    shell.terminal_attach_in_flight.remove(
-                                                        &session_path,
-                                                    );
-                                                },
-                                            );
-                                            maybe_spawn_missing_remote_machine_refreshes(state);
-                                            maybe_spawn_missing_managed_cli_refreshes(state);
                                         }
                                         terminal_has_meaningful_output.set(true);
                                     }
@@ -14520,6 +14751,37 @@ fn TerminalCanvas(
                                     let _ = eval.send(TerminalJsCommand::Write { data });
                                     placeholder_rendered = true;
                                 }
+                                let attach_ready =
+                                    saw_meaningful_output
+                                        || (!is_remote_resume_session && saw_visible_output);
+                                if attach_ready {
+                                    if !traced_attach_ready {
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "attach_ready",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "cursor": cursor,
+                                                "meaningful": saw_meaningful_output,
+                                                "visible": saw_visible_output,
+                                            }),
+                                        );
+                                        traced_attach_ready = true;
+                                        let _ = safe_shell_mut(
+                                            state,
+                                            "terminal_attach_ready",
+                                            |shell| {
+                                                shell.terminal_attach_in_flight.remove(
+                                                    &session_path,
+                                                );
+                                            },
+                                        );
+                                        maybe_spawn_missing_remote_machine_refreshes(state);
+                                        maybe_spawn_missing_managed_cli_refreshes(state);
+                                    }
+                                }
                                 if saw_meaningful_output {
                                     if !traced_first_meaningful_output {
                                         append_trace_event(
@@ -14533,17 +14795,6 @@ fn TerminalCanvas(
                                             }),
                                         );
                                         traced_first_meaningful_output = true;
-                                        let _ = safe_shell_mut(
-                                            state,
-                                            "terminal_attach_meaningful_output",
-                                            |shell| {
-                                                shell.terminal_attach_in_flight.remove(
-                                                    &session_path,
-                                                );
-                                            },
-                                        );
-                                        maybe_spawn_missing_remote_machine_refreshes(state);
-                                        maybe_spawn_missing_managed_cli_refreshes(state);
                                     }
                                     terminal_has_meaningful_output.set(true);
                                 }
@@ -14924,6 +15175,42 @@ where
         trace_home,
         "ui",
         "terminal_io",
+        "dispatch",
+        json!({
+            "label": label,
+            "queue_delay_ms": started_at_ms.saturating_sub(queued_at_ms),
+        }),
+    );
+    result
+}
+
+async fn run_dedicated_interactive_request_io<T, F>(
+    label: &str,
+    trace_home: &Path,
+    work: F,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    let queued_at_ms = current_millis();
+    let (tx, rx) = oneshot::channel();
+    let worker_name = format!("yggterm-{label}-{queued_at_ms}");
+    thread::Builder::new()
+        .name(worker_name.clone())
+        .spawn(move || {
+            let started_at_ms = current_millis();
+            let result = work();
+            let _ = tx.send((started_at_ms, result));
+        })
+        .with_context(|| format!("spawning dedicated interactive worker {worker_name}"))?;
+    let (started_at_ms, result) = rx
+        .await
+        .map_err(|error| anyhow!("waiting for dedicated interactive worker {label}: {error}"))?;
+    append_trace_event(
+        trace_home,
+        "ui",
+        "interactive_request",
         "dispatch",
         json!({
             "label": label,
