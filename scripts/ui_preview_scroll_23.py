@@ -16,6 +16,7 @@ from ui_preview_23 import (
     expand_groups_until_target,
     launch_local_client,
     preview_ready,
+    preview_semantic_issues,
     read_png_size,
     run_process,
     titlebar_matches_viewport,
@@ -209,6 +210,7 @@ def main() -> int:
                     "font_family": font_family,
                     "font_family_ok": any(token in font_family.lower() for token in ("serif", "georgia", "iowan")),
                     "titlebar_matches_viewport": titlebar_matches_viewport(scrolled_state),
+                    "semantic_issues": preview_semantic_issues(scrolled_state),
                     "forbidden_hits": [
                         marker
                         for marker in FORBIDDEN_PREVIEW_MARKERS
@@ -260,6 +262,7 @@ def main() -> int:
         "titlebar_failures": len([item for item in results if not item.get("titlebar_matches_viewport", False)]),
         "viewport_size_failures": len([item for item in results if not item.get("viewport_size_matches", False)]),
         "font_failures": len([item for item in results if not item.get("font_family_ok", False)]),
+        "semantic_failures": len([item for item in results if item.get("semantic_issues")]),
         "forbidden_content_failures": len([item for item in results if item.get("forbidden_hits")]),
         "scroll_effect_failures": len([item for item in results if not item.get("scroll_effect_ok", False)]),
         "virtualization_failures": len([item for item in results if not item.get("virtualization_ok", False)]),
@@ -283,6 +286,7 @@ def main() -> int:
         and summary["titlebar_failures"] == 0
         and summary["viewport_size_failures"] == 0
         and summary["font_failures"] == 0
+        and summary["semantic_failures"] == 0
         and summary["forbidden_content_failures"] == 0
         and summary["scroll_effect_failures"] == 0
         and summary["virtualization_failures"] == 0

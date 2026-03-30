@@ -2965,32 +2965,149 @@ fn summarize_recent_context(messages: &[yggterm_core::TranscriptMessage]) -> Str
     generation_context_from_messages(messages)
 }
 
-fn preview_blocks_from_recent_context(recent_context: &str) -> Vec<SessionPreviewBlock> {
-    recent_context
-        .lines()
-        .filter_map(|line| {
+fn parse_recent_context_sections(
+    recent_context: &str,
+) -> (Vec<String>, Vec<SessionPreviewBlock>, Vec<SessionRenderedSection>) {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum RecentContextSection {
+        None,
+        Goals,
+        Turns,
+        Notes,
+    }
+
+    fn push_recent_context_block(
+        blocks: &mut Vec<SessionPreviewBlock>,
+        role: &'static str,
+        tone: PreviewTone,
+        content: &str,
+    ) {
+        let compact = content
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim()
+            .to_string();
+        if compact.is_empty() {
+            return;
+        }
+        blocks.push(SessionPreviewBlock {
+            role,
+            timestamp: "remote:scan".to_string(),
+            tone,
+            folded: false,
+            lines: vec![compact],
+        });
+    }
+
+    let mut section = RecentContextSection::None;
+    let mut goals = Vec::new();
+    let mut blocks = Vec::new();
+    let mut notes = Vec::new();
+
+    for line in recent_context.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match trimmed {
+            "PRIMARY USER GOALS:" => {
+                section = RecentContextSection::Goals;
+                continue;
+            }
+            "RECENT SUBSTANTIVE TURNS:" | "RECENT CONTEXT:" => {
+                section = RecentContextSection::Turns;
+                continue;
+            }
+            "SERVER NOTES:" => {
+                section = RecentContextSection::Notes;
+                continue;
+            }
+            _ => {}
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("USER:") {
+            push_recent_context_block(&mut blocks, "USER", PreviewTone::User, rest.trim());
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("ASSISTANT:") {
+            push_recent_context_block(
+                &mut blocks,
+                "ASSISTANT",
+                PreviewTone::Assistant,
+                rest.trim(),
+            );
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("SYSTEM:") {
+            push_recent_context_block(
+                &mut blocks,
+                "SYSTEM",
+                PreviewTone::Assistant,
+                rest.trim(),
+            );
+            continue;
+        }
+
+        match section {
+            RecentContextSection::Goals => {
+                let goal = trimmed
+                    .strip_prefix("- ")
+                    .unwrap_or(trimmed)
+                    .trim()
+                    .to_string();
+                if !goal.is_empty() {
+                    goals.push(goal);
+                }
+            }
+            RecentContextSection::Notes => {
+                notes.push(trimmed.to_string());
+            }
+            RecentContextSection::Turns | RecentContextSection::None => {}
+        }
+    }
+
+    if blocks.is_empty() {
+        for line in recent_context.lines() {
             let trimmed = line.trim();
             if trimmed.is_empty() {
-                return None;
+                continue;
             }
-            let (role, tone, content) = if let Some(rest) = trimmed.strip_prefix("USER:") {
-                ("USER", PreviewTone::User, rest.trim())
+            if let Some(rest) = trimmed.strip_prefix("USER:") {
+                push_recent_context_block(&mut blocks, "USER", PreviewTone::User, rest.trim());
             } else if let Some(rest) = trimmed.strip_prefix("ASSISTANT:") {
-                ("ASSISTANT", PreviewTone::Assistant, rest.trim())
+                push_recent_context_block(
+                    &mut blocks,
+                    "ASSISTANT",
+                    PreviewTone::Assistant,
+                    rest.trim(),
+                );
             } else if let Some(rest) = trimmed.strip_prefix("SYSTEM:") {
-                ("SYSTEM", PreviewTone::Assistant, rest.trim())
-            } else {
-                ("ASSISTANT", PreviewTone::Assistant, trimmed)
-            };
-            (!content.is_empty()).then(|| SessionPreviewBlock {
-                role,
-                timestamp: "remote:scan".to_string(),
-                tone,
-                folded: false,
-                lines: vec![content.to_string()],
-            })
-        })
-        .collect()
+                push_recent_context_block(
+                    &mut blocks,
+                    "SYSTEM",
+                    PreviewTone::Assistant,
+                    rest.trim(),
+                );
+            }
+        }
+    }
+
+    let mut rendered_sections = Vec::new();
+    if !goals.is_empty() {
+        rendered_sections.push(SessionRenderedSection {
+            title: "Primary User Goals",
+            lines: goals.clone(),
+        });
+    }
+    if !notes.is_empty() {
+        rendered_sections.push(SessionRenderedSection {
+            title: "Server Notes",
+            lines: notes,
+        });
+    }
+
+    (goals, blocks, rendered_sections)
 }
 
 fn modified_epoch_display(epoch: i64) -> String {
@@ -3018,18 +3135,11 @@ fn apply_remote_scanned_session_preview(
     {
         session.title = scanned.title_hint.clone();
     }
-    let preview_blocks = preview_blocks_from_recent_context(&scanned.recent_context);
+    let (primary_goals, preview_blocks, rendered_sections) =
+        parse_recent_context_sections(&scanned.recent_context);
     if !preview_blocks.is_empty() {
         session.preview.blocks = preview_blocks;
-        session.rendered_sections = vec![SessionRenderedSection {
-            title: "Recent Context",
-            lines: scanned
-                .recent_context
-                .lines()
-                .map(|line| line.trim().to_string())
-                .filter(|line| !line.is_empty())
-                .collect(),
-        }];
+        session.rendered_sections = rendered_sections;
     }
     let messages = format!(
         "{} user · {} assistant",
@@ -3057,6 +3167,13 @@ fn apply_remote_scanned_session_preview(
         "Updated",
         modified_epoch_display(scanned.modified_epoch),
     );
+    if let Some(goal) = primary_goals.first() {
+        upsert_session_metadata(
+            &mut session.preview.summary,
+            "Goal",
+            goal.clone(),
+        );
+    }
     if let Some(precis) = &scanned.cached_precis {
         upsert_session_metadata(&mut session.preview.summary, "Precis", precis.clone());
     }
@@ -7231,16 +7348,17 @@ fn short_session_id(session_id: &str) -> String {
 mod tests {
     use super::{
         GhosttyHostSupport, PersistedDaemonState, PersistedLiveSession, REMOTE_OUTPUT_SENTINEL,
-        RemoteCommandCacheEntry, RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot,
-        RemoteScannedSession, SessionKind, SessionNode, SessionNodeKind, SshConnectTarget,
-        TerminalBackend, TerminalLaunchPhase, UiTheme, WorkspaceViewMode, YggtermServer,
-        current_millis_u64,
+        PreviewTone, RemoteCommandCacheEntry, RemoteDeployState, RemoteMachineHealth,
+        RemoteMachineSnapshot, RemoteScannedSession, SessionKind, SessionNode, SessionNodeKind,
+        SshConnectTarget, TerminalBackend, TerminalLaunchPhase, UiTheme, WorkspaceViewMode,
+        YggtermServer, current_millis_u64,
         dedupe_remote_scanned_sessions, load_remote_machine_sessions_from_mirror,
         mirror_remote_machine_sessions, parse_screen_session_ref, parse_stored_transcript,
-        remote_cache_key, remote_command_cache, remote_resume_shell_command,
-        remote_saved_codex_session_exists, remote_scan_roots_with_parents,
-        remote_scanned_session_path, remote_ssh_launch_command, should_fallback_to_python,
-        stored_session_launch_command, strip_remote_payload_noise,
+        parse_recent_context_sections, remote_cache_key, remote_command_cache,
+        remote_resume_shell_command, remote_saved_codex_session_exists,
+        remote_scan_roots_with_parents, remote_scanned_session_path,
+        remote_ssh_launch_command, should_fallback_to_python, stored_session_launch_command,
+        strip_remote_payload_noise,
         synthesize_remote_scanned_session_view,
     };
     use anyhow::Result;
@@ -7493,6 +7611,29 @@ mod tests {
         assert_eq!(server.active_session_path(), Some(session_path.as_str()));
         assert_eq!(server.active_view_mode, WorkspaceViewMode::Rendered);
         Ok(())
+    }
+
+    #[test]
+    fn recent_context_goals_do_not_become_fake_assistant_turns() {
+        let (goals, blocks, sections) = parse_recent_context_sections(
+            "PRIMARY USER GOALS:\n- Make a passwordless user pi and copy our dotfiles to this user.\n\nRECENT SUBSTANTIVE TURNS:\nUSER: Make a passwordless user pi and copy our ~/.{{all dot files with permissions and ownership adjusted}} to this user.\nASSISTANT: I'll create the pi account without a password, then copy the dotfiles and fix ownership.",
+        );
+
+        assert_eq!(
+            goals,
+            vec!["Make a passwordless user pi and copy our dotfiles to this user.".to_string()]
+        );
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].tone, PreviewTone::User);
+        assert!(
+            blocks[0].lines[0]
+                .contains("Make a passwordless user pi and copy our ~/."),
+            "unexpected first user preview block: {:?}",
+            blocks[0].lines
+        );
+        assert_eq!(blocks[1].tone, PreviewTone::Assistant);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].title, "Primary User Goals");
     }
 
     #[test]
