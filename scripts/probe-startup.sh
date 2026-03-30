@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_BIN="${ROOT_DIR}/target/debug/yggterm"
 PERF_FILE="${HOME}/.yggterm/perf-telemetry.jsonl"
+TRACE_FILE="${HOME}/.yggterm/event-trace.jsonl"
 SUMMARY_FILE="/tmp/yggterm-perf-summary.txt"
 STARTUP_FILE="/tmp/yggterm-startup-measure.txt"
 STDOUT_FILE="/tmp/yggterm-gui.out"
@@ -15,16 +16,57 @@ rm -f "${PERF_FILE}" "${SUMMARY_FILE}" "${STARTUP_FILE}" "${STDOUT_FILE}" "${STD
 pkill -f "${APP_BIN}" || true
 
 start_ms="$(date +%s%3N)"
-DISPLAY="${DISPLAY:-:10.0}" "${APP_BIN}" >"${STDOUT_FILE}" 2>"${STDERR_FILE}" &
+DISPLAY="${DISPLAY:-:10.0}" YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF=1 "${APP_BIN}" >"${STDOUT_FILE}" 2>"${STDERR_FILE}" &
 app_pid="$!"
 
 for _ in $(seq 1 400); do
-  win="$(DISPLAY="${DISPLAY:-:10.0}" xdotool search --name 'yggterm' 2>/dev/null | head -n 1 || true)"
+  if ! kill -0 "${app_pid}" 2>/dev/null; then
+    break
+  fi
+  spawn_json="$(python3 - <<'PY' "${TRACE_FILE}" "${app_pid}" "${start_ms}"
+import json, sys
+from pathlib import Path
+trace_path = Path(sys.argv[1])
+pid = int(sys.argv[2])
+start_ms = int(sys.argv[3])
+if not trace_path.exists():
+    sys.exit(1)
+for line in reversed(trace_path.read_text(encoding="utf-8").splitlines()[-4000:]):
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    payload = event.get("payload") or {}
+    if (
+        event.get("pid") == pid
+        and event.get("category") == "startup"
+        and event.get("name") == "window_spawned"
+        and (event.get("ts_ms") or 0) >= start_ms
+    ):
+        print(json.dumps(payload))
+        sys.exit(0)
+sys.exit(1)
+PY
+  )" || spawn_json=""
+  if [[ -n "${spawn_json}" ]]; then
+    python3 - <<'PY' "${STARTUP_FILE}" "${spawn_json}"
+import json, sys
+payload = json.loads(sys.argv[2])
+window = payload.get("window") or {}
+with open(sys.argv[1], "w", encoding="utf-8") as fh:
+    fh.write(f"window_ms={payload.get('elapsed_ms', '')}\n")
+    fh.write(f"window_id={window.get('window_id', '')}\n")
+    fh.write(f"window_pid={window.get('pid', '')}\n")
+PY
+    break
+  fi
+  win="$(DISPLAY="${DISPLAY:-:10.0}" xdotool search --pid "${app_pid}" 2>/dev/null | head -n 1 || true)"
   if [[ -n "${win}" ]]; then
     now_ms="$(date +%s%3N)"
     {
       echo "window_ms=$((now_ms - start_ms))"
       echo "window_id=${win}"
+      echo "window_pid=${app_pid}"
     } >"${STARTUP_FILE}"
     break
   fi
