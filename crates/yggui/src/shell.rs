@@ -184,6 +184,8 @@ struct ShellState {
     next_notification_id: u64,
     titlebar_new_menu_open: bool,
     titlebar_session_menu_open: bool,
+    alt_overlay_active: bool,
+    alt_overlay_sequence: String,
     selected_tree_paths: HashSet<String>,
     selection_anchor: Option<String>,
     context_menu_row: Option<BrowserRow>,
@@ -346,6 +348,8 @@ struct RenderSnapshot {
     notifications: Vec<ToastNotification>,
     titlebar_new_menu_open: bool,
     titlebar_session_menu_open: bool,
+    alt_overlay_active: bool,
+    alt_overlay_sequence: String,
     selected_tree_paths: Vec<String>,
     context_menu_row: Option<BrowserRow>,
     context_menu_position: Option<(f64, f64)>,
@@ -382,6 +386,29 @@ type SharedSnapshot = Arc<RenderSnapshot>;
 struct SearchCommandSuggestion {
     command: String,
     description: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AltOverlayAction {
+    ToggleSidebar,
+    SetViewMode(WorkspaceViewMode),
+    ToggleConnect,
+    ToggleNotifications,
+    ToggleSettings,
+    ToggleMetadata,
+    ToggleFullscreen,
+    ToggleAlwaysOnTop,
+    OpenInsertMenu,
+    StartSession,
+    StartTerminal,
+    CreatePaper,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AltOverlayResolution {
+    Pending(String),
+    Action(AltOverlayAction),
+    Invalid,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -644,6 +671,8 @@ impl ShellState {
             next_notification_id: 1,
             titlebar_new_menu_open: false,
             titlebar_session_menu_open: false,
+            alt_overlay_active: false,
+            alt_overlay_sequence: String::new(),
             selected_tree_paths: HashSet::new(),
             selection_anchor: None,
             context_menu_row: None,
@@ -889,6 +918,8 @@ impl ShellState {
             notifications: self.notifications.clone(),
             titlebar_new_menu_open: self.titlebar_new_menu_open,
             titlebar_session_menu_open: self.titlebar_session_menu_open,
+            alt_overlay_active: self.alt_overlay_active,
+            alt_overlay_sequence: self.alt_overlay_sequence.clone(),
             selected_tree_paths: self.selected_tree_paths.iter().cloned().collect(),
             context_menu_row: self.context_menu_row.clone(),
             context_menu_position: self.context_menu_position,
@@ -2410,6 +2441,18 @@ impl ShellState {
 
     fn close_titlebar_session_menu(&mut self) {
         self.titlebar_session_menu_open = false;
+    }
+
+    fn activate_alt_overlay(&mut self) {
+        self.alt_overlay_active = true;
+        self.alt_overlay_sequence.clear();
+        self.titlebar_new_menu_open = false;
+        self.titlebar_session_menu_open = false;
+    }
+
+    fn clear_alt_overlay(&mut self) {
+        self.alt_overlay_active = false;
+        self.alt_overlay_sequence.clear();
     }
 
     fn push_notification(
@@ -5551,8 +5594,6 @@ fn maybe_spawn_background_copy_generation(mut state: Signal<ShellState>) {
             || shell.needs_initial_server_sync
             || PASSIVE_COPY_SUSPENDED.load(Ordering::Relaxed)
             || shell.passive_copy_suspended
-            || shell.server.active_view_mode() == WorkspaceViewMode::Terminal
-            || shell.server.active_session().is_some()
             || !shell.title_requests_in_flight.is_empty()
             || !shell.summary_requests_in_flight.is_empty()
             || shell.next_background_copy_scan_after_ms > now
@@ -6236,6 +6277,184 @@ fn search_command_suggestions(query: &str) -> Vec<SearchCommandSuggestion> {
         .collect()
 }
 
+fn resolve_alt_overlay_sequence(sequence: &str) -> AltOverlayResolution {
+    match sequence {
+        "" => AltOverlayResolution::Pending(String::new()),
+        "b" => AltOverlayResolution::Action(AltOverlayAction::ToggleSidebar),
+        "v" => AltOverlayResolution::Action(AltOverlayAction::SetViewMode(
+            WorkspaceViewMode::Rendered,
+        )),
+        "t" => AltOverlayResolution::Action(AltOverlayAction::SetViewMode(
+            WorkspaceViewMode::Terminal,
+        )),
+        "c" => AltOverlayResolution::Action(AltOverlayAction::ToggleConnect),
+        "n" => AltOverlayResolution::Action(AltOverlayAction::ToggleNotifications),
+        "g" => AltOverlayResolution::Action(AltOverlayAction::ToggleSettings),
+        "m" => AltOverlayResolution::Action(AltOverlayAction::ToggleMetadata),
+        "f" => AltOverlayResolution::Action(AltOverlayAction::ToggleFullscreen),
+        "a" => AltOverlayResolution::Action(AltOverlayAction::ToggleAlwaysOnTop),
+        "i" => AltOverlayResolution::Action(AltOverlayAction::OpenInsertMenu),
+        "is" => AltOverlayResolution::Action(AltOverlayAction::StartSession),
+        "it" => AltOverlayResolution::Action(AltOverlayAction::StartTerminal),
+        "ip" => AltOverlayResolution::Action(AltOverlayAction::CreatePaper),
+        _ => AltOverlayResolution::Invalid,
+    }
+}
+
+fn alt_overlay_badge_visible(snapshot: &RenderSnapshot, prefix: &str) -> bool {
+    snapshot.alt_overlay_active && snapshot.alt_overlay_sequence == prefix
+}
+
+fn execute_alt_overlay_action(mut state: Signal<ShellState>, action: AltOverlayAction) {
+    match action {
+        AltOverlayAction::ToggleSidebar => state.with_mut(|shell| {
+            shell.clear_alt_overlay();
+            shell.toggle_sidebar();
+        }),
+        AltOverlayAction::SetViewMode(mode) => {
+            state.with_mut(|shell| shell.clear_alt_overlay());
+            spawn_set_view_mode(state, mode);
+        }
+        AltOverlayAction::ToggleConnect => state.with_mut(|shell| {
+            shell.clear_alt_overlay();
+            shell.toggle_connect_panel();
+        }),
+        AltOverlayAction::ToggleNotifications => state.with_mut(|shell| {
+            shell.clear_alt_overlay();
+            shell.toggle_notifications_panel();
+        }),
+        AltOverlayAction::ToggleSettings => state.with_mut(|shell| {
+            shell.clear_alt_overlay();
+            shell.toggle_settings_panel();
+        }),
+        AltOverlayAction::ToggleMetadata => state.with_mut(|shell| {
+            shell.clear_alt_overlay();
+            shell.toggle_metadata_panel();
+        }),
+        AltOverlayAction::ToggleFullscreen => state.with_mut(|shell| {
+            shell.clear_alt_overlay();
+            shell.toggle_fullscreen();
+        }),
+        AltOverlayAction::ToggleAlwaysOnTop => state.with_mut(|shell| {
+            shell.clear_alt_overlay();
+            shell.toggle_always_on_top();
+        }),
+        AltOverlayAction::OpenInsertMenu => state.with_mut(|shell| {
+            shell.alt_overlay_active = true;
+            shell.alt_overlay_sequence = "i".to_string();
+            shell.titlebar_session_menu_open = false;
+            shell.titlebar_new_menu_open = true;
+        }),
+        AltOverlayAction::StartSession => {
+            let preferred_agent_kind = preferred_agent_session_kind(&state.read().settings);
+            let (cwd, title_hint) = state.with_mut(|shell| {
+                shell.clear_alt_overlay();
+                shell.close_titlebar_new_menu();
+                current_new_session_context(shell, preferred_agent_kind)
+            });
+            spawn_server_snapshot_action(state, "starting session".to_string(), move |endpoint| {
+                start_local_session_at(
+                    &endpoint,
+                    preferred_agent_kind,
+                    cwd.as_deref(),
+                    title_hint.as_deref(),
+                )
+            });
+        }
+        AltOverlayAction::StartTerminal => {
+            let launch_context = state.with_mut(|shell| {
+                shell.clear_alt_overlay();
+                shell.close_titlebar_new_menu();
+                terminal_launch_context(shell)
+            });
+            match launch_context {
+                TerminalLaunchContext::Local { cwd, title_hint } => {
+                    spawn_server_snapshot_action(
+                        state,
+                        "starting terminal".to_string(),
+                        move |endpoint| {
+                            start_local_session_at(
+                                &endpoint,
+                                SessionKind::Shell,
+                                cwd.as_deref(),
+                                title_hint.as_deref(),
+                            )
+                        },
+                    );
+                }
+                TerminalLaunchContext::Remote {
+                    ssh_target,
+                    prefix,
+                    cwd,
+                    title_hint,
+                } => {
+                    spawn_server_snapshot_action(
+                        state,
+                        "starting ssh terminal".to_string(),
+                        move |endpoint| {
+                            start_ssh_session_at(
+                                &endpoint,
+                                &ssh_target,
+                                prefix.as_deref(),
+                                cwd.as_deref(),
+                                title_hint.as_deref(),
+                            )
+                        },
+                    );
+                }
+            }
+        }
+        AltOverlayAction::CreatePaper => {
+            state.with_mut(|shell| {
+                shell.clear_alt_overlay();
+                shell.close_titlebar_new_menu();
+            });
+            queue_new_document(state);
+        }
+    }
+}
+
+fn handle_alt_overlay_key(mut state: Signal<ShellState>, key: Key) -> bool {
+    if key == Key::Alt {
+        state.with_mut(|shell| shell.activate_alt_overlay());
+        return true;
+    }
+
+    if !state.read().alt_overlay_active {
+        return false;
+    }
+
+    if key == Key::Escape {
+        state.with_mut(|shell| shell.clear_alt_overlay());
+        return true;
+    }
+
+    let Key::Character(chars) = key else {
+        return false;
+    };
+    let next_sequence = {
+        let shell = state.read();
+        format!("{}{}", shell.alt_overlay_sequence, chars.to_ascii_lowercase())
+    };
+    match resolve_alt_overlay_sequence(&next_sequence) {
+        AltOverlayResolution::Pending(sequence) => {
+            state.with_mut(|shell| {
+                shell.alt_overlay_active = true;
+                shell.alt_overlay_sequence = sequence;
+            });
+            true
+        }
+        AltOverlayResolution::Action(action) => {
+            execute_alt_overlay_action(state, action);
+            true
+        }
+        AltOverlayResolution::Invalid => {
+            state.with_mut(|shell| shell.clear_alt_overlay());
+            true
+        }
+    }
+}
+
 fn execute_search_command(mut state: Signal<ShellState>, query: String) {
     let command = query.trim().to_ascii_lowercase();
     match command.as_str() {
@@ -6838,10 +7057,15 @@ fn merged_sidebar_rows_uncached(
     live_sessions: &[ManagedSessionView],
     expanded_paths: &HashSet<String>,
 ) -> Vec<BrowserRow> {
-    let promoted_live_sessions = live_sessions
+    let mut promoted_live_sessions = live_sessions
         .iter()
         .filter(|session| is_promoted_live_session(session))
         .collect::<Vec<_>>();
+    promoted_live_sessions.sort_by(|a, b| {
+        live_session_recency_key(remote_machines, b)
+            .cmp(&live_session_recency_key(remote_machines, a))
+            .then_with(|| a.session_path.cmp(&b.session_path))
+    });
 
     if ssh_targets.is_empty() && remote_machines.is_empty() && promoted_live_sessions.is_empty() {
         return stored_rows.to_vec();
@@ -6889,6 +7113,9 @@ fn merged_sidebar_rows_uncached(
                 .retain(|session| !promoted_remote_paths.contains(&session.session_path));
         }
     }
+    for machine in machine_rows.values_mut() {
+        sort_remote_scanned_sessions_by_recency(&mut machine.scanned_sessions);
+    }
     push_live_session_rows(
         &mut rows,
         &promoted_live_sessions,
@@ -6900,6 +7127,19 @@ fn merged_sidebar_rows_uncached(
     }
     rows.extend_from_slice(stored_rows);
     rows
+}
+
+fn live_session_recency_key(
+    remote_machines: &[RemoteMachineSnapshot],
+    session: &ManagedSessionView,
+) -> (i64, String) {
+    let remote_epoch = remote_machines
+        .iter()
+        .flat_map(|machine| machine.sessions.iter())
+        .find(|candidate| candidate.session_path == session.session_path)
+        .map(|candidate| candidate.modified_epoch)
+        .unwrap_or(0);
+    (remote_epoch, session.id.clone())
 }
 
 fn push_live_session_rows(
@@ -7117,6 +7357,15 @@ fn merge_remote_live_sessions(
                 session,
             ));
     }
+}
+
+fn sort_remote_scanned_sessions_by_recency(sessions: &mut [RemoteScannedSession]) {
+    sessions.sort_by(|a, b| {
+        b.modified_epoch
+            .cmp(&a.modified_epoch)
+            .then_with(|| b.started_at.cmp(&a.started_at))
+            .then_with(|| a.session_path.cmp(&b.session_path))
+    });
 }
 
 fn is_local_live_session_path(path: &str) -> bool {
@@ -9359,6 +9608,8 @@ fn describe_app_state_snapshot(
             "preview_layout": preview_layout_mode_label(shell.preview_layout),
             "search_query": shell.search_query,
             "search_focused": shell.search_focused,
+            "alt_overlay_active": shell.alt_overlay_active,
+            "alt_overlay_sequence": shell.alt_overlay_sequence,
             "selected_tree_paths": selected_tree_paths,
             "selection_anchor": shell.selection_anchor,
             "tree_rename_path": shell.tree_rename_path,
@@ -11264,38 +11515,9 @@ fn app() -> Element {
         };
         if !has_good_title || !has_summary || summary_stale {
             spawn_active_session_copy_hydration(state, session.clone());
-        }
-        let generation_target = copy_generation_target_for_session(&state.read().server, &session);
-        let has_generation_context = generation_target
-            .as_ref()
-            .and_then(|target| target.remote_context.as_deref())
-            .is_some_and(|context| !context.trim().is_empty())
-            || preview_context_from_session(&session).is_some();
-        let can_fetch_remote_generation_context = generation_target
-            .as_ref()
-            .is_some_and(target_can_fetch_remote_generation_context);
-        if supports_generated_session_copy(&session)
-            && !has_good_title
-            && (!session.session_path.starts_with("remote-session://")
-                || has_generation_context
-                || can_fetch_remote_generation_context)
-        {
-            queue_active_session_title_generation(state, false);
-        }
-        if has_summary && !summary_stale {
             state.with_mut(|shell| shell.next_background_copy_scan_after_ms = current_millis());
             maybe_spawn_background_copy_generation(state);
-            return;
         }
-        if session.session_path.starts_with("remote-session://")
-            && !has_generation_context
-            && !can_fetch_remote_generation_context
-        {
-            state.with_mut(|shell| shell.next_background_copy_scan_after_ms = current_millis());
-            maybe_spawn_background_copy_generation(state);
-            return;
-        }
-        spawn_summary_generation(state, session, summary_stale, false);
         state.with_mut(|shell| shell.next_background_copy_scan_after_ms = current_millis());
         maybe_spawn_background_copy_generation(state);
     });
@@ -11591,6 +11813,7 @@ fn app() -> Element {
             ),
             onclick: move |_| {
                 state.with_mut(|shell| {
+                    shell.clear_alt_overlay();
                     shell.close_titlebar_new_menu();
                     shell.close_titlebar_session_menu();
                 })
@@ -11602,6 +11825,10 @@ fn app() -> Element {
                 }
             },
             onkeydown: move |evt| {
+                if handle_alt_overlay_key(state, evt.key()) {
+                    evt.prevent_default();
+                    return;
+                }
                 let is_accel = evt.modifiers().contains(Modifiers::CONTROL)
                     || evt.modifiers().contains(Modifiers::META);
                 if is_accel
@@ -12326,6 +12553,12 @@ fn Titlebar(
                         onmousedown: |evt| evt.stop_propagation(),
                         ondoubleclick: |evt| evt.stop_propagation(),
                         onclick: move |_| on_toggle_sidebar.call(()),
+                        if alt_overlay_badge_visible(&snapshot, "") {
+                            span {
+                                style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:2px;",
+                                "B"
+                            }
+                        }
                         "☰"
                     }
                     div {
@@ -12338,6 +12571,12 @@ fn Titlebar(
                             ),
                             ondoubleclick: |evt| evt.stop_propagation(),
                             onclick: move |_| on_set_view_mode.call(WorkspaceViewMode::Rendered),
+                            if alt_overlay_badge_visible(&snapshot, "") {
+                                span {
+                                    style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:5px;",
+                                    "V"
+                                }
+                            }
                             "Preview"
                         }
                         button {
@@ -12347,6 +12586,12 @@ fn Titlebar(
                             ),
                             ondoubleclick: |evt| evt.stop_propagation(),
                             onclick: move |_| on_set_view_mode.call(WorkspaceViewMode::Terminal),
+                            if alt_overlay_badge_visible(&snapshot, "") {
+                                span {
+                                    style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:5px;",
+                                    "T"
+                                }
+                            }
                             "Terminal"
                         }
                     }
@@ -12363,6 +12608,12 @@ fn Titlebar(
                                 if snapshot.titlebar_new_menu_open { snapshot.palette.accent } else { snapshot.palette.text }
                             ),
                             onclick: move |_| on_toggle_new_menu.call(()),
+                            if alt_overlay_badge_visible(&snapshot, "") {
+                                span {
+                                    style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800;",
+                                    "I"
+                                }
+                            }
                             "+"
                             span {
                                 style: format!(
@@ -12383,16 +12634,34 @@ fn Titlebar(
                                 button {
                                     style: titlebar_new_action_style(snapshot.palette),
                                     onclick: move |_| on_start_session.call(()),
+                                    if alt_overlay_badge_visible(&snapshot, "i") {
+                                        span {
+                                            style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:8px;",
+                                            "S"
+                                        }
+                                    }
                                     "New Session"
                                 }
                                 button {
                                     style: titlebar_new_action_style(snapshot.palette),
                                     onclick: move |_| on_start_terminal.call(()),
+                                    if alt_overlay_badge_visible(&snapshot, "i") {
+                                        span {
+                                            style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:8px;",
+                                            "T"
+                                        }
+                                    }
                                     "New Terminal"
                                 }
                                 button {
                                     style: titlebar_new_action_style(snapshot.palette),
                                     onclick: move |_| on_create_paper.call(()),
+                                    if alt_overlay_badge_visible(&snapshot, "i") {
+                                        span {
+                                            style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:8px;",
+                                            "P"
+                                        }
+                                    }
                                     "New Paper"
                                 }
                             }
@@ -12607,6 +12876,12 @@ fn Titlebar(
                         onmousedown: |evt| evt.stop_propagation(),
                         ondoubleclick: |evt| evt.stop_propagation(),
                         onclick: move |_| on_toggle_connect.call(()),
+                        if alt_overlay_badge_visible(&snapshot, "") {
+                            span {
+                                style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:6px;",
+                                "C"
+                            }
+                        }
                         "Connect SSH"
                     }
                     button {
@@ -12617,6 +12892,12 @@ fn Titlebar(
                         onmousedown: |evt| evt.stop_propagation(),
                         ondoubleclick: |evt| evt.stop_propagation(),
                         onclick: move |_| on_toggle_notifications.call(()),
+                        if alt_overlay_badge_visible(&snapshot, "") {
+                            span {
+                                style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:6px;",
+                                "N"
+                            }
+                        }
                         BellIcon {}
                     }
                     button {
@@ -12628,6 +12909,12 @@ fn Titlebar(
                         onmousedown: |evt| evt.stop_propagation(),
                         ondoubleclick: |evt| evt.stop_propagation(),
                         onclick: move |_| on_toggle_settings.call(()),
+                        if alt_overlay_badge_visible(&snapshot, "") {
+                            span {
+                                style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:6px;",
+                                "G"
+                            }
+                        }
                         "⚙"
                     }
                     button {
@@ -12638,6 +12925,12 @@ fn Titlebar(
                         onmousedown: |evt| evt.stop_propagation(),
                         ondoubleclick: |evt| evt.stop_propagation(),
                         onclick: move |_| on_toggle_meta.call(()),
+                        if alt_overlay_badge_visible(&snapshot, "") {
+                            span {
+                                style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:6px;",
+                                "M"
+                            }
+                        }
                         "ⓘ"
                     }
                     div { style: "flex:1; min-width:24px; max-width:40px; height:100%;" }
@@ -19680,6 +19973,68 @@ mod tests {
     }
 
     #[test]
+    fn merged_sidebar_rows_sort_remote_sessions_by_modified_epoch_desc() {
+        let expanded_paths = HashSet::from([
+            "__remote_machine__/jojo".to_string(),
+            "__remote_folder__/jojo/home/pi".to_string(),
+        ]);
+        let rows = merged_sidebar_rows(
+            &[],
+            &[RemoteMachineSnapshot {
+                machine_key: "jojo".to_string(),
+                label: "jojo".to_string(),
+                ssh_target: "jojo".to_string(),
+                prefix: None,
+                remote_binary_expr: None,
+                remote_deploy_state: RemoteDeployState::Ready,
+                health: RemoteMachineHealth::Healthy,
+                sessions: vec![
+                    RemoteScannedSession {
+                        session_path: "remote-session://jojo/older".to_string(),
+                        session_id: "older".to_string(),
+                        cwd: "/home/pi".to_string(),
+                        started_at: "2026-03-23T10:00:00Z".to_string(),
+                        modified_epoch: 10,
+                        event_count: 1,
+                        user_message_count: 1,
+                        assistant_message_count: 1,
+                        title_hint: "older".to_string(),
+                        recent_context: "USER: older".to_string(),
+                        cached_precis: None,
+                        cached_summary: None,
+                        storage_path: "older".to_string(),
+                    },
+                    RemoteScannedSession {
+                        session_path: "remote-session://jojo/newer".to_string(),
+                        session_id: "newer".to_string(),
+                        cwd: "/home/pi".to_string(),
+                        started_at: "2026-03-23T10:05:00Z".to_string(),
+                        modified_epoch: 20,
+                        event_count: 1,
+                        user_message_count: 1,
+                        assistant_message_count: 1,
+                        title_hint: "newer".to_string(),
+                        recent_context: "USER: newer".to_string(),
+                        cached_precis: None,
+                        cached_summary: None,
+                        storage_path: "newer".to_string(),
+                    },
+                ],
+            }],
+            &[],
+            &[],
+            &expanded_paths,
+        );
+
+        let labels = rows
+            .iter()
+            .filter(|row| row.kind == BrowserRowKind::Session)
+            .map(|row| row.label.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["newer".to_string(), "older".to_string()]);
+    }
+
+    #[test]
     fn merged_sidebar_rows_hide_nested_remote_children_when_folder_collapsed() {
         let expanded_paths = HashSet::from(["__remote_machine__/pi-raspberry".to_string()]);
         let rows = merged_sidebar_rows(
@@ -20456,6 +20811,27 @@ mod tests {
                 "legal".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn alt_overlay_sequence_supports_insert_submenu() {
+        assert_eq!(
+            resolve_alt_overlay_sequence("i"),
+            AltOverlayResolution::Action(AltOverlayAction::OpenInsertMenu)
+        );
+        assert_eq!(
+            resolve_alt_overlay_sequence("is"),
+            AltOverlayResolution::Action(AltOverlayAction::StartSession)
+        );
+        assert_eq!(
+            resolve_alt_overlay_sequence("it"),
+            AltOverlayResolution::Action(AltOverlayAction::StartTerminal)
+        );
+        assert_eq!(
+            resolve_alt_overlay_sequence("ip"),
+            AltOverlayResolution::Action(AltOverlayAction::CreatePaper)
+        );
+        assert_eq!(resolve_alt_overlay_sequence("iz"), AltOverlayResolution::Invalid);
     }
 
     #[test]
