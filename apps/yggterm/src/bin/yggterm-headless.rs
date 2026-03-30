@@ -2,8 +2,10 @@ use anyhow::Result;
 use yggterm_core::{SessionStore, detect_install_context, refresh_desktop_integration};
 use yggterm_server::{
     AppControlViewMode, cleanup_legacy_daemons, default_endpoint, detect_ghostty_host, ping,
+    run_app_control_create_terminal,
     run_app_control_describe_rows, run_app_control_describe_state, run_app_control_drag,
     run_app_control_dump_state, run_app_control_focus_window, run_app_control_open_path,
+    run_app_control_remove_session, run_app_control_send_terminal_input,
     run_app_control_set_fullscreen, run_app_control_set_row_expanded, run_attach, run_daemon, run_remote_ensure_managed_cli,
     run_remote_generation_context, run_remote_preview, run_remote_protocol_version,
     run_remote_refresh_managed_cli, run_remote_resume_codex, run_remote_scan,
@@ -31,8 +33,13 @@ fn main() -> Result<()> {
         let host = detect_ghostty_host();
         return run_daemon(&endpoint, host);
     }
-    if args.len() == 3 && args[0] == "server" && args[1] == "attach" {
-        return run_attach(&args[2]);
+    if args.len() >= 3 && args[0] == "server" && args[1] == "attach" {
+        return run_attach(
+            &args[2],
+            args.get(3)
+                .map(String::as_str)
+                .filter(|value| !value.is_empty()),
+        );
     }
     if args.as_slice() == ["server", "remote", "stage-clipboard-png"] {
         return run_remote_stage_clipboard_png();
@@ -265,6 +272,74 @@ fn main() -> Result<()> {
                     }
                 });
                 run_app_control_drag(action, row_path, placement, timeout_ms)
+            }
+            "terminal" => {
+                let action = args
+                    .get(3)
+                    .map(String::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("missing action for server app terminal"))?;
+                match action {
+                    "new" => {
+                        let machine_key = args.windows(2).find_map(|window| {
+                            if window[0] == "--machine-key" {
+                                Some(window[1].as_str())
+                            } else {
+                                None
+                            }
+                        });
+                        let cwd = args.windows(2).find_map(|window| {
+                            if window[0] == "--cwd" {
+                                Some(window[1].as_str())
+                            } else {
+                                None
+                            }
+                        });
+                        let title_hint = args.windows(2).find_map(|window| {
+                            if window[0] == "--title" {
+                                Some(window[1].as_str())
+                            } else {
+                                None
+                            }
+                        });
+                        run_app_control_create_terminal(machine_key, cwd, title_hint, timeout_ms)
+                    }
+                    "send" => {
+                        let session_path = args
+                            .iter()
+                            .skip(4)
+                            .find(|value| !value.starts_with("--"))
+                            .map(String::as_str)
+                            .ok_or_else(|| anyhow::anyhow!("missing session path for server app terminal send"))?;
+                        let data = args.windows(2).find_map(|window| {
+                            if window[0] == "--data" {
+                                Some(window[1].as_str())
+                            } else {
+                                None
+                            }
+                        })
+                        .ok_or_else(|| anyhow::anyhow!("missing --data for server app terminal send"))?;
+                        run_app_control_send_terminal_input(session_path, data, timeout_ms)
+                    }
+                    other => anyhow::bail!("unsupported app terminal action: {other}"),
+                }
+            }
+            "session" => {
+                let action = args
+                    .get(3)
+                    .map(String::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("missing action for server app session"))?;
+                match action {
+                    "remove" | "delete" => {
+                        let session_path = args
+                            .iter()
+                            .skip(4)
+                            .find(|value| !value.starts_with("--"))
+                            .map(String::as_str)
+                            .ok_or_else(|| anyhow::anyhow!("missing session path for server app session remove"))?;
+                        run_app_control_remove_session(session_path, timeout_ms)
+                    }
+                    other => anyhow::bail!("unsupported app session action: {other}"),
+                }
             }
             other => anyhow::bail!("unsupported app control command: {other}"),
         };
