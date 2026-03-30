@@ -19,6 +19,13 @@ FORBIDDEN_PREVIEW_MARKERS = (
     "filesystem sandboxing",
 )
 
+FORBIDDEN_PREVIEW_ENTRY_MARKERS = (
+    "PRIMARY USER GOALS:",
+    "RECENT SUBSTANTIVE TURNS:",
+    "RECENT CONTEXT:",
+    "SERVER NOTES:",
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -268,6 +275,40 @@ def preview_ready(state: dict, session_path: str) -> bool:
     )
 
 
+def normalize_preview_entry_text(value: str) -> str:
+    return " ".join((value or "").split()).strip().lower()
+
+
+def preview_semantic_issues(state: dict) -> list[str]:
+    preview = ((state.get("viewport") or {}).get("preview") or {})
+    entries = preview.get("visible_entries") or []
+    issues = []
+    normalized_entries = []
+    for index, entry in enumerate(entries):
+        text = (entry.get("text") or "").strip()
+        tone = (entry.get("tone") or "").strip()
+        normalized = normalize_preview_entry_text(text)
+        if not normalized:
+            issues.append(f"entry[{index}] is empty")
+            continue
+        for marker in FORBIDDEN_PREVIEW_ENTRY_MARKERS:
+            if marker.lower() in normalized:
+                issues.append(f"entry[{index}] still shows scaffold marker {marker}")
+        normalized_entries.append((index, tone, normalized))
+
+    for prev, curr in zip(normalized_entries, normalized_entries[1:]):
+        prev_ix, prev_tone, prev_text = prev
+        curr_ix, curr_tone, curr_text = curr
+        if len(prev_text) < 20 or len(curr_text) < 20:
+            continue
+        if prev_text == curr_text:
+            issues.append(
+                f"adjacent duplicate preview text at entries {prev_ix} ({prev_tone}) and {curr_ix} ({curr_tone})"
+            )
+
+    return issues
+
+
 def read_png_size(path: Path) -> tuple[int, int]:
     with path.open("rb") as handle:
         header = handle.read(24)
@@ -396,6 +437,7 @@ def main() -> int:
                     "raw_timestamps": raw_timestamps,
                     "timestamp_labels_ok": (len(raw_timestamps) == 0) or (len(timestamp_labels) > 0),
                     "titlebar_matches_viewport": titlebar_ok,
+                    "semantic_issues": preview_semantic_issues(state),
                     "forbidden_hits": forbidden_hits,
                     "preview_window": window,
                     "preview_window_ok": (
@@ -429,6 +471,7 @@ def main() -> int:
         "viewport_size_failures": len([item for item in results if not item.get("viewport_size_matches", False)]),
         "font_failures": len([item for item in results if not item.get("font_family_ok", False)]),
         "timestamp_failures": len([item for item in results if not item.get("timestamp_labels_ok", False)]),
+        "semantic_failures": len([item for item in results if item.get("semantic_issues")]),
         "forbidden_content_failures": len([item for item in results if item.get("forbidden_hits")]),
         "virtual_window_failures": len([item for item in results if not item.get("preview_window_ok", False)]),
         "results": results,
@@ -453,6 +496,7 @@ def main() -> int:
         and summary["viewport_size_failures"] == 0
         and summary["font_failures"] == 0
         and summary["timestamp_failures"] == 0
+        and summary["semantic_failures"] == 0
         and summary["forbidden_content_failures"] == 0
         and summary["virtual_window_failures"] == 0
     ) else 1
