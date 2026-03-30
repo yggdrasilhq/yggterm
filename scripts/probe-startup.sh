@@ -31,11 +31,13 @@ pid = int(sys.argv[2])
 start_ms = int(sys.argv[3])
 if not trace_path.exists():
     sys.exit(1)
-for line in reversed(trace_path.read_text(encoding="utf-8").splitlines()[-4000:]):
+for line in reversed(trace_path.read_text(encoding="utf-8").splitlines()):
     try:
         event = json.loads(line)
     except json.JSONDecodeError:
         continue
+    if (event.get("ts_ms") or 0) < start_ms:
+        break
     payload = event.get("payload") or {}
     if (
         event.get("pid") == pid
@@ -57,21 +59,21 @@ with open(sys.argv[1], "w", encoding="utf-8") as fh:
     fh.write(f"window_ms={payload.get('elapsed_ms', '')}\n")
     fh.write(f"window_id={window.get('window_id', '')}\n")
     fh.write(f"window_pid={window.get('pid', '')}\n")
+    fh.write("window_source=trace_window_spawned\n")
 PY
-    break
-  fi
-  win="$(DISPLAY="${DISPLAY:-:10.0}" xdotool search --pid "${app_pid}" 2>/dev/null | head -n 1 || true)"
-  if [[ -n "${win}" ]]; then
-    now_ms="$(date +%s%3N)"
-    {
-      echo "window_ms=$((now_ms - start_ms))"
-      echo "window_id=${win}"
-      echo "window_pid=${app_pid}"
-    } >"${STARTUP_FILE}"
     break
   fi
   sleep 0.1
 done
+
+if [[ ! -f "${STARTUP_FILE}" ]]; then
+  {
+    echo "window_ms="
+    echo "window_id="
+    echo "window_pid=${app_pid}"
+    echo "window_source=missing_trace_window_spawned"
+  } >"${STARTUP_FILE}"
+fi
 
 sleep "${WAIT_SECS}"
 kill "${app_pid}" || true
