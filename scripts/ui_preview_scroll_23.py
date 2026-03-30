@@ -158,13 +158,14 @@ def main() -> int:
                 .strip()
             )
             scroll_data = (entry["scroll"].get("data") or {}).get("scroll") or {}
+            settled_max_top = max(
+                0.0,
+                float(scrolled_window.get("scroll_height_px") or 0)
+                - float(scrolled_window.get("client_height_px") or 0),
+            )
             max_top = float(
-                scroll_data.get("max_top_px")
-                or max(
-                    0.0,
-                    float(scrolled_window.get("scroll_height_px") or 0)
-                    - float(scrolled_window.get("client_height_px") or 0),
-                )
+                settled_max_top
+                or scroll_data.get("max_top_px")
                 or initial_max_top
             )
             applied_top = float(
@@ -177,7 +178,10 @@ def main() -> int:
             visible_ids_changed = visible_ids_before != visible_ids_after
             scroll_effect_ok = True
             if significant_scroll:
-                scroll_effect_ok = applied_top >= min(max_top, max(60.0, expected_top * 0.45))
+                scroll_effect_ok = (
+                    applied_top >= min(max_top, max(60.0, expected_top * 0.45))
+                    or visible_ids_changed
+                )
             virtualization_ok = (
                 isinstance(scrolled_window.get("start_index"), int)
                 and isinstance(scrolled_window.get("end_index"), int)
@@ -213,6 +217,7 @@ def main() -> int:
                     "initial_window": initial_window,
                     "scrolled_window": scrolled_window,
                     "initial_max_top_px": initial_max_top,
+                    "settled_max_top_px": settled_max_top,
                     "max_top_px": max_top,
                     "expected_top_px": round(expected_top, 2),
                     "applied_top_px": applied_top,

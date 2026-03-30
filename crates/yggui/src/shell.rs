@@ -10054,24 +10054,71 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
     })
 }
 
-async fn capture_dom_debug_snapshot() -> Value {
+async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Value {
+    let active_session_path_literal =
+        serde_json::to_string(&active_session_path).unwrap_or_else(|_| "null".to_string());
     let script = r#"
         (async () => {
+            const activeSessionPath = __ACTIVE_SESSION_PATH__;
+            const pickLast = (nodes) => nodes.length ? nodes[nodes.length - 1] : null;
+            const visibleNodes = (nodes) => nodes.filter((node) => node.getClientRects().length > 0);
+            const previewScrolls = Array.from(document.querySelectorAll('[data-preview-scroll="1"]'))
+              .filter((node) => node.isConnected);
+            const matchingPreviewScrolls = previewScrolls.filter((node) => {
+                const path = node.getAttribute('data-preview-session-path');
+                return activeSessionPath && path === activeSessionPath;
+            });
+            const activePreviewScrolls = previewScrolls.filter(
+                (node) => node.getAttribute('data-preview-scroll-active') === 'true'
+            );
+            const activeMatchingPreviewScrolls = matchingPreviewScrolls.filter(
+                (node) => node.getAttribute('data-preview-scroll-active') === 'true'
+            );
+            const previewScroller =
+                pickLast(visibleNodes(activeMatchingPreviewScrolls))
+                || pickLast(activeMatchingPreviewScrolls)
+                || pickLast(visibleNodes(matchingPreviewScrolls))
+                || pickLast(matchingPreviewScrolls)
+                || pickLast(visibleNodes(activePreviewScrolls))
+                || pickLast(activePreviewScrolls)
+                || pickLast(visibleNodes(previewScrolls))
+                || pickLast(previewScrolls)
+                || null;
             const terminalHosts = Array.from(document.querySelectorAll('[id^="yggterm-terminal-"]'));
-            const previewScrolls = Array.from(document.querySelectorAll('[data-preview-scroll="1"]'));
-            const previewWindow = document.querySelector('[data-preview-window-start]');
+            const activeTerminalHost = pickLast(terminalHosts.filter((host) => {
+                const path = host.getAttribute('data-terminal-session-path');
+                return activeSessionPath && path === activeSessionPath;
+            }));
+            const previewWindow = previewScroller?.querySelector('[data-preview-window-start]') || null;
             const documentEditors = Array.from(document.querySelectorAll('[data-document-editor="1"]'));
             const documentBodies = Array.from(document.querySelectorAll('[data-document-editor-body="1"]'));
             const shellRoots = Array.from(document.querySelectorAll('#yggterm-shell-root'));
-            const sidebars = Array.from(document.querySelectorAll('#yggterm-sidebar'));
-            const titlebars = Array.from(document.querySelectorAll('[data-yggterm-titlebar="1"]'));
-            const titlebarTitle = document.querySelector('[data-titlebar-title="1"]');
-            const titlebarButton = document.querySelector('[data-titlebar-session-button="1"]');
-            const titlebarSummary = document.querySelector('[data-titlebar-summary-body="1"]');
-            const titlebarSummaryMenu = document.querySelector('[data-titlebar-summary-menu="1"]');
-            const mainSurfaces = Array.from(document.querySelectorAll('[data-yggterm-main-surface="1"]'));
-            const sidebarScroller = document.querySelector('[data-sidebar-scroll="1"]');
-            const sidebarRows = Array.from(document.querySelectorAll('[data-sidebar-row-path]'));
+            const rootNode =
+                previewScroller?.closest('#yggterm-shell-root')
+                || activeTerminalHost?.closest('#yggterm-shell-root')
+                || pickLast(visibleNodes(shellRoots))
+                || pickLast(shellRoots)
+                || null;
+            const sidebars = rootNode
+                ? Array.from(rootNode.querySelectorAll('#yggterm-sidebar'))
+                : Array.from(document.querySelectorAll('#yggterm-sidebar'));
+            const titlebars = rootNode
+                ? Array.from(rootNode.querySelectorAll('[data-yggterm-titlebar="1"]'))
+                : Array.from(document.querySelectorAll('[data-yggterm-titlebar="1"]'));
+            const titlebar = pickLast(visibleNodes(titlebars)) || pickLast(titlebars);
+            const titlebarTitle = titlebar?.querySelector('[data-titlebar-title="1"]') || null;
+            const titlebarButton = titlebar?.querySelector('[data-titlebar-session-button="1"]') || null;
+            const titlebarSummary = titlebar?.querySelector('[data-titlebar-summary-body="1"]') || null;
+            const titlebarSummaryMenu = titlebar?.querySelector('[data-titlebar-summary-menu="1"]') || null;
+            const mainSurfaces = rootNode
+                ? Array.from(rootNode.querySelectorAll('[data-yggterm-main-surface="1"]'))
+                : Array.from(document.querySelectorAll('[data-yggterm-main-surface="1"]'));
+            const sidebarScroller = rootNode
+                ? rootNode.querySelector('[data-sidebar-scroll="1"]')
+                : document.querySelector('[data-sidebar-scroll="1"]');
+            const sidebarRows = rootNode
+                ? Array.from(rootNode.querySelectorAll('[data-sidebar-row-path]'))
+                : Array.from(document.querySelectorAll('[data-sidebar-row-path]'));
             const visibleSidebarRows = sidebarRows
                 .map((row) => {
                     const rect = row.getBoundingClientRect();
@@ -10118,9 +10165,9 @@ async fn capture_dom_debug_snapshot() -> Value {
                     canvas_count: host.querySelectorAll('canvas').length,
                 };
             });
-            const previewViewportRect = previewScrolls[0]
+            const previewViewportRect = previewScroller
                 ? (() => {
-                    const rect = previewScrolls[0].getBoundingClientRect();
+                    const rect = previewScroller.getBoundingClientRect();
                     return {
                         left: Number(rect.left.toFixed(2)),
                         top: Number(rect.top.toFixed(2)),
@@ -10129,7 +10176,7 @@ async fn capture_dom_debug_snapshot() -> Value {
                     };
                 })()
                 : null;
-            const previewVisibleBlocks = Array.from(document.querySelectorAll('[id^="preview-block-"]'))
+            const previewVisibleBlocks = Array.from((previewScroller || document).querySelectorAll('[id^="preview-block-"]'))
                 .map((block) => {
                     const rect = block.getBoundingClientRect();
                     return {
@@ -10139,18 +10186,19 @@ async fn capture_dom_debug_snapshot() -> Value {
                     };
                 })
                 .filter((block) => block.height > 0 && block.top < window.innerHeight + 120 && block.top + block.height > -120);
-            const previewEntries = Array.from(document.querySelectorAll('[data-preview-entry="1"]'));
+            const previewEntries = Array.from((previewScroller || document).querySelectorAll('[data-preview-entry="1"]'));
             const previewAssistantEntries = previewEntries.filter((entry) => entry.getAttribute('data-preview-tone') === 'assistant');
             const previewRawTimestamps = previewEntries
                 .map((entry) => String(entry.getAttribute('data-preview-raw-timestamp') || '').trim())
                 .filter(Boolean)
                 .slice(0, 24);
-            const previewTimestampLabels = Array.from(document.querySelectorAll('[data-preview-timestamp="1"] div:first-child'))
+            const previewTimestampLabels = Array.from((previewScroller || document).querySelectorAll('[data-preview-timestamp="1"] div:first-child'))
                 .map((node) => String(node.textContent || '').trim())
                 .filter(Boolean)
                 .slice(0, 16);
-            const previewFontFamily = previewAssistantEntries[0]
-                ? window.getComputedStyle(previewAssistantEntries[0]).fontFamily
+            const previewFontProbe = previewAssistantEntries[0] || previewEntries[0] || previewScroller;
+            const previewFontFamily = previewFontProbe
+                ? window.getComputedStyle(previewFontProbe).fontFamily
                 : null;
             const previewWindowMetrics = previewWindow
                 ? {
@@ -10169,8 +10217,10 @@ async fn capture_dom_debug_snapshot() -> Value {
             dioxus.send({
                 terminal_host_count: terminalHosts.length,
                 terminal_hosts: hostDetails,
-                preview_scroll_count: previewScrolls.length,
-                preview_text_sample: String(previewScrolls[0]?.innerText || "").slice(0, 240),
+                preview_scroll_count: rootNode
+                    ? rootNode.querySelectorAll('[data-preview-scroll="1"]').length
+                    : previewScrolls.length,
+                preview_text_sample: String(previewScroller?.innerText || "").slice(0, 240),
                 preview_viewport_rect: previewViewportRect,
                 preview_visible_block_count: previewVisibleBlocks.length,
                 preview_visible_block_ids: previewVisibleBlocks.slice(0, 24).map((block) => block.id),
@@ -10191,7 +10241,7 @@ async fn capture_dom_debug_snapshot() -> Value {
                 titlebar_summary_text: String(titlebarSummary?.textContent || "").trim().slice(0, 240),
                 titlebar_menu_open: Boolean(titlebarSummaryMenu),
                 main_surface_count: mainSurfaces.length,
-                shell_text_sample: String(document.getElementById("yggterm-shell-root")?.innerText || "").slice(0, 240),
+                shell_text_sample: String((rootNode || pickLast(shellRoots) || document.getElementById("yggterm-shell-root"))?.innerText || "").slice(0, 240),
                 sidebar_scroll_top: sidebarScroller ? Math.round(sidebarScroller.scrollTop) : null,
                 sidebar_visible_row_count: visibleSidebarRows.length,
                 sidebar_visible_rows: visibleSidebarRows.slice(0, 24),
@@ -10201,7 +10251,8 @@ async fn capture_dom_debug_snapshot() -> Value {
             await new Promise((resolve) => setTimeout(resolve, 25));
         })();
     "#;
-    let mut eval = document::eval(script);
+    let script = script.replace("__ACTIVE_SESSION_PATH__", &active_session_path_literal);
+    let mut eval = document::eval(&script);
     match eval.recv::<Value>().await {
         Ok(value) => value,
         Err(error) => json!({
@@ -10210,11 +10261,17 @@ async fn capture_dom_debug_snapshot() -> Value {
     }
 }
 
-async fn scroll_preview_viewport(top_px: Option<f64>, ratio: Option<f64>) -> Value {
+async fn scroll_preview_viewport_for(
+    active_session_path: Option<&str>,
+    top_px: Option<f64>,
+    ratio: Option<f64>,
+) -> Value {
     let requested_top_px = top_px.filter(|value| value.is_finite());
     let requested_ratio = ratio
         .filter(|value| value.is_finite())
         .map(|value| value.clamp(0.0, 1.0));
+    let active_session_path_literal =
+        serde_json::to_string(&active_session_path).unwrap_or_else(|_| "null".to_string());
     let top_literal = requested_top_px
         .map(|value| value.to_string())
         .unwrap_or_else(|| "null".to_string());
@@ -10224,35 +10281,80 @@ async fn scroll_preview_viewport(top_px: Option<f64>, ratio: Option<f64>) -> Val
     let script = format!(
         r#"
         (async () => {{
-            const requestedTop = {top_literal};
-            const requestedRatio = {ratio_literal};
-            const scroller = document.querySelector('[data-preview-scroll="1"]');
-            if (!scroller) {{
+            try {{
+                const activeSessionPath = {active_session_path_literal};
+                const requestedTop = {top_literal};
+                const requestedRatio = {ratio_literal};
+                const pickLast = (nodes) => nodes.length ? nodes[nodes.length - 1] : null;
+                const visibleNodes = (nodes) => nodes.filter((node) => node.getClientRects().length > 0);
+                const previewScrolls = Array.from(document.querySelectorAll('[data-preview-scroll="1"]'))
+                  .filter((node) => node.isConnected);
+                const matchingPreviewScrolls = previewScrolls.filter((node) => {{
+                    const path = node.getAttribute('data-preview-session-path');
+                    return activeSessionPath && path === activeSessionPath;
+                }});
+                const activePreviewScrolls = previewScrolls.filter(
+                    (node) => node.getAttribute('data-preview-scroll-active') === 'true'
+                );
+                const activeMatchingPreviewScrolls = matchingPreviewScrolls.filter(
+                    (node) => node.getAttribute('data-preview-scroll-active') === 'true'
+                );
+                const scroller =
+                    pickLast(visibleNodes(activeMatchingPreviewScrolls))
+                    || pickLast(activeMatchingPreviewScrolls)
+                    || pickLast(visibleNodes(matchingPreviewScrolls))
+                    || pickLast(matchingPreviewScrolls)
+                    || pickLast(visibleNodes(activePreviewScrolls))
+                    || pickLast(activePreviewScrolls)
+                    || pickLast(visibleNodes(previewScrolls))
+                    || pickLast(previewScrolls)
+                    || null;
+                if (!scroller) {{
+                    dioxus.send({{
+                        accepted: false,
+                        reason: "preview_scroller_missing",
+                    }});
+                    return;
+                }}
+                const settle = async () => {{
+                    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+                    await new Promise((resolve) => setTimeout(resolve, 70));
+                }};
+                const computeTargetTop = (maxTop) => {{
+                    let nextTop = 0;
+                    if (typeof requestedTop === 'number' && Number.isFinite(requestedTop)) {{
+                        nextTop = requestedTop;
+                    }} else if (typeof requestedRatio === 'number' && Number.isFinite(requestedRatio)) {{
+                        nextTop = maxTop * requestedRatio;
+                    }}
+                    return Math.max(0, Math.min(maxTop, nextTop));
+                }};
+                const initialMaxTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+                let targetTop = computeTargetTop(initialMaxTop);
+                scroller.scrollTo({{ top: targetTop, behavior: 'auto' }});
+                await settle();
+                const settledMaxTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+                const settledTargetTop = computeTargetTop(settledMaxTop);
+                if (Math.abs(settledTargetTop - scroller.scrollTop) > 12) {{
+                    scroller.scrollTo({{ top: settledTargetTop, behavior: 'auto' }});
+                    await settle();
+                }}
+                dioxus.send({{
+                    accepted: true,
+                    requested_top_px: requestedTop,
+                    requested_ratio: requestedRatio,
+                    applied_top_px: Math.round(scroller.scrollTop),
+                    max_top_px: Math.round(initialMaxTop),
+                    settled_max_top_px: Math.round(settledMaxTop),
+                    client_height_px: Math.round(scroller.clientHeight),
+                    scroll_height_px: Math.round(scroller.scrollHeight),
+                }});
+            }} catch (error) {{
                 dioxus.send({{
                     accepted: false,
-                    reason: "preview_scroller_missing",
+                    reason: error && error.message ? error.message : String(error),
                 }});
-                return;
             }}
-            const maxTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
-            let targetTop = 0;
-            if (typeof requestedTop === 'number' && Number.isFinite(requestedTop)) {{
-                targetTop = requestedTop;
-            }} else if (typeof requestedRatio === 'number' && Number.isFinite(requestedRatio)) {{
-                targetTop = maxTop * requestedRatio;
-            }}
-            targetTop = Math.max(0, Math.min(maxTop, targetTop));
-            scroller.scrollTo({{ top: targetTop, behavior: 'auto' }});
-            await new Promise((resolve) => setTimeout(resolve, 70));
-            dioxus.send({{
-                accepted: true,
-                requested_top_px: requestedTop,
-                requested_ratio: requestedRatio,
-                applied_top_px: Math.round(scroller.scrollTop),
-                max_top_px: Math.round(maxTop),
-                client_height_px: Math.round(scroller.clientHeight),
-                scroll_height_px: Math.round(scroller.scrollHeight),
-            }});
         }})();
     "#
     );
@@ -10294,9 +10396,10 @@ async fn process_pending_app_control_requests(
                 .max(current_millis() + BACKGROUND_REFRESH_STARTUP_DEFER_MS);
         });
     }
+    let active_session_path = state.read().server.active_session_path().map(str::to_string);
     let response = match command {
         AppControlCommand::CaptureScreenshot { target, output_path } => {
-            let dom_snapshot = capture_dom_debug_snapshot().await;
+            let dom_snapshot = capture_dom_debug_snapshot_for(active_session_path.as_deref()).await;
             match capture_visible_app_surface(
                 &desktop,
                 Path::new(&output_path),
@@ -10330,9 +10433,10 @@ async fn process_pending_app_control_requests(
             },
         }},
         AppControlCommand::ScrollPreview { top_px, ratio } => {
-            let scroll_result = scroll_preview_viewport(top_px, ratio).await;
+            let scroll_result =
+                scroll_preview_viewport_for(active_session_path.as_deref(), top_px, ratio).await;
             sleep(Duration::from_millis(40)).await;
-            let dom_snapshot = capture_dom_debug_snapshot().await;
+            let dom_snapshot = capture_dom_debug_snapshot_for(active_session_path.as_deref()).await;
             AppControlResponse {
                 request_id: request.request_id.clone(),
                 handled_by_pid: std::process::id(),
@@ -10891,7 +10995,7 @@ async fn process_pending_app_control_requests(
             output_path: None,
             data: Some({
                 let mut snapshot = describe_app_state_snapshot(&state, &desktop);
-                let dom = capture_dom_debug_snapshot().await;
+                let dom = capture_dom_debug_snapshot_for(active_session_path.as_deref()).await;
                 let viewport = describe_viewport_snapshot(&snapshot, &dom);
                 if let Some(map) = snapshot.as_object_mut() {
                     map.insert("dom".to_string(), dom.clone());
@@ -12333,14 +12437,45 @@ fn app() -> Element {
                                         ));
                                     }
                                 } else if dom_id == PREVIEW_HEADER_SEARCH_HIT_ID {
-                                    let _ = document::eval(
-                                        "(function() {
-                                            const scroller = document.querySelector('[data-preview-scroll=\"1\"]');
-                                            if (scroller) {
-                                                scroller.scrollTo({ top: 0, behavior: 'smooth' });
-                                            }
-                                        })();",
-                                    );
+                                    let active_session_path = state
+                                        .read()
+                                        .server
+                                        .active_session_path()
+                                        .map(str::to_string);
+                                    let session_path_literal = serde_json::to_string(&active_session_path)
+                                        .unwrap_or_else(|_| "null".to_string());
+                                    let _ = document::eval(&format!(
+                                        "(function() {{
+                                            const activeSessionPath = {session_path_literal};
+                                            const pickLast = (nodes) => nodes.length ? nodes[nodes.length - 1] : null;
+                                            const visibleNodes = (nodes) => nodes.filter((node) => node.getClientRects().length > 0);
+                                            const previewScrolls = Array.from(document.querySelectorAll('[data-preview-scroll=\"1\"]'))
+                                              .filter((node) => node.isConnected);
+                                            const matchingPreviewScrolls = previewScrolls.filter((node) => {{
+                                                const path = node.getAttribute('data-preview-session-path');
+                                                return activeSessionPath && path === activeSessionPath;
+                                            }});
+                                            const activePreviewScrolls = previewScrolls.filter(
+                                                (node) => node.getAttribute('data-preview-scroll-active') === 'true'
+                                            );
+                                            const activeMatchingPreviewScrolls = matchingPreviewScrolls.filter(
+                                                (node) => node.getAttribute('data-preview-scroll-active') === 'true'
+                                            );
+                                            const scroller =
+                                                pickLast(visibleNodes(activeMatchingPreviewScrolls))
+                                                || pickLast(activeMatchingPreviewScrolls)
+                                                || pickLast(visibleNodes(matchingPreviewScrolls))
+                                                || pickLast(matchingPreviewScrolls)
+                                                || pickLast(visibleNodes(activePreviewScrolls))
+                                                || pickLast(activePreviewScrolls)
+                                                || pickLast(visibleNodes(previewScrolls))
+                                                || pickLast(previewScrolls)
+                                                || null;
+                                            if (scroller) {{
+                                                scroller.scrollTo({{ top: 0, behavior: 'smooth' }});
+                                            }}
+                                        }})();"
+                                    ));
                                 } else {
                                     let _ = document::eval(&format!(
                                         "(function() {{
@@ -12368,14 +12503,45 @@ fn app() -> Element {
                                         ));
                                     }
                                 } else if dom_id == PREVIEW_HEADER_SEARCH_HIT_ID {
-                                    let _ = document::eval(
-                                        "(function() {
-                                            const scroller = document.querySelector('[data-preview-scroll=\"1\"]');
-                                            if (scroller) {
-                                                scroller.scrollTo({ top: 0, behavior: 'smooth' });
-                                            }
-                                        })();",
-                                    );
+                                    let active_session_path = state
+                                        .read()
+                                        .server
+                                        .active_session_path()
+                                        .map(str::to_string);
+                                    let session_path_literal = serde_json::to_string(&active_session_path)
+                                        .unwrap_or_else(|_| "null".to_string());
+                                    let _ = document::eval(&format!(
+                                        "(function() {{
+                                            const activeSessionPath = {session_path_literal};
+                                            const pickLast = (nodes) => nodes.length ? nodes[nodes.length - 1] : null;
+                                            const visibleNodes = (nodes) => nodes.filter((node) => node.getClientRects().length > 0);
+                                            const previewScrolls = Array.from(document.querySelectorAll('[data-preview-scroll=\"1\"]'))
+                                              .filter((node) => node.isConnected);
+                                            const matchingPreviewScrolls = previewScrolls.filter((node) => {{
+                                                const path = node.getAttribute('data-preview-session-path');
+                                                return activeSessionPath && path === activeSessionPath;
+                                            }});
+                                            const activePreviewScrolls = previewScrolls.filter(
+                                                (node) => node.getAttribute('data-preview-scroll-active') === 'true'
+                                            );
+                                            const activeMatchingPreviewScrolls = matchingPreviewScrolls.filter(
+                                                (node) => node.getAttribute('data-preview-scroll-active') === 'true'
+                                            );
+                                            const scroller =
+                                                pickLast(visibleNodes(activeMatchingPreviewScrolls))
+                                                || pickLast(activeMatchingPreviewScrolls)
+                                                || pickLast(visibleNodes(matchingPreviewScrolls))
+                                                || pickLast(matchingPreviewScrolls)
+                                                || pickLast(visibleNodes(activePreviewScrolls))
+                                                || pickLast(activePreviewScrolls)
+                                                || pickLast(visibleNodes(previewScrolls))
+                                                || pickLast(previewScrolls)
+                                                || null;
+                                            if (scroller) {{
+                                                scroller.scrollTo({{ top: 0, behavior: 'smooth' }});
+                                            }}
+                                        }})();"
+                                    ));
                                 } else {
                                     let _ = document::eval(&format!(
                                         "(function() {{
@@ -14330,6 +14496,8 @@ fn MainSurface(
                             }
                             div {
                                 "data-preview-scroll": "1",
+                                "data-preview-scroll-active": "true",
+                                "data-preview-session-path": "{session.session_path}",
                                 style: "display:flex; flex-direction:column; gap:18px; min-width:0; min-height:0; overflow:auto; padding:24px; \
                                         overscroll-behavior:contain; scrollbar-gutter:stable; contain:layout paint style;",
                                 onscroll: move |evt: ScrollEvent| {
@@ -14343,6 +14511,7 @@ fn MainSurface(
                                     div {
                                         "data-preview-window-start": "{preview_window.start_index}",
                                         "data-preview-window-end": "{preview_window.end_index}",
+                                        "data-preview-session-path": "{session.session_path}",
                                         "data-preview-window-total": "{visible_blocks.len()}",
                                         "data-preview-window-top-spacer": "{preview_window.top_spacer_px.round() as i64}",
                                         "data-preview-window-bottom-spacer": "{preview_window.bottom_spacer_px.round() as i64}",
