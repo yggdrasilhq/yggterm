@@ -85,7 +85,7 @@ use yggterm_server::{
     connect_ssh_custom, fetch_remote_generation_context, fetch_remote_preview_payload,
     focus_live_with_view, open_remote_session_with_view,
     open_stored_session, open_stored_session_with_view, persist_remote_generated_copy, ping,
-    refresh_managed_cli, refresh_remote_machine, remove_ssh_target, request_terminal_launch,
+    refresh_managed_cli, refresh_remote_machine, remove_session, remove_ssh_target, request_terminal_launch,
     set_all_preview_blocks_folded, set_view_mode as daemon_set_view_mode,
     shutdown as daemon_shutdown, snapshot as daemon_snapshot, stage_remote_clipboard_png,
     start_command_session, start_local_session_at, start_ssh_session_at, status,
@@ -329,6 +329,7 @@ struct RenderSnapshot {
     selected_path: Option<String>,
     selected_row: Option<BrowserRow>,
     active_session: Option<ManagedSessionView>,
+    active_session_path: Option<String>,
     active_view_mode: WorkspaceViewMode,
     ssh_targets: Vec<SshConnectTarget>,
     live_sessions: Vec<ManagedSessionView>,
@@ -789,6 +790,7 @@ impl ShellState {
         } else {
             self.browser.selected_path().map(ToOwned::to_owned)
         };
+        let active_session_path = self.server.active_session_path().map(ToOwned::to_owned);
         let active_session = self.server.active_session().cloned();
         let active_title = active_session
             .as_ref()
@@ -814,6 +816,18 @@ impl ShellState {
             self.selection_anchor.as_deref(),
             selected_path.as_deref(),
         );
+        let preview_loading = self
+            .active_surface_requests
+            .get(&YggSurface::Preview)
+            .is_some_and(|request| {
+                active_surface_request_matches_session(request, active_session_path.as_deref())
+            });
+        let terminal_loading = self
+            .active_surface_requests
+            .get(&YggSurface::Terminal)
+            .is_some_and(|request| {
+                active_surface_request_matches_session(request, active_session_path.as_deref())
+            });
 
         RenderSnapshot {
             palette: palette,
@@ -829,12 +843,8 @@ impl ShellState {
             sidebar_loading: self
                 .active_surface_requests
                 .contains_key(&YggSurface::Sidebar),
-            preview_loading: self
-                .active_surface_requests
-                .contains_key(&YggSurface::Preview),
-            terminal_loading: self
-                .active_surface_requests
-                .contains_key(&YggSurface::Terminal),
+            preview_loading,
+            terminal_loading,
             metadata_loading: self
                 .active_surface_requests
                 .contains_key(&YggSurface::MetadataRail),
@@ -844,6 +854,7 @@ impl ShellState {
             selected_path,
             selected_row,
             active_session,
+            active_session_path,
             active_view_mode: self.server.active_view_mode(),
             ssh_targets: self.server.ssh_targets().to_vec(),
             live_sessions,
@@ -1126,6 +1137,10 @@ impl ShellState {
         label: String,
         global_busy: bool,
     ) {
+        let request_id = request_meta.request_id.clone();
+        let request_surface = request_meta.surface;
+        let request_operation = request_meta.operation.clone();
+        let request_target = request_meta.target.clone();
         if request_meta.priority == YggOperationPriority::Interactive {
             self.background_refresh_after_ms = self
                 .background_refresh_after_ms
@@ -1151,14 +1166,34 @@ impl ShellState {
             self.busy_request_id = Some(request_meta.request_id.clone());
             self.server_busy = true;
         }
-        self.active_surface_requests.insert(
-            request_meta.surface,
+        let replaced = self.active_surface_requests.insert(
+            request_surface,
             ActiveSurfaceRequest {
                 request_id: request_meta.request_id,
                 operation: request_meta.operation,
                 target: request_meta.target,
             },
         );
+        if let Some(replaced) = replaced
+            && replaced.request_id != request_id
+        {
+            self.clear_job_notification(&format!("loading:{}", replaced.request_id));
+            if let Ok(store) = SessionStore::open_or_init() {
+                append_trace_event(
+                    store.home_dir(),
+                    "ui",
+                    "surface_request",
+                    "superseded",
+                    json!({
+                        "request_id": replaced.request_id,
+                        "replacement_request_id": request_id,
+                        "surface": format!("{request_surface:?}"),
+                        "replacement_operation": request_operation,
+                        "replacement_target": serde_json::to_value(&request_target).unwrap_or(Value::Null),
+                    }),
+                );
+            }
+        }
         self.last_action = label;
     }
 
@@ -4054,6 +4089,18 @@ fn maybe_spawn_missing_managed_cli_refreshes(state: Signal<ShellState>) {
     }
 }
 
+fn app_control_command_defers_background_refresh(command: &AppControlCommand) -> bool {
+    matches!(
+        command,
+        AppControlCommand::CreateTerminal { .. }
+            | AppControlCommand::SendTerminalInput { .. }
+            | AppControlCommand::RemoveSession { .. }
+            | AppControlCommand::OpenPath { .. }
+            | AppControlCommand::Drag { .. }
+            | AppControlCommand::SetRowExpanded { .. }
+    )
+}
+
 fn terminal_attach_blocks_background_work(shell: &ShellState) -> bool {
     if shell.server.active_view_mode() != WorkspaceViewMode::Terminal {
         return false;
@@ -5063,7 +5110,10 @@ fn is_local_stored_session_row(row: &BrowserRow) -> bool {
 }
 
 fn supports_generated_session_copy(session: &ManagedSessionView) -> bool {
-    session.kind.is_agent() || session.session_path.starts_with("remote-session://")
+    session.kind.is_agent()
+        || session.kind == SessionKind::SshShell
+        || session.session_path.starts_with("remote-session://")
+        || session.session_path.starts_with("ssh://")
 }
 
 fn copy_generation_target_for_session(
@@ -6904,6 +6954,7 @@ fn live_session_label(
 
 fn is_promoted_live_session(session: &ManagedSessionView) -> bool {
     session.session_path.starts_with("remote-session://")
+        || session.session_path.starts_with("ssh://")
         || (session.kind != SessionKind::SshShell
             && is_local_live_session_path(&session.session_path))
 }
@@ -9152,6 +9203,32 @@ fn drag_drop_placement_from_app_control(placement: AppControlDragPlacement) -> D
     }
 }
 
+fn active_surface_request_matches_session(
+    request: &ActiveSurfaceRequest,
+    active_session_path: Option<&str>,
+) -> bool {
+    match (&request.target, active_session_path) {
+        (YggTarget::ActiveSession, Some(_)) => true,
+        (YggTarget::Session { session_path }, Some(active_path))
+        | (YggTarget::Terminal { session_path }, Some(active_path))
+        | (YggTarget::Preview { session_path }, Some(active_path)) => session_path == active_path,
+        _ => false,
+    }
+}
+
+fn resolve_app_control_remote_machine(
+    shell: &ShellState,
+    machine_key: &str,
+) -> Option<RemoteMachineSnapshot> {
+    let normalized = machine_key_from_labelish(machine_key);
+    shell
+        .server
+        .remote_machines()
+        .iter()
+        .find(|machine| machine.machine_key == normalized)
+        .cloned()
+}
+
 fn describe_app_state_snapshot(
     state: &Signal<ShellState>,
     desktop: &dioxus::desktop::DesktopContext,
@@ -9181,7 +9258,7 @@ fn describe_app_state_snapshot(
     json!({
         "window": describe_window(desktop),
         "active_view_mode": format!("{:?}", snapshot.active_view_mode),
-        "active_session_path": snapshot.active_session.as_ref().map(|session| session.session_path.clone()),
+        "active_session_path": snapshot.active_session_path.clone(),
         "active_session_source": snapshot.active_session.as_ref().map(|session| format!("{:?}", session.source)),
         "active_title": snapshot.active_title.clone(),
         "active_precis": snapshot.active_precis.clone(),
@@ -9488,7 +9565,7 @@ async fn capture_dom_debug_snapshot() -> Value {
                     session_path: host.getAttribute('data-terminal-session-path'),
                     mount_epoch: host.getAttribute('data-terminal-mount-epoch'),
                     child_count: host.childElementCount,
-                    text_sample: String(host.innerText || "").slice(0, 160),
+                    text_sample: String(host.innerText || "").slice(0, 4096),
                     background_color: style.backgroundColor,
                     foreground_color: style.color,
                     font_family: style.fontFamily,
@@ -9548,6 +9625,13 @@ async fn process_pending_app_control_requests(
         }),
     );
     let command = request.command.clone();
+    if app_control_command_defers_background_refresh(&command) {
+        let _ = safe_shell_mut(state, "app_control_defer_background_refresh", |shell| {
+            shell.background_refresh_after_ms = shell
+                .background_refresh_after_ms
+                .max(current_millis() + BACKGROUND_REFRESH_STARTUP_DEFER_MS);
+        });
+    }
     let response = match command {
         AppControlCommand::CaptureScreenshot {
             target: _,
@@ -9777,6 +9861,202 @@ async fn process_pending_app_control_requests(
                 }
             }
         },
+        AppControlCommand::CreateTerminal {
+            machine_key,
+            cwd,
+            title_hint,
+        } => {
+            let endpoint = state.read().bootstrap.server_endpoint.clone();
+            match machine_key
+                .clone()
+                .map(|key| {
+                    state
+                        .with(|shell| resolve_app_control_remote_machine(shell, &key))
+                        .map(|machine| (key, machine))
+                })
+            {
+                Some(None) => AppControlResponse {
+                    request_id: request.request_id.clone(),
+                    handled_by_pid: std::process::id(),
+                    completed_at_ms: current_millis() as u128,
+                    output_path: None,
+                    data: None,
+                    error: Some(format!(
+                        "unknown remote machine key: {}",
+                        machine_key.unwrap_or_default()
+                    )),
+                },
+                Some(Some((machine_key, machine))) => {
+                    let cwd_for_task = cwd.clone();
+                    let title_hint_for_task = title_hint.clone();
+                    let outcome = run_dedicated_interactive_request_io(
+                        "app_control_create_terminal_remote",
+                        &home,
+                        move || {
+                            ensure_daemon_running(&endpoint)?;
+                            start_ssh_session_at(
+                                &endpoint,
+                                &machine.ssh_target,
+                                machine.prefix.as_deref(),
+                                cwd_for_task.as_deref(),
+                                title_hint_for_task.as_deref(),
+                            )
+                        },
+                    )
+                    .await;
+                    match outcome {
+                        Ok((snapshot, message)) => {
+                            let created_path = snapshot.active_session_path.clone();
+                            state.with_mut(|shell| {
+                                shell.apply_daemon_snapshot_result(Ok((snapshot, message.clone())));
+                            });
+                            AppControlResponse {
+                                request_id: request.request_id.clone(),
+                                handled_by_pid: std::process::id(),
+                                completed_at_ms: current_millis() as u128,
+                                output_path: None,
+                                data: Some(json!({
+                                    "queued": true,
+                                    "machine_key": machine_key,
+                                    "cwd": cwd,
+                                    "title_hint": title_hint,
+                                    "active_session_path": created_path,
+                                    "message": message,
+                                })),
+                                error: None,
+                            }
+                        }
+                        Err(error) => AppControlResponse {
+                            request_id: request.request_id.clone(),
+                            handled_by_pid: std::process::id(),
+                            completed_at_ms: current_millis() as u128,
+                            output_path: None,
+                            data: None,
+                            error: Some(error.to_string()),
+                        },
+                    }
+                }
+                None => {
+                    let cwd_for_task = cwd.clone();
+                    let title_hint_for_task = title_hint.clone();
+                    let outcome = run_dedicated_interactive_request_io(
+                        "app_control_create_terminal_local",
+                        &home,
+                        move || {
+                            ensure_daemon_running(&endpoint)?;
+                            start_local_session_at(
+                                &endpoint,
+                                SessionKind::Shell,
+                                cwd_for_task.as_deref(),
+                                title_hint_for_task.as_deref(),
+                            )
+                        },
+                    )
+                    .await;
+                    match outcome {
+                        Ok((snapshot, message)) => {
+                            let created_path = snapshot.active_session_path.clone();
+                            state.with_mut(|shell| {
+                                shell.apply_daemon_snapshot_result(Ok((snapshot, message.clone())));
+                            });
+                            AppControlResponse {
+                                request_id: request.request_id.clone(),
+                                handled_by_pid: std::process::id(),
+                                completed_at_ms: current_millis() as u128,
+                                output_path: None,
+                                data: Some(json!({
+                                    "queued": true,
+                                    "machine_key": Value::Null,
+                                    "cwd": cwd,
+                                    "title_hint": title_hint,
+                                    "active_session_path": created_path,
+                                    "message": message,
+                                })),
+                                error: None,
+                            }
+                        }
+                        Err(error) => AppControlResponse {
+                            request_id: request.request_id.clone(),
+                            handled_by_pid: std::process::id(),
+                            completed_at_ms: current_millis() as u128,
+                            output_path: None,
+                            data: None,
+                            error: Some(error.to_string()),
+                        },
+                    }
+                }
+            }
+        }
+        AppControlCommand::SendTerminalInput { session_path, data } => {
+            let endpoint = state.read().bootstrap.server_endpoint.clone();
+            match terminal_write_async(endpoint, session_path.clone(), data.clone()).await {
+                Ok(()) => AppControlResponse {
+                    request_id: request.request_id.clone(),
+                    handled_by_pid: std::process::id(),
+                    completed_at_ms: current_millis() as u128,
+                    output_path: None,
+                    data: Some(json!({
+                        "accepted": true,
+                        "session_path": session_path,
+                        "bytes": data.len(),
+                    })),
+                    error: None,
+                },
+                Err(error) => AppControlResponse {
+                    request_id: request.request_id.clone(),
+                    handled_by_pid: std::process::id(),
+                    completed_at_ms: current_millis() as u128,
+                    output_path: None,
+                    data: Some(json!({
+                        "accepted": false,
+                        "session_path": session_path,
+                    })),
+                    error: Some(error.to_string()),
+                },
+            }
+        }
+        AppControlCommand::RemoveSession { session_path } => {
+            let endpoint = state.read().bootstrap.server_endpoint.clone();
+            let session_path_for_task = session_path.clone();
+            let outcome: Result<(ServerUiSnapshot, Option<String>)> = run_dedicated_interactive_request_io(
+                "app_control_remove_session",
+                &home,
+                move || remove_session(&endpoint, &session_path_for_task),
+            )
+            .await;
+            match outcome {
+                Ok((snapshot, message)) => {
+                    let active_session_path = snapshot.active_session_path.clone();
+                    state.with_mut(|shell| {
+                        shell.apply_daemon_snapshot_result(Ok((snapshot, message.clone())));
+                    });
+                    AppControlResponse {
+                        request_id: request.request_id.clone(),
+                        handled_by_pid: std::process::id(),
+                        completed_at_ms: current_millis() as u128,
+                        output_path: None,
+                        data: Some(json!({
+                            "accepted": true,
+                            "session_path": session_path,
+                            "active_session_path": active_session_path,
+                            "message": message,
+                        })),
+                        error: None,
+                    }
+                }
+                Err(error) => AppControlResponse {
+                    request_id: request.request_id.clone(),
+                    handled_by_pid: std::process::id(),
+                    completed_at_ms: current_millis() as u128,
+                    output_path: None,
+                    data: Some(json!({
+                        "accepted": false,
+                        "session_path": session_path,
+                    })),
+                    error: Some(error.to_string()),
+                },
+            }
+        }
         AppControlCommand::SetRowExpanded { row_path, expanded } => {
             let maybe_row = state.with(|shell| resolve_app_control_row(shell, &row_path));
             match maybe_row {
@@ -10444,17 +10724,6 @@ fn app() -> Element {
         );
     }
     let mut state = use_signal(|| ShellState::new(bootstrap.clone()));
-    let initial_terminal_session_path = {
-        let snapshot = state.read().snapshot();
-        if snapshot.active_view_mode == WorkspaceViewMode::Terminal {
-            snapshot
-                .active_session
-                .as_ref()
-                .map(|session| session.session_path.clone())
-        } else {
-            None
-        }
-    };
     let desktop = use_window();
     let mut hovered = use_signal(|| None::<HoveredControl>);
     let mut startup_sync_started = use_signal(|| false);
@@ -10463,14 +10732,13 @@ fn app() -> Element {
     let mut update_check_started = use_signal(|| false);
     let mut dock_pulse_started = use_signal(|| false);
     let mut app_control_loop_started = use_signal(|| false);
+    let mut app_control_watchdog_started = use_signal(|| false);
     let mut app_control_drain_in_flight = use_signal(|| false);
     let window_spawn_probe_started = use_signal(current_millis);
     let window_spawn_traced = use_signal(|| false);
     let mut window_epoch = use_signal(|| 0_u64);
-    let mut terminal_mount_epoch = use_signal(|| 0_u64);
+    let terminal_mount_epoch = use_signal(|| 0_u64);
     let async_render_epoch = use_signal(|| 0_u64);
-    let mut last_terminal_session_path =
-        use_signal(move || initial_terminal_session_path.clone());
     let mut last_open_recovery_path = use_signal(|| None::<String>);
     let mut last_preview_refresh_marker = use_signal(|| None::<(String, u64)>);
     let mut last_sidebar_autoscroll_path = use_signal(|| None::<String>);
@@ -10563,6 +10831,7 @@ fn app() -> Element {
     {
         let settings_path = bootstrap.settings_path.clone();
         let wake_app_control = desktop.poll_waker();
+        let schedule_ui_update = schedule_ui_update.clone();
         use_effect(move || {
             if *app_control_loop_started.read() {
                 return;
@@ -10571,6 +10840,7 @@ fn app() -> Element {
             let settings_path = settings_path.clone();
             let trace_home = perf_home_dir(&settings_path);
             let wake_app_control = wake_app_control.clone();
+            let schedule_ui_update = schedule_ui_update.clone();
             thread::spawn(move || {
                 append_trace_event(
                     &trace_home,
@@ -10584,8 +10854,94 @@ fn app() -> Element {
                 loop {
                     if app_control_requests_pending(&trace_home) {
                         wake_app_control();
+                        schedule_ui_update();
                     }
                     thread::sleep(Duration::from_millis(SCREENSHOT_REQUEST_POLL_MS));
+                }
+            });
+        });
+    }
+    {
+        let settings_path = bootstrap.settings_path.clone();
+        let desktop = desktop.clone();
+        let state = state;
+        let schedule_ui_update = schedule_ui_update.clone();
+        use_effect(move || {
+            if *app_control_watchdog_started.read() {
+                return;
+            }
+            app_control_watchdog_started.set(true);
+            let settings_path = settings_path.clone();
+            let desktop = desktop.clone();
+            let state = state;
+            let schedule_ui_update = schedule_ui_update.clone();
+            let mut app_control_drain_in_flight = app_control_drain_in_flight;
+            spawn(async move {
+                let trace_home = perf_home_dir(&settings_path);
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "app_control",
+                    "watchdog_spawned",
+                    json!({
+                        "pid": std::process::id(),
+                    }),
+                );
+                loop {
+                    if !*app_control_drain_in_flight.read()
+                        && app_control_requests_pending(&trace_home)
+                    {
+                        app_control_drain_in_flight.set(true);
+                        append_trace_event(
+                            &trace_home,
+                            "ui",
+                            "app_control",
+                            "watchdog_drain_begin",
+                            json!({
+                                "pid": std::process::id(),
+                            }),
+                        );
+                        loop {
+                            match process_pending_app_control_requests(
+                                &settings_path,
+                                desktop.clone(),
+                                state,
+                            )
+                            .await
+                            {
+                                Ok(true) => continue,
+                                Ok(false) => break,
+                                Err(error) => {
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "app_control",
+                                        "watchdog_loop_error",
+                                        json!({
+                                            "pid": std::process::id(),
+                                            "error": error.to_string(),
+                                        }),
+                                    );
+                                    warn!(error=%error, "failed to process app control request");
+                                    break;
+                                }
+                            }
+                        }
+                        app_control_drain_in_flight.set(false);
+                        append_trace_event(
+                            &trace_home,
+                            "ui",
+                            "app_control",
+                            "watchdog_drain_end",
+                            json!({
+                                "pid": std::process::id(),
+                            }),
+                        );
+                        if app_control_requests_pending(&trace_home) {
+                            schedule_ui_update();
+                        }
+                    }
+                    sleep(Duration::from_millis(SCREENSHOT_REQUEST_POLL_MS as u64)).await;
                 }
             });
         });
@@ -10776,21 +11132,6 @@ fn app() -> Element {
             {
                 spawn_auto_update_install_check(state);
             }
-        }
-    });
-    use_effect(move || {
-        let snapshot = state.read().snapshot();
-        let current_terminal_session = if snapshot.active_view_mode == WorkspaceViewMode::Terminal {
-            snapshot
-                .active_session
-                .as_ref()
-                .map(|session| session.session_path.clone())
-        } else {
-            None
-        };
-        if *last_terminal_session_path.read() != current_terminal_session {
-            last_terminal_session_path.set(current_terminal_session);
-            terminal_mount_epoch.with_mut(|epoch| *epoch += 1);
         }
     });
     use_effect(move || {
@@ -13118,10 +13459,7 @@ fn MainSurface(
     on_save_document: EventHandler<(String, WorkspaceDocumentInput)>,
     on_run_recipe_document: EventHandler<(String, WorkspaceDocumentInput, bool)>,
 ) -> Element {
-    let active_session_path = snapshot
-        .active_session
-        .as_ref()
-        .map(|session| session.session_path.clone());
+    let active_session_path = snapshot.active_session_path.clone();
     let surface_view_key = match snapshot.active_view_mode {
         WorkspaceViewMode::Rendered => "preview",
         WorkspaceViewMode::Terminal => "terminal",
@@ -13143,7 +13481,10 @@ fn MainSurface(
     let render_trace_session_path = active_session_path.clone();
     let render_trace_surface_key = surface_key.clone();
     let render_trace_view_mode = snapshot.active_view_mode;
-    let render_trace_session_kind = snapshot.active_session.as_ref().map(|session| format!("{:?}", session.kind));
+    let render_trace_session_kind = snapshot
+        .active_session
+        .as_ref()
+        .map(|session| format!("{:?}", session.kind));
     use_effect(move || {
         let trace_home = perf_home_dir(&state.read().bootstrap.settings_path);
         append_trace_event(
@@ -14765,6 +15106,7 @@ fn TerminalCanvas(
             );
             let mut eval = document::eval(&terminal_eval_script(&host_id, &theme));
             let mut cursor = 0u64;
+            let mut js_ready = false;
             let mut read_poll_ms = 120u64;
             let mut placeholder_rendered = false;
             let mut terminal_has_visible_output = false;
@@ -14776,6 +15118,7 @@ fn TerminalCanvas(
                     event = eval.recv::<TerminalJsEvent>() => {
                         match event {
                             Ok(TerminalJsEvent::Ready) => {
+                                js_ready = true;
                                 append_trace_event(
                                     &trace_home,
                                     "ui",
@@ -15107,6 +15450,9 @@ fn TerminalCanvas(
                         }
                     }
                     _ = sleep(Duration::from_millis(read_poll_ms)) => {
+                        if !js_ready {
+                            continue;
+                        }
                         match terminal_read_async(
                             endpoint.clone(),
                             session_path.clone(),
