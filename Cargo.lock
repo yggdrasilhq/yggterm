@@ -5592,6 +5592,7 @@ dependencies = [
  "base64",
  "cairo-rs",
  "dioxus",
+ "dioxus-desktop",
  "include_dir",
  "libc",
  "once_cell",
