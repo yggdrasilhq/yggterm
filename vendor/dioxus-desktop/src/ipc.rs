@@ -3,6 +3,7 @@ use tao::window::WindowId;
 
 #[non_exhaustive]
 #[derive(Debug, Clone)]
+#[allow(missing_docs)]
 pub enum UserWindowEvent {
     /// A global hotkey event
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
