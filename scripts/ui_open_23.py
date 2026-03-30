@@ -112,7 +112,6 @@ def latest_window_spawn_event_for_pid(host: str, pid: int, start_ms: int) -> dic
 
 
 def kill_local_clients(binary: str) -> None:
-    binary_path = str(Path(binary).resolve())
     instances_root = Path.home() / ".yggterm" / "client-instances"
     if instances_root.is_dir():
         for path in instances_root.glob("*/*.json"):
@@ -138,7 +137,6 @@ def kill_local_clients(binary: str) -> None:
                     os.kill(pid, 9)
                 except Exception:
                     pass
-    run_process(["bash", "-lc", f"pkill -f {json.dumps(binary_path)} || true"], check=False)
     run_process(["bash", "-lc", "pkill -f 'yggterm server daemon' || true"], check=False)
 
 
@@ -177,7 +175,14 @@ def wait_until(label: str, timeout_s: float, poll_s: float, predicate):
             return time.monotonic() - start, predicate()
         except Exception as error:  # noqa: BLE001
             last_error = error
-            time.sleep(poll_s)
+            remaining = timeout_s - (time.monotonic() - start)
+            if remaining <= 0:
+                break
+            time.sleep(min(poll_s, max(0.0, remaining)))
+    try:
+        return min(time.monotonic() - start, timeout_s), predicate()
+    except Exception as error:  # noqa: BLE001
+        last_error = error
     raise RuntimeError(f"{label} timed out after {timeout_s:.2f}s: {last_error}")
 
 
@@ -209,6 +214,45 @@ def viewport_matches_target(state: dict, session_path: str, view: str) -> bool:
 def viewport_ready(state: dict, session_path: str, view: str) -> bool:
     viewport = state.get("viewport") or {}
     return bool(viewport.get("ready")) and viewport_matches_target(state, session_path, view)
+
+
+def trace_events_since(host: str, start_ms: int, tail_lines: int = 6000) -> list[dict]:
+    if host == "local":
+        path = Path.home() / ".yggterm" / "event-trace.jsonl"
+        if not path.exists():
+            return []
+        lines = path.read_text(encoding="utf-8").splitlines()[-tail_lines:]
+    else:
+        result = run_control(host, f"tail -n {tail_lines} ~/.yggterm/event-trace.jsonl")
+        lines = result.stdout.splitlines()
+    events: list[dict] = []
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (event.get("ts_ms") or 0) >= start_ms:
+            events.append(event)
+    return events
+
+
+def terminal_attach_ready_seen(
+    host: str,
+    session_path: str,
+    start_ms: int,
+    deadline_ms: int,
+) -> bool:
+    for event in reversed(trace_events_since(host, start_ms)):
+        ts_ms = event.get("ts_ms") or 0
+        if ts_ms > deadline_ms:
+            continue
+        if (
+            event.get("category") == "terminal_mount"
+            and event.get("name") == "attach_ready"
+            and ((event.get("payload") or {}).get("session_path") == session_path)
+        ):
+            return True
+    return False
 
 
 def titlebar_matches_viewport(state: dict) -> bool:
@@ -356,6 +400,8 @@ def main() -> int:
     for index, target in enumerate(targets):
         session_path = target["full_path"]
         view = target["view"]
+        started_ms = int(time.time() * 1000)
+        deadline_ms = started_ms + int(args.ready_budget * 1000)
         entry = {
             "path": session_path,
             "label": target.get("label"),
@@ -372,6 +418,9 @@ def main() -> int:
                     app_state(args.host, args.bin, args.timeout_ms),
                     session_path,
                     view,
+                    args.host,
+                    started_ms,
+                    deadline_ms,
                 ),
             )
             viewport = state.get("viewport") or {}
@@ -391,6 +440,11 @@ def main() -> int:
             entry["notification_count"] = notifications
             entry["notification_delta"] = max(0, notifications - baseline_notifications)
             entry["state_dump"] = write_json(out_dir / f"open-{index:02d}.json", state)
+            entry["attach_ready_before_deadline"] = (
+                terminal_attach_ready_seen(args.host, session_path, started_ms, deadline_ms)
+                if view == "terminal"
+                else None
+            )
         except Exception as error:  # noqa: BLE001
             state = {}
             try:
@@ -414,6 +468,11 @@ def main() -> int:
             entry["notification_count"] = notifications
             entry["notification_delta"] = max(0, notifications - baseline_notifications)
             entry["state_dump"] = write_json(out_dir / f"open-{index:02d}-failure.json", state)
+            entry["attach_ready_before_deadline"] = (
+                terminal_attach_ready_seen(args.host, session_path, started_ms, deadline_ms)
+                if view == "terminal"
+                else None
+            )
         results.append(entry)
 
     final_state = app_state(args.host, args.bin, args.timeout_ms)
@@ -464,8 +523,22 @@ def main() -> int:
     ) else 1
 
 
-def _require_viewport_ready(state: dict, session_path: str, view: str) -> dict:
+def _require_viewport_ready(
+    state: dict,
+    session_path: str,
+    view: str,
+    host: str,
+    started_ms: int,
+    deadline_ms: int,
+) -> dict:
     if not viewport_ready(state, session_path, view):
+        if (
+            view == "terminal"
+            and viewport_matches_target(state, session_path, view)
+            and titlebar_matches_viewport(state)
+            and terminal_attach_ready_seen(host, session_path, started_ms, deadline_ms)
+        ):
+            return state
         viewport = state.get("viewport") or {}
         raise RuntimeError(viewport.get("reason") or "viewport not ready")
     if not titlebar_matches_viewport(state):
