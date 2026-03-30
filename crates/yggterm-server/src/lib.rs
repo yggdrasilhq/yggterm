@@ -1461,6 +1461,18 @@ impl YggtermServer {
         cwd: Option<&str>,
         title_hint: Option<&str>,
     ) -> anyhow::Result<String> {
+        self.open_remote_scanned_session_with_view(machine_key, session_id, cwd, title_hint, None)
+    }
+
+    pub fn open_remote_scanned_session_with_view(
+        &mut self,
+        machine_key: &str,
+        session_id: &str,
+        cwd: Option<&str>,
+        title_hint: Option<&str>,
+        view_mode: Option<WorkspaceViewMode>,
+    ) -> anyhow::Result<String> {
+        let launch_terminal = view_mode != Some(WorkspaceViewMode::Rendered);
         let machine_key = normalize_machine_key(machine_key);
         if let Ok(home) = resolve_yggterm_home() {
             append_trace_event(
@@ -1489,11 +1501,20 @@ impl YggtermServer {
             prefix: machine.prefix.clone(),
             cwd: cwd.map(ToOwned::to_owned),
         };
-        let (remote_binary, remote_deploy_state) =
+        let (remote_binary, remote_deploy_state) = if launch_terminal {
             resolve_remote_yggterm_binary(&target.ssh_target, target.prefix.as_deref())
                 .unwrap_or_else(|_| {
                     (preferred_remote_binary_fallback(), RemoteDeployState::Planned)
-                });
+                })
+        } else {
+            machine
+                .remote_binary_expr
+                .clone()
+                .map(|binary_expr| (binary_expr, machine.remote_deploy_state))
+                .unwrap_or_else(|| {
+                    (preferred_remote_binary_fallback(), machine.remote_deploy_state)
+                })
+        };
         let resolved_title = title_hint
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| short_session_id(session_id));
@@ -1571,16 +1592,24 @@ impl YggtermServer {
                     );
                 }
             }
-            self.focus_live_session(&session_path);
-            self.request_terminal_launch_for_path(&session_path);
+            if launch_terminal {
+                self.focus_live_session(&session_path);
+            } else {
+                self.active_session_path = Some(session_path.clone());
+                self.active_view_mode = WorkspaceViewMode::Rendered;
+            }
+            if launch_terminal {
+                self.request_terminal_launch_for_path(&session_path);
+            }
             return Ok(session_path);
         }
-        self.insert_live_session(
+        self.insert_live_session_with_launch(
             &session_path,
             session_id,
             SessionKind::SshShell,
             &target,
             Some(resolved_title.clone()),
+            launch_terminal,
         );
         if let Some(session) = self.sessions.get_mut(&session_path) {
             session.session_path = session_path.clone();
@@ -1651,8 +1680,13 @@ impl YggtermServer {
                 );
             }
         }
-        self.focus_live_session(&session_path);
-        self.request_terminal_launch_for_path(&session_path);
+        if launch_terminal {
+            self.focus_live_session(&session_path);
+            self.request_terminal_launch_for_path(&session_path);
+        } else {
+            self.active_session_path = Some(session_path.clone());
+            self.active_view_mode = WorkspaceViewMode::Rendered;
+        }
         Ok(session_path)
     }
 
@@ -7199,7 +7233,8 @@ mod tests {
         GhosttyHostSupport, PersistedDaemonState, PersistedLiveSession, REMOTE_OUTPUT_SENTINEL,
         RemoteCommandCacheEntry, RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot,
         RemoteScannedSession, SessionKind, SessionNode, SessionNodeKind, SshConnectTarget,
-        TerminalBackend, UiTheme, WorkspaceViewMode, YggtermServer, current_millis_u64,
+        TerminalBackend, TerminalLaunchPhase, UiTheme, WorkspaceViewMode, YggtermServer,
+        current_millis_u64,
         dedupe_remote_scanned_sessions, load_remote_machine_sessions_from_mirror,
         mirror_remote_machine_sessions, parse_screen_session_ref, parse_stored_transcript,
         remote_cache_key, remote_command_cache, remote_resume_shell_command,
@@ -7412,6 +7447,51 @@ mod tests {
         let _ = fs::remove_dir_all(home);
 
         assert_eq!(loaded, sessions);
+        Ok(())
+    }
+
+    #[test]
+    fn remote_preview_open_does_not_queue_terminal_resume() -> Result<()> {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.remote_machines.push(RemoteMachineSnapshot {
+            machine_key: "jojo".to_string(),
+            label: "jojo".to_string(),
+            ssh_target: "jojo".to_string(),
+            prefix: None,
+            remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+            remote_deploy_state: RemoteDeployState::Ready,
+            health: RemoteMachineHealth::Healthy,
+            sessions: Vec::new(),
+        });
+
+        let session_path = server.open_remote_scanned_session_with_view(
+            "jojo",
+            "019cf00a-57bd-7480-a642-495ac1389b8e",
+            Some("/home/pi"),
+            Some("Passthrough Gpus Dev Set Intel"),
+            Some(WorkspaceViewMode::Rendered),
+        )?;
+
+        let session = server.sessions.get(&session_path).expect("session");
+        assert_eq!(session.launch_phase, TerminalLaunchPhase::RemoteBootstrap);
+        assert_eq!(server.active_session_path(), Some(session_path.as_str()));
+        assert_eq!(server.active_view_mode, WorkspaceViewMode::Rendered);
         Ok(())
     }
 
