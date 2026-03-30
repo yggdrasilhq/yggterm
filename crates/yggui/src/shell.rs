@@ -9392,6 +9392,28 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
         .get("active_summary")
         .and_then(Value::as_str)
         .map(str::to_string);
+    let titlebar_title_text = dom
+        .get("titlebar_title_text")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let titlebar_summary_text = dom
+        .get("titlebar_summary_text")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let titlebar_button_tooltip = dom
+        .get("titlebar_button_tooltip")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let titlebar_menu_open = dom
+        .get("titlebar_menu_open")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let terminal_attach_in_flight = snapshot
         .get("shell")
         .and_then(|shell| shell.get("terminal_attach_in_flight"))
@@ -9501,6 +9523,12 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
         "active_view_mode": active_view_mode,
         "active_title": active_title,
         "active_summary": active_summary,
+        "titlebar": {
+            "title_text": titlebar_title_text,
+            "summary_text": titlebar_summary_text,
+            "button_tooltip": titlebar_button_tooltip,
+            "menu_open": titlebar_menu_open,
+        },
         "notification_count": notification_count,
         "notifications": notifications,
         "preview_text_sample": preview_text_sample,
@@ -9525,6 +9553,10 @@ async fn capture_dom_debug_snapshot() -> Value {
             const shellRoots = Array.from(document.querySelectorAll('#yggterm-shell-root'));
             const sidebars = Array.from(document.querySelectorAll('#yggterm-sidebar'));
             const titlebars = Array.from(document.querySelectorAll('[data-yggterm-titlebar="1"]'));
+            const titlebarTitle = document.querySelector('[data-titlebar-title="1"]');
+            const titlebarButton = document.querySelector('[data-titlebar-session-button="1"]');
+            const titlebarSummary = document.querySelector('[data-titlebar-summary-body="1"]');
+            const titlebarSummaryMenu = document.querySelector('[data-titlebar-summary-menu="1"]');
             const mainSurfaces = Array.from(document.querySelectorAll('[data-yggterm-main-surface="1"]'));
             const sidebarScroller = document.querySelector('[data-sidebar-scroll="1"]');
             const sidebarRows = Array.from(document.querySelectorAll('[data-sidebar-row-path]'));
@@ -9584,6 +9616,10 @@ async fn capture_dom_debug_snapshot() -> Value {
                 shell_root_count: shellRoots.length,
                 sidebar_count: sidebars.length,
                 titlebar_count: titlebars.length,
+                titlebar_title_text: String(titlebarTitle?.textContent || "").trim().slice(0, 240),
+                titlebar_button_tooltip: String(titlebarButton?.getAttribute('title') || "").trim().slice(0, 240),
+                titlebar_summary_text: String(titlebarSummary?.textContent || "").trim().slice(0, 240),
+                titlebar_menu_open: Boolean(titlebarSummaryMenu),
                 main_surface_count: mainSurfaces.length,
                 shell_text_sample: String(document.getElementById("yggterm-shell-root")?.innerText || "").slice(0, 240),
                 sidebar_scroll_top: sidebarScroller ? Math.round(sidebarScroller.scrollTop) : null,
@@ -12294,6 +12330,7 @@ fn Titlebar(
                             onclick: |evt| evt.stop_propagation(),
                             ondoubleclick: |evt| evt.stop_propagation(),
                             button {
+                                "data-titlebar-session-button": "1",
                                 title: active_summary
                                     .clone()
                                     .unwrap_or_else(|| "Summary not generated yet.".to_string()),
@@ -12305,6 +12342,7 @@ fn Titlebar(
                                 ),
                                 onclick: move |_| on_toggle_session_menu.call(()),
                                 span {
+                                    "data-titlebar-title": "1",
                                     style: "min-width:0; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; text-align:left;",
                                     "{active_title}"
                                 }
@@ -12341,6 +12379,7 @@ fn Titlebar(
                             }
                             if snapshot.titlebar_session_menu_open {
                                 div {
+                                    "data-titlebar-summary-menu": "1",
                                     style: format!(
                                         "position:absolute; left:0; top:38px; z-index:210; width:min(420px, 70vw); padding:12px 14px; border-radius:16px; \
                                          background:rgba(255,255,255,0.97); box-shadow:0 20px 48px rgba(74,93,122,0.18), \
@@ -12352,6 +12391,7 @@ fn Titlebar(
                                         "{active_title}"
                                     }
                                     div {
+                                        "data-titlebar-summary-body": "1",
                                         style: format!(
                                             "font-size:12px; line-height:1.65; color:{}; max-height:180px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere;",
                                             snapshot.palette.muted
