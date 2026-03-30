@@ -9,10 +9,11 @@ mod terminal;
 pub use app_control::{
     AppControlCommand, AppControlDragCommand, AppControlDragPlacement, AppControlRequest,
     AppControlResponse, AppControlViewMode, ScreenshotTarget, app_control_captures_dir,
-    app_control_requests_dir, app_control_responses_dir, complete_app_control_request,
-    current_millis, default_recording_output_path, default_screenshot_output_path,
-    enqueue_app_control_request, enqueue_screen_recording_request, enqueue_screenshot_request,
-    take_next_app_control_request, wait_for_app_control_response,
+    app_control_requests_dir, app_control_requests_pending, app_control_responses_dir,
+    complete_app_control_request, current_millis, default_recording_output_path,
+    default_screenshot_output_path, enqueue_app_control_request,
+    enqueue_screen_recording_request, enqueue_screenshot_request, take_next_app_control_request,
+    wait_for_app_control_response,
 };
 pub use attach::{AttachMetadata, run_attach};
 pub use codex_cli::{ManagedCliTool, ManagedCliToolStatus};
@@ -43,7 +44,7 @@ use codex_cli::{
 };
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
@@ -4835,6 +4836,31 @@ pub fn run_app_control_describe_state(timeout_ms: u64) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
     let response = request_app_control(&home, AppControlCommand::DescribeState, timeout_ms)?;
     write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_dump_state(output_path: &str, timeout_ms: u64) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(&home, AppControlCommand::DescribeState, timeout_ms)?;
+    let data = response
+        .data
+        .context("app control dump missing response data")?;
+    let output_path = PathBuf::from(output_path);
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating app dump dir {}", parent.display()))?;
+    }
+    fs::write(&output_path, serde_json::to_vec_pretty(&data)?)
+        .with_context(|| format!("writing app dump {}", output_path.display()))?;
+    write_stdout_payload(
+        &serde_json::to_string_pretty(&json!({
+            "request_id": response.request_id,
+            "handled_by_pid": response.handled_by_pid,
+            "completed_at_ms": response.completed_at_ms,
+            "output_path": output_path,
+            "error": response.error,
+        }))?,
+    )?;
     Ok(())
 }
 
