@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import random
 import shlex
 import subprocess
@@ -47,6 +48,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout-ms", type=int, default=8000)
     parser.add_argument("--seed", type=int, default=23)
     parser.add_argument("--out-dir", default="/tmp/yggterm-ui-stress-23")
+    parser.add_argument(
+        "--launch-local",
+        action="store_true",
+        help="Launch a fresh local GUI client from --bin before running the test",
+    )
     parser.add_argument(
         "--apply-drag",
         action="store_true",
@@ -145,6 +151,59 @@ def latest_window_spawn_event(host: str, tail_lines: int = 4000) -> dict | None:
         if event.get("category") == "startup" and event.get("name") == "window_spawned":
             return event
     return None
+
+
+def latest_window_spawn_event_for_pid(
+    host: str,
+    pid: int,
+    start_ms: int,
+    tail_lines: int = 4000,
+) -> dict | None:
+    events = trace_events_since(host, start_ms, tail_lines=tail_lines)
+    for event in reversed(events):
+        if (
+            event.get("pid") == pid
+            and event.get("category") == "startup"
+            and event.get("name") == "window_spawned"
+        ):
+            return event
+    return None
+
+
+def launch_local_client(binary: str, timeout_s: float = 3.0) -> tuple[subprocess.Popen, dict]:
+    binary_path = str(Path(binary).resolve())
+    subprocess.run(
+        ["bash", "-lc", f"pkill -f {shlex.quote(binary_path)} || true"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    env = os.environ.copy()
+    env.setdefault("DISPLAY", ":10.0")
+    env["YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF"] = "1"
+    stdout_path = "/tmp/yggterm-ui-stress-launch.out"
+    stderr_path = "/tmp/yggterm-ui-stress-launch.err"
+    stdout = open(stdout_path, "w", encoding="utf-8")
+    stderr = open(stderr_path, "w", encoding="utf-8")
+    start_ms = int(time.time() * 1000)
+    proc = subprocess.Popen(
+        [binary_path],
+        stdout=stdout,
+        stderr=stderr,
+        env=env,
+        cwd=str(Path(binary).resolve().parent.parent.parent),
+    )
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        event = latest_window_spawn_event_for_pid("local", proc.pid, start_ms)
+        if event is not None:
+            return proc, event
+        if proc.poll() is not None:
+            break
+        time.sleep(0.05)
+    raise RuntimeError(
+        f"local launch did not emit window_spawned within {timeout_s:.2f}s for pid {proc.pid}"
+    )
 
 
 def app_open(host: str, binary: str, session_path: str, view: str, timeout_ms: int) -> dict:
@@ -547,6 +606,11 @@ def main() -> int:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    launch = None
+    launch_event = None
+    if args.host == "local" and args.launch_local:
+        launch, launch_event = launch_local_client(args.bin)
+
     baseline_state = wait_for_app_state(args.host, args.bin, args.timeout_ms)
     baseline_dump = write_state_dump(out_dir, "baseline", baseline_state)
     inventory = server_inventory(args.host)
@@ -556,7 +620,7 @@ def main() -> int:
     drags = drag_trials(args, drag_rows_payload, out_dir)
     final_state = wait_for_app_state(args.host, args.bin, args.timeout_ms)
     final_dump = write_state_dump(out_dir, "final", final_state)
-    window_spawn_event = latest_window_spawn_event(args.host)
+    window_spawn_event = launch_event or latest_window_spawn_event(args.host)
 
     open_failures = [item for item in opens if not item.get("within_budget")]
     open_anomalies = [item for item in opens if item.get("anomaly")]
@@ -595,6 +659,12 @@ def main() -> int:
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(summary_path)
     print(json.dumps(summary, indent=2))
+    if launch is not None and launch.poll() is None:
+        launch.terminate()
+        try:
+            launch.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            launch.kill()
     return 0 if not open_failures and not drag_failures else 1
 
 
