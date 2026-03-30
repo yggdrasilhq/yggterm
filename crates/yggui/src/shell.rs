@@ -32,6 +32,7 @@ use dioxus::document;
 use dioxus::html::{InteractionElementOffset, input_data::MouseButton};
 use dioxus::prelude::*;
 use dioxus_core::schedule_update;
+use dioxus_desktop::UserWindowEvent as DesktopUserWindowEvent;
 use keyboard_types::{Key, Modifiers};
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
@@ -72,8 +73,9 @@ use yggterm_core::{
 };
 use yggterm_platform::{DockRect, send_user_notification};
 use yggterm_server::{
-    AppControlCommand, AppControlDragCommand, AppControlDragPlacement, AppControlResponse,
-    AppControlViewMode, GhosttyTerminalHostMode, ManagedSessionView, PreviewTone,
+    app_control_requests_pending, AppControlCommand, AppControlDragCommand,
+    AppControlDragPlacement, AppControlResponse, AppControlViewMode, GhosttyTerminalHostMode,
+    ManagedSessionView, PreviewTone,
     RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession,
     ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry,
     SessionPreviewBlock, SessionRenderedSection, SshConnectTarget, TerminalBackend,
@@ -2627,7 +2629,7 @@ fn queue_active_session_title_generation(state: Signal<ShellState>, force: bool)
     .flatten() else {
         return;
     };
-    spawn_title_generation_for_target(state, target, force, force, true);
+    spawn_title_generation_for_target(state, target, force, force, force);
 }
 
 fn spawn_deferred_active_session_title_generation(state: Signal<ShellState>, force: bool) {
@@ -3074,7 +3076,12 @@ fn spawn_precis_generation_for_target(
     });
 }
 
-fn spawn_summary_generation(state: Signal<ShellState>, session: ManagedSessionView, force: bool) {
+fn spawn_summary_generation(
+    state: Signal<ShellState>,
+    session: ManagedSessionView,
+    force: bool,
+    announce: bool,
+) {
     let target = {
         let shell = state.read();
         copy_generation_target_for_session(&shell.server, &session)
@@ -3082,7 +3089,7 @@ fn spawn_summary_generation(state: Signal<ShellState>, session: ManagedSessionVi
     let Some(target) = target else {
         return;
     };
-    spawn_summary_generation_for_target(state, target, force, force, true);
+    spawn_summary_generation_for_target(state, target, force, announce, force);
 }
 
 fn spawn_summary_generation_for_target(
@@ -3845,6 +3852,32 @@ fn daemon_spawn_lock_path(endpoint: &ServerEndpoint) -> PathBuf {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct DaemonSpawnLockRecord {
+    pid: u32,
+    created_at_ms: u64,
+}
+
+fn daemon_spawn_lock_is_stale(path: &Path) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return true;
+    };
+    let record = serde_json::from_slice::<DaemonSpawnLockRecord>(&bytes).ok();
+    let now = current_millis();
+    if let Some(record) = record {
+        if process_is_alive(record.pid) {
+            return now.saturating_sub(record.created_at_ms) > 15_000;
+        }
+        return true;
+    }
+    let modified_age_ms = fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.elapsed().ok())
+        .map(|elapsed| elapsed.as_millis() as u64);
+    modified_age_ms.is_none_or(|age_ms| age_ms > 15_000)
+}
+
 fn acquire_daemon_spawn_lock(endpoint: &ServerEndpoint) -> Result<DaemonSpawnLock> {
     let path = daemon_spawn_lock_path(endpoint);
     if let Some(parent) = path.parent() {
@@ -3852,12 +3885,22 @@ fn acquire_daemon_spawn_lock(endpoint: &ServerEndpoint) -> Result<DaemonSpawnLoc
     }
     for _ in 0..120 {
         match OpenOptions::new().create_new(true).write(true).open(&path) {
-            Ok(_) => {
+            Ok(mut file) => {
+                let record = DaemonSpawnLockRecord {
+                    pid: std::process::id(),
+                    created_at_ms: current_millis(),
+                };
+                let _ = file.write_all(&serde_json::to_vec(&record)?);
                 return Ok(DaemonSpawnLock { path: Some(path) });
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 if ping(endpoint).is_ok() {
                     return Ok(DaemonSpawnLock { path: None });
+                }
+                if daemon_spawn_lock_is_stale(&path) {
+                    let _ = fs::remove_file(&path);
+                    thread::sleep(Duration::from_millis(25));
+                    continue;
                 }
                 thread::sleep(Duration::from_millis(100));
             }
@@ -9119,6 +9162,9 @@ fn describe_app_state_snapshot(
         "active_view_mode": format!("{:?}", snapshot.active_view_mode),
         "active_session_path": snapshot.active_session.as_ref().map(|session| session.session_path.clone()),
         "active_session_source": snapshot.active_session.as_ref().map(|session| format!("{:?}", session.source)),
+        "active_title": snapshot.active_title.clone(),
+        "active_precis": snapshot.active_precis.clone(),
+        "active_summary": snapshot.active_summary.clone(),
         "browser": {
             "selected_path": selected_path.clone(),
             "stored_selected_path": shell.browser.selected_path(),
@@ -9173,6 +9219,18 @@ fn describe_app_state_snapshot(
                 .cloned()
                 .collect::<Vec<_>>(),
             "notifications_count": shell.notifications.len(),
+            "notifications": shell.notifications.iter().map(|notification| {
+                json!({
+                    "id": notification.id,
+                    "tone": format!("{:?}", notification.tone),
+                    "title": notification.title,
+                    "message": notification.message,
+                    "created_at_ms": notification.created_at_ms,
+                    "job_key": notification.job_key,
+                    "progress": notification.progress,
+                    "persistent": notification.persistent,
+                })
+            }).collect::<Vec<_>>(),
         },
         "generation": {
             "title_requests_in_flight": shell.title_requests_in_flight.len(),
@@ -9218,11 +9276,119 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
     })
 }
 
+fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
+    let active_session_path = snapshot
+        .get("active_session_path")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let active_view_mode = snapshot
+        .get("active_view_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("Unknown")
+        .to_string();
+    let active_title = snapshot
+        .get("active_title")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let active_summary = snapshot
+        .get("active_summary")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let notifications = snapshot
+        .get("shell")
+        .and_then(|shell| shell.get("notifications"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let notification_count = notifications.len();
+    let preview_text_sample = dom
+        .get("preview_text_sample")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let document_editor_count = dom
+        .get("document_editor_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let document_body_sample = dom
+        .get("document_body_sample")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let terminal_hosts = dom
+        .get("terminal_hosts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let terminal_rendered = terminal_hosts.iter().any(|host| {
+        host.get("canvas_count")
+            .and_then(Value::as_u64)
+            .is_some_and(|count| count > 0)
+            || host
+                .get("child_count")
+                .and_then(Value::as_u64)
+                .is_some_and(|count| count > 0)
+            || host
+                .get("text_sample")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty())
+    });
+    let (ready, reason) = if active_session_path.is_none() {
+        (false, Some("no active session selected".to_string()))
+    } else if active_view_mode == "Rendered" {
+        let preview_scroll_count = dom
+            .get("preview_scroll_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if preview_scroll_count == 0 && document_editor_count == 0 {
+            (false, Some("preview surface not mounted".to_string()))
+        } else if preview_scroll_count > 0 && preview_text_sample.is_empty() {
+            (false, Some("preview surface mounted but content is empty".to_string()))
+        } else if document_editor_count > 0 && document_body_sample.is_empty() {
+            (false, Some("document editor mounted but body is empty".to_string()))
+        } else {
+            (true, None)
+        }
+    } else if active_view_mode == "Terminal" {
+        if terminal_hosts.is_empty() {
+            (false, Some("terminal host is missing".to_string()))
+        } else if !terminal_rendered {
+            (
+                false,
+                Some("terminal host exists but xterm surface is empty".to_string()),
+            )
+        } else {
+            (true, None)
+        }
+    } else {
+        (false, Some(format!("unsupported active view mode: {active_view_mode}")))
+    };
+    json!({
+        "active_session_path": active_session_path,
+        "active_view_mode": active_view_mode,
+        "active_title": active_title,
+        "active_summary": active_summary,
+        "notification_count": notification_count,
+        "notifications": notifications,
+        "preview_text_sample": preview_text_sample,
+        "document_editor_count": document_editor_count,
+        "document_body_sample": document_body_sample,
+        "terminal_host_count": terminal_hosts.len(),
+        "terminal_hosts": terminal_hosts,
+        "ready": ready,
+        "reason": reason,
+    })
+}
+
 async fn capture_dom_debug_snapshot() -> Value {
     let script = r#"
         (async () => {
             const terminalHosts = Array.from(document.querySelectorAll('[id^="yggterm-terminal-"]'));
             const previewScrolls = Array.from(document.querySelectorAll('[data-preview-scroll="1"]'));
+            const documentEditors = Array.from(document.querySelectorAll('[data-document-editor="1"]'));
+            const documentBodies = Array.from(document.querySelectorAll('[data-document-editor-body="1"]'));
             const sidebarScroller = document.querySelector('[data-sidebar-scroll="1"]');
             const sidebarRows = Array.from(document.querySelectorAll('[data-sidebar-row-path]'));
             const visibleSidebarRows = sidebarRows
@@ -9274,6 +9440,8 @@ async fn capture_dom_debug_snapshot() -> Value {
                 terminal_hosts: hostDetails,
                 preview_scroll_count: previewScrolls.length,
                 preview_text_sample: String(previewScrolls[0]?.innerText || "").slice(0, 240),
+                document_editor_count: documentEditors.length,
+                document_body_sample: String(documentBodies[0]?.value || "").slice(0, 240),
                 shell_text_sample: String(document.getElementById("yggterm-shell-root")?.innerText || "").slice(0, 240),
                 sidebar_scroll_top: sidebarScroller ? Math.round(sidebarScroller.scrollTop) : null,
                 sidebar_visible_row_count: visibleSidebarRows.length,
@@ -9297,11 +9465,11 @@ async fn process_pending_app_control_requests(
     settings_path: &std::path::Path,
     desktop: dioxus::desktop::DesktopContext,
     mut state: Signal<ShellState>,
-) -> Result<()> {
+) -> Result<bool> {
     let home = perf_home_dir(settings_path);
     let Some((inflight_path, request)) = take_next_app_control_request(&home, std::process::id())?
     else {
-        return Ok(());
+        return Ok(false);
     };
     append_trace_event(
         &home,
@@ -9640,8 +9808,11 @@ async fn process_pending_app_control_requests(
             output_path: None,
             data: Some({
                 let mut snapshot = describe_app_state_snapshot(&state, &desktop);
+                let dom = capture_dom_debug_snapshot().await;
+                let viewport = describe_viewport_snapshot(&snapshot, &dom);
                 if let Some(map) = snapshot.as_object_mut() {
-                    map.insert("dom".to_string(), capture_dom_debug_snapshot().await);
+                    map.insert("dom".to_string(), dom.clone());
+                    map.insert("viewport".to_string(), viewport);
                 }
                 snapshot
             }),
@@ -9662,7 +9833,7 @@ async fn process_pending_app_control_requests(
             "error": response.error,
         }),
     );
-    Ok(())
+    Ok(true)
 }
 
 fn parse_client_instance_pid(path: &Path) -> Option<u32> {
@@ -10167,6 +10338,9 @@ fn app() -> Element {
     let mut update_check_started = use_signal(|| false);
     let mut dock_pulse_started = use_signal(|| false);
     let mut app_control_loop_started = use_signal(|| false);
+    let mut app_control_drain_in_flight = use_signal(|| false);
+    let window_spawn_probe_started = use_signal(current_millis);
+    let window_spawn_traced = use_signal(|| false);
     let mut window_epoch = use_signal(|| 0_u64);
     let mut terminal_mount_epoch = use_signal(|| 0_u64);
     let async_render_epoch = use_signal(|| 0_u64);
@@ -10176,11 +10350,13 @@ fn app() -> Element {
     let mut last_preview_refresh_marker = use_signal(|| None::<(String, u64)>);
     let mut last_sidebar_autoscroll_path = use_signal(|| None::<String>);
     let schedule_ui_update = schedule_update();
+    #[cfg(target_os = "macos")]
     let desktop_for_root_effect = desktop.clone();
+    let trace_home_for_root_effect = trace_home.clone();
     use_effect(move || {
         if !APP_ROOT_EFFECT_TRACED.swap(true, Ordering::SeqCst) {
             append_trace_event(
-                &trace_home,
+                &trace_home_for_root_effect,
                 "ui",
                 "startup",
                 "app_root_effect",
@@ -10196,7 +10372,7 @@ fn app() -> Element {
                 desktop_for_root_effect.set_minimized(false);
                 desktop_for_root_effect.set_focus();
                 append_trace_event(
-                    &trace_home,
+                    &trace_home_for_root_effect,
                     "ui",
                     "startup",
                     "mac_window_forced_visible",
@@ -10212,19 +10388,65 @@ fn app() -> Element {
         }
     });
     {
-        let settings_path = bootstrap.settings_path.clone();
         let desktop = desktop.clone();
-        let state = state;
+        let trace_home = trace_home.clone();
+        use_effect(move || {
+            if *window_spawn_traced.read() {
+                return;
+            }
+            let desktop = desktop.clone();
+            let trace_home = trace_home.clone();
+            let started_at_ms = *window_spawn_probe_started.read();
+            let mut window_spawn_traced = window_spawn_traced;
+            spawn(async move {
+                for _ in 0..40 {
+                    let window = describe_window(&desktop);
+                    let visible = window
+                        .get("visible")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let width = window
+                        .get("inner_size")
+                        .and_then(|value| value.get("width"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let height = window
+                        .get("inner_size")
+                        .and_then(|value| value.get("height"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    if visible && width > 0 && height > 0 {
+                        append_trace_event(
+                            &trace_home,
+                            "ui",
+                            "startup",
+                            "window_spawned",
+                            json!({
+                                "pid": std::process::id(),
+                                "elapsed_ms": current_millis().saturating_sub(started_at_ms),
+                                "window": window,
+                            }),
+                        );
+                        window_spawn_traced.set(true);
+                        return;
+                    }
+                    sleep(Duration::from_millis(50)).await;
+                }
+            });
+        });
+    }
+    {
+        let settings_path = bootstrap.settings_path.clone();
+        let wake_app_control = desktop.poll_waker();
         use_effect(move || {
             if *app_control_loop_started.read() {
                 return;
             }
             app_control_loop_started.set(true);
             let settings_path = settings_path.clone();
-            let desktop = desktop.clone();
-            let state = state;
             let trace_home = perf_home_dir(&settings_path);
-            spawn(async move {
+            let wake_app_control = wake_app_control.clone();
+            thread::spawn(move || {
                 append_trace_event(
                     &trace_home,
                     "ui",
@@ -10235,28 +10457,98 @@ fn app() -> Element {
                     }),
                 );
                 loop {
-                    if let Err(error) =
-                        process_pending_app_control_requests(&settings_path, desktop.clone(), state)
-                            .await
-                    {
-                        append_trace_event(
-                            &trace_home,
-                            "ui",
-                            "app_control",
-                            "loop_error",
-                            json!({
-                                "pid": std::process::id(),
-                                "error": error.to_string(),
-                            }),
-                        );
-                        warn!(error=%error, "failed to process app control request");
+                    if app_control_requests_pending(&trace_home) {
+                        wake_app_control();
                     }
-                    sleep(Duration::from_millis(SCREENSHOT_REQUEST_POLL_MS)).await;
+                    thread::sleep(Duration::from_millis(SCREENSHOT_REQUEST_POLL_MS));
                 }
             });
         });
     }
+    {
+        let settings_path = bootstrap.settings_path.clone();
+        let desktop = desktop.clone();
+        let state = state;
+        let schedule_ui_update = schedule_ui_update.clone();
+        use_effect(move || {
+            let trace_home = perf_home_dir(&settings_path);
+            if *app_control_drain_in_flight.read() || !app_control_requests_pending(&trace_home) {
+                return;
+            }
+            app_control_drain_in_flight.set(true);
+            let settings_path = settings_path.clone();
+            let desktop = desktop.clone();
+            let state = state;
+            let schedule_ui_update = schedule_ui_update.clone();
+            spawn(async move {
+                let trace_home = perf_home_dir(&settings_path);
+                loop {
+                    match process_pending_app_control_requests(&settings_path, desktop.clone(), state)
+                        .await
+                    {
+                        Ok(true) => continue,
+                        Ok(false) => break,
+                        Err(error) => {
+                            append_trace_event(
+                                &trace_home,
+                                "ui",
+                                "app_control",
+                                "loop_error",
+                                json!({
+                                    "pid": std::process::id(),
+                                    "error": error.to_string(),
+                                }),
+                            );
+                            warn!(error=%error, "failed to process app control request");
+                            break;
+                        }
+                    }
+                }
+                app_control_drain_in_flight.set(false);
+                if app_control_requests_pending(&trace_home) {
+                    schedule_ui_update();
+                }
+            });
+        });
+    }
+    let settings_path_for_app_control_handler = bootstrap.settings_path.clone();
+    let desktop_for_app_control_handler = desktop.clone();
     use_wry_event_handler(move |event, _| {
+        if matches!(event, TaoEvent::UserEvent(DesktopUserWindowEvent::Poll(_))) {
+            let trace_home = perf_home_dir(&settings_path_for_app_control_handler);
+            if !*app_control_drain_in_flight.read() && app_control_requests_pending(&trace_home) {
+                app_control_drain_in_flight.set(true);
+                let settings_path = settings_path_for_app_control_handler.clone();
+                let desktop = desktop_for_app_control_handler.clone();
+                let state = state;
+                spawn(async move {
+                    let trace_home = perf_home_dir(&settings_path);
+                    loop {
+                        match process_pending_app_control_requests(&settings_path, desktop.clone(), state)
+                            .await
+                        {
+                            Ok(true) => continue,
+                            Ok(false) => break,
+                            Err(error) => {
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "app_control",
+                                    "loop_error",
+                                    json!({
+                                        "pid": std::process::id(),
+                                        "error": error.to_string(),
+                                    }),
+                                );
+                                warn!(error=%error, "failed to process app control request");
+                                break;
+                            }
+                        }
+                    }
+                    app_control_drain_in_flight.set(false);
+                });
+            }
+        }
         if let TaoEvent::WindowEvent { event, .. } = event {
             match event {
                 DesktopWindowEvent::KeyboardInput { event, .. } => {
@@ -10435,7 +10727,7 @@ fn app() -> Element {
             maybe_spawn_background_copy_generation(state);
             return;
         }
-        spawn_summary_generation(state, session, summary_stale);
+        spawn_summary_generation(state, session, summary_stale, summary_stale);
         state.with_mut(|shell| shell.next_background_copy_scan_after_ms = current_millis());
         maybe_spawn_background_copy_generation(state);
     });
@@ -11005,7 +11297,7 @@ fn app() -> Element {
                         },
                         on_refresh_summary: move |_| {
                             if let Some(session) = state.read().server.active_session().cloned() {
-                                spawn_summary_generation(state, session, true);
+                                spawn_summary_generation(state, session, true, true);
                             }
                         },
                         on_toggle_meta: move || state.with_mut(|shell| shell.toggle_metadata_panel()),
@@ -12728,6 +13020,7 @@ fn MainSurface(
     let render_trace_session_path = active_session_path.clone();
     let render_trace_surface_key = surface_key.clone();
     let render_trace_view_mode = snapshot.active_view_mode;
+    let render_trace_session_kind = snapshot.active_session.as_ref().map(|session| format!("{:?}", session.kind));
     use_effect(move || {
         let trace_home = perf_home_dir(&state.read().bootstrap.settings_path);
         append_trace_event(
@@ -12741,6 +13034,20 @@ fn MainSurface(
                 "active_session_path": render_trace_session_path,
             }),
         );
+        if render_trace_view_mode == WorkspaceViewMode::Rendered {
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "main_surface",
+                "viewport_ready",
+                json!({
+                    "surface_key": render_trace_surface_key,
+                    "active_view_mode": format!("{:?}", render_trace_view_mode),
+                    "active_session_path": render_trace_session_path,
+                    "session_kind": render_trace_session_kind,
+                }),
+            );
+        }
     });
     let body = if let Some(session) = snapshot.active_session.clone() {
         match snapshot.active_view_mode {
@@ -13125,6 +13432,8 @@ fn DocumentEditor(
     let source_session_cwd = metadata_value(&session, "Source Cwd");
     rsx! {
         div {
+            "data-document-editor": "1",
+            "data-document-session-path": "{storage_path}",
             style: "display:flex; flex-direction:column; gap:18px; min-width:0; width:min(980px, 100%); max-width:100%; height:100%; margin:0 auto; overflow:hidden;",
             div {
                 style: "display:flex; align-items:center; justify-content:space-between; gap:14px; flex-wrap:wrap;",
@@ -13225,6 +13534,7 @@ fn DocumentEditor(
                 }
             }
             textarea {
+                "data-document-editor-body": "1",
                 value: "{body}",
                 wrap: "soft",
                 style: format!(
