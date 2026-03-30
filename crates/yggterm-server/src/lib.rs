@@ -22,7 +22,7 @@ pub use daemon::{
     cleanup_legacy_daemons, connect_ssh, connect_ssh_custom, default_endpoint, focus_live,
     focus_live_with_view, open_remote_session, open_remote_session_with_view, open_stored_session,
     open_stored_session_with_view, ping, raise_external_window, refresh_managed_cli,
-    refresh_remote_machine, remove_ssh_target, request_terminal_launch, run_daemon,
+    refresh_remote_machine, remove_session, remove_ssh_target, request_terminal_launch, run_daemon,
     set_all_preview_blocks_folded, set_view_mode, shutdown, snapshot, start_command_session,
     start_local_session, start_local_session_at, start_ssh_session_at, status,
     switch_agent_session_mode, sync_external_window, sync_theme, terminal_ensure, terminal_read,
@@ -75,6 +75,12 @@ const REMOTE_COMMAND_CACHE_VERIFY_TTL_MS: u64 = 60_000;
 struct RemoteCommandCacheEntry {
     binary_expr: String,
     verified_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteProtocolDescriptor {
+    version: String,
+    build_id: u64,
 }
 
 static REMOTE_YGGTERM_COMMAND_CACHE: OnceLock<
@@ -143,6 +149,40 @@ pub enum SessionKind {
 impl SessionKind {
     pub fn is_agent(self) -> bool {
         matches!(self, SessionKind::Codex | SessionKind::CodexLiteLlm)
+    }
+}
+
+fn live_session_default_title(kind: SessionKind, cwd: Option<&str>, fallback: &str) -> String {
+    match kind {
+        SessionKind::Shell | SessionKind::SshShell => cwd
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| fallback.to_string()),
+        _ => fallback.to_string(),
+    }
+}
+
+fn live_session_default_summary(kind: SessionKind, target: &SshConnectTarget) -> String {
+    let cwd = target.cwd.as_deref().filter(|value| !value.trim().is_empty());
+    match kind {
+        SessionKind::SshShell => match cwd {
+            Some(cwd) => format!("SSH terminal on {} rooted at {cwd}.", target.ssh_target),
+            None => format!("SSH terminal on {}.", target.ssh_target),
+        },
+        SessionKind::Shell => match cwd {
+            Some(cwd) => format!("Local shell rooted at {cwd}."),
+            None => "Local shell terminal.".to_string(),
+        },
+        SessionKind::Codex => match cwd {
+            Some(cwd) => format!("Local Codex terminal rooted at {cwd}."),
+            None => "Local Codex terminal.".to_string(),
+        },
+        SessionKind::CodexLiteLlm => match cwd {
+            Some(cwd) => format!("Local Codex LiteLLM terminal rooted at {cwd}."),
+            None => "Local Codex LiteLLM terminal.".to_string(),
+        },
+        SessionKind::Document => "Document preview.".to_string(),
     }
 }
 
@@ -718,6 +758,42 @@ impl YggtermServer {
         removed
     }
 
+    pub fn remove_live_session(&mut self, path: &str) -> anyhow::Result<bool> {
+        let Some((resolved_key, session)) = self
+            .sessions
+            .get(path)
+            .cloned()
+            .map(|session| (path.to_string(), session))
+            .or_else(|| {
+                self.sessions
+                    .iter()
+                    .find(|(_, session)| {
+                        session.source == SessionSource::LiveSsh && session.session_path == path
+                    })
+                    .map(|(key, session)| (key.clone(), session.clone()))
+            })
+        else {
+            return Ok(false);
+        };
+        if session.source != SessionSource::LiveSsh {
+            anyhow::bail!("only live sessions can be removed through this path");
+        }
+        self.sessions.remove(&resolved_key);
+        self.live_session_order
+            .retain(|existing| existing != &resolved_key);
+        if self.active_session_path.as_deref() == Some(resolved_key.as_str())
+            || self.active_session_path.as_deref() == Some(path)
+        {
+            self.active_session_path = self
+                .live_session_order
+                .iter()
+                .find(|candidate| self.sessions.contains_key(candidate.as_str()))
+                .cloned()
+                .or_else(|| self.sessions.keys().next().cloned());
+        }
+        Ok(true)
+    }
+
     pub fn set_session_title_hint(&mut self, session_path: &str, title: &str) {
         if let Some(session) = self.sessions.get_mut(session_path) {
             session.title = title.to_string();
@@ -792,8 +868,12 @@ impl YggtermServer {
                 )
             })
         });
+        let active_session_path = active_session
+            .as_ref()
+            .map(|session| session.session_path.clone())
+            .or_else(|| self.active_session_path.clone());
         ServerUiSnapshot {
-            active_session_path: self.active_session_path.clone(),
+            active_session_path,
             active_session: active_session.map(snapshot_session_view),
             active_view_mode: self.active_view_mode,
             remote_machines: self.remote_machines.clone(),
@@ -1148,13 +1228,12 @@ impl YggtermServer {
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| {
-                cwd.clone().unwrap_or_else(|| {
-                    ssh_target
-                        .rsplit('@')
-                        .next()
-                        .unwrap_or(ssh_target.as_str())
-                        .to_string()
-                })
+                let fallback = ssh_target
+                    .rsplit('@')
+                    .next()
+                    .unwrap_or(ssh_target.as_str())
+                    .to_string();
+                live_session_default_title(SessionKind::SshShell, cwd.as_deref(), &fallback)
             });
         let target = SshConnectTarget {
             label: title.clone(),
@@ -1412,7 +1491,9 @@ impl YggtermServer {
         };
         let (remote_binary, remote_deploy_state) =
             resolve_remote_yggterm_binary(&target.ssh_target, target.prefix.as_deref())
-                .unwrap_or_else(|_| ("yggterm".to_string(), RemoteDeployState::Planned));
+                .unwrap_or_else(|_| {
+                    (preferred_remote_binary_fallback(), RemoteDeployState::Planned)
+                });
         let resolved_title = title_hint
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| short_session_id(session_id));
@@ -1591,7 +1672,9 @@ impl YggtermServer {
         let target = local_session_target(kind, cwd);
         let title = title_hint
             .map(ToOwned::to_owned)
-            .unwrap_or_else(|| target.label.clone());
+            .unwrap_or_else(|| {
+                live_session_default_title(kind, target.cwd.as_deref(), &target.label)
+            });
         self.insert_live_session(&key, &uuid, kind, &target, Some(title));
         key
     }
@@ -1906,7 +1989,10 @@ impl YggtermServer {
                         cached_launch.unwrap_or_else(|| {
                             resolve_remote_yggterm_binary(&ssh_target, ssh_prefix.as_deref())
                                 .unwrap_or_else(|_| {
-                                    ("yggterm".to_string(), RemoteDeployState::Planned)
+                                    (
+                                        preferred_remote_binary_fallback(),
+                                        RemoteDeployState::Planned,
+                                    )
                                 })
                         });
                     session.remote_deploy_state = remote_deploy_state;
@@ -1920,11 +2006,12 @@ impl YggtermServer {
                                 &["server", "remote", "resume-codex", &session.id, &cwd],
                             )
                         } else {
+                            let cwd = session_metadata_value(session, "Cwd").unwrap_or_default();
                             remote_ssh_launch_command(
                                 &ssh_target,
                                 ssh_prefix.as_deref(),
                                 &remote_binary,
-                                &["server", "attach", &session.id],
+                                &["server", "attach", &session.id, &cwd],
                             )
                         };
                     upsert_session_metadata(
@@ -3969,9 +4056,10 @@ fn check_remote_protocol_version(
     exec_prefix: Option<&str>,
     binary_expr: &str,
 ) -> anyhow::Result<()> {
-    let version = remote_protocol_version_for_binary(ssh_target, exec_prefix, binary_expr)?;
-    let normalized = version.trim();
-    if normalized == daemon::SERVER_PROTOCOL_VERSION {
+    let descriptor = remote_protocol_descriptor_for_binary(ssh_target, exec_prefix, binary_expr)?;
+    let normalized = descriptor.version.trim();
+    let local_build_id = current_local_build_id();
+    if normalized == daemon::SERVER_PROTOCOL_VERSION && descriptor.build_id == local_build_id {
         return Ok(());
     }
     if is_remote_protocol_probe_recoverable(normalized) {
@@ -3987,25 +4075,66 @@ fn check_remote_protocol_version(
         );
     }
     anyhow::bail!(
-        "remote yggterm protocol mismatch for {} with {binary_expr}: expected {}, got {}",
+        "remote yggterm protocol mismatch for {} with {binary_expr}: expected {}@{}, got {}@{}",
         ssh_target,
         daemon::SERVER_PROTOCOL_VERSION,
-        normalized
+        local_build_id,
+        normalized,
+        descriptor.build_id,
     )
 }
 
-fn remote_protocol_version_for_binary(
+fn current_local_build_id() -> u64 {
+    local_remote_bootstrap_executable()
+        .or_else(|| std::env::current_exe().ok())
+        .and_then(|path| fs::read(path).ok())
+        .map(|bytes| {
+            const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+            const FNV_PRIME: u64 = 0x100000001b3;
+            let mut hash = FNV_OFFSET;
+            for byte in bytes {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(FNV_PRIME);
+            }
+            hash
+        })
+        .unwrap_or_default()
+}
+
+fn parse_remote_protocol_descriptor(text: &str) -> RemoteProtocolDescriptor {
+    let trimmed = text.trim();
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        let version = value
+            .get("version")
+            .and_then(Value::as_str)
+            .unwrap_or(trimmed)
+            .to_string();
+        let build_id = value.get("build_id").and_then(Value::as_u64).unwrap_or_default();
+        return RemoteProtocolDescriptor { version, build_id };
+    }
+    RemoteProtocolDescriptor {
+        version: trimmed.to_string(),
+        build_id: 0,
+    }
+}
+
+fn remote_protocol_descriptor_for_binary(
     ssh_target: &str,
     exec_prefix: Option<&str>,
     binary_expr: &str,
-) -> anyhow::Result<String> {
-    run_remote_binary_command(
+) -> anyhow::Result<RemoteProtocolDescriptor> {
+    let output = run_remote_binary_command(
         ssh_target,
         exec_prefix,
         binary_expr,
         &["server", "remote", "protocol-version"],
         None,
-    )
+    )?;
+    Ok(parse_remote_protocol_descriptor(&output))
+}
+
+fn preferred_remote_binary_fallback() -> String {
+    "$HOME/.yggterm/bin/yggterm".to_string()
 }
 
 fn bootstrap_remote_yggterm(ssh_target: &str, exec_prefix: Option<&str>) -> anyhow::Result<String> {
@@ -4129,8 +4258,13 @@ fn resolve_remote_yggterm_binary(
     }
 
     let installed_binary = "$HOME/.yggterm/bin/yggterm";
-    match remote_protocol_version_for_binary(ssh_target, exec_prefix, installed_binary) {
-        Ok(version) if version.trim() == daemon::SERVER_PROTOCOL_VERSION => {
+    let local_build_id = current_local_build_id();
+
+    match remote_protocol_descriptor_for_binary(ssh_target, exec_prefix, installed_binary) {
+        Ok(descriptor)
+            if descriptor.version.trim() == daemon::SERVER_PROTOCOL_VERSION
+                && descriptor.build_id == local_build_id =>
+        {
             if let Ok(mut cache) = remote_command_cache().lock() {
                 cache.insert(
                     cache_key,
@@ -4144,17 +4278,22 @@ fn resolve_remote_yggterm_binary(
                 "ssh_target": ssh_target,
                 "result": "installed_path_match",
                 "binary_expr": installed_binary,
-                "protocol_version": version.trim(),
+                "protocol_version": descriptor.version.trim(),
+                "build_id": descriptor.build_id,
             }));
             return Ok((installed_binary.to_string(), RemoteDeployState::Ready));
         }
-        Ok(version) => {
-            if !is_remote_protocol_probe_recoverable(&version) {
+        Ok(descriptor) => {
+            if descriptor.version.trim() != daemon::SERVER_PROTOCOL_VERSION
+                && !is_remote_protocol_probe_recoverable(&descriptor.version)
+            {
                 anyhow::bail!(
-                    "remote yggterm protocol mismatch for {}: expected {}, got {}",
+                    "remote yggterm protocol mismatch for {}: expected {}@{}, got {}@{}",
                     ssh_target,
                     daemon::SERVER_PROTOCOL_VERSION,
-                    version.trim()
+                    local_build_id,
+                    descriptor.version.trim(),
+                    descriptor.build_id
                 );
             }
         }
@@ -4162,8 +4301,11 @@ fn resolve_remote_yggterm_binary(
         Err(_) => {}
     }
 
-    match remote_protocol_version_for_binary(ssh_target, exec_prefix, "yggterm") {
-        Ok(version) if version.trim() == daemon::SERVER_PROTOCOL_VERSION => {
+    match remote_protocol_descriptor_for_binary(ssh_target, exec_prefix, "yggterm") {
+        Ok(descriptor)
+            if descriptor.version.trim() == daemon::SERVER_PROTOCOL_VERSION
+                && descriptor.build_id == local_build_id =>
+        {
             if let Ok(mut cache) = remote_command_cache().lock() {
                 cache.insert(
                     cache_key,
@@ -4177,17 +4319,22 @@ fn resolve_remote_yggterm_binary(
                 "ssh_target": ssh_target,
                 "result": "path_match",
                 "binary_expr": "yggterm",
-                "protocol_version": version.trim(),
+                "protocol_version": descriptor.version.trim(),
+                "build_id": descriptor.build_id,
             }));
             return Ok(("yggterm".to_string(), RemoteDeployState::Ready));
         }
-        Ok(version) => {
-            if !is_remote_protocol_probe_recoverable(&version) {
+        Ok(descriptor) => {
+            if descriptor.version.trim() != daemon::SERVER_PROTOCOL_VERSION
+                && !is_remote_protocol_probe_recoverable(&descriptor.version)
+            {
                 anyhow::bail!(
-                    "remote yggterm protocol mismatch for {}: expected {}, got {}",
+                    "remote yggterm protocol mismatch for {}: expected {}@{}, got {}@{}",
                     ssh_target,
                     daemon::SERVER_PROTOCOL_VERSION,
-                    version.trim()
+                    local_build_id,
+                    descriptor.version.trim(),
+                    descriptor.build_id
                 );
             }
         }
@@ -4196,14 +4343,18 @@ fn resolve_remote_yggterm_binary(
     }
 
     let installed = bootstrap_remote_yggterm(ssh_target, exec_prefix)?;
-    let installed_version =
-        remote_protocol_version_for_binary(ssh_target, exec_prefix, &installed)?;
-    if installed_version.trim() != daemon::SERVER_PROTOCOL_VERSION {
+    let installed_descriptor =
+        remote_protocol_descriptor_for_binary(ssh_target, exec_prefix, &installed)?;
+    if installed_descriptor.version.trim() != daemon::SERVER_PROTOCOL_VERSION
+        || installed_descriptor.build_id != local_build_id
+    {
         anyhow::bail!(
-            "remote yggterm protocol mismatch for {}: expected {}, got {}",
+            "remote yggterm protocol mismatch for {}: expected {}@{}, got {}@{}",
             ssh_target,
             daemon::SERVER_PROTOCOL_VERSION,
-            installed_version.trim()
+            local_build_id,
+            installed_descriptor.version.trim(),
+            installed_descriptor.build_id
         );
     }
     if let Ok(mut cache) = remote_command_cache().lock() {
@@ -4219,7 +4370,8 @@ fn resolve_remote_yggterm_binary(
         "ssh_target": ssh_target,
         "result": "bootstrapped",
         "binary_expr": installed,
-        "protocol_version": installed_version.trim(),
+        "protocol_version": installed_descriptor.version.trim(),
+        "build_id": installed_descriptor.build_id,
     }));
     Ok((installed, RemoteDeployState::Ready))
 }
@@ -4360,7 +4512,13 @@ pub fn run_remote_stage_clipboard_png() -> anyhow::Result<()> {
 }
 
 pub fn run_remote_protocol_version() -> anyhow::Result<()> {
-    println!("{}", daemon::SERVER_PROTOCOL_VERSION);
+    println!(
+        "{}",
+        serde_json::to_string(&json!({
+            "version": daemon::SERVER_PROTOCOL_VERSION,
+            "build_id": current_local_build_id(),
+        }))?
+    );
     Ok(())
 }
 
@@ -4956,6 +5114,57 @@ pub fn run_app_control_drag(
         other => anyhow::bail!("unsupported app drag action: {other}"),
     };
     let response = request_app_control(&home, command, timeout_ms)?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_create_terminal(
+    machine_key: Option<&str>,
+    cwd: Option<&str>,
+    title_hint: Option<&str>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::CreateTerminal {
+            machine_key: machine_key.map(ToOwned::to_owned),
+            cwd: cwd.map(ToOwned::to_owned),
+            title_hint: title_hint.map(ToOwned::to_owned),
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_send_terminal_input(
+    session_path: &str,
+    data: &str,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::SendTerminalInput {
+            session_path: session_path.to_string(),
+            data: data.to_string(),
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_remove_session(session_path: &str, timeout_ms: u64) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::RemoveSession {
+            session_path: session_path.to_string(),
+        },
+        timeout_ms,
+    )?;
     write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
     Ok(())
 }
@@ -5800,11 +6009,7 @@ fn build_live_session(
     let (launch_command, session_path, source_value, target_value, prefix_value, deploy_state) =
         match kind {
             SessionKind::Shell => (
-                format!(
-                    "cd {} && {} -l",
-                    shell_single_quote(&default_cwd),
-                    shell_program
-                ),
+                format!("exec {} -i", shell_single_quote(&shell_program)),
                 format!("local://{uuid}"),
                 "local-shell".to_string(),
                 default_cwd.clone(),
@@ -5832,7 +6037,7 @@ fn build_live_session(
                     &target.ssh_target,
                     target.prefix.as_deref(),
                     "yggterm",
-                    &["server", "attach", uuid],
+                    &["server", "attach", uuid, default_cwd.as_str()],
                 ),
                 format!("ssh://{}/{}", target.ssh_target, uuid),
                 "live-ssh".to_string(),
@@ -5879,6 +6084,7 @@ fn build_live_session(
         }
         SessionKind::Document => "No terminal runtime is required.".to_string(),
     };
+    let default_summary = live_session_default_summary(kind, target);
 
     ManagedSessionView {
         id: uuid.to_string(),
@@ -5939,6 +6145,14 @@ fn build_live_session(
                         "not linked".to_string()
                     },
                 },
+                SessionMetadataEntry {
+                    label: "Cwd",
+                    value: default_cwd.clone(),
+                },
+                SessionMetadataEntry {
+                    label: "Summary",
+                    value: default_summary.clone(),
+                },
             ],
             blocks: vec![
                 SessionPreviewBlock {
@@ -5981,6 +6195,10 @@ fn build_live_session(
                 value: target_value,
             },
             SessionMetadataEntry {
+                label: "Cwd",
+                value: default_cwd,
+            },
+            SessionMetadataEntry {
                 label: "Prefix",
                 value: prefix_value,
             },
@@ -6008,6 +6226,10 @@ fn build_live_session(
             SessionMetadataEntry {
                 label: "Status",
                 value: "planned".to_string(),
+            },
+            SessionMetadataEntry {
+                label: "Summary",
+                value: default_summary,
             },
             SessionMetadataEntry {
                 label: "Launch",
@@ -6055,7 +6277,9 @@ fn synthesize_remote_scanned_session_view(
         .map(|binary_expr| (binary_expr, machine.remote_deploy_state))
         .unwrap_or_else(|| {
             resolve_remote_yggterm_binary(&target.ssh_target, target.prefix.as_deref())
-                .unwrap_or_else(|_| ("yggterm".to_string(), RemoteDeployState::Planned))
+                .unwrap_or_else(|_| {
+                    (preferred_remote_binary_fallback(), RemoteDeployState::Planned)
+                })
         });
     session.remote_deploy_state = remote_deploy_state;
     session.session_path = scanned.session_path.clone();
