@@ -18,8 +18,8 @@ use yggterm_core::{
 use time::OffsetDateTime;
 
 pub const SERVER_PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
-const BACKGROUND_COPY_CHORE_MS: u64 = 45_000;
-const BACKGROUND_COPY_BUDGET_PER_TICK: usize = 12;
+const BACKGROUND_COPY_CHORE_MS: u64 = 12_000;
+const BACKGROUND_COPY_BUDGET_PER_TICK: usize = 23;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerEndpoint {
