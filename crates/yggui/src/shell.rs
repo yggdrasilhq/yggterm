@@ -1293,18 +1293,39 @@ impl ShellState {
         let remote_paths = self.active_session_visibility_paths();
         if !remote_paths.is_empty() {
             self.browser.ensure_expanded_paths(remote_paths);
-        } else if let Some(active) = self.server.active_session().cloned() {
-            self.browser.ensure_visible_path(&active.session_path);
+        } else if let Some(active_path) = self.active_browser_selection_path_for_session() {
+            self.browser.ensure_visible_path(&active_path);
         }
     }
 
     fn sync_active_session_selection(&mut self) {
         if let Some(active) = self.server.active_session().cloned() {
+            let selected_path = self
+                .active_browser_selection_path_for_session()
+                .unwrap_or_else(|| active.session_path.clone());
             self.selected_tree_paths.clear();
-            self.selected_tree_paths.insert(active.session_path.clone());
-            self.selection_anchor = Some(active.session_path.clone());
-            self.browser.select_path(active.session_path.clone());
+            self.selected_tree_paths.insert(selected_path.clone());
+            self.selection_anchor = Some(selected_path.clone());
+            self.browser.select_path(selected_path);
         }
+    }
+
+    fn active_browser_selection_path_for_session(&self) -> Option<String> {
+        let active = self.server.active_session()?;
+        let active_path = active.session_path.clone();
+        if self
+            .browser
+            .rows()
+            .iter()
+            .any(|row| row.full_path == active_path)
+        {
+            return Some(active_path);
+        }
+        self.browser.rows().iter().find_map(|row| {
+            (row.session_id.as_deref() == Some(active.id.as_str())
+                && matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document))
+            .then(|| row.full_path.clone())
+        })
     }
 
     fn active_session_visibility_paths(&self) -> Vec<String> {
