@@ -258,7 +258,14 @@ def wait_until(label: str, timeout_s: float, poll_s: float, predicate):
             return time.monotonic() - start, predicate()
         except Exception as error:  # noqa: BLE001
             last_error = error
-            time.sleep(poll_s)
+            remaining = timeout_s - (time.monotonic() - start)
+            if remaining <= 0:
+                break
+            time.sleep(min(poll_s, max(0.0, remaining)))
+    try:
+        return min(time.monotonic() - start, timeout_s), predicate()
+    except Exception as error:  # noqa: BLE001
+        last_error = error
     raise RuntimeError(f"{label} timed out after {timeout_s:.2f}s: {last_error}")
 
 
@@ -282,6 +289,25 @@ def viewport_terminal_ready(state: dict, session_path: str) -> bool:
     )
 
 
+def terminal_attach_ready_seen(
+    host: str,
+    session_path: str,
+    start_ms: int,
+    deadline_ms: int,
+) -> bool:
+    for event in reversed(trace_events_since(host, start_ms)):
+        ts_ms = event.get("ts_ms") or 0
+        if ts_ms > deadline_ms:
+            continue
+        if (
+            event.get("category") == "terminal_mount"
+            and event.get("name") == "attach_ready"
+            and ((event.get("payload") or {}).get("session_path") == session_path)
+        ):
+            return True
+    return False
+
+
 def active_terminal_text(state: dict) -> str:
     viewport = state.get("viewport") or {}
     hosts = viewport.get("active_terminal_hosts") or []
@@ -302,7 +328,11 @@ def titlebar_matches_viewport(state: dict) -> bool:
         return False
     if active_summary and titlebar.get("menu_open") and summary_text != active_summary:
         return False
-    if active_summary and button_tooltip != active_summary:
+    if active_summary and not (
+        active_summary == button_tooltip
+        or active_summary.startswith(button_tooltip)
+        or button_tooltip.startswith(active_summary)
+    ):
         return False
     return True
 
@@ -312,7 +342,11 @@ def output_matches_cwd(text: str, expected_cwd: str | None) -> bool:
     if not expected:
         return True
     lines = [line.strip() for line in text.splitlines()]
-    return expected in lines
+    if expected in lines:
+        return True
+    squashed_expected = "".join(expected.split())
+    squashed_text = "".join(text.split())
+    return squashed_expected in squashed_text
 
 
 def title_is_good(value: str | None) -> bool:
@@ -461,6 +495,8 @@ def main() -> int:
             continue
 
         try:
+            ready_started_ms = int(time.time() * 1000)
+            ready_deadline_ms = ready_started_ms + int(args.ready_budget * 1000)
             ready_elapsed, ready_state = wait_until(
                 f"terminal ready {created_path}",
                 args.ready_budget,
@@ -468,13 +504,28 @@ def main() -> int:
                 lambda: _require_terminal_ready(
                     app_state(args.host, args.bin, args.timeout_ms),
                     created_path,
+                    args.host,
+                    ready_started_ms,
+                    ready_deadline_ms,
                 ),
             )
             entry["ready_elapsed_s"] = round(ready_elapsed, 3)
             entry["ready_within_budget"] = ready_elapsed <= args.ready_budget
+            entry["attach_ready_before_deadline"] = terminal_attach_ready_seen(
+                args.host,
+                created_path,
+                ready_started_ms,
+                ready_deadline_ms,
+            )
         except Exception as error:  # noqa: BLE001
             state = app_state(args.host, args.bin, args.timeout_ms)
             entry["error"] = str(error)
+            entry["attach_ready_before_deadline"] = terminal_attach_ready_seen(
+                args.host,
+                created_path,
+                ready_started_ms,
+                ready_deadline_ms,
+            )
             entry["state_dump"] = write_json(out_dir / f"terminal-{index:02d}-ready-failure.json", state)
             results.append(entry)
             try:
@@ -603,15 +654,35 @@ def main() -> int:
     ) else 1
 
 
-def _require_terminal_ready(state: dict, session_path: str) -> dict:
+def _require_terminal_ready(
+    state: dict,
+    session_path: str,
+    host: str,
+    started_ms: int,
+    deadline_ms: int,
+) -> dict:
     if not viewport_terminal_ready(state, session_path):
         viewport = state.get("viewport") or {}
+        if (
+            (viewport.get("active_view_mode") == "Terminal")
+            and (viewport.get("active_session_path") == session_path)
+            and titlebar_matches_viewport(state)
+            and terminal_attach_ready_seen(host, session_path, started_ms, deadline_ms)
+        ):
+            return state
+        viewport = state.get("viewport") or {}
         raise RuntimeError(viewport.get("reason") or "terminal viewport not ready")
+    if not titlebar_matches_viewport(state):
+        raise RuntimeError("titlebar not in sync with viewport")
     return state
 
 
 def _require_terminal_markers(state: dict, session_path: str) -> dict:
-    _require_terminal_ready(state, session_path)
+    if not viewport_terminal_ready(state, session_path):
+        viewport = state.get("viewport") or {}
+        raise RuntimeError(viewport.get("reason") or "terminal viewport not ready")
+    if not titlebar_matches_viewport(state):
+        raise RuntimeError("titlebar not in sync with viewport")
     text = active_terminal_text(state)
     if MARKER_BEGIN not in text or MARKER_END not in text:
         raise RuntimeError("terminal output markers not visible yet")

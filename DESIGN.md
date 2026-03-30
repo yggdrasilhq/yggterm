@@ -260,7 +260,7 @@ If a project has drag-and-drop tree or list reordering:
 If a project has a conversation preview surface:
 
 - preview reading mode and runtime/live mode should share one header system
-- generated title, precis, and summary should be treated as refreshable navigational aids
+- generated title and summary should be treated as refreshable navigational aids
 - preview content should render like content, not raw log lines
 - headings, bullets, task items, quotes, and code fences should each have distinct treatment
 - overview/graph mode should feel structural, not like the same chat list in a second skin
@@ -432,11 +432,18 @@ Preview mode and terminal mode should share the same header system.
 That shared header may contain:
 
 - the session title
-- a short generated precis or preview summary
+- a generated summary
 - a session mode selector when relevant
-- refresh affordances for generated title/precis/summary copy
+- refresh affordances for generated title/summary copy
 
 Generated UI copy is not static decoration. It should be treated as refreshable state because long-running sessions drift over time.
+
+Keyboard-first command access should be discoverable.
+
+- pressing `Alt` should enter a visible command-hint mode instead of doing nothing
+- hint chips should appear on the live controls they target, not in a detached cheat sheet alone
+- multi-step overlays are preferred for creation flows; `Alt` then `I` should expose insert/create actions
+- the overlay should stay lightweight and reversible with `Esc`
 
 Hash-like fallback titles are placeholders, not real metadata.
 
