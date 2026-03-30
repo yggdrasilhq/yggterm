@@ -1,0 +1,468 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import random
+import shlex
+import subprocess
+import time
+from pathlib import Path
+from typing import Callable
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Stress a running Yggterm GUI through app-control by opening random sessions "
+            "and optionally exercising drag/drop."
+        )
+    )
+    parser.add_argument("--host", default="local", help="SSH host for a running GUI, or 'local'")
+    parser.add_argument("--bin", default="./target/debug/yggterm")
+    parser.add_argument("--count", type=int, default=23, help="Number of random session opens")
+    parser.add_argument(
+        "--drag-count",
+        type=int,
+        default=23,
+        help="Number of random drag operations to attempt when --apply-drag is set",
+    )
+    parser.add_argument(
+        "--ready-budget",
+        type=float,
+        default=2.3,
+        help="Maximum seconds allowed for a session open to become usable",
+    )
+    parser.add_argument("--poll", type=float, default=0.1)
+    parser.add_argument("--timeout-ms", type=int, default=8000)
+    parser.add_argument("--seed", type=int, default=23)
+    parser.add_argument("--out-dir", default="/tmp/yggterm-ui-stress-23")
+    parser.add_argument(
+        "--apply-drag",
+        action="store_true",
+        help="Actually perform drag/drop operations instead of only planning them",
+    )
+    parser.add_argument(
+        "--screenshot-on-failure",
+        action="store_true",
+        help="Capture an app screenshot when an open or drag test fails",
+    )
+    return parser.parse_args()
+
+
+def run_process(argv: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(argv, check=check, text=True, capture_output=True)
+
+
+def run_control(host: str, command: str, *, check: bool = True) -> subprocess.CompletedProcess:
+    if host == "local":
+        return run_process(["bash", "-lc", command], check=check)
+    return run_process(["ssh", host, command], check=check)
+
+
+def run_json(host: str, command: str) -> dict:
+    result = run_control(host, command)
+    return json.loads(result.stdout)
+
+
+def app_state(host: str, binary: str, timeout_ms: int) -> dict:
+    payload = run_json(host, f"{binary} server app state --timeout-ms {timeout_ms}")
+    return payload.get("data") or {}
+
+
+def app_rows(host: str, binary: str, timeout_ms: int) -> dict:
+    payload = run_json(host, f"{binary} server app rows --timeout-ms {timeout_ms}")
+    return payload.get("data") or {}
+
+
+def server_inventory(host: str) -> dict:
+    if host == "local":
+        path = Path.home() / ".yggterm" / "server-state.json"
+        return json.loads(path.read_text(encoding="utf-8"))
+    result = run_control(host, "cat ~/.yggterm/server-state.json")
+    return json.loads(result.stdout)
+
+
+def app_open(host: str, binary: str, session_path: str, view: str, timeout_ms: int) -> dict:
+    return run_json(
+        host,
+        f"{binary} server app open {json.dumps(session_path)} --view {view} --timeout-ms {timeout_ms}",
+    )
+
+
+def app_drag(
+    host: str,
+    binary: str,
+    action: str,
+    timeout_ms: int,
+    row_path: str | None = None,
+    placement: str | None = None,
+) -> dict:
+    parts = [f"{binary} server app drag {action}"]
+    if row_path is not None:
+        parts.append(json.dumps(row_path))
+    if placement is not None:
+        parts.append(placement)
+    parts.append(f"--timeout-ms {timeout_ms}")
+    return run_json(host, " ".join(parts))
+
+
+def capture_failure_artifact(
+    host: str,
+    binary: str,
+    timeout_ms: int,
+    out_dir: Path,
+    name: str,
+) -> str | None:
+    remote_path = f"/tmp/{name}.png"
+    local_path = out_dir / f"{name}.png"
+    try:
+        run_control(
+            host,
+            f"{binary} server app screenshot {json.dumps(remote_path)} --timeout-ms {timeout_ms}",
+        )
+        if host == "local":
+            run_process(["cp", remote_path, str(local_path)])
+        else:
+            run_process(["scp", f"{host}:{remote_path}", str(local_path)])
+        return str(local_path)
+    except Exception:
+        return None
+
+
+def preview_ready(state: dict, session_path: str) -> bool:
+    if state.get("active_view_mode") != "Rendered":
+        return False
+    if state.get("active_session_path") != session_path:
+        return False
+    shell = state.get("shell") or {}
+    if session_path in (shell.get("terminal_attach_in_flight") or []):
+        return False
+    if len(state.get("active_surface_requests") or []) > 0:
+        return False
+    return True
+
+
+def terminal_ready(state: dict, session_path: str) -> bool:
+    if state.get("active_view_mode") != "Terminal":
+        return False
+    if state.get("active_session_path") != session_path:
+        return False
+    shell = state.get("shell") or {}
+    dom = state.get("dom") or {}
+    hosts = dom.get("terminal_hosts") or []
+    if session_path in (shell.get("terminal_attach_in_flight") or []):
+        return False
+    if dom.get("terminal_host_count", 0) <= 0 or not hosts:
+        return False
+    sample = (hosts[0].get("text_sample") or "").strip()
+    if bool(sample) or hosts[0].get("canvas_count", 0) > 0:
+        return True
+    return not session_path.startswith("remote-session://")
+
+
+def wait_until(
+    label: str,
+    timeout_s: float,
+    poll_s: float,
+    predicate: Callable[[], dict],
+) -> tuple[float, dict]:
+    start = time.monotonic()
+    last_error = None
+    while time.monotonic() - start <= timeout_s:
+        try:
+            state = predicate()
+            return time.monotonic() - start, state
+        except Exception as error:  # noqa: BLE001
+            last_error = error
+            time.sleep(poll_s)
+    raise RuntimeError(f"{label} timed out after {timeout_s:.2f}s: {last_error}")
+
+
+def choose_session_targets(
+    inventory: dict,
+    rows_payload: dict,
+    rng: random.Random,
+    count: int,
+) -> list[dict]:
+    rows = rows_payload.get("rows") or []
+    rows_by_session_id = {
+        row.get("session_id"): row
+        for row in rows
+        if row.get("session_id") and row.get("full_path")
+    }
+    candidates: list[dict] = []
+    seen_paths: set[str] = set()
+
+    for item in inventory.get("stored_sessions", []):
+        session_path = item.get("path")
+        if not session_path or session_path in seen_paths:
+            continue
+        kind = item.get("kind")
+        if kind == "document":
+            view = "preview"
+        elif kind == "codex":
+            view = "terminal" if len(candidates) % 2 == 0 else "preview"
+        else:
+            continue
+        candidates.append(
+            {
+                "full_path": session_path,
+                "label": item.get("title_hint") or session_path,
+                "kind": "Document" if kind == "document" else "Session",
+                "view": view,
+            }
+        )
+        seen_paths.add(session_path)
+
+    for item in inventory.get("live_sessions", []):
+        row = rows_by_session_id.get(item.get("id"))
+        session_path = row.get("full_path") if row else item.get("key")
+        if not session_path or session_path in seen_paths:
+            continue
+        candidates.append(
+            {
+                "full_path": session_path,
+                "label": item.get("title") or session_path,
+                "kind": "Session",
+                "view": "terminal",
+            }
+        )
+        seen_paths.add(session_path)
+
+    if len(candidates) <= count:
+        return candidates
+    return rng.sample(candidates, count)
+
+
+def choose_drag_rows(rows_payload: dict, rng: random.Random, count: int) -> list[tuple[dict, dict, str]]:
+    rows = rows_payload.get("rows") or []
+    draggable = [row for row in rows if row.get("draggable") and row.get("full_path")]
+    drop_targets = [row for row in rows if row.get("drop_target_row") and row.get("full_path")]
+    operations: list[tuple[dict, dict, str]] = []
+    if not draggable or not drop_targets:
+        return operations
+    placements = ["before", "after", "into"]
+    attempts = 0
+    while len(operations) < count and attempts < count * 20:
+        attempts += 1
+        source = rng.choice(draggable)
+        target = rng.choice(drop_targets)
+        if source["full_path"] == target["full_path"]:
+            continue
+        placement = rng.choice(placements)
+        if placement == "into" and target.get("kind") not in {"Group"}:
+            placement = rng.choice(["before", "after"])
+        operations.append((source, target, placement))
+    return operations
+
+
+def open_trials(args: argparse.Namespace, inventory: dict, rows_payload: dict, out_dir: Path) -> list[dict]:
+    rng = random.Random(args.seed)
+    chosen_rows = choose_session_targets(inventory, rows_payload, rng, args.count)
+    results: list[dict] = []
+    for index, row in enumerate(chosen_rows):
+        kind = row.get("kind")
+        view = row.get("view") or ("preview" if kind == "Document" else "terminal")
+        session_path = row["full_path"]
+        started = time.monotonic()
+        app_open(args.host, args.bin, session_path, view, args.timeout_ms)
+        try:
+            elapsed, state = wait_until(
+                f"open {session_path}",
+                args.ready_budget,
+                args.poll,
+                lambda: _require_ready(
+                    app_state(args.host, args.bin, args.timeout_ms),
+                    preview_ready if view == "preview" else terminal_ready,
+                    session_path,
+                ),
+            )
+            anomaly = detect_anomaly(state, args.ready_budget)
+            results.append(
+                {
+                    "path": session_path,
+                    "label": row.get("label"),
+                    "kind": kind,
+                    "view": view,
+                    "elapsed_s": round(elapsed, 3),
+                    "within_budget": elapsed <= args.ready_budget,
+                    "anomaly": anomaly,
+                    "notifications_count": ((state.get("shell") or {}).get("notifications_count")),
+                    "active_surface_requests": len(state.get("active_surface_requests") or []),
+                    "machine_refresh_requests": ((state.get("remote") or {}).get("machine_refresh_requests")),
+                }
+            )
+        except Exception as error:  # noqa: BLE001
+            failure_artifact = None
+            state = {}
+            if args.screenshot_on_failure:
+                failure_artifact = capture_failure_artifact(
+                    args.host,
+                    args.bin,
+                    args.timeout_ms,
+                    out_dir,
+                    f"open-failure-{index:02d}",
+                )
+            try:
+                state = app_state(args.host, args.bin, args.timeout_ms)
+            except Exception:
+                state = {}
+            results.append(
+                {
+                    "path": session_path,
+                    "label": row.get("label"),
+                    "kind": kind,
+                    "view": view,
+                    "elapsed_s": round(time.monotonic() - started, 3),
+                    "within_budget": False,
+                    "error": str(error),
+                    "notifications_count": ((state.get("shell") or {}).get("notifications_count")),
+                    "active_surface_requests": len(state.get("active_surface_requests") or []),
+                    "machine_refresh_requests": ((state.get("remote") or {}).get("machine_refresh_requests")),
+                    "failure_artifact": failure_artifact,
+                }
+            )
+    return results
+
+
+def drag_trials(args: argparse.Namespace, rows_payload: dict, out_dir: Path) -> list[dict]:
+    rng = random.Random(args.seed + 2300)
+    operations = choose_drag_rows(rows_payload, rng, args.drag_count)
+    results: list[dict] = []
+    if not args.apply_drag:
+        for source, target, placement in operations:
+            results.append(
+                {
+                    "source": source["full_path"],
+                    "target": target["full_path"],
+                    "placement": placement,
+                    "planned_only": True,
+                }
+            )
+        return results
+    for index, (source, target, placement) in enumerate(operations):
+        failure_artifact = None
+        try:
+            app_drag(args.host, args.bin, "begin", args.timeout_ms, row_path=source["full_path"])
+            app_drag(
+                args.host,
+                args.bin,
+                "hover",
+                args.timeout_ms,
+                row_path=target["full_path"],
+                placement=placement,
+            )
+            app_drag(args.host, args.bin, "drop", args.timeout_ms)
+            state = app_state(args.host, args.bin, args.timeout_ms)
+            dom = state.get("dom") or {}
+            drag_state = state.get("shell") or {}
+            anomaly = None
+            if drag_state.get("drag_paths") or drag_state.get("drag_hover_target"):
+                anomaly = "drag state not cleared after drop"
+            if dom.get("drop_zone_count", 0) <= 0:
+                anomaly = anomaly or "drop zones missing during drag cycle"
+            results.append(
+                {
+                    "source": source["full_path"],
+                    "target": target["full_path"],
+                    "placement": placement,
+                    "planned_only": False,
+                    "anomaly": anomaly,
+                    "notifications_count": drag_state.get("notifications_count"),
+                }
+            )
+        except Exception as error:  # noqa: BLE001
+            try:
+                app_drag(args.host, args.bin, "clear", args.timeout_ms)
+            except Exception:
+                pass
+            if args.screenshot_on_failure:
+                failure_artifact = capture_failure_artifact(
+                    args.host,
+                    args.bin,
+                    args.timeout_ms,
+                    out_dir,
+                    f"drag-failure-{index:02d}",
+                )
+            results.append(
+                {
+                    "source": source["full_path"],
+                    "target": target["full_path"],
+                    "placement": placement,
+                    "planned_only": False,
+                    "error": str(error),
+                    "failure_artifact": failure_artifact,
+                }
+            )
+    return results
+
+
+def detect_anomaly(state: dict, ready_budget: float) -> str | None:
+    shell = state.get("shell") or {}
+    remote = state.get("remote") or {}
+    notifications = shell.get("notifications_count") or 0
+    machine_refresh = remote.get("machine_refresh_requests") or 0
+    requests = len(state.get("active_surface_requests") or [])
+    if notifications > 0:
+        return f"notification cascade ({notifications})"
+    if machine_refresh > 0:
+        return f"background machine refresh active ({machine_refresh})"
+    if requests > 1:
+        return f"surface request pileup ({requests})"
+    return None
+
+
+def _require_ready(state: dict, ready_pred: Callable[[dict, str], bool], session_path: str) -> dict:
+    if not ready_pred(state, session_path):
+        raise RuntimeError("not ready yet")
+    return state
+
+
+def main() -> int:
+    args = parse_args()
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    baseline_state = app_state(args.host, args.bin, args.timeout_ms)
+    inventory = server_inventory(args.host)
+    rows_payload = app_rows(args.host, args.bin, args.timeout_ms)
+    opens = open_trials(args, inventory, rows_payload, out_dir)
+    drag_rows_payload = app_rows(args.host, args.bin, args.timeout_ms)
+    drags = drag_trials(args, drag_rows_payload, out_dir)
+    final_state = app_state(args.host, args.bin, args.timeout_ms)
+
+    open_failures = [item for item in opens if not item.get("within_budget")]
+    open_anomalies = [item for item in opens if item.get("anomaly")]
+    drag_failures = [item for item in drags if item.get("error")]
+    drag_anomalies = [item for item in drags if item.get("anomaly")]
+
+    summary = {
+        "host": args.host,
+        "seed": args.seed,
+        "count": args.count,
+        "drag_count": args.drag_count,
+        "ready_budget_s": args.ready_budget,
+        "apply_drag": args.apply_drag,
+        "baseline_active_session_path": baseline_state.get("active_session_path"),
+        "baseline_notifications_count": ((baseline_state.get("shell") or {}).get("notifications_count")),
+        "inventory_stored_sessions": len(inventory.get("stored_sessions") or []),
+        "inventory_live_sessions": len(inventory.get("live_sessions") or []),
+        "rows_seen": rows_payload.get("row_count"),
+        "open_failures": len(open_failures),
+        "open_anomalies": len(open_anomalies),
+        "drag_failures": len(drag_failures),
+        "drag_anomalies": len(drag_anomalies),
+        "final_active_session_path": final_state.get("active_session_path"),
+        "final_notifications_count": ((final_state.get("shell") or {}).get("notifications_count")),
+        "opens": opens,
+        "drags": drags,
+    }
+
+    summary_path = out_dir / "summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(summary_path)
+    print(json.dumps(summary, indent=2))
+    return 0 if not open_failures and not drag_failures else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
