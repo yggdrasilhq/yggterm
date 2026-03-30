@@ -11401,6 +11401,15 @@ fn app() -> Element {
         if let TaoEvent::WindowEvent { event, .. } = event {
             match event {
                 DesktopWindowEvent::KeyboardInput { event, .. } => {
+                    let is_alt_press = event.state == ElementState::Pressed
+                        && (event.logical_key == TaoKey::Alt
+                            || matches!(
+                                event.physical_key,
+                                TaoKeyCode::AltLeft | TaoKeyCode::AltRight
+                            ));
+                    if is_alt_press {
+                        state.with_mut(|shell| shell.activate_alt_overlay());
+                    }
                     if event.state == ElementState::Pressed
                         && (event.logical_key == TaoKey::Delete
                             || event.physical_key == TaoKeyCode::Delete)
@@ -11414,6 +11423,12 @@ fn app() -> Element {
                 | DesktopWindowEvent::Resized(_)
                 | DesktopWindowEvent::Focused(_)
                 | DesktopWindowEvent::ScaleFactorChanged { .. } => {
+                    window_epoch.with_mut(|epoch| *epoch += 1);
+                }
+                DesktopWindowEvent::ModifiersChanged(modifiers) => {
+                    if modifiers.alt_key() {
+                        state.with_mut(|shell| shell.activate_alt_overlay());
+                    }
                     window_epoch.with_mut(|epoch| *epoch += 1);
                 }
                 DesktopWindowEvent::CloseRequested => {
