@@ -394,7 +394,14 @@ def choose_terminal_targets(inventory: dict, rng: random.Random, count: int) -> 
         if key in seen:
             continue
         seen.add(key)
-        candidates.append({"machine_key": None, "cwd": cwd, "label": f"local:{cwd}"})
+        candidates.append(
+            {
+                "machine_key": None,
+                "cwd": cwd,
+                "label": f"local:{cwd}",
+                "cwd_verified": False,
+            }
+        )
 
     for machine in inventory.get("remote_machines") or []:
         machine_key = (machine.get("machine_key") or "").strip()
@@ -416,6 +423,8 @@ def choose_terminal_targets(inventory: dict, rng: random.Random, count: int) -> 
                     "machine_key": machine_key,
                     "cwd": cwd,
                     "label": f"{machine_key}:{cwd}",
+                    # Live remote inventory already observed this cwd on the target.
+                    "cwd_verified": True,
                 }
             )
 
@@ -428,7 +437,9 @@ def choose_terminal_targets(inventory: dict, rng: random.Random, count: int) -> 
         machine_key = candidate.get("machine_key")
         cwd = candidate.get("cwd") or ""
         key = (machine_key, cwd)
-        if machine_key:
+        if candidate.get("cwd_verified"):
+            exists = True
+        elif machine_key:
             ssh_target = machine_targets.get(machine_key) or ""
             exists = dir_exists_cache.setdefault(key, bool(ssh_target) and remote_dir_exists(ssh_target, cwd))
         else:
