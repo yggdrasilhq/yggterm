@@ -4830,6 +4830,21 @@ fn normalize_live_session_path(session_path: &str) -> String {
         .unwrap_or_else(|| session_path.to_string())
 }
 
+fn set_app_control_row_expanded(shell: &mut ShellState, row: &BrowserRow, expanded: bool) {
+    if row.kind != BrowserRowKind::Group {
+        return;
+    }
+    if row.expanded == expanded {
+        return;
+    }
+    if is_synthetic_sidebar_row(row) {
+        shell.browser.toggle_virtual_group(&row.full_path);
+    } else {
+        shell.browser.toggle_group(&row.full_path);
+    }
+    shell.sync_browser_settings();
+}
+
 fn app_control_drag_pointer(row: &BrowserRow, placement: Option<DragDropPlacement>) -> (f64, f64) {
     let y = 72.0 + (row.depth as f64 * 12.0);
     let x = match placement {
@@ -9311,6 +9326,12 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
         .get("active_summary")
         .and_then(Value::as_str)
         .map(str::to_string);
+    let terminal_attach_in_flight = snapshot
+        .get("shell")
+        .and_then(|shell| shell.get("terminal_attach_in_flight"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let notifications = snapshot
         .get("shell")
         .and_then(|shell| shell.get("notifications"))
@@ -9358,13 +9379,16 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
             .and_then(Value::as_u64)
             .is_some_and(|count| count > 0)
             || host
-                .get("child_count")
-                .and_then(Value::as_u64)
-                .is_some_and(|count| count > 0)
-            || host
                 .get("text_sample")
                 .and_then(Value::as_str)
                 .is_some_and(|text| !text.trim().is_empty())
+    });
+    let terminal_attach_pending = active_session_path.as_deref().is_some_and(|path| {
+        terminal_attach_in_flight.iter().any(|candidate| {
+            candidate
+                .as_str()
+                .is_some_and(|candidate_path| candidate_path == path)
+        })
     });
     let (ready, reason) = if active_session_path.is_none() {
         (false, Some("no active session selected".to_string()))
@@ -9387,6 +9411,11 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
             (
                 false,
                 Some("active terminal host is missing".to_string()),
+            )
+        } else if terminal_attach_pending {
+            (
+                false,
+                Some("active terminal host exists but attach is still in flight".to_string()),
             )
         } else if terminal_hosts.is_empty() {
             (false, Some("terminal host is missing".to_string()))
@@ -9759,6 +9788,54 @@ async fn process_pending_app_control_requests(
                 }
             }
         },
+        AppControlCommand::SetRowExpanded { row_path, expanded } => {
+            let maybe_row = state.with(|shell| resolve_app_control_row(shell, &row_path));
+            match maybe_row {
+                Some(row) if row.kind == BrowserRowKind::Group => {
+                    state.with_mut(|shell| {
+                        set_app_control_row_expanded(shell, &row, expanded);
+                    });
+                    AppControlResponse {
+                        request_id: request.request_id.clone(),
+                        handled_by_pid: std::process::id(),
+                        completed_at_ms: current_millis() as u128,
+                        output_path: None,
+                        data: Some(json!({
+                            "accepted": true,
+                            "row_path": row_path,
+                            "expanded": expanded,
+                        })),
+                        error: None,
+                    }
+                }
+                Some(_) => AppControlResponse {
+                    request_id: request.request_id.clone(),
+                    handled_by_pid: std::process::id(),
+                    completed_at_ms: current_millis() as u128,
+                    output_path: None,
+                    data: Some(json!({
+                        "accepted": false,
+                        "row_path": row_path,
+                        "expanded": expanded,
+                    })),
+                    error: Some(format!("row is not expandable: {row_path}")),
+                },
+                None => AppControlResponse {
+                    request_id: request.request_id.clone(),
+                    handled_by_pid: std::process::id(),
+                    completed_at_ms: current_millis() as u128,
+                    output_path: None,
+                    data: Some(json!({
+                        "accepted": false,
+                        "row_path": row_path,
+                        "expanded": expanded,
+                    })),
+                    error: Some(format!(
+                        "row path is not visible in the current sidebar snapshot: {row_path}"
+                    )),
+                },
+            }
+        }
         AppControlCommand::OpenPath {
             session_path,
             view_mode,
@@ -14760,12 +14837,19 @@ fn TerminalCanvas(
                                 {
                                     cursor = next_cursor;
                                     read_poll_ms = if chunks.is_empty() { 140 } else { 60 };
-                                    let (batched_output, saw_visible_output, saw_meaningful_output) =
+                                    let (
+                                        batched_output,
+                                        saw_visible_output,
+                                        saw_meaningful_output,
+                                        saw_prompt_output,
+                                    ) =
                                         batch_terminal_chunks(chunks);
                                     if saw_visible_output {
                                         terminal_has_visible_output = true;
                                     }
-                                    if saw_meaningful_output && placeholder_rendered {
+                                    if (saw_meaningful_output || saw_prompt_output)
+                                        && placeholder_rendered
+                                    {
                                         let _ = eval.send(TerminalJsCommand::Reset {
                                             title: title.clone(),
                                             background: theme.background.clone(),
@@ -14829,6 +14913,7 @@ fn TerminalCanvas(
                                     }
                                     let attach_ready =
                                         saw_meaningful_output
+                                            || saw_prompt_output
                                             || (!is_remote_resume_session && saw_visible_output);
                                     if attach_ready {
                                         if !traced_attach_ready {
@@ -14858,7 +14943,7 @@ fn TerminalCanvas(
                                             maybe_spawn_missing_managed_cli_refreshes(state);
                                         }
                                     }
-                                    if saw_meaningful_output {
+                                    if saw_meaningful_output || saw_prompt_output {
                                         if !traced_first_meaningful_output {
                                             append_trace_event(
                                                 &trace_home,
@@ -14868,6 +14953,7 @@ fn TerminalCanvas(
                                                 json!({
                                                     "session_path": session_path.clone(),
                                                     "cursor": cursor,
+                                                    "prompt_like": saw_prompt_output && !saw_meaningful_output,
                                                 }),
                                             );
                                             traced_first_meaningful_output = true;
@@ -15052,12 +15138,19 @@ fn TerminalCanvas(
                                 } else {
                                     60
                                 };
-                                let (batched_output, saw_visible_output, saw_meaningful_output) =
+                                let (
+                                    batched_output,
+                                    saw_visible_output,
+                                    saw_meaningful_output,
+                                    saw_prompt_output,
+                                ) =
                                     batch_terminal_chunks(chunks);
                                 if saw_visible_output {
                                     terminal_has_visible_output = true;
                                 }
-                                if saw_meaningful_output && placeholder_rendered {
+                                if (saw_meaningful_output || saw_prompt_output)
+                                    && placeholder_rendered
+                                {
                                     let _ = eval.send(TerminalJsCommand::Reset {
                                         title: title.clone(),
                                         background: theme.background.clone(),
@@ -15121,6 +15214,7 @@ fn TerminalCanvas(
                                 }
                                 let attach_ready =
                                     saw_meaningful_output
+                                        || saw_prompt_output
                                         || (!is_remote_resume_session && saw_visible_output);
                                 if attach_ready {
                                     if !traced_attach_ready {
@@ -15150,7 +15244,7 @@ fn TerminalCanvas(
                                         maybe_spawn_missing_managed_cli_refreshes(state);
                                     }
                                 }
-                                if saw_meaningful_output {
+                                if saw_meaningful_output || saw_prompt_output {
                                     if !traced_first_meaningful_output {
                                         append_trace_event(
                                             &trace_home,
@@ -15160,6 +15254,7 @@ fn TerminalCanvas(
                                             json!({
                                                 "session_path": session_path.clone(),
                                                 "cursor": cursor,
+                                                "prompt_like": saw_prompt_output && !saw_meaningful_output,
                                             }),
                                         );
                                         traced_first_meaningful_output = true;
@@ -15336,6 +15431,21 @@ fn terminal_chunk_has_meaningful_output(data: &str) -> bool {
     printable >= 80 || newline_count >= 6 || normalized_lines.len() >= 4
 }
 
+fn terminal_chunk_has_prompt_output(data: &str) -> bool {
+    let stripped = strip_terminal_control_sequences(data);
+    let normalized_lines = stripped
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    !normalized_lines.is_empty()
+        && normalized_lines.len() <= 2
+        && normalized_lines.iter().all(|line| line.len() <= 48)
+        && normalized_lines.iter().any(|line| {
+            line.ends_with('$') || line.ends_with('#') || line.ends_with('>') || line.ends_with('%')
+        })
+}
+
 fn terminal_chunk_has_visible_output(data: &str) -> bool {
     let stripped = strip_terminal_control_sequences(data);
     stripped
@@ -15345,13 +15455,14 @@ fn terminal_chunk_has_visible_output(data: &str) -> bool {
 
 fn batch_terminal_chunks(
     chunks: Vec<yggterm_server::TerminalStreamChunk>,
-) -> (Option<String>, bool, bool) {
+) -> (Option<String>, bool, bool, bool) {
     if chunks.is_empty() {
-        return (None, false, false);
+        return (None, false, false, false);
     }
     let mut combined = String::new();
     let mut saw_visible_output = false;
     let mut saw_meaningful_output = false;
+    let mut saw_prompt_output = false;
     for chunk in chunks {
         if !saw_visible_output && terminal_chunk_has_visible_output(&chunk.data) {
             saw_visible_output = true;
@@ -15359,9 +15470,17 @@ fn batch_terminal_chunks(
         if !saw_meaningful_output && terminal_chunk_has_meaningful_output(&chunk.data) {
             saw_meaningful_output = true;
         }
+        if !saw_prompt_output && terminal_chunk_has_prompt_output(&chunk.data) {
+            saw_prompt_output = true;
+        }
         combined.push_str(&chunk.data);
     }
-    (Some(combined), saw_visible_output, saw_meaningful_output)
+    (
+        Some(combined),
+        saw_visible_output,
+        saw_meaningful_output,
+        saw_prompt_output,
+    )
 }
 
 fn strip_terminal_control_sequences(data: &str) -> String {

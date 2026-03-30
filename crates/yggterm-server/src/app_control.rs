@@ -63,6 +63,10 @@ pub enum AppControlCommand {
     Drag {
         command: AppControlDragCommand,
     },
+    SetRowExpanded {
+        row_path: String,
+        expanded: bool,
+    },
     DescribeRows,
     OpenPath {
         session_path: String,
@@ -80,6 +84,7 @@ impl AppControlCommand {
             Self::CaptureScreenRecording { .. } => "capture_screen_recording",
             Self::SetFullscreen { .. } => "set_fullscreen",
             Self::Drag { .. } => "drag",
+            Self::SetRowExpanded { .. } => "set_row_expanded",
             Self::DescribeRows => "describe_rows",
             Self::OpenPath { .. } => "open_path",
             Self::FocusWindow => "focus_window",

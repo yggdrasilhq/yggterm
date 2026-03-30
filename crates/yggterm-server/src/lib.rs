@@ -4885,6 +4885,24 @@ pub fn run_app_control_describe_rows(timeout_ms: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn run_app_control_set_row_expanded(
+    row_path: &str,
+    expanded: bool,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::SetRowExpanded {
+            row_path: row_path.to_string(),
+            expanded,
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 pub fn run_app_control_open_path(
     session_path: &str,
     view_mode: Option<AppControlViewMode>,
