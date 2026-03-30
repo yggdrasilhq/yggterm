@@ -151,6 +151,15 @@ impl DesktopService {
         context
     }
 
+    /// Create a sendable handle that wakes this window's event loop and polls the VirtualDom.
+    pub fn poll_waker(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let proxy = self.shared.proxy.clone();
+        let id = self.id();
+        Arc::new(move || {
+            let _ = proxy.send_event(UserWindowEvent::Poll(id));
+        })
+    }
+
     /// trigger the drag-window event
     ///
     /// Moves the window with the left mouse button until the button is released.

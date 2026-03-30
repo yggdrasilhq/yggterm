@@ -114,6 +114,21 @@ pub fn app_control_requests_dir(home: &Path) -> PathBuf {
     home.join(APP_CONTROL_REQUESTS_DIR)
 }
 
+pub fn app_control_requests_pending(home: &Path) -> bool {
+    let requests_dir = app_control_requests_dir(home);
+    let Ok(entries) = fs::read_dir(&requests_dir) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        let path = entry.path();
+        path.extension().and_then(|ext| ext.to_str()) == Some("json")
+            && !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("inflight-"))
+    })
+}
+
 pub fn app_control_responses_dir(home: &Path) -> PathBuf {
     home.join(APP_CONTROL_RESPONSES_DIR)
 }

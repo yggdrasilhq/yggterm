@@ -9,6 +9,18 @@ from pathlib import Path
 from typing import Callable
 
 
+class ReadinessPending(RuntimeError):
+    def __init__(self, message: str, state: dict):
+        super().__init__(message)
+        self.state = state
+
+
+class ReadinessTimeout(RuntimeError):
+    def __init__(self, label: str, timeout_s: float, last_error: Exception | None, state: dict):
+        super().__init__(f"{label} timed out after {timeout_s:.2f}s: {last_error}")
+        self.state = state
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -73,12 +85,66 @@ def app_rows(host: str, binary: str, timeout_ms: int) -> dict:
     return payload.get("data") or {}
 
 
+def write_state_dump(out_dir: Path, name: str, state: dict) -> str:
+    path = out_dir / f"{name}.state.json"
+    path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    return str(path)
+
+
 def server_inventory(host: str) -> dict:
     if host == "local":
         path = Path.home() / ".yggterm" / "server-state.json"
         return json.loads(path.read_text(encoding="utf-8"))
     result = run_control(host, "cat ~/.yggterm/server-state.json")
     return json.loads(result.stdout)
+
+
+def trace_events_since(host: str, start_ms: int, tail_lines: int = 4000) -> list[dict]:
+    if host == "local":
+        path = Path.home() / ".yggterm" / "event-trace.jsonl"
+        lines = path.read_text(encoding="utf-8").splitlines()[-tail_lines:]
+    else:
+        result = run_control(host, f"tail -n {tail_lines} ~/.yggterm/event-trace.jsonl")
+        lines = result.stdout.splitlines()
+    events = []
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (event.get("ts_ms") or 0) >= start_ms:
+            events.append(event)
+    return events
+
+
+def ready_event_seen(host: str, start_ms: int, session_path: str, view: str) -> bool:
+    events = trace_events_since(host, start_ms)
+    for event in events:
+        payload = event.get("payload") or {}
+        if view == "preview":
+            if (
+                event.get("category") == "main_surface"
+                and event.get("name") == "viewport_ready"
+                and payload.get("active_session_path") == session_path
+                and payload.get("active_view_mode") == "Rendered"
+            ):
+                return True
+            continue
+        if (
+            event.get("category") == "terminal_mount"
+            and event.get("name") in {"attach_ready", "first_meaningful_output"}
+            and payload.get("session_path") == session_path
+        ):
+            return True
+    return False
+
+
+def latest_window_spawn_event(host: str, tail_lines: int = 4000) -> dict | None:
+    events = trace_events_since(host, 0, tail_lines=tail_lines)
+    for event in reversed(events):
+        if event.get("category") == "startup" and event.get("name") == "window_spawned":
+            return event
+    return None
 
 
 def app_open(host: str, binary: str, session_path: str, view: str, timeout_ms: int) -> dict:
@@ -129,34 +195,38 @@ def capture_failure_artifact(
 
 
 def preview_ready(state: dict, session_path: str) -> bool:
-    if state.get("active_view_mode") != "Rendered":
+    viewport = state.get("viewport") or {}
+    if viewport.get("active_view_mode") != "Rendered":
         return False
-    if state.get("active_session_path") != session_path:
+    if viewport.get("active_session_path") != session_path:
         return False
-    shell = state.get("shell") or {}
-    if session_path in (shell.get("terminal_attach_in_flight") or []):
-        return False
-    if len(state.get("active_surface_requests") or []) > 0:
-        return False
-    return True
+    return bool(viewport.get("ready"))
 
 
 def terminal_ready(state: dict, session_path: str) -> bool:
-    if state.get("active_view_mode") != "Terminal":
+    viewport = state.get("viewport") or {}
+    if viewport.get("active_view_mode") != "Terminal":
         return False
-    if state.get("active_session_path") != session_path:
+    if viewport.get("active_session_path") != session_path:
         return False
-    shell = state.get("shell") or {}
-    dom = state.get("dom") or {}
-    hosts = dom.get("terminal_hosts") or []
-    if session_path in (shell.get("terminal_attach_in_flight") or []):
-        return False
-    if dom.get("terminal_host_count", 0) <= 0 or not hosts:
-        return False
-    sample = (hosts[0].get("text_sample") or "").strip()
-    if bool(sample) or hosts[0].get("canvas_count", 0) > 0:
-        return True
-    return not session_path.startswith("remote-session://")
+    return bool(viewport.get("ready"))
+
+
+def viewport_failure_reason(state: dict) -> str:
+    viewport = state.get("viewport") or {}
+    reason = viewport.get("reason")
+    if isinstance(reason, str) and reason:
+        return reason
+    return "main viewport not ready"
+
+
+def viewport_matches_target(state: dict, session_path: str, view: str) -> bool:
+    viewport = state.get("viewport") or {}
+    expected_mode = "Rendered" if view == "preview" else "Terminal"
+    return (
+        viewport.get("active_session_path") == session_path
+        and viewport.get("active_view_mode") == expected_mode
+    )
 
 
 def wait_until(
@@ -167,14 +237,35 @@ def wait_until(
 ) -> tuple[float, dict]:
     start = time.monotonic()
     last_error = None
+    last_state: dict = {}
     while time.monotonic() - start <= timeout_s:
         try:
             state = predicate()
             return time.monotonic() - start, state
         except Exception as error:  # noqa: BLE001
             last_error = error
+            if isinstance(error, ReadinessPending):
+                last_state = error.state
             time.sleep(poll_s)
-    raise RuntimeError(f"{label} timed out after {timeout_s:.2f}s: {last_error}")
+    raise ReadinessTimeout(label, timeout_s, last_error, last_state)
+
+
+def wait_for_app_state(
+    host: str,
+    binary: str,
+    timeout_ms: int,
+    timeout_s: float = 8.0,
+    poll_s: float = 0.25,
+) -> dict:
+    def _probe() -> dict:
+        state = app_state(host, binary, timeout_ms)
+        window = state.get("window") or {}
+        if not window.get("visible"):
+            raise RuntimeError("window not visible yet")
+        return state
+
+    _, state = wait_until("app state", timeout_s, poll_s, _probe)
+    return state
 
 
 def choose_session_targets(
@@ -263,19 +354,24 @@ def open_trials(args: argparse.Namespace, inventory: dict, rows_payload: dict, o
         kind = row.get("kind")
         view = row.get("view") or ("preview" if kind == "Document" else "terminal")
         session_path = row["full_path"]
+        ready_pred = preview_ready if view == "preview" else terminal_ready
         started = time.monotonic()
+        started_ms = int(time.time() * 1000)
         app_open(args.host, args.bin, session_path, view, args.timeout_ms)
         try:
             elapsed, state = wait_until(
                 f"open {session_path}",
                 args.ready_budget,
                 args.poll,
-                lambda: _require_ready(
-                    app_state(args.host, args.bin, args.timeout_ms),
-                    preview_ready if view == "preview" else terminal_ready,
+                lambda: _require_ready_event_or_state(
+                    args.host,
+                    started_ms,
                     session_path,
+                    view,
+                    app_state(args.host, args.bin, args.timeout_ms),
                 ),
             )
+            state_dump = write_state_dump(out_dir, f"open-{index:02d}", state)
             anomaly = detect_anomaly(state, args.ready_budget)
             results.append(
                 {
@@ -289,11 +385,16 @@ def open_trials(args: argparse.Namespace, inventory: dict, rows_payload: dict, o
                     "notifications_count": ((state.get("shell") or {}).get("notifications_count")),
                     "active_surface_requests": len(state.get("active_surface_requests") or []),
                     "machine_refresh_requests": ((state.get("remote") or {}).get("machine_refresh_requests")),
+                    "viewport_ready": ready_pred(state, session_path),
+                    "viewport_reported_ready": ((state.get("viewport") or {}).get("ready")),
+                    "viewport_target_matched": viewport_matches_target(state, session_path, view),
+                    "viewport_reason": ((state.get("viewport") or {}).get("reason")),
+                    "state_dump": state_dump,
                 }
             )
         except Exception as error:  # noqa: BLE001
             failure_artifact = None
-            state = {}
+            state = getattr(error, "state", {}) or {}
             if args.screenshot_on_failure:
                 failure_artifact = capture_failure_artifact(
                     args.host,
@@ -302,10 +403,12 @@ def open_trials(args: argparse.Namespace, inventory: dict, rows_payload: dict, o
                     out_dir,
                     f"open-failure-{index:02d}",
                 )
-            try:
-                state = app_state(args.host, args.bin, args.timeout_ms)
-            except Exception:
-                state = {}
+            if not state:
+                try:
+                    state = app_state(args.host, args.bin, args.timeout_ms)
+                except Exception:
+                    state = {}
+            state_dump = write_state_dump(out_dir, f"open-{index:02d}-failure", state)
             results.append(
                 {
                     "path": session_path,
@@ -318,6 +421,11 @@ def open_trials(args: argparse.Namespace, inventory: dict, rows_payload: dict, o
                     "notifications_count": ((state.get("shell") or {}).get("notifications_count")),
                     "active_surface_requests": len(state.get("active_surface_requests") or []),
                     "machine_refresh_requests": ((state.get("remote") or {}).get("machine_refresh_requests")),
+                    "viewport_ready": ready_pred(state, session_path),
+                    "viewport_reported_ready": ((state.get("viewport") or {}).get("ready")),
+                    "viewport_target_matched": viewport_matches_target(state, session_path, view),
+                    "viewport_reason": ((state.get("viewport") or {}).get("reason")),
+                    "state_dump": state_dump,
                     "failure_artifact": failure_artifact,
                 }
             )
@@ -353,6 +461,7 @@ def drag_trials(args: argparse.Namespace, rows_payload: dict, out_dir: Path) -> 
             )
             app_drag(args.host, args.bin, "drop", args.timeout_ms)
             state = app_state(args.host, args.bin, args.timeout_ms)
+            state_dump = write_state_dump(out_dir, f"drag-{index:02d}", state)
             dom = state.get("dom") or {}
             drag_state = state.get("shell") or {}
             anomaly = None
@@ -368,6 +477,7 @@ def drag_trials(args: argparse.Namespace, rows_payload: dict, out_dir: Path) -> 
                     "planned_only": False,
                     "anomaly": anomaly,
                     "notifications_count": drag_state.get("notifications_count"),
+                    "state_dump": state_dump,
                 }
             )
         except Exception as error:  # noqa: BLE001
@@ -413,7 +523,22 @@ def detect_anomaly(state: dict, ready_budget: float) -> str | None:
 
 def _require_ready(state: dict, ready_pred: Callable[[dict, str], bool], session_path: str) -> dict:
     if not ready_pred(state, session_path):
-        raise RuntimeError("not ready yet")
+        raise ReadinessPending("not ready yet", state)
+    return state
+
+
+def _require_ready_event_or_state(
+    host: str,
+    started_ms: int,
+    session_path: str,
+    view: str,
+    state: dict,
+) -> dict:
+    ready_pred = preview_ready if view == "preview" else terminal_ready
+    if not ready_pred(state, session_path):
+        raise ReadinessPending(viewport_failure_reason(state), state)
+    if ready_event_seen(host, started_ms, session_path, view):
+        return state
     return state
 
 
@@ -422,13 +547,16 @@ def main() -> int:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    baseline_state = app_state(args.host, args.bin, args.timeout_ms)
+    baseline_state = wait_for_app_state(args.host, args.bin, args.timeout_ms)
+    baseline_dump = write_state_dump(out_dir, "baseline", baseline_state)
     inventory = server_inventory(args.host)
     rows_payload = app_rows(args.host, args.bin, args.timeout_ms)
     opens = open_trials(args, inventory, rows_payload, out_dir)
     drag_rows_payload = app_rows(args.host, args.bin, args.timeout_ms)
     drags = drag_trials(args, drag_rows_payload, out_dir)
-    final_state = app_state(args.host, args.bin, args.timeout_ms)
+    final_state = wait_for_app_state(args.host, args.bin, args.timeout_ms)
+    final_dump = write_state_dump(out_dir, "final", final_state)
+    window_spawn_event = latest_window_spawn_event(args.host)
 
     open_failures = [item for item in opens if not item.get("within_budget")]
     open_anomalies = [item for item in opens if item.get("anomaly")]
@@ -444,6 +572,11 @@ def main() -> int:
         "apply_drag": args.apply_drag,
         "baseline_active_session_path": baseline_state.get("active_session_path"),
         "baseline_notifications_count": ((baseline_state.get("shell") or {}).get("notifications_count")),
+        "baseline_dump": baseline_dump,
+        "window_spawn_elapsed_ms": ((window_spawn_event or {}).get("payload") or {}).get("elapsed_ms"),
+        "window_spawn_within_900ms": (
+            (((window_spawn_event or {}).get("payload") or {}).get("elapsed_ms") or 10_000) <= 900
+        ),
         "inventory_stored_sessions": len(inventory.get("stored_sessions") or []),
         "inventory_live_sessions": len(inventory.get("live_sessions") or []),
         "rows_seen": rows_payload.get("row_count"),
@@ -453,6 +586,7 @@ def main() -> int:
         "drag_anomalies": len(drag_anomalies),
         "final_active_session_path": final_state.get("active_session_path"),
         "final_notifications_count": ((final_state.get("shell") or {}).get("notifications_count")),
+        "final_dump": final_dump,
         "opens": opens,
         "drags": drags,
     }
