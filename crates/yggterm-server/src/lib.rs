@@ -19,7 +19,8 @@ pub use codex_cli::{ManagedCliTool, ManagedCliToolStatus};
 pub use daemon::{
     ServerEndpoint, ServerRequest, ServerResponse, ServerRuntimeStatus, TerminalStreamChunk,
     cleanup_legacy_daemons, connect_ssh, connect_ssh_custom, default_endpoint, focus_live,
-    open_remote_session, open_stored_session, ping, raise_external_window, refresh_managed_cli,
+    focus_live_with_view, open_remote_session, open_remote_session_with_view, open_stored_session,
+    open_stored_session_with_view, ping, raise_external_window, refresh_managed_cli,
     refresh_remote_machine, remove_ssh_target, request_terminal_launch, run_daemon,
     set_all_preview_blocks_folded, set_view_mode, shutdown, snapshot, start_command_session,
     start_local_session, start_local_session_at, start_ssh_session_at, status,
