@@ -9923,6 +9923,11 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
         .get("preview_font_family")
         .and_then(Value::as_str)
         .map(str::to_string);
+    let preview_visible_entries = dom
+        .get("preview_visible_entries")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let preview_timestamp_labels = dom
         .get("preview_timestamp_labels")
         .and_then(Value::as_array)
@@ -10039,6 +10044,7 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
             "viewport_rect": preview_viewport_rect,
             "visible_block_count": preview_visible_block_count,
             "visible_block_ids": preview_visible_block_ids,
+            "visible_entries": preview_visible_entries,
             "font_family": preview_font_family,
             "timestamp_labels": preview_timestamp_labels,
             "window": preview_window,
@@ -10105,7 +10111,22 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
             const titlebars = rootNode
                 ? Array.from(rootNode.querySelectorAll('[data-yggterm-titlebar="1"]'))
                 : Array.from(document.querySelectorAll('[data-yggterm-titlebar="1"]'));
-            const titlebar = pickLast(visibleNodes(titlebars)) || pickLast(titlebars);
+            const titlebarSessionContainers = rootNode
+                ? Array.from(rootNode.querySelectorAll('[data-titlebar-session-path]'))
+                : Array.from(document.querySelectorAll('[data-titlebar-session-path]'));
+            const matchingTitlebarSessionContainers = titlebarSessionContainers.filter((node) => {
+                const path = node.getAttribute('data-titlebar-session-path');
+                return activeSessionPath && path === activeSessionPath;
+            });
+            const titlebarSessionContainer =
+                pickLast(visibleNodes(matchingTitlebarSessionContainers))
+                || pickLast(matchingTitlebarSessionContainers)
+                || pickLast(visibleNodes(titlebarSessionContainers))
+                || pickLast(titlebarSessionContainers)
+                || null;
+            const titlebar = titlebarSessionContainer?.closest('[data-yggterm-titlebar="1"]')
+                || pickLast(visibleNodes(titlebars))
+                || pickLast(titlebars);
             const titlebarTitle = titlebar?.querySelector('[data-titlebar-title="1"]') || null;
             const titlebarButton = titlebar?.querySelector('[data-titlebar-session-button="1"]') || null;
             const titlebarSummary = titlebar?.querySelector('[data-titlebar-summary-body="1"]') || null;
@@ -10176,6 +10197,10 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     };
                 })()
                 : null;
+            const previewViewportTop = previewViewportRect ? previewViewportRect.top : -120;
+            const previewViewportBottom = previewViewportRect
+                ? (previewViewportRect.top + previewViewportRect.height)
+                : (window.innerHeight + 120);
             const previewVisibleBlocks = Array.from((previewScroller || document).querySelectorAll('[id^="preview-block-"]'))
                 .map((block) => {
                     const rect = block.getBoundingClientRect();
@@ -10185,8 +10210,22 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                         height: Math.round(rect.height),
                     };
                 })
-                .filter((block) => block.height > 0 && block.top < window.innerHeight + 120 && block.top + block.height > -120);
+                .filter((block) => block.height > 0 && block.top < previewViewportBottom && block.top + block.height > previewViewportTop);
             const previewEntries = Array.from((previewScroller || document).querySelectorAll('[data-preview-entry="1"]'));
+            const previewVisibleEntries = previewEntries
+                .map((entry) => {
+                    const rect = entry.getBoundingClientRect();
+                    return {
+                        block_id: entry.id || null,
+                        tone: entry.getAttribute('data-preview-tone'),
+                        block_ix: Number(entry.getAttribute('data-preview-block-ix') || '-1'),
+                        top: Math.round(rect.top),
+                        height: Math.round(rect.height),
+                        timestamp: String(entry.getAttribute('data-preview-raw-timestamp') || '').trim(),
+                        text: String(entry.innerText || '').trim().slice(0, 480),
+                    };
+                })
+                .filter((entry) => entry.height > 0 && entry.top < previewViewportBottom && entry.top + entry.height > previewViewportTop);
             const previewAssistantEntries = previewEntries.filter((entry) => entry.getAttribute('data-preview-tone') === 'assistant');
             const previewRawTimestamps = previewEntries
                 .map((entry) => String(entry.getAttribute('data-preview-raw-timestamp') || '').trim())
@@ -10224,6 +10263,7 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                 preview_viewport_rect: previewViewportRect,
                 preview_visible_block_count: previewVisibleBlocks.length,
                 preview_visible_block_ids: previewVisibleBlocks.slice(0, 24).map((block) => block.id),
+                preview_visible_entries: previewVisibleEntries.slice(0, 24),
                 preview_assistant_entry_count: previewAssistantEntries.length,
                 preview_font_family: previewFontFamily,
                 preview_raw_timestamps: previewRawTimestamps,
@@ -13058,12 +13098,13 @@ fn Titlebar(
             .terminal_loading
             .then_some("Resuming terminal…".to_string())
     };
+    let active_session_path_value = snapshot
+        .active_session_path
+        .clone()
+        .unwrap_or_else(|| "__none__".to_string());
     let titlebar_session_key = format!(
         "titlebar-session:{}:{}:{}",
-        snapshot
-            .active_session_path
-            .clone()
-            .unwrap_or_else(|| "__none__".to_string()),
+        active_session_path_value,
         active_title.clone().unwrap_or_default(),
         active_summary.clone().unwrap_or_default()
     );
@@ -13200,6 +13241,7 @@ fn Titlebar(
                     if let Some(active_title) = active_title.clone() {
                         div {
                             key: "{titlebar_session_key}",
+                            "data-titlebar-session-path": "{active_session_path_value}",
                             style: "position:relative; display:flex; align-items:center; flex:1 1 220px; min-width:0; max-width:360px;",
                             onmousedown: |evt| evt.stop_propagation(),
                             onclick: |evt| evt.stop_propagation(),
