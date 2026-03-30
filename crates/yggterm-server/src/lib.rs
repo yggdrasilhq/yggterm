@@ -1651,6 +1651,7 @@ impl YggtermServer {
                 );
             }
         }
+        self.focus_live_session(&session_path);
         self.request_terminal_launch_for_path(&session_path);
         Ok(session_path)
     }
@@ -2650,6 +2651,20 @@ fn tmux_attach_session(session_name: &str) -> anyhow::Result<()> {
             anyhow::bail!("tmux attach-session failed for {session_name}: {status}");
         }
     }
+}
+
+fn tmux_snapshot_bytes(session_name: &str) -> anyhow::Result<Vec<u8>> {
+    let output = Command::new("tmux")
+        .args(["capture-pane", "-p", "-e", "-J", "-S", "-", "-t", session_name])
+        .output()
+        .with_context(|| format!("capturing tmux pane for {session_name}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "tmux capture-pane failed for {session_name}: {}",
+            output.status
+        );
+    }
+    Ok(sanitize_terminal_snapshot(&output.stdout))
 }
 
 fn tmux_send_keys(session_name: &str, text: &str) -> anyhow::Result<()> {
@@ -4563,6 +4578,10 @@ pub fn run_remote_resume_codex(session_id: &str, cwd: Option<&str>) -> anyhow::R
                 "mode": if saved_session_exists { "resume" } else { "resume_picker" },
             }));
         } else {
+            if matches!(multiplexer, RemoteMultiplexer::Tmux) {
+                let _ = tmux_snapshot_bytes(&session_name)
+                    .and_then(|bytes| emit_terminal_snapshot(&bytes));
+            }
             if matches!(multiplexer, RemoteMultiplexer::Screen) {
                 let _ = screen_snapshot_bytes(&session_name)
                     .and_then(|bytes| emit_terminal_snapshot(&bytes));

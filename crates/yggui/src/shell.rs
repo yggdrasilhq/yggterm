@@ -794,11 +794,29 @@ impl ShellState {
         let active_session = self.server.active_session().cloned();
         let active_title = active_session
             .as_ref()
-            .and_then(|session| resolved_session_title(self, session));
+            .and_then(|session| resolved_session_title(self, session))
+            .or_else(|| {
+                active_session_path.as_deref().and_then(|path| {
+                    rows.iter()
+                        .find(|row| row.full_path == path)
+                        .and_then(fallback_title_from_browser_row)
+                        .or_else(|| {
+                            merged_rows
+                                .iter()
+                                .find(|row| row.full_path == path)
+                                .and_then(fallback_title_from_browser_row)
+                        })
+                })
+            });
         let active_precis = None;
         let active_summary = active_session
             .as_ref()
-            .and_then(|session| resolved_session_summary(self, session));
+            .and_then(|session| resolved_session_summary(self, session))
+            .or_else(|| {
+                active_session_path
+                    .as_deref()
+                    .and_then(|path| fallback_summary_for_session_path(self, path))
+            });
         let search_content_hits = search_content_hits(
             active_session.as_ref(),
             self.server.active_view_mode(),
@@ -5679,6 +5697,54 @@ fn resolved_session_summary(shell: &ShellState, session: &ManagedSessionView) ->
         })
         .or_else(|| preview_summary_metadata_value(session, "Summary"))
         .filter(|summary| !looks_like_low_signal_generated_copy(summary))
+}
+
+fn fallback_title_from_browser_row(row: &BrowserRow) -> Option<String> {
+    row.session_title
+        .clone()
+        .filter(|title| !title.trim().is_empty() && !looks_like_generated_fallback_title(title))
+        .or_else(|| {
+            let label = row.label.trim();
+            if label.is_empty() || looks_like_generated_fallback_title(label) {
+                None
+            } else {
+                Some(label.to_string())
+            }
+        })
+        .or_else(|| {
+            row.session_cwd
+                .as_deref()
+                .map(str::trim)
+                .filter(|cwd| !cwd.is_empty())
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn fallback_summary_for_session_path(shell: &ShellState, session_path: &str) -> Option<String> {
+    if let Some(summary) = remote_generated_copy(&shell.server, session_path)
+        .and_then(|(_, _, summary)| summary)
+        .filter(|summary| !summary.trim().is_empty())
+        .filter(|summary| !looks_like_low_signal_generated_copy(summary))
+    {
+        return Some(summary);
+    }
+    if let Some((machine_key, _session_id)) = parse_remote_scanned_session_path(session_path)
+        && let Some(machine) = shell
+            .server
+            .remote_machines()
+            .iter()
+            .find(|machine| machine.machine_key == machine_key)
+        && let Some(scanned) = machine
+            .sessions
+            .iter()
+            .find(|scanned| scanned.session_path == session_path)
+    {
+        let cwd = scanned.cwd.trim();
+        if !cwd.is_empty() {
+            return Some(format!("SSH terminal on {machine_key} rooted at {cwd}."));
+        }
+    }
+    None
 }
 
 fn titlebar_summary_text(
@@ -12235,6 +12301,15 @@ fn Titlebar(
             .terminal_loading
             .then_some("Resuming terminal…".to_string())
     };
+    let titlebar_session_key = format!(
+        "titlebar-session:{}:{}:{}",
+        snapshot
+            .active_session_path
+            .clone()
+            .unwrap_or_else(|| "__none__".to_string()),
+        active_title.clone().unwrap_or_default(),
+        active_summary.clone().unwrap_or_default()
+    );
     rsx! {
         TitlebarChrome {
             background: snapshot.palette.titlebar.to_string(),
@@ -12325,6 +12400,7 @@ fn Titlebar(
                     }
                     if let Some(active_title) = active_title.clone() {
                         div {
+                            key: "{titlebar_session_key}",
                             style: "position:relative; display:flex; align-items:center; flex:1 1 220px; min-width:0; max-width:360px;",
                             onmousedown: |evt| evt.stop_propagation(),
                             onclick: |evt| evt.stop_propagation(),

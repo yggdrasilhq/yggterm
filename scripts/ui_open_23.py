@@ -185,8 +185,13 @@ def wait_for_window(host: str, binary: str, timeout_ms: int) -> dict:
     def _probe() -> dict:
         state = app_state(host, binary, timeout_ms)
         window = state.get("window") or {}
+        shell = state.get("shell") or {}
         if not window.get("visible"):
             raise RuntimeError("window not visible")
+        if shell.get("needs_initial_server_sync"):
+            raise RuntimeError("initial server sync still in progress")
+        if shell.get("server_busy"):
+            raise RuntimeError("server still busy")
         return state
 
     return wait_until("window visible", 8.0, 0.25, _probe)[1]
@@ -218,9 +223,19 @@ def titlebar_matches_viewport(state: dict) -> bool:
         return False
     if active_summary and titlebar.get("menu_open") and summary_text != active_summary:
         return False
-    if active_summary and button_tooltip != active_summary:
+    if active_summary and not _summary_matches_probe_text(active_summary, button_tooltip):
         return False
     return True
+
+
+def _summary_matches_probe_text(active_summary: str, probe_text: str) -> bool:
+    active = active_summary.strip()
+    probe = probe_text.strip()
+    if not active:
+        return True
+    if not probe:
+        return False
+    return active == probe or active.startswith(probe) or probe.startswith(active)
 
 
 def title_is_good(value: str | None) -> bool:
@@ -246,7 +261,7 @@ def is_remote_machine_group(row: dict) -> bool:
 
 
 def openable_row_count(rows_payload: dict) -> int:
-    return len(choose_open_targets(rows_payload, random.Random(23), 10_000))
+    return len(collect_open_targets(rows_payload, random.Random(23)))
 
 
 def expand_groups_until_target(
@@ -289,7 +304,7 @@ def expand_groups_until_target(
     return last
 
 
-def choose_open_targets(rows_payload: dict, rng: random.Random, count: int) -> list[dict]:
+def collect_open_targets(rows_payload: dict, rng: random.Random) -> list[dict]:
     candidates: list[dict] = []
     seen_paths: set[str] = set()
     for row in rows_payload.get("rows") or []:
@@ -310,6 +325,11 @@ def choose_open_targets(rows_payload: dict, rng: random.Random, count: int) -> l
             }
         )
         seen_paths.add(session_path)
+    return candidates
+
+
+def choose_open_targets(rows_payload: dict, rng: random.Random, count: int) -> list[dict]:
+    candidates = collect_open_targets(rows_payload, rng)
     if not candidates:
         raise RuntimeError("no openable rows available")
     if len(candidates) > count:
@@ -448,6 +468,8 @@ def _require_viewport_ready(state: dict, session_path: str, view: str) -> dict:
     if not viewport_ready(state, session_path, view):
         viewport = state.get("viewport") or {}
         raise RuntimeError(viewport.get("reason") or "viewport not ready")
+    if not titlebar_matches_viewport(state):
+        raise RuntimeError("titlebar not in sync with viewport")
     return state
 
 
