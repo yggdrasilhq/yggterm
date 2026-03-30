@@ -290,6 +290,23 @@ def active_terminal_text(state: dict) -> str:
     return "\n".join((host.get("text_sample") or "") for host in hosts)
 
 
+def titlebar_matches_viewport(state: dict) -> bool:
+    viewport = state.get("viewport") or {}
+    titlebar = viewport.get("titlebar") or {}
+    active_title = (viewport.get("active_title") or "").strip()
+    active_summary = (viewport.get("active_summary") or "").strip()
+    title_text = (titlebar.get("title_text") or "").strip()
+    summary_text = (titlebar.get("summary_text") or "").strip()
+    button_tooltip = (titlebar.get("button_tooltip") or "").strip()
+    if active_title and title_text != active_title:
+        return False
+    if active_summary and titlebar.get("menu_open") and summary_text != active_summary:
+        return False
+    if active_summary and button_tooltip != active_summary:
+        return False
+    return True
+
+
 def output_matches_cwd(text: str, expected_cwd: str | None) -> bool:
     expected = (expected_cwd or "").strip()
     if not expected:
@@ -507,15 +524,21 @@ def main() -> int:
             continue
 
         viewport = output_state.get("viewport") or {}
+        titlebar = viewport.get("titlebar") or {}
         notifications = (output_state.get("shell") or {}).get("notifications_count") or 0
         entry["active_title"] = viewport.get("active_title")
         entry["active_summary"] = viewport.get("active_summary")
+        entry["titlebar_title_text"] = titlebar.get("title_text")
+        entry["titlebar_summary_text"] = titlebar.get("summary_text")
+        entry["titlebar_button_tooltip"] = titlebar.get("button_tooltip")
+        entry["titlebar_menu_open"] = titlebar.get("menu_open")
         entry["notification_count"] = notifications
         entry["notification_delta"] = max(0, notifications - baseline_notifications)
         entry["terminal_text_sample"] = active_terminal_text(output_state)
         entry["state_dump"] = write_json(out_dir / f"terminal-{index:02d}.json", output_state)
         entry["title_present"] = title_is_good(viewport.get("active_title"))
         entry["summary_present"] = bool((viewport.get("active_summary") or "").strip())
+        entry["titlebar_matches_viewport"] = titlebar_matches_viewport(output_state)
         entry["cwd_matches"] = output_matches_cwd(
             entry["terminal_text_sample"],
             target.get("cwd"),
@@ -549,6 +572,7 @@ def main() -> int:
         "command_failures": len([item for item in results if item.get("created_session_path") and not item.get("output_contains_markers")]),
         "summary_failures": len([item for item in results if item.get("created_session_path") and not item.get("summary_present")]),
         "title_failures": len([item for item in results if item.get("created_session_path") and not item.get("title_present")]),
+        "titlebar_failures": len([item for item in results if item.get("created_session_path") and not item.get("titlebar_matches_viewport")]),
         "cwd_failures": len([item for item in results if item.get("created_session_path") and not item.get("cwd_matches", False)]),
         "notification_anomalies": len([item for item in results if item.get("notification_noise")]),
         "remove_failures": len([item for item in results if item.get("remove_error")]),
@@ -572,6 +596,7 @@ def main() -> int:
         and item.get("cwd_matches")
         and item.get("title_present")
         and item.get("summary_present")
+        and item.get("titlebar_matches_viewport")
         and not item.get("notification_noise")
         and not item.get("remove_error")
         for item in results
