@@ -63,6 +63,21 @@ pub enum AppControlCommand {
     Drag {
         command: AppControlDragCommand,
     },
+    CreateTerminal {
+        #[serde(default)]
+        machine_key: Option<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        title_hint: Option<String>,
+    },
+    SendTerminalInput {
+        session_path: String,
+        data: String,
+    },
+    RemoveSession {
+        session_path: String,
+    },
     SetRowExpanded {
         row_path: String,
         expanded: bool,
@@ -84,6 +99,9 @@ impl AppControlCommand {
             Self::CaptureScreenRecording { .. } => "capture_screen_recording",
             Self::SetFullscreen { .. } => "set_fullscreen",
             Self::Drag { .. } => "drag",
+            Self::CreateTerminal { .. } => "create_terminal",
+            Self::SendTerminalInput { .. } => "send_terminal_input",
+            Self::RemoveSession { .. } => "remove_session",
             Self::SetRowExpanded { .. } => "set_row_expanded",
             Self::DescribeRows => "describe_rows",
             Self::OpenPath { .. } => "open_path",
