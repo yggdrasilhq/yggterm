@@ -18,7 +18,7 @@ pub const TOAST_CSS: &str = r#"
 }
 "#;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToastTone {
     Info,
     Success,
