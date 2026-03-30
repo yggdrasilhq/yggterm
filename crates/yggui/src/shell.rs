@@ -9322,7 +9322,21 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let terminal_rendered = terminal_hosts.iter().any(|host| {
+    let active_terminal_hosts = active_session_path
+        .as_deref()
+        .map(|path| {
+            terminal_hosts
+                .iter()
+                .filter(|host| {
+                    host.get("session_path")
+                        .and_then(Value::as_str)
+                        .is_some_and(|session_path| session_path == path)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let terminal_rendered = active_terminal_hosts.iter().any(|host| {
         host.get("canvas_count")
             .and_then(Value::as_u64)
             .is_some_and(|count| count > 0)
@@ -9352,12 +9366,17 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
             (true, None)
         }
     } else if active_view_mode == "Terminal" {
-        if terminal_hosts.is_empty() {
+        if active_terminal_hosts.is_empty() {
+            (
+                false,
+                Some("active terminal host is missing".to_string()),
+            )
+        } else if terminal_hosts.is_empty() {
             (false, Some("terminal host is missing".to_string()))
         } else if !terminal_rendered {
             (
                 false,
-                Some("terminal host exists but xterm surface is empty".to_string()),
+                Some("active terminal host exists but xterm surface is empty".to_string()),
             )
         } else {
             (true, None)
@@ -9377,6 +9396,8 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
         "document_body_sample": document_body_sample,
         "terminal_host_count": terminal_hosts.len(),
         "terminal_hosts": terminal_hosts,
+        "active_terminal_host_count": active_terminal_hosts.len(),
+        "active_terminal_hosts": active_terminal_hosts,
         "ready": ready,
         "reason": reason,
     })
@@ -9425,6 +9446,8 @@ async fn capture_dom_debug_snapshot() -> Value {
                 const viewportStyle = viewport ? window.getComputedStyle(viewport) : null;
                 return {
                     id: host.id,
+                    session_path: host.getAttribute('data-terminal-session-path'),
+                    mount_epoch: host.getAttribute('data-terminal-mount-epoch'),
                     child_count: host.childElementCount,
                     text_sample: String(host.innerText || "").slice(0, 160),
                     background_color: style.backgroundColor,
@@ -11157,22 +11180,17 @@ fn app() -> Element {
                         on_execute_search_command: move |command: String| execute_search_command(state, command),
                         on_set_search_focus: move |focused: bool| state.with_mut(|shell| shell.set_search_focus(focused)),
                             on_prev_search_content: move |_| {
-                            if let Some(dom_id) = state.with_mut(|shell| shell.next_search_content_dom_id(-1)) {
-                                if let Some(line_index) = dom_id.strip_prefix("__terminal_line__:") {
-                                    let host_id = state
+                                if let Some(dom_id) = state.with_mut(|shell| shell.next_search_content_dom_id(-1)) {
+                                    if let Some(line_index) = dom_id.strip_prefix("__terminal_line__:") {
+                                    let session_path = state
                                         .read()
                                         .server
                                         .active_session()
-                                        .map(|session| terminal_host_id(&session.session_path));
-                                    if let (Some(host_id), Ok(line_index)) = (host_id, line_index.parse::<usize>()) {
-                                        let _ = document::eval(&format!(
-                                            "(function() {{
-                                                const registry = window.__yggtermXtermHosts || {{}};
-                                                const entry = registry[{host_id:?}];
-                                                if (!entry || !entry.term) return;
-                                                const target = Math.max(0, {line_index} - Math.floor((entry.term.rows || 1) / 2));
-                                                try {{ entry.term.scrollToLine(target); }} catch (_error) {{}}
-                                            }})();"
+                                        .map(|session| session.session_path.clone());
+                                    if let (Some(session_path), Ok(line_index)) = (session_path, line_index.parse::<usize>()) {
+                                        let _ = document::eval(&terminal_scroll_to_line_script(
+                                            &session_path,
+                                            line_index,
                                         ));
                                     }
                                 } else if dom_id == PREVIEW_HEADER_SEARCH_HIT_ID {
@@ -11199,20 +11217,15 @@ fn app() -> Element {
                         on_next_search_content: move |_| {
                             if let Some(dom_id) = state.with_mut(|shell| shell.next_search_content_dom_id(1)) {
                                 if let Some(line_index) = dom_id.strip_prefix("__terminal_line__:") {
-                                    let host_id = state
+                                    let session_path = state
                                         .read()
                                         .server
                                         .active_session()
-                                        .map(|session| terminal_host_id(&session.session_path));
-                                    if let (Some(host_id), Ok(line_index)) = (host_id, line_index.parse::<usize>()) {
-                                        let _ = document::eval(&format!(
-                                            "(function() {{
-                                                const registry = window.__yggtermXtermHosts || {{}};
-                                                const entry = registry[{host_id:?}];
-                                                if (!entry || !entry.term) return;
-                                                const target = Math.max(0, {line_index} - Math.floor((entry.term.rows || 1) / 2));
-                                                try {{ entry.term.scrollToLine(target); }} catch (_error) {{}}
-                                            }})();"
+                                        .map(|session| session.session_path.clone());
+                                    if let (Some(session_path), Ok(line_index)) = (session_path, line_index.parse::<usize>()) {
+                                        let _ = document::eval(&terminal_scroll_to_line_script(
+                                            &session_path,
+                                            line_index,
                                         ));
                                     }
                                 } else if dom_id == PREVIEW_HEADER_SEARCH_HIT_ID {
@@ -14518,7 +14531,8 @@ fn TerminalCanvas(
         .server_endpoint
         .clone();
     let session_path = session.session_path.clone();
-    let host_id = terminal_host_id(&session_path);
+    let host_session_path = session_path.clone();
+    let host_id = terminal_mount_host_id(&session_path, mount_epoch);
     let instance_key = format!(
         "{}:{}",
         terminal_instance_key(&session_path, snapshot.settings.terminal_font_size),
@@ -15178,6 +15192,8 @@ fn TerminalCanvas(
                 div {
                     key: "{host_id}",
                     id: "{host_id}",
+                    "data-terminal-session-path": "{host_session_path}",
+                    "data-terminal-mount-epoch": "{mount_epoch}",
                     style: format!(
                         "flex:1; min-width:0; min-height:0; height:100%; background:{}; overflow:hidden; {};",
                         theme.background,
@@ -15728,6 +15744,10 @@ fn terminal_host_id(session_path: &str) -> String {
     id
 }
 
+fn terminal_mount_host_id(session_path: &str, mount_epoch: u64) -> String {
+    format!("{}-m{}", terminal_host_id(session_path), mount_epoch)
+}
+
 fn sidebar_row_dom_id(path: &str) -> String {
     let mut id = String::from("yggterm-sidebar-row-");
     for ch in path.chars() {
@@ -15812,7 +15832,6 @@ fn apply_active_terminal_zoom(state: Signal<ShellState>) {
     let Some(session) = snapshot.active_session else {
         return;
     };
-    let host_id = terminal_host_id(&session.session_path);
     let theme = terminal_theme(
         snapshot.settings.theme,
         snapshot.palette,
@@ -15821,11 +15840,13 @@ fn apply_active_terminal_zoom(state: Signal<ShellState>) {
     );
     info!(
         session=%session.session_path,
-        host_id=%host_id,
         font_size=theme.font_size,
         "applying live terminal zoom"
     );
-    let _ = document::eval(&terminal_apply_script(&host_id, &theme));
+    let _ = document::eval(&terminal_apply_script_for_session(
+        &session.session_path,
+        &theme,
+    ));
 }
 
 fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
@@ -16031,7 +16052,13 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
             return false;
         }});
         window.__yggtermXtermHosts = window.__yggtermXtermHosts || {{}};
-        window.__yggtermXtermHosts[hostId] = {{ term, fitAddon }};
+        window.__yggtermXtermHosts[hostId] = {{
+            term,
+            fitAddon,
+            hostId,
+            sessionPath: host.getAttribute("data-terminal-session-path") || "",
+            mountedAt: Date.now(),
+        }};
         dioxus.send({{
             kind: "debug",
             message: `constructed host=${{hostId}} cols=${{term.cols}} rows=${{term.rows}}`
@@ -16229,6 +16256,128 @@ fn terminal_apply_script(host_id: &str, theme: &TerminalTheme) -> String {
         bright_magenta = bright_magenta,
         bright_cyan = bright_cyan,
         bright_white = bright_white,
+    )
+}
+
+fn terminal_apply_script_for_session(session_path: &str, theme: &TerminalTheme) -> String {
+    let session_path =
+        serde_json::to_string(session_path).expect("serialize terminal session path");
+    let background =
+        serde_json::to_string(&theme.background).expect("serialize terminal background");
+    let foreground =
+        serde_json::to_string(&theme.foreground).expect("serialize terminal foreground");
+    let cursor = serde_json::to_string(&theme.cursor).expect("serialize terminal cursor");
+    let selection = serde_json::to_string(&theme.selection).expect("serialize terminal selection");
+    let black = serde_json::to_string(&theme.black).expect("serialize terminal black");
+    let red = serde_json::to_string(&theme.red).expect("serialize terminal red");
+    let green = serde_json::to_string(&theme.green).expect("serialize terminal green");
+    let yellow = serde_json::to_string(&theme.yellow).expect("serialize terminal yellow");
+    let blue = serde_json::to_string(&theme.blue).expect("serialize terminal blue");
+    let magenta = serde_json::to_string(&theme.magenta).expect("serialize terminal magenta");
+    let cyan = serde_json::to_string(&theme.cyan).expect("serialize terminal cyan");
+    let white = serde_json::to_string(&theme.white).expect("serialize terminal white");
+    let bright_black =
+        serde_json::to_string(&theme.bright_black).expect("serialize terminal bright black");
+    let bright_red =
+        serde_json::to_string(&theme.bright_red).expect("serialize terminal bright red");
+    let bright_green =
+        serde_json::to_string(&theme.bright_green).expect("serialize terminal bright green");
+    let bright_yellow =
+        serde_json::to_string(&theme.bright_yellow).expect("serialize terminal bright yellow");
+    let bright_blue =
+        serde_json::to_string(&theme.bright_blue).expect("serialize terminal bright blue");
+    let bright_magenta =
+        serde_json::to_string(&theme.bright_magenta).expect("serialize terminal bright magenta");
+    let bright_cyan =
+        serde_json::to_string(&theme.bright_cyan).expect("serialize terminal bright cyan");
+    let bright_white =
+        serde_json::to_string(&theme.bright_white).expect("serialize terminal bright white");
+    format!(
+        r#"
+        (() => {{
+          const sessionPath = {session_path};
+          const registry = window.__yggtermXtermHosts || {{}};
+          const entries = Object.values(registry)
+            .filter((entry) => entry && entry.term && entry.sessionPath === sessionPath)
+            .sort((a, b) => (b.mountedAt || 0) - (a.mountedAt || 0));
+          const entry = entries[0];
+          if (!entry || !entry.term) {{
+            return;
+          }}
+          entry.term.options.fontSize = {font_size};
+          entry.term.options.theme = {{
+            background: {background},
+            foreground: {foreground},
+            cursor: {cursor},
+            selectionBackground: {selection},
+            black: {black},
+            red: {red},
+            green: {green},
+            yellow: {yellow},
+            blue: {blue},
+            magenta: {magenta},
+            cyan: {cyan},
+            white: {white},
+            brightBlack: {bright_black},
+            brightRed: {bright_red},
+            brightGreen: {bright_green},
+            brightYellow: {bright_yellow},
+            brightBlue: {bright_blue},
+            brightMagenta: {bright_magenta},
+            brightCyan: {bright_cyan},
+            brightWhite: {bright_white},
+          }};
+          try {{
+            entry.fitAddon && entry.fitAddon.fit();
+          }} catch (_error) {{}}
+          window.__yggtermLastApply = {{
+            hostId: entry.hostId || "unknown",
+            sessionPath,
+            fontSize: entry.term.options.fontSize,
+            appliedAt: Date.now(),
+          }};
+        }})();
+        "#,
+        session_path = session_path,
+        font_size = theme.font_size,
+        background = background,
+        foreground = foreground,
+        cursor = cursor,
+        selection = selection,
+        black = black,
+        red = red,
+        green = green,
+        yellow = yellow,
+        blue = blue,
+        magenta = magenta,
+        cyan = cyan,
+        white = white,
+        bright_black = bright_black,
+        bright_red = bright_red,
+        bright_green = bright_green,
+        bright_yellow = bright_yellow,
+        bright_blue = bright_blue,
+        bright_magenta = bright_magenta,
+        bright_cyan = bright_cyan,
+        bright_white = bright_white,
+    )
+}
+
+fn terminal_scroll_to_line_script(session_path: &str, line_index: usize) -> String {
+    format!(
+        r#"
+        (() => {{
+            const sessionPath = {session_path:?};
+            const registry = window.__yggtermXtermHosts || {{}};
+            const entries = Object.values(registry)
+                .filter((entry) => entry && entry.term && entry.sessionPath === sessionPath)
+                .sort((a, b) => (b.mountedAt || 0) - (a.mountedAt || 0));
+            const entry = entries[0];
+            if (!entry || !entry.term) return;
+            const target = Math.max(0, {line_index} - Math.floor((entry.term.rows || 1) / 2));
+            try {{ entry.term.scrollToLine(target); }} catch (_error) {{}}
+        }})();
+        "#
     )
 }
 
