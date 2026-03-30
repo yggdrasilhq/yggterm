@@ -1,15 +1,19 @@
 use crate::{
     GhosttyHostSupport, PersistedDaemonState, RemoteMachineSnapshot, ServerUiSnapshot,
     SessionKind, SshConnectTarget, TerminalManager, WorkspaceViewMode, YggtermServer,
+    active_client_instance_records, current_millis,
     fetch_remote_generation_context, persist_remote_generated_copy, terminate_remote_codex_session,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use tracing::{info, warn};
 use yggterm_core::{
     AppSettings, PerfSpan, SessionNode, SessionNodeKind, SessionStore, UiTheme, append_trace_event,
@@ -20,6 +24,8 @@ use time::OffsetDateTime;
 pub const SERVER_PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BACKGROUND_COPY_CHORE_MS: u64 = 12_000;
 const BACKGROUND_COPY_BUDGET_PER_TICK: usize = 23;
+const DAEMON_ACCEPT_POLL_MS: u64 = 200;
+const DEFAULT_DAEMON_IDLE_SHUTDOWN_MS: u64 = 90_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerEndpoint {
@@ -868,7 +874,7 @@ fn build_background_copy_updates(
     Ok(updates)
 }
 
-fn run_background_copy_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<()> {
+fn run_background_copy_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usize> {
     let (store, settings, local_root, remote_machines, ssh_targets, perf_home) = {
         let runtime = runtime.lock().expect("daemon runtime lock poisoned");
         let settings = runtime.store.load_settings().unwrap_or_default();
@@ -891,7 +897,7 @@ fn run_background_copy_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<()> 
     }));
 
     if updates.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
 
     let mut runtime = runtime.lock().expect("daemon runtime lock poisoned");
@@ -911,7 +917,42 @@ fn run_background_copy_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<()> 
         "tick",
         serde_json::json!({ "updates": updates.len() }),
     );
-    Ok(())
+    Ok(updates.len())
+}
+
+fn daemon_idle_shutdown_ms() -> u64 {
+    std::env::var("YGGTERM_DAEMON_IDLE_SHUTDOWN_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_DAEMON_IDLE_SHUTDOWN_MS)
+}
+
+fn current_millis_u64() -> u64 {
+    u64::try_from(current_millis()).unwrap_or(u64::MAX)
+}
+
+fn mark_daemon_activity(last_activity_ms: &AtomicU64) {
+    last_activity_ms.store(current_millis_u64(), Ordering::Relaxed);
+}
+
+fn daemon_should_idle_shutdown(
+    home_dir: &Path,
+    endpoint: &ServerEndpoint,
+    last_activity_ms: &AtomicU64,
+    idle_shutdown_ms: u64,
+) -> bool {
+    let idle_for_ms = current_millis_u64().saturating_sub(last_activity_ms.load(Ordering::Relaxed));
+    if idle_for_ms < idle_shutdown_ms {
+        return false;
+    }
+    match active_client_instance_records(home_dir, endpoint) {
+        Ok(records) => records.is_empty(),
+        Err(error) => {
+            warn!(error=%error, "failed to read active client instances during daemon idle check");
+            false
+        }
+    }
 }
 
 fn server_request_name(request: &ServerRequest) -> &'static str {
@@ -1371,12 +1412,24 @@ pub fn cleanup_legacy_daemons(endpoint: &ServerEndpoint, current_exe: &Path) -> 
 
 pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Result<()> {
     let runtime = Arc::new(Mutex::new(DaemonRuntime::load(runtime)?));
+    let last_activity_ms = Arc::new(AtomicU64::new(current_millis_u64()));
+    let idle_shutdown_ms = daemon_idle_shutdown_ms();
+    let home_dir = {
+        let runtime = runtime.lock().expect("daemon runtime lock poisoned");
+        runtime.store.home_dir().to_path_buf()
+    };
     {
         let runtime = runtime.clone();
+        let last_activity_ms = last_activity_ms.clone();
         std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_millis(BACKGROUND_COPY_CHORE_MS));
-            if let Err(error) = run_background_copy_chore(&runtime) {
-                warn!(error=%error, "daemon background copy chore failed");
+            match run_background_copy_chore(&runtime) {
+                Ok(update_count) => {
+                    if update_count > 0 {
+                        mark_daemon_activity(&last_activity_ms);
+                    }
+                }
+                Err(error) => warn!(error=%error, "daemon background copy chore failed"),
             }
         });
     }
@@ -1397,18 +1450,45 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
         }
         let listener = std::os::unix::net::UnixListener::bind(path)
             .with_context(|| format!("binding server socket {}", path.display()))?;
+        listener
+            .set_nonblocking(true)
+            .context("setting daemon unix listener nonblocking")?;
         let host = {
             let runtime = runtime.lock().expect("daemon runtime lock poisoned");
             runtime.support.kind.as_str().to_string()
         };
         info!(path=%path.display(), host=%host, "yggterm server daemon listening");
         loop {
-            let (stream, _) = listener.accept().context("accepting daemon client")?;
-            let runtime = runtime.clone();
-            match handle_unix_stream(stream, runtime) {
-                Ok(true) => break,
-                Ok(false) => {}
-                Err(error) => warn!(error=%error, "daemon request failed"),
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let runtime = runtime.clone();
+                    let last_activity_ms = last_activity_ms.clone();
+                    match handle_unix_stream(stream, runtime, last_activity_ms) {
+                        Ok(true) => break,
+                        Ok(false) => {}
+                        Err(error) => warn!(error=%error, "daemon request failed"),
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    if daemon_should_idle_shutdown(
+                        &home_dir,
+                        endpoint,
+                        last_activity_ms.as_ref(),
+                        idle_shutdown_ms,
+                    ) {
+                        append_trace_event(
+                            &home_dir,
+                            "daemon",
+                            "lifecycle",
+                            "idle_shutdown",
+                            serde_json::json!({ "idle_shutdown_ms": idle_shutdown_ms }),
+                        );
+                        info!(path=%path.display(), idle_shutdown_ms, "yggterm daemon idle shutdown");
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(DAEMON_ACCEPT_POLL_MS));
+                }
+                Err(error) => return Err(error).context("accepting daemon client"),
             }
         }
         return Ok(());
@@ -1425,18 +1505,45 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
         ServerEndpoint::Tcp { host, port } => {
             let listener = std::net::TcpListener::bind((host.as_str(), *port))
                 .with_context(|| format!("binding server tcp endpoint {}:{}", host, port))?;
+            listener
+                .set_nonblocking(true)
+                .context("setting daemon tcp listener nonblocking")?;
             let host_kind = {
                 let runtime = runtime.lock().expect("daemon runtime lock poisoned");
                 runtime.support.kind.as_str().to_string()
             };
             info!(host=%host, port, host_kind=%host_kind, "yggterm server daemon listening");
             loop {
-                let (stream, _) = listener.accept().context("accepting daemon client")?;
-                let runtime = runtime.clone();
-                match handle_tcp_stream(stream, runtime) {
-                    Ok(true) => break,
-                    Ok(false) => {}
-                    Err(error) => warn!(error=%error, "daemon request failed"),
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let runtime = runtime.clone();
+                        let last_activity_ms = last_activity_ms.clone();
+                        match handle_tcp_stream(stream, runtime, last_activity_ms) {
+                            Ok(true) => break,
+                            Ok(false) => {}
+                            Err(error) => warn!(error=%error, "daemon request failed"),
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        if daemon_should_idle_shutdown(
+                            &home_dir,
+                            endpoint,
+                            last_activity_ms.as_ref(),
+                            idle_shutdown_ms,
+                        ) {
+                            append_trace_event(
+                                &home_dir,
+                                "daemon",
+                                "lifecycle",
+                                "idle_shutdown",
+                                serde_json::json!({ "idle_shutdown_ms": idle_shutdown_ms }),
+                            );
+                            info!(host=%host, port, idle_shutdown_ms, "yggterm daemon idle shutdown");
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(DAEMON_ACCEPT_POLL_MS));
+                    }
+                    Err(error) => return Err(error).context("accepting daemon client"),
                 }
             }
             Ok(())
@@ -1601,8 +1708,10 @@ fn read_request<R: std::io::Read>(reader: R) -> Result<ServerRequest> {
 fn handle_unix_stream(
     mut stream: std::os::unix::net::UnixStream,
     runtime: Arc<Mutex<DaemonRuntime>>,
+    last_activity_ms: Arc<AtomicU64>,
 ) -> Result<bool> {
     let request = read_request(stream.try_clone().context("cloning unix stream")?)?;
+    mark_daemon_activity(last_activity_ms.as_ref());
     let should_shutdown = matches!(request, ServerRequest::Shutdown);
     let response = match {
         let mut runtime = runtime.lock().expect("daemon runtime lock poisoned");
@@ -1620,8 +1729,10 @@ fn handle_unix_stream(
 fn handle_tcp_stream(
     mut stream: std::net::TcpStream,
     runtime: Arc<Mutex<DaemonRuntime>>,
+    last_activity_ms: Arc<AtomicU64>,
 ) -> Result<bool> {
     let request = read_request(stream.try_clone().context("cloning tcp stream")?)?;
+    mark_daemon_activity(last_activity_ms.as_ref());
     let should_shutdown = matches!(request, ServerRequest::Shutdown);
     let response = match {
         let mut runtime = runtime.lock().expect("daemon runtime lock poisoned");

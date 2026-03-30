@@ -4839,20 +4839,8 @@ fn process_is_alive(pid: u32) -> bool {
 
 fn preferred_app_control_pid(home: &Path) -> Option<u32> {
     let endpoint = default_endpoint(home);
-    let dir = client_instances_dir(home, &endpoint);
-    let entries = fs::read_dir(dir).ok()?;
     let mut newest: Option<ClientInstanceRecord> = None;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(bytes) = fs::read(&path) else {
-            continue;
-        };
-        let Ok(record) = serde_json::from_slice::<ClientInstanceRecord>(&bytes) else {
-            continue;
-        };
-        if !process_is_alive(record.pid) {
-            continue;
-        }
+    for record in active_client_instance_records(home, &endpoint).ok()? {
         if newest
             .as_ref()
             .is_none_or(|candidate| record.started_at_ms > candidate.started_at_ms)
@@ -4861,6 +4849,40 @@ fn preferred_app_control_pid(home: &Path) -> Option<u32> {
         }
     }
     newest.map(|record| record.pid)
+}
+
+pub(crate) fn active_client_instance_records(
+    home: &Path,
+    endpoint: &ServerEndpoint,
+) -> anyhow::Result<Vec<ClientInstanceRecord>> {
+    let dir = client_instances_dir(home, endpoint);
+    let entries = fs::read_dir(&dir).or_else(|error| {
+        if error.kind() == ErrorKind::NotFound {
+            Ok(fs::read_dir(home.join(".missing-client-instances-dir"))?)
+        } else {
+            Err(error)
+        }
+    });
+    let Ok(entries) = entries else {
+        return Ok(Vec::new());
+    };
+    let mut active = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_slice::<ClientInstanceRecord>(&bytes) else {
+            let _ = fs::remove_file(&path);
+            continue;
+        };
+        if process_is_alive(record.pid) {
+            active.push(record);
+        } else {
+            let _ = fs::remove_file(&path);
+        }
+    }
+    Ok(active)
 }
 
 fn capture_trace_screenshot(home: &std::path::Path) -> Option<std::path::PathBuf> {
