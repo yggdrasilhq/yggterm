@@ -264,6 +264,14 @@ def app_open(host: str, binary: str, session_path: str, view: str, timeout_ms: i
     )
 
 
+def app_expand(host: str, binary: str, row_path: str, expanded: bool, timeout_ms: int) -> dict:
+    action = "expand" if expanded else "collapse"
+    return run_json(
+        host,
+        f"{binary} server app {action} {json.dumps(row_path)} --timeout-ms {timeout_ms}",
+    )
+
+
 def app_drag(
     host: str,
     binary: str,
@@ -276,7 +284,7 @@ def app_drag(
     if row_path is not None:
         parts.append(json.dumps(row_path))
     if placement is not None:
-        parts.append(placement)
+        parts.append(f"--placement {placement}")
     parts.append(f"--timeout-ms {timeout_ms}")
     return run_json(host, " ".join(parts))
 
@@ -384,51 +392,26 @@ def choose_session_targets(
     rng: random.Random,
     count: int,
 ) -> list[dict]:
+    del inventory
     rows = rows_payload.get("rows") or []
-    rows_by_session_id = {
-        row.get("session_id"): row
-        for row in rows
-        if row.get("session_id") and row.get("full_path")
-    }
     candidates: list[dict] = []
     seen_paths: set[str] = set()
 
-    for item in inventory.get("stored_sessions", []):
-        session_path = canonical_session_path(item.get("path"))
-        if not session_path or session_path in seen_paths:
+    for row in rows:
+        row_kind = row.get("kind")
+        session_path = canonical_session_path(row.get("full_path"))
+        if row_kind not in {"Document", "Session"} or not session_path or session_path in seen_paths:
             continue
-        kind = item.get("kind")
-        if kind == "document":
+        if row_kind == "Document":
             view = "preview"
-        elif kind == "codex":
-            view = "terminal" if len(candidates) % 2 == 0 else "preview"
         else:
-            continue
+            view = "terminal"
         candidates.append(
             {
                 "full_path": session_path,
-                "label": item.get("title_hint") or session_path,
-                "kind": "Document" if kind == "document" else "Session",
+                "label": row.get("label") or session_path,
+                "kind": row_kind,
                 "view": view,
-            }
-        )
-        seen_paths.add(session_path)
-
-    for item in inventory.get("live_sessions", []):
-        row = rows_by_session_id.get(item.get("id"))
-        if row is None:
-            continue
-        session_path = row.get("full_path")
-        if not session_path or session_path in seen_paths:
-            continue
-        live_kind = (item.get("kind") or "").lower()
-        is_document = live_kind == "document"
-        candidates.append(
-            {
-                "full_path": session_path,
-                "label": item.get("title") or session_path,
-                "kind": "Document" if is_document else "Session",
-                "view": "preview" if is_document else "terminal",
             }
         )
         seen_paths.add(session_path)
@@ -440,8 +423,17 @@ def choose_session_targets(
 
 def choose_drag_rows(rows_payload: dict, rng: random.Random, count: int) -> list[tuple[dict, dict, str]]:
     rows = rows_payload.get("rows") or []
-    draggable = [row for row in rows if row.get("draggable") and row.get("full_path")]
-    drop_targets = [row for row in rows if row.get("drop_target_row") and row.get("full_path")]
+    def is_workspace_path(path: str | None) -> bool:
+        return bool(path) and path.startswith("/")
+
+    draggable = [
+        row for row in rows
+        if row.get("draggable") and is_workspace_path(row.get("full_path"))
+    ]
+    drop_targets = [
+        row for row in rows
+        if row.get("drop_target_row") and is_workspace_path(row.get("full_path"))
+    ]
     operations: list[tuple[dict, dict, str]] = []
     if not draggable or not drop_targets:
         return operations
@@ -460,7 +452,53 @@ def choose_drag_rows(rows_payload: dict, rng: random.Random, count: int) -> list
     return operations
 
 
-def open_trials(args: argparse.Namespace, inventory: dict, rows_payload: dict, out_dir: Path) -> list[dict]:
+def expand_all_groups(host: str, binary: str, timeout_ms: int, max_passes: int = 8) -> dict:
+    last = app_rows(host, binary, timeout_ms)
+    for _ in range(max_passes):
+        rows = last.get("rows") or []
+        collapsed = [
+            row for row in rows
+            if row.get("kind") == "Group" and not row.get("expanded") and row.get("full_path")
+        ]
+        if not collapsed:
+            return last
+        for row in collapsed:
+            app_expand(host, binary, row["full_path"], True, timeout_ms)
+        time.sleep(0.15)
+        last = app_rows(host, binary, timeout_ms)
+    return last
+
+
+def wait_for_openable_rows(
+    args: argparse.Namespace,
+    inventory: dict,
+) -> dict:
+    target_count = min(
+        args.count,
+        (len(inventory.get("stored_sessions") or []) + len(inventory.get("live_sessions") or [])),
+    )
+
+    def _probe() -> dict:
+        rows_payload = expand_all_groups(args.host, args.bin, args.timeout_ms)
+        openable = choose_session_targets(inventory, rows_payload, random.Random(args.seed), args.count)
+        if len(openable) < target_count:
+            raise ReadinessPending(
+                f"only {len(openable)} openable rows visible",
+                {"rows_payload": rows_payload, "openable_count": len(openable)},
+            )
+        return rows_payload
+
+    _, rows_payload = wait_until("openable rows", 12.0, 0.25, _probe)
+    return rows_payload
+
+
+def open_trials(
+    args: argparse.Namespace,
+    inventory: dict,
+    rows_payload: dict,
+    out_dir: Path,
+    baseline_notifications_count: int,
+) -> list[dict]:
     rng = random.Random(args.seed)
     chosen_rows = choose_session_targets(inventory, rows_payload, rng, args.count)
     results: list[dict] = []
@@ -486,7 +524,7 @@ def open_trials(args: argparse.Namespace, inventory: dict, rows_payload: dict, o
                 ),
             )
             state_dump = write_state_dump(out_dir, f"open-{index:02d}", state)
-            anomaly = detect_anomaly(state, args.ready_budget)
+            anomaly = detect_anomaly(state, baseline_notifications_count)
             results.append(
                 {
                     "path": session_path,
@@ -546,11 +584,16 @@ def open_trials(args: argparse.Namespace, inventory: dict, rows_payload: dict, o
     return results
 
 
-def drag_trials(args: argparse.Namespace, rows_payload: dict, out_dir: Path) -> list[dict]:
+def drag_trials(
+    args: argparse.Namespace,
+    rows_payload: dict,
+    out_dir: Path,
+    baseline_notifications_count: int,
+) -> list[dict]:
     rng = random.Random(args.seed + 2300)
-    operations = choose_drag_rows(rows_payload, rng, args.drag_count)
     results: list[dict] = []
     if not args.apply_drag:
+        operations = choose_drag_rows(rows_payload, rng, args.drag_count)
         for source, target, placement in operations:
             results.append(
                 {
@@ -561,11 +604,22 @@ def drag_trials(args: argparse.Namespace, rows_payload: dict, out_dir: Path) -> 
                 }
             )
         return results
-    for index, (source, target, placement) in enumerate(operations):
+    for index in range(args.drag_count):
+        current_rows_payload = expand_all_groups(args.host, args.bin, args.timeout_ms)
+        operations = choose_drag_rows(current_rows_payload, rng, 1)
+        if not operations:
+            break
+        source, target, placement = operations[0]
         failure_artifact = None
         try:
-            app_drag(args.host, args.bin, "begin", args.timeout_ms, row_path=source["full_path"])
-            app_drag(
+            begin_response = app_drag(
+                args.host,
+                args.bin,
+                "begin",
+                args.timeout_ms,
+                row_path=source["full_path"],
+            )
+            hover_response = app_drag(
                 args.host,
                 args.bin,
                 "hover",
@@ -573,16 +627,33 @@ def drag_trials(args: argparse.Namespace, rows_payload: dict, out_dir: Path) -> 
                 row_path=target["full_path"],
                 placement=placement,
             )
-            app_drag(args.host, args.bin, "drop", args.timeout_ms)
+            drop_response = app_drag(args.host, args.bin, "drop", args.timeout_ms)
             state = app_state(args.host, args.bin, args.timeout_ms)
             state_dump = write_state_dump(out_dir, f"drag-{index:02d}", state)
-            dom = state.get("dom") or {}
             drag_state = state.get("shell") or {}
+            begin_data = begin_response.get("data") or {}
+            hover_data = hover_response.get("data") or {}
+            drop_data = drop_response.get("data") or {}
             anomaly = None
+            if not begin_data.get("accepted"):
+                anomaly = "drag begin not accepted"
+            elif not hover_data.get("accepted"):
+                anomaly = "drag hover target missing during drag cycle"
+            elif not drop_data.get("accepted"):
+                anomaly = "drag drop not accepted"
             if drag_state.get("drag_paths") or drag_state.get("drag_hover_target"):
                 anomaly = "drag state not cleared after drop"
-            if dom.get("drop_zone_count", 0) <= 0:
-                anomaly = anomaly or "drop zones missing during drag cycle"
+            new_notifications = max(
+                0,
+                (drag_state.get("notifications_count") or 0) - baseline_notifications_count,
+            )
+            if anomaly is None and new_notifications > 0:
+                tones = [
+                    notification.get("tone")
+                    for notification in (drag_state.get("notifications") or [])[-new_notifications:]
+                ]
+                if any(tone != "Success" for tone in tones):
+                    anomaly = f"drag emitted non-success notifications ({new_notifications})"
             results.append(
                 {
                     "source": source["full_path"],
@@ -591,6 +662,9 @@ def drag_trials(args: argparse.Namespace, rows_payload: dict, out_dir: Path) -> 
                     "planned_only": False,
                     "anomaly": anomaly,
                     "notifications_count": drag_state.get("notifications_count"),
+                    "begin_response": begin_response,
+                    "hover_response": hover_response,
+                    "drop_response": drop_response,
                     "state_dump": state_dump,
                 }
             )
@@ -620,14 +694,14 @@ def drag_trials(args: argparse.Namespace, rows_payload: dict, out_dir: Path) -> 
     return results
 
 
-def detect_anomaly(state: dict, ready_budget: float) -> str | None:
+def detect_anomaly(state: dict, baseline_notifications_count: int) -> str | None:
     shell = state.get("shell") or {}
     remote = state.get("remote") or {}
     notifications = shell.get("notifications_count") or 0
     machine_refresh = remote.get("machine_refresh_requests") or 0
     requests = len(state.get("active_surface_requests") or [])
-    if notifications > 0:
-        return f"notification cascade ({notifications})"
+    if notifications > baseline_notifications_count:
+        return f"notification cascade (+{notifications - baseline_notifications_count})"
     if machine_refresh > 0:
         return f"background machine refresh active ({machine_refresh})"
     if requests > 1:
@@ -668,11 +742,12 @@ def main() -> int:
 
     baseline_state = wait_for_app_state(args.host, args.bin, args.timeout_ms)
     baseline_dump = write_state_dump(out_dir, "baseline", baseline_state)
+    baseline_notifications_count = ((baseline_state.get("shell") or {}).get("notifications_count")) or 0
     inventory = server_inventory(args.host)
-    rows_payload = app_rows(args.host, args.bin, args.timeout_ms)
-    opens = open_trials(args, inventory, rows_payload, out_dir)
-    drag_rows_payload = app_rows(args.host, args.bin, args.timeout_ms)
-    drags = drag_trials(args, drag_rows_payload, out_dir)
+    rows_payload = wait_for_openable_rows(args, inventory)
+    opens = open_trials(args, inventory, rows_payload, out_dir, baseline_notifications_count)
+    drag_rows_payload = expand_all_groups(args.host, args.bin, args.timeout_ms)
+    drags = drag_trials(args, drag_rows_payload, out_dir, baseline_notifications_count)
     final_state = wait_for_app_state(args.host, args.bin, args.timeout_ms)
     final_dump = write_state_dump(out_dir, "final", final_state)
     window_spawn_event = launch_event or latest_window_spawn_event(args.host)

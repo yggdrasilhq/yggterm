@@ -4,7 +4,7 @@ use yggterm_server::{
     AppControlViewMode, cleanup_legacy_daemons, default_endpoint, detect_ghostty_host, ping,
     run_app_control_describe_rows, run_app_control_describe_state, run_app_control_drag,
     run_app_control_dump_state, run_app_control_focus_window, run_app_control_open_path,
-    run_app_control_set_fullscreen, run_attach, run_daemon, run_remote_ensure_managed_cli,
+    run_app_control_set_fullscreen, run_app_control_set_row_expanded, run_attach, run_daemon, run_remote_ensure_managed_cli,
     run_remote_generation_context, run_remote_preview, run_remote_protocol_version,
     run_remote_refresh_managed_cli, run_remote_resume_codex, run_remote_scan,
     run_remote_stage_clipboard_png, run_remote_upsert_generated_copy, run_screenshot_capture,
@@ -191,6 +191,15 @@ fn main() -> Result<()> {
                 run_app_control_dump_state(output_path, timeout_ms)
             }
             "rows" => run_app_control_describe_rows(timeout_ms),
+            "expand" | "collapse" => {
+                let row_path = args
+                    .iter()
+                    .skip(3)
+                    .find(|value| !value.starts_with("--"))
+                    .map(String::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("missing row path for server app expand/collapse"))?;
+                run_app_control_set_row_expanded(row_path, args[2] == "expand", timeout_ms)
+            }
             "focus" => run_app_control_focus_window(timeout_ms),
             "fullscreen" => {
                 let action = args
