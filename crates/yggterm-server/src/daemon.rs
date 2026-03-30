@@ -1,6 +1,7 @@
 use crate::{
-    GhosttyHostSupport, PersistedDaemonState, ServerUiSnapshot, SessionKind, TerminalManager,
-    WorkspaceViewMode, YggtermServer, terminate_remote_codex_session,
+    GhosttyHostSupport, PersistedDaemonState, RemoteMachineSnapshot, ServerUiSnapshot,
+    SessionKind, SshConnectTarget, TerminalManager, WorkspaceViewMode, YggtermServer,
+    fetch_remote_generation_context, persist_remote_generated_copy, terminate_remote_codex_session,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -10,9 +11,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
-use yggterm_core::{PerfSpan, SessionStore, UiTheme, append_trace_event};
+use yggterm_core::{
+    AppSettings, PerfSpan, SessionNode, SessionNodeKind, SessionStore, UiTheme, append_trace_event,
+    looks_like_generated_fallback_title,
+};
+use time::OffsetDateTime;
 
 pub const SERVER_PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
+const BACKGROUND_COPY_CHORE_MS: u64 = 45_000;
+const BACKGROUND_COPY_BUDGET_PER_TICK: usize = 12;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerEndpoint {
@@ -61,6 +68,7 @@ pub enum ServerRequest {
         session_id: Option<String>,
         cwd: Option<String>,
         title_hint: Option<String>,
+        view_mode: Option<WorkspaceViewMode>,
     },
     ConnectSsh {
         target_ix: usize,
@@ -80,6 +88,7 @@ pub enum ServerRequest {
         session_id: String,
         cwd: Option<String>,
         title_hint: Option<String>,
+        view_mode: Option<WorkspaceViewMode>,
     },
     RefreshRemoteMachine {
         machine_key: String,
@@ -108,6 +117,7 @@ pub enum ServerRequest {
     },
     FocusLive {
         key: String,
+        view_mode: Option<WorkspaceViewMode>,
     },
     SetViewMode {
         mode: WorkspaceViewMode,
@@ -174,6 +184,26 @@ struct DaemonRuntime {
     restored_stored_sessions: usize,
     restored_live_sessions: usize,
     restored_remote_machines: usize,
+}
+
+#[derive(Debug, Clone)]
+struct BackgroundCopyCandidate {
+    session_path: String,
+    session_id: String,
+    cwd: String,
+    title: String,
+    source_updated_at: Option<OffsetDateTime>,
+    remote_machine: Option<RemoteMachineSnapshot>,
+    remote_context: Option<String>,
+    storage_path: Option<String>,
+    cached_summary: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct BackgroundCopyUpdate {
+    session_path: String,
+    title: Option<String>,
+    summary: Option<String>,
 }
 
 impl DaemonRuntime {
@@ -307,6 +337,7 @@ impl DaemonRuntime {
                 session_id,
                 cwd,
                 title_hint,
+                view_mode,
             } => {
                 let document = if session_kind == SessionKind::Document {
                     self.store.load_document(&path)?
@@ -321,7 +352,15 @@ impl DaemonRuntime {
                     title_hint.as_deref(),
                     document.as_ref(),
                 );
-                self.server.set_view_mode(WorkspaceViewMode::Rendered);
+                match view_mode.unwrap_or(WorkspaceViewMode::Rendered) {
+                    WorkspaceViewMode::Rendered => {
+                        self.server.set_view_mode(WorkspaceViewMode::Rendered);
+                    }
+                    WorkspaceViewMode::Terminal => {
+                        self.server.set_view_mode(WorkspaceViewMode::Terminal);
+                        self.ensure_terminal_for_active()?;
+                    }
+                }
                 self.persist()?;
                 self.snapshot_response(Some(format!("opened {path}")))
             }
@@ -393,6 +432,7 @@ impl DaemonRuntime {
                 session_id,
                 cwd,
                 title_hint,
+                view_mode,
             } => {
                 let key = self.server.open_remote_scanned_session(
                     &machine_key,
@@ -400,6 +440,12 @@ impl DaemonRuntime {
                     cwd.as_deref(),
                     title_hint.as_deref(),
                 )?;
+                if let Some(mode) = view_mode {
+                    self.server.set_view_mode(mode);
+                    if mode == WorkspaceViewMode::Terminal {
+                        self.ensure_terminal_for_active()?;
+                    }
+                }
                 self.persist()?;
                 self.snapshot_response(Some(format!("opened {key}")))
             }
@@ -489,8 +535,14 @@ impl DaemonRuntime {
                 self.persist()?;
                 self.snapshot_response(Some(format!("started {key}")))
             }
-            ServerRequest::FocusLive { key } => {
+            ServerRequest::FocusLive { key, view_mode } => {
                 self.server.focus_live_session(&key);
+                if let Some(mode) = view_mode {
+                    self.server.set_view_mode(mode);
+                    if mode == WorkspaceViewMode::Terminal {
+                        self.ensure_terminal_for_active()?;
+                    }
+                }
                 self.persist()?;
                 self.snapshot_response(Some(format!("focused {key}")))
             }
@@ -608,6 +660,257 @@ impl DaemonRuntime {
     }
 }
 
+fn source_updated_at_for_path(path: &Path) -> Option<OffsetDateTime> {
+    fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|dur| OffsetDateTime::from_unix_timestamp(dur.as_secs() as i64).ok())
+}
+
+fn source_updated_at_for_remote_epoch(epoch: i64) -> Option<OffsetDateTime> {
+    (epoch > 0)
+        .then(|| OffsetDateTime::from_unix_timestamp(epoch).ok())
+        .flatten()
+}
+
+fn background_machine_key(raw_machine_key: &str) -> String {
+    match raw_machine_key.trim().to_ascii_lowercase().as_str() {
+        "juju" | "jujo" => "jojo".to_string(),
+        value => value
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() {
+                    ch.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>()
+            .trim_matches('-')
+            .to_string(),
+    }
+}
+
+fn collect_local_copy_candidates(node: &SessionNode, out: &mut Vec<BackgroundCopyCandidate>) {
+    if node.kind == SessionNodeKind::CodexSession {
+        if let (Some(session_id), Some(cwd)) = (node.session_id.as_ref(), node.cwd.as_ref()) {
+            out.push(BackgroundCopyCandidate {
+                session_path: node.path.to_string_lossy().to_string(),
+                session_id: session_id.clone(),
+                cwd: cwd.clone(),
+                title: node.title.clone().unwrap_or_else(|| node.name.clone()),
+                source_updated_at: source_updated_at_for_path(&node.path),
+                remote_machine: None,
+                remote_context: None,
+                storage_path: None,
+                cached_summary: None,
+            });
+        }
+    }
+    for child in &node.children {
+        collect_local_copy_candidates(child, out);
+    }
+}
+
+fn collect_remote_copy_candidates(
+    remote_machines: &[RemoteMachineSnapshot],
+) -> Vec<BackgroundCopyCandidate> {
+    let mut out = Vec::new();
+    for machine in remote_machines {
+        for session in &machine.sessions {
+            out.push(BackgroundCopyCandidate {
+                session_path: session.session_path.clone(),
+                session_id: session.session_id.clone(),
+                cwd: session.cwd.clone(),
+                title: session.title_hint.clone(),
+                source_updated_at: source_updated_at_for_remote_epoch(session.modified_epoch),
+                remote_machine: Some(machine.clone()),
+                remote_context: (!session.recent_context.trim().is_empty())
+                    .then(|| session.recent_context.clone()),
+                storage_path: (!session.storage_path.trim().is_empty())
+                    .then(|| session.storage_path.clone()),
+                cached_summary: session.cached_summary.clone(),
+            });
+        }
+    }
+    out
+}
+
+fn copy_target_context(
+    candidate: &BackgroundCopyCandidate,
+    ssh_targets: &[SshConnectTarget],
+) -> Result<Option<String>> {
+    if let Some(context) = candidate.remote_context.as_ref()
+        && !context.trim().is_empty()
+    {
+        return Ok(Some(context.clone()));
+    }
+    let (Some(machine), Some(storage_path)) = (
+        candidate.remote_machine.as_ref(),
+        candidate.storage_path.as_deref(),
+    ) else {
+        return Ok(None);
+    };
+    let Some(target) = ssh_targets
+        .iter()
+        .find(|target| background_machine_key(&target.label) == machine.machine_key)
+    else {
+        return Ok(None);
+    };
+    fetch_remote_generation_context(target, storage_path).map(Some)
+}
+
+fn build_background_copy_updates(
+    store: &SessionStore,
+    settings: &AppSettings,
+    local_root: &SessionNode,
+    remote_machines: &[RemoteMachineSnapshot],
+    ssh_targets: &[SshConnectTarget],
+) -> Result<Vec<BackgroundCopyUpdate>> {
+    let mut candidates = Vec::new();
+    collect_local_copy_candidates(local_root, &mut candidates);
+    candidates.extend(collect_remote_copy_candidates(remote_machines));
+
+    let mut updates = Vec::new();
+    for candidate in candidates.into_iter().take(BACKGROUND_COPY_BUDGET_PER_TICK) {
+        let stored_title = store.resolve_title_for_session_id(&candidate.session_id).ok().flatten();
+        let title_missing = looks_like_generated_fallback_title(&candidate.title)
+            && stored_title
+                .as_deref()
+                .is_none_or(looks_like_generated_fallback_title);
+        let stored_summary = store
+            .resolve_summary_for_session_id(&candidate.session_id)
+            .ok()
+            .flatten();
+        let summary_needs_refresh = candidate
+            .source_updated_at
+            .and_then(|updated_at| {
+                store
+                    .summary_needs_refresh_for_session_id(&candidate.session_id, updated_at)
+                    .ok()
+            })
+            .unwrap_or(stored_summary.is_none());
+        let summary_missing = summary_needs_refresh
+            && candidate
+                .cached_summary
+                .as_deref()
+                .is_none_or(|summary| summary.trim().is_empty());
+        if !title_missing && !summary_missing {
+            continue;
+        }
+
+        let (title, summary) = if candidate.remote_machine.is_some() {
+            let Some(context) = copy_target_context(&candidate, ssh_targets)? else {
+                continue;
+            };
+            let title = if title_missing {
+                store.generate_title_for_context(
+                    settings,
+                    &candidate.session_id,
+                    &candidate.cwd,
+                    &context,
+                    false,
+                )?
+            } else {
+                None
+            };
+            let summary = if summary_missing {
+                store.generate_summary_for_context(
+                    settings,
+                    &candidate.session_id,
+                    &candidate.cwd,
+                    &context,
+                    false,
+                )?
+            } else {
+                None
+            };
+            if let Some(machine) = candidate.remote_machine.as_ref() {
+                if title.is_some() || summary.is_some() {
+                    persist_remote_generated_copy(
+                        machine,
+                        &candidate.session_id,
+                        &candidate.cwd,
+                        title.as_deref(),
+                        None,
+                        summary.as_deref(),
+                        &settings.interface_llm_model,
+                    )?;
+                }
+            }
+            (title, summary)
+        } else {
+            let title = if title_missing {
+                store.generate_title_for_session_path(settings, &candidate.session_path, false)?
+            } else {
+                None
+            };
+            let summary = if summary_missing {
+                store.generate_summary_for_session_path(settings, &candidate.session_path, false)?
+            } else {
+                None
+            };
+            (title, summary)
+        };
+
+        if title.is_some() || summary.is_some() {
+            updates.push(BackgroundCopyUpdate {
+                session_path: candidate.session_path,
+                title,
+                summary,
+            });
+        }
+    }
+    Ok(updates)
+}
+
+fn run_background_copy_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<()> {
+    let (store, settings, local_root, remote_machines, ssh_targets, perf_home) = {
+        let runtime = runtime.lock().expect("daemon runtime lock poisoned");
+        let settings = runtime.store.load_settings().unwrap_or_default();
+        let local_root = runtime.store.load_codex_tree(&settings)?;
+        (
+            runtime.store.clone(),
+            settings,
+            local_root,
+            runtime.server.remote_machines().to_vec(),
+            runtime.server.ssh_targets().to_vec(),
+            runtime.store.home_dir().to_path_buf(),
+        )
+    };
+    let perf = PerfSpan::start(&perf_home, "daemon", "background_copy_chore");
+    let updates =
+        build_background_copy_updates(&store, &settings, &local_root, &remote_machines, &ssh_targets)?;
+    perf.finish(serde_json::json!({
+        "updates": updates.len(),
+        "remote_machines": remote_machines.len(),
+    }));
+
+    if updates.is_empty() {
+        return Ok(());
+    }
+
+    let mut runtime = runtime.lock().expect("daemon runtime lock poisoned");
+    for update in &updates {
+        if let Some(title) = update.title.as_deref() {
+            runtime.server.set_session_title_hint(&update.session_path, title);
+        }
+        if let Some(summary) = update.summary.as_deref() {
+            runtime.server.set_session_summary_hint(&update.session_path, summary);
+        }
+    }
+    runtime.persist()?;
+    append_trace_event(
+        runtime.store.home_dir(),
+        "daemon",
+        "background_copy",
+        "tick",
+        serde_json::json!({ "updates": updates.len() }),
+    );
+    Ok(())
+}
+
 fn server_request_name(request: &ServerRequest) -> &'static str {
     match request {
         ServerRequest::Ping => "ping",
@@ -716,6 +1019,18 @@ pub fn open_stored_session(
     cwd: Option<&str>,
     title_hint: Option<&str>,
 ) -> Result<(ServerUiSnapshot, Option<String>)> {
+    open_stored_session_with_view(endpoint, kind, path, session_id, cwd, title_hint, None)
+}
+
+pub fn open_stored_session_with_view(
+    endpoint: &ServerEndpoint,
+    kind: SessionKind,
+    path: &str,
+    session_id: Option<&str>,
+    cwd: Option<&str>,
+    title_hint: Option<&str>,
+    view_mode: Option<WorkspaceViewMode>,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
     expect_snapshot(send_request(
         endpoint,
         &ServerRequest::OpenStoredSession {
@@ -724,6 +1039,7 @@ pub fn open_stored_session(
             session_id: session_id.map(ToOwned::to_owned),
             cwd: cwd.map(ToOwned::to_owned),
             title_hint: title_hint.map(ToOwned::to_owned),
+            view_mode,
         },
     )?)
 }
@@ -759,6 +1075,17 @@ pub fn open_remote_session(
     cwd: Option<&str>,
     title_hint: Option<&str>,
 ) -> Result<(ServerUiSnapshot, Option<String>)> {
+    open_remote_session_with_view(endpoint, machine_key, session_id, cwd, title_hint, None)
+}
+
+pub fn open_remote_session_with_view(
+    endpoint: &ServerEndpoint,
+    machine_key: &str,
+    session_id: &str,
+    cwd: Option<&str>,
+    title_hint: Option<&str>,
+    view_mode: Option<WorkspaceViewMode>,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
     expect_snapshot(send_request(
         endpoint,
         &ServerRequest::OpenRemoteSession {
@@ -766,6 +1093,7 @@ pub fn open_remote_session(
             session_id: session_id.to_string(),
             cwd: cwd.map(ToOwned::to_owned),
             title_hint: title_hint.map(ToOwned::to_owned),
+            view_mode,
         },
     )?)
 }
@@ -871,10 +1199,19 @@ pub fn focus_live(
     endpoint: &ServerEndpoint,
     key: &str,
 ) -> Result<(ServerUiSnapshot, Option<String>)> {
+    focus_live_with_view(endpoint, key, None)
+}
+
+pub fn focus_live_with_view(
+    endpoint: &ServerEndpoint,
+    key: &str,
+    view_mode: Option<WorkspaceViewMode>,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
     expect_snapshot(send_request(
         endpoint,
         &ServerRequest::FocusLive {
             key: key.to_string(),
+            view_mode,
         },
     )?)
 }
@@ -1018,6 +1355,15 @@ pub fn cleanup_legacy_daemons(endpoint: &ServerEndpoint, current_exe: &Path) -> 
 
 pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Result<()> {
     let runtime = Arc::new(Mutex::new(DaemonRuntime::load(runtime)?));
+    {
+        let runtime = runtime.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(BACKGROUND_COPY_CHORE_MS));
+            if let Err(error) = run_background_copy_chore(&runtime) {
+                warn!(error=%error, "daemon background copy chore failed");
+            }
+        });
+    }
 
     #[cfg(unix)]
     if let ServerEndpoint::UnixSocket(path) = endpoint {

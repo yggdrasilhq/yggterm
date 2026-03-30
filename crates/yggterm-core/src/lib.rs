@@ -794,6 +794,7 @@ struct CodexSessionSummary {
     session_id: String,
     cwd: String,
     generated_title: Option<String>,
+    modified_epoch_ms: u128,
 }
 
 #[derive(Debug, Clone)]
@@ -841,7 +842,11 @@ fn build_codex_browser_tree(
 
     let mut buckets = Vec::new();
     for (cwd, mut project_sessions) in projects {
-        project_sessions.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        project_sessions.sort_by(|a, b| {
+            b.modified_epoch_ms
+                .cmp(&a.modified_epoch_ms)
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
         buckets.push(CodexProjectBucket {
             cwd,
             sessions: project_sessions,
@@ -916,6 +921,12 @@ fn read_codex_session_summary(
         }),
         session_id: identity.session_id,
         cwd: identity.cwd,
+        modified_epoch_ms: fs::metadata(path)
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default(),
     }))
 }
 

@@ -79,8 +79,9 @@ use yggterm_server::{
     WorkspaceViewMode,
     YGG_LOADING_NOTIFICATION_AFTER_MS, YggRequestMeta, YggSurface, YggTarget, YggtermServer,
     apply_remote_preview_payload_for_path, cleanup_legacy_daemons, complete_app_control_request,
-    connect_ssh_custom, fetch_remote_generation_context, fetch_remote_preview_payload, focus_live,
-    open_remote_session, open_stored_session, persist_remote_generated_copy, ping,
+    connect_ssh_custom, fetch_remote_generation_context, fetch_remote_preview_payload,
+    focus_live_with_view, open_remote_session_with_view,
+    open_stored_session, open_stored_session_with_view, persist_remote_generated_copy, ping,
     refresh_managed_cli, refresh_remote_machine, remove_ssh_target, request_terminal_launch,
     set_all_preview_blocks_folded, set_view_mode as daemon_set_view_mode,
     shutdown as daemon_shutdown, snapshot as daemon_snapshot, stage_remote_clipboard_png,
@@ -408,7 +409,6 @@ struct CopyGenerationTarget {
 #[derive(Clone)]
 enum BackgroundCopyJob {
     Title(CopyGenerationTarget),
-    Precis(CopyGenerationTarget),
     Summary(CopyGenerationTarget),
 }
 
@@ -2634,15 +2634,17 @@ fn spawn_title_generation_for_target(
     } else {
         format!("Caching a title for {session_title}.")
     };
-    safe_upsert_job_notification(
-        state,
-        job_key.clone(),
-        NotificationTone::Info,
-        job_title,
-        job_message,
-        None,
-        announce,
-    );
+    if announce {
+        safe_upsert_job_notification(
+            state,
+            job_key.clone(),
+            NotificationTone::Info,
+            job_title,
+            job_message,
+            None,
+            true,
+        );
+    }
     if announce {
         state.with_mut(|shell| {
             shell.last_action = if force {
@@ -2740,13 +2742,17 @@ fn spawn_title_generation_for_target(
                     current_millis() + BACKGROUND_COPY_RETRY_MS,
                 );
                 warn!(session_path=%target.session_path, "title generation produced no usable title");
-                shell.finish_job_notification(
-                    &job_key,
-                    NotificationTone::Warning,
-                    "No Title Generated",
-                    "The model did not return a usable short title for this session.",
-                    true,
-                );
+                if announce {
+                    shell.finish_job_notification(
+                        &job_key,
+                        NotificationTone::Warning,
+                        "No Title Generated",
+                        "The model did not return a usable short title for this session.",
+                        true,
+                    );
+                } else {
+                    shell.clear_job_notification(&job_key);
+                }
             }
             Ok(Err(error)) => {
                 shell.title_requests_in_flight.remove(&session_path);
@@ -2807,6 +2813,7 @@ fn spawn_title_generation_for_target(
     });
 }
 
+#[allow(dead_code)]
 fn spawn_precis_generation(state: Signal<ShellState>, session: ManagedSessionView, force: bool) {
     let Some(target) = copy_generation_target_for_session(&state.read().server, &session) else {
         return;
@@ -2814,6 +2821,7 @@ fn spawn_precis_generation(state: Signal<ShellState>, session: ManagedSessionVie
     spawn_precis_generation_for_target(state, target, force, force, true);
 }
 
+#[allow(dead_code)]
 fn spawn_precis_generation_for_target(
     mut state: Signal<ShellState>,
     target: CopyGenerationTarget,
@@ -2848,23 +2856,25 @@ fn spawn_precis_generation_for_target(
         return;
     }
     let job_key = format!("copy:precis:{session_path}");
-    safe_upsert_job_notification(
-        state,
-        job_key.clone(),
-        NotificationTone::Info,
-        if announce || priority {
-            "Generating Precis"
-        } else {
-            "Background Cache"
-        },
-        if announce || priority {
-            format!("Generating a short precis for {session_title}.")
-        } else {
-            format!("Caching a precis for {session_title}.")
-        },
-        None,
-        announce,
-    );
+    if announce {
+        safe_upsert_job_notification(
+            state,
+            job_key.clone(),
+            NotificationTone::Info,
+            if priority {
+                "Generating Precis"
+            } else {
+                "Background Cache"
+            },
+            if priority {
+                format!("Generating a short precis for {session_title}.")
+            } else {
+                format!("Caching a precis for {session_title}.")
+            },
+            None,
+            true,
+        );
+    }
     spawn(async move {
         let perf = PerfSpan::start(&perf_home, "copy_generation", "precis");
         let target_for_task = target.clone();
@@ -2954,13 +2964,17 @@ fn spawn_precis_generation_for_target(
                         background_copy_retry_key("precis", &session_path),
                         current_millis() + BACKGROUND_COPY_RETRY_MS,
                     );
-                    shell.finish_job_notification(
-                        &job_key,
-                        NotificationTone::Warning,
-                        "No Precis Generated",
-                        "The model did not return a usable precis.",
-                        true,
-                    );
+                    if announce {
+                        shell.finish_job_notification(
+                            &job_key,
+                            NotificationTone::Warning,
+                            "No Precis Generated",
+                            "The model did not return a usable precis.",
+                            true,
+                        );
+                    } else {
+                        shell.clear_job_notification(&job_key);
+                    }
                 }
                 Ok(Err(error)) => {
                     if !announce && !force {
@@ -3065,23 +3079,25 @@ fn spawn_summary_generation_for_target(
         return;
     }
     let job_key = format!("copy:summary:{session_path}");
-    safe_upsert_job_notification(
-        state,
-        job_key.clone(),
-        NotificationTone::Info,
-        if announce || priority {
-            "Generating Summary"
-        } else {
-            "Background Cache"
-        },
-        if announce || priority {
-            format!("Generating a summary for {session_title}.")
-        } else {
-            format!("Caching a summary for {session_title}.")
-        },
-        None,
-        announce,
-    );
+    if announce {
+        safe_upsert_job_notification(
+            state,
+            job_key.clone(),
+            NotificationTone::Info,
+            if priority {
+                "Generating Summary"
+            } else {
+                "Background Cache"
+            },
+            if priority {
+                format!("Generating a summary for {session_title}.")
+            } else {
+                format!("Caching a summary for {session_title}.")
+            },
+            None,
+            true,
+        );
+    }
     spawn(async move {
         let perf = PerfSpan::start(&perf_home, "copy_generation", "summary");
         let target_for_task = target.clone();
@@ -3175,13 +3191,17 @@ fn spawn_summary_generation_for_target(
                         background_copy_retry_key("summary", &session_path),
                         current_millis() + BACKGROUND_COPY_RETRY_MS,
                     );
-                    shell.finish_job_notification(
-                        &job_key,
-                        NotificationTone::Warning,
-                        "No Summary Generated",
-                        "The model did not return a usable summary.",
-                        true,
-                    );
+                    if announce {
+                        shell.finish_job_notification(
+                            &job_key,
+                            NotificationTone::Warning,
+                            "No Summary Generated",
+                            "The model did not return a usable summary.",
+                            true,
+                        );
+                    } else {
+                        shell.clear_job_notification(&job_key);
+                    }
                 }
                 Ok(Err(error)) => {
                     if !announce && !force {
@@ -4404,13 +4424,9 @@ fn spawn_focus_live_session_row(
     spawn(async move {
         maybe_debug_request_delay().await;
         let row_path = row.full_path.clone();
-        let outcome = task::spawn_blocking(move || {
-            let _ = focus_live(&endpoint, &row_path)?;
-            if mode == WorkspaceViewMode::Terminal {
-                request_terminal_launch(&endpoint)
-            } else {
-                daemon_set_view_mode(&endpoint, WorkspaceViewMode::Rendered)
-            }
+        let outcome = task::spawn_blocking(
+            move || -> Result<(ServerUiSnapshot, Option<String>)> {
+            focus_live_with_view(&endpoint, &row_path, Some(mode))
         })
         .await;
         let _ = safe_shell_mut(
@@ -4493,33 +4509,37 @@ fn spawn_open_session_row_with_mode(
     spawn(async move {
         maybe_debug_request_delay().await;
         let row_for_request = row.clone();
-        let outcome = task::spawn_blocking(move || {
-            let opened = if let Some((machine_key, session_id)) =
+        let outcome = task::spawn_blocking(
+            move || -> Result<(ServerUiSnapshot, Option<String>)> {
+            if let Some((machine_key, session_id)) =
                 parse_remote_scanned_session_path(&row_for_request.full_path)
             {
-                open_remote_session(
+                open_remote_session_with_view(
                     &endpoint,
                     machine_key,
                     session_id,
                     row_for_request.session_cwd.as_deref(),
                     Some(row_for_request.label.as_str()),
+                    Some(if prefer_terminal {
+                        WorkspaceViewMode::Terminal
+                    } else {
+                        WorkspaceViewMode::Rendered
+                    }),
                 )
             } else {
-                open_stored_session(
+                open_stored_session_with_view(
                     &endpoint,
                     session_kind_for_row(row_for_request.kind),
                     &row_for_request.full_path,
                     row_for_request.session_id.as_deref(),
                     row_for_request.session_cwd.as_deref(),
                     Some(row_for_request.label.as_str()),
+                    Some(if prefer_terminal {
+                        WorkspaceViewMode::Terminal
+                    } else {
+                        WorkspaceViewMode::Rendered
+                    }),
                 )
-            }?;
-            if prefer_terminal {
-                request_terminal_launch(&endpoint)
-            } else if row_for_request.full_path.starts_with("remote-session://") {
-                daemon_set_view_mode(&endpoint, WorkspaceViewMode::Rendered)
-            } else {
-                Ok(opened)
             }
         })
         .await;
@@ -5108,40 +5128,6 @@ fn background_copy_job_for_target(
             return Some(BackgroundCopyJob::Title(target.clone()));
         }
     }
-    let stored_precis = store
-        .resolve_precis_for_session_id(&target.session_id)
-        .ok()
-        .flatten();
-    let precis_needs_refresh = target
-        .source_updated_at
-        .and_then(|updated_at| {
-            store
-                .precis_needs_refresh_for_session_id(&target.session_id, updated_at)
-                .ok()
-        })
-        .unwrap_or(stored_precis.is_none());
-    let precis_missing = precis_needs_refresh
-        && target
-            .remote_machine
-            .as_ref()
-            .and_then(|machine| {
-                machine
-                    .sessions
-                    .iter()
-                    .find(|session| session.session_path == target.session_path)
-                    .and_then(|session| session.cached_precis.clone())
-            })
-            .is_none();
-    if precis_missing {
-        let retry_key = background_copy_retry_key("precis", &target.session_path);
-        if copy_retry_after_ms
-            .get(&retry_key)
-            .copied()
-            .is_none_or(|retry_after| retry_after <= now)
-        {
-            return Some(BackgroundCopyJob::Precis(target.clone()));
-        }
-    }
     let stored_summary = store
         .resolve_summary_for_session_id(&target.session_id)
         .ok()
@@ -5231,7 +5217,6 @@ fn maybe_spawn_background_copy_generation(mut state: Signal<ShellState>) {
             || shell.server.active_view_mode() == WorkspaceViewMode::Terminal
             || shell.server.active_session().is_some()
             || !shell.title_requests_in_flight.is_empty()
-            || !shell.precis_requests_in_flight.is_empty()
             || !shell.summary_requests_in_flight.is_empty()
             || shell.next_background_copy_scan_after_ms > now
         {
@@ -5262,15 +5247,6 @@ fn maybe_spawn_background_copy_generation(mut state: Signal<ShellState>) {
         return;
     };
     state.with_mut(|shell| shell.background_copy_scan_in_flight = true);
-    safe_upsert_job_notification(
-        state,
-        "background:copy_scan",
-        NotificationTone::Info,
-        "Background Cache",
-        "Scanning sessions for missing titles, precis, and summaries.",
-        None,
-        false,
-    );
     spawn(async move {
         let perf = PerfSpan::start(&perf_home, "background", "copy_scan");
         let outcome = task::spawn_blocking(move || {
@@ -5287,13 +5263,11 @@ fn maybe_spawn_background_copy_generation(mut state: Signal<ShellState>) {
         perf.finish(json!({
             "job": job.as_ref().map(|job| match job {
                 BackgroundCopyJob::Title(target) => format!("title:{}", target.session_path),
-                BackgroundCopyJob::Precis(target) => format!("precis:{}", target.session_path),
                 BackgroundCopyJob::Summary(target) => format!("summary:{}", target.session_path),
             }),
         }));
         state.with_mut(|shell| {
             shell.background_copy_scan_in_flight = false;
-            shell.clear_job_notification("background:copy_scan");
             shell.next_background_copy_scan_after_ms = if job.is_some() {
                 current_millis() + BACKGROUND_COPY_CONTINUE_MS
             } else {
@@ -5303,9 +5277,6 @@ fn maybe_spawn_background_copy_generation(mut state: Signal<ShellState>) {
         match job {
             Some(BackgroundCopyJob::Title(target)) => {
                 spawn_title_generation_for_target(state, target, false, false, false)
-            }
-            Some(BackgroundCopyJob::Precis(target)) => {
-                spawn_precis_generation_for_target(state, target, false, false, false)
             }
             Some(BackgroundCopyJob::Summary(target)) => {
                 spawn_summary_generation_for_target(state, target, false, false, false)
@@ -10180,12 +10151,11 @@ fn app() -> Element {
             last_preview_refresh_marker.set(None);
             return;
         };
-        let (has_precis, has_summary, has_good_title, precis_stale, summary_stale) = {
+        let (has_summary, has_good_title, summary_stale) = {
             let shell = state.read();
             let source_updated_at = source_updated_at_for_session(&shell.server, &session);
             let store = SessionStore::open_or_init().ok();
             (
-                resolved_session_precis(&shell, &session).is_some(),
                 resolved_session_summary(&shell, &session).is_some(),
                 resolved_session_title(&shell, &session)
                     .as_deref()
@@ -10194,23 +10164,14 @@ fn app() -> Element {
                     .and_then(|updated_at| {
                         store.as_ref().and_then(|store| {
                             store
-                                .precis_needs_refresh_for_session_id(&session.id, updated_at)
-                                .ok()
-                        })
-                    })
-                    .unwrap_or(false),
-                source_updated_at
-                    .and_then(|updated_at| {
-                        store.as_ref().and_then(|store| {
-                            store
                                 .summary_needs_refresh_for_session_id(&session.id, updated_at)
                                 .ok()
                         })
-                    })
+                })
                     .unwrap_or(false),
             )
         };
-        if !has_good_title || !has_precis || !has_summary || precis_stale || summary_stale {
+        if !has_good_title || !has_summary || summary_stale {
             spawn_active_session_copy_hydration(state, session.clone());
         }
         let generation_target = copy_generation_target_for_session(&state.read().server, &session);
@@ -10229,13 +10190,6 @@ fn app() -> Element {
                 || can_fetch_remote_generation_context)
         {
             queue_active_session_title_generation(state, false);
-        }
-        if (!has_precis || precis_stale)
-            && (!session.session_path.starts_with("remote-session://")
-                || has_generation_context
-                || can_fetch_remote_generation_context)
-        {
-            spawn_precis_generation(state, session.clone(), precis_stale);
         }
         if has_summary && !summary_stale {
             state.with_mut(|shell| shell.next_background_copy_scan_after_ms = current_millis());
