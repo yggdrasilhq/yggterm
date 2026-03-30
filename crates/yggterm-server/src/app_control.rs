@@ -15,6 +15,7 @@ const APP_CONTROL_RECORDINGS_DIR: &str = "recordings";
 #[serde(rename_all = "snake_case")]
 pub enum ScreenshotTarget {
     App,
+    PreviewViewport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,12 +47,18 @@ pub enum AppControlDragCommand {
     Clear,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AppControlCommand {
     CaptureScreenshot {
         target: ScreenshotTarget,
         output_path: String,
+    },
+    ScrollPreview {
+        #[serde(default)]
+        top_px: Option<f64>,
+        #[serde(default)]
+        ratio: Option<f64>,
     },
     CaptureScreenRecording {
         output_path: String,
@@ -96,6 +103,7 @@ impl AppControlCommand {
     pub fn name(&self) -> &'static str {
         match self {
             Self::CaptureScreenshot { .. } => "capture_screenshot",
+            Self::ScrollPreview { .. } => "scroll_preview",
             Self::CaptureScreenRecording { .. } => "capture_screen_recording",
             Self::SetFullscreen { .. } => "set_fullscreen",
             Self::Drag { .. } => "drag",

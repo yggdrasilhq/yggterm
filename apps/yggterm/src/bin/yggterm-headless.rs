@@ -5,7 +5,8 @@ use yggterm_server::{
     run_app_control_create_terminal,
     run_app_control_describe_rows, run_app_control_describe_state, run_app_control_drag,
     run_app_control_dump_state, run_app_control_focus_window, run_app_control_open_path,
-    run_app_control_remove_session, run_app_control_send_terminal_input,
+    run_app_control_remove_session, run_app_control_scroll_preview,
+    run_app_control_send_terminal_input,
     run_app_control_set_fullscreen, run_app_control_set_row_expanded, run_attach, run_daemon, run_remote_ensure_managed_cli,
     run_remote_generation_context, run_remote_preview, run_remote_protocol_version,
     run_remote_refresh_managed_cli, run_remote_resume_codex, run_remote_scan,
@@ -162,12 +163,22 @@ fn main() -> Result<()> {
             .unwrap_or(15_000);
         return match args[2].as_str() {
             "screenshot" => {
+                let target = args
+                    .windows(2)
+                    .find_map(|window| {
+                        if window[0] == "--target" {
+                            Some(window[1].as_str())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or("app");
                 let output_path = args
                     .iter()
                     .skip(3)
-                    .find(|value| !value.starts_with("--"))
+                    .find(|value| !value.starts_with("--") && *value != target)
                     .map(String::as_str);
-                run_screenshot_capture("app", output_path, timeout_ms)
+                run_screenshot_capture(target, output_path, timeout_ms)
             }
             "screenrecord" => {
                 let duration_secs = args
@@ -198,6 +209,29 @@ fn main() -> Result<()> {
                 run_app_control_dump_state(output_path, timeout_ms)
             }
             "rows" => run_app_control_describe_rows(timeout_ms),
+            "preview" => {
+                let action = args.get(3).map(String::as_str).unwrap_or("scroll");
+                match action {
+                    "scroll" => {
+                        let top_px = args.windows(2).find_map(|window| {
+                            if window[0] == "--top" {
+                                window[1].parse::<f64>().ok()
+                            } else {
+                                None
+                            }
+                        });
+                        let ratio = args.windows(2).find_map(|window| {
+                            if window[0] == "--ratio" {
+                                window[1].parse::<f64>().ok()
+                            } else {
+                                None
+                            }
+                        });
+                        run_app_control_scroll_preview(top_px, ratio, timeout_ms)
+                    }
+                    other => anyhow::bail!("unsupported app preview action: {other}"),
+                }
+            }
             "expand" | "collapse" => {
                 let row_path = args
                     .iter()
