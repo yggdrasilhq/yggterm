@@ -428,11 +428,12 @@ impl DaemonRuntime {
                 title_hint,
                 view_mode,
             } => {
-                let key = self.server.open_remote_scanned_session(
+                let key = self.server.open_remote_scanned_session_with_view(
                     &machine_key,
                     &session_id,
                     cwd.as_deref(),
                     title_hint.as_deref(),
+                    view_mode,
                 )?;
                 if let Some(mode) = view_mode {
                     self.server.set_view_mode(mode);
