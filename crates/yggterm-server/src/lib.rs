@@ -4761,12 +4761,13 @@ fn parse_app_control_drag_placement(value: &str) -> Option<AppControlDragPlaceme
 
 fn capture_embedded_app_screenshot(
     home: &std::path::Path,
+    target: ScreenshotTarget,
     output_path: Option<std::path::PathBuf>,
     timeout_ms: u64,
 ) -> anyhow::Result<AppControlResponse> {
     let request = enqueue_screenshot_request(
         home,
-        ScreenshotTarget::App,
+        target,
         output_path,
         preferred_app_control_pid(home),
     )?;
@@ -4953,7 +4954,7 @@ fn trace_bundle(lines: usize, include_screenshot: bool) -> anyhow::Result<serde_
         .ok()
         .and_then(|response| response.data);
     let screenshot_path = if include_screenshot {
-        capture_embedded_app_screenshot(&home, None, 10_000)
+        capture_embedded_app_screenshot(&home, ScreenshotTarget::App, None, 10_000)
             .ok()
             .and_then(|response| response.output_path)
             .or_else(|| capture_trace_screenshot(&home).map(|path| path.display().to_string()))
@@ -5012,6 +5013,13 @@ pub fn run_screenshot_capture(
     let response = match target {
         "app" => capture_embedded_app_screenshot(
             &home,
+            ScreenshotTarget::App,
+            output_path.map(std::path::PathBuf::from),
+            timeout_ms,
+        )?,
+        "preview" | "preview_viewport" => capture_embedded_app_screenshot(
+            &home,
+            ScreenshotTarget::PreviewViewport,
             output_path.map(std::path::PathBuf::from),
             timeout_ms,
         )?,
@@ -5037,6 +5045,21 @@ pub fn run_screenrecord_capture(
         )?,
         other => anyhow::bail!("unsupported screenrecord target: {other}"),
     };
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_scroll_preview(
+    top_px: Option<f64>,
+    ratio: Option<f64>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::ScrollPreview { top_px, ratio },
+        timeout_ms,
+    )?;
     write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
     Ok(())
 }

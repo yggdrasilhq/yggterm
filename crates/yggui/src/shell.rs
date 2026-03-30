@@ -121,6 +121,9 @@ const XTERM_CSS: &str = include_str!("../../../assets/xterm/xterm.css");
 const XTERM_JS: &str = include_str!("../../../assets/xterm/xterm.js");
 const XTERM_FIT_JS: &str = include_str!("../../../assets/xterm/addon-fit.js");
 const PREVIEW_BLOCK_WINDOW: usize = 24;
+const PREVIEW_VIRTUAL_OVERSCAN_FACTOR: f64 = 0.85;
+const PREVIEW_MIN_VIEWPORT_HEIGHT_PX: f64 = 680.0;
+const PREVIEW_MAX_OVERSCAN_PX: f64 = 1_200.0;
 const REMOTE_PREVIEW_SYNC_DEBOUNCE_MS: u64 = 2_500;
 static XTERM_ASSETS_BOOTSTRAPPED: OnceCell<()> = OnceCell::new();
 const TREE_LOADING_DOT_CSS: &str = "@keyframes yggterm-tree-loading-dot { 0%, 80%, 100% { opacity: 0.28; transform: translateY(0px); } 40% { opacity: 1; transform: translateY(-1px); } }";
@@ -563,6 +566,19 @@ struct PreviewRunEntry {
     block_ix: usize,
     block: SessionPreviewBlock,
     display_timestamp: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PreviewVirtualWindow {
+    start_index: usize,
+    end_index: usize,
+    top_spacer_px: f64,
+    bottom_spacer_px: f64,
+    total_height_px: f64,
+    scroll_top_px: f64,
+    viewport_height_px: f64,
+    scroll_height_px: f64,
+    overscan_px: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4161,6 +4177,7 @@ fn app_control_command_defers_background_refresh(command: &AppControlCommand) ->
             | AppControlCommand::OpenPath { .. }
             | AppControlCommand::Drag { .. }
             | AppControlCommand::SetRowExpanded { .. }
+            | AppControlCommand::ScrollPreview { .. }
     )
 }
 
@@ -6047,7 +6064,20 @@ fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlo
             let cleaned_lines = block
                 .lines
                 .iter()
-                .filter(|line| !is_preview_scaffold_line(line))
+                .filter(|line| {
+                    if is_preview_scaffold_line(line) {
+                        return false;
+                    }
+                    let lower = line.trim().to_ascii_lowercase();
+                    !(lower.starts_with("# agents.md instructions")
+                        || lower.starts_with("## skills")
+                        || lower.contains("<instructions>")
+                        || lower.contains("<permissions instructions>")
+                        || lower.contains("<collaboration_mode>")
+                        || lower.contains("environment_context")
+                        || lower.contains("request_user_input")
+                        || lower.contains("skill is a set of local instructions"))
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             if cleaned_lines.is_empty() {
@@ -6062,11 +6092,13 @@ fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlo
             let lower = compact.to_ascii_lowercase();
             if lower.len() > 40
                 && (lower.contains("<permissions instructions>")
+                    || lower.contains("<instructions>")
                     || lower.contains("filesystem sandboxing")
                     || lower.contains("request_user_input")
                     || lower.contains("collaboration mode:")
                     || lower.contains("<collaboration_mode>")
                     || lower.contains("environment_context")
+                    || lower.contains("agents.md instructions for /root")
                     || lower.contains("current_date>")
                     || lower.contains("while commands are running inside the sandbox")
                     || lower.contains("how to request escalation")
@@ -6115,6 +6147,135 @@ fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlo
     }
 
     visible
+}
+
+fn estimate_preview_block_height(block: &SessionPreviewBlock) -> f64 {
+    if block.folded {
+        return 64.0;
+    }
+
+    let mut height = 56.0;
+    let mut in_code = false;
+    for line in &block.lines {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_code = !in_code;
+            height += if in_code { 30.0 } else { 18.0 };
+            continue;
+        }
+        if trimmed.is_empty() {
+            height += if in_code { 10.0 } else { 14.0 };
+            continue;
+        }
+        if extract_image_path_from_line(line).is_some() {
+            height += 248.0;
+            continue;
+        }
+        let chars = trimmed.chars().count().max(1) as f64;
+        let wrap_width = if in_code {
+            88.0
+        } else if trimmed.starts_with('#') {
+            42.0
+        } else {
+            62.0
+        };
+        let wrapped_lines = (chars / wrap_width).ceil().max(1.0);
+        let line_height = if in_code {
+            18.0
+        } else if trimmed.starts_with('#') {
+            24.0
+        } else {
+            20.0
+        };
+        height += wrapped_lines * line_height;
+    }
+
+    height.max(88.0)
+}
+
+fn preview_virtual_window(
+    blocks: &[SessionPreviewBlock],
+    scroll_top_px: f64,
+    viewport_height_px: f64,
+    scroll_height_px: f64,
+    search_active: bool,
+) -> PreviewVirtualWindow {
+    let total_height_px = blocks
+        .iter()
+        .map(estimate_preview_block_height)
+        .sum::<f64>();
+    let viewport_height_px = viewport_height_px.max(PREVIEW_MIN_VIEWPORT_HEIGHT_PX);
+    let scroll_top_px = scroll_top_px.max(0.0);
+    let scroll_height_px = scroll_height_px.max(total_height_px).max(viewport_height_px);
+
+    if search_active || blocks.len() <= PREVIEW_BLOCK_WINDOW {
+        return PreviewVirtualWindow {
+            start_index: 0,
+            end_index: blocks.len(),
+            top_spacer_px: 0.0,
+            bottom_spacer_px: 0.0,
+            total_height_px,
+            scroll_top_px,
+            viewport_height_px,
+            scroll_height_px,
+            overscan_px: 0.0,
+        };
+    }
+
+    let overscan_px = (viewport_height_px * PREVIEW_VIRTUAL_OVERSCAN_FACTOR)
+        .clamp(320.0, PREVIEW_MAX_OVERSCAN_PX);
+    let render_top_px = (scroll_top_px - overscan_px).max(0.0);
+    let render_bottom_px = (scroll_top_px + viewport_height_px + overscan_px).max(viewport_height_px);
+
+    let mut start_index = 0usize;
+    let mut end_index = blocks.len();
+    let mut cumulative_px = 0.0;
+    let mut top_spacer_px = 0.0;
+    let mut started = false;
+
+    for (ix, block) in blocks.iter().enumerate() {
+        let block_height = estimate_preview_block_height(block);
+        let next_cumulative_px = cumulative_px + block_height;
+        if !started && next_cumulative_px >= render_top_px {
+            start_index = ix;
+            top_spacer_px = cumulative_px;
+            started = true;
+        }
+        if started && cumulative_px > render_bottom_px {
+            end_index = ix;
+            break;
+        }
+        cumulative_px = next_cumulative_px;
+    }
+
+    if !started {
+        start_index = blocks.len().saturating_sub(PREVIEW_BLOCK_WINDOW);
+        top_spacer_px = blocks[..start_index]
+            .iter()
+            .map(estimate_preview_block_height)
+            .sum::<f64>();
+    }
+
+    if end_index <= start_index {
+        end_index = (start_index + PREVIEW_BLOCK_WINDOW).min(blocks.len());
+    }
+
+    let bottom_spacer_px = blocks[end_index..]
+        .iter()
+        .map(estimate_preview_block_height)
+        .sum::<f64>();
+
+    PreviewVirtualWindow {
+        start_index,
+        end_index,
+        top_spacer_px,
+        bottom_spacer_px,
+        total_height_px,
+        scroll_top_px,
+        viewport_height_px,
+        scroll_height_px,
+        overscan_px,
+    }
 }
 
 fn group_preview_runs(blocks: &[SessionPreviewBlock], start_index: usize) -> Vec<PreviewRun> {
@@ -6752,7 +6913,7 @@ fn format_preview_timestamp_label(raw: &str, last_date_key: &mut Option<(i32, u8
     }
     let parsed = parse_preview_timestamp(trimmed);
     let Some(timestamp) = parsed else {
-        return trimmed.to_string();
+        return String::new();
     };
     let date_key = (timestamp.year(), timestamp.month() as u8, timestamp.day());
     let time_only = timestamp
@@ -9752,6 +9913,22 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
         .unwrap_or("")
         .trim()
         .to_string();
+    let preview_viewport_rect = dom.get("preview_viewport_rect").cloned().unwrap_or(Value::Null);
+    let preview_visible_block_ids = dom
+        .get("preview_visible_block_ids")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let preview_font_family = dom
+        .get("preview_font_family")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let preview_timestamp_labels = dom
+        .get("preview_timestamp_labels")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let preview_window = dom.get("preview_window").cloned().unwrap_or(Value::Null);
     let document_editor_count = dom
         .get("document_editor_count")
         .and_then(Value::as_u64)
@@ -9781,6 +9958,10 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let preview_visible_block_count = dom
+        .get("preview_visible_block_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let terminal_rendered = active_terminal_hosts.iter().any(|host| {
         host.get("canvas_count")
             .and_then(Value::as_u64)
@@ -9806,7 +9987,10 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
             .unwrap_or(0);
         if preview_scroll_count == 0 && document_editor_count == 0 {
             (false, Some("preview surface not mounted".to_string()))
-        } else if preview_scroll_count > 0 && preview_text_sample.is_empty() {
+        } else if preview_scroll_count > 0
+            && preview_text_sample.is_empty()
+            && preview_visible_block_count == 0
+        {
             (false, Some("preview surface mounted but content is empty".to_string()))
         } else if document_editor_count > 0 && document_body_sample.is_empty() {
             (false, Some("document editor mounted but body is empty".to_string()))
@@ -9850,7 +10034,15 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
         },
         "notification_count": notification_count,
         "notifications": notifications,
-        "preview_text_sample": preview_text_sample,
+        "preview": {
+            "text_sample": preview_text_sample,
+            "viewport_rect": preview_viewport_rect,
+            "visible_block_count": preview_visible_block_count,
+            "visible_block_ids": preview_visible_block_ids,
+            "font_family": preview_font_family,
+            "timestamp_labels": preview_timestamp_labels,
+            "window": preview_window,
+        },
         "document_editor_count": document_editor_count,
         "document_body_sample": document_body_sample,
         "terminal_host_count": terminal_hosts.len(),
@@ -9867,6 +10059,7 @@ async fn capture_dom_debug_snapshot() -> Value {
         (async () => {
             const terminalHosts = Array.from(document.querySelectorAll('[id^="yggterm-terminal-"]'));
             const previewScrolls = Array.from(document.querySelectorAll('[data-preview-scroll="1"]'));
+            const previewWindow = document.querySelector('[data-preview-window-start]');
             const documentEditors = Array.from(document.querySelectorAll('[data-document-editor="1"]'));
             const documentBodies = Array.from(document.querySelectorAll('[data-document-editor-body="1"]'));
             const shellRoots = Array.from(document.querySelectorAll('#yggterm-shell-root'));
@@ -9925,11 +10118,69 @@ async fn capture_dom_debug_snapshot() -> Value {
                     canvas_count: host.querySelectorAll('canvas').length,
                 };
             });
+            const previewViewportRect = previewScrolls[0]
+                ? (() => {
+                    const rect = previewScrolls[0].getBoundingClientRect();
+                    return {
+                        left: Number(rect.left.toFixed(2)),
+                        top: Number(rect.top.toFixed(2)),
+                        width: Number(rect.width.toFixed(2)),
+                        height: Number(rect.height.toFixed(2)),
+                    };
+                })()
+                : null;
+            const previewVisibleBlocks = Array.from(document.querySelectorAll('[id^="preview-block-"]'))
+                .map((block) => {
+                    const rect = block.getBoundingClientRect();
+                    return {
+                        id: block.id,
+                        top: Math.round(rect.top),
+                        height: Math.round(rect.height),
+                    };
+                })
+                .filter((block) => block.height > 0 && block.top < window.innerHeight + 120 && block.top + block.height > -120);
+            const previewEntries = Array.from(document.querySelectorAll('[data-preview-entry="1"]'));
+            const previewAssistantEntries = previewEntries.filter((entry) => entry.getAttribute('data-preview-tone') === 'assistant');
+            const previewRawTimestamps = previewEntries
+                .map((entry) => String(entry.getAttribute('data-preview-raw-timestamp') || '').trim())
+                .filter(Boolean)
+                .slice(0, 24);
+            const previewTimestampLabels = Array.from(document.querySelectorAll('[data-preview-timestamp="1"] div:first-child'))
+                .map((node) => String(node.textContent || '').trim())
+                .filter(Boolean)
+                .slice(0, 16);
+            const previewFontFamily = previewAssistantEntries[0]
+                ? window.getComputedStyle(previewAssistantEntries[0]).fontFamily
+                : null;
+            const previewWindowMetrics = previewWindow
+                ? {
+                    start_index: Number(previewWindow.getAttribute('data-preview-window-start') || '0'),
+                    end_index: Number(previewWindow.getAttribute('data-preview-window-end') || '0'),
+                    total_count: Number(previewWindow.getAttribute('data-preview-window-total') || '0'),
+                    top_spacer_px: Number(previewWindow.getAttribute('data-preview-window-top-spacer') || '0'),
+                    bottom_spacer_px: Number(previewWindow.getAttribute('data-preview-window-bottom-spacer') || '0'),
+                    total_height_px: Number(previewWindow.getAttribute('data-preview-window-total-height') || '0'),
+                    scroll_top_px: Number(previewWindow.getAttribute('data-preview-window-scroll-top') || '0'),
+                    client_height_px: Number(previewWindow.getAttribute('data-preview-window-client-height') || '0'),
+                    scroll_height_px: Number(previewWindow.getAttribute('data-preview-window-scroll-height') || '0'),
+                    overscan_px: Number(previewWindow.getAttribute('data-preview-window-overscan') || '0'),
+                }
+                : null;
             dioxus.send({
                 terminal_host_count: terminalHosts.length,
                 terminal_hosts: hostDetails,
                 preview_scroll_count: previewScrolls.length,
                 preview_text_sample: String(previewScrolls[0]?.innerText || "").slice(0, 240),
+                preview_viewport_rect: previewViewportRect,
+                preview_visible_block_count: previewVisibleBlocks.length,
+                preview_visible_block_ids: previewVisibleBlocks.slice(0, 24).map((block) => block.id),
+                preview_assistant_entry_count: previewAssistantEntries.length,
+                preview_font_family: previewFontFamily,
+                preview_raw_timestamps: previewRawTimestamps,
+                preview_timestamp_labels: previewTimestampLabels,
+                preview_window: previewWindowMetrics,
+                window_inner_width: window.innerWidth,
+                window_inner_height: window.innerHeight,
                 document_editor_count: documentEditors.length,
                 document_body_sample: String(documentBodies[0]?.value || "").slice(0, 240),
                 shell_root_count: shellRoots.length,
@@ -9955,6 +10206,62 @@ async fn capture_dom_debug_snapshot() -> Value {
         Ok(value) => value,
         Err(error) => json!({
             "error": error.to_string(),
+        }),
+    }
+}
+
+async fn scroll_preview_viewport(top_px: Option<f64>, ratio: Option<f64>) -> Value {
+    let requested_top_px = top_px.filter(|value| value.is_finite());
+    let requested_ratio = ratio
+        .filter(|value| value.is_finite())
+        .map(|value| value.clamp(0.0, 1.0));
+    let top_literal = requested_top_px
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let ratio_literal = requested_ratio
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let script = format!(
+        r#"
+        (async () => {{
+            const requestedTop = {top_literal};
+            const requestedRatio = {ratio_literal};
+            const scroller = document.querySelector('[data-preview-scroll="1"]');
+            if (!scroller) {{
+                dioxus.send({{
+                    accepted: false,
+                    reason: "preview_scroller_missing",
+                }});
+                return;
+            }}
+            const maxTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+            let targetTop = 0;
+            if (typeof requestedTop === 'number' && Number.isFinite(requestedTop)) {{
+                targetTop = requestedTop;
+            }} else if (typeof requestedRatio === 'number' && Number.isFinite(requestedRatio)) {{
+                targetTop = maxTop * requestedRatio;
+            }}
+            targetTop = Math.max(0, Math.min(maxTop, targetTop));
+            scroller.scrollTo({{ top: targetTop, behavior: 'auto' }});
+            await new Promise((resolve) => setTimeout(resolve, 70));
+            dioxus.send({{
+                accepted: true,
+                requested_top_px: requestedTop,
+                requested_ratio: requestedRatio,
+                applied_top_px: Math.round(scroller.scrollTop),
+                max_top_px: Math.round(maxTop),
+                client_height_px: Math.round(scroller.clientHeight),
+                scroll_height_px: Math.round(scroller.scrollHeight),
+            }});
+        }})();
+    "#
+    );
+    let mut eval = document::eval(&script);
+    match eval.recv::<Value>().await {
+        Ok(value) => value,
+        Err(error) => json!({
+            "accepted": false,
+            "reason": error.to_string(),
         }),
     }
 }
@@ -9988,10 +10295,16 @@ async fn process_pending_app_control_requests(
         });
     }
     let response = match command {
-        AppControlCommand::CaptureScreenshot {
-            target: _,
-            output_path,
-        } => match capture_visible_app_surface(&desktop, Path::new(&output_path)).await {
+        AppControlCommand::CaptureScreenshot { target, output_path } => {
+            let dom_snapshot = capture_dom_debug_snapshot().await;
+            match capture_visible_app_surface(
+                &desktop,
+                Path::new(&output_path),
+                target,
+                Some(&dom_snapshot),
+            )
+            .await
+            {
             Ok(output_path) => AppControlResponse {
                 request_id: request.request_id.clone(),
                 handled_by_pid: std::process::id(),
@@ -9999,10 +10312,11 @@ async fn process_pending_app_control_requests(
                 output_path: Some(output_path.display().to_string()),
                 data: Some(json!({
                     "command": "capture_screenshot",
+                    "target": target,
                     "window": describe_window(&desktop),
                     "active_view_mode": format!("{:?}", state.read().server.active_view_mode()),
                     "active_session_path": state.read().server.active_session_path(),
-                    "dom": capture_dom_debug_snapshot().await,
+                    "dom": dom_snapshot,
                 })),
                 error: None,
             },
@@ -10014,7 +10328,27 @@ async fn process_pending_app_control_requests(
                 data: None,
                 error: Some(error.to_string()),
             },
-        },
+        }},
+        AppControlCommand::ScrollPreview { top_px, ratio } => {
+            let scroll_result = scroll_preview_viewport(top_px, ratio).await;
+            sleep(Duration::from_millis(40)).await;
+            let dom_snapshot = capture_dom_debug_snapshot().await;
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(json!({
+                    "command": "scroll_preview",
+                    "window": describe_window(&desktop),
+                    "active_view_mode": format!("{:?}", state.read().server.active_view_mode()),
+                    "active_session_path": state.read().server.active_session_path(),
+                    "scroll": scroll_result,
+                    "dom": dom_snapshot,
+                })),
+                error: None,
+            }
+        }
         AppControlCommand::CaptureScreenRecording {
             output_path,
             duration_secs,
@@ -13909,13 +14243,15 @@ fn MainSurface(
             .clone()
             .unwrap_or_else(|| "__empty__".to_string())
     );
-    let mut preview_block_limit = use_signal(|| PREVIEW_BLOCK_WINDOW);
     let mut preview_scroll_top = use_signal(|| 0.0_f64);
+    let mut preview_scroll_client_height = use_signal(|| PREVIEW_MIN_VIEWPORT_HEIGHT_PX);
+    let mut preview_scroll_height = use_signal(|| PREVIEW_MIN_VIEWPORT_HEIGHT_PX);
     let preview_reset_session_path = active_session_path.clone();
     use_effect(move || {
         let _ = preview_reset_session_path.clone();
-        preview_block_limit.set(PREVIEW_BLOCK_WINDOW);
         preview_scroll_top.set(0.0);
+        preview_scroll_client_height.set(PREVIEW_MIN_VIEWPORT_HEIGHT_PX);
+        preview_scroll_height.set(PREVIEW_MIN_VIEWPORT_HEIGHT_PX);
     });
     let render_trace_session_path = active_session_path.clone();
     let render_trace_surface_key = surface_key.clone();
@@ -13968,19 +14304,15 @@ fn MainSurface(
                     }
                 } else {
                     let visible_blocks = visible_preview_blocks(&session);
-                    let rendered_block_limit = if snapshot.search_active {
-                        visible_blocks.len()
-                    } else {
-                        (*preview_block_limit.read()).max(PREVIEW_BLOCK_WINDOW)
-                    };
-                    let hidden_block_count =
-                        visible_blocks.len().saturating_sub(rendered_block_limit);
-                    let rendered_blocks = if hidden_block_count > 0 {
-                        visible_blocks[hidden_block_count..].to_vec()
-                    } else {
-                        visible_blocks.clone()
-                    };
-                    let grouped_runs = group_preview_runs(&rendered_blocks, hidden_block_count);
+                    let preview_window = preview_virtual_window(
+                        &visible_blocks,
+                        *preview_scroll_top.read(),
+                        *preview_scroll_client_height.read(),
+                        *preview_scroll_height.read(),
+                        snapshot.search_active,
+                    );
+                    let rendered_blocks = visible_blocks[preview_window.start_index..preview_window.end_index].to_vec();
+                    let grouped_runs = group_preview_runs(&rendered_blocks, preview_window.start_index);
                     rsx! {
                         div {
                             style: "display:flex; flex-direction:column; min-width:0; min-height:0; width:100%; height:100%;",
@@ -14002,29 +14334,29 @@ fn MainSurface(
                                         overscroll-behavior:contain; scrollbar-gutter:stable; contain:layout paint style;",
                                 onscroll: move |evt: ScrollEvent| {
                                     preview_scroll_top.set(evt.data().scroll_top());
+                                    preview_scroll_client_height
+                                        .set((evt.data().client_height() as f64).max(PREVIEW_MIN_VIEWPORT_HEIGHT_PX));
+                                    preview_scroll_height
+                                        .set((evt.data().scroll_height() as f64).max(PREVIEW_MIN_VIEWPORT_HEIGHT_PX));
                                 },
                                 if snapshot.preview_layout == PreviewLayoutMode::Chat {
                                     div {
+                                        "data-preview-window-start": "{preview_window.start_index}",
+                                        "data-preview-window-end": "{preview_window.end_index}",
+                                        "data-preview-window-total": "{visible_blocks.len()}",
+                                        "data-preview-window-top-spacer": "{preview_window.top_spacer_px.round() as i64}",
+                                        "data-preview-window-bottom-spacer": "{preview_window.bottom_spacer_px.round() as i64}",
+                                        "data-preview-window-total-height": "{preview_window.total_height_px.round() as i64}",
+                                        "data-preview-window-scroll-top": "{preview_window.scroll_top_px.round() as i64}",
+                                        "data-preview-window-client-height": "{preview_window.viewport_height_px.round() as i64}",
+                                        "data-preview-window-scroll-height": "{preview_window.scroll_height_px.round() as i64}",
+                                        "data-preview-window-overscan": "{preview_window.overscan_px.round() as i64}",
                                         style: "display:flex; flex-direction:column; gap:16px; min-width:0; width:min(1020px, 100%); margin:0 auto; \
                                                 contain:layout paint style;",
-                                        if hidden_block_count > 0 && !snapshot.search_active {
+                                        if preview_window.top_spacer_px > 0.0 {
                                             div {
-                                                style: "display:flex; justify-content:center; margin:0 0 4px 0;",
-                                                button {
-                                                    class: "yggui-secondary-button",
-                                                    style: format!(
-                                                        "border:none; border-radius:999px; padding:10px 16px; background:{}; color:{}; \
-                                                         box-shadow:0 12px 30px rgba(128,162,198,0.14); font-size:12px; font-weight:600; cursor:pointer;",
-                                                        snapshot.palette.accent_soft,
-                                                        snapshot.palette.text
-                                                    ),
-                                                    onclick: move |_| {
-                                                        preview_block_limit.with_mut(|limit| {
-                                                            *limit += PREVIEW_BLOCK_WINDOW;
-                                                        });
-                                                    },
-                                                    "Show {hidden_block_count} Earlier Messages"
-                                                }
+                                                "data-preview-spacer": "top",
+                                                style: format!("height:{}px; min-height:{}px;", preview_window.top_spacer_px.round(), preview_window.top_spacer_px.round()),
                                             }
                                         }
                                         for run in grouped_runs.into_iter() {
@@ -14033,6 +14365,12 @@ fn MainSurface(
                                                 run: run.clone(),
                                                 palette: snapshot.palette,
                                                 on_toggle_block: move |ix| on_toggle_preview_block.call(ix),
+                                            }
+                                        }
+                                        if preview_window.bottom_spacer_px > 0.0 {
+                                            div {
+                                                "data-preview-spacer": "bottom",
+                                                style: format!("height:{}px; min-height:{}px;", preview_window.bottom_spacer_px.round(), preview_window.bottom_spacer_px.round()),
                                             }
                                         }
                                     }
@@ -14965,6 +15303,10 @@ fn PreviewRunBlock(
                         div {
                             key: "{entry.block_ix}",
                             id: "{preview_block_dom_id(&session_id, entry.block_ix)}",
+                            "data-preview-entry": "1",
+                            "data-preview-tone": if user_run { "user" } else { "assistant" },
+                            "data-preview-block-ix": "{entry.block_ix}",
+                            "data-preview-raw-timestamp": "{entry.block.timestamp}",
                             style: format!(
                                 "width:100%; min-width:0; box-sizing:border-box; text-align:left; background:transparent; padding:{}; \
                                  {} {} {}",
@@ -14994,10 +15336,15 @@ fn PreviewRunBlock(
                                 }
                             ),
                             div {
+                                "data-preview-timestamp": "1",
                                 style: "display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:8px;",
-                                div {
-                                    style: format!("font-size:10px; color:{}; opacity:0.82;", palette.muted),
-                                    "{entry.display_timestamp}"
+                                if !entry.display_timestamp.trim().is_empty() {
+                                    div {
+                                        style: format!("font-size:10px; color:{}; opacity:0.82;", palette.muted),
+                                        "{entry.display_timestamp}"
+                                    }
+                                } else {
+                                    div { style: "flex:1 1 auto;" }
                                 }
                                 if entry.block.folded || entry.block.lines.len() > 8 {
                                     button {
