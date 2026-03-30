@@ -161,7 +161,7 @@ That means the desktop app can ask a remote host to:
 
 - report its Yggterm remote protocol version
 - scan Codex sessions
-- persist generated `title` / `precis` / `summary`
+- persist generated `title` / `summary`
 - stage clipboard images into that machine's `~/.yggterm/clipboard/`
 
 When the SSH target does not already have a compatible `yggterm` binary on `PATH`, Yggterm bootstraps a matching binary into:

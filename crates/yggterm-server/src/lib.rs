@@ -2859,7 +2859,17 @@ fn remote_ssh_launch_command(
         Some(prefix) => format!("{prefix} && {inner}"),
         None => inner,
     };
-    format!("ssh -tt {} {}", ssh_target, shell_single_quote(&remote))
+    if cfg!(windows) {
+        return format!("ssh -tt {} {}", ssh_target, shell_single_quote(&remote));
+    }
+    let control_dir = "$HOME/.yggterm/ssh-control";
+    let ssh = format!(
+        "ssh -o ControlMaster=auto -o ControlPersist=60 -o ControlPath={} -tt {} {}",
+        shell_single_quote(&format!("{control_dir}/%C")),
+        ssh_target,
+        shell_single_quote(&remote)
+    );
+    format!("mkdir -p {control_dir} >/dev/null 2>&1 && {ssh}")
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -7219,7 +7229,11 @@ mod tests {
             "$HOME/.yggterm/bin/yggterm",
             &["server", "remote", "resume-codex", "abc123", "/srv/app"],
         );
-        assert!(command.starts_with("ssh -tt jojo "));
+        assert!(command.starts_with("mkdir -p $HOME/.yggterm/ssh-control >/dev/null 2>&1 && ssh "));
+        assert!(command.contains("-o ControlMaster=auto"));
+        assert!(command.contains("-o ControlPersist=60"));
+        assert!(command.contains("-o ControlPath='$HOME/.yggterm/ssh-control/%C'"));
+        assert!(command.contains("-tt jojo "));
         assert!(command.contains("tmux new-session -A -s yggterm &&"));
         assert!(command.contains("$HOME/.yggterm/bin/yggterm"));
         assert!(command.contains("'resume-codex'"));
