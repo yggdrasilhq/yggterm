@@ -278,6 +278,8 @@ enum CloseAppMode {
     ShutdownDaemon,
 }
 
+const KEEP_DAEMON_RUNNING_AFTER_LAST_CLIENT: bool = true;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RightPanelMode {
     Hidden,
@@ -10693,7 +10695,20 @@ fn maybe_shutdown_daemon_for_last_client(
                 .collect::<Vec<_>>(),
         }),
     );
-    if active.is_empty() {
+    if active.is_empty() && KEEP_DAEMON_RUNNING_AFTER_LAST_CLIENT {
+        append_trace_event(
+            &perf_home_dir(settings_path),
+            "client",
+            "gui",
+            "shutdown_deferred_for_background_chores",
+            json!({
+                "remaining_clients": 0,
+            }),
+        );
+        Ok(CloseAppMode::CloseClientOnly {
+            remaining_clients: 0,
+        })
+    } else if active.is_empty() {
         let _ = daemon_shutdown(endpoint)?;
         Ok(CloseAppMode::ShutdownDaemon)
     } else {
