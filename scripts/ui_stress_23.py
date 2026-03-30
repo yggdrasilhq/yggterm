@@ -91,6 +91,14 @@ def app_rows(host: str, binary: str, timeout_ms: int) -> dict:
     return payload.get("data") or {}
 
 
+def canonical_session_path(session_path: str | None) -> str | None:
+    if session_path is None:
+        return None
+    if session_path.startswith("local::"):
+        return f"local://{session_path[len('local::'):]}"
+    return session_path
+
+
 def write_state_dump(out_dir: Path, name: str, state: dict) -> str:
     path = out_dir / f"{name}.state.json"
     path.write_text(json.dumps(state, indent=2), encoding="utf-8")
@@ -170,8 +178,51 @@ def latest_window_spawn_event_for_pid(
     return None
 
 
+def local_client_instance_dir() -> Path:
+    return Path.home() / ".yggterm" / "client-instances"
+
+
+def kill_local_clients() -> None:
+    instances_root = local_client_instance_dir()
+    if instances_root.is_dir():
+        for path in instances_root.glob("*/*.json"):
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            pid = int(record.get("pid") or 0)
+            if pid > 0:
+                try:
+                    os.kill(pid, 15)
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    pass
+        time.sleep(0.4)
+        for path in instances_root.glob("*/*.json"):
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            pid = int(record.get("pid") or 0)
+            if pid > 0:
+                try:
+                    os.kill(pid, 9)
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    pass
+    subprocess.run(
+        ["bash", "-lc", "pkill -f 'yggterm server daemon' || true"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
 def launch_local_client(binary: str, timeout_s: float = 3.0) -> tuple[subprocess.Popen, dict]:
     binary_path = str(Path(binary).resolve())
+    kill_local_clients()
     subprocess.run(
         ["bash", "-lc", f"pkill -f {shlex.quote(binary_path)} || true"],
         check=False,
@@ -343,7 +394,7 @@ def choose_session_targets(
     seen_paths: set[str] = set()
 
     for item in inventory.get("stored_sessions", []):
-        session_path = item.get("path")
+        session_path = canonical_session_path(item.get("path"))
         if not session_path or session_path in seen_paths:
             continue
         kind = item.get("kind")
@@ -365,15 +416,19 @@ def choose_session_targets(
 
     for item in inventory.get("live_sessions", []):
         row = rows_by_session_id.get(item.get("id"))
-        session_path = row.get("full_path") if row else item.get("key")
+        if row is None:
+            continue
+        session_path = row.get("full_path")
         if not session_path or session_path in seen_paths:
             continue
+        live_kind = (item.get("kind") or "").lower()
+        is_document = live_kind == "document"
         candidates.append(
             {
                 "full_path": session_path,
                 "label": item.get("title") or session_path,
-                "kind": "Session",
-                "view": "terminal",
+                "kind": "Document" if is_document else "Session",
+                "view": "preview" if is_document else "terminal",
             }
         )
         seen_paths.add(session_path)
@@ -626,6 +681,7 @@ def main() -> int:
     open_anomalies = [item for item in opens if item.get("anomaly")]
     drag_failures = [item for item in drags if item.get("error")]
     drag_anomalies = [item for item in drags if item.get("anomaly")]
+    drag_shortfall = max(0, args.drag_count - len(drags))
 
     summary = {
         "host": args.host,
@@ -646,6 +702,8 @@ def main() -> int:
         "rows_seen": rows_payload.get("row_count"),
         "open_failures": len(open_failures),
         "open_anomalies": len(open_anomalies),
+        "drag_operations_executed": len(drags),
+        "drag_shortfall": drag_shortfall,
         "drag_failures": len(drag_failures),
         "drag_anomalies": len(drag_anomalies),
         "final_active_session_path": final_state.get("active_session_path"),
@@ -665,7 +723,7 @@ def main() -> int:
             launch.wait(timeout=2)
         except subprocess.TimeoutExpired:
             launch.kill()
-    return 0 if not open_failures and not drag_failures else 1
+    return 0 if not open_failures and not drag_failures and drag_shortfall == 0 else 1
 
 
 if __name__ == "__main__":

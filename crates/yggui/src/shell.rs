@@ -43,7 +43,7 @@ use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -106,6 +106,7 @@ static INTENTIONAL_CLIENT_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static APP_ROOT_RENDER_TRACED: AtomicBool = AtomicBool::new(false);
 static APP_ROOT_EFFECT_TRACED: AtomicBool = AtomicBool::new(false);
 static APP_ROOT_MAC_WINDOW_FORCED: AtomicBool = AtomicBool::new(false);
+static APP_ROOT_RENDER_COUNT: AtomicU64 = AtomicU64::new(0);
 
 const PREVIEW_BLOCK_CACHE_LIMIT: usize = 256;
 const PREVIEW_CONTENT_CACHE_LIMIT: usize = 256;
@@ -6822,12 +6823,28 @@ fn push_live_session_rows(
     for session in sessions {
         let cwd = metadata_value(session, "Cwd");
         let label = live_session_label(remote_machines, session, &short_ids);
+        let full_path = if session.kind == SessionKind::Document {
+            session
+                .metadata
+                .iter()
+                .find(|entry| entry.label == "Path")
+                .map(|entry| entry.value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| normalize_live_session_path(&session.session_path))
+        } else {
+            normalize_live_session_path(&session.session_path)
+        };
         rows.push(BrowserRow {
-            kind: BrowserRowKind::Session,
-            full_path: session.session_path.clone(),
+            kind: if session.kind == SessionKind::Document {
+                BrowserRowKind::Document
+            } else {
+                BrowserRowKind::Session
+            },
+            full_path,
             label: label.clone(),
             detail_label: String::new(),
-            document_kind: None,
+            document_kind: (session.kind == SessionKind::Document)
+                .then_some(WorkspaceDocumentKind::Note),
             group_kind: None,
             session_title: Some(label),
             depth: 1,
@@ -9410,6 +9427,10 @@ async fn capture_dom_debug_snapshot() -> Value {
             const previewScrolls = Array.from(document.querySelectorAll('[data-preview-scroll="1"]'));
             const documentEditors = Array.from(document.querySelectorAll('[data-document-editor="1"]'));
             const documentBodies = Array.from(document.querySelectorAll('[data-document-editor-body="1"]'));
+            const shellRoots = Array.from(document.querySelectorAll('#yggterm-shell-root'));
+            const sidebars = Array.from(document.querySelectorAll('#yggterm-sidebar'));
+            const titlebars = Array.from(document.querySelectorAll('[data-yggterm-titlebar="1"]'));
+            const mainSurfaces = Array.from(document.querySelectorAll('[data-yggterm-main-surface="1"]'));
             const sidebarScroller = document.querySelector('[data-sidebar-scroll="1"]');
             const sidebarRows = Array.from(document.querySelectorAll('[data-sidebar-row-path]'));
             const visibleSidebarRows = sidebarRows
@@ -9465,6 +9486,10 @@ async fn capture_dom_debug_snapshot() -> Value {
                 preview_text_sample: String(previewScrolls[0]?.innerText || "").slice(0, 240),
                 document_editor_count: documentEditors.length,
                 document_body_sample: String(documentBodies[0]?.value || "").slice(0, 240),
+                shell_root_count: shellRoots.length,
+                sidebar_count: sidebars.length,
+                titlebar_count: titlebars.length,
+                main_surface_count: mainSurfaces.length,
                 shell_text_sample: String(document.getElementById("yggterm-shell-root")?.innerText || "").slice(0, 240),
                 sidebar_scroll_top: sidebarScroller ? Math.round(sidebarScroller.scrollTop) : null,
                 sidebar_visible_row_count: visibleSidebarRows.length,
@@ -10330,6 +10355,17 @@ fn app() -> Element {
         .expect("shell bootstrap not initialized")
         .clone();
     let trace_home = perf_home_dir(&bootstrap.settings_path);
+    let render_count = APP_ROOT_RENDER_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+    append_trace_event(
+        &trace_home,
+        "ui",
+        "startup",
+        "app_root_render_count",
+        json!({
+            "pid": std::process::id(),
+            "count": render_count,
+        }),
+    );
     if !APP_ROOT_RENDER_TRACED.swap(true, Ordering::SeqCst) {
         append_trace_event(
             &trace_home,
@@ -11172,13 +11208,16 @@ fn app() -> Element {
                     WindowResizeHandles {}
                 }
                 if !fullscreen {
-                    Titlebar {
-                        snapshot: titlebar_snapshot,
-                        hovered: hovered,
-                        on_toggle_sidebar: move || state.with_mut(|shell| shell.toggle_sidebar()),
-                        on_search: move |value: String| state.with_mut(|shell| shell.set_search(value)),
-                        on_execute_search_command: move |command: String| execute_search_command(state, command),
-                        on_set_search_focus: move |focused: bool| state.with_mut(|shell| shell.set_search_focus(focused)),
+                    div {
+                        "data-yggterm-titlebar": "1",
+                        style: "display:flex; flex-direction:column; min-width:0;",
+                        Titlebar {
+                            snapshot: titlebar_snapshot,
+                            hovered: hovered,
+                            on_toggle_sidebar: move || state.with_mut(|shell| shell.toggle_sidebar()),
+                            on_search: move |value: String| state.with_mut(|shell| shell.set_search(value)),
+                            on_execute_search_command: move |command: String| execute_search_command(state, command),
+                            on_set_search_focus: move |focused: bool| state.with_mut(|shell| shell.set_search_focus(focused)),
                             on_prev_search_content: move |_| {
                                 if let Some(dom_id) = state.with_mut(|shell| shell.next_search_content_dom_id(-1)) {
                                     if let Some(line_index) = dom_id.strip_prefix("__terminal_line__:") {
@@ -11320,10 +11359,11 @@ fn app() -> Element {
                         on_restart_update: move || restart_into_pending_update(state),
                         on_toggle_maximized: move || state.with_mut(|shell| shell.toggle_maximized()),
                         on_toggle_fullscreen: move || state.with_mut(|shell| shell.toggle_fullscreen()),
-                        on_toggle_always_on_top: move || state.with_mut(|shell| shell.toggle_always_on_top()),
-                        on_close_app: move || spawn_graceful_shutdown_and_close(state),
-                        maximized: maximized,
-                        fullscreen: fullscreen,
+                            on_toggle_always_on_top: move || state.with_mut(|shell| shell.toggle_always_on_top()),
+                            on_close_app: move || spawn_graceful_shutdown_and_close(state),
+                            maximized: maximized,
+                            fullscreen: fullscreen,
+                        }
                     }
                 }
                 if fullscreen {
@@ -11449,11 +11489,14 @@ fn app() -> Element {
                         on_cancel_rename: move |_| state.with_mut(|shell| shell.cancel_tree_rename()),
                     }
                     }
-                    MainSurface {
-                        state,
-                        snapshot: main_snapshot,
-                        terminal_mount_epoch: *terminal_mount_epoch.read(),
-                        on_expand_preview: move || spawn_surface_snapshot_action(
+                    div {
+                        "data-yggterm-main-surface": "1",
+                        style: "display:flex; flex:1; min-width:0; min-height:0;",
+                        MainSurface {
+                            state,
+                            snapshot: main_snapshot,
+                            terminal_mount_epoch: *terminal_mount_epoch.read(),
+                            on_expand_preview: move || spawn_surface_snapshot_action(
                             state,
                             "expanding preview".to_string(),
                             YggRequestMeta::interactive(
@@ -11498,7 +11541,7 @@ fn app() -> Element {
                         on_save_document: move |(path, input): (String, WorkspaceDocumentInput)| {
                             queue_document_save(state, path, input, AfterSaveAction::SaveOnly)
                         },
-                        on_run_recipe_document: move |(path, input, run_new_session): (String, WorkspaceDocumentInput, bool)| {
+                            on_run_recipe_document: move |(path, input, run_new_session): (String, WorkspaceDocumentInput, bool)| {
                             queue_document_save(
                                 state,
                                 path,
@@ -11509,7 +11552,8 @@ fn app() -> Element {
                                     AfterSaveAction::RunHere
                                 },
                             )
-                        },
+                            },
+                        }
                     }
                     if !fullscreen && metadata_snapshot.right_panel_mode != RightPanelMode::Hidden {
                         RightRail {
