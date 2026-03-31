@@ -63,6 +63,7 @@ def mock_cli(
 
 
 def start_daemon(binary: str, env: dict[str, str]) -> subprocess.Popen:
+    started_at = time.monotonic()
     proc = subprocess.Popen(
         [str(Path(binary).resolve()), "server", "daemon"],
         stdout=subprocess.DEVNULL,
@@ -74,6 +75,7 @@ def start_daemon(binary: str, env: dict[str, str]) -> subprocess.Popen:
         if proc.poll() is not None:
             raise RuntimeError(f"daemon exited early with code {proc.returncode}")
         if run([str(Path(binary).resolve()), "server", "ping"], env=env, check=False).returncode == 0:
+            proc.startup_ms = int((time.monotonic() - started_at) * 1000)
             return proc
         time.sleep(0.1)
     raise RuntimeError("daemon did not become reachable within 10s")
@@ -120,6 +122,19 @@ def rss_bytes_for_pid(pid: int) -> int:
     return 0
 
 
+def cpu_time_ms_for_pid(pid: int) -> int:
+    stat = Path(f"/proc/{pid}/stat")
+    if not stat.exists():
+        return 0
+    fields = stat.read_text(encoding="utf-8").split()
+    if len(fields) < 17:
+        return 0
+    utime = int(fields[13])
+    stime = int(fields[14])
+    clk_tck = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+    return int(((utime + stime) * 1000) / max(clk_tck, 1))
+
+
 def main() -> int:
     args = parse_args()
     out_dir = Path(args.out_dir)
@@ -143,7 +158,17 @@ def main() -> int:
         daemon_proc = start_daemon(args.bin, env)
         pids = live_daemon_pids_for_home(home)
         rss_before = rss_bytes_for_pid(pids[0]) if pids else 0
-        record("daemon_started", daemon_proc.poll() is None, {"pid": daemon_proc.pid, "pids": pids})
+        startup_ms = int(getattr(daemon_proc, "startup_ms", 0))
+        record(
+            "daemon_started",
+            daemon_proc.poll() is None,
+            {"pid": daemon_proc.pid, "pids": pids, "startup_ms": startup_ms},
+        )
+        record(
+            "startup_under_1500ms",
+            0 < startup_ms <= 1500,
+            {"startup_ms": startup_ms, "startup_budget_ms": 1500},
+        )
 
         startup_result, startup_events = mock_cli(args.mock_bin, env, out_dir, "01-startup", "--scenario", "startup")
         startup = scenario_result_data(startup_events)
@@ -248,6 +273,23 @@ def main() -> int:
                 "rss_peak": rss_peak,
                 "rss_after_trim": rss_after_trim,
                 "tolerance_bytes": 16 * 1024 * 1024,
+            },
+        )
+
+        pids = live_daemon_pids_for_home(home)
+        idle_pid = pids[0] if pids else 0
+        cpu_before_idle = cpu_time_ms_for_pid(idle_pid)
+        time.sleep(5.0)
+        cpu_after_idle = cpu_time_ms_for_pid(idle_pid)
+        idle_cpu_ms = max(0, cpu_after_idle - cpu_before_idle)
+        record(
+            "idle_cpu_under_250ms_over_5s",
+            idle_cpu_ms <= 250,
+            {
+                "pid": idle_pid,
+                "idle_cpu_ms": idle_cpu_ms,
+                "window_ms": 5000,
+                "budget_ms": 250,
             },
         )
 
