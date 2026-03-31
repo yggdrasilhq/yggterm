@@ -611,6 +611,19 @@ struct ActiveSurfaceRequest {
     target: YggTarget,
 }
 
+fn active_request_session_target_path(
+    request: &ActiveSurfaceRequest,
+    fallback_active_path: Option<&str>,
+) -> Option<String> {
+    match &request.target {
+        YggTarget::Session { session_path }
+        | YggTarget::Terminal { session_path }
+        | YggTarget::Preview { session_path } => Some(session_path.clone()),
+        YggTarget::ActiveSession => fallback_active_path.map(ToOwned::to_owned),
+        _ => None,
+    }
+}
+
 #[derive(Default)]
 struct PreviewBlockCache {
     order: VecDeque<u64>,
@@ -900,9 +913,10 @@ impl ShellState {
         );
         let preview_loading = self
             .active_surface_requests
-            .get(&YggSurface::Preview)
-            .is_some_and(|request| {
-                active_surface_request_matches_session(request, active_session_path.as_deref())
+            .iter()
+            .any(|(surface, request)| {
+                matches!(surface, YggSurface::Preview | YggSurface::PreviewSync)
+                    && active_surface_request_matches_session(request, active_session_path.as_deref())
             });
         let terminal_loading = self
             .active_surface_requests
@@ -1313,9 +1327,11 @@ impl ShellState {
             return;
         }
         let was_initial_sync = self.needs_initial_server_sync;
+        let previous_active_session = self.server.active_session().cloned();
         match result {
             Ok((snapshot, message)) => {
                 self.server.apply_snapshot(snapshot);
+                self.restore_active_preview_if_snapshot_regressed(previous_active_session);
                 self.prune_terminal_attach_in_flight();
                 self.hydrate_generated_copy_from_remote_cache();
                 self.needs_initial_server_sync = false;
@@ -1356,11 +1372,13 @@ impl ShellState {
         result: Result<(ServerUiSnapshot, Option<String>)>,
     ) {
         let was_initial_sync = self.needs_initial_server_sync;
+        let previous_active_session = self.server.active_session().cloned();
         match result {
             Ok((snapshot, message)) => {
                 let snapshot =
                     self.reconcile_snapshot_for_interactive_request(request_id, snapshot);
                 self.server.apply_snapshot(snapshot);
+                self.restore_active_preview_if_snapshot_regressed(previous_active_session);
                 self.prune_terminal_attach_in_flight();
                 self.hydrate_generated_copy_from_remote_cache();
                 self.finish_busy_request_for(request_id);
@@ -1390,6 +1408,32 @@ impl ShellState {
                 }
             }
         }
+    }
+
+    fn restore_active_preview_if_snapshot_regressed(
+        &mut self,
+        previous_active_session: Option<ManagedSessionView>,
+    ) {
+        let Some(previous_active_session) = previous_active_session else {
+            return;
+        };
+        if self.server.active_view_mode() != WorkspaceViewMode::Rendered {
+            return;
+        }
+        if previous_active_session.preview.blocks.is_empty() {
+            return;
+        }
+        let Some(active_path) = self.server.active_session_path().map(str::to_string) else {
+            return;
+        };
+        if active_path != previous_active_session.session_path {
+            return;
+        }
+        let _ = self.server.restore_session_preview_if_empty(
+            &active_path,
+            previous_active_session.preview,
+            previous_active_session.rendered_sections,
+        );
     }
 
     fn seed_dynamic_top_level_expansions(&mut self) {
@@ -4716,6 +4760,9 @@ fn spawn_open_session_row_with_mode(
     row: BrowserRow,
     prefer_terminal: bool,
 ) {
+    let staged_remote_preview_session = (!prefer_terminal)
+        .then(|| parse_remote_scanned_session_path(&row.full_path).map(|_| row.full_path.clone()))
+        .flatten();
     if is_live_sidebar_row(&row) {
         let mode = if prefer_terminal {
             WorkspaceViewMode::Terminal
@@ -4741,7 +4788,21 @@ fn spawn_open_session_row_with_mode(
     state.with_mut(|shell| {
         shell.latest_open_request_id = shell.latest_open_request_id.saturating_add(1);
         open_request_id = shell.latest_open_request_id;
+        shell.selected_tree_paths.clear();
+        shell.selected_tree_paths.insert(row.full_path.clone());
+        shell.selection_anchor = Some(row.full_path.clone());
         shell.browser.select_path(row.full_path.clone());
+        if let Some((machine_key, session_id)) = parse_remote_scanned_session_path(&row.full_path) {
+            let _ = shell.server.stage_remote_scanned_session_with_view(
+                machine_key,
+                session_id,
+                if prefer_terminal {
+                    WorkspaceViewMode::Terminal
+                } else {
+                    WorkspaceViewMode::Rendered
+                },
+            );
+        }
         shell.context_menu_row = None;
         shell.sync_browser_settings();
         shell.begin_surface_request(
@@ -4803,6 +4864,7 @@ fn spawn_open_session_row_with_mode(
         )
         .await;
         let request_id = request_meta.request_id.clone();
+        let preview_sync_session_path = staged_remote_preview_session.clone();
         let _ = safe_shell_mut(state, "open_session_row_complete", |shell| {
             if open_request_id != shell.latest_open_request_id {
                 shell.finish_busy_request_for(&request_id);
@@ -4821,6 +4883,23 @@ fn spawn_open_session_row_with_mode(
                 }
             }
         });
+        if let Some(session_path) = preview_sync_session_path {
+            let should_sync = state.with_mut(|shell| {
+                shell
+                    .remote_preview_dirty_epoch
+                    .insert(session_path.clone(), current_millis());
+                shell.server.active_view_mode() == WorkspaceViewMode::Rendered
+                    && shell.server.active_session_path() == Some(session_path.as_str())
+                    && schedule_remote_preview_sync(shell, &session_path, 0)
+            });
+            if should_sync {
+                spawn_remote_preview_payload_sync(
+                    state,
+                    session_path,
+                    "preview_open_initial_sync",
+                );
+            }
+        }
         maybe_spawn_missing_remote_machine_refreshes(state);
     });
 }
@@ -5491,7 +5570,7 @@ fn spawn_remote_preview_payload_sync(
     let request_meta = YggRequestMeta::background(
         format!("remote-preview-sync-{}-{}", session_path, current_millis()),
         "remote_preview_sync",
-        YggSurface::Preview,
+        YggSurface::PreviewSync,
         YggTarget::Preview {
             session_path: session_path.clone(),
         },
@@ -10141,6 +10220,31 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
                 .is_some_and(|candidate_path| candidate_path == path)
         })
     });
+    let preview_loading = snapshot
+        .get("active_surface_requests")
+        .and_then(Value::as_array)
+        .is_some_and(|requests| {
+            requests.iter().any(|request| {
+                request.get("surface").and_then(Value::as_str) == Some("Preview")
+                    && match (
+                        request
+                            .get("target")
+                            .and_then(|target| target.get("kind"))
+                            .and_then(Value::as_str),
+                        request
+                            .get("target")
+                            .and_then(|target| target.get("session_path"))
+                            .and_then(Value::as_str),
+                        active_session_path.as_deref(),
+                    ) {
+                        (Some("active_session"), _, Some(_)) => true,
+                        (Some("session" | "terminal" | "preview"), Some(session_path), Some(active_path)) => {
+                            session_path == active_path
+                        }
+                        _ => false,
+                    }
+            })
+        });
     let (ready, reason) = if active_session_path.is_none() {
         (false, Some("no active session selected".to_string()))
     } else if active_view_mode == "Rendered" {
@@ -10148,7 +10252,9 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
             .get("preview_scroll_count")
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        if preview_scroll_count == 0 && document_editor_count == 0 {
+        if preview_loading {
+            (false, Some("preview still loading".to_string()))
+        } else if preview_scroll_count == 0 && document_editor_count == 0 {
             (false, Some("preview surface not mounted".to_string()))
         } else if preview_scroll_count > 0
             && preview_text_sample.is_empty()
@@ -11477,8 +11583,25 @@ fn preserve_client_focus_for_background_snapshot(
     shell: &ShellState,
     snapshot: &mut ServerUiSnapshot,
 ) {
-    let preserved_view_mode = shell.server.active_view_mode();
-    let preserved_active_path = shell.server.active_session_path().map(ToOwned::to_owned);
+    let fallback_active_path = shell.server.active_session_path();
+    let (preserved_view_mode, preserved_active_path) = if let Some(request) =
+        shell.active_surface_requests.get(&YggSurface::Terminal)
+    {
+        (
+            WorkspaceViewMode::Terminal,
+            active_request_session_target_path(request, fallback_active_path),
+        )
+    } else if let Some(request) = shell.active_surface_requests.get(&YggSurface::Preview) {
+        (
+            WorkspaceViewMode::Rendered,
+            active_request_session_target_path(request, fallback_active_path),
+        )
+    } else {
+        (
+            shell.server.active_view_mode(),
+            fallback_active_path.map(ToOwned::to_owned),
+        )
+    };
     snapshot.active_view_mode = preserved_view_mode;
     snapshot.active_session_path = preserved_active_path.clone();
     snapshot.active_session = match preserved_active_path.as_deref() {
@@ -20462,6 +20585,34 @@ mod tests {
         assert_eq!(style.padding, "0px");
         assert_eq!(style.shell_radius, "0px");
         assert_eq!(style.host_radius, "0px");
+    }
+
+    #[test]
+    fn active_request_session_target_path_prefers_explicit_session_path() {
+        let request = ActiveSurfaceRequest {
+            request_id: "req-1".to_string(),
+            operation: "open_row".to_string(),
+            target: YggTarget::Session {
+                session_path: "remote-session://jojo/preview-target".to_string(),
+            },
+        };
+        assert_eq!(
+            active_request_session_target_path(&request, Some("remote-session://jojo/old")),
+            Some("remote-session://jojo/preview-target".to_string())
+        );
+    }
+
+    #[test]
+    fn active_request_session_target_path_uses_active_fallback_for_active_session_target() {
+        let request = ActiveSurfaceRequest {
+            request_id: "req-2".to_string(),
+            operation: "expand_preview".to_string(),
+            target: YggTarget::ActiveSession,
+        };
+        assert_eq!(
+            active_request_session_target_path(&request, Some("remote-session://jojo/current")),
+            Some("remote-session://jojo/current".to_string())
+        );
     }
 
     #[test]
