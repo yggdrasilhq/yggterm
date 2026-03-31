@@ -2965,6 +2965,133 @@ fn summarize_recent_context(messages: &[yggterm_core::TranscriptMessage]) -> Str
     generation_context_from_messages(messages)
 }
 
+fn recent_context_scaffold_line(trimmed: &str) -> bool {
+    let lower = trimmed.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    [
+        "<instructions>",
+        "<cwd>",
+        "<shell>",
+        "<approval_policy>",
+        "<sandbox_mode>",
+        "<network_access>",
+        "<environment_context",
+        "</environment_context>",
+        "<collaboration_mode>",
+        "</collaboration_mode>",
+        "<permissions instructions>",
+        "</permissions instructions>",
+    ]
+    .iter()
+    .any(|marker| lower.starts_with(marker) || lower.contains(marker))
+        || lower.contains("you are now in default mode")
+        || lower.contains("agents.md instructions for")
+        || lower.contains("any previous instructions for other modes")
+        || lower.contains("default mode you should strongly prefer")
+        || lower.contains("if a decision is necessary and cannot be discovered from local context")
+        || lower.contains("request_user_input")
+        || lower.contains("filesystem sandboxing")
+        || lower.contains("approvals are your mechanism to get user consent")
+        || lower.contains("approval_policy is")
+        || lower.contains("danger-full-access")
+        || lower.contains("non-interactive mode where you may never ask the user for approval")
+        || lower.contains("<turn_aborted>")
+        || lower.contains("</turn_aborted>")
+        || lower.contains("the user interrupted the previous turn on purpose")
+        || lower.contains("any running unified exec processes were terminated")
+}
+
+fn sanitize_recent_context_payload(recent_context: &str) -> String {
+    let (goals, blocks, _sections) = parse_recent_context_sections(recent_context);
+    let goals = goals
+        .into_iter()
+        .filter_map(|goal| sanitize_recent_context_turn_content(&goal))
+        .collect::<Vec<_>>();
+    if goals.is_empty() && blocks.is_empty() {
+        return String::new();
+    }
+    let mut lines = Vec::new();
+    if !goals.is_empty() {
+        lines.push("PRIMARY USER GOALS:".to_string());
+        for goal in goals {
+            lines.push(format!("- {goal}"));
+        }
+        if !blocks.is_empty() {
+            lines.push(String::new());
+        }
+    }
+    if !blocks.is_empty() {
+        lines.push("RECENT SUBSTANTIVE TURNS:".to_string());
+        for block in blocks {
+            let label = match block.tone {
+                PreviewTone::User => "USER",
+                PreviewTone::Assistant => "ASSISTANT",
+            };
+            let text = block
+                .lines
+                .iter()
+                .map(|line| line.trim())
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !text.is_empty() {
+                lines.push(format!("{label}: {text}"));
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+fn sanitize_recent_context_turn_content(content: &str) -> Option<String> {
+    let lines = content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !recent_context_scaffold_line(line))
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return None;
+    }
+    Some(lines.join(" "))
+}
+
+fn sanitize_preview_lines(lines: Vec<String>) -> Vec<String> {
+    lines
+        .into_iter()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .filter(|line| !recent_context_scaffold_line(line))
+        .collect()
+}
+
+fn sanitize_session_preview_blocks(blocks: Vec<SessionPreviewBlock>) -> Vec<SessionPreviewBlock> {
+    blocks
+        .into_iter()
+        .filter_map(|block| {
+            let lines = sanitize_preview_lines(block.lines);
+            if lines.is_empty() {
+                return None;
+            }
+            Some(SessionPreviewBlock { lines, ..block })
+        })
+        .collect()
+}
+
+fn sanitize_snapshot_preview_blocks(blocks: Vec<SnapshotPreviewBlock>) -> Vec<SnapshotPreviewBlock> {
+    blocks
+        .into_iter()
+        .filter_map(|block| {
+            let lines = sanitize_preview_lines(block.lines);
+            if lines.is_empty() {
+                return None;
+            }
+            Some(SnapshotPreviewBlock { lines, ..block })
+        })
+        .collect()
+}
+
 fn parse_recent_context_sections(
     recent_context: &str,
 ) -> (Vec<String>, Vec<SessionPreviewBlock>, Vec<SessionRenderedSection>) {
@@ -2982,12 +3109,16 @@ fn parse_recent_context_sections(
         tone: PreviewTone,
         content: &str,
     ) {
-        let compact = content
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .trim()
-            .to_string();
+        let Some(compact) = sanitize_recent_context_turn_content(content).map(|content| {
+            content
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .trim()
+                .to_string()
+        }) else {
+            return;
+        };
         if compact.is_empty() {
             return;
         }
@@ -3137,10 +3268,8 @@ fn apply_remote_scanned_session_preview(
     }
     let (primary_goals, preview_blocks, rendered_sections) =
         parse_recent_context_sections(&scanned.recent_context);
-    if !preview_blocks.is_empty() {
-        session.preview.blocks = preview_blocks;
-        session.rendered_sections = rendered_sections;
-    }
+    session.preview.blocks = preview_blocks;
+    session.rendered_sections = rendered_sections;
     let messages = format!(
         "{} user · {} assistant",
         scanned.user_message_count, scanned.assistant_message_count
@@ -3216,9 +3345,7 @@ fn apply_remote_preview_payload(session: &mut ManagedSessionView, payload: Remot
                 value: entry.value,
             })
             .collect(),
-        blocks: payload
-            .preview
-            .blocks
+        blocks: sanitize_snapshot_preview_blocks(payload.preview.blocks)
             .into_iter()
             .map(|block| SessionPreviewBlock {
                 role: leak_label(block.role),
@@ -3464,11 +3591,51 @@ def summarize(path):
     user_count = 0
     assistant_count = 0
     snippets = []
+    def is_scaffold_line(text):
+        lower = (text or "").strip().lower()
+        if not lower:
+            return False
+        markers = (
+            "<instructions>",
+            "<cwd>",
+            "<shell>",
+            "<approval_policy>",
+            "<sandbox_mode>",
+            "<network_access>",
+            "<environment_context",
+            "</environment_context>",
+            "<collaboration_mode>",
+            "</collaboration_mode>",
+            "<permissions instructions>",
+            "</permissions instructions>",
+        )
+        return (
+            any(marker in lower for marker in markers)
+            or "you are now in default mode" in lower
+            or "agents.md instructions for" in lower
+            or "any previous instructions for other modes" in lower
+            or "default mode you should strongly prefer" in lower
+            or "if a decision is necessary and cannot be discovered from local context" in lower
+            or "request_user_input" in lower
+            or "filesystem sandboxing" in lower
+            or "approvals are your mechanism to get user consent" in lower
+            or "approval_policy is" in lower
+            or "danger-full-access" in lower
+            or "non-interactive mode where you may never ask the user for approval" in lower
+            or "<turn_aborted>" in lower
+            or "</turn_aborted>" in lower
+            or "the user interrupted the previous turn on purpose" in lower
+            or "any running unified exec processes were terminated" in lower
+        )
     def normalize_lines(text):
         if not text:
             return []
         if isinstance(text, str):
-            return [line.strip() for line in text.splitlines() if line.strip()]
+            return [
+                line.strip()
+                for line in text.splitlines()
+                if line.strip() and not is_scaffold_line(line)
+            ]
         return []
     def extract_lines(payload):
         lines = []
@@ -3493,12 +3660,14 @@ def summarize(path):
         return lines
     def push_message(payload):
         role = payload.get("role") or "assistant"
-        if role in ("user", "developer"):
+        if role == "developer":
+            return
+        if role == "user":
             label = "USER"
         elif role == "assistant":
             label = "ASSISTANT"
         else:
-            label = "SYSTEM"
+            return
         lines = extract_lines(payload)
         if lines:
             snippets.append(f"{label}: {' '.join(lines)}")
@@ -3525,7 +3694,7 @@ def summarize(path):
                     payload = value.get("payload") or {}
                     if payload.get("type") == "message":
                         role = payload.get("role")
-                        if role in ("user", "developer"):
+                        if role == "user":
                             user_count += 1
                         elif role == "assistant":
                             assistant_count += 1
@@ -3536,7 +3705,7 @@ def summarize(path):
                         if (msg or {}).get("type") != "message":
                             continue
                         role = msg.get("role")
-                        if role in ("user", "developer"):
+                        if role == "user":
                             user_count += 1
                         elif role == "assistant":
                             assistant_count += 1
@@ -4180,6 +4349,7 @@ fn should_fallback_to_python(error: &anyhow::Error) -> bool {
         || message.contains("permission denied")
         || message.contains("cannot execute")
         || message.contains("Exec format error")
+        || message.contains("failed to upload yggterm binary")
         || message.contains("yggterm-headless only supports server subcommands")
         || message.contains("remote yggterm command failed")
 }
@@ -4617,6 +4787,7 @@ print(path)
 fn scan_remote_machine_sessions(
     target: &SshConnectTarget,
 ) -> anyhow::Result<Vec<RemoteScannedSession>> {
+    let python_args = [String::from("~/.codex")];
     let lines = match run_remote_yggterm_command(
         &target.ssh_target,
         target.prefix.as_deref(),
@@ -4624,19 +4795,27 @@ fn scan_remote_machine_sessions(
         None,
     ) {
         Ok(output) => output.lines().map(str::to_string).collect::<Vec<_>>(),
-        Err(error) if !should_fallback_to_python(&error) => return Err(error),
-        Err(_) => run_remote_python_lines(
+        Err(error) => match run_remote_python_lines(
             &target.ssh_target,
             target.prefix.as_deref(),
             REMOTE_SCAN_SCRIPT,
-            &[String::from("~/.codex")],
-        )?,
+            &python_args,
+        ) {
+            Ok(lines) => lines,
+            Err(_python_error) if !should_fallback_to_python(&error) => return Err(error),
+            Err(python_error) => {
+                return Err(python_error).with_context(|| {
+                    format!("remote yggterm scan failed before python fallback: {error:#}")
+                });
+            }
+        },
     };
     let machine_key = machine_key_from_ssh_target(&target.ssh_target);
     let mut sessions = Vec::new();
     for line in lines {
         let summary: RemoteSummaryLine =
             serde_json::from_str(&line).context("invalid remote summary line")?;
+        let sanitized_recent_context = sanitize_recent_context_payload(&summary.recent_context);
         sessions.push(RemoteScannedSession {
             session_path: remote_scanned_session_path(&machine_key, &summary.id),
             session_id: summary.id.clone(),
@@ -4650,7 +4829,7 @@ fn scan_remote_machine_sessions(
                 .title_hint
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| short_session_id(&summary.id)),
-            recent_context: summary.recent_context,
+            recent_context: sanitized_recent_context,
             cached_precis: summary
                 .cached_precis
                 .filter(|value| !value.trim().is_empty()),
@@ -5723,6 +5902,7 @@ fn snapshot_preview_block(block: SessionPreviewBlock) -> SnapshotPreviewBlock {
 }
 
 fn snapshot_session_view(session: ManagedSessionView) -> SnapshotSessionView {
+    let preview_blocks = sanitize_session_preview_blocks(session.preview.blocks);
     SnapshotSessionView {
         id: session.id,
         session_path: session.session_path,
@@ -5747,9 +5927,7 @@ fn snapshot_session_view(session: ManagedSessionView) -> SnapshotSessionView {
             .collect(),
         preview: SnapshotPreview {
             summary: snapshot_metadata_entries(&session.preview.summary),
-            blocks: session
-                .preview
-                .blocks
+            blocks: preview_blocks
                 .into_iter()
                 .map(snapshot_preview_block)
                 .collect(),
@@ -5773,6 +5951,7 @@ fn leak_label(value: String) -> &'static str {
 }
 
 fn managed_session_from_snapshot(session: SnapshotSessionView) -> ManagedSessionView {
+    let preview_blocks = sanitize_snapshot_preview_blocks(session.preview.blocks);
     ManagedSessionView {
         id: session.id,
         session_path: session.session_path,
@@ -5805,9 +5984,7 @@ fn managed_session_from_snapshot(session: SnapshotSessionView) -> ManagedSession
                     value: entry.value,
                 })
                 .collect(),
-            blocks: session
-                .preview
-                .blocks
+            blocks: preview_blocks
                 .into_iter()
                 .map(|block| SessionPreviewBlock {
                     role: leak_label(block.role),
@@ -7132,6 +7309,10 @@ fn push_preview_block(
     lines: Vec<String>,
     timestamp: String,
 ) {
+    let lines = match role {
+        TranscriptRole::System => Vec::new(),
+        TranscriptRole::User | TranscriptRole::Assistant => sanitize_preview_lines(lines),
+    };
     if lines.is_empty() {
         return;
     }
@@ -7347,23 +7528,27 @@ fn short_session_id(session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        GhosttyHostSupport, PersistedDaemonState, PersistedLiveSession, REMOTE_OUTPUT_SENTINEL,
-        PreviewTone, RemoteCommandCacheEntry, RemoteDeployState, RemoteMachineHealth,
-        RemoteMachineSnapshot, RemoteScannedSession, SessionKind, SessionNode, SessionNodeKind,
-        SshConnectTarget, TerminalBackend, TerminalLaunchPhase, UiTheme, WorkspaceViewMode,
+        GhosttyHostSupport, GhosttyTerminalHostMode, PersistedDaemonState, PersistedLiveSession,
+        REMOTE_OUTPUT_SENTINEL, PreviewTone, RemoteCommandCacheEntry, RemoteDeployState,
+        RemoteMachineHealth, RemoteMachineSnapshot, RemotePreviewPayload, RemoteScannedSession,
+        SessionKind, SessionNode, SessionNodeKind, SessionSource, SnapshotPreview,
+        SnapshotPreviewBlock, SnapshotRenderedSection, SnapshotSessionView, SshConnectTarget,
+        TerminalBackend, TerminalLaunchPhase, UiTheme, WorkspaceViewMode,
         YggtermServer, current_millis_u64,
+        apply_remote_preview_payload,
         dedupe_remote_scanned_sessions, load_remote_machine_sessions_from_mirror,
-        mirror_remote_machine_sessions, parse_screen_session_ref, parse_stored_transcript,
-        parse_recent_context_sections, remote_cache_key, remote_command_cache,
-        remote_resume_shell_command, remote_saved_codex_session_exists,
-        remote_scan_roots_with_parents, remote_scanned_session_path,
-        remote_ssh_launch_command, should_fallback_to_python, stored_session_launch_command,
-        strip_remote_payload_noise,
+        managed_session_from_snapshot, mirror_remote_machine_sessions, parse_screen_session_ref,
+        parse_stored_transcript, parse_recent_context_sections, remote_cache_key,
+        remote_command_cache, remote_resume_shell_command, remote_saved_codex_session_exists,
+        remote_scan_roots_with_parents, remote_scanned_session_path, remote_ssh_launch_command,
+        sanitize_recent_context_payload, should_fallback_to_python, stored_session_launch_command,
+        strip_remote_payload_noise, push_preview_block,
         synthesize_remote_scanned_session_view,
     };
     use anyhow::Result;
     use std::fs;
     use std::path::PathBuf;
+    use yggterm_core::TranscriptRole;
 
     #[test]
     fn parse_stored_transcript_counts_compacted_replacement_history() -> Result<()> {
@@ -7634,6 +7819,219 @@ mod tests {
         assert_eq!(blocks[1].tone, PreviewTone::Assistant);
         assert_eq!(sections.len(), 1);
         assert_eq!(sections[0].title, "Primary User Goals");
+    }
+
+    #[test]
+    fn recent_context_scaffold_lines_are_filtered_out_of_preview_turns() {
+        let (_goals, blocks, _sections) = parse_recent_context_sections(
+            "RECENT SUBSTANTIVE TURNS:\nUSER: # AGENTS.md instructions for /home/pi <INSTRUCTIONS> ## Skills ...\nUSER: <cwd>/home/pi</cwd>\nUSER: <shell>bash</shell>\nUSER: <approval_policy>never</approval_policy>\nUSER: Approvals are your mechanism to get user consent to run shell commands without the sandbox.\nUSER: <turn_aborted> The user interrupted the previous turn on purpose. Any running unified exec processes were terminated. </turn_aborted>\nUSER: I launched excel but it is a blank window.\nASSISTANT: You are now in Default mode. Any previous instructions for other modes (e.g. Plan mode) are no longer active.\nASSISTANT: I’m going to inspect the launch output and the window state.",
+        );
+
+        assert_eq!(blocks.len(), 2, "unexpected preview blocks: {blocks:?}");
+        assert_eq!(blocks[0].tone, PreviewTone::User);
+        assert_eq!(blocks[0].lines, vec!["I launched excel but it is a blank window.".to_string()]);
+        assert_eq!(blocks[1].tone, PreviewTone::Assistant);
+        assert_eq!(
+            blocks[1].lines,
+            vec!["I’m going to inspect the launch output and the window state.".to_string()]
+        );
+    }
+
+    #[test]
+    fn sanitize_recent_context_payload_rewrites_scaffolded_remote_summaries() {
+        let text = sanitize_recent_context_payload(
+            "PRIMARY USER GOALS:\n- Keep the real user request.\n- <turn_aborted> The user interrupted the previous turn on purpose. Any running unified exec processes were terminated. </turn_aborted>\n\nRECENT SUBSTANTIVE TURNS:\nUSER: Approvals are your mechanism to get user consent to run shell commands without the sandbox.\nUSER: # AGENTS.md instructions for /home/pi <INSTRUCTIONS> ...\nUSER: I launched excel but it is a blank window.\nASSISTANT: I’m sorry, but I can’t help with that.",
+        );
+        assert!(text.contains("Keep the real user request."));
+        assert!(text.contains("USER: I launched excel but it is a blank window."));
+        assert!(text.contains("ASSISTANT: I’m sorry, but I can’t help with that."));
+        assert!(!text.contains("Approvals are your mechanism"));
+        assert!(!text.contains("AGENTS.md instructions for"));
+        assert!(!text.contains("<turn_aborted>"));
+    }
+
+    #[test]
+    fn stored_transcript_preview_blocks_filter_scaffold_and_system_messages() {
+        let mut blocks = Vec::new();
+        let mut metadata_entries = Vec::new();
+        let mut user_messages = 0;
+        let mut assistant_messages = 0;
+
+        push_preview_block(
+            &mut blocks,
+            &mut metadata_entries,
+            &mut user_messages,
+            &mut assistant_messages,
+            TranscriptRole::User,
+            vec![
+                "<cwd>/home/pi</cwd>".to_string(),
+                "<shell>bash</shell>".to_string(),
+                "# AGENTS.md instructions for /home/pi <INSTRUCTIONS> ## Skills ...".to_string(),
+                "Approvals are your mechanism to get user consent to run shell commands without the sandbox.".to_string(),
+                "<turn_aborted> The user interrupted the previous turn on purpose. Any running unified exec processes were terminated. </turn_aborted>".to_string(),
+                "I launched excel but it is a blank window.".to_string(),
+            ],
+            "Feb 07, 2026 08:41 PM UTC+0530".to_string(),
+        );
+        push_preview_block(
+            &mut blocks,
+            &mut metadata_entries,
+            &mut user_messages,
+            &mut assistant_messages,
+            TranscriptRole::System,
+            vec!["You are now in Default mode.".to_string()],
+            "Feb 07, 2026 08:43 PM UTC+0530".to_string(),
+        );
+
+        assert_eq!(user_messages, 1);
+        assert_eq!(assistant_messages, 0);
+        assert_eq!(blocks.len(), 1, "unexpected preview blocks: {blocks:?}");
+        assert_eq!(
+            blocks[0].lines,
+            vec!["I launched excel but it is a blank window.".to_string()]
+        );
+    }
+
+    #[test]
+    fn remote_preview_payload_apply_filters_scaffold_from_older_remote_binaries() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.open_or_focus_session(
+            SessionKind::Codex,
+            "remote-session://jojo/test",
+            Some("test-session"),
+            Some("/home/pi"),
+            Some("Test Session"),
+            None,
+        );
+
+        let payload = RemotePreviewPayload {
+            title_hint: Some("Test Session".to_string()),
+            cached_precis: None,
+            cached_summary: None,
+            preview: SnapshotPreview {
+                summary: Vec::new(),
+                blocks: vec![
+                    SnapshotPreviewBlock {
+                        role: "USER".to_string(),
+                        timestamp: "Feb 07, 2026 02:56 PM UTC+0530".to_string(),
+                        tone: PreviewTone::User,
+                        folded: false,
+                        lines: vec![
+                            "<cwd>/home/pi</cwd>".to_string(),
+                            "<shell>bash</shell>".to_string(),
+                            "I launched excel but it is a blank window.".to_string(),
+                        ],
+                    },
+                    SnapshotPreviewBlock {
+                        role: "USER".to_string(),
+                        timestamp: "Feb 07, 2026 02:59 PM UTC+0530".to_string(),
+                        tone: PreviewTone::User,
+                        folded: false,
+                        lines: vec![
+                            "You are now in Default mode.".to_string(),
+                            "</collaboration_mode>".to_string(),
+                        ],
+                    },
+                ],
+            },
+            rendered_sections: vec![SnapshotRenderedSection {
+                title: "Recent Context".to_string(),
+                lines: vec!["placeholder".to_string()],
+            }],
+        };
+
+        let session = server
+            .sessions
+            .get_mut("remote-session://jojo/test")
+            .expect("session");
+        apply_remote_preview_payload(session, payload);
+
+        assert_eq!(session.preview.blocks.len(), 1, "{:?}", session.preview.blocks);
+        assert_eq!(
+            session.preview.blocks[0].lines,
+            vec!["I launched excel but it is a blank window.".to_string()]
+        );
+    }
+
+    #[test]
+    fn managed_session_from_snapshot_filters_scaffold_preview_blocks() {
+        let session = managed_session_from_snapshot(SnapshotSessionView {
+            id: "019c38a8-e725-7cc0-81ed-db9595254739".to_string(),
+            session_path: "remote-session://jojo/019c38a8-e725-7cc0-81ed-db9595254739".to_string(),
+            title: "Router issue".to_string(),
+            kind: SessionKind::Codex,
+            host_label: "jojo".to_string(),
+            source: SessionSource::Stored,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::Ready,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: Vec::new(),
+            rendered_sections: Vec::new(),
+            preview: SnapshotPreview {
+                summary: Vec::new(),
+                blocks: vec![
+                    SnapshotPreviewBlock {
+                        role: "USER".to_string(),
+                        timestamp: "Feb 07, 2026 08:41 PM UTC+0530".to_string(),
+                        tone: PreviewTone::User,
+                        folded: false,
+                        lines: vec![
+                            "<cwd>/home/pi</cwd>".to_string(),
+                            "<shell>bash</shell>".to_string(),
+                            "Just 30 mins ago, no client can connect with my GL-iNet router."
+                                .to_string(),
+                        ],
+                    },
+                    SnapshotPreviewBlock {
+                        role: "USER".to_string(),
+                        timestamp: "Feb 07, 2026 08:43 PM UTC+0530".to_string(),
+                        tone: PreviewTone::User,
+                        folded: false,
+                        lines: vec![
+                            "You are now in Default mode.".to_string(),
+                            "If a decision is necessary and cannot be discovered from local context, ask the user directly.".to_string(),
+                            "</collaboration_mode>".to_string(),
+                        ],
+                    },
+                ],
+            },
+            metadata: Vec::new(),
+            terminal_process_id: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+        });
+
+        assert_eq!(session.preview.blocks.len(), 1, "{:?}", session.preview.blocks);
+        assert_eq!(
+            session.preview.blocks[0].lines,
+            vec!["Just 30 mins ago, no client can connect with my GL-iNet router.".to_string()]
+        );
     }
 
     #[test]
