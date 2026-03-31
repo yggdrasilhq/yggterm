@@ -4082,7 +4082,9 @@ fn maybe_spawn_missing_remote_machine_refreshes(state: Signal<ShellState>) {
         state,
         "maybe_spawn_missing_remote_machine_refreshes_gate",
         |shell| {
-            terminal_attach_blocks_background_work(shell) || background_refreshes_deferred(shell)
+            terminal_attach_blocks_background_work(shell)
+                || background_refreshes_deferred(shell)
+                || interactive_surface_request_in_flight(shell)
         },
     )
     .unwrap_or(false)
@@ -4093,7 +4095,9 @@ fn maybe_spawn_missing_remote_machine_refreshes(state: Signal<ShellState>) {
         state,
         "maybe_spawn_missing_remote_machine_refreshes_read",
         |shell| {
-            if terminal_attach_blocks_background_work(shell) || background_refreshes_deferred(shell)
+            if terminal_attach_blocks_background_work(shell)
+                || background_refreshes_deferred(shell)
+                || interactive_surface_request_in_flight(shell)
             {
                 return Vec::new();
             }
@@ -4143,7 +4147,9 @@ fn maybe_spawn_missing_managed_cli_refreshes(state: Signal<ShellState>) {
         state,
         "maybe_spawn_missing_managed_cli_refreshes_gate",
         |shell| {
-            terminal_attach_blocks_background_work(shell) || background_refreshes_deferred(shell)
+            terminal_attach_blocks_background_work(shell)
+                || background_refreshes_deferred(shell)
+                || interactive_surface_request_in_flight(shell)
         },
     )
     .unwrap_or(false)
@@ -4154,7 +4160,9 @@ fn maybe_spawn_missing_managed_cli_refreshes(state: Signal<ShellState>) {
         state,
         "maybe_spawn_missing_managed_cli_refreshes_read",
         |shell| {
-            if terminal_attach_blocks_background_work(shell) || background_refreshes_deferred(shell)
+            if terminal_attach_blocks_background_work(shell)
+                || background_refreshes_deferred(shell)
+                || interactive_surface_request_in_flight(shell)
             {
                 return Vec::new();
             }
@@ -4197,6 +4205,15 @@ fn terminal_attach_blocks_background_work(shell: &ShellState) -> bool {
     };
     active_path.starts_with("remote-session://")
         && shell.terminal_attach_in_flight.contains(active_path)
+}
+
+fn interactive_surface_request_in_flight(shell: &ShellState) -> bool {
+    shell.active_surface_requests.values().any(|request| {
+        !matches!(
+            request.operation.as_str(),
+            "refresh_remote_machine" | "refresh_managed_cli" | "remote_preview_sync"
+        )
+    })
 }
 
 fn background_refreshes_deferred(shell: &ShellState) -> bool {
@@ -4341,12 +4358,14 @@ fn spawn_background_remote_machine_refresh(state: Signal<ShellState>, machine_ke
             shell.remote_machine_refresh_requests.remove(&machine_key);
             match outcome {
                 Ok(Ok((mut snapshot, message))) => {
-                    if terminal_attach_blocks_background_work(shell) {
+                    if terminal_attach_blocks_background_work(shell)
+                        || interactive_surface_request_in_flight(shell)
+                    {
                         shell
                             .remote_machine_refresh_retry_after_ms
                             .insert(machine_key.clone(), current_millis() + 2_000);
                         shell.last_action = format!(
-                            "deferred {machine_key} refresh until terminal attach completes"
+                            "deferred {machine_key} refresh until interactive work settles"
                         );
                         return;
                     }
@@ -12614,7 +12633,6 @@ fn app() -> Element {
     let maximized = snapshot.maximized;
     let fullscreen = snapshot.fullscreen;
     let shell_radius = if maximized { 0 } else { 11 };
-    let shell_backdrop = shell_backdrop_style(maximized);
     let context_menu_overlay = snapshot.context_menu_row.clone().map(|row| {
         let context_row = resolve_creation_context_row(&snapshot.rows, &row);
         (row, context_row)
@@ -12626,9 +12644,8 @@ fn app() -> Element {
             tabindex: "0",
             style: format!(
                 "position: fixed; inset: 0; overflow: hidden; border-radius:{}px; \
-                 background-color:{}; background-image:{}; backdrop-filter:{}; \
-                 -webkit-backdrop-filter:{};",
-                shell_radius, snapshot.shell_tint, snapshot.shell_gradient, shell_backdrop, shell_backdrop
+                 background:rgba(205, 217, 229, 0.7); box-shadow:inset 0 0 0 1px rgba(255,255,255,0.42);",
+                shell_radius
             ),
             onclick: move |_| {
                 state.with_mut(|shell| {
@@ -14479,7 +14496,10 @@ fn SidebarRow(
                     }
                 }
             }
-            if row.kind == BrowserRowKind::Group && !row.detail_label.is_empty() {
+            if row.kind == BrowserRowKind::Group
+                && machine_health.is_none()
+                && !row.detail_label.is_empty()
+            {
                 div {
                     style: format!(
                         "font-size:11px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
@@ -19987,10 +20007,12 @@ fn shell_style(
     maximized: bool,
 ) -> String {
     let backdrop = shell_backdrop_style(maximized);
+    let frame_inset = if maximized { 0 } else { 1 };
     format!(
-        "position:fixed; inset:0; display:flex; flex-direction:column; overflow:hidden; \
+        "position:fixed; inset:{}px; display:flex; flex-direction:column; overflow:hidden; \
          border-radius:{}px; background-color:{}; background-image:{}; box-shadow:{}; backdrop-filter:{}; \
          -webkit-backdrop-filter:{}; font-family:{};",
+        frame_inset,
         radius,
         shell_tint,
         shell_gradient,
