@@ -11,7 +11,8 @@ use yggterm_core::resolve_yggterm_home;
 use yggterm_server::{
     SessionKind, YGG_LOADING_NOTIFICATION_AFTER_MS, YggEventEnvelope, YggEventKind, YggProgress,
     YggRequestMeta, YggSurface, YggTarget, default_endpoint, ping, refresh_remote_machine,
-    request_terminal_launch, shutdown, snapshot, start_local_session_at, status,
+    request_terminal_launch, shutdown, snapshot, start_local_session_at, status, terminal_ensure,
+    terminal_read, terminal_write,
 };
 
 fn remote_machine_details_json(snap: &yggterm_server::ServerUiSnapshot) -> serde_json::Value {
@@ -61,6 +62,7 @@ enum Scenario {
     Status,
     Snapshot,
     RefreshRemote,
+    TerminalFootprint,
     DisconnectSafe,
     ReconnectCheck,
     GracefulShutdown,
@@ -74,6 +76,7 @@ impl Scenario {
             Self::Status => "status",
             Self::Snapshot => "snapshot",
             Self::RefreshRemote => "refresh_remote",
+            Self::TerminalFootprint => "terminal_footprint",
             Self::DisconnectSafe => "disconnect_safe",
             Self::ReconnectCheck => "reconnect_check",
             Self::GracefulShutdown => "graceful_shutdown",
@@ -93,6 +96,8 @@ struct Config {
     title_hint: Option<String>,
     expect_path: Option<String>,
     machine_key: Option<String>,
+    session_count: usize,
+    burst_bytes: usize,
 }
 
 fn main() -> Result<()> {
@@ -117,6 +122,8 @@ fn parse_args(args: Vec<String>) -> Result<Config> {
     let mut title_hint = None::<String>;
     let mut expect_path = None::<String>;
     let mut machine_key = None::<String>;
+    let mut session_count = 23usize;
+    let mut burst_bytes = 512 * 1024usize;
 
     let mut ix = 0usize;
     while ix < args.len() {
@@ -130,6 +137,7 @@ fn parse_args(args: Vec<String>) -> Result<Config> {
                     "status" => Scenario::Status,
                     "snapshot" => Scenario::Snapshot,
                     "refresh-remote" => Scenario::RefreshRemote,
+                    "terminal-footprint" => Scenario::TerminalFootprint,
                     "disconnect-safe" => Scenario::DisconnectSafe,
                     "reconnect-check" => Scenario::ReconnectCheck,
                     "graceful-shutdown" => Scenario::GracefulShutdown,
@@ -206,6 +214,22 @@ fn parse_args(args: Vec<String>) -> Result<Config> {
                         .to_string(),
                 );
             }
+            "--session-count" => {
+                ix += 1;
+                session_count = args
+                    .get(ix)
+                    .context("missing value after --session-count")?
+                    .parse()
+                    .context("invalid --session-count value")?;
+            }
+            "--burst-bytes" => {
+                ix += 1;
+                burst_bytes = args
+                    .get(ix)
+                    .context("missing value after --burst-bytes")?
+                    .parse()
+                    .context("invalid --burst-bytes value")?;
+            }
             other => bail!("unknown argument: {other}"),
         }
         ix += 1;
@@ -222,6 +246,8 @@ fn parse_args(args: Vec<String>) -> Result<Config> {
         title_hint,
         expect_path,
         machine_key,
+        session_count,
+        burst_bytes,
     })
 }
 
@@ -319,6 +345,44 @@ fn run_scenario(
                 "machine_key": machine_key,
                 "health": machine.map(|machine| &machine.health),
                 "session_count": machine.map(|machine| machine.sessions.len()).unwrap_or_default(),
+            }))
+        }
+        Scenario::TerminalFootprint => {
+            ping(endpoint)?;
+            let mut session_paths = Vec::new();
+            for ix in 0..cfg.session_count {
+                let (snap, _) = start_local_session_at(
+                    endpoint,
+                    SessionKind::Shell,
+                    cfg.cwd.as_deref(),
+                    Some(&format!("mock footprint {}", ix + 1)),
+                )?;
+                let session_path = snap
+                    .active_session_path
+                    .clone()
+                    .context("terminal-footprint scenario did not produce an active session")?;
+                let _ = request_terminal_launch(endpoint)?;
+                let _ = terminal_ensure(endpoint, &session_path)?;
+                let command = format!(
+                    "head -c {bytes} /dev/zero | tr '\\\\000' x; printf '\\\\n'\n",
+                    bytes = cfg.burst_bytes
+                );
+                let _ = terminal_write(endpoint, &session_path, &command)?;
+                std::thread::sleep(Duration::from_millis(80));
+                let _ = terminal_read(endpoint, &session_path, 0)?;
+                session_paths.push(session_path);
+            }
+            std::thread::sleep(Duration::from_millis(250));
+            let daemon_status = status(endpoint)?;
+            Ok(json!({
+                "session_paths": session_paths,
+                "requested_session_count": cfg.session_count,
+                "burst_bytes": cfg.burst_bytes,
+                "terminal_session_count": daemon_status.terminal_session_count,
+                "terminal_retained_chunks": daemon_status.terminal_retained_chunks,
+                "terminal_retained_bytes": daemon_status.terminal_retained_bytes,
+                "terminal_session_buffer_limit_bytes": daemon_status.terminal_session_buffer_limit_bytes,
+                "terminal_idle_buffer_limit_bytes": daemon_status.terminal_idle_buffer_limit_bytes,
             }))
         }
         Scenario::DisconnectSafe => {
