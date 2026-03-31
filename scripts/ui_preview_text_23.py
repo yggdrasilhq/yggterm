@@ -61,14 +61,29 @@ def preview_payload(state: dict) -> dict:
 def normalized_visible_signature(state: dict) -> list[dict]:
     preview = preview_payload(state)
     signature = []
-    for entry in preview.get("visible_entries") or []:
+    visible_entries = list(preview.get("visible_entries") or [])
+    if visible_entries:
+        for entry in visible_entries:
+            signature.append(
+                {
+                    "tone": entry.get("tone"),
+                    "text": (entry.get("text") or "").strip(),
+                    "height": entry.get("height"),
+                    "top": entry.get("top"),
+                    "block_ix": entry.get("block_ix"),
+                }
+            )
+        return signature
+    for index, section in enumerate(preview.get("rendered_sections") or []):
+        lines = [line.strip() for line in (section.get("lines") or []) if line and line.strip()]
+        text = "\n".join(([section.get("title") or ""] + lines)).strip()
         signature.append(
             {
-                "tone": entry.get("tone"),
-                "text": (entry.get("text") or "").strip(),
-                "height": entry.get("height"),
-                "top": entry.get("top"),
-                "block_ix": entry.get("block_ix"),
+                "tone": "section",
+                "text": text,
+                "height": section.get("height"),
+                "top": section.get("top"),
+                "block_ix": -(index + 1),
             }
         )
     return signature
