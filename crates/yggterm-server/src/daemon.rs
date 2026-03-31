@@ -9,6 +9,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{
@@ -24,8 +26,9 @@ use yggterm_core::{
 
 pub const SERVER_PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BACKGROUND_COPY_CHORE_MS: u64 = 12_000;
+const BACKGROUND_COPY_MAX_IDLE_CHORE_MS: u64 = 60_000;
 const BACKGROUND_COPY_BUDGET_PER_TICK: usize = 23;
-const DAEMON_ACCEPT_POLL_MS: u64 = 200;
+const DAEMON_ACCEPT_POLL_MS: u64 = 1000;
 const DEFAULT_DAEMON_IDLE_SHUTDOWN_MS: u64 = 90_000;
 const DEFAULT_TERMINAL_IDLE_TRIM_AFTER_MS: u64 = 45_000;
 
@@ -1034,6 +1037,31 @@ fn daemon_should_idle_shutdown(
     }
 }
 
+#[cfg(unix)]
+fn wait_for_listener_ready(fd: i32, timeout_ms: u64) -> Result<bool> {
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout_ms = i32::try_from(timeout_ms).unwrap_or(i32::MAX);
+    loop {
+        // SAFETY: `pollfd` points to valid memory for one file descriptor descriptor.
+        let rc = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+        if rc > 0 {
+            return Ok(true);
+        }
+        if rc == 0 {
+            return Ok(false);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err).context("polling daemon listener");
+    }
+}
+
 fn server_request_name(request: &ServerRequest) -> &'static str {
     match request {
         ServerRequest::Ping => "ping",
@@ -1515,15 +1543,24 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
         let runtime = runtime.clone();
         let last_activity_ms = last_activity_ms.clone();
         std::thread::spawn(move || {
+            let mut sleep_ms = BACKGROUND_COPY_CHORE_MS;
             loop {
-                std::thread::sleep(std::time::Duration::from_millis(BACKGROUND_COPY_CHORE_MS));
+                std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
                 match run_background_copy_chore(&runtime) {
                     Ok(update_count) => {
                         if update_count > 0 {
                             mark_daemon_activity(&last_activity_ms);
+                            sleep_ms = BACKGROUND_COPY_CHORE_MS;
+                        } else {
+                            sleep_ms =
+                                (sleep_ms.saturating_mul(2)).min(BACKGROUND_COPY_MAX_IDLE_CHORE_MS);
                         }
                     }
-                    Err(error) => warn!(error=%error, "daemon background copy chore failed"),
+                    Err(error) => {
+                        sleep_ms =
+                            (sleep_ms.saturating_mul(2)).min(BACKGROUND_COPY_MAX_IDLE_CHORE_MS);
+                        warn!(error=%error, "daemon background copy chore failed");
+                    }
                 }
             }
         });
@@ -1616,7 +1653,7 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                         info!(path=%path.display(), idle_shutdown_ms, "yggterm daemon idle shutdown");
                         break;
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(DAEMON_ACCEPT_POLL_MS));
+                    let _ = wait_for_listener_ready(listener.as_raw_fd(), DAEMON_ACCEPT_POLL_MS)?;
                 }
                 Err(error) => return Err(error).context("accepting daemon client"),
             }
@@ -1671,7 +1708,17 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                             info!(host=%host, port, idle_shutdown_ms, "yggterm daemon idle shutdown");
                             break;
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(DAEMON_ACCEPT_POLL_MS));
+                        #[cfg(unix)]
+                        {
+                            let _ =
+                                wait_for_listener_ready(listener.as_raw_fd(), DAEMON_ACCEPT_POLL_MS)?;
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(
+                                DAEMON_ACCEPT_POLL_MS,
+                            ));
+                        }
                     }
                     Err(error) => return Err(error).context("accepting daemon client"),
                 }
