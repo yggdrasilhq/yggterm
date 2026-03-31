@@ -58,8 +58,8 @@ use yggterm_core::{
     PerfSpan, SessionNode, SessionNodeKind, SessionStore, SessionTitleStore, TranscriptRole,
     UiTheme, WorkspaceDocument, WorkspaceDocumentKind, append_trace_event, event_trace_path,
     follow_trace_lines, generation_context_from_messages, looks_like_generated_fallback_title,
-    read_codex_session_identity_fields, read_codex_transcript_messages, read_trace_tail,
-    resolve_yggterm_home,
+    read_codex_session_identity_fields, read_codex_transcript_messages,
+    read_codex_transcript_messages_limited, read_trace_tail, resolve_yggterm_home,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +69,7 @@ pub enum WorkspaceViewMode {
 }
 
 const REMOTE_COMMAND_CACHE_VERIFY_TTL_MS: u64 = 60_000;
+const REMOTE_PREVIEW_HEAD_BLOCKS: usize = 8;
 
 #[derive(Debug, Clone)]
 struct RemoteCommandCacheEntry {
@@ -1688,13 +1689,6 @@ impl YggtermServer {
                         &machine.label,
                         &target.ssh_target,
                     );
-                    if !launch_terminal && !scanned.storage_path.trim().is_empty() {
-                        if let Ok(payload) =
-                            fetch_remote_preview_payload(&preview_target, &scanned.storage_path)
-                        {
-                            apply_remote_preview_payload(session, payload);
-                        }
-                    }
                 }
             }
             if launch_terminal {
@@ -1702,6 +1696,26 @@ impl YggtermServer {
             } else {
                 self.active_session_path = Some(session_path.clone());
                 self.active_view_mode = WorkspaceViewMode::Rendered;
+            }
+            if !launch_terminal
+                && let Some(scanned) = machine
+                    .sessions
+                    .iter()
+                    .find(|scanned| scanned.session_id == session_id)
+                && !scanned.storage_path.trim().is_empty()
+                && let Ok(payload) = fetch_remote_preview_head_payload(
+                    &preview_target,
+                    &scanned.storage_path,
+                    REMOTE_PREVIEW_HEAD_BLOCKS,
+                )
+                && let Some(session) = self.sessions.get_mut(&session_path)
+            {
+                apply_remote_preview_payload(session, payload);
+                upsert_session_metadata(
+                    &mut session.metadata,
+                    "Preview Hydration",
+                    "head".to_string(),
+                );
             }
             if launch_terminal {
                 self.request_terminal_launch_for_path(&session_path);
@@ -1783,13 +1797,6 @@ impl YggtermServer {
                     &machine.label,
                     &target.ssh_target,
                 );
-                if !launch_terminal && !scanned.storage_path.trim().is_empty() {
-                    if let Ok(payload) =
-                        fetch_remote_preview_payload(&preview_target, &scanned.storage_path)
-                    {
-                        apply_remote_preview_payload(session, payload);
-                    }
-                }
             }
         }
         if launch_terminal {
@@ -1798,6 +1805,25 @@ impl YggtermServer {
         } else {
             self.active_session_path = Some(session_path.clone());
             self.active_view_mode = WorkspaceViewMode::Rendered;
+            if let Some(scanned) = machine
+                .sessions
+                .iter()
+                .find(|scanned| scanned.session_id == session_id)
+                && !scanned.storage_path.trim().is_empty()
+                && let Ok(payload) = fetch_remote_preview_head_payload(
+                    &preview_target,
+                    &scanned.storage_path,
+                    REMOTE_PREVIEW_HEAD_BLOCKS,
+                )
+                && let Some(session) = self.sessions.get_mut(&session_path)
+            {
+                apply_remote_preview_payload(session, payload);
+                upsert_session_metadata(
+                    &mut session.metadata,
+                    "Preview Hydration",
+                    "head".to_string(),
+                );
+            }
         }
         Ok(session_path)
     }
@@ -3128,6 +3154,51 @@ fn recent_context_scaffold_line(trimmed: &str) -> bool {
         || lower.contains("any running unified exec processes were terminated")
 }
 
+fn preview_scaffold_line(trimmed: &str) -> bool {
+    let lower = trimmed.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    if recent_context_scaffold_line(trimmed) {
+        return true;
+    }
+    if matches!(
+        lower.as_str(),
+        "## skills" | "### available skills" | "### how to use skills" | "</instructions>"
+    ) {
+        return true;
+    }
+    if [
+        "a skill is a set of local instructions to follow that is stored in a",
+        "how to use a skill (progressive disclosure):",
+        "coordination and sequencing:",
+        "context hygiene:",
+        "safety and fallback:",
+        "trigger rules:",
+        "discovery:",
+        "missing/blocked:",
+        "after deciding to use a skill, open its `skill.md`",
+        "when `skill.md` references relative paths",
+        "if `skill.md` points to extra folders such as `references/`",
+        "if `scripts/` exist, prefer running or patching them",
+        "if `assets/` or templates exist, reuse them",
+        "if multiple skills apply, choose the minimal set",
+        "announce which skill(s) you're using and why",
+        "keep context small: summarize long sections instead of pasting them",
+        "avoid deep reference-chasing",
+        "when variants exist (frameworks, providers, domains)",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return true;
+    }
+    if lower.contains("/.codex/skills/") && lower.contains("file:") {
+        return true;
+    }
+    lower.starts_with("- skill-") || lower.starts_with("skill-")
+}
+
 fn sanitize_recent_context_payload(recent_context: &str) -> String {
     let (goals, blocks, _sections) = parse_recent_context_sections(recent_context);
     let goals = dedupe_recent_context_lines(
@@ -3175,7 +3246,7 @@ fn sanitize_recent_context_turn_content(content: &str) -> Option<String> {
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .filter(|line| !recent_context_scaffold_line(line))
+        .filter(|line| !preview_scaffold_line(line))
         .collect::<Vec<_>>();
     if lines.is_empty() {
         return None;
@@ -3242,7 +3313,7 @@ fn sanitize_preview_lines(lines: Vec<String>) -> Vec<String> {
         .into_iter()
         .map(|line| line.trim().to_string())
         .filter(|line| !line.is_empty())
-        .filter(|line| !recent_context_scaffold_line(line))
+        .filter(|line| !preview_scaffold_line(line))
         .collect()
 }
 
@@ -3539,6 +3610,76 @@ fn apply_remote_preview_payload(session: &mut ManagedSessionView, payload: Remot
             lines: section.lines,
         })
         .collect();
+    upsert_session_metadata(&mut session.metadata, "Preview Hydration", "full".to_string());
+}
+
+fn build_remote_preview_payload_from_messages(
+    session_id: &str,
+    cwd: &str,
+    path: &std::path::Path,
+    title_store: &SessionTitleStore,
+    title_hint: Option<String>,
+    messages: Vec<yggterm_core::TranscriptMessage>,
+) -> anyhow::Result<RemotePreviewPayload> {
+    let started_at = messages
+        .iter()
+        .find_map(|message| message.timestamp.as_deref().map(parse_and_format_timestamp))
+        .unwrap_or_else(|| format_display_datetime(OffsetDateTime::now_utc()));
+    let mut user_messages = 0usize;
+    let mut assistant_messages = 0usize;
+    let mut metadata_entries = Vec::new();
+    let mut blocks = Vec::new();
+    for message in messages {
+        let timestamp = message
+            .timestamp
+            .as_deref()
+            .map(parse_and_format_timestamp)
+            .unwrap_or_else(|| started_at.clone());
+        push_preview_block(
+            &mut blocks,
+            &mut metadata_entries,
+            &mut user_messages,
+            &mut assistant_messages,
+            message.role,
+            message.lines,
+            timestamp,
+        );
+    }
+    Ok(RemotePreviewPayload {
+        title_hint,
+        cached_precis: title_store
+            .get_precis(session_id)?
+            .filter(|value| !value.trim().is_empty()),
+        cached_summary: title_store
+            .get_summary(session_id)?
+            .filter(|value| !value.trim().is_empty()),
+        preview: SnapshotPreview {
+            summary: vec![
+                SnapshotMetadataEntry {
+                    label: "Session".to_string(),
+                    value: session_id.to_string(),
+                },
+                SnapshotMetadataEntry {
+                    label: "Storage".to_string(),
+                    value: path.display().to_string(),
+                },
+                SnapshotMetadataEntry {
+                    label: "Cwd".to_string(),
+                    value: cwd.to_string(),
+                },
+                SnapshotMetadataEntry {
+                    label: "Started".to_string(),
+                    value: started_at,
+                },
+                SnapshotMetadataEntry {
+                    label: "Messages".to_string(),
+                    value: format!("{user_messages} user · {assistant_messages} assistant"),
+                },
+            ],
+            blocks: blocks.into_iter().map(snapshot_preview_block).collect(),
+        },
+        rendered_sections: Vec::new(),
+    })
 }
 
 pub fn fetch_remote_preview_payload(
@@ -3552,6 +3693,26 @@ pub fn fetch_remote_preview_payload(
         None,
     )?;
     serde_json::from_str(&output).context("invalid remote preview payload")
+}
+
+pub fn fetch_remote_preview_head_payload(
+    target: &SshConnectTarget,
+    storage_path: &str,
+    blocks: usize,
+) -> anyhow::Result<RemotePreviewPayload> {
+    let output = run_remote_yggterm_command(
+        &target.ssh_target,
+        target.prefix.as_deref(),
+        &[
+            "server",
+            "remote",
+            "preview-head",
+            storage_path,
+            &blocks.to_string(),
+        ],
+        None,
+    )?;
+    serde_json::from_str(&output).context("invalid remote preview head payload")
 }
 
 pub fn apply_remote_preview_payload_for_path(
@@ -3728,6 +3889,29 @@ fn remote_preview_payload_for_path(
             })
             .collect(),
     }))
+}
+
+fn remote_preview_head_payload_for_path(
+    path: &std::path::Path,
+    title_store: &SessionTitleStore,
+    max_blocks: usize,
+) -> anyhow::Result<Option<RemotePreviewPayload>> {
+    let Some((session_id, cwd)) = read_codex_session_identity_fields(path)? else {
+        return Ok(None);
+    };
+    let title_hint = title_store
+        .get_title(&session_id)?
+        .filter(|value| !value.trim().is_empty() && !looks_like_generated_fallback_title(value));
+    let messages = read_codex_transcript_messages_limited(path, max_blocks)
+        .with_context(|| format!("reading remote transcript head {}", path.display()))?;
+    Ok(Some(build_remote_preview_payload_from_messages(
+        &session_id,
+        &cwd,
+        path,
+        title_store,
+        title_hint,
+        messages,
+    )?))
 }
 
 const REMOTE_SCAN_SCRIPT: &str = r#"
@@ -5834,6 +6018,16 @@ pub fn run_remote_preview(path: &str) -> anyhow::Result<()> {
     let title_store = SessionTitleStore::open(&yggterm_home)?;
     let payload = remote_preview_payload_for_path(std::path::Path::new(path), &title_store)?
         .with_context(|| format!("no previewable codex session at {path}"))?;
+    write_stdout_line(&serde_json::to_string(&payload)?)?;
+    Ok(())
+}
+
+pub fn run_remote_preview_head(path: &str, blocks: usize) -> anyhow::Result<()> {
+    let yggterm_home = resolve_yggterm_home()?;
+    let title_store = SessionTitleStore::open(&yggterm_home)?;
+    let payload =
+        remote_preview_head_payload_for_path(std::path::Path::new(path), &title_store, blocks)?
+            .with_context(|| format!("no previewable codex session at {path}"))?;
     write_stdout_line(&serde_json::to_string(&payload)?)?;
     Ok(())
 }

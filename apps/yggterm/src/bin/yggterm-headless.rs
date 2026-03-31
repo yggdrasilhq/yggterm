@@ -8,9 +8,10 @@ use yggterm_server::{
     run_app_control_send_terminal_input, run_app_control_set_fullscreen,
     run_app_control_set_row_expanded, run_attach, run_daemon, run_remote_ensure_managed_cli,
     run_remote_generation_context, run_remote_preview, run_remote_protocol_version,
-    run_remote_refresh_managed_cli, run_remote_resume_codex, run_remote_scan,
-    run_remote_stage_clipboard_png, run_remote_upsert_generated_copy, run_screenrecord_capture,
-    run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, status,
+    run_remote_preview_head, run_remote_refresh_managed_cli, run_remote_resume_codex,
+    run_remote_scan, run_remote_stage_clipboard_png, run_remote_upsert_generated_copy,
+    run_screenrecord_capture, run_screenshot_capture, run_trace_bundle, run_trace_follow,
+    run_trace_tail, shutdown, status,
 };
 
 fn main() -> Result<()> {
@@ -75,6 +76,13 @@ fn main() -> Result<()> {
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "remote" && args[2] == "scan" {
         return run_remote_scan(args.get(3).map(String::as_str));
+    }
+    if args.len() >= 4 && args[0] == "server" && args[1] == "remote" && args[2] == "preview-head" {
+        let blocks = args
+            .get(4)
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(8);
+        return run_remote_preview_head(&args[3], blocks);
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "trace" && args[2] == "tail" {
         let lines = args
