@@ -131,7 +131,7 @@ const BACKGROUND_COPY_RETRY_MS: u64 = 300_000;
 const BACKGROUND_COPY_CONTINUE_MS: u64 = 15_000;
 const BACKGROUND_COPY_IDLE_MS: u64 = 120_000;
 const BACKGROUND_REFRESH_NOTICE_MS: u64 = 12_000;
-const BACKGROUND_REFRESH_STARTUP_DEFER_MS: u64 = 30_000;
+const BACKGROUND_REFRESH_STARTUP_DEFER_MS: u64 = 3_000;
 const THEME_EDITOR_PAD_SIZE: f64 = 286.0;
 const SEARCH_INPUT_ID: &str = "yggterm-search-input";
 const PREVIEW_HEADER_SEARCH_HIT_ID: &str = "__preview_header__";
@@ -558,6 +558,13 @@ enum PreviewContentBlock {
         language: Option<String>,
         code: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PreviewInlineSegment {
+    Text(String),
+    Code(String),
+    ImageReference(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -4177,10 +4184,7 @@ fn app_control_command_defers_background_refresh(command: &AppControlCommand) ->
         AppControlCommand::CreateTerminal { .. }
             | AppControlCommand::SendTerminalInput { .. }
             | AppControlCommand::RemoveSession { .. }
-            | AppControlCommand::OpenPath { .. }
             | AppControlCommand::Drag { .. }
-            | AppControlCommand::SetRowExpanded { .. }
-            | AppControlCommand::ScrollPreview { .. }
     )
 }
 
@@ -11682,10 +11686,22 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
         .with_min_inner_size(LogicalSize::new(1024.0, 720.0));
 
     #[cfg(not(target_os = "macos"))]
+    let linux_transparent_window = std::env::var("YGGTERM_ENABLE_TRANSPARENT_WINDOW")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        || !(std::env::var_os("XRDP_SESSION").is_some()
+            || std::env::var_os("XRDP_SOCKET_PATH").is_some());
+
+    #[cfg(not(target_os = "macos"))]
     let window = WindowBuilder::new()
         .with_title("Yggterm")
         .with_window_icon(Some(window_icon::load_yggterm_window_icon()))
-        .with_transparent(true)
+        .with_transparent(linux_transparent_window)
         .with_decorations(false)
         .with_resizable(true)
         .with_inner_size(LogicalSize::new(1460.0, 920.0))
@@ -12231,16 +12247,35 @@ fn app() -> Element {
             return;
         }
         background_refresh_defer_started.set(true);
-        let defer_ms = state
-            .read()
-            .background_refresh_after_ms
-            .saturating_sub(current_millis());
         spawn(async move {
-            if defer_ms > 0 {
-                sleep(Duration::from_millis(defer_ms)).await;
+            loop {
+                let defer_ms = safe_shell_read(
+                    state,
+                    "background_refresh_scheduler_read",
+                    |shell| shell.background_refresh_after_ms.saturating_sub(current_millis()),
+                )
+                .unwrap_or_default();
+                if defer_ms > 0 {
+                    sleep(Duration::from_millis(defer_ms)).await;
+                    continue;
+                }
+                if safe_shell_read(
+                    state,
+                    "background_refresh_scheduler_gate",
+                    |shell| {
+                        terminal_attach_blocks_background_work(shell)
+                            || background_refreshes_deferred(shell)
+                    },
+                )
+                .unwrap_or(false)
+                {
+                    sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+                maybe_spawn_missing_remote_machine_refreshes(state);
+                maybe_spawn_missing_managed_cli_refreshes(state);
+                break;
             }
-            maybe_spawn_missing_remote_machine_refreshes(state);
-            maybe_spawn_missing_managed_cli_refreshes(state);
         });
     });
     use_effect(move || {
@@ -14811,6 +14846,7 @@ fn MainSurface(
                         group_preview_runs(&rendered_blocks, preview_window.start_index);
                     rsx! {
                         div {
+                            key: "{session.session_path}:{snapshot.active_view_mode as u8}",
                             style: "display:flex; flex-direction:column; min-width:0; min-height:0; width:100%; height:100%;",
                             div {
                                 style: "display:flex; align-items:flex-start; justify-content:flex-end; gap:16px; padding:14px 18px 2px 18px;",
@@ -14825,6 +14861,7 @@ fn MainSurface(
                                 }
                             }
                             div {
+                                key: "{session.session_path}:preview-scroll",
                                 "data-preview-scroll": "1",
                                 "data-preview-scroll-active": "true",
                                 "data-preview-session-path": "{session.session_path}",
@@ -15903,13 +15940,13 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                                 palette.text,
                                 if level == 1 { 4 } else { 2 }
                             ),
-                            "{text}"
+                            PreviewInlineText { text, palette, muted: false }
                         }
                     },
                     PreviewContentBlock::Paragraph(text) => rsx! {
                         div {
                             style: "font-size:14px; line-height:1.76; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;",
-                            "{text}"
+                            PreviewInlineText { text, palette, muted: false }
                         }
                     },
                     PreviewContentBlock::Bullet(text) => rsx! {
@@ -15920,7 +15957,7 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                             }
                             div {
                                 style: "font-size:14px; line-height:1.76; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;",
-                                "{text}"
+                                PreviewInlineText { text, palette, muted: false }
                             }
                         }
                     },
@@ -15933,7 +15970,7 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                             }
                             div {
                                 style: "font-size:14px; line-height:1.76; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;",
-                                "{text}"
+                                PreviewInlineText { text, palette, muted: false }
                             }
                         }
                     },
@@ -15956,7 +15993,7 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                                     "font-size:14px; line-height:1.76; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; color:{};",
                                     if done { palette.muted } else { palette.text }
                                 ),
-                                "{text}"
+                                PreviewInlineText { text, palette, muted: done }
                             }
                         }
                     },
@@ -15968,7 +16005,7 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                             }
                             div {
                                 style: format!("font-size:14px; line-height:1.76; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; color:{};", palette.muted),
-                                "{text}"
+                                PreviewInlineText { text, palette, muted: true }
                             }
                         }
                     },
@@ -15984,7 +16021,7 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                             if let Some(text) = text.filter(|value| !value.trim().is_empty()) {
                                 div {
                                     style: "font-size:14px; line-height:1.76; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; flex:1 1 240px;",
-                                    "{text}"
+                                    PreviewInlineText { text, palette, muted: false }
                                 }
                             }
                         }
@@ -16064,6 +16101,108 @@ fn preview_content_blocks(lines: &[String]) -> Vec<PreviewContentBlock> {
         }
     }
     parsed
+}
+
+fn preview_inline_segments(text: &str) -> Vec<PreviewInlineSegment> {
+    let mut segments = Vec::new();
+    let mut index = 0usize;
+
+    while index < text.len() {
+        let remaining = &text[index..];
+        let code_start = remaining.find('`').map(|offset| index + offset);
+        let image_start = remaining.find("[Image #").map(|offset| index + offset);
+        let next_start = match (code_start, image_start) {
+            (Some(code), Some(image)) => Some(code.min(image)),
+            (Some(code), None) => Some(code),
+            (None, Some(image)) => Some(image),
+            (None, None) => None,
+        };
+        let Some(start) = next_start else {
+            if !remaining.is_empty() {
+                segments.push(PreviewInlineSegment::Text(remaining.to_string()));
+            }
+            break;
+        };
+
+        if start > index {
+            segments.push(PreviewInlineSegment::Text(text[index..start].to_string()));
+        }
+
+        if Some(start) == image_start
+            && let Some(end_offset) = text[start..].find(']')
+        {
+            let end = start + end_offset + 1;
+            segments.push(PreviewInlineSegment::ImageReference(
+                text[start..end].to_string(),
+            ));
+            index = end;
+            continue;
+        }
+
+        if Some(start) == code_start
+            && let Some(end_offset) = text[start + 1..].find('`')
+        {
+            let end = start + 1 + end_offset;
+            let code = &text[start + 1..end];
+            if !code.is_empty() {
+                segments.push(PreviewInlineSegment::Code(code.to_string()));
+                index = end + 1;
+                continue;
+            }
+        }
+
+        segments.push(PreviewInlineSegment::Text(text[start..start + 1].to_string()));
+        index = start + 1;
+    }
+
+    segments
+        .into_iter()
+        .filter(|segment| match segment {
+            PreviewInlineSegment::Text(text) => !text.is_empty(),
+            PreviewInlineSegment::Code(text) => !text.is_empty(),
+            PreviewInlineSegment::ImageReference(text) => !text.is_empty(),
+        })
+        .collect()
+}
+
+#[component]
+fn PreviewInlineText(text: String, palette: Palette, muted: bool) -> Element {
+    let segments = preview_inline_segments(&text);
+    rsx! {
+        span {
+            for (ix, segment) in segments.into_iter().enumerate() {
+                match segment {
+                    PreviewInlineSegment::Text(value) => rsx! {
+                        span { key: "text-{ix}", "{value}" }
+                    },
+                    PreviewInlineSegment::Code(value) => rsx! {
+                        span {
+                            key: "code-{ix}",
+                            style: format!(
+                                "font-family:'JetBrains Mono', 'Iosevka Term', monospace; font-size:0.92em; \
+                                 padding:0.08em 0.42em; border-radius:0.5em; background:{}; color:{}; \
+                                 box-shadow:inset 0 0 0 1px {};",
+                                if muted { "rgba(15,23,42,0.06)" } else { "rgba(15,23,42,0.07)" },
+                                if muted { palette.muted.to_string() } else { palette.text.to_string() },
+                                if muted { "rgba(148,163,184,0.18)" } else { "rgba(148,163,184,0.22)" }
+                            ),
+                            "{value}"
+                        }
+                    },
+                    PreviewInlineSegment::ImageReference(value) => rsx! {
+                        span {
+                            key: "image-{ix}",
+                            style: "display:inline-flex; align-items:center; justify-content:center; padding:0.08em 0.48em; \
+                                    border-radius:999px; background:rgba(73,160,153,0.12); color:#2c8c83; \
+                                    font-size:0.86em; font-weight:700; letter-spacing:0.01em; \
+                                    font-family:'JetBrains Mono', 'Iosevka Term', monospace;",
+                            "{value}"
+                        }
+                    },
+                }
+            }
+        }
+    }
 }
 
 fn build_preview_content_blocks(lines: &[String]) -> Vec<PreviewContentBlock> {
