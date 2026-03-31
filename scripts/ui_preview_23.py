@@ -226,6 +226,8 @@ def launch_local_client(binary: str, timeout_s: float = 4.0) -> tuple[subprocess
     kill_local_clients(binary_path)
     env = os.environ.copy()
     env.setdefault("DISPLAY", ":10.0")
+    env.setdefault("XAUTHORITY", str(Path.home() / ".Xauthority"))
+    env["YGGTERM_ALLOW_MULTI_WINDOW"] = "1"
     env["YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF"] = "1"
     proc = subprocess.Popen(
         [binary_path],
