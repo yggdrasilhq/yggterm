@@ -38,6 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout-ms", type=int, default=8000)
     parser.add_argument("--poll", type=float, default=0.15)
     parser.add_argument("--ready-budget", type=float, default=2.5)
+    parser.add_argument("--settle-budget", type=float, default=8.0)
     parser.add_argument("--dwell-sec", type=float, default=23.0)
     parser.add_argument("--launch-local", action="store_true")
     parser.add_argument("--out-dir", default="/tmp/yggterm-preview-text-23")
@@ -132,9 +133,19 @@ def main() -> int:
             }
             try:
                 entry["open"] = app_open(args.host, args.bin, session_path, args.timeout_ms)
+                initial_state = app_state(args.host, args.bin, args.timeout_ms)
+                initial_viewport = initial_state.get("viewport") or {}
+                entry["initial_state_dump"] = write_json(
+                    out_dir / f"preview-text-{index:02d}-initial.json",
+                    initial_state,
+                )
+                entry["initial_loading"] = (
+                    (initial_viewport.get("reason") == "preview still loading")
+                    or not preview_ready(initial_state, session_path)
+                )
                 _, early_state = wait_until(
                     f"preview early {session_path}",
-                    args.ready_budget,
+                    max(args.ready_budget, args.settle_budget),
                     args.poll,
                     lambda: require_preview_ready(app_state(args.host, args.bin, args.timeout_ms), session_path),
                 )
@@ -217,6 +228,7 @@ def main() -> int:
         "launch_event": launch_event,
         "dwell_sec": args.dwell_sec,
         "open_failures": sum(1 for item in results if item.get("error")),
+        "initial_loading_count": sum(1 for item in results if item.get("initial_loading")),
         "early_semantic_failures": sum(
             1 for item in results if item.get("early_semantic_issues")
         ),

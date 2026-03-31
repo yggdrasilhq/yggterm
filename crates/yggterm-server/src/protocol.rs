@@ -27,6 +27,7 @@ pub enum YggSurface {
     App,
     Sidebar,
     Preview,
+    PreviewSync,
     Terminal,
     MetadataRail,
     Search,

@@ -852,6 +852,23 @@ impl YggtermServer {
         }
     }
 
+    pub fn restore_session_preview_if_empty(
+        &mut self,
+        session_path: &str,
+        preview: SessionPreview,
+        rendered_sections: Vec<SessionRenderedSection>,
+    ) -> bool {
+        let Some(session) = self.sessions.get_mut(session_path) else {
+            return false;
+        };
+        if !session.preview.blocks.is_empty() {
+            return false;
+        }
+        session.preview = preview;
+        session.rendered_sections = rendered_sections;
+        true
+    }
+
     pub fn remote_machines(&self) -> &[RemoteMachineSnapshot] {
         &self.remote_machines
     }
@@ -1609,13 +1626,6 @@ impl YggtermServer {
         let resolved_title = title_hint
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| short_session_id(session_id));
-        let preview_target = SshConnectTarget {
-            label: machine.label.clone(),
-            kind: SessionKind::Codex,
-            ssh_target: machine.ssh_target.clone(),
-            prefix: machine.prefix.clone(),
-            cwd: cwd.map(ToOwned::to_owned),
-        };
         if self.sessions.contains_key(&session_path) {
             if let Some(session) = self.sessions.get_mut(&session_path) {
                 session.session_path = session_path.clone();
@@ -1688,6 +1698,9 @@ impl YggtermServer {
                         &machine.label,
                         &target.ssh_target,
                     );
+                    if !launch_terminal {
+                        clear_session_preview_for_loading(session);
+                    }
                 }
             }
             if launch_terminal {
@@ -1695,23 +1708,6 @@ impl YggtermServer {
             } else {
                 self.active_session_path = Some(session_path.clone());
                 self.active_view_mode = WorkspaceViewMode::Rendered;
-            }
-            if !launch_terminal
-                && let Some(scanned) = machine
-                    .sessions
-                    .iter()
-                    .find(|scanned| scanned.session_id == session_id)
-                && !scanned.storage_path.trim().is_empty()
-                && let Ok(payload) =
-                    fetch_remote_preview_payload(&preview_target, &scanned.storage_path)
-                && let Some(session) = self.sessions.get_mut(&session_path)
-            {
-                apply_remote_preview_payload(session, payload);
-                upsert_session_metadata(
-                    &mut session.metadata,
-                    "Preview Hydration",
-                    "full".to_string(),
-                );
             }
             if launch_terminal {
                 self.request_terminal_launch_for_path(&session_path);
@@ -1793,6 +1789,9 @@ impl YggtermServer {
                     &machine.label,
                     &target.ssh_target,
                 );
+                if !launch_terminal {
+                    clear_session_preview_for_loading(session);
+                }
             }
         }
         if launch_terminal {
@@ -1801,24 +1800,50 @@ impl YggtermServer {
         } else {
             self.active_session_path = Some(session_path.clone());
             self.active_view_mode = WorkspaceViewMode::Rendered;
-            if let Some(scanned) = machine
-                .sessions
-                .iter()
-                .find(|scanned| scanned.session_id == session_id)
-                && !scanned.storage_path.trim().is_empty()
-                && let Ok(payload) =
-                    fetch_remote_preview_payload(&preview_target, &scanned.storage_path)
-                && let Some(session) = self.sessions.get_mut(&session_path)
-            {
-                apply_remote_preview_payload(session, payload);
-                upsert_session_metadata(
-                    &mut session.metadata,
-                    "Preview Hydration",
-                    "full".to_string(),
-                );
-            }
         }
         Ok(session_path)
+    }
+
+    pub fn stage_remote_scanned_session_with_view(
+        &mut self,
+        machine_key: &str,
+        session_id: &str,
+        view_mode: WorkspaceViewMode,
+    ) -> Option<String> {
+        let machine_key = normalize_machine_key(machine_key);
+        let machine = self
+            .remote_machines
+            .iter()
+            .find(|machine| machine.machine_key == machine_key)?
+            .clone();
+        let scanned = machine
+            .sessions
+            .iter()
+            .find(|session| session.session_id == session_id)?
+            .clone();
+        let session_path = scanned.session_path.clone();
+        let staged = synthesize_remote_scanned_session_view(
+            &machine,
+            &scanned,
+            self.backend,
+            self.theme,
+            self.ghostty_host.bridge_enabled,
+        );
+        let mut staged = staged;
+        if view_mode == WorkspaceViewMode::Rendered {
+            clear_session_preview_for_loading(&mut staged);
+        }
+        self.sessions.insert(session_path.clone(), staged);
+        if !self
+            .live_session_order
+            .iter()
+            .any(|existing| existing == &session_path)
+        {
+            self.live_session_order.insert(0, session_path.clone());
+        }
+        self.active_session_path = Some(session_path.clone());
+        self.active_view_mode = view_mode;
+        Some(session_path)
     }
 
     pub fn start_local_session(
@@ -3587,6 +3612,16 @@ fn apply_remote_scanned_session_preview(
         modified_epoch_display(scanned.modified_epoch),
     );
     upsert_session_metadata(&mut session.metadata, "Messages", messages);
+}
+
+fn clear_session_preview_for_loading(session: &mut ManagedSessionView) {
+    session.preview.blocks.clear();
+    session.rendered_sections.clear();
+    upsert_session_metadata(
+        &mut session.metadata,
+        "Preview Hydration",
+        "loading".to_string(),
+    );
 }
 
 fn apply_remote_preview_payload(session: &mut ManagedSessionView, payload: RemotePreviewPayload) {
@@ -7948,8 +7983,9 @@ mod tests {
         parse_stored_transcript, push_preview_block, remote_cache_key, remote_command_cache,
         remote_resume_shell_command, remote_saved_codex_session_exists,
         remote_scan_roots_with_parents, remote_scanned_session_path, remote_ssh_launch_command,
-        sanitize_recent_context_payload, should_fallback_to_python, stored_session_launch_command,
-        strip_remote_payload_noise, synthesize_remote_scanned_session_view,
+        sanitize_recent_context_payload, session_metadata_value, should_fallback_to_python,
+        stored_session_launch_command, strip_remote_payload_noise,
+        synthesize_remote_scanned_session_view,
     };
     use anyhow::Result;
     use std::fs;
@@ -8201,6 +8237,68 @@ mod tests {
         assert_eq!(session.launch_phase, TerminalLaunchPhase::RemoteBootstrap);
         assert_eq!(server.active_session_path(), Some(session_path.as_str()));
         assert_eq!(server.active_view_mode, WorkspaceViewMode::Rendered);
+        Ok(())
+    }
+
+    #[test]
+    fn remote_preview_open_starts_in_loading_state_without_recent_context_blocks() -> Result<()> {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.remote_machines.push(RemoteMachineSnapshot {
+            machine_key: "jojo".to_string(),
+            label: "jojo".to_string(),
+            ssh_target: "jojo".to_string(),
+            prefix: None,
+            remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+            remote_deploy_state: RemoteDeployState::Ready,
+            health: RemoteMachineHealth::Healthy,
+            sessions: vec![RemoteScannedSession {
+                session_id: "019cf00a-57bd-7480-a642-495ac1389b8e".to_string(),
+                session_path: "remote-session://jojo/019cf00a-57bd-7480-a642-495ac1389b8e".to_string(),
+                cwd: "/home/pi".to_string(),
+                started_at: "2026-03-24T12:00:00Z".to_string(),
+                modified_epoch: 42,
+                event_count: 9,
+                user_message_count: 4,
+                assistant_message_count: 5,
+                title_hint: "Passthrough Gpus Dev Set Intel".to_string(),
+                recent_context: "USER: stale summary-like first turn\nASSISTANT: stale reply".to_string(),
+                cached_precis: Some("Short precis".to_string()),
+                cached_summary: Some("Longer summary text".to_string()),
+                storage_path: "/home/pi/.codex/sessions/test.jsonl".to_string(),
+            }],
+        });
+
+        let session_path = server.open_remote_scanned_session_with_view(
+            "jojo",
+            "019cf00a-57bd-7480-a642-495ac1389b8e",
+            Some("/home/pi"),
+            Some("Passthrough Gpus Dev Set Intel"),
+            Some(WorkspaceViewMode::Rendered),
+        )?;
+
+        let session = server.sessions.get(&session_path).expect("session");
+        assert!(session.preview.blocks.is_empty());
+        assert!(session.rendered_sections.is_empty());
+        assert_eq!(
+            session_metadata_value(session, "Preview Hydration").as_deref(),
+            Some("loading")
+        );
         Ok(())
     }
 
