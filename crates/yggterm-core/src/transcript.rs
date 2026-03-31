@@ -94,6 +94,20 @@ pub fn generation_context_from_messages(messages: &[TranscriptMessage]) -> Strin
 }
 
 pub fn read_codex_transcript_messages(path: &Path) -> Result<Vec<TranscriptMessage>> {
+    read_codex_transcript_messages_with_limit(path, None)
+}
+
+pub fn read_codex_transcript_messages_limited(
+    path: &Path,
+    max_messages: usize,
+) -> Result<Vec<TranscriptMessage>> {
+    read_codex_transcript_messages_with_limit(path, Some(max_messages))
+}
+
+fn read_codex_transcript_messages_with_limit(
+    path: &Path,
+    max_messages: Option<usize>,
+) -> Result<Vec<TranscriptMessage>> {
     let file = fs::File::open(path)
         .with_context(|| format!("failed to read session transcript {}", path.display()))?;
     let reader = BufReader::new(file);
@@ -137,6 +151,9 @@ pub fn read_codex_transcript_messages(path: &Path) -> Result<Vec<TranscriptMessa
                         item,
                         extract_timestamp_raw(item).or_else(|| fallback_timestamp.clone()),
                     );
+                    if max_messages.is_some_and(|limit| messages.len() >= limit) {
+                        break;
+                    }
                 }
             }
             Some("event_msg") => {
@@ -154,6 +171,10 @@ pub fn read_codex_transcript_messages(path: &Path) -> Result<Vec<TranscriptMessa
                 );
             }
             _ => {}
+        }
+
+        if max_messages.is_some_and(|limit| messages.len() >= limit) {
+            break;
         }
     }
 

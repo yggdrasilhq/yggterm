@@ -173,10 +173,16 @@ def main() -> int:
                 scroll_data.get("applied_top_px") or scrolled_window.get("scroll_top_px") or 0.0
             )
             expected_top = max_top * ratio
-            significant_scroll = max_top >= 160.0 and ratio >= 0.16
             visible_ids_before = initial_preview.get("visible_block_ids") or []
             visible_ids_after = scrolled_preview.get("visible_block_ids") or []
             visible_ids_changed = visible_ids_before != visible_ids_after
+            total_count_initial = int(initial_window.get("total_count") or 0)
+            all_content_visible_initially = (
+                total_count_initial > 0 and len(visible_ids_before) >= total_count_initial
+            )
+            significant_scroll = (
+                not all_content_visible_initially and max_top >= 160.0 and ratio >= 0.16
+            )
             scroll_effect_ok = True
             if significant_scroll:
                 scroll_effect_ok = (
