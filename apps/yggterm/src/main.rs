@@ -521,6 +521,20 @@ fn main() -> Result<()> {
         "no cached server snapshot".to_string()
     };
 
+    append_trace_event(
+        &startup_home,
+        "gui",
+        "startup",
+        "before_launch_shell",
+        serde_json::json!({
+            "pid": std::process::id(),
+            "transparent": linux_window_profile.transparent,
+            "profile_reason": linux_window_profile.reason,
+            "browser_tree_loaded": browser_tree_loaded,
+            "initial_server_snapshot": initial_server_snapshot.is_some(),
+        }),
+    );
+
     let launch_result = yggui::launch_shell(yggui::ShellBootstrap {
         tree,
         browser_tree,
@@ -538,6 +552,8 @@ fn main() -> Result<()> {
         prefer_ghostty_backend,
         pending_update_restart,
         refresh_server_after_launch: true,
+        linux_window_transparent: linux_window_profile.transparent,
+        linux_window_profile_reason: linux_window_profile.reason.to_string(),
     });
     startup_span.finish(serde_json::json!({
         "update_policy": format!("{:?}", install_context.update_policy),
