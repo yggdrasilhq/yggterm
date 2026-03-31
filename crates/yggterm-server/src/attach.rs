@@ -25,8 +25,7 @@ pub fn run_attach(uuid: &str, cwd: Option<&str>) -> Result<()> {
         .with_context(|| format!("creating attach dir {}", session_dir.display()))?;
 
     if let Some(cwd) = cwd.map(str::trim).filter(|value| !value.is_empty()) {
-        std::env::set_current_dir(cwd)
-            .with_context(|| format!("setting attach cwd to {cwd}"))?;
+        std::env::set_current_dir(cwd).with_context(|| format!("setting attach cwd to {cwd}"))?;
     }
 
     let metadata_path = session_dir.join("session.json");
@@ -118,7 +117,11 @@ fn exec_tmux(uuid: &str, cwd: Option<&str>) -> Result<()> {
     {
         use std::os::unix::process::CommandExt;
         let mut command = Command::new("tmux");
-        command.arg("new-session").arg("-A").arg("-s").arg(session_name);
+        command
+            .arg("new-session")
+            .arg("-A")
+            .arg("-s")
+            .arg(session_name);
         if let Some(cwd) = cwd.map(str::trim).filter(|value| !value.is_empty()) {
             command.arg("-c").arg(cwd);
         }
@@ -132,16 +135,18 @@ fn exec_tmux(uuid: &str, cwd: Option<&str>) -> Result<()> {
     #[cfg(not(unix))]
     {
         let mut command = Command::new("tmux");
-        command.arg("new-session").arg("-A").arg("-s").arg(session_name);
+        command
+            .arg("new-session")
+            .arg("-A")
+            .arg("-s")
+            .arg(session_name);
         if let Some(cwd) = cwd.map(str::trim).filter(|value| !value.is_empty()) {
             command.arg("-c").arg(cwd);
         }
         if let Some(attach_command) = attach_command.as_deref() {
             command.arg(attach_command);
         }
-        let status = command
-            .status()
-            .context("running tmux attach")?;
+        let status = command.status().context("running tmux attach")?;
         if status.success() {
             Ok(())
         } else {

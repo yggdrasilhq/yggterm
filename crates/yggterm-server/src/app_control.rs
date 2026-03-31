@@ -257,10 +257,9 @@ pub fn take_next_app_control_request(
                 continue;
             }
         };
-        if request
-            .preferred_pid
-            .is_some_and(|preferred_pid| preferred_pid != worker_pid && process_is_alive(preferred_pid))
-        {
+        if request.preferred_pid.is_some_and(|preferred_pid| {
+            preferred_pid != worker_pid && process_is_alive(preferred_pid)
+        }) {
             continue;
         }
         let file_name = path
@@ -286,7 +285,9 @@ fn recover_stale_inflight_requests(requests_dir: &Path) -> Result<()> {
         let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
             continue;
         };
-        if !name.starts_with("inflight-") || path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+        if !name.starts_with("inflight-")
+            || path.extension().and_then(|ext| ext.to_str()) != Some("json")
+        {
             continue;
         }
         let Some(worker_pid) = parse_inflight_worker_pid(name) else {
@@ -321,7 +322,10 @@ fn process_is_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    unsafe { libc::kill(pid as i32, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
+    unsafe {
+        libc::kill(pid as i32, 0) == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
 }
 
 #[cfg(not(unix))]

@@ -14,18 +14,16 @@ use yggterm_core::{
 };
 use yggterm_server::{
     AppControlViewMode, PersistedDaemonState, SessionKind, YggtermServer, cleanup_legacy_daemons,
-    run_app_control_create_terminal,
-    default_endpoint, detect_ghostty_host, ping, run_app_control_describe_rows,
-    run_app_control_describe_state, run_app_control_drag, run_app_control_dump_state,
-    run_app_control_focus_window, run_app_control_open_path, run_app_control_scroll_preview,
-    run_app_control_set_fullscreen,
-    run_app_control_remove_session, run_app_control_send_terminal_input,
-    run_app_control_set_row_expanded,
-    run_attach, run_daemon, run_remote_generation_context, run_remote_preview,
-    run_remote_protocol_version, run_remote_resume_codex, run_remote_scan,
-    run_remote_stage_clipboard_png, run_remote_terminate_codex,
-    run_remote_upsert_generated_copy, run_screenshot_capture, run_screenrecord_capture,
-    run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, start_local_session, status,
+    default_endpoint, detect_ghostty_host, ping, run_app_control_create_terminal,
+    run_app_control_describe_rows, run_app_control_describe_state, run_app_control_drag,
+    run_app_control_dump_state, run_app_control_focus_window, run_app_control_open_path,
+    run_app_control_remove_session, run_app_control_scroll_preview,
+    run_app_control_send_terminal_input, run_app_control_set_fullscreen,
+    run_app_control_set_row_expanded, run_attach, run_daemon, run_remote_generation_context,
+    run_remote_preview, run_remote_protocol_version, run_remote_resume_codex, run_remote_scan,
+    run_remote_stage_clipboard_png, run_remote_terminate_codex, run_remote_upsert_generated_copy,
+    run_screenrecord_capture, run_screenshot_capture, run_trace_bundle, run_trace_follow,
+    run_trace_tail, shutdown, start_local_session, status,
 };
 
 const DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT_ENV: &str =
@@ -224,10 +222,7 @@ fn main() -> Result<()> {
             }
             "rows" => run_app_control_describe_rows(timeout_ms),
             "preview" => {
-                let action = args
-                    .get(3)
-                    .map(String::as_str)
-                    .unwrap_or("scroll");
+                let action = args.get(3).map(String::as_str).unwrap_or("scroll");
                 match action {
                     "scroll" => {
                         let top_px = args.windows(2).find_map(|window| {
@@ -361,14 +356,16 @@ fn main() -> Result<()> {
                             .find(|value| !value.starts_with("--"))
                             .map(String::as_str)
                             .context("missing session path for server app terminal send")?;
-                        let data = args.windows(2).find_map(|window| {
-                            if window[0] == "--data" {
-                                Some(window[1].as_str())
-                            } else {
-                                None
-                            }
-                        })
-                        .context("missing --data for server app terminal send")?;
+                        let data = args
+                            .windows(2)
+                            .find_map(|window| {
+                                if window[0] == "--data" {
+                                    Some(window[1].as_str())
+                                } else {
+                                    None
+                                }
+                            })
+                            .context("missing --data for server app terminal send")?;
                         run_app_control_send_terminal_input(session_path, data, timeout_ms)
                     }
                     other => anyhow::bail!("unsupported app terminal action: {other}"),
