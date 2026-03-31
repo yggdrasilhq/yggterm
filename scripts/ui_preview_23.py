@@ -17,6 +17,20 @@ FORBIDDEN_PREVIEW_MARKERS = (
     "request_user_input",
     "environment_context",
     "filesystem sandboxing",
+    "<instructions>",
+    "<cwd>",
+    "<shell>",
+    "<approval_policy>",
+    "<sandbox_mode>",
+    "<network_access>",
+    "</collaboration_mode>",
+    "you are now in default mode.",
+    "agents.md instructions for",
+    "<turn_aborted>",
+    "approvals are your mechanism to get user consent",
+    "approval_policy is",
+    "danger-full-access",
+    "non-interactive mode where you may never ask the user for approval",
 )
 
 FORBIDDEN_PREVIEW_ENTRY_MARKERS = (
@@ -24,6 +38,22 @@ FORBIDDEN_PREVIEW_ENTRY_MARKERS = (
     "RECENT SUBSTANTIVE TURNS:",
     "RECENT CONTEXT:",
     "SERVER NOTES:",
+    "<instructions>",
+    "<cwd>",
+    "<shell>",
+    "<approval_policy>",
+    "<sandbox_mode>",
+    "<network_access>",
+    "</collaboration_mode>",
+    "you are now in default mode.",
+    "agents.md instructions for",
+    "any previous instructions for other modes",
+    "default mode you should strongly prefer",
+    "<turn_aborted>",
+    "approvals are your mechanism to get user consent",
+    "approval_policy is",
+    "danger-full-access",
+    "non-interactive mode where you may never ask the user for approval",
 )
 
 
@@ -155,6 +185,7 @@ def latest_window_spawn_event_for_pid(host: str, pid: int, start_ms: int) -> dic
 
 
 def kill_local_clients(binary: str) -> None:
+    binary_path = str(Path(binary).resolve())
     instances_root = Path.home() / ".yggterm" / "client-instances"
     if instances_root.is_dir():
         for path in instances_root.glob("*/*.json"):
@@ -180,6 +211,7 @@ def kill_local_clients(binary: str) -> None:
                     os.kill(pid, 9)
                 except Exception:
                     pass
+    run_process(["bash", "-lc", f"pkill -f {json.dumps(binary_path)} || true"], check=False)
     run_process(["bash", "-lc", "pkill -f 'yggterm server daemon' || true"], check=False)
 
 
@@ -234,10 +266,19 @@ def wait_for_window(host: str, binary: str, timeout_ms: int) -> dict:
         state = app_state(host, binary, timeout_ms)
         window = state.get("window") or {}
         shell = state.get("shell") or {}
+        dom = state.get("dom") or {}
         if not window.get("visible"):
             raise RuntimeError("window not visible")
         if shell.get("needs_initial_server_sync"):
             raise RuntimeError("initial server sync still in progress")
+        if dom.get("shell_root_count") != 1:
+            raise RuntimeError(f"shell_root_count={dom.get('shell_root_count')}")
+        if dom.get("sidebar_count") != 1:
+            raise RuntimeError(f"sidebar_count={dom.get('sidebar_count')}")
+        if dom.get("titlebar_count") != 1:
+            raise RuntimeError(f"titlebar_count={dom.get('titlebar_count')}")
+        if dom.get("main_surface_count") != 1:
+            raise RuntimeError(f"main_surface_count={dom.get('main_surface_count')}")
         return state
 
     return wait_until("window visible", 8.0, 0.25, _probe)[1]
@@ -282,6 +323,10 @@ def normalize_preview_entry_text(value: str) -> str:
 def preview_semantic_issues(state: dict) -> list[str]:
     preview = ((state.get("viewport") or {}).get("preview") or {})
     entries = preview.get("visible_entries") or []
+    return preview_semantic_issues_for_entries(entries)
+
+
+def preview_semantic_issues_for_entries(entries: list[dict]) -> list[str]:
     issues = []
     normalized_entries = []
     for index, entry in enumerate(entries):
@@ -400,6 +445,7 @@ def main() -> int:
             entry["screenshot"] = app_screenshot_preview(args.host, args.bin, screenshot_path, args.timeout_ms)
             screenshot_dom = (((entry["screenshot"].get("data") or {}).get("dom")) or {})
             preview = ((state.get("viewport") or {}).get("preview") or {})
+            screenshot_entries = screenshot_dom.get("preview_visible_entries") or []
             png_width, png_height = read_png_size(screenshot_path)
             viewport_rect = (screenshot_dom.get("preview_viewport_rect") or preview.get("viewport_rect") or {})
             window = (screenshot_dom.get("preview_window") or preview.get("window") or {})
@@ -419,6 +465,14 @@ def main() -> int:
             forbidden_hits = [
                 marker for marker in FORBIDDEN_PREVIEW_MARKERS if marker.lower() in text_sample.lower()
             ]
+            semantic_issues = preview_semantic_issues(state)
+            screenshot_semantic_issues = preview_semantic_issues_for_entries(screenshot_entries)
+            screenshot_forbidden_hits = [
+                marker
+                for marker in FORBIDDEN_PREVIEW_MARKERS
+                if marker.lower()
+                in " ".join((entry.get("text") or "") for entry in screenshot_entries).lower()
+            ]
             entry.update(
                 {
                     "elapsed_s": round(elapsed, 3),
@@ -437,8 +491,8 @@ def main() -> int:
                     "raw_timestamps": raw_timestamps,
                     "timestamp_labels_ok": (len(raw_timestamps) == 0) or (len(timestamp_labels) > 0),
                     "titlebar_matches_viewport": titlebar_ok,
-                    "semantic_issues": preview_semantic_issues(state),
-                    "forbidden_hits": forbidden_hits,
+                    "semantic_issues": list(dict.fromkeys(semantic_issues + screenshot_semantic_issues)),
+                    "forbidden_hits": list(dict.fromkeys(forbidden_hits + screenshot_forbidden_hits)),
                     "preview_window": window,
                     "preview_window_ok": (
                         isinstance(window.get("start_index"), int)
@@ -503,6 +557,10 @@ def main() -> int:
 
 
 def _require_preview_ready(state: dict, session_path: str) -> dict:
+    dom = state.get("dom") or {}
+    for key in ("shell_root_count", "sidebar_count", "titlebar_count", "main_surface_count"):
+        if dom.get(key) != 1:
+            raise RuntimeError(f"{key}={dom.get(key)}")
     if not preview_ready(state, session_path):
         viewport = state.get("viewport") or {}
         raise RuntimeError(viewport.get("reason") or "preview viewport not ready")
