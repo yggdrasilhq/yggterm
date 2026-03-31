@@ -317,7 +317,34 @@ def preview_ready(state: dict, session_path: str) -> bool:
 
 
 def normalize_preview_entry_text(value: str) -> str:
-    return " ".join((value or "").split()).strip().lower()
+    normalized = (value or "")
+    for marker in ("`", "**", "__", "*"):
+        normalized = normalized.replace(marker, "")
+    return " ".join(normalized.split()).strip().lower()
+
+
+def preview_entry_body_text(value: str) -> str:
+    lines = [(line or "").strip() for line in (value or "").splitlines()]
+    lines = [line for line in lines if line]
+    while lines:
+        first = lines[0]
+        upper = first.upper()
+        if upper == "COLLAPSE" or upper == "EXPAND":
+            lines.pop(0)
+            continue
+        if any(ch.isdigit() for ch in first) and (
+            "UTC" in upper or "AM" in upper or "PM" in upper
+        ):
+            lines.pop(0)
+            continue
+        break
+    while lines and lines[0].upper() in {"COLLAPSE", "EXPAND"}:
+        lines.pop(0)
+    return "\n".join(lines)
+
+
+def normalize_preview_entry_body_text(value: str) -> str:
+    return normalize_preview_entry_text(preview_entry_body_text(value))
 
 
 def preview_semantic_issues(state: dict) -> list[str]:
@@ -333,7 +360,7 @@ def preview_semantic_issues_for_entries(entries: list[dict], rendered_sections: 
     for index, entry in enumerate(entries):
         text = (entry.get("text") or "").strip()
         tone = (entry.get("tone") or "").strip()
-        normalized = normalize_preview_entry_text(text)
+        normalized = normalize_preview_entry_body_text(text)
         if not normalized:
             issues.append(f"entry[{index}] is empty")
             continue
@@ -387,32 +414,71 @@ def load_server_state() -> dict:
         return {}
 
 
-def expected_recent_turns_for_session(server_state: dict, session_path: str) -> list[dict]:
-    def _recent_context_for_path() -> str:
-        for machine in server_state.get("remote_machines") or []:
-            for session in machine.get("sessions") or []:
-                if session.get("session_path") == session_path:
-                    return session.get("recent_context") or ""
-        for collection in ("local_sessions",):
-            for session in server_state.get(collection) or []:
-                if session.get("session_path") == session_path:
-                    return session.get("recent_context") or ""
-        return ""
+def session_source_record(server_state: dict, session_path: str) -> dict | None:
+    for machine in server_state.get("remote_machines") or []:
+        for session in machine.get("sessions") or []:
+            if session.get("session_path") == session_path:
+                return {
+                    "storage_path": session.get("storage_path") or "",
+                    "ssh_target": machine.get("ssh_target") or machine.get("machine_key") or "",
+                    "prefix": machine.get("prefix"),
+                    "machine_key": machine.get("machine_key"),
+                }
+    for collection in ("local_sessions",):
+        for session in server_state.get(collection) or []:
+            if session.get("session_path") == session_path:
+                return {
+                    "storage_path": session.get("storage_path") or "",
+                    "ssh_target": "",
+                    "prefix": None,
+                    "machine_key": "local",
+                }
+    return None
 
-    recent_context = _recent_context_for_path()
+
+def expected_preview_turns_for_session(server_state: dict, session_path: str, binary: str) -> list[dict]:
+    record = session_source_record(server_state, session_path)
+    if not record:
+        return []
+    storage_path = (record.get("storage_path") or "").strip()
+    if not storage_path:
+        return []
+
+    if record.get("ssh_target"):
+        remote_bin = "~/.yggterm/bin/yggterm"
+        payload = run_json(
+            "local",
+            " ".join(
+                [
+                    "ssh",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ConnectTimeout=8",
+                    quote(record["ssh_target"]),
+                    quote(f"{remote_bin} server remote preview {quote(storage_path)}"),
+                ]
+            ),
+        )
+    else:
+        payload = run_json(
+            "local",
+            f"{quote(binary)} server remote preview {quote(storage_path)}",
+        )
+
+    preview = payload.get("preview") or {}
     turns = []
-    for line in recent_context.splitlines():
-        trimmed = line.strip()
-        if trimmed.startswith("USER:"):
-            turns.append({"tone": "user", "text": trimmed.split("USER:", 1)[1].strip()})
-        elif trimmed.startswith("ASSISTANT:"):
-            turns.append({"tone": "assistant", "text": trimmed.split("ASSISTANT:", 1)[1].strip()})
+    for block in preview.get("blocks") or []:
+        tone = (block.get("tone") or "").strip().lower()
+        text = " ".join((block.get("lines") or [])).strip()
+        if tone and text:
+            turns.append({"tone": tone, "text": text})
     return turns
 
 
 def preview_entry_matches_expected(entry: dict, expected_turns: list[dict]) -> bool:
     entry_tone = (entry.get("tone") or "").strip().lower()
-    entry_text = normalize_preview_entry_text(entry.get("text") or "")
+    entry_text = normalize_preview_entry_body_text(entry.get("text") or "")
     if not entry_tone or not entry_text:
         return False
     for turn in expected_turns:
@@ -430,17 +496,23 @@ def preview_entry_matches_expected(entry: dict, expected_turns: list[dict]) -> b
     return False
 
 
-def preview_expected_turn_issues(state: dict, expected_turns: list[dict]) -> list[str]:
+def preview_expected_turn_issues_for_entries(
+    entries: list[dict], expected_turns: list[dict]
+) -> list[str]:
     if not expected_turns:
         return []
-    entries = (((state.get("viewport") or {}).get("preview") or {}).get("visible_entries") or [])
     issues = []
     for index, entry in enumerate(entries):
         if not preview_entry_matches_expected(entry, expected_turns):
             issues.append(
-                f"entry[{index}] does not match expected recent_context turn for tone={entry.get('tone')}"
+                f"entry[{index}] does not match expected preview payload turn for tone={entry.get('tone')}"
             )
     return issues
+
+
+def preview_expected_turn_issues(state: dict, expected_turns: list[dict]) -> list[str]:
+    entries = (((state.get("viewport") or {}).get("preview") or {}).get("visible_entries") or [])
+    return preview_expected_turn_issues_for_entries(entries, expected_turns)
 
 
 def read_png_size(path: Path) -> tuple[int, int]:
@@ -523,7 +595,7 @@ def main() -> int:
             "label": target["label"],
             "kind": target["kind"],
         }
-        expected_turns = expected_recent_turns_for_session(server_state, session_path)
+        expected_turns = expected_preview_turns_for_session(server_state, session_path, args.bin)
         try:
             entry["open"] = app_open(args.host, args.bin, session_path, args.timeout_ms)
             elapsed, state = wait_until(
@@ -568,6 +640,10 @@ def main() -> int:
                 screenshot_entries,
                 screenshot_rendered_sections,
             )
+            screenshot_expected_issues = preview_expected_turn_issues_for_entries(
+                screenshot_entries,
+                expected_turns,
+            )
             screenshot_forbidden_hits = [
                 marker
                 for marker in FORBIDDEN_PREVIEW_MARKERS
@@ -592,7 +668,13 @@ def main() -> int:
                     "raw_timestamps": raw_timestamps,
                     "timestamp_labels_ok": (len(raw_timestamps) == 0) or (len(timestamp_labels) > 0),
                     "titlebar_matches_viewport": titlebar_ok,
-                    "semantic_issues": list(dict.fromkeys(semantic_issues + screenshot_semantic_issues)),
+                    "semantic_issues": list(
+                        dict.fromkeys(
+                            semantic_issues
+                            + screenshot_semantic_issues
+                            + screenshot_expected_issues
+                        )
+                    ),
                     "forbidden_hits": list(dict.fromkeys(forbidden_hits + screenshot_forbidden_hits)),
                     "preview_window": window,
                     "preview_window_ok": (
