@@ -32,6 +32,7 @@ const ENV_YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF: &str = "YGGTERM_SKIP_ACTIVE_EXEC_HAN
 const ENV_YGGTERM_ENABLE_ACCESSIBILITY: &str = "YGGTERM_ENABLE_ACCESSIBILITY";
 const ENV_YGGTERM_ENABLE_WEBKIT_COMPOSITING: &str = "YGGTERM_ENABLE_WEBKIT_COMPOSITING";
 const ENV_YGGTERM_ALLOW_MULTI_WINDOW: &str = "YGGTERM_ALLOW_MULTI_WINDOW";
+const ENV_YGGTERM_ENABLE_TRANSPARENT_WINDOW: &str = "YGGTERM_ENABLE_TRANSPARENT_WINDOW";
 
 fn main() -> Result<()> {
     configure_linux_accessibility_bridge();
@@ -479,6 +480,18 @@ fn main() -> Result<()> {
     let cleanup_span = PerfSpan::start(&startup_home, "startup", "cleanup_legacy_daemons");
     let _ = cleanup_legacy_daemons(&endpoint, &current_exe);
     cleanup_span.finish(serde_json::json!({}));
+    let linux_window_profile = detect_linux_window_profile();
+    append_trace_event(
+        &startup_home,
+        "gui",
+        "startup",
+        "linux_window_profile",
+        serde_json::json!({
+            "transparent": linux_window_profile.transparent,
+            "xrpd_session": linux_window_profile.xrpd_session,
+            "reason": linux_window_profile.reason,
+        }),
+    );
     let host_span = PerfSpan::start(&startup_home, "startup", "detect_terminal_host");
     let host = detect_ghostty_host();
     host_span.finish(serde_json::json!({ "detail": host.detail }));
@@ -532,6 +545,57 @@ fn main() -> Result<()> {
         }),
     );
     launch_result
+}
+
+#[derive(Debug, Clone)]
+struct LinuxWindowProfile {
+    transparent: bool,
+    xrpd_session: bool,
+    reason: &'static str,
+}
+
+fn detect_linux_window_profile() -> LinuxWindowProfile {
+    #[cfg(target_os = "linux")]
+    {
+        let transparent_opt_in = std::env::var(ENV_YGGTERM_ENABLE_TRANSPARENT_WINDOW)
+            .ok()
+            .is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            });
+        let xrpd_session = std::env::var_os("XRDP_SESSION").is_some()
+            || std::env::var_os("XRDP_SOCKET_PATH").is_some();
+        if transparent_opt_in {
+            return LinuxWindowProfile {
+                transparent: true,
+                xrpd_session,
+                reason: "explicit_opt_in",
+            };
+        }
+        if xrpd_session {
+            return LinuxWindowProfile {
+                transparent: false,
+                xrpd_session: true,
+                reason: "xrdp_safe_mode",
+            };
+        }
+        return LinuxWindowProfile {
+            transparent: true,
+            xrpd_session: false,
+            reason: "default_linux_profile",
+        };
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        LinuxWindowProfile {
+            transparent: false,
+            xrpd_session: false,
+            reason: "non_linux",
+        }
+    }
 }
 
 fn configure_linux_accessibility_bridge() {
