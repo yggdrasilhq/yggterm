@@ -21,6 +21,7 @@ pub use daemon::{
     cleanup_legacy_daemons, connect_ssh, connect_ssh_custom, default_endpoint, focus_live,
     focus_live_with_view, open_remote_session, open_remote_session_with_view, open_stored_session,
     open_stored_session_with_view, ping, raise_external_window, refresh_managed_cli,
+    refresh_preview,
     refresh_remote_machine, remove_session, remove_ssh_target, request_terminal_launch, run_daemon,
     set_all_preview_blocks_folded, set_view_mode, shutdown, snapshot, start_command_session,
     start_local_session, start_local_session_at, start_ssh_session_at, status,
@@ -473,19 +474,23 @@ impl YggtermServer {
         let Some(path) = self.active_session_path.clone() else {
             return Ok(());
         };
+        self.refresh_session_preview_from_source(&path)
+    }
+
+    pub fn refresh_session_preview_from_source(&mut self, path: &str) -> anyhow::Result<()> {
         if let Some((raw_machine_key, session_id)) = parse_remote_scanned_session_path(&path) {
             let machine_key = normalize_machine_key(raw_machine_key);
             self.refresh_remote_scanned_session_preview(&machine_key, session_id)?;
             return Ok(());
         }
-        let Some(session) = self.sessions.get(&path).cloned() else {
+        let Some(session) = self.sessions.get(path).cloned() else {
             return Ok(());
         };
         match session.source {
-            SessionSource::Stored => self.refresh_stored_session_preview(&path, &session)?,
+            SessionSource::Stored => self.refresh_stored_session_preview(path, &session)?,
             SessionSource::LiveSsh => {
                 if let Some((raw_machine_key, session_id)) =
-                    parse_remote_scanned_session_path(&path)
+                    parse_remote_scanned_session_path(path)
                 {
                     let machine_key = normalize_machine_key(raw_machine_key);
                     self.refresh_remote_scanned_session_preview(&machine_key, session_id)?;
@@ -1519,6 +1524,42 @@ impl YggtermServer {
         Ok(summarize_managed_cli_report(&scope, &report))
     }
 
+    pub fn queue_background_managed_cli_refresh(
+        &self,
+        machine_key: Option<&str>,
+    ) -> anyhow::Result<String> {
+        match machine_key.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(machine_key) => {
+                let machine_key = normalize_machine_key(machine_key);
+                let target = self.remote_target_for_machine_key(&machine_key)?;
+                let ssh_target = target.ssh_target.clone();
+                let prefix = target.prefix.clone();
+                let queued_scope = machine_key.clone();
+                std::thread::spawn(move || {
+                    if let Err(error) =
+                        refresh_remote_managed_cli(&ssh_target, prefix.as_deref(), true)
+                    {
+                        warn!(
+                            machine_key = %queued_scope,
+                            ssh_target = %ssh_target,
+                            error = %error,
+                            "background managed cli refresh failed"
+                        );
+                    }
+                });
+                Ok(format!("queued managed cli refresh for {machine_key}"))
+            }
+            None => {
+                std::thread::spawn(|| {
+                    if let Err(error) = refresh_local_managed_cli(true) {
+                        warn!(error = %error, "background managed cli refresh failed");
+                    }
+                });
+                Ok("queued managed cli refresh for local".to_string())
+            }
+        }
+    }
+
     fn remote_target_for_machine_key(&self, machine_key: &str) -> anyhow::Result<SshConnectTarget> {
         let machine_key = normalize_machine_key(machine_key);
         self.ssh_targets
@@ -1699,7 +1740,9 @@ impl YggtermServer {
                         &target.ssh_target,
                     );
                     if !launch_terminal {
-                        clear_session_preview_for_loading(session);
+                        if !try_apply_remote_preview_head_payload(session, &target, scanned) {
+                            clear_session_preview_for_loading(session);
+                        }
                     }
                 }
             }
@@ -1790,7 +1833,9 @@ impl YggtermServer {
                     &target.ssh_target,
                 );
                 if !launch_terminal {
-                    clear_session_preview_for_loading(session);
+                    if !try_apply_remote_preview_head_payload(session, &target, scanned) {
+                        clear_session_preview_for_loading(session);
+                    }
                 }
             }
         }
@@ -3622,6 +3667,36 @@ fn clear_session_preview_for_loading(session: &mut ManagedSessionView) {
         "Preview Hydration",
         "loading".to_string(),
     );
+}
+
+fn apply_remote_preview_head_payload(
+    session: &mut ManagedSessionView,
+    payload: RemotePreviewPayload,
+) {
+    apply_remote_preview_payload(session, payload);
+    upsert_session_metadata(&mut session.metadata, "Preview Hydration", "head".to_string());
+}
+
+fn try_apply_remote_preview_head_payload(
+    session: &mut ManagedSessionView,
+    target: &SshConnectTarget,
+    scanned: &RemoteScannedSession,
+) -> bool {
+    match fetch_remote_preview_head_payload(target, &scanned.storage_path, 8) {
+        Ok(payload) => {
+            apply_remote_preview_head_payload(session, payload);
+            true
+        }
+        Err(error) => {
+            warn!(
+                ssh_target = %target.ssh_target,
+                storage_path = %scanned.storage_path,
+                error = %error,
+                "failed to fetch remote preview head payload"
+            );
+            false
+        }
+    }
 }
 
 fn apply_remote_preview_payload(session: &mut ManagedSessionView, payload: RemotePreviewPayload) {
