@@ -16226,7 +16226,7 @@ fn PreviewRunBlock(
 
 #[component]
 fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
-    let blocks = use_memo(move || preview_content_blocks(&lines));
+    let blocks = preview_content_blocks(&lines);
     rsx! {
         div {
             style: format!(
@@ -16234,7 +16234,7 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                  font-family:\"Source Serif 4\", \"Noto Serif\", \"Iowan Old Style\", Georgia, serif;",
                 palette.text
             ),
-            for block in blocks.read().iter().cloned() {
+            for block in blocks.into_iter() {
                 match block {
                     PreviewContentBlock::Heading { level, text } => rsx! {
                         div {
