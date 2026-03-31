@@ -2,17 +2,15 @@ use anyhow::Result;
 use yggterm_core::{SessionStore, detect_install_context, refresh_desktop_integration};
 use yggterm_server::{
     AppControlViewMode, cleanup_legacy_daemons, default_endpoint, detect_ghostty_host, ping,
-    run_app_control_create_terminal,
-    run_app_control_describe_rows, run_app_control_describe_state, run_app_control_drag,
-    run_app_control_dump_state, run_app_control_focus_window, run_app_control_open_path,
-    run_app_control_remove_session, run_app_control_scroll_preview,
-    run_app_control_send_terminal_input,
-    run_app_control_set_fullscreen, run_app_control_set_row_expanded, run_attach, run_daemon, run_remote_ensure_managed_cli,
+    run_app_control_create_terminal, run_app_control_describe_rows, run_app_control_describe_state,
+    run_app_control_drag, run_app_control_dump_state, run_app_control_focus_window,
+    run_app_control_open_path, run_app_control_remove_session, run_app_control_scroll_preview,
+    run_app_control_send_terminal_input, run_app_control_set_fullscreen,
+    run_app_control_set_row_expanded, run_attach, run_daemon, run_remote_ensure_managed_cli,
     run_remote_generation_context, run_remote_preview, run_remote_protocol_version,
     run_remote_refresh_managed_cli, run_remote_resume_codex, run_remote_scan,
-    run_remote_stage_clipboard_png, run_remote_upsert_generated_copy, run_screenshot_capture,
-    run_screenrecord_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown,
-    status,
+    run_remote_stage_clipboard_png, run_remote_upsert_generated_copy, run_screenrecord_capture,
+    run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, status,
 };
 
 fn main() -> Result<()> {
@@ -238,7 +236,9 @@ fn main() -> Result<()> {
                     .skip(3)
                     .find(|value| !value.starts_with("--"))
                     .map(String::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("missing row path for server app expand/collapse"))?;
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("missing row path for server app expand/collapse")
+                    })?;
                 run_app_control_set_row_expanded(row_path, args[2] == "expand", timeout_ms)
             }
             "focus" => run_app_control_focus_window(timeout_ms),
@@ -343,15 +343,21 @@ fn main() -> Result<()> {
                             .skip(4)
                             .find(|value| !value.starts_with("--"))
                             .map(String::as_str)
-                            .ok_or_else(|| anyhow::anyhow!("missing session path for server app terminal send"))?;
-                        let data = args.windows(2).find_map(|window| {
-                            if window[0] == "--data" {
-                                Some(window[1].as_str())
-                            } else {
-                                None
-                            }
-                        })
-                        .ok_or_else(|| anyhow::anyhow!("missing --data for server app terminal send"))?;
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("missing session path for server app terminal send")
+                            })?;
+                        let data = args
+                            .windows(2)
+                            .find_map(|window| {
+                                if window[0] == "--data" {
+                                    Some(window[1].as_str())
+                                } else {
+                                    None
+                                }
+                            })
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("missing --data for server app terminal send")
+                            })?;
                         run_app_control_send_terminal_input(session_path, data, timeout_ms)
                     }
                     other => anyhow::bail!("unsupported app terminal action: {other}"),
@@ -369,7 +375,11 @@ fn main() -> Result<()> {
                             .skip(4)
                             .find(|value| !value.starts_with("--"))
                             .map(String::as_str)
-                            .ok_or_else(|| anyhow::anyhow!("missing session path for server app session remove"))?;
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "missing session path for server app session remove"
+                                )
+                            })?;
                         run_app_control_remove_session(session_path, timeout_ms)
                     }
                     other => anyhow::bail!("unsupported app session action: {other}"),
