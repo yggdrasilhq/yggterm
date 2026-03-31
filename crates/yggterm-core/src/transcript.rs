@@ -143,21 +143,15 @@ pub fn read_codex_transcript_messages(path: &Path) -> Result<Vec<TranscriptMessa
                 let Some(payload) = value.get("payload") else {
                     continue;
                 };
-                if payload.get("type").and_then(Value::as_str) != Some("user_message") {
-                    continue;
-                }
-                let Some(text) = payload.get("message").and_then(Value::as_str) else {
+                let Some((role, text)) = event_message_role_and_text(payload) else {
                     continue;
                 };
-                let lines = normalize_preview_text(text);
-                if lines.is_empty() {
-                    continue;
-                }
-                messages.push(TranscriptMessage {
-                    role: TranscriptRole::User,
-                    timestamp: extract_timestamp_raw(&value),
-                    lines,
-                });
+                push_message_lines(
+                    &mut messages,
+                    role,
+                    normalize_preview_text(text),
+                    extract_timestamp_raw(&value),
+                );
             }
             _ => {}
         }
@@ -182,12 +176,32 @@ pub fn message_lines_from_payload(payload: &Value) -> Vec<String> {
 }
 
 fn push_message(messages: &mut Vec<TranscriptMessage>, payload: &Value, timestamp: Option<String>) {
-    let lines = message_lines_from_payload(payload);
+    push_message_lines(
+        messages,
+        normalized_message_role(payload),
+        message_lines_from_payload(payload),
+        timestamp,
+    );
+}
+
+fn push_message_lines(
+    messages: &mut Vec<TranscriptMessage>,
+    role: TranscriptRole,
+    lines: Vec<String>,
+    timestamp: Option<String>,
+) {
     if lines.is_empty() {
         return;
     }
+    let candidate_key = normalized_transcript_message_key(role, &lines);
+    if let Some(last) = messages.last() {
+        let last_key = normalized_transcript_message_key(last.role, &last.lines);
+        if last.role == role && last_key == candidate_key {
+            return;
+        }
+    }
     messages.push(TranscriptMessage {
-        role: normalized_message_role(payload),
+        role,
         timestamp,
         lines,
     });
@@ -199,10 +213,22 @@ fn normalized_message_role(payload: &Value) -> TranscriptRole {
         .and_then(Value::as_str)
         .unwrap_or("assistant")
     {
-        "user" | "developer" => TranscriptRole::User,
+        "user" => TranscriptRole::User,
         "assistant" => TranscriptRole::Assistant,
         _ => TranscriptRole::System,
     }
+}
+
+fn event_message_role_and_text(payload: &Value) -> Option<(TranscriptRole, &str)> {
+    let role = match payload.get("type").and_then(Value::as_str) {
+        Some("user_message") => TranscriptRole::User,
+        Some("agent_message") => TranscriptRole::Assistant,
+        _ => return None,
+    };
+    payload
+        .get("message")
+        .and_then(Value::as_str)
+        .map(|text| (role, text))
 }
 
 fn extract_timestamp_raw(value: &Value) -> Option<String> {
@@ -265,6 +291,15 @@ fn normalize_generation_semantic_text(text: &str) -> String {
         .join(" ")
         .trim()
         .to_string()
+}
+
+fn normalized_transcript_message_key(role: TranscriptRole, lines: &[String]) -> String {
+    let text = lines
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{role:?}:{}", normalize_generation_semantic_text(&text))
 }
 
 fn collapse_named_image_markup(text: &str) -> String {
@@ -379,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn transcript_reader_normalizes_developer_messages_as_user() -> Result<()> {
+    fn transcript_reader_treats_developer_messages_as_system() -> Result<()> {
         let path = std::env::temp_dir().join(format!(
             "yggterm-transcript-dev-{}-{}.jsonl",
             std::process::id(),
@@ -395,7 +430,36 @@ mod tests {
 
         let messages = read_codex_transcript_messages(&path)?;
         assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, TranscriptRole::System);
+
+        let _ = fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn transcript_reader_dedupes_response_and_event_message_pairs() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "yggterm-transcript-dedupe-{}-{}.jsonl",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-03-20T10:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"continue."}]}}"#,
+                r#"{"timestamp":"2026-03-20T10:00:00Z","type":"event_msg","payload":{"type":"user_message","message":"continue."}}"#,
+                r#"{"timestamp":"2026-03-20T10:00:01Z","type":"event_msg","payload":{"type":"agent_message","message":"I fixed it."}}"#,
+                r#"{"timestamp":"2026-03-20T10:00:01Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I fixed it."}]}}"#,
+            ]
+            .join("\n"),
+        )?;
+
+        let messages = read_codex_transcript_messages(&path)?;
+        assert_eq!(messages.len(), 2, "{messages:?}");
         assert_eq!(messages[0].role, TranscriptRole::User);
+        assert_eq!(messages[0].lines, vec!["continue.".to_string()]);
+        assert_eq!(messages[1].role, TranscriptRole::Assistant);
+        assert_eq!(messages[1].lines, vec!["I fixed it.".to_string()]);
 
         let _ = fs::remove_file(path);
         Ok(())
