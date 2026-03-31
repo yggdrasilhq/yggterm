@@ -137,6 +137,7 @@ const SEARCH_INPUT_ID: &str = "yggterm-search-input";
 const PREVIEW_HEADER_SEARCH_HIT_ID: &str = "__preview_header__";
 const DEBUG_REQUEST_DELAY_ENV: &str = "YGGTERM_DEBUG_REQUEST_DELAY_MS";
 const SCREENSHOT_REQUEST_POLL_MS: u64 = 250;
+const APP_CONTROL_DRAIN_STUCK_MS: u64 = 2_500;
 type WorkspaceReorderPlanItem = TreeReorderPlanItem<BrowserRowKind>;
 
 #[derive(Debug, Clone)]
@@ -1764,7 +1765,7 @@ impl ShellState {
         let Some(preferred_path) = preferred_path else {
             return snapshot;
         };
-        let Some(preferred_session) = snapshot
+        let preferred_session = snapshot
             .live_sessions
             .iter()
             .find(|session| session.session_path == preferred_path)
@@ -1775,12 +1776,11 @@ impl ShellState {
                     .as_ref()
                     .filter(|session| session.session_path == preferred_path)
                     .cloned()
-            })
-        else {
-            return snapshot;
-        };
+            });
         snapshot.active_session_path = Some(preferred_path);
-        snapshot.active_session = Some(preferred_session);
+        if let Some(preferred_session) = preferred_session {
+            snapshot.active_session = Some(preferred_session);
+        }
         snapshot
     }
 
@@ -6034,14 +6034,34 @@ fn preview_block_text(block: &SessionPreviewBlock) -> String {
 }
 
 fn is_preview_scaffold_line(line: &str) -> bool {
-    matches!(
-        line.trim(),
+    let trimmed = line.trim();
+    if matches!(
+        trimmed,
         "PRIMARY USER GOALS:"
             | "RECENT SUBSTANTIVE TURNS:"
             | "RECENT CONTEXT:"
             | "SERVER NOTES:"
             | "RENDERED SESSION:"
-    )
+    ) {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("# agents.md instructions")
+        || lower.contains("agents.md instructions for")
+        || lower.starts_with("## skills")
+        || lower.contains("<instructions>")
+        || lower.contains("<permissions instructions>")
+        || lower.contains("<collaboration_mode>")
+        || lower.contains("environment_context")
+        || lower.contains("request_user_input")
+        || lower.contains("skill is a set of local instructions")
+        || lower.contains("approvals are your mechanism to get user consent")
+        || lower.contains("approval_policy is")
+        || lower.contains("danger-full-access")
+        || lower.contains("non-interactive mode where you may never ask the user for approval")
+        || lower.contains("<turn_aborted>")
+        || lower.contains("the user interrupted the previous turn on purpose")
+        || lower.contains("any running unified exec processes were terminated")
 }
 
 fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlock> {
@@ -6064,20 +6084,7 @@ fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlo
             let cleaned_lines = block
                 .lines
                 .iter()
-                .filter(|line| {
-                    if is_preview_scaffold_line(line) {
-                        return false;
-                    }
-                    let lower = line.trim().to_ascii_lowercase();
-                    !(lower.starts_with("# agents.md instructions")
-                        || lower.starts_with("## skills")
-                        || lower.contains("<instructions>")
-                        || lower.contains("<permissions instructions>")
-                        || lower.contains("<collaboration_mode>")
-                        || lower.contains("environment_context")
-                        || lower.contains("request_user_input")
-                        || lower.contains("skill is a set of local instructions"))
-                })
+                .filter(|line| !is_preview_scaffold_line(line))
                 .cloned()
                 .collect::<Vec<_>>();
             if cleaned_lines.is_empty() {
@@ -6098,11 +6105,18 @@ fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlo
                     || lower.contains("collaboration mode:")
                     || lower.contains("<collaboration_mode>")
                     || lower.contains("environment_context")
-                    || lower.contains("agents.md instructions for /root")
+                    || lower.contains("agents.md instructions for")
                     || lower.contains("current_date>")
                     || lower.contains("while commands are running inside the sandbox")
                     || lower.contains("how to request escalation")
-                    || lower.contains("prefix_rule guidance"))
+                    || lower.contains("prefix_rule guidance")
+                    || lower.contains("approvals are your mechanism to get user consent")
+                    || lower.contains("approval_policy is")
+                    || lower.contains("danger-full-access")
+                    || lower.contains("non-interactive mode where you may never ask the user for approval")
+                    || lower.contains("<turn_aborted>")
+                    || lower.contains("the user interrupted the previous turn on purpose")
+                    || lower.contains("any running unified exec processes were terminated"))
             {
                 return None;
             }
@@ -11580,6 +11594,7 @@ fn app() -> Element {
     let mut app_control_loop_started = use_signal(|| false);
     let mut app_control_watchdog_started = use_signal(|| false);
     let mut app_control_drain_in_flight = use_signal(|| false);
+    let mut app_control_drain_started_ms = use_signal(|| 0_u64);
     let window_spawn_probe_started = use_signal(current_millis);
     let window_spawn_traced = use_signal(|| false);
     let mut window_epoch = use_signal(|| 0_u64);
@@ -11722,6 +11737,8 @@ fn app() -> Element {
             let state = state;
             let schedule_ui_update = schedule_ui_update.clone();
             let mut app_control_drain_in_flight = app_control_drain_in_flight;
+            let mut app_control_drain_started_ms = app_control_drain_started_ms;
+            let window_spawn_traced = window_spawn_traced;
             spawn(async move {
                 let trace_home = perf_home_dir(&settings_path);
                 append_trace_event(
@@ -11734,10 +11751,36 @@ fn app() -> Element {
                     }),
                 );
                 loop {
-                    if !*app_control_drain_in_flight.read()
-                        && app_control_requests_pending(&trace_home)
+                    let pending_requests = app_control_requests_pending(&trace_home);
+                    if *app_control_drain_in_flight.read() && pending_requests {
+                        let started_ms = *app_control_drain_started_ms.read();
+                        if started_ms > 0
+                            && current_millis().saturating_sub(started_ms)
+                                > APP_CONTROL_DRAIN_STUCK_MS
+                        {
+                            app_control_drain_in_flight.set(false);
+                            app_control_drain_started_ms.set(0);
+                            append_trace_event(
+                                &trace_home,
+                                "ui",
+                                "app_control",
+                                "watchdog_drain_stuck_reset",
+                                json!({
+                                    "pid": std::process::id(),
+                                    "started_ms": started_ms,
+                                    "age_ms": current_millis().saturating_sub(started_ms),
+                                }),
+                            );
+                        }
+                    }
+                    if !*window_spawn_traced.read() {
+                        sleep(Duration::from_millis(SCREENSHOT_REQUEST_POLL_MS)).await;
+                        continue;
+                    }
+                    if !*app_control_drain_in_flight.read() && pending_requests
                     {
                         app_control_drain_in_flight.set(true);
+                        app_control_drain_started_ms.set(current_millis());
                         append_trace_event(
                             &trace_home,
                             "ui",
@@ -11774,6 +11817,7 @@ fn app() -> Element {
                             }
                         }
                         app_control_drain_in_flight.set(false);
+                        app_control_drain_started_ms.set(0);
                         append_trace_event(
                             &trace_home,
                             "ui",
@@ -11797,16 +11841,22 @@ fn app() -> Element {
         let desktop = desktop.clone();
         let state = state;
         let schedule_ui_update = schedule_ui_update.clone();
+        let window_spawn_traced = window_spawn_traced;
         use_effect(move || {
             let trace_home = perf_home_dir(&settings_path);
+            if !*window_spawn_traced.read() {
+                return;
+            }
             if *app_control_drain_in_flight.read() || !app_control_requests_pending(&trace_home) {
                 return;
             }
             app_control_drain_in_flight.set(true);
+            app_control_drain_started_ms.set(current_millis());
             let settings_path = settings_path.clone();
             let desktop = desktop.clone();
             let state = state;
             let schedule_ui_update = schedule_ui_update.clone();
+            let mut app_control_drain_started_ms = app_control_drain_started_ms;
             spawn(async move {
                 let trace_home = perf_home_dir(&settings_path);
                 loop {
@@ -11832,6 +11882,7 @@ fn app() -> Element {
                     }
                 }
                 app_control_drain_in_flight.set(false);
+                app_control_drain_started_ms.set(0);
                 if app_control_requests_pending(&trace_home) {
                     schedule_ui_update();
                 }
@@ -11843,11 +11894,16 @@ fn app() -> Element {
     use_wry_event_handler(move |event, _| {
         if matches!(event, TaoEvent::UserEvent(DesktopUserWindowEvent::Poll(_))) {
             let trace_home = perf_home_dir(&settings_path_for_app_control_handler);
+            if !*window_spawn_traced.read() {
+                return;
+            }
             if !*app_control_drain_in_flight.read() && app_control_requests_pending(&trace_home) {
                 app_control_drain_in_flight.set(true);
+                app_control_drain_started_ms.set(current_millis());
                 let settings_path = settings_path_for_app_control_handler.clone();
                 let desktop = desktop_for_app_control_handler.clone();
                 let state = state;
+                let mut app_control_drain_started_ms = app_control_drain_started_ms;
                 spawn(async move {
                     let trace_home = perf_home_dir(&settings_path);
                     loop {
@@ -11873,6 +11929,7 @@ fn app() -> Element {
                         }
                     }
                     app_control_drain_in_flight.set(false);
+                    app_control_drain_started_ms.set(0);
                 });
             }
         }
@@ -11962,6 +12019,9 @@ fn app() -> Element {
         if *background_refresh_defer_started.read() {
             return;
         }
+        if !*window_spawn_traced.read() {
+            return;
+        }
         background_refresh_defer_started.set(true);
         let defer_ms = state
             .read()
@@ -11996,6 +12056,9 @@ fn app() -> Element {
         }
     });
     use_effect(move || {
+        if !*window_spawn_traced.read() {
+            return;
+        }
         let active = state.read().server.active_session().cloned();
         let Some(session) = active else {
             last_preview_refresh_marker.set(None);
@@ -12030,6 +12093,9 @@ fn app() -> Element {
         maybe_spawn_background_copy_generation(state);
     });
     use_effect(move || {
+        if !*window_spawn_traced.read() {
+            return;
+        }
         let (active, view_mode, server_busy, dirty_epoch) = {
             let shell = state.read();
             (
