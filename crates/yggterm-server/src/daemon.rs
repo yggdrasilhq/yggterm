@@ -1,8 +1,8 @@
 use crate::{
-    GhosttyHostSupport, PersistedDaemonState, RemoteMachineSnapshot, ServerUiSnapshot,
-    SessionKind, SshConnectTarget, TerminalManager, WorkspaceViewMode, YggtermServer,
-    active_client_instance_records, current_millis,
-    fetch_remote_generation_context, persist_remote_generated_copy, terminate_remote_codex_session,
+    GhosttyHostSupport, PersistedDaemonState, RemoteMachineSnapshot, ServerUiSnapshot, SessionKind,
+    SshConnectTarget, TerminalManager, WorkspaceViewMode, YggtermServer,
+    active_client_instance_records, current_millis, fetch_remote_generation_context,
+    persist_remote_generated_copy, terminate_remote_codex_session,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -14,12 +14,12 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
 };
+use time::OffsetDateTime;
 use tracing::{info, warn};
 use yggterm_core::{
     AppSettings, PerfSpan, SessionNode, SessionNodeKind, SessionStore, UiTheme, append_trace_event,
     looks_like_generated_fallback_title,
 };
-use time::OffsetDateTime;
 
 pub const SERVER_PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BACKGROUND_COPY_CHORE_MS: u64 = 12_000;
@@ -473,7 +473,9 @@ impl DaemonRuntime {
             }
             ServerRequest::RemoveSession { path } => {
                 let stop_command = self.server.terminal_stop_command(&path);
-                let removed_terminal = self.terminals.remove_session(&path, stop_command.as_deref())?;
+                let removed_terminal = self
+                    .terminals
+                    .remove_session(&path, stop_command.as_deref())?;
                 let removed_session = self.server.remove_live_session(&path)?;
                 self.persist()?;
                 self.snapshot_response(Some(if removed_session {
@@ -784,7 +786,10 @@ fn build_background_copy_updates(
 
     let mut updates = Vec::new();
     for candidate in candidates.into_iter().take(BACKGROUND_COPY_BUDGET_PER_TICK) {
-        let stored_title = store.resolve_title_for_session_id(&candidate.session_id).ok().flatten();
+        let stored_title = store
+            .resolve_title_for_session_id(&candidate.session_id)
+            .ok()
+            .flatten();
         let title_missing = looks_like_generated_fallback_title(&candidate.title)
             && stored_title
                 .as_deref()
@@ -890,8 +895,13 @@ fn run_background_copy_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usiz
         )
     };
     let perf = PerfSpan::start(&perf_home, "daemon", "background_copy_chore");
-    let updates =
-        build_background_copy_updates(&store, &settings, &local_root, &remote_machines, &ssh_targets)?;
+    let updates = build_background_copy_updates(
+        &store,
+        &settings,
+        &local_root,
+        &remote_machines,
+        &ssh_targets,
+    )?;
     perf.finish(serde_json::json!({
         "updates": updates.len(),
         "remote_machines": remote_machines.len(),
@@ -904,10 +914,14 @@ fn run_background_copy_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usiz
     let mut runtime = runtime.lock().expect("daemon runtime lock poisoned");
     for update in &updates {
         if let Some(title) = update.title.as_deref() {
-            runtime.server.set_session_title_hint(&update.session_path, title);
+            runtime
+                .server
+                .set_session_title_hint(&update.session_path, title);
         }
         if let Some(summary) = update.summary.as_deref() {
-            runtime.server.set_session_summary_hint(&update.session_path, summary);
+            runtime
+                .server
+                .set_session_summary_hint(&update.session_path, summary);
         }
     }
     runtime.persist()?;
@@ -1422,15 +1436,17 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
     {
         let runtime = runtime.clone();
         let last_activity_ms = last_activity_ms.clone();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_millis(BACKGROUND_COPY_CHORE_MS));
-            match run_background_copy_chore(&runtime) {
-                Ok(update_count) => {
-                    if update_count > 0 {
-                        mark_daemon_activity(&last_activity_ms);
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(BACKGROUND_COPY_CHORE_MS));
+                match run_background_copy_chore(&runtime) {
+                    Ok(update_count) => {
+                        if update_count > 0 {
+                            mark_daemon_activity(&last_activity_ms);
+                        }
                     }
+                    Err(error) => warn!(error=%error, "daemon background copy chore failed"),
                 }
-                Err(error) => warn!(error=%error, "daemon background copy chore failed"),
             }
         });
     }
