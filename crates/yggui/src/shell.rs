@@ -10337,7 +10337,9 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
             .get("preview_scroll_count")
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        if preview_loading {
+        let preview_has_content = preview_scroll_count > 0
+            && (!preview_text_sample.is_empty() || preview_visible_block_count > 0);
+        if preview_loading && !preview_has_content {
             (false, Some("preview still loading".to_string()))
         } else if preview_scroll_count == 0 && document_editor_count == 0 {
             (false, Some("preview surface not mounted".to_string()))
@@ -10580,7 +10582,9 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                         block_id: entry.id || null,
                         tone: entry.getAttribute('data-preview-tone'),
                         block_ix: Number(entry.getAttribute('data-preview-block-ix') || '-1'),
+                        left: Math.round(rect.left),
                         top: Math.round(rect.top),
+                        width: Math.round(rect.width),
                         height: Math.round(rect.height),
                         timestamp: String(entry.getAttribute('data-preview-raw-timestamp') || '').trim(),
                         text: String(entry.innerText || '').trim().slice(0, 480),
@@ -15168,6 +15172,12 @@ fn MainSurface(
                                         "data-preview-window-scroll-height": "{preview_window.scroll_height_px.round() as i64}",
                                         "data-preview-window-overscan": "{preview_window.overscan_px.round() as i64}",
                                         style: "display:flex; flex-direction:column; gap:16px; min-width:0; width:min(1020px, 100%); margin:0 auto;",
+                                        if !preview_rendered_sections(&session).is_empty() {
+                                            RenderedSectionsStrip {
+                                                sections: preview_rendered_sections(&session),
+                                                palette: snapshot.palette,
+                                            }
+                                        }
                                         if preview_window.top_spacer_px > 0.0 {
                                             div {
                                                 "data-preview-spacer": "top",

@@ -3660,8 +3660,6 @@ fn apply_remote_scanned_session_preview(
 }
 
 fn clear_session_preview_for_loading(session: &mut ManagedSessionView) {
-    session.preview.blocks.clear();
-    session.rendered_sections.clear();
     upsert_session_metadata(
         &mut session.metadata,
         "Preview Hydration",
@@ -8316,7 +8314,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_preview_open_starts_in_loading_state_without_recent_context_blocks() -> Result<()> {
+    fn remote_preview_open_keeps_synthesized_preview_while_loading() -> Result<()> {
         let tree = SessionNode {
             kind: SessionNodeKind::Group,
             name: "root".to_string(),
@@ -8368,8 +8366,15 @@ mod tests {
         )?;
 
         let session = server.sessions.get(&session_path).expect("session");
-        assert!(session.preview.blocks.is_empty());
+        assert!(!session.preview.blocks.is_empty());
         assert!(session.rendered_sections.is_empty());
+        assert_eq!(session.preview.blocks[0].tone, PreviewTone::User);
+        assert!(
+            session.preview.blocks[0]
+                .lines
+                .join(" ")
+                .contains("stale summary-like first turn")
+        );
         assert_eq!(
             session_metadata_value(session, "Preview Hydration").as_deref(),
             Some("loading")
