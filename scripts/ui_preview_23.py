@@ -461,24 +461,38 @@ def expected_preview_turns_for_session(server_state: dict, session_path: str, bi
 
     if record.get("ssh_target"):
         remote_bin = "~/.yggterm/bin/yggterm"
-        payload = run_json(
-            "local",
-            " ".join(
-                [
-                    "ssh",
-                    "-o",
-                    "BatchMode=yes",
-                    "-o",
-                    "ConnectTimeout=8",
-                    quote(record["ssh_target"]),
-                    quote(f"{remote_bin} server remote preview {quote(storage_path)}"),
-                ]
-            ),
+        command = " ".join(
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=8",
+                quote(record["ssh_target"]),
+                quote(f"{remote_bin} server remote preview-head {quote(storage_path)} 24"),
+            ]
         )
+        try:
+            result = subprocess.run(
+                ["bash", "-lc", command],
+                check=False,
+                text=True,
+                capture_output=True,
+                timeout=12,
+            )
+        except subprocess.TimeoutExpired:
+            return []
+        stdout = result.stdout.strip()
+        if result.returncode != 0 or not stdout:
+            return []
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError:
+            return []
     else:
         payload = run_json(
             "local",
-            f"{quote(binary)} server remote preview {quote(storage_path)}",
+            f"{quote(binary)} server remote preview-head {quote(storage_path)} 24",
         )
 
     preview = payload.get("preview") or {}
