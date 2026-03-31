@@ -20009,7 +20009,7 @@ fn shell_style(
     let backdrop = shell_backdrop_style(maximized);
     let frame_inset = if maximized { 0 } else { 1 };
     format!(
-        "position:fixed; inset:{}px; display:flex; flex-direction:column; overflow:hidden; \
+        "position:absolute; inset:{}px; display:flex; flex-direction:column; overflow:hidden; \
          border-radius:{}px; background-color:{}; background-image:{}; box-shadow:{}; backdrop-filter:{}; \
          -webkit-backdrop-filter:{}; font-family:{};",
         frame_inset,
