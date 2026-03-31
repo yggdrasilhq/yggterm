@@ -131,7 +131,8 @@ const BACKGROUND_COPY_RETRY_MS: u64 = 300_000;
 const BACKGROUND_COPY_CONTINUE_MS: u64 = 15_000;
 const BACKGROUND_COPY_IDLE_MS: u64 = 120_000;
 const BACKGROUND_REFRESH_NOTICE_MS: u64 = 12_000;
-const BACKGROUND_REFRESH_STARTUP_DEFER_MS: u64 = 3_000;
+const BACKGROUND_REFRESH_STARTUP_DEFER_MS: u64 = 20_000;
+const BACKGROUND_REFRESH_INTERACTIVE_DEFER_MS: u64 = 15_000;
 const THEME_EDITOR_PAD_SIZE: f64 = 286.0;
 const SEARCH_INPUT_ID: &str = "yggterm-search-input";
 const PREVIEW_HEADER_SEARCH_HIT_ID: &str = "__preview_header__";
@@ -1223,7 +1224,7 @@ impl ShellState {
         if request_meta.priority == YggOperationPriority::Interactive {
             self.background_refresh_after_ms = self
                 .background_refresh_after_ms
-                .max(current_millis() + BACKGROUND_REFRESH_STARTUP_DEFER_MS);
+                .max(current_millis() + BACKGROUND_REFRESH_INTERACTIVE_DEFER_MS);
         }
         if let Ok(store) = SessionStore::open_or_init() {
             append_trace_event(
@@ -5441,6 +5442,7 @@ fn restore_browser_tree(
 fn remote_preview_needs_refresh(session: &ManagedSessionView) -> bool {
     session.session_path.starts_with("remote-session://")
         && (session.preview.blocks.is_empty()
+            || metadata_value(session, "Preview Hydration") == "head"
             || session.preview.blocks.iter().any(|block| {
                 block.timestamp == "server:launch" || block.timestamp == "remote:scan"
             })
@@ -10631,7 +10633,7 @@ async fn process_pending_app_control_requests(
         let _ = safe_shell_mut(state, "app_control_defer_background_refresh", |shell| {
             shell.background_refresh_after_ms = shell
                 .background_refresh_after_ms
-                .max(current_millis() + BACKGROUND_REFRESH_STARTUP_DEFER_MS);
+                .max(current_millis() + BACKGROUND_REFRESH_INTERACTIVE_DEFER_MS);
         });
     }
     let active_session_path = state
@@ -15799,8 +15801,7 @@ fn PreviewRunBlock(
     let column_style = if user_run {
         format!(
             "display:flex; flex-direction:column; gap:0; width:auto; max-width:min(72%, 720px); \
-             min-width:0; box-sizing:border-box; content-visibility:auto; contain:layout paint style; \
-             contain-intrinsic-size:760px 260px; font-family:{};",
+             min-width:0; box-sizing:border-box; contain:layout paint style; font-family:{};",
             serif_stack
         )
     } else {
