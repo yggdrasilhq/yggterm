@@ -51,7 +51,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 use time::{OffsetDateTime, UtcOffset, macros::format_description};
 use tracing::warn;
 use uuid::Uuid;
@@ -69,7 +69,7 @@ pub enum WorkspaceViewMode {
     Rendered,
 }
 
-const REMOTE_COMMAND_CACHE_VERIFY_TTL_MS: u64 = 60_000;
+const REMOTE_COMMAND_CACHE_VERIFY_TTL_MS: u64 = 10 * 60_000;
 
 #[derive(Debug, Clone)]
 struct RemoteCommandCacheEntry {
@@ -4727,7 +4727,12 @@ fn strip_remote_payload_noise(stdout: &[u8]) -> String {
 }
 
 fn remote_cache_key(ssh_target: &str, exec_prefix: Option<&str>) -> String {
-    format!("{}|{}", ssh_target, exec_prefix.unwrap_or_default())
+    let normalized_target = ssh_target.trim();
+    let normalized_prefix = exec_prefix
+        .map(str::trim)
+        .filter(|prefix| !prefix.is_empty())
+        .unwrap_or_default();
+    format!("{normalized_target}|{normalized_prefix}")
 }
 
 fn remote_command_cache()
@@ -5961,16 +5966,120 @@ pub fn run_app_control_open_path(
     timeout_ms: u64,
 ) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
-    let response = request_app_control(
+    let mut response = request_app_control(
         &home,
         AppControlCommand::OpenPath {
             session_path: session_path.to_string(),
-            view_mode,
+            view_mode: view_mode.clone(),
         },
         timeout_ms,
     )?;
+    let settled_state = wait_for_app_control_open_path_ready(&home, session_path, view_mode, timeout_ms)?;
+    let mut data = response.data.take().unwrap_or_else(|| json!({}));
+    if let Some(map) = data.as_object_mut() {
+        map.insert("activated".to_string(), Value::Bool(true));
+        map.insert("state".to_string(), settled_state);
+    }
+    response.data = Some(data);
     write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
     Ok(())
+}
+
+fn app_control_open_path_ready(
+    data: &Value,
+    session_path: &str,
+    view_mode: Option<&AppControlViewMode>,
+) -> bool {
+    let viewport = data.get("viewport").and_then(Value::as_object);
+    let Some(viewport) = viewport else {
+        return false;
+    };
+    if viewport
+        .get("active_session_path")
+        .and_then(Value::as_str)
+        != Some(session_path)
+    {
+        return false;
+    }
+    let Some(active_view_mode) = viewport.get("active_view_mode").and_then(Value::as_str) else {
+        return false;
+    };
+    let ready = viewport
+        .get("ready")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !ready {
+        return false;
+    }
+    match view_mode {
+        Some(AppControlViewMode::Terminal) => active_view_mode == "Terminal",
+        Some(AppControlViewMode::Preview) | None => {
+            if active_view_mode != "Rendered" {
+                return false;
+            }
+            let preview = viewport
+                .get("preview")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let visible_block_count = preview
+                .get("visible_block_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let rendered_sections = preview
+                .get("rendered_sections")
+                .and_then(Value::as_array)
+                .map(|items| !items.is_empty())
+                .unwrap_or(false);
+            let text_sample = preview
+                .get("text_sample")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or("");
+            visible_block_count > 0 || rendered_sections || !text_sample.is_empty()
+        }
+    }
+}
+
+fn wait_for_app_control_open_path_ready(
+    home: &Path,
+    session_path: &str,
+    view_mode: Option<AppControlViewMode>,
+    timeout_ms: u64,
+) -> anyhow::Result<Value> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(250));
+    let mut last_state = None::<Value>;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let describe_timeout_ms = remaining
+            .as_millis()
+            .clamp(250, 1_000) as u64;
+        let response = request_app_control(home, AppControlCommand::DescribeState, describe_timeout_ms)?;
+        if let Some(data) = response.data {
+            if app_control_open_path_ready(&data, session_path, view_mode.as_ref()) {
+                return Ok(data);
+            }
+            last_state = Some(data);
+        }
+        if Instant::now() >= deadline {
+            let summary = last_state
+                .as_ref()
+                .and_then(|data| data.get("viewport"))
+                .map(|viewport| {
+                    json!({
+                        "active_session_path": viewport.get("active_session_path"),
+                        "active_view_mode": viewport.get("active_view_mode"),
+                        "reason": viewport.get("reason"),
+                        "ready": viewport.get("ready"),
+                    })
+                })
+                .unwrap_or(Value::Null);
+            anyhow::bail!(
+                "timed out waiting for app open to settle for {session_path}: {summary}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(120));
+    }
 }
 
 pub fn run_app_control_drag(
@@ -9391,6 +9500,15 @@ mod tests {
             "remote yggterm command failed for oc: sh: 1: /home/pi/.yggterm/bin/yggterm: Permission denied"
         );
         assert!(should_fallback_to_python(&error));
+    }
+
+    #[test]
+    fn remote_cache_key_trims_prefix_noise() {
+        assert_eq!(
+            remote_cache_key(" jojo ", Some("  sudo -u pi  ")),
+            remote_cache_key("jojo", Some("sudo -u pi"))
+        );
+        assert_eq!(remote_cache_key("jojo", Some("   ")), remote_cache_key("jojo", None));
     }
 
     #[test]

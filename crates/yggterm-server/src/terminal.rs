@@ -3,14 +3,17 @@ use anyhow::{Context, Result, bail};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_COLS: u16 = 120;
 const DEFAULT_ROWS: u16 = 36;
-const MAX_CHUNKS: usize = 4096;
+const MAX_CHUNKS: usize = 512;
+pub const MAX_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+pub const IDLE_TRIM_MAX_CHUNKS: usize = 64;
+pub const IDLE_TRIM_MAX_BYTES: usize = 128 * 1024;
 const INITIAL_ATTACH_MAX_CHUNKS: usize = 192;
 const INITIAL_ATTACH_MAX_BYTES: usize = 512 * 1024;
 
@@ -24,6 +27,19 @@ pub struct TerminalChunk {
 pub struct TerminalReadResult {
     pub cursor: u64,
     pub chunks: Vec<TerminalChunk>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TerminalBufferStats {
+    pub session_count: usize,
+    pub retained_chunks: usize,
+    pub retained_bytes: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TerminalTrimSummary {
+    pub trimmed_sessions: usize,
+    pub reclaimed_bytes: usize,
 }
 
 pub struct TerminalManager {
@@ -91,6 +107,31 @@ impl TerminalManager {
         self.sessions.contains_key(key)
     }
 
+    pub fn stats(&self) -> TerminalBufferStats {
+        let mut stats = TerminalBufferStats {
+            session_count: self.sessions.len(),
+            ..TerminalBufferStats::default()
+        };
+        for session in self.sessions.values() {
+            let (chunks, bytes) = session.buffer_usage();
+            stats.retained_chunks += chunks;
+            stats.retained_bytes += bytes;
+        }
+        stats
+    }
+
+    pub fn trim_idle_buffers(&self, within: Duration) -> TerminalTrimSummary {
+        let mut summary = TerminalTrimSummary::default();
+        for session in self.sessions.values() {
+            let reclaimed = session.trim_idle_buffer(within);
+            if reclaimed > 0 {
+                summary.trimmed_sessions += 1;
+                summary.reclaimed_bytes += reclaimed;
+            }
+        }
+        summary
+    }
+
     pub fn recent_activity(&self, key: &str, within: Duration) -> bool {
         self.sessions
             .get(key)
@@ -125,15 +166,24 @@ impl TerminalManager {
         F: Fn(&str) -> Option<String>,
     {
         let keys = self.sessions.keys().cloned().collect::<Vec<_>>();
-        let mut stopped = 0usize;
-        let mut errors = Vec::new();
+        let mut handles = Vec::new();
         for key in keys {
             let Some(runtime) = self.sessions.remove(&key) else {
                 continue;
             };
-            match runtime.shutdown(stop_command(&key).as_deref()) {
-                Ok(()) => stopped += 1,
-                Err(error) => errors.push(format!("{key}: {error}")),
+            let stop = stop_command(&key);
+            handles.push((
+                key,
+                thread::spawn(move || runtime.shutdown(stop.as_deref())),
+            ));
+        }
+        let mut stopped = 0usize;
+        let mut errors = Vec::new();
+        for (key, handle) in handles {
+            match handle.join() {
+                Ok(Ok(())) => stopped += 1,
+                Ok(Err(error)) => errors.push(format!("{key}: {error}")),
+                Err(_) => errors.push(format!("{key}: terminal shutdown thread panicked")),
             }
         }
         TerminalShutdownSummary { stopped, errors }
@@ -145,6 +195,7 @@ struct PtySessionRuntime {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     chunks: Arc<Mutex<VecDeque<TerminalChunk>>>,
+    retained_bytes: Arc<AtomicUsize>,
     seq: Arc<AtomicU64>,
     last_activity_ms: Arc<AtomicU64>,
     launch_command: String,
@@ -175,9 +226,11 @@ impl PtySessionRuntime {
             .context("cloning pty reader")?;
         let writer = pair.master.take_writer().context("taking pty writer")?;
         let chunks = Arc::new(Mutex::new(VecDeque::new()));
+        let retained_bytes = Arc::new(AtomicUsize::new(0));
         let seq = Arc::new(AtomicU64::new(0));
         let last_activity_ms = Arc::new(AtomicU64::new(now_millis()));
         let reader_chunks = Arc::clone(&chunks);
+        let reader_retained_bytes = Arc::clone(&retained_bytes);
         let reader_seq = Arc::clone(&seq);
         let reader_activity = Arc::clone(&last_activity_ms);
         let key_label = key.to_string();
@@ -197,25 +250,27 @@ impl PtySessionRuntime {
                             reader_activity.store(now_millis(), Ordering::SeqCst);
                             let seq_value = reader_seq.fetch_add(1, Ordering::SeqCst) + 1;
                             let mut chunks = reader_chunks.lock().expect("pty chunk lock poisoned");
+                            let mut retained = reader_retained_bytes.load(Ordering::SeqCst);
                             chunks.push_back(TerminalChunk {
                                 seq: seq_value,
                                 data,
                             });
-                            while chunks.len() > MAX_CHUNKS {
-                                chunks.pop_front();
-                            }
+                            retained = retained.saturating_add(chunks.back().map(|chunk| chunk.data.len()).unwrap_or(0));
+                            trim_chunk_buffer(&mut chunks, &mut retained, MAX_CHUNKS, MAX_BUFFER_BYTES);
+                            reader_retained_bytes.store(retained, Ordering::SeqCst);
                         }
                         Err(error) => {
                             reader_activity.store(now_millis(), Ordering::SeqCst);
                             let seq_value = reader_seq.fetch_add(1, Ordering::SeqCst) + 1;
                             let mut chunks = reader_chunks.lock().expect("pty chunk lock poisoned");
+                            let mut retained = reader_retained_bytes.load(Ordering::SeqCst);
                             chunks.push_back(TerminalChunk {
                                 seq: seq_value,
                                 data: format!("\r\n[yggterm] terminal reader stopped for {key_label}: {error}\r\n"),
                             });
-                            while chunks.len() > MAX_CHUNKS {
-                                chunks.pop_front();
-                            }
+                            retained = retained.saturating_add(chunks.back().map(|chunk| chunk.data.len()).unwrap_or(0));
+                            trim_chunk_buffer(&mut chunks, &mut retained, MAX_CHUNKS, MAX_BUFFER_BYTES);
+                            reader_retained_bytes.store(retained, Ordering::SeqCst);
                             break;
                         }
                     }
@@ -228,6 +283,7 @@ impl PtySessionRuntime {
             writer: Arc::new(Mutex::new(writer)),
             child: Arc::new(Mutex::new(child)),
             chunks,
+            retained_bytes,
             seq,
             last_activity_ms,
             launch_command: launch_command.to_string(),
@@ -271,6 +327,14 @@ impl PtySessionRuntime {
         }
     }
 
+    fn buffer_usage(&self) -> (usize, usize) {
+        let chunks = self.chunks.lock().expect("pty chunk lock poisoned");
+        (
+            chunks.len(),
+            self.retained_bytes.load(Ordering::SeqCst),
+        )
+    }
+
     fn write(&self, data: &str) -> Result<()> {
         let mut writer = self.writer.lock().expect("pty writer lock poisoned");
         self.last_activity_ms.store(now_millis(), Ordering::SeqCst);
@@ -285,6 +349,23 @@ impl PtySessionRuntime {
         let now = now_millis();
         let last = self.last_activity_ms.load(Ordering::SeqCst);
         now.saturating_sub(last) <= within.as_millis() as u64
+    }
+
+    fn trim_idle_buffer(&self, within: Duration) -> usize {
+        if self.recent_activity(within) {
+            return 0;
+        }
+        let mut chunks = self.chunks.lock().expect("pty chunk lock poisoned");
+        let mut retained = self.retained_bytes.load(Ordering::SeqCst);
+        let before = retained;
+        trim_chunk_buffer(
+            &mut chunks,
+            &mut retained,
+            IDLE_TRIM_MAX_CHUNKS,
+            IDLE_TRIM_MAX_BYTES,
+        );
+        self.retained_bytes.store(retained, Ordering::SeqCst);
+        before.saturating_sub(retained)
     }
 
     fn resize(&self, cols: u16, rows: u16) -> Result<()> {
@@ -309,7 +390,13 @@ impl PtySessionRuntime {
             && !command.is_empty()
         {
             let _ = self.write(command);
-            for _ in 0..12 {
+            let normalized = command.trim();
+            let (attempts, sleep_ms) = if normalized == "exit" {
+                (2usize, 50u64)
+            } else {
+                (4usize, 75u64)
+            };
+            for _ in 0..attempts {
                 if child
                     .try_wait()
                     .context("checking terminal exit state")?
@@ -317,7 +404,7 @@ impl PtySessionRuntime {
                 {
                     return Ok(());
                 }
-                thread::sleep(Duration::from_millis(120));
+                thread::sleep(Duration::from_millis(sleep_ms));
             }
         }
 
@@ -378,4 +465,68 @@ fn shell_uses_bash_prompt_cwd() -> bool {
                 .map(|name| name.eq_ignore_ascii_case("bash"))
         })
         .unwrap_or(true)
+}
+
+fn trim_chunk_buffer(
+    chunks: &mut VecDeque<TerminalChunk>,
+    retained_bytes: &mut usize,
+    max_chunks: usize,
+    max_bytes: usize,
+) {
+    while chunks.len() > max_chunks || *retained_bytes > max_bytes {
+        let Some(chunk) = chunks.pop_front() else {
+            *retained_bytes = 0;
+            break;
+        };
+        *retained_bytes = retained_bytes.saturating_sub(chunk.data.len());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trim_chunk_buffer_enforces_byte_budget() {
+        let mut chunks = VecDeque::from([
+            TerminalChunk {
+                seq: 1,
+                data: "a".repeat(900_000),
+            },
+            TerminalChunk {
+                seq: 2,
+                data: "b".repeat(900_000),
+            },
+            TerminalChunk {
+                seq: 3,
+                data: "c".repeat(900_000),
+            },
+        ]);
+        let mut retained = 2_700_000usize;
+        trim_chunk_buffer(&mut chunks, &mut retained, MAX_CHUNKS, MAX_BUFFER_BYTES);
+        assert!(retained <= MAX_BUFFER_BYTES);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks.front().map(|chunk| chunk.seq), Some(2));
+    }
+
+    #[test]
+    fn trim_chunk_buffer_enforces_idle_budget() {
+        let mut chunks = VecDeque::from(
+            (0..96)
+                .map(|ix| TerminalChunk {
+                    seq: ix,
+                    data: "x".repeat(4096),
+                })
+                .collect::<Vec<_>>(),
+        );
+        let mut retained = 96 * 4096;
+        trim_chunk_buffer(
+            &mut chunks,
+            &mut retained,
+            IDLE_TRIM_MAX_CHUNKS,
+            IDLE_TRIM_MAX_BYTES,
+        );
+        assert!(chunks.len() <= IDLE_TRIM_MAX_CHUNKS);
+        assert!(retained <= IDLE_TRIM_MAX_BYTES);
+    }
 }

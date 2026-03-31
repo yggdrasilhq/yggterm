@@ -4,6 +4,7 @@ use crate::{
     active_client_instance_records, current_millis, fetch_remote_generation_context,
     persist_remote_generated_copy, terminate_remote_codex_session,
 };
+use crate::terminal::TerminalBufferStats;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -26,6 +27,7 @@ const BACKGROUND_COPY_CHORE_MS: u64 = 12_000;
 const BACKGROUND_COPY_BUDGET_PER_TICK: usize = 23;
 const DAEMON_ACCEPT_POLL_MS: u64 = 200;
 const DEFAULT_DAEMON_IDLE_SHUTDOWN_MS: u64 = 90_000;
+const DEFAULT_TERMINAL_IDLE_TRIM_AFTER_MS: u64 = 45_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerEndpoint {
@@ -54,6 +56,16 @@ pub struct ServerRuntimeStatus {
     pub restored_live_sessions: usize,
     #[serde(default)]
     pub restored_remote_machines: usize,
+    #[serde(default)]
+    pub terminal_session_count: usize,
+    #[serde(default)]
+    pub terminal_retained_chunks: usize,
+    #[serde(default)]
+    pub terminal_retained_bytes: usize,
+    #[serde(default)]
+    pub terminal_session_buffer_limit_bytes: usize,
+    #[serde(default)]
+    pub terminal_idle_buffer_limit_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -263,6 +275,7 @@ impl DaemonRuntime {
     }
 
     fn status(&self) -> ServerRuntimeStatus {
+        let terminal_stats = self.terminals.stats();
         ServerRuntimeStatus {
             server_version: SERVER_PROTOCOL_VERSION.to_string(),
             server_build_id: current_build_id(),
@@ -274,6 +287,11 @@ impl DaemonRuntime {
             restored_stored_sessions: self.restored_stored_sessions,
             restored_live_sessions: self.restored_live_sessions,
             restored_remote_machines: self.restored_remote_machines,
+            terminal_session_count: terminal_stats.session_count,
+            terminal_retained_chunks: terminal_stats.retained_chunks,
+            terminal_retained_bytes: terminal_stats.retained_bytes,
+            terminal_session_buffer_limit_bytes: crate::terminal::MAX_BUFFER_BYTES,
+            terminal_idle_buffer_limit_bytes: crate::terminal::IDLE_TRIM_MAX_BYTES,
         }
     }
 
@@ -684,6 +702,32 @@ impl DaemonRuntime {
     }
 }
 
+fn trim_terminal_buffers(
+    runtime: &Arc<Mutex<DaemonRuntime>>,
+    idle_trim_after_ms: u64,
+) -> Result<TerminalTrimTick> {
+    let runtime = runtime.lock().expect("daemon runtime lock poisoned");
+    let before = runtime.terminals.stats();
+    let trim = runtime
+        .terminals
+        .trim_idle_buffers(std::time::Duration::from_millis(idle_trim_after_ms));
+    let after = runtime.terminals.stats();
+    Ok(TerminalTrimTick {
+        before,
+        after,
+        trimmed_sessions: trim.trimmed_sessions,
+        reclaimed_bytes: trim.reclaimed_bytes,
+    })
+}
+
+#[derive(Debug, Clone, Default)]
+struct TerminalTrimTick {
+    before: TerminalBufferStats,
+    after: TerminalBufferStats,
+    trimmed_sessions: usize,
+    reclaimed_bytes: usize,
+}
+
 fn source_updated_at_for_path(path: &Path) -> Option<OffsetDateTime> {
     fs::metadata(path)
         .ok()
@@ -953,6 +997,14 @@ fn daemon_idle_shutdown_ms() -> u64 {
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_DAEMON_IDLE_SHUTDOWN_MS)
+}
+
+fn daemon_terminal_idle_trim_after_ms() -> u64 {
+    std::env::var("YGGTERM_DAEMON_TERMINAL_IDLE_TRIM_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_TERMINAL_IDLE_TRIM_AFTER_MS)
 }
 
 fn current_millis_u64() -> u64 {
@@ -1454,6 +1506,7 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
     let runtime = Arc::new(Mutex::new(DaemonRuntime::load(runtime)?));
     let last_activity_ms = Arc::new(AtomicU64::new(current_millis_u64()));
     let idle_shutdown_ms = daemon_idle_shutdown_ms();
+    let terminal_idle_trim_after_ms = daemon_terminal_idle_trim_after_ms();
     let home_dir = {
         let runtime = runtime.lock().expect("daemon runtime lock poisoned");
         runtime.store.home_dir().to_path_buf()
@@ -1471,6 +1524,41 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                         }
                     }
                     Err(error) => warn!(error=%error, "daemon background copy chore failed"),
+                }
+            }
+        });
+    }
+    {
+        let runtime = runtime.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(BACKGROUND_COPY_CHORE_MS));
+                match trim_terminal_buffers(&runtime, terminal_idle_trim_after_ms) {
+                    Ok(summary) if summary.trimmed_sessions > 0 => {
+                        let home_dir = {
+                            let runtime = runtime.lock().expect("daemon runtime lock poisoned");
+                            runtime.store.home_dir().to_path_buf()
+                        };
+                        append_trace_event(
+                            &home_dir,
+                            "daemon",
+                            "terminal_buffers",
+                            "idle_trim",
+                            serde_json::json!({
+                                "trimmed_sessions": summary.trimmed_sessions,
+                                "reclaimed_bytes": summary.reclaimed_bytes,
+                                "before_sessions": summary.before.session_count,
+                                "before_chunks": summary.before.retained_chunks,
+                                "before_bytes": summary.before.retained_bytes,
+                                "after_sessions": summary.after.session_count,
+                                "after_chunks": summary.after.retained_chunks,
+                                "after_bytes": summary.after.retained_bytes,
+                                "idle_trim_after_ms": terminal_idle_trim_after_ms,
+                            }),
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => warn!(error=%error, "daemon terminal buffer trim chore failed"),
                 }
             }
         });
