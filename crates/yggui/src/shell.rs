@@ -4392,10 +4392,16 @@ fn pending_remote_machine_refreshes(
         })
         .collect::<HashMap<_, _>>();
 
-    let mut desired_machine_keys = ssh_targets
+    let mut desired_machine_keys = remote_machines
+        .iter()
+        .map(|machine| machine.machine_key.clone())
+        .collect::<Vec<_>>();
+    desired_machine_keys.extend(
+        ssh_targets
         .iter()
         .map(|target| machine_key_from_labelish(&target.ssh_target))
-        .collect::<Vec<_>>();
+        .collect::<Vec<_>>(),
+    );
     desired_machine_keys.extend(
         live_sessions
             .iter()
@@ -21890,6 +21896,45 @@ mod tests {
         let pending = pending_remote_machine_refreshes(
             &remote_machines,
             &ssh_targets,
+            &[],
+            &HashSet::new(),
+            &HashMap::new(),
+            1_000,
+        );
+
+        assert_eq!(pending, vec!["dev".to_string()]);
+    }
+
+    #[test]
+    fn pending_remote_machine_refreshes_include_restored_machine_without_target() {
+        let remote_machines = vec![RemoteMachineSnapshot {
+            machine_key: "dev".to_string(),
+            label: "dev".to_string(),
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            remote_binary_expr: None,
+            remote_deploy_state: RemoteDeployState::Ready,
+            health: RemoteMachineHealth::Cached,
+            sessions: vec![RemoteScannedSession {
+                session_path: "remote-session://dev/123".to_string(),
+                session_id: "123".to_string(),
+                cwd: "/srv/app".to_string(),
+                started_at: "2026-03-31T12:00:00Z".to_string(),
+                modified_epoch: 1,
+                event_count: 4,
+                user_message_count: 1,
+                assistant_message_count: 1,
+                title_hint: "deploy".to_string(),
+                recent_context: String::new(),
+                cached_precis: None,
+                cached_summary: None,
+                storage_path: "/tmp/remote-dev-123.jsonl".to_string(),
+            }],
+        }];
+
+        let pending = pending_remote_machine_refreshes(
+            &remote_machines,
+            &[],
             &[],
             &HashSet::new(),
             &HashMap::new(),
