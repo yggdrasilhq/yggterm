@@ -85,7 +85,7 @@ use yggterm_server::{
     refresh_managed_cli, refresh_preview, refresh_remote_machine, remove_session,
     remove_ssh_target, request_terminal_launch, set_all_preview_blocks_folded,
     set_view_mode as daemon_set_view_mode, shutdown as daemon_shutdown,
-    snapshot as daemon_snapshot, stage_remote_clipboard_png, start_command_session,
+    snapshot as daemon_snapshot, snapshot_session_view_for_ui, stage_remote_clipboard_png, start_command_session,
     start_local_session_at, start_ssh_session_at, status, take_next_app_control_request,
     terminal_ensure, terminal_read, terminal_resize, terminal_write,
     toggle_preview_block as daemon_toggle_preview_block,
@@ -11691,9 +11691,22 @@ fn preserve_client_focus_for_background_snapshot(
             fallback_active_path.map(ToOwned::to_owned),
         )
     };
+    let preserved_preview_session = (preserved_view_mode == WorkspaceViewMode::Rendered)
+        .then(|| {
+            preserved_active_path.as_deref().and_then(|path| {
+                shell
+                    .server
+                    .active_session()
+                    .filter(|session| session.session_path == path)
+                    .cloned()
+                    .map(snapshot_session_view_for_ui)
+            })
+        })
+        .flatten();
     snapshot.active_view_mode = preserved_view_mode;
     snapshot.active_session_path = preserved_active_path.clone();
     snapshot.active_session = match preserved_active_path.as_deref() {
+        Some(_path) if preserved_preview_session.is_some() => preserved_preview_session.clone(),
         Some(path)
             if snapshot
                 .active_session
@@ -11704,6 +11717,15 @@ fn preserve_client_focus_for_background_snapshot(
         }
         _ => None,
     };
+    if let Some(preserved_session) = preserved_preview_session {
+        if let Some(live) = snapshot
+            .live_sessions
+            .iter_mut()
+            .find(|session| session.session_path == preserved_session.session_path)
+        {
+            *live = preserved_session;
+        }
+    }
 }
 
 #[derive(Clone)]

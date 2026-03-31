@@ -480,7 +480,11 @@ impl YggtermServer {
     pub fn refresh_session_preview_from_source(&mut self, path: &str) -> anyhow::Result<()> {
         if let Some((raw_machine_key, session_id)) = parse_remote_scanned_session_path(&path) {
             let machine_key = normalize_machine_key(raw_machine_key);
-            self.refresh_remote_scanned_session_preview(&machine_key, session_id)?;
+            if self.sessions.contains_key(path) {
+                self.refresh_remote_preview_from_active_session(&machine_key, session_id)?;
+            } else {
+                self.refresh_remote_scanned_session_preview(&machine_key, session_id)?;
+            }
             return Ok(());
         }
         let Some(session) = self.sessions.get(path).cloned() else {
@@ -3596,6 +3600,13 @@ fn apply_remote_scanned_session_preview(
     machine_label: &str,
     ssh_target: &str,
 ) {
+    let preserve_hydrated_preview = session
+        .metadata
+        .iter()
+        .find(|entry| entry.label == "Preview Hydration")
+        .map(|entry| entry.value.as_str())
+        .is_some_and(|value| matches!(value, "head" | "full"))
+        && (!session.preview.blocks.is_empty() || !session.rendered_sections.is_empty());
     if !scanned.title_hint.trim().is_empty()
         && !looks_like_generated_fallback_title(&scanned.title_hint)
     {
@@ -3603,8 +3614,10 @@ fn apply_remote_scanned_session_preview(
     }
     let (primary_goals, preview_blocks, rendered_sections) =
         parse_recent_context_sections(&scanned.recent_context);
-    session.preview.blocks = preview_blocks;
-    session.rendered_sections = rendered_sections;
+    if !preserve_hydrated_preview {
+        session.preview.blocks = preview_blocks;
+        session.rendered_sections = rendered_sections;
+    }
     let messages = format!(
         "{} user · {} assistant",
         scanned.user_message_count, scanned.assistant_message_count
@@ -6555,6 +6568,10 @@ fn snapshot_session_view(session: ManagedSessionView) -> SnapshotSessionView {
     }
 }
 
+pub fn snapshot_session_view_for_ui(session: ManagedSessionView) -> SnapshotSessionView {
+    snapshot_session_view(session)
+}
+
 fn leak_label(value: String) -> &'static str {
     Box::leak(value.into_boxed_str())
 }
@@ -8156,9 +8173,10 @@ mod tests {
         PersistedStoredSession, PreviewTone, REMOTE_OUTPUT_SENTINEL, RemoteCommandCacheEntry,
         RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot, RemotePreviewPayload,
         RemoteScannedSession, SessionKind, SessionNode, SessionNodeKind, SessionSource,
-        SnapshotPreview, SnapshotPreviewBlock, SnapshotRenderedSection, SnapshotSessionView,
-        SshConnectTarget, StoredPreviewHydrationMode, TerminalBackend, TerminalLaunchPhase,
-        UiTheme, WorkspaceViewMode, YggtermServer, apply_remote_preview_payload, build_session,
+        SessionPreviewBlock, SnapshotPreview, SnapshotPreviewBlock, SnapshotRenderedSection,
+        SnapshotSessionView, SshConnectTarget, StoredPreviewHydrationMode, TerminalBackend,
+        TerminalLaunchPhase, UiTheme, WorkspaceViewMode, YggtermServer,
+        apply_remote_preview_payload, apply_remote_scanned_session_preview, build_session,
         current_millis_u64, dedupe_remote_scanned_sessions,
         load_remote_machine_sessions_from_mirror, managed_session_from_snapshot,
         mirror_remote_machine_sessions, parse_recent_context_sections, parse_screen_session_ref,
@@ -8167,7 +8185,7 @@ mod tests {
         remote_scan_roots_with_parents, remote_scanned_session_path, remote_ssh_launch_command,
         sanitize_recent_context_payload, session_metadata_value, should_fallback_to_python,
         stored_session_launch_command, strip_remote_payload_noise,
-        synthesize_remote_scanned_session_view,
+        synthesize_remote_scanned_session_view, upsert_session_metadata,
     };
     use anyhow::Result;
     use std::fs;
@@ -8829,6 +8847,54 @@ mod tests {
     }
 
     #[test]
+    fn remote_scanned_preview_does_not_clobber_hydrated_preview_blocks() {
+        let mut session = build_session(
+            SessionKind::SshShell,
+            "remote-session://jojo/abc123",
+            Some("abc123"),
+            Some("/home/pi"),
+            Some("Hydrated Session"),
+            None,
+            TerminalBackend::Xterm,
+            UiTheme::ZedLight,
+            false,
+            StoredPreviewHydrationMode::Eager,
+        );
+        session.preview.blocks = vec![SessionPreviewBlock {
+            role: "ASSISTANT",
+            timestamp: "Mar 31, 2026 10:00 PM UTC+0530".to_string(),
+            tone: PreviewTone::Assistant,
+            folded: false,
+            lines: vec!["Hydrated preview block".to_string()],
+        }];
+        upsert_session_metadata(
+            &mut session.metadata,
+            "Preview Hydration",
+            "head".to_string(),
+        );
+        let scanned = RemoteScannedSession {
+            session_path: "remote-session://jojo/abc123".to_string(),
+            session_id: "abc123".to_string(),
+            cwd: "/home/pi".to_string(),
+            started_at: "Mar 31, 2026 10:00 PM UTC+0530".to_string(),
+            modified_epoch: 1,
+            event_count: 2,
+            user_message_count: 1,
+            assistant_message_count: 1,
+            title_hint: "Hydrated Session".to_string(),
+            recent_context: "USER: Scanned recent-context block".to_string(),
+            cached_precis: None,
+            cached_summary: None,
+            storage_path: "/tmp/abc123.jsonl".to_string(),
+        };
+
+        apply_remote_scanned_session_preview(&mut session, &scanned, "jojo", "jojo");
+
+        assert_eq!(session.preview.blocks.len(), 1);
+        assert_eq!(session.preview.blocks[0].lines, vec!["Hydrated preview block"]);
+    }
+
+    #[test]
     fn managed_session_from_snapshot_filters_scaffold_preview_blocks() {
         let session = managed_session_from_snapshot(SnapshotSessionView {
             id: "019c38a8-e725-7cc0-81ed-db9595254739".to_string(),
@@ -9400,6 +9466,39 @@ mod tests {
             server.terminal_stop_command("remote-session://dev/abc123"),
             None
         );
+    }
+
+    #[test]
+    fn refresh_remote_preview_for_open_session_does_not_require_machine_scan() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.restore_live_session(PersistedLiveSession {
+            key: "remote-session://dev/abc123".to_string(),
+            id: "abc123".to_string(),
+            title: "Remote session".to_string(),
+            kind: SessionKind::SshShell,
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            cwd: Some("/home/pi/gh".to_string()),
+        });
+
+        let result = server.refresh_session_preview_from_source("remote-session://dev/abc123");
+        assert!(result.is_ok());
     }
 
     #[test]
