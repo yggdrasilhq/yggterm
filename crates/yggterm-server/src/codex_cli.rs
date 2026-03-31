@@ -202,7 +202,10 @@ pub(crate) fn terminal_identity_env_pairs() -> Vec<(&'static str, String)> {
         ),
         ("YGGTERM_TERM_PROGRAM", YGGTERM_TERM_PROGRAM.to_string()),
         ("YGGTERM_APPEARANCE", appearance.clone()),
-        ("COLORFGBG", colorfgbg_for_appearance(&appearance).to_string()),
+        (
+            "COLORFGBG",
+            colorfgbg_for_appearance(&appearance).to_string(),
+        ),
     ]
 }
 

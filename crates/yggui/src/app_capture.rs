@@ -6,12 +6,12 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use yggterm_server::ScreenshotTarget;
 
+#[cfg(target_os = "macos")]
+use tao::platform::macos::WindowExtMacOS;
 #[cfg(target_os = "linux")]
 use webkit2gtk::{SnapshotOptions, SnapshotRegion, WebViewExt};
 #[cfg(target_os = "linux")]
 use wry::WebViewExtUnix;
-#[cfg(target_os = "macos")]
-use tao::platform::macos::WindowExtMacOS;
 #[cfg(target_os = "macos")]
 use yggterm_platform::{capture_macos_window_recording, capture_macos_window_screenshot};
 
