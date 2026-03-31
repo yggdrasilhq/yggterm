@@ -323,10 +323,11 @@ def normalize_preview_entry_text(value: str) -> str:
 def preview_semantic_issues(state: dict) -> list[str]:
     preview = ((state.get("viewport") or {}).get("preview") or {})
     entries = preview.get("visible_entries") or []
-    return preview_semantic_issues_for_entries(entries)
+    rendered_sections = preview.get("rendered_sections") or []
+    return preview_semantic_issues_for_entries(entries, rendered_sections)
 
 
-def preview_semantic_issues_for_entries(entries: list[dict]) -> list[str]:
+def preview_semantic_issues_for_entries(entries: list[dict], rendered_sections: list[dict] | None = None) -> list[str]:
     issues = []
     normalized_entries = []
     for index, entry in enumerate(entries):
@@ -336,6 +337,8 @@ def preview_semantic_issues_for_entries(entries: list[dict]) -> list[str]:
         if not normalized:
             issues.append(f"entry[{index}] is empty")
             continue
+        if "<image name=[" in normalized or "</image>" in normalized:
+            issues.append(f"entry[{index}] still shows raw image markup")
         for marker in FORBIDDEN_PREVIEW_ENTRY_MARKERS:
             if marker.lower() in normalized:
                 issues.append(f"entry[{index}] still shows scaffold marker {marker}")
@@ -351,6 +354,92 @@ def preview_semantic_issues_for_entries(entries: list[dict]) -> list[str]:
                 f"adjacent duplicate preview text at entries {prev_ix} ({prev_tone}) and {curr_ix} ({curr_tone})"
             )
 
+    entry_texts = {text for _, _, text in normalized_entries if text}
+    for section_index, section in enumerate(rendered_sections or []):
+        title = (section.get("title") or "").strip()
+        for line_index, line in enumerate(section.get("lines") or []):
+            normalized = normalize_preview_entry_text(line)
+            if not normalized:
+                continue
+            if "<image name=[" in normalized or "</image>" in normalized:
+                issues.append(
+                    f"rendered section {section_index}:{line_index} still shows raw image markup"
+                )
+            if normalized in entry_texts:
+                issues.append(
+                    f"rendered section {section_index}:{line_index} duplicates visible transcript text"
+                )
+            if "goal" in title.lower() and normalized in entry_texts:
+                issues.append(
+                    f"goal section {section_index}:{line_index} duplicates a visible transcript turn"
+                )
+
+    return issues
+
+
+def load_server_state() -> dict:
+    path = Path.home() / ".yggterm" / "server-state.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def expected_recent_turns_for_session(server_state: dict, session_path: str) -> list[dict]:
+    def _recent_context_for_path() -> str:
+        for machine in server_state.get("remote_machines") or []:
+            for session in machine.get("sessions") or []:
+                if session.get("session_path") == session_path:
+                    return session.get("recent_context") or ""
+        for collection in ("local_sessions",):
+            for session in server_state.get(collection) or []:
+                if session.get("session_path") == session_path:
+                    return session.get("recent_context") or ""
+        return ""
+
+    recent_context = _recent_context_for_path()
+    turns = []
+    for line in recent_context.splitlines():
+        trimmed = line.strip()
+        if trimmed.startswith("USER:"):
+            turns.append({"tone": "user", "text": trimmed.split("USER:", 1)[1].strip()})
+        elif trimmed.startswith("ASSISTANT:"):
+            turns.append({"tone": "assistant", "text": trimmed.split("ASSISTANT:", 1)[1].strip()})
+    return turns
+
+
+def preview_entry_matches_expected(entry: dict, expected_turns: list[dict]) -> bool:
+    entry_tone = (entry.get("tone") or "").strip().lower()
+    entry_text = normalize_preview_entry_text(entry.get("text") or "")
+    if not entry_tone or not entry_text:
+        return False
+    for turn in expected_turns:
+        if (turn.get("tone") or "").strip().lower() != entry_tone:
+            continue
+        turn_text = normalize_preview_entry_text(turn.get("text") or "")
+        if not turn_text:
+            continue
+        if (
+            turn_text == entry_text
+            or turn_text.startswith(entry_text)
+            or entry_text.startswith(turn_text)
+        ):
+            return True
+    return False
+
+
+def preview_expected_turn_issues(state: dict, expected_turns: list[dict]) -> list[str]:
+    if not expected_turns:
+        return []
+    entries = (((state.get("viewport") or {}).get("preview") or {}).get("visible_entries") or [])
+    issues = []
+    for index, entry in enumerate(entries):
+        if not preview_entry_matches_expected(entry, expected_turns):
+            issues.append(
+                f"entry[{index}] does not match expected recent_context turn for tone={entry.get('tone')}"
+            )
     return issues
 
 
@@ -420,6 +509,7 @@ def main() -> int:
         launch, launch_event = launch_local_client(args.bin)
 
     wait_for_window(args.host, args.bin, args.timeout_ms)
+    server_state = load_server_state() if args.host == "local" else {}
     rows_payload = expand_groups_until_target(args.host, args.bin, args.timeout_ms, args.count)
     targets = collect_preview_targets(rows_payload, random.Random(args.seed), args.count)
     if not targets:
@@ -433,13 +523,18 @@ def main() -> int:
             "label": target["label"],
             "kind": target["kind"],
         }
+        expected_turns = expected_recent_turns_for_session(server_state, session_path)
         try:
             entry["open"] = app_open(args.host, args.bin, session_path, args.timeout_ms)
             elapsed, state = wait_until(
                 f"preview {session_path}",
                 args.ready_budget,
                 args.poll,
-                lambda: _require_preview_ready(app_state(args.host, args.bin, args.timeout_ms), session_path),
+                lambda: _require_preview_ready(
+                    app_state(args.host, args.bin, args.timeout_ms),
+                    session_path,
+                    expected_turns,
+                ),
             )
             screenshot_path = out_dir / f"preview-{index:02d}.png"
             entry["screenshot"] = app_screenshot_preview(args.host, args.bin, screenshot_path, args.timeout_ms)
@@ -465,8 +560,14 @@ def main() -> int:
             forbidden_hits = [
                 marker for marker in FORBIDDEN_PREVIEW_MARKERS if marker.lower() in text_sample.lower()
             ]
-            semantic_issues = preview_semantic_issues(state)
-            screenshot_semantic_issues = preview_semantic_issues_for_entries(screenshot_entries)
+            semantic_issues = preview_semantic_issues(state) + preview_expected_turn_issues(
+                state, expected_turns
+            )
+            screenshot_rendered_sections = screenshot_dom.get("preview_rendered_sections") or preview.get("rendered_sections") or []
+            screenshot_semantic_issues = preview_semantic_issues_for_entries(
+                screenshot_entries,
+                screenshot_rendered_sections,
+            )
             screenshot_forbidden_hits = [
                 marker
                 for marker in FORBIDDEN_PREVIEW_MARKERS
@@ -556,7 +657,9 @@ def main() -> int:
     ) else 1
 
 
-def _require_preview_ready(state: dict, session_path: str) -> dict:
+def _require_preview_ready(
+    state: dict, session_path: str, expected_turns: list[dict] | None = None
+) -> dict:
     dom = state.get("dom") or {}
     for key in ("shell_root_count", "sidebar_count", "titlebar_count", "main_surface_count"):
         if dom.get(key) != 1:
@@ -566,6 +669,9 @@ def _require_preview_ready(state: dict, session_path: str) -> dict:
         raise RuntimeError(viewport.get("reason") or "preview viewport not ready")
     if not titlebar_matches_viewport(state):
         raise RuntimeError("titlebar not in sync with preview viewport")
+    expected_issues = preview_expected_turn_issues(state, expected_turns or [])
+    if expected_issues:
+        raise RuntimeError(expected_issues[0])
     return state
 
 

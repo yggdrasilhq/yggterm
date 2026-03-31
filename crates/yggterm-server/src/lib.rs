@@ -3105,10 +3105,11 @@ fn recent_context_scaffold_line(trimmed: &str) -> bool {
 
 fn sanitize_recent_context_payload(recent_context: &str) -> String {
     let (goals, blocks, _sections) = parse_recent_context_sections(recent_context);
-    let goals = goals
-        .into_iter()
-        .filter_map(|goal| sanitize_recent_context_turn_content(&goal))
-        .collect::<Vec<_>>();
+    let goals = dedupe_recent_context_lines(
+        goals.into_iter()
+            .filter_map(|goal| sanitize_recent_context_turn_content(&goal))
+            .collect::<Vec<_>>(),
+    );
     if goals.is_empty() && blocks.is_empty() {
         return String::new();
     }
@@ -3154,7 +3155,61 @@ fn sanitize_recent_context_turn_content(content: &str) -> Option<String> {
     if lines.is_empty() {
         return None;
     }
-    Some(lines.join(" "))
+    Some(collapse_recent_context_inline_markup(&lines.join(" ")))
+}
+
+fn collapse_recent_context_inline_markup(content: &str) -> String {
+    let mut remaining = content.trim();
+    let mut out = String::new();
+
+    loop {
+        let Some(start) = remaining.find("<image name=[") else {
+            out.push_str(remaining);
+            break;
+        };
+        out.push_str(&remaining[..start]);
+        let after = &remaining[start + "<image name=[".len()..];
+        let Some(label_end) = after.find("]>") else {
+            out.push_str(&remaining[start..]);
+            break;
+        };
+        let label_text = after[..label_end].trim();
+        let label = format!("[{label_text}]");
+        out.push_str(&label);
+
+        let mut tail = after[label_end + 2..].trim_start();
+        if let Some(stripped) = tail.strip_prefix("</image>") {
+            tail = stripped.trim_start();
+        }
+        if let Some(stripped) = tail.strip_prefix(&label) {
+            tail = stripped.trim_start();
+        }
+        remaining = tail;
+    }
+
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn normalize_recent_context_semantic_text(content: &str) -> String {
+    collapse_recent_context_inline_markup(content)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn dedupe_recent_context_lines(lines: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::<String>::new();
+    let mut deduped = Vec::with_capacity(lines.len());
+    for line in lines {
+        let normalized = normalize_recent_context_semantic_text(&line);
+        if normalized.is_empty() || !seen.insert(normalized) {
+            continue;
+        }
+        deduped.push(line);
+    }
+    deduped
 }
 
 fn sanitize_preview_lines(lines: Vec<String>) -> Vec<String> {
@@ -3283,12 +3338,9 @@ fn parse_recent_context_sections(
 
         match section {
             RecentContextSection::Goals => {
-                let goal = trimmed
-                    .strip_prefix("- ")
-                    .unwrap_or(trimmed)
-                    .trim()
-                    .to_string();
-                if !goal.is_empty() {
+                if let Some(goal) =
+                    sanitize_recent_context_turn_content(trimmed.strip_prefix("- ").unwrap_or(trimmed))
+                {
                     goals.push(goal);
                 }
             }
@@ -3325,6 +3377,7 @@ fn parse_recent_context_sections(
         }
     }
 
+    let goals = dedupe_recent_context_lines(goals);
     let mut rendered_sections = Vec::new();
     if !goals.is_empty() {
         rendered_sections.push(SessionRenderedSection {
@@ -7968,6 +8021,17 @@ mod tests {
         assert!(!text.contains("Approvals are your mechanism"));
         assert!(!text.contains("AGENTS.md instructions for"));
         assert!(!text.contains("<turn_aborted>"));
+    }
+
+    #[test]
+    fn sanitize_recent_context_payload_dedupes_image_goal_markup() {
+        let text = sanitize_recent_context_payload(
+            "PRIMARY USER GOALS:\n- <image name=[Image #1]> </image> [Image #1] This is how excel looks.\n- [Image #1] This is how excel looks.\n\nRECENT SUBSTANTIVE TURNS:\nUSER: [Image #1] This is how excel looks.\nASSISTANT: I understand the screenshot.",
+        );
+
+        assert_eq!(text.matches("[Image #1] This is how excel looks.").count(), 2);
+        assert!(!text.contains("<image name=[Image #1]>"));
+        assert!(!text.contains("</image>"));
     }
 
     #[test]

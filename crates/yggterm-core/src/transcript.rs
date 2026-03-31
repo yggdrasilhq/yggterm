@@ -251,10 +251,52 @@ fn message_text_for_generation(message: &TranscriptMessage) -> Option<String> {
         .join(" ")
         .trim()
         .to_string();
+    let compact = normalize_generation_semantic_text(&compact);
     if compact.is_empty() || looks_like_generation_noise(&compact, message.role) {
         return None;
     }
     Some(compact)
+}
+
+fn normalize_generation_semantic_text(text: &str) -> String {
+    collapse_named_image_markup(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string()
+}
+
+fn collapse_named_image_markup(text: &str) -> String {
+    let mut remaining = text.trim();
+    let mut out = String::new();
+
+    loop {
+        let Some(start) = remaining.find("<image name=[") else {
+            out.push_str(remaining);
+            break;
+        };
+        out.push_str(&remaining[..start]);
+        let after = &remaining[start + "<image name=[".len()..];
+        let Some(label_end) = after.find("]>") else {
+            out.push_str(&remaining[start..]);
+            break;
+        };
+        let label_text = after[..label_end].trim();
+        let label = format!("[{label_text}]");
+        out.push_str(&label);
+
+        let mut tail = after[label_end + 2..].trim_start();
+        if let Some(stripped) = tail.strip_prefix("</image>") {
+            tail = stripped.trim_start();
+        }
+        if let Some(stripped) = tail.strip_prefix(&label) {
+            tail = stripped.trim_start();
+        }
+        remaining = tail;
+    }
+
+    out
 }
 
 fn looks_like_generation_noise(text: &str, role: TranscriptRole) -> bool {
