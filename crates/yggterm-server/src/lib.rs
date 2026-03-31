@@ -69,7 +69,6 @@ pub enum WorkspaceViewMode {
 }
 
 const REMOTE_COMMAND_CACHE_VERIFY_TTL_MS: u64 = 60_000;
-const REMOTE_PREVIEW_HEAD_BLOCKS: usize = 8;
 
 #[derive(Debug, Clone)]
 struct RemoteCommandCacheEntry {
@@ -1703,18 +1702,15 @@ impl YggtermServer {
                     .iter()
                     .find(|scanned| scanned.session_id == session_id)
                 && !scanned.storage_path.trim().is_empty()
-                && let Ok(payload) = fetch_remote_preview_head_payload(
-                    &preview_target,
-                    &scanned.storage_path,
-                    REMOTE_PREVIEW_HEAD_BLOCKS,
-                )
+                && let Ok(payload) =
+                    fetch_remote_preview_payload(&preview_target, &scanned.storage_path)
                 && let Some(session) = self.sessions.get_mut(&session_path)
             {
                 apply_remote_preview_payload(session, payload);
                 upsert_session_metadata(
                     &mut session.metadata,
                     "Preview Hydration",
-                    "head".to_string(),
+                    "full".to_string(),
                 );
             }
             if launch_terminal {
@@ -1810,18 +1806,15 @@ impl YggtermServer {
                 .iter()
                 .find(|scanned| scanned.session_id == session_id)
                 && !scanned.storage_path.trim().is_empty()
-                && let Ok(payload) = fetch_remote_preview_head_payload(
-                    &preview_target,
-                    &scanned.storage_path,
-                    REMOTE_PREVIEW_HEAD_BLOCKS,
-                )
+                && let Ok(payload) =
+                    fetch_remote_preview_payload(&preview_target, &scanned.storage_path)
                 && let Some(session) = self.sessions.get_mut(&session_path)
             {
                 apply_remote_preview_payload(session, payload);
                 upsert_session_metadata(
                     &mut session.metadata,
                     "Preview Hydration",
-                    "head".to_string(),
+                    "full".to_string(),
                 );
             }
         }
@@ -3345,6 +3338,28 @@ fn sanitize_snapshot_preview_blocks(
         .collect()
 }
 
+fn is_placeholder_rendered_section_title(title: &str) -> bool {
+    title.eq_ignore_ascii_case("Rendered Session")
+        || title.eq_ignore_ascii_case("Server Notes")
+        || title.eq_ignore_ascii_case("Recent Context")
+}
+
+fn sanitize_snapshot_rendered_sections(
+    sections: Vec<SnapshotRenderedSection>,
+) -> Vec<SnapshotRenderedSection> {
+    sections
+        .into_iter()
+        .filter(|section| !is_placeholder_rendered_section_title(&section.title))
+        .filter_map(|section| {
+            let lines = sanitize_preview_lines(section.lines);
+            if lines.is_empty() {
+                return None;
+            }
+            Some(SnapshotRenderedSection { lines, ..section })
+        })
+        .collect()
+}
+
 fn parse_recent_context_sections(
     recent_context: &str,
 ) -> (
@@ -3602,8 +3617,7 @@ fn apply_remote_preview_payload(session: &mut ManagedSessionView, payload: Remot
             })
             .collect(),
     };
-    session.rendered_sections = payload
-        .rendered_sections
+    session.rendered_sections = sanitize_snapshot_rendered_sections(payload.rendered_sections)
         .into_iter()
         .map(|section| SessionRenderedSection {
             title: leak_label(section.title),
@@ -3880,14 +3894,16 @@ fn remote_preview_payload_for_path(
                 .map(snapshot_preview_block)
                 .collect(),
         },
-        rendered_sections: session
-            .rendered_sections
-            .into_iter()
-            .map(|section| SnapshotRenderedSection {
-                title: section.title.to_string(),
-                lines: section.lines,
-            })
-            .collect(),
+        rendered_sections: sanitize_snapshot_rendered_sections(
+            session
+                .rendered_sections
+                .into_iter()
+                .map(|section| SnapshotRenderedSection {
+                    title: section.title.to_string(),
+                    lines: section.lines,
+                })
+                .collect(),
+        ),
     }))
 }
 
@@ -8444,6 +8460,84 @@ mod tests {
         assert_eq!(
             session.preview.blocks[0].lines,
             vec!["Investigate the boot delay on manin.".to_string()]
+        );
+    }
+
+    #[test]
+    fn remote_preview_payload_apply_filters_placeholder_rendered_sections() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.open_or_focus_session(
+            SessionKind::Codex,
+            "remote-session://jojo/test-rendered-sections",
+            Some("test-rendered-sections"),
+            Some("/home/pi"),
+            Some("Test Rendered Sections"),
+            None,
+        );
+
+        let payload = RemotePreviewPayload {
+            title_hint: Some("Test Rendered Sections".to_string()),
+            cached_precis: None,
+            cached_summary: None,
+            preview: SnapshotPreview {
+                summary: Vec::new(),
+                blocks: vec![SnapshotPreviewBlock {
+                    role: "USER".to_string(),
+                    timestamp: "Mar 31, 2026 06:00 PM UTC+0530".to_string(),
+                    tone: PreviewTone::User,
+                    folded: false,
+                    lines: vec!["Check the rendered preview.".to_string()],
+                }],
+            },
+            rendered_sections: vec![
+                SnapshotRenderedSection {
+                    title: "Rendered Session".to_string(),
+                    lines: vec![
+                        "Preview mode renders the stored Codex transcript as a chat surface."
+                            .to_string(),
+                    ],
+                },
+                SnapshotRenderedSection {
+                    title: "Server Notes".to_string(),
+                    lines: vec![
+                        "GUI selection asks the Yggterm server to open or focus the session."
+                            .to_string(),
+                    ],
+                },
+                SnapshotRenderedSection {
+                    title: "Primary User Goals".to_string(),
+                    lines: vec!["Make the preview stable.".to_string()],
+                },
+            ],
+        };
+
+        let session = server
+            .sessions
+            .get_mut("remote-session://jojo/test-rendered-sections")
+            .expect("session");
+        apply_remote_preview_payload(session, payload);
+
+        assert_eq!(session.rendered_sections.len(), 1);
+        assert_eq!(session.rendered_sections[0].title, "Primary User Goals");
+        assert_eq!(
+            session.rendered_sections[0].lines,
+            vec!["Make the preview stable.".to_string()]
         );
     }
 

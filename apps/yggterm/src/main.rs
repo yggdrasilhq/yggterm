@@ -582,6 +582,15 @@ fn detect_linux_window_profile() -> LinuxWindowProfile {
                 reason: "explicit_opt_in",
             };
         }
+        let x11_session =
+            std::env::var_os("DISPLAY").is_some() && std::env::var_os("WAYLAND_DISPLAY").is_none();
+        if xrpd_session && x11_session {
+            return LinuxWindowProfile {
+                transparent: true,
+                xrpd_session: true,
+                reason: "xrdp_x11_profile",
+            };
+        }
         if xrpd_session {
             return LinuxWindowProfile {
                 transparent: false,

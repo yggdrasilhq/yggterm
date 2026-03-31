@@ -121,6 +121,7 @@ const XTERM_CSS: &str = include_str!("../../../assets/xterm/xterm.css");
 const XTERM_JS: &str = include_str!("../../../assets/xterm/xterm.js");
 const XTERM_FIT_JS: &str = include_str!("../../../assets/xterm/addon-fit.js");
 const PREVIEW_BLOCK_WINDOW: usize = 24;
+const PREVIEW_SAFE_FULL_RENDER_BLOCK_LIMIT: usize = 600;
 const PREVIEW_VIRTUAL_OVERSCAN_FACTOR: f64 = 0.85;
 const PREVIEW_MIN_VIEWPORT_HEIGHT_PX: f64 = 680.0;
 const PREVIEW_MAX_OVERSCAN_PX: f64 = 1_200.0;
@@ -6316,7 +6317,10 @@ fn preview_virtual_window(
         .max(total_height_px)
         .max(viewport_height_px);
 
-    if search_active || blocks.len() <= PREVIEW_BLOCK_WINDOW {
+    if search_active
+        || blocks.len() <= PREVIEW_BLOCK_WINDOW
+        || blocks.len() <= PREVIEW_SAFE_FULL_RENDER_BLOCK_LIMIT
+    {
         return PreviewVirtualWindow {
             start_index: 0,
             end_index: blocks.len(),
@@ -12646,7 +12650,7 @@ fn app() -> Element {
             tabindex: "0",
             style: format!(
                 "position: fixed; inset: 0; overflow: hidden; border-radius:{}px; \
-                 background:rgba(205, 217, 229, 0.7); box-shadow:inset 0 0 0 1px rgba(255,255,255,0.42);",
+                 background:transparent; box-shadow:none; box-sizing:border-box;",
                 shell_radius
             ),
             onclick: move |_| {
@@ -12770,6 +12774,7 @@ fn app() -> Element {
                 evt.stop_propagation();
             },
             style { "{TOAST_CSS}" }
+            style { "html, body, #main {{ margin:0; width:100%; height:100%; background:transparent !important; overflow:hidden; }} body {{ overscroll-behavior:none; }}" }
             div {
                 style: shell_style(
                     snapshot.palette,
@@ -14796,9 +14801,21 @@ fn MainSurface(
     let mut preview_scroll_top = use_signal(|| 0.0_f64);
     let mut preview_scroll_client_height = use_signal(|| PREVIEW_MIN_VIEWPORT_HEIGHT_PX);
     let mut preview_scroll_height = use_signal(|| PREVIEW_MIN_VIEWPORT_HEIGHT_PX);
+    let mut preview_reset_key = use_signal(String::new);
     let preview_reset_session_path = active_session_path.clone();
+    let preview_reset_view_mode = snapshot.active_view_mode as u8;
     use_effect(move || {
-        let _ = preview_reset_session_path.clone();
+        let reset_key = format!(
+            "{}:{}",
+            preview_reset_session_path
+                .clone()
+                .unwrap_or_else(|| "__empty__".to_string()),
+            preview_reset_view_mode
+        );
+        if *preview_reset_key.read() == reset_key {
+            return;
+        }
+        preview_reset_key.set(reset_key);
         preview_scroll_top.set(0.0);
         preview_scroll_client_height.set(PREVIEW_MIN_VIEWPORT_HEIGHT_PX);
         preview_scroll_height.set(PREVIEW_MIN_VIEWPORT_HEIGHT_PX);
@@ -14888,7 +14905,7 @@ fn MainSurface(
                                 "data-preview-scroll-active": "true",
                                 "data-preview-session-path": "{session.session_path}",
                                 style: "display:flex; flex-direction:column; gap:18px; min-width:0; min-height:0; overflow:auto; padding:24px; \
-                                        overscroll-behavior:contain; scrollbar-gutter:stable; contain:layout paint style;",
+                                        overscroll-behavior:contain; scrollbar-gutter:stable;",
                                 onscroll: move |evt: ScrollEvent| {
                                     preview_scroll_top.set(evt.data().scroll_top());
                                     preview_scroll_client_height
@@ -14909,8 +14926,7 @@ fn MainSurface(
                                         "data-preview-window-client-height": "{preview_window.viewport_height_px.round() as i64}",
                                         "data-preview-window-scroll-height": "{preview_window.scroll_height_px.round() as i64}",
                                         "data-preview-window-overscan": "{preview_window.overscan_px.round() as i64}",
-                                        style: "display:flex; flex-direction:column; gap:16px; min-width:0; width:min(1020px, 100%); margin:0 auto; \
-                                                contain:layout paint style;",
+                                        style: "display:flex; flex-direction:column; gap:16px; min-width:0; width:min(1020px, 100%); margin:0 auto;",
                                         if preview_window.top_spacer_px > 0.0 {
                                             div {
                                                 "data-preview-spacer": "top",
@@ -15561,8 +15577,7 @@ fn PreviewGraph(
 fn RenderedSectionsStrip(sections: Vec<SessionRenderedSection>, palette: Palette) -> Element {
     rsx! {
         div {
-            style: "display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:12px; \
-                    contain:layout paint style;",
+            style: "display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:12px;",
             for section in sections {
                 RenderedSectionCard {
                     section,
@@ -15585,8 +15600,7 @@ fn RenderedSectionCard(section: SessionRenderedSection, palette: Palette) -> Ele
             "data-preview-rendered-section-title": "{section.title}",
             style: format!(
                 "display:flex; flex-direction:column; gap:10px; min-width:0; padding:14px 16px; border-radius:18px; \
-                 background:{}; box-shadow:inset 0 0 0 1px {}; \
-                 content-visibility:auto; contain:layout paint style; contain-intrinsic-size:220px 140px;"
+                 background:{}; box-shadow:inset 0 0 0 1px {};"
                 ,
                 if is_goals { "rgba(236,248,247,0.92)" } else { "rgba(255,255,255,0.82)" },
                 if is_goals { "rgba(74,163,153,0.16)" } else { "rgba(170,190,212,0.14)" }
@@ -15801,7 +15815,7 @@ fn PreviewRunBlock(
     let column_style = if user_run {
         format!(
             "display:flex; flex-direction:column; gap:0; width:auto; max-width:min(72%, 720px); \
-             min-width:0; box-sizing:border-box; contain:layout paint style; font-family:{};",
+             min-width:0; box-sizing:border-box; font-family:{};",
             serif_stack
         )
     } else {
@@ -15943,7 +15957,7 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
     rsx! {
         div {
             style: format!(
-                "display:flex; flex-direction:column; gap:9px; color:{}; contain:layout paint style; \
+                "display:flex; flex-direction:column; gap:9px; color:{}; \
                  font-family:\"Source Serif 4\", \"Noto Serif\", \"Iowan Old Style\", Georgia, serif;",
                 palette.text
             ),
@@ -16053,7 +16067,7 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                         rsx! {
                             div {
                                 style: "display:flex; flex-direction:column; gap:10px; padding:12px; border-radius:18px; background:rgba(247,250,253,0.92); \
-                                        box-shadow:inset 0 0 0 1px rgba(170,190,212,0.16); content-visibility:auto; contain:layout paint style;",
+                                        box-shadow:inset 0 0 0 1px rgba(170,190,212,0.16);",
                                 div {
                                     style: "display:flex; align-items:center; justify-content:space-between; gap:12px;",
                                     div {
@@ -16081,8 +16095,7 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                     },
                     PreviewContentBlock::Code { language, code } => rsx! {
                         div {
-                            style: "display:flex; flex-direction:column; gap:8px; border-radius:16px; background:rgba(15,23,42,0.92); color:#e5eef8; overflow:hidden; \
-                                    content-visibility:auto; contain:layout paint style; contain-intrinsic-size:720px 220px;",
+                            style: "display:flex; flex-direction:column; gap:8px; border-radius:16px; background:rgba(15,23,42,0.92); color:#e5eef8; overflow:hidden;",
                             div {
                                 style: "display:flex; align-items:center; justify-content:space-between; gap:12px; padding:10px 14px; border-bottom:1px solid rgba(255,255,255,0.08);",
                                 div {
