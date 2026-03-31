@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use yggterm_core::{PerfSpan, UiTheme, append_trace_event, resolve_yggterm_home};
+use yggterm_core::{ENV_YGGTERM_HOME, PerfSpan, UiTheme, append_trace_event, resolve_yggterm_home};
 
 const MANAGED_NPM_DIRNAME: &str = "npm";
 const MANAGED_NPM_CACHE_DIRNAME: &str = "npm-cache";
@@ -190,7 +190,7 @@ fn colorfgbg_for_appearance(appearance: &str) -> &'static str {
 
 pub(crate) fn terminal_identity_env_pairs() -> Vec<(&'static str, String)> {
     let appearance = ambient_terminal_appearance();
-    vec![
+    let mut pairs = vec![
         ("TERM", "xterm-256color".to_string()),
         ("COLORTERM", "truecolor".to_string()),
         // Codex already knows how to style itself well inside VS Code's terminal surface.
@@ -206,7 +206,13 @@ pub(crate) fn terminal_identity_env_pairs() -> Vec<(&'static str, String)> {
             "COLORFGBG",
             colorfgbg_for_appearance(&appearance).to_string(),
         ),
-    ]
+    ];
+    if let Ok(home) = env::var(ENV_YGGTERM_HOME) {
+        if !home.trim().is_empty() {
+            pairs.push((ENV_YGGTERM_HOME, home));
+        }
+    }
+    pairs
 }
 
 pub(crate) fn terminal_identity_shell_exports() -> Vec<String> {
