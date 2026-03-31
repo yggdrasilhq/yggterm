@@ -90,14 +90,15 @@ def latest_window_spawn_event_for_pid(pid: int, start_ms: int) -> dict | None:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if (event.get("ts_ms") or 0) < start_ms:
-            break
         if (
             event.get("pid") == pid
             and event.get("category") == "startup"
             and event.get("name") == "window_spawned"
         ):
             return event
+        ts_ms = event.get("ts_ms")
+        if isinstance(ts_ms, int) and ts_ms < start_ms:
+            break
     return None
 
 
