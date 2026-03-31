@@ -79,15 +79,15 @@ use yggterm_server::{
     SessionPreviewBlock, SessionRenderedSection, SshConnectTarget, TerminalBackend,
     WorkspaceViewMode, YGG_LOADING_NOTIFICATION_AFTER_MS, YggOperationPriority, YggRequestMeta,
     YggSurface, YggTarget, YggtermServer, app_control_requests_pending,
-    apply_remote_preview_payload_for_path, cleanup_legacy_daemons, complete_app_control_request,
-    connect_ssh_custom, fetch_remote_generation_context, fetch_remote_preview_payload,
-    focus_live_with_view, open_remote_session_with_view, open_stored_session,
-    open_stored_session_with_view, persist_remote_generated_copy, ping, refresh_managed_cli,
-    refresh_remote_machine, remove_session, remove_ssh_target, request_terminal_launch,
-    set_all_preview_blocks_folded, set_view_mode as daemon_set_view_mode,
-    shutdown as daemon_shutdown, snapshot as daemon_snapshot, stage_remote_clipboard_png,
-    start_command_session, start_local_session_at, start_ssh_session_at, status,
-    take_next_app_control_request, terminal_ensure, terminal_read, terminal_resize, terminal_write,
+    cleanup_legacy_daemons, complete_app_control_request, connect_ssh_custom,
+    fetch_remote_generation_context, focus_live_with_view, open_remote_session_with_view,
+    open_stored_session, open_stored_session_with_view, persist_remote_generated_copy, ping,
+    refresh_managed_cli, refresh_preview, refresh_remote_machine, remove_session,
+    remove_ssh_target, request_terminal_launch, set_all_preview_blocks_folded,
+    set_view_mode as daemon_set_view_mode, shutdown as daemon_shutdown,
+    snapshot as daemon_snapshot, stage_remote_clipboard_png, start_command_session,
+    start_local_session_at, start_ssh_session_at, status, take_next_app_control_request,
+    terminal_ensure, terminal_read, terminal_resize, terminal_write,
     toggle_preview_block as daemon_toggle_preview_block,
 };
 
@@ -1375,8 +1375,7 @@ impl ShellState {
         let previous_active_session = self.server.active_session().cloned();
         match result {
             Ok((snapshot, message)) => {
-                let snapshot =
-                    self.reconcile_snapshot_for_interactive_request(request_id, snapshot);
+                let snapshot = self.reconcile_snapshot_for_request(request_id, snapshot);
                 self.server.apply_snapshot(snapshot);
                 self.restore_active_preview_if_snapshot_regressed(previous_active_session);
                 self.prune_terminal_attach_in_flight();
@@ -1809,21 +1808,63 @@ impl ShellState {
         }
     }
 
-    fn reconcile_snapshot_for_interactive_request(
+    fn reconcile_snapshot_for_request(
         &self,
         request_id: &str,
         mut snapshot: ServerUiSnapshot,
     ) -> ServerUiSnapshot {
-        let preferred_path = self
+        let Some((request_surface, request)) = self
             .active_surface_requests
-            .values()
-            .find(|request| request.request_id == request_id)
-            .and_then(|request| match &request.target {
-                YggTarget::Session { session_path }
-                | YggTarget::Terminal { session_path }
-                | YggTarget::Preview { session_path } => Some(session_path.clone()),
-                _ => None,
-            });
+            .iter()
+            .find(|(_, request)| request.request_id == request_id)
+        else {
+            return snapshot;
+        };
+        if matches!(request_surface, YggSurface::PreviewSync | YggSurface::Notifications) {
+            let preferred_background_path = self
+                .active_surface_requests
+                .values()
+                .find(|candidate| {
+                    !matches!(
+                        candidate.operation.as_str(),
+                        "refresh_remote_machine" | "refresh_managed_cli" | "remote_preview_sync"
+                    )
+                })
+                .and_then(|candidate| {
+                    active_request_session_target_path(
+                        candidate,
+                        self.server.active_session_path(),
+                    )
+                })
+                .or_else(|| self.selected_tree_paths.iter().next().cloned())
+                .or_else(|| self.server.active_session_path().map(str::to_string));
+            let Some(current_active_path) = preferred_background_path else {
+                return snapshot;
+            };
+            let preferred_session = snapshot
+                .live_sessions
+                .iter()
+                .find(|session| session.session_path == current_active_path)
+                .cloned()
+                .or_else(|| {
+                    snapshot
+                        .active_session
+                        .as_ref()
+                        .filter(|session| session.session_path == current_active_path)
+                        .cloned()
+                });
+            snapshot.active_session_path = Some(current_active_path);
+            if let Some(preferred_session) = preferred_session {
+                snapshot.active_session = Some(preferred_session);
+            }
+            return snapshot;
+        }
+        let preferred_path = match &request.target {
+            YggTarget::Session { session_path }
+            | YggTarget::Terminal { session_path }
+            | YggTarget::Preview { session_path } => Some(session_path.clone()),
+            _ => None,
+        };
         let Some(preferred_path) = preferred_path else {
             return snapshot;
         };
@@ -4319,16 +4360,37 @@ fn spawn_background_managed_cli_refresh(state: Signal<ShellState>, scope_key: St
                     shell.last_action = message
                         .clone()
                         .unwrap_or_else(|| format!("codex tools checked for {scope_key}"));
+                    let queued = message
+                        .as_deref()
+                        .is_some_and(|value| value.starts_with("queued managed cli refresh"));
                     shell.finish_job_notification(
                         &format!("managed-cli-refresh:{scope_key}"),
-                        NotificationTone::Success,
+                        if queued {
+                            NotificationTone::Info
+                        } else {
+                            NotificationTone::Success
+                        },
                         if scope_key == "local" {
-                            "Codex Tools Ready"
+                            if queued {
+                                "Codex Tool Refresh Queued"
+                            } else {
+                                "Codex Tools Ready"
+                            }
+                        } else if queued {
+                            "Remote Codex Tool Refresh Queued"
                         } else {
                             "Remote Codex Tools Ready"
                         },
                         message.unwrap_or_else(|| {
-                            format!("Finished refreshing the managed Codex tools for {scope_key}.")
+                            if queued {
+                                format!(
+                                    "Queued a background refresh for the managed Codex tools on {scope_key}."
+                                )
+                            } else {
+                                format!(
+                                    "Finished refreshing the managed Codex tools for {scope_key}."
+                                )
+                            }
                         }),
                         false,
                     );
@@ -5560,13 +5622,6 @@ fn spawn_remote_preview_payload_sync(
     session_path: String,
     reason: &'static str,
 ) {
-    let fetch_target = {
-        let shell = state.read();
-        remote_preview_fetch_target_for_path(&shell.server, &session_path)
-    };
-    let Some((target, storage_path)) = fetch_target else {
-        return;
-    };
     let request_meta = YggRequestMeta::background(
         format!("remote-preview-sync-{}-{}", session_path, current_millis()),
         "remote_preview_sync",
@@ -5591,32 +5646,25 @@ fn spawn_remote_preview_payload_sync(
     spawn(async move {
         maybe_debug_request_delay().await;
         let path_for_task = session_path.clone();
-        let outcome =
-            task::spawn_blocking(move || fetch_remote_preview_payload(&target, &storage_path))
-                .await;
         let request_id = request_meta.request_id.clone();
-        let _ = safe_shell_mut(state, "remote_preview_sync_finish", |shell| {
-            shell.finish_busy_request_for(&request_id);
-        });
-        match outcome {
-            Ok(Ok(payload)) => {
-                state.with_mut(|shell| {
-                    if apply_remote_preview_payload_for_path(
-                        &mut shell.server,
-                        &path_for_task,
-                        payload,
-                    ) {
-                        shell.record_preview_issue_telemetry(reason);
-                    }
-                });
-            }
-            Ok(Err(error)) => {
-                warn!(path=%path_for_task, error=%error, "failed to fetch remote preview payload");
+        let endpoint = state.read().bootstrap.server_endpoint.clone();
+        let trace_home = resolve_yggterm_home().unwrap_or_else(|_| PathBuf::from("."));
+        let outcome = run_dedicated_interactive_request_io(
+            "remote_preview_sync",
+            trace_home.as_path(),
+            move || refresh_preview(&endpoint, &path_for_task),
+        )
+        .await;
+        let _ = safe_shell_mut(state, "remote_preview_sync_finish", |shell| match outcome {
+            Ok(result) => {
+                shell.record_preview_issue_telemetry(reason);
+                shell.apply_daemon_snapshot_result_for(&request_id, Ok(result));
             }
             Err(error) => {
-                warn!(path=%path_for_task, error=%error, "remote preview payload task join failed");
+                shell.finish_busy_request_for(&request_id);
+                warn!(path=%session_path, error=%error, "failed to refresh remote preview");
             }
-        }
+        });
     });
 }
 
@@ -12596,51 +12644,16 @@ fn app() -> Element {
             })
         });
         last_preview_refresh_marker.set(Some(refresh_marker));
-        let fetch_target = {
-            let shell = state.read();
-            remote_preview_fetch_target(&shell.server, &session)
-        };
-        if let Some((target, storage_path)) = fetch_target {
-            let session_path = session.session_path.clone();
-            spawn(async move {
-                let path_for_task = session_path.clone();
-                let outcome = task::spawn_blocking(move || {
-                    fetch_remote_preview_payload(&target, &storage_path)
-                })
-                .await;
-                match outcome {
-                    Ok(Ok(payload)) => {
-                        state.with_mut(|shell| {
-                            if apply_remote_preview_payload_for_path(
-                                &mut shell.server,
-                                &path_for_task,
-                                payload,
-                            ) {
-                                shell.remote_preview_dirty_epoch.remove(&path_for_task);
-                                shell.record_preview_issue_telemetry(if needs_refresh {
-                                    "preview_refresh_applied_client_side"
-                                } else {
-                                    "preview_refresh_synced_client_side"
-                                });
-                            }
-                        });
-                    }
-                    Ok(Err(error)) => {
-                        warn!(path=%path_for_task, error=%error, "failed to fetch remote preview payload from ui");
-                        let _ = safe_shell_mut(state, "preview_refresh_fetch_failed", |shell| {
-                            shell.record_preview_issue_telemetry("preview_refresh_fetch_failed");
-                            shell.last_action =
-                                format!("preview sync deferred for {}", path_for_task);
-                        });
-                    }
-                    Err(error) => {
-                        warn!(path=%path_for_task, error=%error, "preview payload task join failed");
-                        let _ = safe_shell_mut(state, "preview_refresh_join_failed", |shell| {
-                            shell.record_preview_issue_telemetry("preview_refresh_join_failed");
-                        });
-                    }
-                }
-            });
+        if remote_preview_fetch_target(&state.read().server, &session).is_some() {
+            spawn_remote_preview_payload_sync(
+                state,
+                session.session_path.clone(),
+                if needs_refresh {
+                    "preview_refresh_request_placeholder"
+                } else {
+                    "preview_refresh_request_active"
+                },
+            );
         } else if needs_refresh {
             state.with_mut(|shell| {
                 shell.record_preview_issue_telemetry("preview_refresh_no_target")

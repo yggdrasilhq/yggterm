@@ -103,6 +103,9 @@ pub enum ServerRequest {
         machine_key: Option<String>,
         background: bool,
     },
+    RefreshPreview {
+        path: String,
+    },
     RemoveSshTarget {
         machine_key: String,
     },
@@ -453,12 +456,21 @@ impl DaemonRuntime {
                 machine_key,
                 background,
             } => {
-                let message = self
-                    .server
-                    .refresh_managed_cli(machine_key.as_deref(), background)?;
+                let message = if background {
+                    self.server
+                        .queue_background_managed_cli_refresh(machine_key.as_deref())?
+                } else {
+                    self.server
+                        .refresh_managed_cli(machine_key.as_deref(), background)?
+                };
                 ServerResponse::Ack {
                     message: Some(message),
                 }
+            }
+            ServerRequest::RefreshPreview { path } => {
+                self.server.refresh_session_preview_from_source(&path)?;
+                self.persist()?;
+                self.snapshot_response(Some(format!("refreshed preview {path}")))
             }
             ServerRequest::RemoveSshTarget { machine_key } => {
                 let removed = self.server.remove_ssh_targets_for_machine(&machine_key);
@@ -982,6 +994,7 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::OpenRemoteSession { .. } => "open_remote_session",
         ServerRequest::RefreshRemoteMachine { .. } => "refresh_remote_machine",
         ServerRequest::RefreshManagedCli { .. } => "refresh_managed_cli",
+        ServerRequest::RefreshPreview { .. } => "refresh_preview",
         ServerRequest::RemoveSshTarget { .. } => "remove_ssh_target",
         ServerRequest::RemoveSession { .. } => "remove_session",
         ServerRequest::StartLocalSession { .. } => "start_local_session",
@@ -1198,6 +1211,18 @@ pub fn refresh_managed_cli(
         &ServerRequest::RefreshManagedCli {
             machine_key: machine_key.map(ToOwned::to_owned),
             background,
+        },
+    )?)
+}
+
+pub fn refresh_preview(
+    endpoint: &ServerEndpoint,
+    path: &str,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
+    expect_snapshot(send_request(
+        endpoint,
+        &ServerRequest::RefreshPreview {
+            path: path.to_string(),
         },
     )?)
 }
