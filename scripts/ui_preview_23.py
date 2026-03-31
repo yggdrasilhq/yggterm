@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import random
+import re
 import shlex
 import struct
 import subprocess
@@ -55,6 +56,11 @@ FORBIDDEN_PREVIEW_ENTRY_MARKERS = (
     "danger-full-access",
     "non-interactive mode where you may never ask the user for approval",
 )
+
+FULL_TIMESTAMP_RE = re.compile(
+    r"^[A-Z][a-z]{2} \d{1,2}, \d{4} \d{1,2}:\d{2}(?:AM|PM)(?: UTC[+-]\d{4})?$"
+)
+SHORT_TIMESTAMP_RE = re.compile(r"^\d{1,2}:\d{2}(?:AM|PM)$")
 
 
 def parse_args() -> argparse.Namespace:
@@ -320,6 +326,16 @@ def normalize_preview_entry_text(value: str) -> str:
     normalized = (value or "")
     for marker in ("`", "**", "__", "*"):
         normalized = normalized.replace(marker, "")
+    normalized = (
+        normalized.replace("‑", " ")
+        .replace("–", " ")
+        .replace("—", " ")
+        .replace("-", " ")
+        .replace("’", "'")
+        .replace("“", '"')
+        .replace("”", '"')
+    )
+    normalized = re.sub(r"[^0-9A-Za-z/@.:+_]+", " ", normalized)
     return " ".join(normalized.split()).strip().lower()
 
 
@@ -328,13 +344,10 @@ def preview_entry_body_text(value: str) -> str:
     lines = [line for line in lines if line]
     while lines:
         first = lines[0]
-        upper = first.upper()
-        if upper == "COLLAPSE" or upper == "EXPAND":
+        if first.upper() == "COLLAPSE" or first.upper() == "EXPAND":
             lines.pop(0)
             continue
-        if any(ch.isdigit() for ch in first) and (
-            "UTC" in upper or "AM" in upper or "PM" in upper
-        ):
+        if FULL_TIMESTAMP_RE.fullmatch(first) or SHORT_TIMESTAMP_RE.fullmatch(first):
             lines.pop(0)
             continue
         break
@@ -691,8 +704,20 @@ def main() -> int:
                 state = app_state(args.host, args.bin, args.timeout_ms)
             except Exception:
                 pass
+            failure_preview = ((state.get("viewport") or {}).get("preview") or {})
             entry["error"] = str(error)
-            entry["state_dump"] = write_json(out_dir / f"preview-{index:02d}-failure.json", state)
+            entry["state_dump"] = write_json(
+                out_dir / f"preview-{index:02d}-failure.json",
+                {
+                    **state,
+                    "failure": str(error),
+                    "session_path": session_path,
+                    "expected_entries": expected_turns[:12],
+                    "preview_entries": (failure_preview.get("visible_entries") or [])[:12],
+                    "viewport_verdict": (state.get("viewport") or {}).get("verdict"),
+                    "viewport_reason": (state.get("viewport") or {}).get("reason"),
+                },
+            )
             entry["within_budget"] = False
         results.append(entry)
 
