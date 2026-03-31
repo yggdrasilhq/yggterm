@@ -547,6 +547,10 @@ enum PreviewContentBlock {
         text: String,
     },
     Quote(String),
+    ImageReference {
+        label: String,
+        text: Option<String>,
+    },
     ImageAttachment {
         path: String,
     },
@@ -6015,17 +6019,77 @@ fn sidebar_search_cache_key(rows: &[BrowserRow], query: &str, mode: u8) -> u64 {
 }
 
 fn preview_rendered_sections(session: &ManagedSessionView) -> Vec<SessionRenderedSection> {
+    let visible_preview_texts = visible_preview_blocks(session)
+        .into_iter()
+        .map(|block| normalize_preview_semantic_text(&preview_block_text(&block)))
+        .filter(|text| !text.is_empty())
+        .collect::<HashSet<_>>();
     let filtered = session
         .rendered_sections
         .iter()
         .filter(|section| !is_placeholder_rendered_section_title(&section.title))
-        .cloned()
+        .filter_map(|section| {
+            let lines = section
+                .lines
+                .iter()
+                .filter_map(|line| {
+                    let normalized = normalize_preview_semantic_text(line);
+                    if normalized.is_empty() || visible_preview_texts.contains(&normalized) {
+                        return None;
+                    }
+                    Some(collapse_preview_image_markup(line))
+                })
+                .collect::<Vec<_>>();
+            if lines.is_empty() {
+                return None;
+            }
+            Some(SessionRenderedSection {
+                title: section.title,
+                lines,
+            })
+        })
         .collect::<Vec<_>>();
     if filtered.is_empty() {
         Vec::new()
     } else {
         filtered
     }
+}
+
+fn collapse_preview_image_markup(text: &str) -> String {
+    let mut remaining = text.trim();
+    let mut out = String::new();
+
+    loop {
+        let Some(start) = remaining.find("<image name=[") else {
+            out.push_str(remaining);
+            break;
+        };
+        out.push_str(&remaining[..start]);
+        let after = &remaining[start + "<image name=[".len()..];
+        let Some(label_end) = after.find("]>") else {
+            out.push_str(&remaining[start..]);
+            break;
+        };
+        let label_text = after[..label_end].trim();
+        let label = format!("[{label_text}]");
+        out.push_str(&label);
+
+        let mut tail = after[label_end + 2..].trim_start();
+        if let Some(stripped) = tail.strip_prefix("</image>") {
+            tail = stripped.trim_start();
+        }
+        if let Some(stripped) = tail.strip_prefix(&label) {
+            tail = stripped.trim_start();
+        }
+        remaining = tail;
+    }
+
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn normalize_preview_semantic_text(text: &str) -> String {
+    collapse_preview_image_markup(text).to_ascii_lowercase()
 }
 
 fn preview_block_text(block: &SessionPreviewBlock) -> String {
@@ -6136,11 +6200,7 @@ fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlo
     for block in visible.into_iter() {
         let signature = (
             block.tone,
-            preview_block_text(&block)
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .to_ascii_lowercase(),
+            normalize_preview_semantic_text(&preview_block_text(&block)),
         );
         if last_signature.as_ref() == Some(&signature) {
             continue;
@@ -9989,6 +10049,11 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let preview_rendered_sections = dom
+        .get("preview_rendered_sections")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let preview_timestamp_labels = dom
         .get("preview_timestamp_labels")
         .and_then(Value::as_array)
@@ -10112,6 +10177,7 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
             "visible_block_count": preview_visible_block_count,
             "visible_block_ids": preview_visible_block_ids,
             "visible_entries": preview_visible_entries,
+            "rendered_sections": preview_rendered_sections,
             "font_family": preview_font_family,
             "timestamp_labels": preview_timestamp_labels,
             "window": preview_window,
@@ -10298,6 +10364,20 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     };
                 })
                 .filter((entry) => entry.height > 0 && entry.top < previewViewportBottom && entry.top + entry.height > previewViewportTop);
+            const previewRenderedSections = Array.from((previewScroller || document).querySelectorAll('[data-preview-rendered-section="1"]'))
+                .map((section) => {
+                    const rect = section.getBoundingClientRect();
+                    return {
+                        title: String(section.getAttribute('data-preview-rendered-section-title') || '').trim(),
+                        top: Math.round(rect.top),
+                        height: Math.round(rect.height),
+                        lines: Array.from(section.querySelectorAll('[data-preview-rendered-line="1"]'))
+                            .map((node) => String(node.textContent || '').trim())
+                            .filter(Boolean)
+                            .slice(0, 8),
+                    };
+                })
+                .filter((section) => section.height > 0 && section.top < previewViewportBottom && section.top + section.height > previewViewportTop);
             const previewAssistantEntries = previewEntries.filter((entry) => entry.getAttribute('data-preview-tone') === 'assistant');
             const previewRawTimestamps = previewEntries
                 .map((entry) => String(entry.getAttribute('data-preview-raw-timestamp') || '').trim())
@@ -10357,6 +10437,7 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                 preview_visible_block_count: previewVisibleBlocks.length,
                 preview_visible_block_ids: previewVisibleBlocks.slice(0, 24).map((block) => block.id),
                 preview_visible_entries: previewVisibleEntries.slice(0, 24),
+                preview_rendered_sections: previewRenderedSections.slice(0, 12),
                 preview_assistant_entry_count: previewAssistantEntries.length,
                 preview_font_family: previewFontFamily,
                 preview_raw_timestamps: previewRawTimestamps,
@@ -15436,19 +15517,25 @@ fn RenderedSectionsStrip(sections: Vec<SessionRenderedSection>, palette: Palette
 #[component]
 fn RenderedSectionCard(section: SessionRenderedSection, palette: Palette) -> Element {
     let is_commands = section.title.to_ascii_lowercase().contains("command");
+    let is_goals = section.title.to_ascii_lowercase().contains("goal");
     let visible_lines = section.lines.iter().take(3).cloned().collect::<Vec<_>>();
     let visible_count = visible_lines.len();
     rsx! {
         div {
+            "data-preview-rendered-section": "1",
+            "data-preview-rendered-section-title": "{section.title}",
             style: format!(
                 "display:flex; flex-direction:column; gap:10px; min-width:0; padding:14px 16px; border-radius:18px; \
-                 background:rgba(255,255,255,0.82); box-shadow:inset 0 0 0 1px rgba(170,190,212,0.14); \
+                 background:{}; box-shadow:inset 0 0 0 1px {}; \
                  content-visibility:auto; contain:layout paint style; contain-intrinsic-size:220px 140px;"
+                ,
+                if is_goals { "rgba(236,248,247,0.92)" } else { "rgba(255,255,255,0.82)" },
+                if is_goals { "rgba(74,163,153,0.16)" } else { "rgba(170,190,212,0.14)" }
             ),
             div {
                 style: "display:flex; align-items:center; justify-content:space-between; gap:12px;",
                 div {
-                    style: format!("font-size:12px; font-weight:700; letter-spacing:0.03em; text-transform:uppercase; color:{};", palette.muted),
+                    style: format!("font-size:12px; font-weight:700; letter-spacing:0.03em; text-transform:uppercase; color:{};", if is_goals { "#2c8c83" } else { palette.muted }),
                     "{section.title}"
                 }
                 if section.lines.len() > visible_count {
@@ -15472,6 +15559,7 @@ fn RenderedSectionCard(section: SessionRenderedSection, palette: Palette) -> Ele
                         }
                     } else {
                         div {
+                            "data-preview-rendered-line": "1",
                             style: format!("font-size:13px; line-height:1.62; white-space:pre-wrap; color:{};", palette.text),
                             "{line}"
                         }
@@ -15884,6 +15972,23 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                             }
                         }
                     },
+                    PreviewContentBlock::ImageReference { label, text } => rsx! {
+                        div {
+                            style: "display:flex; flex-wrap:wrap; align-items:flex-start; gap:10px;",
+                            div {
+                                style: "display:inline-flex; align-items:center; justify-content:center; padding:4px 10px; border-radius:999px; \
+                                        background:rgba(73,160,153,0.12); color:#2c8c83; font-size:12px; font-weight:700; \
+                                        letter-spacing:0.01em; font-family:'JetBrains Mono', 'Iosevka Term', monospace;",
+                                "{label}"
+                            }
+                            if let Some(text) = text.filter(|value| !value.trim().is_empty()) {
+                                div {
+                                    style: "font-size:14px; line-height:1.76; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; flex:1 1 240px;",
+                                    "{text}"
+                                }
+                            }
+                        }
+                    },
                     PreviewContentBlock::ImageAttachment { path } => {
                         let exists = Path::new(&path).exists();
                         let file_url = format!("file://{}", path);
@@ -16072,6 +16177,14 @@ fn build_preview_content_blocks(lines: &[String]) -> Vec<PreviewContentBlock> {
             blocks.push(PreviewContentBlock::Quote(quote.trim().to_string()));
             continue;
         }
+        if let Some((label, residue)) = extract_named_image_reference_from_line(line) {
+            flush_paragraph(&mut blocks, &mut paragraph);
+            blocks.push(PreviewContentBlock::ImageReference {
+                label,
+                text: residue,
+            });
+            continue;
+        }
         if let Some((image_path, residue)) = extract_image_path_from_line(line) {
             flush_paragraph(&mut blocks, &mut paragraph);
             if let Some(text) = residue.filter(|value| !value.trim().is_empty()) {
@@ -16119,6 +16232,29 @@ fn extract_image_path_from_line(line: &str) -> Option<(String, Option<String>)> 
     let residue = line.replace(&format!("@{path}"), "").replace(&path, "");
     let residue = residue.trim().trim_matches(':').trim().to_string();
     Some((path, (!residue.is_empty()).then_some(residue)))
+}
+
+fn extract_named_image_reference_from_line(line: &str) -> Option<(String, Option<String>)> {
+    let trimmed = line.trim();
+    if let Some(after) = trimmed.strip_prefix("<image name=[") {
+        let label_end = after.find("]>")?;
+        let label = format!("[{}]", after[..label_end].trim());
+        let mut residue = after[label_end + 2..].trim();
+        if let Some(stripped) = residue.strip_prefix("</image>") {
+            residue = stripped.trim();
+        }
+        if let Some(stripped) = residue.strip_prefix(&label) {
+            residue = stripped.trim();
+        }
+        return Some((label, (!residue.is_empty()).then_some(residue.to_string())));
+    }
+    if trimmed.starts_with("[Image #") {
+        let label_end = trimmed.find(']')?;
+        let label = trimmed[..=label_end].to_string();
+        let residue = trimmed[label_end + 1..].trim();
+        return Some((label, (!residue.is_empty()).then_some(residue.to_string())));
+    }
+    None
 }
 
 fn looks_like_image_path(path: &str) -> bool {
@@ -20606,6 +20742,19 @@ mod tests {
                 .any(|block| matches!(block, PreviewContentBlock::Quote(text) if text == "quoted"))
         );
         assert!(blocks.iter().any(|block| matches!(block, PreviewContentBlock::Code { language: Some(language), code } if language == "rust" && code == "fn main() {}")));
+    }
+
+    #[test]
+    fn preview_content_blocks_collapse_named_image_markup() {
+        let blocks = preview_content_blocks(&[
+            "<image name=[Image #1]> </image> [Image #1] This is how excel looks.".to_string(),
+        ]);
+
+        assert!(matches!(
+            blocks.first(),
+            Some(PreviewContentBlock::ImageReference { label, text })
+                if label == "[Image #1]" && text.as_deref() == Some("This is how excel looks.")
+        ));
     }
 
     #[test]
