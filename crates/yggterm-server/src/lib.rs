@@ -1609,6 +1609,13 @@ impl YggtermServer {
         let resolved_title = title_hint
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| short_session_id(session_id));
+        let preview_target = SshConnectTarget {
+            label: machine.label.clone(),
+            kind: SessionKind::Codex,
+            ssh_target: machine.ssh_target.clone(),
+            prefix: machine.prefix.clone(),
+            cwd: cwd.map(ToOwned::to_owned),
+        };
         if self.sessions.contains_key(&session_path) {
             if let Some(session) = self.sessions.get_mut(&session_path) {
                 session.session_path = session_path.clone();
@@ -1681,6 +1688,13 @@ impl YggtermServer {
                         &machine.label,
                         &target.ssh_target,
                     );
+                    if !launch_terminal && !scanned.storage_path.trim().is_empty() {
+                        if let Ok(payload) =
+                            fetch_remote_preview_payload(&preview_target, &scanned.storage_path)
+                        {
+                            apply_remote_preview_payload(session, payload);
+                        }
+                    }
                 }
             }
             if launch_terminal {
@@ -1769,6 +1783,13 @@ impl YggtermServer {
                     &machine.label,
                     &target.ssh_target,
                 );
+                if !launch_terminal && !scanned.storage_path.trim().is_empty() {
+                    if let Ok(payload) =
+                        fetch_remote_preview_payload(&preview_target, &scanned.storage_path)
+                    {
+                        apply_remote_preview_payload(session, payload);
+                    }
+                }
             }
         }
         if launch_terminal {
@@ -3074,6 +3095,10 @@ fn recent_context_scaffold_line(trimmed: &str) -> bool {
         "<instructions>",
         "<cwd>",
         "<shell>",
+        "<current_date>",
+        "</current_date>",
+        "<timezone>",
+        "</timezone>",
         "<approval_policy>",
         "<sandbox_mode>",
         "<network_access>",
@@ -8155,6 +8180,76 @@ mod tests {
         assert_eq!(
             session.preview.blocks[0].lines,
             vec!["I launched excel but it is a blank window.".to_string()]
+        );
+    }
+
+    #[test]
+    fn remote_preview_payload_apply_filters_current_date_timezone_scaffold() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.open_or_focus_session(
+            SessionKind::Codex,
+            "remote-session://jojo/test-scaffold",
+            Some("test-scaffold"),
+            Some("/home/pi"),
+            Some("Test Scaffold"),
+            None,
+        );
+
+        let payload = RemotePreviewPayload {
+            title_hint: Some("Test Scaffold".to_string()),
+            cached_precis: None,
+            cached_summary: None,
+            preview: SnapshotPreview {
+                summary: Vec::new(),
+                blocks: vec![
+                    SnapshotPreviewBlock {
+                        role: "USER".to_string(),
+                        timestamp: "Mar 20, 2026 10:40 AM UTC+0530".to_string(),
+                        tone: PreviewTone::User,
+                        folded: false,
+                        lines: vec![
+                            "<current_date>2026-03-20</current_date>".to_string(),
+                            "<timezone>Asia/Kolkata</timezone>".to_string(),
+                        ],
+                    },
+                    SnapshotPreviewBlock {
+                        role: "USER".to_string(),
+                        timestamp: "Mar 20, 2026 10:40 AM UTC+0530".to_string(),
+                        tone: PreviewTone::User,
+                        folded: false,
+                        lines: vec!["Investigate the boot delay on manin.".to_string()],
+                    },
+                ],
+            },
+            rendered_sections: Vec::new(),
+        };
+
+        let session = server
+            .sessions
+            .get_mut("remote-session://jojo/test-scaffold")
+            .expect("session");
+        apply_remote_preview_payload(session, payload);
+
+        assert_eq!(session.preview.blocks.len(), 1, "{:?}", session.preview.blocks);
+        assert_eq!(
+            session.preview.blocks[0].lines,
+            vec!["Investigate the boot delay on manin.".to_string()]
         );
     }
 
