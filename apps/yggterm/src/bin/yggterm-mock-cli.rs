@@ -14,6 +14,46 @@ use yggterm_server::{
     request_terminal_launch, shutdown, snapshot, start_local_session_at, status,
 };
 
+fn remote_machine_details_json(snap: &yggterm_server::ServerUiSnapshot) -> serde_json::Value {
+    serde_json::Value::Array(
+        snap.remote_machines
+            .iter()
+            .map(|machine| {
+                json!({
+                    "machine_key": machine.machine_key,
+                    "label": machine.label,
+                    "health": machine.health,
+                    "remote_deploy_state": machine.remote_deploy_state,
+                    "session_count": machine.sessions.len(),
+                })
+            })
+            .collect(),
+    )
+}
+
+fn remote_machine_health_counts_json(snap: &yggterm_server::ServerUiSnapshot) -> serde_json::Value {
+    let healthy = snap
+        .remote_machines
+        .iter()
+        .filter(|machine| matches!(machine.health, yggterm_server::RemoteMachineHealth::Healthy))
+        .count();
+    let cached = snap
+        .remote_machines
+        .iter()
+        .filter(|machine| matches!(machine.health, yggterm_server::RemoteMachineHealth::Cached))
+        .count();
+    let offline = snap
+        .remote_machines
+        .iter()
+        .filter(|machine| matches!(machine.health, yggterm_server::RemoteMachineHealth::Offline))
+        .count();
+    json!({
+        "healthy": healthy,
+        "cached": cached,
+        "offline": offline,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Scenario {
     Startup,
@@ -236,6 +276,8 @@ fn run_scenario(
                 "active_session_path": snap.active_session_path,
                 "active_view_mode": snap.active_view_mode,
                 "remote_machines": snap.remote_machines.len(),
+                "remote_machine_details": remote_machine_details_json(&snap),
+                "remote_machine_health_counts": remote_machine_health_counts_json(&snap),
                 "ssh_targets": snap.ssh_targets.len(),
                 "live_sessions": snap.live_sessions.len(),
             }))
@@ -255,6 +297,8 @@ fn run_scenario(
                 "active_session_path": snap.active_session_path,
                 "active_view_mode": snap.active_view_mode,
                 "remote_machines": snap.remote_machines.len(),
+                "remote_machine_details": remote_machine_details_json(&snap),
+                "remote_machine_health_counts": remote_machine_health_counts_json(&snap),
                 "ssh_targets": snap.ssh_targets.len(),
                 "live_sessions": snap.live_sessions.len(),
             }))
