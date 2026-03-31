@@ -12,7 +12,6 @@ use std::io::{BufRead, BufReader, ErrorKind, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
@@ -31,6 +30,8 @@ const BACKGROUND_COPY_BUDGET_PER_TICK: usize = 23;
 const DAEMON_ACCEPT_POLL_MS: u64 = 1000;
 const DEFAULT_DAEMON_IDLE_SHUTDOWN_MS: u64 = 90_000;
 const DEFAULT_TERMINAL_IDLE_TRIM_AFTER_MS: u64 = 45_000;
+#[cfg(target_os = "linux")]
+const DEFAULT_ORPHAN_DAEMON_REAP_AFTER_MS: u64 = 180_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerEndpoint {
@@ -1526,7 +1527,7 @@ pub fn cleanup_legacy_daemons(endpoint: &ServerEndpoint, current_exe: &Path) -> 
     #[cfg(unix)]
     cleanup_legacy_unix_daemons(endpoint)?;
     #[cfg(target_os = "linux")]
-    cleanup_legacy_linux_daemon_processes(current_exe)?;
+    cleanup_legacy_linux_daemon_processes(endpoint, current_exe)?;
     Ok(())
 }
 
@@ -1539,6 +1540,10 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
         let runtime = runtime.lock().expect("daemon runtime lock poisoned");
         runtime.store.home_dir().to_path_buf()
     };
+    #[cfg(target_os = "linux")]
+    if let Ok(current_exe) = std::env::current_exe() {
+        let _ = cleanup_legacy_linux_daemon_processes(endpoint, &current_exe);
+    }
     {
         let runtime = runtime.clone();
         let last_activity_ms = last_activity_ms.clone();
@@ -1779,8 +1784,75 @@ fn cleanup_legacy_unix_daemons(endpoint: &ServerEndpoint) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn cleanup_legacy_linux_daemon_processes(current_exe: &Path) -> Result<()> {
+fn daemon_orphan_reap_after_ms() -> u64 {
+    std::env::var("YGGTERM_DAEMON_ORPHAN_REAP_AFTER_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_ORPHAN_DAEMON_REAP_AFTER_MS)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proc_pid_age_ms(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.split_once(") ")?.1;
+    let fields = rest.split_whitespace().collect::<Vec<_>>();
+    let start_ticks = fields.get(19)?.parse::<u64>().ok()?;
+    let uptime = fs::read_to_string("/proc/uptime").ok()?;
+    let uptime_secs = uptime.split_whitespace().next()?.parse::<f64>().ok()?;
+    let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if clk_tck <= 0 {
+        return None;
+    }
+    let uptime_ticks = (uptime_secs * clk_tck as f64).floor() as u64;
+    Some(
+        uptime_ticks
+            .saturating_sub(start_ticks)
+            .saturating_mul(1_000)
+            / (clk_tck as u64),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proc_yggterm_home(proc_path: &Path) -> Option<PathBuf> {
+    let environ = fs::read(proc_path.join("environ")).ok()?;
+    environ
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .find_map(|part| {
+            let item = String::from_utf8_lossy(part);
+            item.strip_prefix("YGGTERM_HOME=").map(PathBuf::from)
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_linux_process(pid: u32) {
+    unsafe {
+        let _ = libc::kill(pid as i32, libc::SIGTERM);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    if Path::new(&format!("/proc/{pid}")).exists() {
+        unsafe {
+            let _ = libc::kill(pid as i32, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_legacy_linux_daemon_processes(
+    endpoint: &ServerEndpoint,
+    current_exe: &Path,
+) -> Result<()> {
     let current_exe = current_exe.to_string_lossy().to_string();
+    let current_home = match endpoint {
+        #[cfg(unix)]
+        ServerEndpoint::UnixSocket(path) => path.parent().map(Path::to_path_buf),
+        ServerEndpoint::Tcp { .. } => None,
+    };
+    let reap_after_ms = daemon_orphan_reap_after_ms();
+    let mut daemon_candidates = 0usize;
+    let mut killed_legacy = 0usize;
+    let mut killed_orphan = 0usize;
     let proc_entries = fs::read_dir("/proc").context("reading /proc for stale daemon cleanup")?;
     for entry in proc_entries {
         let entry = entry?;
@@ -1795,6 +1867,7 @@ fn cleanup_legacy_linux_daemon_processes(current_exe: &Path) -> Result<()> {
         if pid == std::process::id() {
             continue;
         }
+        let proc_path = entry.path();
         let cmdline_path = entry.path().join("cmdline");
         let Ok(bytes) = fs::read(&cmdline_path) else {
             continue;
@@ -1814,21 +1887,42 @@ fn cleanup_legacy_linux_daemon_processes(current_exe: &Path) -> Result<()> {
         let is_daemon = argv0.contains("yggterm")
             && parts.iter().any(|part| part == "server")
             && parts.iter().any(|part| part == "daemon");
-        if !is_daemon || argv0 == &current_exe {
+        if !is_daemon {
             continue;
         }
-
-        let _ = Command::new("kill")
-            .arg("-TERM")
-            .arg(pid.to_string())
-            .status();
-        std::thread::sleep(std::time::Duration::from_millis(120));
-        if Path::new(&format!("/proc/{pid}")).exists() {
-            let _ = Command::new("kill")
-                .arg("-KILL")
-                .arg(pid.to_string())
-                .status();
+        daemon_candidates += 1;
+        let daemon_home = linux_proc_yggterm_home(&proc_path);
+        let has_clients = daemon_home
+            .as_deref()
+            .and_then(|home| active_client_instance_records(home, &default_endpoint(home)).ok())
+            .is_some_and(|records| !records.is_empty());
+        let age_ms = linux_proc_pid_age_ms(pid).unwrap_or_default();
+        let is_legacy_binary = argv0 != &current_exe;
+        let is_orphan_clientless = !has_clients
+            && age_ms >= reap_after_ms
+            && daemon_home.as_deref() != current_home.as_deref();
+        if is_legacy_binary || is_orphan_clientless {
+            terminate_linux_process(pid);
+            if is_legacy_binary {
+                killed_legacy += 1;
+            } else {
+                killed_orphan += 1;
+            }
         }
+    }
+    if let Some(home) = current_home.as_deref() {
+        append_trace_event(
+            home,
+            "daemon",
+            "cleanup",
+            "linux_daemon_sweep",
+            serde_json::json!({
+                "candidates": daemon_candidates,
+                "killed_legacy": killed_legacy,
+                "killed_orphan": killed_orphan,
+                "reap_after_ms": reap_after_ms,
+            }),
+        );
     }
     Ok(())
 }
