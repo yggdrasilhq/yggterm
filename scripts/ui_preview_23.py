@@ -316,11 +316,17 @@ def titlebar_matches_viewport(state: dict) -> bool:
 def preview_ready(state: dict, session_path: str) -> bool:
     viewport = state.get("viewport") or {}
     preview = viewport.get("preview") or {}
+    rendered_sections = preview.get("rendered_sections") or []
+    has_visible_content = (
+        (preview.get("visible_block_count") or 0) > 0
+        or bool(rendered_sections)
+        or bool((preview.get("text_sample") or "").strip())
+    )
     return (
         viewport.get("active_view_mode") == "Rendered"
         and viewport.get("active_session_path") == session_path
         and bool(viewport.get("ready"))
-        and (preview.get("visible_block_count") or 0) > 0
+        and has_visible_content
     )
 
 
