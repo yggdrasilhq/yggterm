@@ -125,6 +125,7 @@ const PREVIEW_SAFE_FULL_RENDER_BLOCK_LIMIT: usize = 600;
 const PREVIEW_VIRTUAL_OVERSCAN_FACTOR: f64 = 0.85;
 const PREVIEW_MIN_VIEWPORT_HEIGHT_PX: f64 = 680.0;
 const PREVIEW_MAX_OVERSCAN_PX: f64 = 1_200.0;
+const SHELL_FRAME_INSET_PX: f64 = 6.0;
 const REMOTE_PREVIEW_SYNC_DEBOUNCE_MS: u64 = 2_500;
 static XTERM_ASSETS_BOOTSTRAPPED: OnceCell<()> = OnceCell::new();
 const TREE_LOADING_DOT_CSS: &str = "@keyframes yggterm-tree-loading-dot { 0%, 80%, 100% { opacity: 0.28; transform: translateY(0px); } 40% { opacity: 1; transform: translateY(-1px); } }";
@@ -160,6 +161,8 @@ pub struct ShellBootstrap {
     pub prefer_ghostty_backend: bool,
     pub pending_update_restart: Option<PendingUpdateRestart>,
     pub refresh_server_after_launch: bool,
+    pub linux_window_transparent: bool,
+    pub linux_window_profile_reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11656,7 +11659,7 @@ fn ghostty_dock_request(
     let top_padding = 12.0;
     let right_padding = 12.0;
     let bottom_padding = 10.0;
-    let frame_inset = 1.0;
+    let frame_inset = SHELL_FRAME_INSET_PX;
 
     let x = ((left_sidebar + frame_inset) * scale).round() as i32;
     let y = ((titlebar_height + top_padding + frame_inset) * scale).round() as i32;
@@ -11687,18 +11690,80 @@ fn ghostty_dock_request(
 }
 
 pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
+    let trace_home = perf_home_dir(&bootstrap.settings_path);
+    let linux_window_transparent = bootstrap.linux_window_transparent;
+    let linux_window_profile_reason = bootstrap.linux_window_profile_reason.clone();
+    append_trace_event(
+        &trace_home,
+        "ui",
+        "startup",
+        "launch_shell_enter",
+        json!({
+            "pid": std::process::id(),
+            "transparent": linux_window_transparent,
+            "profile_reason": linux_window_profile_reason,
+        }),
+    );
     if CLIENT_INSTANCE.get().is_none() {
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "startup",
+            "launch_shell_register_begin",
+            json!({
+                "pid": std::process::id(),
+            }),
+        );
         match register_client_instance(&bootstrap.settings_path, &bootstrap.server_endpoint) {
             Ok(registration) => {
                 let _ = CLIENT_INSTANCE.set(registration);
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "startup",
+                    "launch_shell_register_end",
+                    json!({
+                        "pid": std::process::id(),
+                        "ok": true,
+                    }),
+                );
             }
             Err(error) => {
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "startup",
+                    "launch_shell_register_end",
+                    json!({
+                        "pid": std::process::id(),
+                        "ok": false,
+                        "error": error.to_string(),
+                    }),
+                );
                 warn!(error=%error, "failed to register yggterm client instance");
             }
         }
     }
     let shutdown_bootstrap = bootstrap.clone();
+    append_trace_event(
+        &trace_home,
+        "ui",
+        "startup",
+        "launch_shell_before_bootstrap_set",
+        json!({
+            "pid": std::process::id(),
+        }),
+    );
     let _ = BOOTSTRAP.set(bootstrap);
+    append_trace_event(
+        &trace_home,
+        "ui",
+        "startup",
+        "launch_shell_after_bootstrap_set",
+        json!({
+            "pid": std::process::id(),
+        }),
+    );
 
     #[cfg(target_os = "macos")]
     let window = WindowBuilder::new()
@@ -11711,16 +11776,7 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
         .with_min_inner_size(LogicalSize::new(1024.0, 720.0));
 
     #[cfg(not(target_os = "macos"))]
-    let linux_transparent_window = std::env::var("YGGTERM_ENABLE_TRANSPARENT_WINDOW")
-        .ok()
-        .is_some_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        || !(std::env::var_os("XRDP_SESSION").is_some()
-            || std::env::var_os("XRDP_SOCKET_PATH").is_some());
+    let linux_transparent_window = linux_window_transparent;
 
     #[cfg(not(target_os = "macos"))]
     let window = WindowBuilder::new()
@@ -11736,6 +11792,18 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
         .with_window(window)
         .with_close_behaviour(WindowCloseBehaviour::WindowCloses)
         .with_exits_when_last_window_closes(true);
+
+    append_trace_event(
+        &trace_home,
+        "ui",
+        "startup",
+        "launch_shell_config_ready",
+        json!({
+            "pid": std::process::id(),
+            "transparent": linux_window_transparent,
+            "profile_reason": linux_window_profile_reason,
+        }),
+    );
 
     dioxus::LaunchBuilder::desktop()
         .with_cfg(config)
@@ -20021,7 +20089,11 @@ fn shell_style(
     maximized: bool,
 ) -> String {
     let backdrop = shell_backdrop_style(maximized);
-    let frame_inset = if maximized { 0 } else { 1 };
+    let frame_inset = if maximized {
+        0.0
+    } else {
+        SHELL_FRAME_INSET_PX
+    };
     format!(
         "position:absolute; inset:{}px; display:flex; flex-direction:column; overflow:hidden; \
          border-radius:{}px; background-color:{}; background-image:{}; box-shadow:{}; backdrop-filter:{}; \
