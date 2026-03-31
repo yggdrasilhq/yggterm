@@ -4927,13 +4927,50 @@ fn spawn_open_session_row_with_mode(
         .await;
         let request_id = request_meta.request_id.clone();
         let preview_sync_session_path = staged_remote_preview_session.clone();
+        append_trace_event(
+            trace_home.as_path(),
+            "ui",
+            "interactive_request",
+            "open_row_outcome",
+            json!({
+                "request_id": request_id,
+                "ok": outcome.is_ok(),
+                "error": outcome.as_ref().err().map(|error| error.to_string()),
+            }),
+        );
         let _ = safe_shell_mut(state, "open_session_row_complete", |shell| {
+            append_trace_event(
+                trace_home.as_path(),
+                "ui",
+                "interactive_request",
+                "open_row_apply_begin",
+                json!({
+                    "request_id": request_id,
+                    "latest_open_request_id": shell.latest_open_request_id,
+                    "matches_latest": open_request_id == shell.latest_open_request_id,
+                }),
+            );
             if open_request_id != shell.latest_open_request_id {
                 shell.finish_busy_request_for(&request_id);
                 return;
             }
             match outcome {
-                Ok(result) => shell.apply_daemon_snapshot_result_for(&request_id, Ok(result)),
+                Ok(result) => {
+                    shell.apply_daemon_snapshot_result_for(&request_id, Ok(result));
+                    append_trace_event(
+                        trace_home.as_path(),
+                        "ui",
+                        "interactive_request",
+                        "open_row_apply_end",
+                        json!({
+                            "request_id": request_id,
+                            "request_active": shell
+                                .active_surface_requests
+                                .values()
+                                .any(|request| request.request_id == request_id),
+                        }),
+                    );
+                }
                 Err(error) => {
                     shell.finish_busy_request_for(&request_id);
                     shell.last_action = format!("{pending_label} task failed: {error}");
@@ -17731,11 +17768,50 @@ where
     let queued_at_ms = current_millis();
     let (tx, rx) = oneshot::channel();
     let worker_name = format!("yggterm-{label}-{queued_at_ms}");
+    let label = label.to_string();
+    let worker_label = label.clone();
+    let trace_home = trace_home.to_path_buf();
+    let worker_trace_home = trace_home.clone();
+    append_trace_event(
+        &trace_home,
+        "ui",
+        "interactive_request",
+        "queued",
+        json!({
+            "label": label,
+            "queued_at_ms": queued_at_ms,
+        }),
+    );
     thread::Builder::new()
         .name(worker_name.clone())
         .spawn(move || {
             let started_at_ms = current_millis();
+            append_trace_event(
+                &worker_trace_home,
+                "ui",
+                "interactive_request",
+                "worker_start",
+                json!({
+                    "label": worker_label.clone(),
+                    "queued_at_ms": queued_at_ms,
+                    "started_at_ms": started_at_ms,
+                }),
+            );
             let result = work();
+            append_trace_event(
+                &worker_trace_home,
+                "ui",
+                "interactive_request",
+                "worker_finish",
+                json!({
+                    "label": worker_label,
+                    "queued_at_ms": queued_at_ms,
+                    "started_at_ms": started_at_ms,
+                    "finished_at_ms": current_millis(),
+                    "ok": result.is_ok(),
+                    "error": result.as_ref().err().map(|error| error.to_string()),
+                }),
+            );
             let _ = tx.send((started_at_ms, result));
         })
         .with_context(|| format!("spawning dedicated interactive worker {worker_name}"))?;
@@ -17743,7 +17819,7 @@ where
         .await
         .map_err(|error| anyhow!("waiting for dedicated interactive worker {label}: {error}"))?;
     append_trace_event(
-        trace_home,
+        &trace_home,
         "ui",
         "interactive_request",
         "dispatch",
