@@ -57,6 +57,11 @@ pub enum AppControlDragCommand {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AppControlCommand {
+    SetSearch {
+        query: String,
+        #[serde(default)]
+        focused: Option<bool>,
+    },
     CaptureScreenshot {
         target: ScreenshotTarget,
         output_path: String,
@@ -115,6 +120,7 @@ pub enum AppControlCommand {
 impl AppControlCommand {
     pub fn name(&self) -> &'static str {
         match self {
+            Self::SetSearch { .. } => "set_search",
             Self::CaptureScreenshot { .. } => "capture_screenshot",
             Self::ScrollPreview { .. } => "scroll_preview",
             Self::SetPreviewLayout { .. } => "set_preview_layout",
