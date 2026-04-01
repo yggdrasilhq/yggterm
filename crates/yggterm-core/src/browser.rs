@@ -542,22 +542,54 @@ pub fn unique_session_short_ids_for_pairs(
     sessions: &[(String, String)],
 ) -> HashMap<String, String> {
     let mut out = HashMap::new();
-
-    for (path, session_id) in sessions {
-        let id_len = session_id.chars().count();
-        let mut width = 7usize.min(id_len).max(1);
-        while width < id_len {
-            let suffix = session_id_suffix(session_id, width);
-            let collision = sessions.iter().any(|(other_path, other_id)| {
-                other_path != path && session_id_suffix(other_id, width) == suffix
-            });
-            if !collision {
-                break;
-            }
-            width += 1;
-        }
-        out.insert(path.clone(), session_id_suffix(session_id, width));
+    if sessions.is_empty() {
+        return out;
     }
+
+    let min_widths = sessions
+        .iter()
+        .map(|(_, session_id)| 7usize.min(session_id.chars().count()).max(1))
+        .collect::<Vec<_>>();
+    let max_id_len = sessions
+        .iter()
+        .map(|(_, session_id)| session_id.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut unresolved = (0..sessions.len()).collect::<Vec<_>>();
+
+    for width in 1..=max_id_len {
+        let mut counts = HashMap::<String, usize>::new();
+        for &ix in &unresolved {
+            if width < min_widths[ix] {
+                continue;
+            }
+            let suffix = session_id_suffix(&sessions[ix].1, width);
+            *counts.entry(suffix).or_insert(0) += 1;
+        }
+
+        let mut next_unresolved = Vec::with_capacity(unresolved.len());
+        for ix in unresolved {
+            if width < min_widths[ix] {
+                next_unresolved.push(ix);
+                continue;
+            }
+            let suffix = session_id_suffix(&sessions[ix].1, width);
+            if counts.get(&suffix).copied().unwrap_or_default() == 1 || width >= sessions[ix].1.chars().count() {
+                out.insert(sessions[ix].0.clone(), suffix);
+            } else {
+                next_unresolved.push(ix);
+            }
+        }
+        unresolved = next_unresolved;
+        if unresolved.is_empty() {
+            break;
+        }
+    }
+
+    for ix in unresolved {
+        out.insert(sessions[ix].0.clone(), sessions[ix].1.clone());
+    }
+
     out
 }
 
@@ -578,4 +610,33 @@ fn session_id_suffix(id: &str, width: usize) -> String {
     let chars = id.chars().collect::<Vec<_>>();
     let start = chars.len().saturating_sub(width);
     chars[start..].iter().collect::<String>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unique_session_short_ids_for_pairs;
+
+    #[test]
+    fn unique_session_short_ids_widen_only_colliding_suffixes() {
+        let sessions = vec![
+            ("a".to_string(), "alpha-01234567".to_string()),
+            ("b".to_string(), "beta-11234567".to_string()),
+            ("c".to_string(), "xyz99999999999".to_string()),
+        ];
+        let ids = unique_session_short_ids_for_pairs(&sessions);
+        assert_eq!(ids.get("c").map(String::as_str), Some("9999999"));
+        assert_eq!(ids.get("a").map(String::as_str), Some("01234567"));
+        assert_eq!(ids.get("b").map(String::as_str), Some("11234567"));
+    }
+
+    #[test]
+    fn unique_session_short_ids_fall_back_to_full_id_for_exact_duplicates() {
+        let sessions = vec![
+            ("a".to_string(), "duplicate-id".to_string()),
+            ("b".to_string(), "duplicate-id".to_string()),
+        ];
+        let ids = unique_session_short_ids_for_pairs(&sessions);
+        assert_eq!(ids.get("a").map(String::as_str), Some("duplicate-id"));
+        assert_eq!(ids.get("b").map(String::as_str), Some("duplicate-id"));
+    }
 }
