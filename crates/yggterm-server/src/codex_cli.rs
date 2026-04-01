@@ -188,7 +188,7 @@ fn colorfgbg_for_appearance(appearance: &str) -> &'static str {
     }
 }
 
-pub(crate) fn terminal_identity_env_pairs() -> Vec<(&'static str, String)> {
+fn terminal_identity_env_pairs_with_home(include_yggterm_home: bool) -> Vec<(&'static str, String)> {
     let appearance = ambient_terminal_appearance();
     let mut pairs = vec![
         ("TERM", "xterm-256color".to_string()),
@@ -207,7 +207,7 @@ pub(crate) fn terminal_identity_env_pairs() -> Vec<(&'static str, String)> {
             colorfgbg_for_appearance(&appearance).to_string(),
         ),
     ];
-    if let Ok(home) = env::var(ENV_YGGTERM_HOME) {
+    if include_yggterm_home && let Ok(home) = env::var(ENV_YGGTERM_HOME) {
         if !home.trim().is_empty() {
             pairs.push((ENV_YGGTERM_HOME, home));
         }
@@ -215,8 +215,19 @@ pub(crate) fn terminal_identity_env_pairs() -> Vec<(&'static str, String)> {
     pairs
 }
 
+pub(crate) fn terminal_identity_env_pairs() -> Vec<(&'static str, String)> {
+    terminal_identity_env_pairs_with_home(true)
+}
+
 pub(crate) fn terminal_identity_shell_exports() -> Vec<String> {
     terminal_identity_env_pairs()
+        .into_iter()
+        .map(|(key, value)| format!("export {key}={}", shell_single_quote(&value)))
+        .collect()
+}
+
+pub(crate) fn terminal_identity_shell_exports_for_remote() -> Vec<String> {
+    terminal_identity_env_pairs_with_home(false)
         .into_iter()
         .map(|(key, value)| format!("export {key}={}", shell_single_quote(&value)))
         .collect()
