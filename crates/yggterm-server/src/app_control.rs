@@ -27,6 +27,13 @@ pub enum AppControlViewMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum AppControlPreviewLayout {
+    Chat,
+    Graph,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AppControlDragPlacement {
     Before,
     Into,
@@ -60,9 +67,15 @@ pub enum AppControlCommand {
         #[serde(default)]
         ratio: Option<f64>,
     },
+    SetPreviewLayout {
+        layout: AppControlPreviewLayout,
+    },
     CaptureScreenRecording {
         output_path: String,
         duration_secs: u64,
+    },
+    SetMaximized {
+        enabled: bool,
     },
     SetFullscreen {
         enabled: bool,
@@ -104,7 +117,9 @@ impl AppControlCommand {
         match self {
             Self::CaptureScreenshot { .. } => "capture_screenshot",
             Self::ScrollPreview { .. } => "scroll_preview",
+            Self::SetPreviewLayout { .. } => "set_preview_layout",
             Self::CaptureScreenRecording { .. } => "capture_screen_recording",
+            Self::SetMaximized { .. } => "set_maximized",
             Self::SetFullscreen { .. } => "set_fullscreen",
             Self::Drag { .. } => "drag",
             Self::CreateTerminal { .. } => "create_terminal",
