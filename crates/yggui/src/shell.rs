@@ -8239,6 +8239,14 @@ struct RemoteFolderTree {
     root_session_indices: Vec<usize>,
 }
 
+#[derive(Debug, Default)]
+struct RemoteFolderNodeBuilder {
+    name: String,
+    full_path: String,
+    child_paths: HashSet<String>,
+    session_indices: Vec<usize>,
+}
+
 #[derive(Debug, Clone)]
 struct RemoteFolderNode {
     name: String,
@@ -8383,6 +8391,8 @@ fn remote_scanned_session_label(
 
 fn build_remote_folder_tree(sessions: &[RemoteScannedSession]) -> RemoteFolderTree {
     let mut tree = RemoteFolderTree::default();
+    let mut nodes = HashMap::<String, RemoteFolderNodeBuilder>::new();
+    let mut root_child_paths = HashSet::<String>::new();
     for (session_idx, session) in sessions.iter().enumerate() {
         let segments = session
             .cwd
@@ -8394,7 +8404,7 @@ fn build_remote_folder_tree(sessions: &[RemoteScannedSession]) -> RemoteFolderTr
             continue;
         }
         let mut current = String::new();
-        let mut children = &mut tree.children;
+        let mut parent_path = None::<String>;
         for (ix, segment) in segments.iter().enumerate() {
             current.push('/');
             current.push_str(segment);
@@ -8403,19 +8413,32 @@ fn build_remote_folder_tree(sessions: &[RemoteScannedSession]) -> RemoteFolderTr
             } else {
                 (*segment).to_string()
             };
-            let node = children
+            let node = nodes
                 .entry(current.clone())
-                .or_insert_with(|| RemoteFolderNode {
+                .or_insert_with(|| RemoteFolderNodeBuilder {
                     name: label,
                     full_path: current.clone(),
-                    children: BTreeMap::new(),
+                    child_paths: HashSet::new(),
                     session_indices: Vec::new(),
-                    descendant_sessions: 0,
                 });
             if ix + 1 == segments.len() {
                 node.session_indices.push(session_idx);
             }
-            children = &mut node.children;
+            if let Some(parent) = parent_path.as_ref() {
+                if let Some(parent_node) = nodes.get_mut(parent) {
+                    parent_node.child_paths.insert(current.clone());
+                }
+            } else {
+                root_child_paths.insert(current.clone());
+            }
+            parent_path = Some(current.clone());
+        }
+    }
+    let mut sorted_root_child_paths = root_child_paths.into_iter().collect::<Vec<_>>();
+    sorted_root_child_paths.sort();
+    for path in sorted_root_child_paths {
+        if let Some(node) = finalize_remote_folder_node(&path, &mut nodes) {
+            tree.children.insert(path, node);
         }
     }
     compress_remote_folder_children(&mut tree.children);
@@ -8423,6 +8446,28 @@ fn build_remote_folder_tree(sessions: &[RemoteScannedSession]) -> RemoteFolderTr
         populate_remote_folder_descendant_counts(child);
     }
     tree
+}
+
+fn finalize_remote_folder_node(
+    path: &str,
+    nodes: &mut HashMap<String, RemoteFolderNodeBuilder>,
+) -> Option<RemoteFolderNode> {
+    let builder = nodes.remove(path)?;
+    let mut child_paths = builder.child_paths.into_iter().collect::<Vec<_>>();
+    child_paths.sort();
+    let mut children = BTreeMap::new();
+    for child_path in child_paths {
+        if let Some(child) = finalize_remote_folder_node(&child_path, nodes) {
+            children.insert(child_path, child);
+        }
+    }
+    Some(RemoteFolderNode {
+        name: builder.name,
+        full_path: builder.full_path,
+        children,
+        session_indices: builder.session_indices,
+        descendant_sessions: 0,
+    })
 }
 
 fn compress_remote_folder_children(children: &mut BTreeMap<String, RemoteFolderNode>) {
