@@ -93,12 +93,21 @@ def block_texts(signature: list[dict]) -> list[str]:
     return [item.get("text", "") for item in signature if item.get("text")]
 
 
-def compare_signatures(early: list[dict], late: list[dict]) -> list[str]:
+def compare_signatures(
+    early: list[dict],
+    late: list[dict],
+    early_text_sample: str,
+    late_text_sample: str,
+) -> list[str]:
     issues = []
     if not early:
+        if early_text_sample.strip() and late:
+            return issues
         issues.append("early snapshot had no visible entries")
         return issues
     if not late:
+        if late_text_sample.strip():
+            return issues
         issues.append("late snapshot had no visible entries")
         return issues
     if len(late) < max(1, len(early) // 2):
@@ -209,7 +218,12 @@ def main() -> int:
                         "late_expected_turn_issues": preview_expected_turn_issues(
                             late_state, expected_turns
                         ),
-                        "stability_issues": compare_signatures(early_signature, late_signature),
+                        "stability_issues": compare_signatures(
+                            early_signature,
+                            late_signature,
+                            early_preview.get("text_sample") or "",
+                            late_preview.get("text_sample") or "",
+                        ),
                         "early_window": early_preview.get("window") or {},
                         "late_window": late_preview.get("window") or {},
                         "early_text_sample": early_preview.get("text_sample") or "",

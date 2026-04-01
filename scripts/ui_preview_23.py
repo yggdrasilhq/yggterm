@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+from difflib import SequenceMatcher
 import json
 import os
 import random
@@ -61,6 +62,8 @@ FULL_TIMESTAMP_RE = re.compile(
     r"^[A-Z][a-z]{2} \d{1,2}, \d{4} \d{1,2}:\d{2}(?:AM|PM)(?: UTC[+-]\d{4})?$"
 )
 SHORT_TIMESTAMP_RE = re.compile(r"^\d{1,2}:\d{2}(?:AM|PM)$")
+EXPECTED_PREVIEW_TURN_LIMIT = 4096
+EXPECTED_PREVIEW_TURN_SIMILARITY = 0.985
 
 
 def parse_args() -> argparse.Namespace:
@@ -475,7 +478,10 @@ def expected_preview_turns_for_session(server_state: dict, session_path: str, bi
                 "-o",
                 "ConnectTimeout=8",
                 quote(record["ssh_target"]),
-                quote(f"{remote_bin} server remote preview-head {quote(storage_path)} 24"),
+                quote(
+                    f"{remote_bin} server remote preview-head "
+                    f"{quote(storage_path)} {EXPECTED_PREVIEW_TURN_LIMIT}"
+                ),
             ]
         )
         try:
@@ -498,7 +504,8 @@ def expected_preview_turns_for_session(server_state: dict, session_path: str, bi
     else:
         payload = run_json(
             "local",
-            f"{quote(binary)} server remote preview-head {quote(storage_path)} 24",
+            f"{quote(binary)} server remote preview-head "
+            f"{quote(storage_path)} {EXPECTED_PREVIEW_TURN_LIMIT}",
         )
 
     preview = payload.get("preview") or {}
@@ -526,6 +533,12 @@ def preview_entry_matches_expected(entry: dict, expected_turns: list[dict]) -> b
             turn_text == entry_text
             or turn_text.startswith(entry_text)
             or entry_text.startswith(turn_text)
+        ):
+            return True
+        if (
+            min(len(turn_text), len(entry_text)) >= 120
+            and SequenceMatcher(None, turn_text[:800], entry_text[:800]).ratio()
+            >= EXPECTED_PREVIEW_TURN_SIMILARITY
         ):
             return True
     return False

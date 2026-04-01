@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import random
 import time
 from pathlib import Path
@@ -41,6 +42,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--poll", type=float, default=0.12)
     parser.add_argument("--ready-budget", type=float, default=2.5)
     parser.add_argument("--step-settle-sec", type=float, default=0.18)
+    parser.add_argument("--app-rss-ceiling-mib", type=int, default=768)
+    parser.add_argument("--daemon-rss-ceiling-mib", type=int, default=512)
     parser.add_argument("--launch-local", action="store_true")
     parser.add_argument("--out-dir", default="/tmp/yggterm-preview-ui-scroll-23")
     return parser.parse_args()
@@ -156,6 +159,55 @@ def blank_step_issue(state: dict) -> str | None:
     return None
 
 
+def rss_bytes_for_pid(pid: int | None) -> int:
+    if not pid or pid <= 0:
+        return 0
+    status = Path(f"/proc/{pid}/status")
+    if not status.exists():
+        return 0
+    for line in status.read_text(encoding="utf-8").splitlines():
+        if line.startswith("VmRSS:"):
+            parts = line.split()
+            if len(parts) >= 2:
+                return int(parts[1]) * 1024
+    return 0
+
+
+def local_yggterm_daemon_pids(binary: str) -> list[int]:
+    resolved = str(Path(binary).resolve())
+    pids: list[int] = []
+    for proc_dir in Path("/proc").iterdir():
+        if not proc_dir.name.isdigit():
+            continue
+        try:
+            cmdline = (
+                (proc_dir / "cmdline")
+                .read_bytes()
+                .replace(b"\x00", b" ")
+                .decode("utf-8", "ignore")
+                .strip()
+            )
+        except Exception:
+            continue
+        if cmdline == f"{resolved} server daemon":
+            pids.append(int(proc_dir.name))
+    return sorted(pids)
+
+
+def update_rss_peaks(binary: str, launch: object, peaks: dict[str, int | None]) -> None:
+    if launch is not None:
+        peaks["app_rss_bytes"] = max(
+            int(peaks.get("app_rss_bytes") or 0),
+            rss_bytes_for_pid(getattr(launch, "pid", None)),
+        )
+    daemon_pids = local_yggterm_daemon_pids(binary)
+    if daemon_pids:
+        pid, rss = max(((pid, rss_bytes_for_pid(pid)) for pid in daemon_pids), key=lambda item: item[1])
+        if rss >= int(peaks.get("daemon_rss_bytes") or 0):
+            peaks["daemon_rss_bytes"] = rss
+            peaks["daemon_pid"] = pid
+
+
 def main() -> int:
     args = parse_args()
     out_dir = Path(args.out_dir)
@@ -163,10 +215,13 @@ def main() -> int:
     rng = random.Random(args.seed)
 
     launch = None
+    rss_peaks = {"app_rss_bytes": 0, "daemon_rss_bytes": 0, "daemon_pid": None}
     if args.host == "local" and args.launch_local:
         launch, _ = launch_local_client(args.bin)
 
     wait_for_window(args.host, args.bin, args.timeout_ms)
+    if args.host == "local":
+        update_rss_peaks(args.bin, launch, rss_peaks)
     server_state = load_server_state() if args.host == "local" else {}
     rows_payload = expand_groups_until_target(args.host, args.bin, args.timeout_ms, args.count)
     targets = collect_preview_targets(rows_payload, rng, args.count)
@@ -196,6 +251,8 @@ def main() -> int:
                     lambda: require_preview_ready(app_state(args.host, args.bin, args.timeout_ms), session_path),
                 )
                 step_states.append(state)
+                if args.host == "local":
+                    update_rss_peaks(args.bin, launch, rss_peaks)
                 first_shot = out_dir / f"preview-ui-scroll-{index:02d}-step-00.png"
                 app_screenshot_preview(args.host, args.bin, first_shot, args.timeout_ms)
 
@@ -214,6 +271,8 @@ def main() -> int:
                         lambda: require_preview_ready(app_state(args.host, args.bin, args.timeout_ms), session_path),
                     )
                     step_states.append(state)
+                    if args.host == "local":
+                        update_rss_peaks(args.bin, launch, rss_peaks)
                     entries = visible_entries(state)
                     preview = preview_payload(state)
                     window = preview.get("window") or {}
@@ -287,11 +346,20 @@ def main() -> int:
     summary = {
         "count": len(results),
         "scroll_checks_per_session": 23,
+        "max_app_rss_bytes": rss_peaks["app_rss_bytes"],
+        "max_daemon_rss_bytes": rss_peaks["daemon_rss_bytes"],
+        "max_daemon_pid": rss_peaks["daemon_pid"],
         "open_failures": sum(1 for item in results if item.get("error")),
         "blank_failures": sum(1 for item in results if item.get("blank_issues")),
         "width_failures": sum(1 for item in results if item.get("width_issues")),
         "semantic_failures": sum(1 for item in results if item.get("semantic_issues")),
         "markup_failures": sum(1 for item in results if item.get("markup_issues")),
+        "app_rss_failures": int(
+            int(rss_peaks["app_rss_bytes"] or 0) > args.app_rss_ceiling_mib * 1024 * 1024
+        ),
+        "daemon_rss_failures": int(
+            int(rss_peaks["daemon_rss_bytes"] or 0) > args.daemon_rss_ceiling_mib * 1024 * 1024
+        ),
         "results": results,
     }
     summary_path = out_dir / "summary.json"
@@ -304,6 +372,8 @@ def main() -> int:
         and summary["width_failures"] == 0
         and summary["semantic_failures"] == 0
         and summary["markup_failures"] == 0
+        and summary["app_rss_failures"] == 0
+        and summary["daemon_rss_failures"] == 0
     ) else 1
 
 
