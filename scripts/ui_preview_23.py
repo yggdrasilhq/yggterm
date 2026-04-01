@@ -220,8 +220,64 @@ def kill_local_clients(binary: str) -> None:
                     os.kill(pid, 9)
                 except Exception:
                     pass
-    run_process(["bash", "-lc", f"pkill -f {json.dumps(binary_path)} || true"], check=False)
-    run_process(["bash", "-lc", "pkill -f 'yggterm server daemon' || true"], check=False)
+    self_pid = os.getpid()
+    for proc_dir in Path("/proc").iterdir():
+        if not proc_dir.name.isdigit():
+            continue
+        pid = int(proc_dir.name)
+        if pid == self_pid:
+            continue
+        try:
+            raw = (proc_dir / "cmdline").read_bytes()
+        except Exception:
+            continue
+        if not raw:
+            continue
+        argv = [part.decode("utf-8", errors="ignore") for part in raw.split(b"\0") if part]
+        if not argv:
+            continue
+        is_local_client = argv[0] == binary_path
+        is_local_daemon = len(argv) >= 4 and argv[0] == binary_path and argv[1:4] == [
+            "server",
+            "daemon",
+            "--stdio",
+        ]
+        is_legacy_daemon = len(argv) >= 3 and "yggterm" in argv[0] and argv[1:3] == ["server", "daemon"]
+        if not (is_local_client or is_local_daemon or is_legacy_daemon):
+            continue
+        try:
+            os.kill(pid, 15)
+        except Exception:
+            pass
+    time.sleep(0.3)
+    for proc_dir in Path("/proc").iterdir():
+        if not proc_dir.name.isdigit():
+            continue
+        pid = int(proc_dir.name)
+        if pid == self_pid:
+            continue
+        try:
+            raw = (proc_dir / "cmdline").read_bytes()
+        except Exception:
+            continue
+        if not raw:
+            continue
+        argv = [part.decode("utf-8", errors="ignore") for part in raw.split(b"\0") if part]
+        if not argv:
+            continue
+        is_local_client = argv[0] == binary_path
+        is_local_daemon = len(argv) >= 4 and argv[0] == binary_path and argv[1:4] == [
+            "server",
+            "daemon",
+            "--stdio",
+        ]
+        is_legacy_daemon = len(argv) >= 3 and "yggterm" in argv[0] and argv[1:3] == ["server", "daemon"]
+        if not (is_local_client or is_local_daemon or is_legacy_daemon):
+            continue
+        try:
+            os.kill(pid, 9)
+        except Exception:
+            pass
 
 
 def launch_local_client(binary: str, timeout_s: float = 4.0) -> tuple[subprocess.Popen, dict]:
