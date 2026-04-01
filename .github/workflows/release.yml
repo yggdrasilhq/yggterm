@@ -10,6 +10,27 @@ permissions:
   contents: write
 
 jobs:
+  proof-bundles:
+    name: Collect proof bundle metadata
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate proof bundles
+        run: python3 scripts/validate_demo_manifests.py
+
+      - name: Upload proof bundle metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: yggterm-proof-bundles
+          path: artifacts/demos/unreleased/**
+
   package:
     name: Package ${{ matrix.label }}
     runs-on: ${{ matrix.runs_on }}
@@ -136,6 +157,7 @@ jobs:
     name: Publish GitHub release assets
     if: startsWith(github.ref, 'refs/tags/v') && always()
     needs:
+      - proof-bundles
       - package
       - package-linux-deb
     runs-on: ubuntu-24.04
