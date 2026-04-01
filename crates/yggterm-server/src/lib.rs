@@ -744,8 +744,19 @@ impl YggtermServer {
                 .remote_machines
                 .iter()
                 .find(|machine| machine.machine_key == machine_key)
-                .cloned()
             {
+                // Shutdown only needs remote command routing, not the mirrored session list.
+                // Cloning the full snapshot per session path can explode to O(n^2) memory.
+                let machine = RemoteMachineSnapshot {
+                    machine_key: machine.machine_key.clone(),
+                    label: machine.label.clone(),
+                    ssh_target: machine.ssh_target.clone(),
+                    prefix: machine.prefix.clone(),
+                    remote_binary_expr: machine.remote_binary_expr.clone(),
+                    remote_deploy_state: machine.remote_deploy_state,
+                    health: machine.health,
+                    sessions: Vec::new(),
+                };
                 targets.push((machine, session_id.to_string()));
             }
         }
@@ -3890,7 +3901,9 @@ pub fn fetch_remote_preview_payload(
         &["server", "remote", "preview", storage_path],
         None,
     )?;
-    serde_json::from_str(&output).context("invalid remote preview payload")
+    let payload: RemotePreviewPayload =
+        serde_json::from_str(&output).context("invalid remote preview payload")?;
+    Ok(payload)
 }
 
 pub fn fetch_remote_preview_head_payload(
@@ -3910,7 +3923,9 @@ pub fn fetch_remote_preview_head_payload(
         ],
         None,
     )?;
-    serde_json::from_str(&output).context("invalid remote preview head payload")
+    let payload: RemotePreviewPayload =
+        serde_json::from_str(&output).context("invalid remote preview head payload")?;
+    Ok(payload)
 }
 
 pub fn apply_remote_preview_payload_for_path(
@@ -9750,6 +9765,81 @@ mod tests {
             server.terminal_stop_command("remote-session://dev/abc123"),
             None
         );
+    }
+
+    #[test]
+    fn remote_shutdown_targets_do_not_clone_machine_session_lists() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.remote_machines.push(RemoteMachineSnapshot {
+            machine_key: "jojo".to_string(),
+            label: "jojo".to_string(),
+            ssh_target: "jojo".to_string(),
+            prefix: Some("sudo -u pi".to_string()),
+            remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+            remote_deploy_state: RemoteDeployState::Ready,
+            health: RemoteMachineHealth::Healthy,
+            sessions: vec![RemoteScannedSession {
+                session_path: remote_scanned_session_path("jojo", "cached-1"),
+                session_id: "cached-1".to_string(),
+                cwd: "/home/pi".to_string(),
+                started_at: "2026-04-01T00:00:00Z".to_string(),
+                modified_epoch: 1,
+                event_count: 10,
+                user_message_count: 5,
+                assistant_message_count: 5,
+                title_hint: "Cached".to_string(),
+                recent_context: "USER: cached".to_string(),
+                cached_precis: Some("precis".to_string()),
+                cached_summary: Some("summary".to_string()),
+                storage_path: "/home/pi/.codex/sessions/cached-1.jsonl".to_string(),
+            }],
+        });
+        server.restore_live_session(PersistedLiveSession {
+            key: "remote-session://jojo/live-1".to_string(),
+            id: "live-1".to_string(),
+            title: "Live 1".to_string(),
+            kind: SessionKind::SshShell,
+            ssh_target: "jojo".to_string(),
+            prefix: Some("sudo -u pi".to_string()),
+            cwd: Some("/home/pi".to_string()),
+        });
+        server.restore_live_session(PersistedLiveSession {
+            key: "remote-session://jojo/live-2".to_string(),
+            id: "live-2".to_string(),
+            title: "Live 2".to_string(),
+            kind: SessionKind::SshShell,
+            ssh_target: "jojo".to_string(),
+            prefix: Some("sudo -u pi".to_string()),
+            cwd: Some("/srv/app".to_string()),
+        });
+
+        let targets = server.remote_shutdown_targets();
+
+        assert_eq!(targets.len(), 2);
+        assert_eq!(server.remote_machines[0].sessions.len(), 1);
+        for (machine, session_id) in targets {
+            assert!(machine.sessions.is_empty());
+            assert_eq!(machine.machine_key, "jojo");
+            assert_eq!(machine.ssh_target, "jojo");
+            assert_eq!(machine.prefix.as_deref(), Some("sudo -u pi"));
+            assert!(session_id == "live-1" || session_id == "live-2");
+        }
     }
 
     #[test]
