@@ -12292,12 +12292,12 @@ fn app() -> Element {
     let mut background_refresh_defer_started = use_signal(|| false);
     let mut update_check_started = use_signal(|| false);
     let mut dock_pulse_started = use_signal(|| false);
-    let mut app_control_loop_started = use_signal(|| false);
-    let mut app_control_watchdog_started = use_signal(|| false);
-    let mut app_control_drain_in_flight = use_signal(|| false);
-    let mut app_control_drain_started_ms = use_signal(|| 0_u64);
-    let window_spawn_probe_started = use_signal(current_millis);
-    let window_spawn_traced = use_signal(|| false);
+    let app_control_loop_started = use_hook(|| Arc::new(AtomicBool::new(false))).clone();
+    let app_control_watchdog_started = use_hook(|| Arc::new(AtomicBool::new(false))).clone();
+    let app_control_drain_in_flight = use_hook(|| Arc::new(AtomicBool::new(false))).clone();
+    let app_control_drain_started_ms = use_hook(|| Arc::new(AtomicU64::new(0))).clone();
+    let window_spawn_probe_started = use_hook(current_millis);
+    let window_spawn_traced = use_hook(|| Arc::new(AtomicBool::new(false))).clone();
     let mut window_epoch = use_signal(|| 0_u64);
     let terminal_mount_epoch = use_signal(|| 0_u64);
     let async_render_epoch = use_signal(|| 0_u64);
@@ -12345,14 +12345,15 @@ fn app() -> Element {
     {
         let desktop = desktop.clone();
         let trace_home = trace_home.clone();
+        let window_spawn_traced = window_spawn_traced.clone();
         use_effect(move || {
-            if *window_spawn_traced.read() {
+            if window_spawn_traced.load(Ordering::SeqCst) {
                 return;
             }
             let desktop = desktop.clone();
             let trace_home = trace_home.clone();
-            let started_at_ms = *window_spawn_probe_started.read();
-            let mut window_spawn_traced = window_spawn_traced;
+            let started_at_ms = window_spawn_probe_started;
+            let window_spawn_traced = window_spawn_traced.clone();
             spawn(async move {
                 for _ in 0..40 {
                     let window = describe_window(&desktop);
@@ -12382,7 +12383,7 @@ fn app() -> Element {
                                 "window": window,
                             }),
                         );
-                        window_spawn_traced.set(true);
+                        window_spawn_traced.store(true, Ordering::SeqCst);
                         return;
                     }
                     sleep(Duration::from_millis(50)).await;
@@ -12395,10 +12396,10 @@ fn app() -> Element {
         let wake_app_control = desktop.poll_waker();
         let schedule_ui_update = schedule_ui_update.clone();
         use_effect(move || {
-            if *app_control_loop_started.read() {
+            if app_control_loop_started.load(Ordering::SeqCst) {
                 return;
             }
-            app_control_loop_started.set(true);
+            app_control_loop_started.store(true, Ordering::SeqCst);
             let settings_path = settings_path.clone();
             let trace_home = perf_home_dir(&settings_path);
             let wake_app_control = wake_app_control.clone();
@@ -12428,18 +12429,22 @@ fn app() -> Element {
         let desktop = desktop.clone();
         let state = state;
         let schedule_ui_update = schedule_ui_update.clone();
+        let app_control_watchdog_started = app_control_watchdog_started.clone();
+        let app_control_drain_in_flight = app_control_drain_in_flight.clone();
+        let app_control_drain_started_ms = app_control_drain_started_ms.clone();
+        let window_spawn_traced = window_spawn_traced.clone();
         use_effect(move || {
-            if *app_control_watchdog_started.read() {
+            if app_control_watchdog_started.load(Ordering::SeqCst) {
                 return;
             }
-            app_control_watchdog_started.set(true);
+            app_control_watchdog_started.store(true, Ordering::SeqCst);
             let settings_path = settings_path.clone();
             let desktop = desktop.clone();
             let state = state;
             let schedule_ui_update = schedule_ui_update.clone();
-            let mut app_control_drain_in_flight = app_control_drain_in_flight;
-            let mut app_control_drain_started_ms = app_control_drain_started_ms;
-            let window_spawn_traced = window_spawn_traced;
+            let app_control_drain_in_flight = app_control_drain_in_flight.clone();
+            let app_control_drain_started_ms = app_control_drain_started_ms.clone();
+            let window_spawn_traced = window_spawn_traced.clone();
             spawn_forever(async move {
                 let trace_home = perf_home_dir(&settings_path);
                 append_trace_event(
@@ -12453,14 +12458,14 @@ fn app() -> Element {
                 );
                 loop {
                     let pending_requests = app_control_requests_pending(&trace_home);
-                    if *app_control_drain_in_flight.read() && pending_requests {
-                        let started_ms = *app_control_drain_started_ms.read();
+                    if app_control_drain_in_flight.load(Ordering::SeqCst) && pending_requests {
+                        let started_ms = app_control_drain_started_ms.load(Ordering::SeqCst);
                         if started_ms > 0
                             && current_millis().saturating_sub(started_ms)
                                 > APP_CONTROL_DRAIN_STUCK_MS
                         {
-                            app_control_drain_in_flight.set(false);
-                            app_control_drain_started_ms.set(0);
+                            app_control_drain_in_flight.store(false, Ordering::SeqCst);
+                            app_control_drain_started_ms.store(0, Ordering::SeqCst);
                             append_trace_event(
                                 &trace_home,
                                 "ui",
@@ -12474,13 +12479,13 @@ fn app() -> Element {
                             );
                         }
                     }
-                    if !*window_spawn_traced.read() {
+                    if !window_spawn_traced.load(Ordering::SeqCst) {
                         sleep(Duration::from_millis(SCREENSHOT_REQUEST_POLL_MS)).await;
                         continue;
                     }
-                    if !*app_control_drain_in_flight.read() && pending_requests {
-                        app_control_drain_in_flight.set(true);
-                        app_control_drain_started_ms.set(current_millis());
+                    if !app_control_drain_in_flight.load(Ordering::SeqCst) && pending_requests {
+                        app_control_drain_in_flight.store(true, Ordering::SeqCst);
+                        app_control_drain_started_ms.store(current_millis(), Ordering::SeqCst);
                         append_trace_event(
                             &trace_home,
                             "ui",
@@ -12516,8 +12521,8 @@ fn app() -> Element {
                                 }
                             }
                         }
-                        app_control_drain_in_flight.set(false);
-                        app_control_drain_started_ms.set(0);
+                        app_control_drain_in_flight.store(false, Ordering::SeqCst);
+                        app_control_drain_started_ms.store(0, Ordering::SeqCst);
                         append_trace_event(
                             &trace_home,
                             "ui",
@@ -12541,22 +12546,27 @@ fn app() -> Element {
         let desktop = desktop.clone();
         let state = state;
         let schedule_ui_update = schedule_ui_update.clone();
-        let window_spawn_traced = window_spawn_traced;
+        let window_spawn_traced = window_spawn_traced.clone();
+        let app_control_drain_in_flight = app_control_drain_in_flight.clone();
+        let app_control_drain_started_ms = app_control_drain_started_ms.clone();
         use_effect(move || {
             let trace_home = perf_home_dir(&settings_path);
-            if !*window_spawn_traced.read() {
+            if !window_spawn_traced.load(Ordering::SeqCst) {
                 return;
             }
-            if *app_control_drain_in_flight.read() || !app_control_requests_pending(&trace_home) {
+            if app_control_drain_in_flight.load(Ordering::SeqCst)
+                || !app_control_requests_pending(&trace_home)
+            {
                 return;
             }
-            app_control_drain_in_flight.set(true);
-            app_control_drain_started_ms.set(current_millis());
+            app_control_drain_in_flight.store(true, Ordering::SeqCst);
+            app_control_drain_started_ms.store(current_millis(), Ordering::SeqCst);
             let settings_path = settings_path.clone();
             let desktop = desktop.clone();
             let state = state;
             let schedule_ui_update = schedule_ui_update.clone();
-            let mut app_control_drain_started_ms = app_control_drain_started_ms;
+            let app_control_drain_in_flight = app_control_drain_in_flight.clone();
+            let app_control_drain_started_ms = app_control_drain_started_ms.clone();
             spawn(async move {
                 let trace_home = perf_home_dir(&settings_path);
                 loop {
@@ -12585,8 +12595,8 @@ fn app() -> Element {
                         }
                     }
                 }
-                app_control_drain_in_flight.set(false);
-                app_control_drain_started_ms.set(0);
+                app_control_drain_in_flight.store(false, Ordering::SeqCst);
+                app_control_drain_started_ms.store(0, Ordering::SeqCst);
                 if app_control_requests_pending(&trace_home) {
                     schedule_ui_update();
                 }
@@ -12595,19 +12605,25 @@ fn app() -> Element {
     }
     let settings_path_for_app_control_handler = bootstrap.settings_path.clone();
     let desktop_for_app_control_handler = desktop.clone();
+    let window_spawn_traced_for_app_control = window_spawn_traced.clone();
+    let app_control_drain_in_flight_for_handler = app_control_drain_in_flight.clone();
+    let app_control_drain_started_ms_for_handler = app_control_drain_started_ms.clone();
     use_wry_event_handler(move |event, _| {
         if matches!(event, TaoEvent::UserEvent(DesktopUserWindowEvent::Poll(_))) {
             let trace_home = perf_home_dir(&settings_path_for_app_control_handler);
-            if !*window_spawn_traced.read() {
+            if !window_spawn_traced_for_app_control.load(Ordering::SeqCst) {
                 return;
             }
-            if !*app_control_drain_in_flight.read() && app_control_requests_pending(&trace_home) {
-                app_control_drain_in_flight.set(true);
-                app_control_drain_started_ms.set(current_millis());
+            if !app_control_drain_in_flight_for_handler.load(Ordering::SeqCst)
+                && app_control_requests_pending(&trace_home)
+            {
+                app_control_drain_in_flight_for_handler.store(true, Ordering::SeqCst);
+                app_control_drain_started_ms_for_handler.store(current_millis(), Ordering::SeqCst);
                 let settings_path = settings_path_for_app_control_handler.clone();
                 let desktop = desktop_for_app_control_handler.clone();
                 let state = state;
-                let mut app_control_drain_started_ms = app_control_drain_started_ms;
+                let app_control_drain_in_flight = app_control_drain_in_flight_for_handler.clone();
+                let app_control_drain_started_ms = app_control_drain_started_ms_for_handler.clone();
                 spawn(async move {
                     let trace_home = perf_home_dir(&settings_path);
                     loop {
@@ -12636,8 +12652,8 @@ fn app() -> Element {
                             }
                         }
                     }
-                    app_control_drain_in_flight.set(false);
-                    app_control_drain_started_ms.set(0);
+                    app_control_drain_in_flight.store(false, Ordering::SeqCst);
+                    app_control_drain_started_ms.store(0, Ordering::SeqCst);
                 });
             }
         }
@@ -12724,11 +12740,12 @@ fn app() -> Element {
             );
         }
     });
+    let window_spawn_traced_for_background_refresh = window_spawn_traced.clone();
     use_effect(move || {
         if *background_refresh_defer_started.read() {
             return;
         }
-        if !*window_spawn_traced.read() {
+        if !window_spawn_traced_for_background_refresh.load(Ordering::SeqCst) {
             return;
         }
         background_refresh_defer_started.set(true);
@@ -12783,8 +12800,9 @@ fn app() -> Element {
             }
         }
     });
+    let window_spawn_traced_for_summary_hydration = window_spawn_traced.clone();
     use_effect(move || {
-        if !*window_spawn_traced.read() {
+        if !window_spawn_traced_for_summary_hydration.load(Ordering::SeqCst) {
             return;
         }
         let active = state.read().server.active_session().cloned();
@@ -12820,8 +12838,9 @@ fn app() -> Element {
         state.with_mut(|shell| shell.next_background_copy_scan_after_ms = current_millis());
         maybe_spawn_background_copy_generation(state);
     });
+    let window_spawn_traced_for_preview_refresh = window_spawn_traced.clone();
     use_effect(move || {
-        if !*window_spawn_traced.read() {
+        if !window_spawn_traced_for_preview_refresh.load(Ordering::SeqCst) {
             return;
         }
         let (active, view_mode, server_busy, dirty_epoch) = {
