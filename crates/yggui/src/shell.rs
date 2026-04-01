@@ -77,18 +77,17 @@ use yggterm_server::{
     PreviewTone, RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot,
     RemoteScannedSession, ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind,
     SessionMetadataEntry, SessionPreviewBlock, SessionRenderedSection, SshConnectTarget,
-    TerminalBackend, WorkspaceViewMode, YGG_LOADING_NOTIFICATION_AFTER_MS,
-    YggOperationPriority, YggRequestMeta, YggSurface, YggTarget, YggtermServer,
-    app_control_requests_pending,
+    TerminalBackend, WorkspaceViewMode, YGG_LOADING_NOTIFICATION_AFTER_MS, YggOperationPriority,
+    YggRequestMeta, YggSurface, YggTarget, YggtermServer, app_control_requests_pending,
     cleanup_legacy_daemons, complete_app_control_request, connect_ssh_custom,
     fetch_remote_generation_context, focus_live_with_view, open_remote_session_with_view,
     open_stored_session, open_stored_session_with_view, persist_remote_generated_copy, ping,
     refresh_managed_cli, refresh_preview, refresh_remote_machine, remove_session,
     remove_ssh_target, request_terminal_launch, set_all_preview_blocks_folded,
     set_view_mode as daemon_set_view_mode, shutdown as daemon_shutdown,
-    snapshot as daemon_snapshot, snapshot_session_view_for_ui, stage_remote_clipboard_png, start_command_session,
-    start_local_session_at, start_ssh_session_at, status, take_next_app_control_request,
-    terminal_ensure, terminal_read, terminal_resize, terminal_write,
+    snapshot as daemon_snapshot, snapshot_session_view_for_ui, stage_remote_clipboard_png,
+    start_command_session, start_local_session_at, start_ssh_session_at, status,
+    take_next_app_control_request, terminal_ensure, terminal_read, terminal_resize, terminal_write,
     toggle_preview_block as daemon_toggle_preview_block,
 };
 
@@ -136,6 +135,7 @@ const BACKGROUND_COPY_IDLE_MS: u64 = 120_000;
 const BACKGROUND_REFRESH_NOTICE_MS: u64 = 12_000;
 const BACKGROUND_REFRESH_STARTUP_DEFER_MS: u64 = 20_000;
 const BACKGROUND_REFRESH_INTERACTIVE_DEFER_MS: u64 = 15_000;
+const BACKGROUND_REFRESH_POLL_MS: u64 = 1_000;
 const THEME_EDITOR_PAD_SIZE: f64 = 286.0;
 const SEARCH_INPUT_ID: &str = "yggterm-search-input";
 const PREVIEW_HEADER_SEARCH_HIT_ID: &str = "__preview_header__";
@@ -921,13 +921,16 @@ impl ShellState {
             self.selection_anchor.as_deref(),
             selected_path.as_deref(),
         );
-        let preview_request_in_flight = self
-            .active_surface_requests
-            .iter()
-            .any(|(surface, request)| {
-                matches!(surface, YggSurface::Preview | YggSurface::PreviewSync)
-                    && active_surface_request_matches_session(request, active_session_path.as_deref())
-            });
+        let preview_request_in_flight =
+            self.active_surface_requests
+                .iter()
+                .any(|(surface, request)| {
+                    matches!(surface, YggSurface::Preview | YggSurface::PreviewSync)
+                        && active_surface_request_matches_session(
+                            request,
+                            active_session_path.as_deref(),
+                        )
+                });
         let preview_failure = active_session_path
             .as_deref()
             .and_then(|path| self.remote_preview_failures.get(path))
@@ -1840,7 +1843,10 @@ impl ShellState {
         else {
             return snapshot;
         };
-        if matches!(request_surface, YggSurface::PreviewSync | YggSurface::Notifications) {
+        if matches!(
+            request_surface,
+            YggSurface::PreviewSync | YggSurface::Notifications
+        ) {
             let preferred_background_path = self
                 .active_surface_requests
                 .values()
@@ -1851,10 +1857,7 @@ impl ShellState {
                     )
                 })
                 .and_then(|candidate| {
-                    active_request_session_target_path(
-                        candidate,
-                        self.server.active_session_path(),
-                    )
+                    active_request_session_target_path(candidate, self.server.active_session_path())
                 })
                 .or_else(|| self.selected_tree_paths.iter().next().cloned())
                 .or_else(|| self.server.active_session_path().map(str::to_string));
@@ -5013,11 +5016,7 @@ fn spawn_open_session_row_with_mode(
                     && schedule_remote_preview_sync(shell, &session_path, 0)
             });
             if should_sync {
-                spawn_remote_preview_payload_sync(
-                    state,
-                    session_path,
-                    "preview_open_initial_sync",
-                );
+                spawn_remote_preview_payload_sync(state, session_path, "preview_open_initial_sync");
             }
         }
         maybe_spawn_missing_remote_machine_refreshes(state);
@@ -5774,10 +5773,9 @@ fn spawn_remote_preview_payload_sync(
                             retry_state,
                             "remote_preview_sync_retry_tick",
                             |shell| {
-                                shell.remote_preview_dirty_epoch.insert(
-                                    retry_session_path.clone(),
-                                    current_millis(),
-                                );
+                                shell
+                                    .remote_preview_dirty_epoch
+                                    .insert(retry_session_path.clone(), current_millis());
                             },
                         );
                     });
@@ -6520,11 +6518,13 @@ fn preview_should_hide_stale_placeholder_content(session: &ManagedSessionView) -
         return false;
     }
     let has_only_placeholder_blocks = !session.preview.blocks.is_empty()
-        && session.preview.blocks.iter().all(|block| {
-            matches!(block.timestamp.as_str(), "remote:scan" | "server:launch")
-        });
-    let has_only_placeholder_sections = session.preview.blocks.is_empty()
-        && !session.rendered_sections.is_empty();
+        && session
+            .preview
+            .blocks
+            .iter()
+            .all(|block| matches!(block.timestamp.as_str(), "remote:scan" | "server:launch"));
+    let has_only_placeholder_sections =
+        session.preview.blocks.is_empty() && !session.rendered_sections.is_empty();
     has_only_placeholder_blocks || has_only_placeholder_sections
 }
 
@@ -8028,6 +8028,14 @@ fn machine_health_attr_value(health: MachineHealth) -> &'static str {
         MachineHealth::Healthy => "healthy",
         MachineHealth::Cached => "cached",
         MachineHealth::Offline => "offline",
+    }
+}
+
+fn machine_indicator_color_value(health: MachineHealth) -> &'static str {
+    match health {
+        MachineHealth::Healthy => "#16a34a",
+        MachineHealth::Cached => "#f59e0b",
+        MachineHealth::Offline => "#ef4444",
     }
 }
 
@@ -10169,12 +10177,22 @@ fn describe_app_state_snapshot(
                 shell.selection_anchor.as_deref(),
                 selected_path.as_deref(),
             ).map(|row| {
+                let machine = remote_machine_for_sidebar_row(&shell, &row);
                 json!({
                     "full_path": row.full_path,
                     "label": row.label,
                     "detail_label": row.detail_label,
                     "session_title": row.session_title,
                     "kind": format!("{:?}", row.kind),
+                    "machine_key": machine.as_ref().map(|machine| machine.machine_key.clone()),
+                    "machine_health": machine.as_ref().map(|machine| format!("{:?}", machine.health).to_ascii_lowercase()),
+                    "machine_indicator_color": machine.as_ref().map(|machine| {
+                        machine_indicator_color_value(match machine.health {
+                            RemoteMachineHealth::Healthy => MachineHealth::Healthy,
+                            RemoteMachineHealth::Cached => MachineHealth::Cached,
+                            RemoteMachineHealth::Offline => MachineHealth::Offline,
+                        })
+                    }),
                 })
             }),
             "expanded_paths": shell.browser.expanded_paths(),
@@ -10243,6 +10261,22 @@ fn describe_app_state_snapshot(
             "preview_dirty_epoch": shell.remote_preview_dirty_epoch.len(),
             "managed_cli_refresh_requests": shell.managed_cli_refresh_requests.len(),
             "managed_cli_refresh_completed": shell.managed_cli_refresh_completed.len(),
+            "machines": shell.server.remote_machines().iter().map(|machine| {
+                let health = match machine.health {
+                    RemoteMachineHealth::Healthy => MachineHealth::Healthy,
+                    RemoteMachineHealth::Cached => MachineHealth::Cached,
+                    RemoteMachineHealth::Offline => MachineHealth::Offline,
+                };
+                json!({
+                    "machine_key": machine.machine_key,
+                    "label": machine.label,
+                    "ssh_target": machine.ssh_target,
+                    "health": format!("{:?}", machine.health).to_ascii_lowercase(),
+                    "machine_indicator_color": machine_indicator_color_value(health),
+                    "remote_deploy_state": format!("{:?}", machine.remote_deploy_state),
+                    "session_count": machine.sessions.len(),
+                })
+            }).collect::<Vec<_>>(),
         },
         "active_surface_requests": active_requests,
     })
@@ -10254,6 +10288,7 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
     json!({
         "row_count": snapshot.rows.len(),
         "rows": snapshot.rows.iter().map(|row| {
+            let machine = remote_machine_for_sidebar_row(&shell, row);
             json!({
                 "full_path": row.full_path,
                 "label": row.label,
@@ -10268,6 +10303,16 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
                 "session_cwd": row.session_cwd,
                 "draggable": is_workspace_row(row),
                 "drop_target_row": is_drop_target_row(row),
+                "machine_key": machine.as_ref().map(|machine| machine.machine_key.clone()),
+                "machine_health": machine.as_ref().map(|machine| format!("{:?}", machine.health).to_ascii_lowercase()),
+                "machine_indicator_color": machine.as_ref().map(|machine| {
+                    machine_indicator_color_value(match machine.health {
+                        RemoteMachineHealth::Healthy => MachineHealth::Healthy,
+                        RemoteMachineHealth::Cached => MachineHealth::Cached,
+                        RemoteMachineHealth::Offline => MachineHealth::Offline,
+                    })
+                }),
+                "remote_deploy_state": machine.as_ref().map(|machine| format!("{:?}", machine.remote_deploy_state)),
             })
         }).collect::<Vec<_>>(),
     })
@@ -10432,9 +10477,11 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
                         active_session_path.as_deref(),
                     ) {
                         (Some("active_session"), _, Some(_)) => true,
-                        (Some("session" | "terminal" | "preview"), Some(session_path), Some(active_path)) => {
-                            session_path == active_path
-                        }
+                        (
+                            Some("session" | "terminal" | "preview"),
+                            Some(session_path),
+                            Some(active_path),
+                        ) => session_path == active_path,
                         _ => false,
                     }
             })
@@ -11830,24 +11877,23 @@ fn preserve_client_focus_for_background_snapshot(
     snapshot: &mut ServerUiSnapshot,
 ) {
     let fallback_active_path = shell.server.active_session_path();
-    let (preserved_view_mode, preserved_active_path) = if let Some(request) =
-        shell.active_surface_requests.get(&YggSurface::Terminal)
-    {
-        (
-            WorkspaceViewMode::Terminal,
-            active_request_session_target_path(request, fallback_active_path),
-        )
-    } else if let Some(request) = shell.active_surface_requests.get(&YggSurface::Preview) {
-        (
-            WorkspaceViewMode::Rendered,
-            active_request_session_target_path(request, fallback_active_path),
-        )
-    } else {
-        (
-            shell.server.active_view_mode(),
-            fallback_active_path.map(ToOwned::to_owned),
-        )
-    };
+    let (preserved_view_mode, preserved_active_path) =
+        if let Some(request) = shell.active_surface_requests.get(&YggSurface::Terminal) {
+            (
+                WorkspaceViewMode::Terminal,
+                active_request_session_target_path(request, fallback_active_path),
+            )
+        } else if let Some(request) = shell.active_surface_requests.get(&YggSurface::Preview) {
+            (
+                WorkspaceViewMode::Rendered,
+                active_request_session_target_path(request, fallback_active_path),
+            )
+        } else {
+            (
+                shell.server.active_view_mode(),
+                fallback_active_path.map(ToOwned::to_owned),
+            )
+        };
     let preserved_preview_session = (preserved_view_mode == WorkspaceViewMode::Rendered)
         .then(|| {
             preserved_active_path.as_deref().and_then(|path| {
@@ -12751,24 +12797,22 @@ fn app() -> Element {
         background_refresh_defer_started.set(true);
         spawn(async move {
             loop {
-                let defer_ms = safe_shell_read(
-                    state,
-                    "background_refresh_scheduler_read",
-                    |shell| shell.background_refresh_after_ms.saturating_sub(current_millis()),
-                )
-                .unwrap_or_default();
+                let defer_ms =
+                    safe_shell_read(state, "background_refresh_scheduler_read", |shell| {
+                        shell
+                            .background_refresh_after_ms
+                            .saturating_sub(current_millis())
+                    })
+                    .unwrap_or_default();
                 if defer_ms > 0 {
                     sleep(Duration::from_millis(defer_ms)).await;
                     continue;
                 }
-                if safe_shell_read(
-                    state,
-                    "background_refresh_scheduler_gate",
-                    |shell| {
-                        terminal_attach_blocks_background_work(shell)
-                            || background_refreshes_deferred(shell)
-                    },
-                )
+                if safe_shell_read(state, "background_refresh_scheduler_gate", |shell| {
+                    terminal_attach_blocks_background_work(shell)
+                        || background_refreshes_deferred(shell)
+                        || interactive_surface_request_in_flight(shell)
+                })
                 .unwrap_or(false)
                 {
                     sleep(Duration::from_millis(250)).await;
@@ -12776,7 +12820,7 @@ fn app() -> Element {
                 }
                 maybe_spawn_missing_remote_machine_refreshes(state);
                 maybe_spawn_missing_managed_cli_refreshes(state);
-                break;
+                sleep(Duration::from_millis(BACKGROUND_REFRESH_POLL_MS)).await;
             }
         });
     });
@@ -14931,11 +14975,7 @@ fn SidebarRow(
                             "data-machine-indicator": "1",
                             style: format!(
                                 "display:inline-flex; width:6px; min-width:6px; height:6px; border-radius:999px; background:{}; box-shadow:0 0 0 1.5px rgba(255,255,255,0.74); opacity:0.96;",
-                                match health {
-                                    MachineHealth::Healthy => "#16a34a",
-                                    MachineHealth::Cached => "#f59e0b",
-                                    MachineHealth::Offline => "#ef4444",
-                                }
+                                machine_indicator_color_value(health)
                             ),
                         }
                     }
@@ -16762,7 +16802,9 @@ fn preview_inline_segments(text: &str) -> Vec<PreviewInlineSegment> {
             }
         }
 
-        segments.push(PreviewInlineSegment::Text(text[start..start + 1].to_string()));
+        segments.push(PreviewInlineSegment::Text(
+            text[start..start + 1].to_string(),
+        ));
         index = start + 1;
     }
 
@@ -20673,11 +20715,7 @@ fn shell_style(
     maximized: bool,
 ) -> String {
     let backdrop = shell_backdrop_style(maximized);
-    let frame_inset = if maximized {
-        0.0
-    } else {
-        SHELL_FRAME_INSET_PX
-    };
+    let frame_inset = if maximized { 0.0 } else { SHELL_FRAME_INSET_PX };
     let frame_outline = if maximized {
         "none".to_string()
     } else {
