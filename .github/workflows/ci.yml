@@ -7,6 +7,20 @@ on:
   pull_request:
 
 jobs:
+  validate-demo-manifests:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate demo manifests
+        run: python3 scripts/validate_demo_manifests.py
+
   build-linux:
     runs-on: ${{ matrix.runs_on }}
     strategy:
