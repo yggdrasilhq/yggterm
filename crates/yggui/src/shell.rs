@@ -222,6 +222,7 @@ struct ShellState {
     terminal_image_paste_ms: HashMap<String, u64>,
     terminal_attach_in_flight: HashSet<String>,
     remote_preview_sync_after_ms: HashMap<String, u64>,
+    remote_preview_failures: HashMap<String, PreviewSyncFailure>,
     remote_preview_dirty_epoch: HashMap<String, u64>,
     remote_machine_refresh_requests: HashSet<String>,
     remote_machine_refresh_retry_after_ms: HashMap<String, u64>,
@@ -320,6 +321,12 @@ struct PendingDeleteDialog {
     hard_delete: bool,
 }
 
+#[derive(Clone, Debug)]
+struct PreviewSyncFailure {
+    message: String,
+    retry_count: u32,
+}
+
 #[derive(Clone, PartialEq)]
 struct RenderSnapshot {
     palette: Palette,
@@ -334,6 +341,7 @@ struct RenderSnapshot {
     search_content_hit_index: Option<usize>,
     sidebar_loading: bool,
     preview_loading: bool,
+    preview_failure: Option<String>,
     terminal_loading: bool,
     metadata_loading: bool,
     sidebar_open: bool,
@@ -748,6 +756,7 @@ impl ShellState {
             terminal_image_paste_ms: HashMap::new(),
             terminal_attach_in_flight: HashSet::new(),
             remote_preview_sync_after_ms: HashMap::new(),
+            remote_preview_failures: HashMap::new(),
             remote_preview_dirty_epoch: HashMap::new(),
             remote_machine_refresh_requests: HashSet::new(),
             remote_machine_refresh_retry_after_ms: HashMap::new(),
@@ -911,16 +920,22 @@ impl ShellState {
             self.selection_anchor.as_deref(),
             selected_path.as_deref(),
         );
-        let preview_loading = self
+        let preview_request_in_flight = self
             .active_surface_requests
             .iter()
             .any(|(surface, request)| {
                 matches!(surface, YggSurface::Preview | YggSurface::PreviewSync)
                     && active_surface_request_matches_session(request, active_session_path.as_deref())
-            })
-            || active_session
-                .as_ref()
-                .is_some_and(preview_should_hide_stale_placeholder_content);
+            });
+        let preview_failure = active_session_path
+            .as_deref()
+            .and_then(|path| self.remote_preview_failures.get(path))
+            .map(|failure| failure.message.clone());
+        let preview_loading = preview_request_in_flight
+            || (preview_failure.is_none()
+                && active_session
+                    .as_ref()
+                    .is_some_and(preview_should_hide_stale_placeholder_content));
         let terminal_loading = self
             .active_surface_requests
             .get(&YggSurface::Terminal)
@@ -943,6 +958,7 @@ impl ShellState {
                 .active_surface_requests
                 .contains_key(&YggSurface::Sidebar),
             preview_loading,
+            preview_failure,
             terminal_loading,
             metadata_loading: self
                 .active_surface_requests
@@ -5657,8 +5673,29 @@ fn schedule_remote_preview_sync(
     true
 }
 
+fn remote_preview_retry_backoff_ms(retry_count: u32) -> u64 {
+    match retry_count {
+        0 | 1 => 3_000,
+        2 => 10_000,
+        3 => 30_000,
+        _ => 60_000,
+    }
+}
+
+fn summarize_preview_refresh_error(error: &str) -> String {
+    let trimmed = error.trim();
+    if trimmed.contains("Connection refused") || trimmed.contains("No such file or directory") {
+        "The local yggterm daemon is unavailable, so this preview cannot refresh right now."
+            .to_string()
+    } else if let Some(first_line) = trimmed.lines().find(|line| !line.trim().is_empty()) {
+        first_line.trim().to_string()
+    } else {
+        "The preview could not be refreshed right now.".to_string()
+    }
+}
+
 fn spawn_remote_preview_payload_sync(
-    mut state: Signal<ShellState>,
+    state: Signal<ShellState>,
     session_path: String,
     reason: &'static str,
 ) {
@@ -5671,6 +5708,7 @@ fn spawn_remote_preview_payload_sync(
         },
     );
     let _ = safe_shell_mut(state, "remote_preview_sync_begin", |shell| {
+        shell.remote_preview_failures.remove(&session_path);
         shell.begin_surface_request(
             request_meta.clone(),
             "refreshing preview".to_string(),
@@ -5698,23 +5736,50 @@ fn spawn_remote_preview_payload_sync(
         let retry_session_path = session_path.clone();
         let _ = safe_shell_mut(state, "remote_preview_sync_finish", |shell| match outcome {
             Ok(result) => {
+                shell.remote_preview_failures.remove(&session_path);
                 shell.record_preview_issue_telemetry(reason);
                 shell.apply_daemon_snapshot_result_for(&request_id, Ok(result));
             }
             Err(error) => {
                 shell.finish_busy_request_for(&request_id);
                 warn!(path=%session_path, error=%error, "failed to refresh remote preview");
-                let mut retry_state = state;
-                let retry_session_path = retry_session_path.clone();
-                spawn(async move {
-                    sleep(Duration::from_millis(3_000)).await;
-                    let _ = safe_shell_mut(retry_state, "remote_preview_sync_retry_tick", |shell| {
-                        shell.remote_preview_dirty_epoch.insert(
-                            retry_session_path.clone(),
-                            current_millis(),
+                let now = current_millis();
+                let retry_count = shell
+                    .remote_preview_failures
+                    .get(&session_path)
+                    .map(|failure| failure.retry_count.saturating_add(1))
+                    .unwrap_or(1);
+                let backoff_ms = remote_preview_retry_backoff_ms(retry_count);
+                let retry_after_ms = now.saturating_add(backoff_ms);
+                let message = summarize_preview_refresh_error(&error.to_string());
+                shell.remote_preview_failures.insert(
+                    session_path.clone(),
+                    PreviewSyncFailure {
+                        message: message.clone(),
+                        retry_count,
+                    },
+                );
+                shell
+                    .remote_preview_sync_after_ms
+                    .insert(session_path.clone(), retry_after_ms);
+                shell.last_action = format!("preview refresh failed: {message}");
+                if retry_count <= 4 {
+                    let retry_state = state;
+                    let retry_session_path = retry_session_path.clone();
+                    spawn(async move {
+                        sleep(Duration::from_millis(backoff_ms)).await;
+                        let _ = safe_shell_mut(
+                            retry_state,
+                            "remote_preview_sync_retry_tick",
+                            |shell| {
+                                shell.remote_preview_dirty_epoch.insert(
+                                    retry_session_path.clone(),
+                                    current_millis(),
+                                );
+                            },
                         );
                     });
-                });
+                }
             }
         });
     });
@@ -15183,6 +15248,7 @@ fn MainSurface(
                 } else {
                     let visible_blocks = visible_preview_blocks(&session);
                     let rendered_sections = preview_rendered_sections(&session);
+                    let preview_failure = snapshot.preview_failure.clone();
                     let preview_window = preview_virtual_window(
                         &visible_blocks,
                         *preview_scroll_top.read(),
@@ -15195,7 +15261,11 @@ fn MainSurface(
                         .to_vec();
                     let grouped_runs =
                         group_preview_runs(&rendered_blocks, preview_window.start_index);
-                    let show_loading_placeholder = snapshot.preview_loading
+                    let show_failure_placeholder = preview_failure.is_some()
+                        && grouped_runs.is_empty()
+                        && rendered_sections.is_empty();
+                    let show_loading_placeholder = !show_failure_placeholder
+                        && snapshot.preview_loading
                         && grouped_runs.is_empty()
                         && rendered_sections.is_empty();
                     rsx! {
@@ -15252,6 +15322,13 @@ fn MainSurface(
                                             PreviewLoadingPlaceholder {
                                                 session: session.clone(),
                                                 palette: snapshot.palette,
+                                            }
+                                        }
+                                        if let Some(message) = preview_failure.clone().filter(|_| show_failure_placeholder) {
+                                            PreviewFailurePlaceholder {
+                                                session: session.clone(),
+                                                palette: snapshot.palette,
+                                                message,
                                             }
                                         }
                                         if preview_window.top_spacer_px > 0.0 {
@@ -15596,6 +15673,54 @@ fn PreviewLoadingPlaceholder(session: ManagedSessionView, palette: Palette) -> E
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+#[component]
+fn PreviewFailurePlaceholder(
+    session: ManagedSessionView,
+    palette: Palette,
+    message: String,
+) -> Element {
+    let host = session
+        .ssh_target
+        .clone()
+        .or_else(|| {
+            let label = session.host_label.trim();
+            (!label.is_empty()).then(|| label.to_string())
+        })
+        .unwrap_or_else(|| "remote host".to_string());
+    rsx! {
+        div {
+            "data-preview-failure-placeholder": "1",
+            style: "display:flex; flex-direction:column; gap:14px; min-height:320px; justify-content:center; padding:28px 30px; border-radius:26px; background:linear-gradient(180deg, rgba(255,252,252,0.96) 0%, rgba(252,246,246,0.98) 100%); box-shadow:0 24px 48px rgba(148,163,184,0.12), inset 0 0 0 1px rgba(212,134,134,0.16);",
+            div {
+                style: "display:flex; align-items:center; gap:10px; flex-wrap:wrap;",
+                div {
+                    style: "display:inline-flex; align-items:center; gap:7px; padding:6px 10px; border-radius:999px; background:rgba(255,255,255,0.78); color:#a24a4a; font-size:11px; font-weight:700; box-shadow: inset 0 0 0 1px rgba(212,134,134,0.18); white-space:nowrap;",
+                    div {
+                        style: "width:7px; height:7px; border-radius:999px; background:#d04d4d; opacity:0.92;"
+                    }
+                    "Preview unavailable"
+                }
+                div {
+                    style: format!("font-size:12px; font-weight:700; letter-spacing:0.03em; text-transform:uppercase; color:{};", palette.muted),
+                    "{host}"
+                }
+            }
+            div {
+                style: format!("font-size:22px; line-height:1.28; font-weight:700; color:{};", palette.text),
+                "{session.title}"
+            }
+            div {
+                style: format!("font-size:14px; line-height:1.72; color:{}; max-width:68ch;", palette.text),
+                "{message}"
+            }
+            div {
+                style: format!("font-size:13px; line-height:1.72; color:{}; max-width:68ch;", palette.muted),
+                "Yggterm will keep the session selected and retry later, but it will not keep painting stale transcript as if it were current."
             }
         }
     }
@@ -20887,6 +21012,27 @@ mod tests {
             active_request_session_target_path(&request, Some("remote-session://jojo/current")),
             Some("remote-session://jojo/current".to_string())
         );
+    }
+
+    #[test]
+    fn summarize_preview_refresh_error_recognizes_local_daemon_outage() {
+        assert_eq!(
+            summarize_preview_refresh_error("Connection refused (os error 111)"),
+            "The local yggterm daemon is unavailable, so this preview cannot refresh right now."
+        );
+        assert_eq!(
+            summarize_preview_refresh_error("No such file or directory (os error 2)"),
+            "The local yggterm daemon is unavailable, so this preview cannot refresh right now."
+        );
+    }
+
+    #[test]
+    fn remote_preview_retry_backoff_grows_and_caps() {
+        assert_eq!(remote_preview_retry_backoff_ms(1), 3_000);
+        assert_eq!(remote_preview_retry_backoff_ms(2), 10_000);
+        assert_eq!(remote_preview_retry_backoff_ms(3), 30_000);
+        assert_eq!(remote_preview_retry_backoff_ms(4), 60_000);
+        assert_eq!(remote_preview_retry_backoff_ms(9), 60_000);
     }
 
     #[test]
