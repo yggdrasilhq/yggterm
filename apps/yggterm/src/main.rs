@@ -13,18 +13,20 @@ use yggterm_core::{
     detect_install_context, install_release_update, refresh_desktop_integration,
 };
 use yggterm_server::{
-    AppControlViewMode, PersistedDaemonState, SessionKind, YggtermServer, cleanup_legacy_daemons,
-    default_endpoint, detect_ghostty_host, ping, run_app_control_create_terminal,
-    run_app_control_describe_rows, run_app_control_describe_state, run_app_control_drag,
-    run_app_control_dump_state, run_app_control_focus_window, run_app_control_open_path,
-    run_app_control_remove_session, run_app_control_scroll_preview,
-    run_app_control_send_terminal_input, run_app_control_set_fullscreen,
+    AppControlPreviewLayout, AppControlViewMode, PersistedDaemonState, SessionKind, YggtermServer,
+    cleanup_legacy_daemons, default_endpoint, detect_ghostty_host, ping,
+    run_app_control_create_terminal, run_app_control_describe_rows,
+    run_app_control_describe_state, run_app_control_drag, run_app_control_dump_state,
+    run_app_control_focus_window, run_app_control_open_path, run_app_control_remove_session,
+    run_app_control_scroll_preview, run_app_control_send_terminal_input,
+    run_app_control_set_fullscreen, run_app_control_set_maximized,
+    run_app_control_set_preview_layout,
     run_app_control_set_row_expanded, run_attach, run_daemon, run_remote_generation_context,
     run_remote_preview, run_remote_preview_head, run_remote_protocol_version,
-    run_remote_resume_codex, run_remote_scan,
-    run_remote_stage_clipboard_png, run_remote_terminate_codex, run_remote_upsert_generated_copy,
-    run_screenrecord_capture, run_screenshot_capture, run_trace_bundle, run_trace_follow,
-    run_trace_tail, shutdown, start_local_session, status,
+    run_remote_resume_codex, run_remote_scan, run_remote_stage_clipboard_png,
+    run_remote_terminate_codex, run_remote_upsert_generated_copy, run_screenrecord_capture,
+    run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown,
+    start_local_session, status,
 };
 
 const DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT_ENV: &str =
@@ -250,6 +252,20 @@ fn main() -> Result<()> {
                         });
                         run_app_control_scroll_preview(top_px, ratio, timeout_ms)
                     }
+                    "layout" => {
+                        let layout = args
+                            .iter()
+                            .skip(4)
+                            .find(|value| !value.starts_with("--"))
+                            .map(String::as_str)
+                            .unwrap_or("chat");
+                        let layout = match layout {
+                            "chat" => AppControlPreviewLayout::Chat,
+                            "graph" | "overview" => AppControlPreviewLayout::Graph,
+                            other => anyhow::bail!("unsupported app preview layout: {other}"),
+                        };
+                        run_app_control_set_preview_layout(layout, timeout_ms)
+                    }
                     other => anyhow::bail!("unsupported app preview action: {other}"),
                 }
             }
@@ -270,25 +286,56 @@ fn main() -> Result<()> {
                     .find(|value| !value.starts_with("--"))
                     .map(String::as_str)
                     .unwrap_or("toggle");
-                let current_state = yggterm_server::request_app_control(
-                    store.home_dir(),
-                    yggterm_server::AppControlCommand::DescribeState,
-                    timeout_ms,
-                )?;
-                let currently_fullscreen = current_state
-                    .data
-                    .as_ref()
-                    .and_then(|data| data.get("shell"))
-                    .and_then(|shell| shell.get("fullscreen"))
-                    .and_then(|value| value.as_bool())
-                    .unwrap_or(false);
                 let enabled = match action {
                     "on" | "true" | "1" => true,
                     "off" | "false" | "0" => false,
-                    "toggle" => !currently_fullscreen,
+                    "toggle" => {
+                        let current_state = yggterm_server::request_app_control(
+                            store.home_dir(),
+                            yggterm_server::AppControlCommand::DescribeState,
+                            timeout_ms,
+                        )?;
+                        let currently_fullscreen = current_state
+                            .data
+                            .as_ref()
+                            .and_then(|data| data.get("shell"))
+                            .and_then(|shell| shell.get("fullscreen"))
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false);
+                        !currently_fullscreen
+                    }
                     other => anyhow::bail!("unsupported fullscreen action: {other}"),
                 };
                 run_app_control_set_fullscreen(enabled, timeout_ms)
+            }
+            "maximize" | "maximized" => {
+                let action = args
+                    .iter()
+                    .skip(3)
+                    .find(|value| !value.starts_with("--"))
+                    .map(String::as_str)
+                    .unwrap_or("toggle");
+                let enabled = match action {
+                    "on" | "true" | "1" => true,
+                    "off" | "false" | "0" => false,
+                    "toggle" => {
+                        let current_state = yggterm_server::request_app_control(
+                            store.home_dir(),
+                            yggterm_server::AppControlCommand::DescribeState,
+                            timeout_ms,
+                        )?;
+                        let currently_maximized = current_state
+                            .data
+                            .as_ref()
+                            .and_then(|data| data.get("window"))
+                            .and_then(|window| window.get("maximized"))
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false);
+                        !currently_maximized
+                    }
+                    other => anyhow::bail!("unsupported maximize action: {other}"),
+                };
+                run_app_control_set_maximized(enabled, timeout_ms)
             }
             "open" => {
                 let session_path = args

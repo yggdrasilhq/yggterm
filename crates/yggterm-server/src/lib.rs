@@ -7,8 +7,8 @@ mod protocol;
 mod terminal;
 
 pub use app_control::{
-    AppControlCommand, AppControlDragCommand, AppControlDragPlacement, AppControlRequest,
-    AppControlResponse, AppControlViewMode, ScreenshotTarget, app_control_captures_dir,
+    AppControlCommand, AppControlDragCommand, AppControlDragPlacement, AppControlPreviewLayout,
+    AppControlRequest, AppControlResponse, AppControlViewMode, ScreenshotTarget, app_control_captures_dir,
     app_control_requests_dir, app_control_requests_pending, app_control_responses_dir,
     complete_app_control_request, current_millis, default_recording_output_path,
     default_screenshot_output_path, enqueue_app_control_request, enqueue_screen_recording_request,
@@ -5963,6 +5963,20 @@ pub fn run_app_control_scroll_preview(
     Ok(())
 }
 
+pub fn run_app_control_set_preview_layout(
+    layout: AppControlPreviewLayout,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::SetPreviewLayout { layout },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 pub fn run_app_control_describe_state(timeout_ms: u64) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
     let response = request_app_control(&home, AppControlCommand::DescribeState, timeout_ms)?;
@@ -6005,6 +6019,17 @@ pub fn run_app_control_set_fullscreen(enabled: bool, timeout_ms: u64) -> anyhow:
     let response = request_app_control(
         &home,
         AppControlCommand::SetFullscreen { enabled },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_set_maximized(enabled: bool, timeout_ms: u64) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::SetMaximized { enabled },
         timeout_ms,
     )?;
     write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
