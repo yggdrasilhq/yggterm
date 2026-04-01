@@ -130,6 +130,7 @@ const SHELL_FRAME_INSET_PX: f64 = 6.0;
 const REMOTE_PREVIEW_SYNC_DEBOUNCE_MS: u64 = 2_500;
 static XTERM_ASSETS_BOOTSTRAPPED: OnceCell<()> = OnceCell::new();
 const TREE_LOADING_DOT_CSS: &str = "@keyframes yggterm-tree-loading-dot { 0%, 80%, 100% { opacity: 0.28; transform: translateY(0px); } 40% { opacity: 1; transform: translateY(-1px); } }";
+const REMOTE_SURFACE_STAGE_CSS: &str = "@keyframes yggterm-remote-stage-float { 0%, 100% { transform: translateY(0px); } 50% { transform: translateY(-4px); } } @keyframes yggterm-remote-stage-beam { 0% { transform: translateX(-110%); opacity: 0.15; } 30% { opacity: 0.92; } 100% { transform: translateX(220%); opacity: 0.15; } } @keyframes yggterm-remote-stage-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(86, 154, 255, 0.14); opacity: 0.86; } 50% { box-shadow: 0 0 0 12px rgba(86, 154, 255, 0.0); opacity: 1; } }";
 const BACKGROUND_COPY_RETRY_MS: u64 = 300_000;
 const BACKGROUND_COPY_CONTINUE_MS: u64 = 15_000;
 const BACKGROUND_COPY_IDLE_MS: u64 = 120_000;
@@ -416,6 +417,43 @@ fn active_viewport_zoom_label(snapshot: &RenderSnapshot) -> String {
                 yggterm_core::WorkspaceDocumentKind::TerminalRecipe => "Recipe Zoom".to_string(),
             })
             .unwrap_or_else(|| "Preview Zoom".to_string()),
+    }
+}
+
+fn rendered_surface_noun(session: &ManagedSessionView) -> &'static str {
+    if session.kind == SessionKind::Document {
+        match metadata_value(session, "Kind").as_str() {
+            "terminal recipe" => "recipe",
+            "note" => "paper",
+            _ => "document",
+        }
+    } else {
+        "preview"
+    }
+}
+
+fn rendered_surface_title(session: &ManagedSessionView) -> &'static str {
+    if session.kind == SessionKind::Document {
+        match metadata_value(session, "Kind").as_str() {
+            "terminal recipe" => "Recipe",
+            "note" => "Paper",
+            _ => "Document",
+        }
+    } else {
+        "Preview"
+    }
+}
+
+fn row_surface_noun(row: &BrowserRow, prefer_terminal: bool) -> &'static str {
+    if prefer_terminal {
+        "terminal"
+    } else if let Some(kind) = row.document_kind {
+        match kind {
+            yggterm_core::WorkspaceDocumentKind::Note => "paper",
+            yggterm_core::WorkspaceDocumentKind::TerminalRecipe => "recipe",
+        }
+    } else {
+        "preview"
     }
 }
 
@@ -4815,13 +4853,17 @@ fn spawn_focus_live_session_row(
             false,
         );
     });
+    let surface_noun = match mode {
+        WorkspaceViewMode::Terminal => "terminal",
+        WorkspaceViewMode::Rendered => row_surface_noun(&row, false),
+    };
     spawn_loading_notice(
         state,
         request_meta.clone(),
-        "Session Still Loading",
+        format!("Loading Remote {surface_noun}"),
         format!(
-            "{} is still loading. Yggterm is keeping the rest of the shell interactive while that session catches up.",
-            row.label
+            "{} is still opening on the remote machine. Yggterm will keep the workspace responsive while the {} catches up.",
+            row.label, surface_noun
         ),
     );
     let endpoint = state.read().bootstrap.server_endpoint.clone();
@@ -4918,13 +4960,14 @@ fn spawn_open_session_row_with_mode(
             false,
         );
     });
+    let surface_noun = row_surface_noun(&row, prefer_terminal);
     spawn_loading_notice(
         state,
         request_meta.clone(),
-        "Session Still Loading",
+        format!("Loading Remote {surface_noun}"),
         format!(
-            "{} is still loading. Yggterm is keeping the rest of the shell interactive while that session catches up.",
-            row.label
+            "{} is still opening on the remote machine. Yggterm will keep the workspace responsive while the {} catches up.",
+            row.label, surface_noun
         ),
     );
     let endpoint = state.read().bootstrap.server_endpoint.clone();
@@ -5727,12 +5770,15 @@ fn schedule_remote_preview_retry_tick(
 fn summarize_preview_refresh_error(error: &str) -> String {
     let trimmed = error.trim();
     if trimmed.contains("Connection refused") || trimmed.contains("No such file or directory") {
-        "The local yggterm daemon is unavailable, so this preview cannot refresh right now."
+        "Yggterm could not reach its local helper yet, so this remote view cannot load right now."
+            .to_string()
+    } else if trimmed.contains("timed out") || trimmed.contains("Timed out") {
+        "The remote machine is taking longer than expected to answer. Yggterm will keep trying in the background."
             .to_string()
     } else if let Some(first_line) = trimmed.lines().find(|line| !line.trim().is_empty()) {
         first_line.trim().to_string()
     } else {
-        "The preview could not be refreshed right now.".to_string()
+        "Yggterm could not refresh this remote view right now.".to_string()
     }
 }
 
@@ -11008,10 +11054,15 @@ fn preview_text_looks_like_loading_placeholder(text: &str) -> bool {
         return false;
     }
     normalized.contains("refreshing preview")
+        || normalized.contains("loading remote session")
+        || normalized.contains("loading remote preview")
+        || normalized.contains("loading remote paper")
+        || normalized.contains("loading remote recipe")
         || normalized.contains("fetching rendered transcript")
         || normalized.contains("preparing the remote preview surface")
         || normalized.contains("waiting for transcript hydration")
         || normalized.contains("preview unavailable")
+        || normalized.contains("could not load this remote")
 }
 
 async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Value {
@@ -16225,6 +16276,8 @@ fn LoadingStateChip(label: String, palette: Palette) -> Element {
 
 #[component]
 fn PreviewLoadingPlaceholder(session: ManagedSessionView, palette: Palette) -> Element {
+    let surface_noun = rendered_surface_noun(&session);
+    let surface_title = rendered_surface_title(&session);
     let host = session
         .ssh_target
         .clone()
@@ -16235,18 +16288,25 @@ fn PreviewLoadingPlaceholder(session: ManagedSessionView, palette: Palette) -> E
         .unwrap_or_else(|| "remote host".to_string());
     let detail = metadata_value(&session, "Preview Hydration");
     let hydration_hint = if detail.eq_ignore_ascii_case("loading") {
-        "Fetching rendered transcript and metadata from the remote yggterm daemon."
+        format!(
+            "Yggterm is talking to {host}, opening the remote session, and hydrating the latest {surface_noun}."
+        )
     } else {
-        "Preparing the remote preview surface and waiting for transcript hydration."
+        format!(
+            "The remote session is awake, but the {surface_noun} is still being assembled into a clean viewport."
+        )
     };
     rsx! {
         div {
             "data-preview-loading-placeholder": "1",
-            style: "display:flex; flex-direction:column; gap:14px; min-height:320px; justify-content:center; padding:28px 30px; border-radius:26px; background:linear-gradient(180deg, rgba(255,255,255,0.92) 0%, rgba(248,251,255,0.98) 100%); box-shadow:0 24px 48px rgba(148,163,184,0.12), inset 0 0 0 1px rgba(170,190,212,0.16);",
+            style: "display:flex; flex-direction:column; gap:18px; min-height:320px; justify-content:center; padding:30px 30px 34px 30px; border-radius:26px; background:linear-gradient(180deg, rgba(255,255,255,0.94) 0%, rgba(247,250,255,0.99) 100%); box-shadow:0 24px 48px rgba(148,163,184,0.12), inset 0 0 0 1px rgba(170,190,212,0.16);",
+            style {
+                "{TREE_LOADING_DOT_CSS}{REMOTE_SURFACE_STAGE_CSS}"
+            }
             div {
                 style: "display:flex; align-items:center; gap:10px; flex-wrap:wrap;",
                 LoadingStateChip {
-                    label: "Refreshing preview…".to_string(),
+                    label: format!("Loading remote {surface_noun}"),
                     palette,
                 }
                 div {
@@ -16255,30 +16315,71 @@ fn PreviewLoadingPlaceholder(session: ManagedSessionView, palette: Palette) -> E
                 }
             }
             div {
-                style: format!("font-size:22px; line-height:1.28; font-weight:700; color:{};", palette.text),
-                "{session.title}"
+                style: "display:flex; flex-direction:column; gap:8px;",
+                div {
+                    style: format!("font-size:24px; line-height:1.22; font-weight:760; color:{};", palette.text),
+                    "Loading remote session {surface_title}"
+                }
+                div {
+                    style: format!("font-size:14px; line-height:1.72; color:{}; max-width:66ch;", palette.muted),
+                    "{session.title}"
+                }
             }
             div {
                 style: format!("font-size:14px; line-height:1.72; color:{}; max-width:64ch;", palette.muted),
                 "{hydration_hint}"
             }
             div {
-                style: "display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:12px; width:100%; max-width:720px;",
-                for width in ["92%", "78%", "86%"] {
+                style: "display:grid; grid-template-columns:minmax(0, 1fr) minmax(240px, 340px) minmax(0, 1fr); gap:16px; width:100%; max-width:860px; align-items:center;",
+                for (ix, label, copy) in [
+                    (0_i32, "Reach Host", format!("Contacting {host} and checking the remote yggterm sidecar.")),
+                    (1_i32, "Open Session", "Restoring the selected session and matching it to the active viewport.".to_string()),
+                    (2_i32, "Hydrate View", format!("Painting the latest {surface_noun} content once the remote state is ready.")),
+                ] {
                     div {
-                        style: "display:flex; flex-direction:column; gap:10px; padding:14px 15px; border-radius:18px; background:rgba(255,255,255,0.74); box-shadow:inset 0 0 0 1px rgba(170,190,212,0.12); min-width:0;",
+                        style: format!(
+                            "display:flex; flex-direction:column; gap:8px; padding:15px 16px; border-radius:18px; min-width:0; background:rgba(255,255,255,0.8); \
+                             box-shadow:0 12px 24px rgba(173,188,207,0.1), inset 0 0 0 1px rgba(170,190,212,0.12); animation:yggterm-remote-stage-float 3.2s ease-in-out infinite; animation-delay:{}ms;",
+                            ix * 140
+                        ),
                         div {
-                            style: "width:72px; height:10px; border-radius:999px; background:rgba(125,155,192,0.18);"
+                            style: format!("font-size:11px; font-weight:800; letter-spacing:0.04em; text-transform:uppercase; color:{};", if ix == 2 { palette.accent } else { palette.muted }),
+                            "{label}"
                         }
                         div {
-                            style: format!("width:{}; height:12px; border-radius:999px; background:rgba(125,155,192,0.12);", width)
+                            style: format!("font-size:13px; line-height:1.62; color:{};", palette.text),
+                            "{copy}"
+                        }
+                    }
+                }
+            }
+            div {
+                style: "display:flex; align-items:center; justify-content:center; width:100%;",
+                div {
+                    style: "display:flex; flex-direction:column; gap:16px; width:min(560px, 100%); padding:18px 18px 16px 18px; border-radius:22px; background:linear-gradient(180deg, rgba(246,250,255,0.95) 0%, rgba(255,255,255,0.88) 100%); box-shadow:0 18px 34px rgba(164,180,201,0.11), inset 0 0 0 1px rgba(170,190,212,0.15);",
+                    div {
+                        style: "display:flex; align-items:center; justify-content:center; gap:18px;",
+                        div {
+                            style: "display:flex; align-items:center; gap:7px; color:rgba(96,118,146,0.95); font-size:12px; font-weight:700; letter-spacing:0.03em; text-transform:uppercase;",
+                            div {
+                                style: format!("width:10px; height:10px; border-radius:999px; background:{}; animation:yggterm-remote-stage-pulse 1.6s ease-in-out infinite;", palette.accent),
+                            }
+                            "{host}"
                         }
                         div {
-                            style: format!("width:{}; height:12px; border-radius:999px; background:rgba(125,155,192,0.12);", width)
+                            style: "flex:1; height:2px; border-radius:999px; background:linear-gradient(90deg, rgba(154,183,219,0.16) 0%, rgba(154,183,219,0.55) 50%, rgba(154,183,219,0.16) 100%); position:relative; overflow:hidden;",
+                            div {
+                                style: format!("position:absolute; inset:0; width:42%; border-radius:999px; background:linear-gradient(90deg, rgba(255,255,255,0.0) 0%, {} 52%, rgba(255,255,255,0.0) 100%); animation:yggterm-remote-stage-beam 2.4s ease-in-out infinite;", palette.accent_soft),
+                            }
                         }
                         div {
-                            style: format!("width:{}; height:12px; border-radius:999px; background:rgba(125,155,192,0.12);", width)
+                            style: format!("display:flex; align-items:center; gap:7px; color:{}; font-size:12px; font-weight:700; letter-spacing:0.03em; text-transform:uppercase;", palette.text),
+                            "{surface_title}"
                         }
+                    }
+                    div {
+                        style: format!("font-size:13px; line-height:1.7; color:{}; text-align:center;", palette.muted),
+                        "You can keep browsing the workspace while this remote session catches up."
                     }
                 }
             }
@@ -16292,6 +16393,8 @@ fn PreviewFailurePlaceholder(
     palette: Palette,
     message: String,
 ) -> Element {
+    let surface_noun = rendered_surface_noun(&session);
+    let surface_title = rendered_surface_title(&session);
     let host = session
         .ssh_target
         .clone()
@@ -16303,7 +16406,7 @@ fn PreviewFailurePlaceholder(
     rsx! {
         div {
             "data-preview-failure-placeholder": "1",
-            style: "display:flex; flex-direction:column; gap:14px; min-height:320px; justify-content:center; padding:28px 30px; border-radius:26px; background:linear-gradient(180deg, rgba(255,252,252,0.96) 0%, rgba(252,246,246,0.98) 100%); box-shadow:0 24px 48px rgba(148,163,184,0.12), inset 0 0 0 1px rgba(212,134,134,0.16);",
+            style: "display:flex; flex-direction:column; gap:16px; min-height:320px; justify-content:center; padding:30px 30px 34px 30px; border-radius:26px; background:linear-gradient(180deg, rgba(255,252,252,0.96) 0%, rgba(252,246,246,0.98) 100%); box-shadow:0 24px 48px rgba(148,163,184,0.12), inset 0 0 0 1px rgba(212,134,134,0.16);",
             div {
                 style: "display:flex; align-items:center; gap:10px; flex-wrap:wrap;",
                 div {
@@ -16311,7 +16414,7 @@ fn PreviewFailurePlaceholder(
                     div {
                         style: "width:7px; height:7px; border-radius:999px; background:#d04d4d; opacity:0.92;"
                     }
-                    "Preview unavailable"
+                    "Remote {surface_noun} unavailable"
                 }
                 div {
                     style: format!("font-size:12px; font-weight:700; letter-spacing:0.03em; text-transform:uppercase; color:{};", palette.muted),
@@ -16319,8 +16422,15 @@ fn PreviewFailurePlaceholder(
                 }
             }
             div {
-                style: format!("font-size:22px; line-height:1.28; font-weight:700; color:{};", palette.text),
-                "{session.title}"
+                style: "display:flex; flex-direction:column; gap:8px;",
+                div {
+                    style: format!("font-size:24px; line-height:1.22; font-weight:760; color:{};", palette.text),
+                    "Could not load this remote {surface_noun}"
+                }
+                div {
+                    style: format!("font-size:14px; line-height:1.72; color:{}; max-width:66ch;", palette.muted),
+                    "{session.title}"
+                }
             }
             div {
                 style: format!("font-size:14px; line-height:1.72; color:{}; max-width:68ch;", palette.text),
@@ -16328,7 +16438,20 @@ fn PreviewFailurePlaceholder(
             }
             div {
                 style: format!("font-size:13px; line-height:1.72; color:{}; max-width:68ch;", palette.muted),
-                "Yggterm will keep the session selected and retry later, but it will not keep painting stale transcript as if it were current."
+                "The session itself is still here. Yggterm will keep retrying quietly, and it will not paint stale content as if it were current."
+            }
+            div {
+                style: "display:flex; align-items:center; gap:10px; flex-wrap:wrap;",
+                div {
+                    style: "display:inline-flex; align-items:center; gap:8px; padding:8px 12px; border-radius:14px; background:rgba(255,255,255,0.78); box-shadow:inset 0 0 0 1px rgba(212,134,134,0.16);",
+                    div {
+                        style: "width:9px; height:9px; border-radius:999px; background:#d04d4d;"
+                    }
+                    div {
+                        style: format!("font-size:12px; font-weight:700; color:{};", palette.text),
+                        "Remote {surface_title} on {host}"
+                    }
+                }
             }
         }
     }
@@ -21659,11 +21782,11 @@ mod tests {
     fn summarize_preview_refresh_error_recognizes_local_daemon_outage() {
         assert_eq!(
             summarize_preview_refresh_error("Connection refused (os error 111)"),
-            "The local yggterm daemon is unavailable, so this preview cannot refresh right now."
+            "Yggterm could not reach its local helper yet, so this remote view cannot load right now."
         );
         assert_eq!(
             summarize_preview_refresh_error("No such file or directory (os error 2)"),
-            "The local yggterm daemon is unavailable, so this preview cannot refresh right now."
+            "Yggterm could not reach its local helper yet, so this remote view cannot load right now."
         );
     }
 
