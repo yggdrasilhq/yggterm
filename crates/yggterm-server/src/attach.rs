@@ -24,7 +24,8 @@ pub fn run_attach(uuid: &str, cwd: Option<&str>) -> Result<()> {
     fs::create_dir_all(&session_dir)
         .with_context(|| format!("creating attach dir {}", session_dir.display()))?;
 
-    if let Some(cwd) = cwd.map(str::trim).filter(|value| !value.is_empty()) {
+    let resolved_cwd = resolve_attach_cwd(cwd);
+    if let Some(cwd) = resolved_cwd.as_deref() {
         std::env::set_current_dir(cwd).with_context(|| format!("setting attach cwd to {cwd}"))?;
     }
 
@@ -63,10 +64,25 @@ pub fn run_attach(uuid: &str, cwd: Option<&str>) -> Result<()> {
         .with_context(|| format!("writing attach metadata {}", metadata_path.display()))?;
 
     if tmux_available() {
-        return exec_tmux(uuid, cwd);
+        return exec_tmux(uuid, resolved_cwd.as_deref());
     }
 
-    exec_shell(cwd)
+    exec_shell(resolved_cwd.as_deref())
+}
+
+fn resolve_attach_cwd(cwd: Option<&str>) -> Option<String> {
+    let requested = cwd.map(str::trim).filter(|value| !value.is_empty())?;
+    let requested_path = PathBuf::from(requested);
+    if requested_path.is_dir() {
+        return Some(requested.to_string());
+    }
+    if let Some(existing_parent) = requested_path.ancestors().find(|path| path.is_dir()) {
+        return Some(existing_parent.display().to_string());
+    }
+    std::env::var("HOME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .filter(|value| PathBuf::from(value).is_dir())
 }
 
 fn load_metadata(path: &PathBuf) -> Option<AttachMetadata> {
@@ -219,6 +235,38 @@ fn attach_shell_command(cwd: Option<&str>) -> Option<String> {
         ));
     }
     Some(shell_single_quote(&shell))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn resolve_attach_cwd_reuses_existing_directory() {
+        let cwd = std::env::temp_dir();
+        let cwd = cwd.display().to_string();
+        assert_eq!(resolve_attach_cwd(Some(&cwd)), Some(cwd));
+    }
+
+    #[test]
+    fn resolve_attach_cwd_falls_back_to_existing_parent() {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-attach-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let existing = root.join("existing");
+        fs::create_dir_all(&existing).expect("create existing parent");
+        let missing = existing.join("missing").join("child");
+        assert_eq!(
+            resolve_attach_cwd(Some(&missing.display().to_string())),
+            Some(existing.display().to_string())
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
 }
 
 fn shell_single_quote(value: &str) -> String {
