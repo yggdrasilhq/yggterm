@@ -33,6 +33,7 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 - For SSH targets, prefer Yggterm-owned remote commands and metadata/clipboard flows over ad hoc shell-text or Python-side workarounds whenever the remote machine has a Yggterm binary available.
 - Remote SSH flows should version-check and, when needed, bootstrap a matching `yggterm` binary into `~/.yggterm/bin/yggterm` on the target machine before depending on remote Yggterm commands.
 - Yggterm should feel remote-first: multiple machines, SSH-heavy workflows, and restoring many live terminal contexts is a core use case.
+- Treat richer surfaces such as `paper`, `cellulose`, and Excalidraw integration as app-grade surfaces that can live in separate repos while still embedding into Yggterm.
 
 ## Design philosophy
 
@@ -101,6 +102,7 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 - Treat `yggterm` as the first proving ground for a reusable `yggui` platform covering app-control, observability, automation, proof bundles, and demo composition.
 - When a feature feels generic across future YggdrasilHQ desktop apps, prefer a structure that can later move into `yggui`, `yggui-platform`, `yggui-observe`, `yggui-automation`, or `yggui-demo` rather than hard-wiring it to `yggterm`.
 - Keep app-specific semantics in `yggterm`, but design schemas, manifests, trace formats, and macro concepts so future apps like `yggtopo` or `cellulose` can reuse them.
+- Prefer clean embedding boundaries so standalone repos like `paper` or `cellulose` remain independently valuable products rather than permanently trapped as private subfeatures.
 
 ## Demo And Changelog Evidence
 

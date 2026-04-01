@@ -173,6 +173,22 @@ That means the current app already supports:
 - direct install with self-update and package-manager-aware notify-only mode
 - SSH-side Yggterm commands for remote session scanning, generated-copy persistence, and clipboard image staging
 
+## Separately Tracked Embeddable Surfaces
+
+Some Yggterm workspace surfaces are now intended to mature in their own repositories while still embedding into the Yggterm shell.
+
+The current expected family is:
+
+- `paper`: a richer notion-like workspace and document surface
+- `cellulose`: an AI-first spreadsheet and analytical workspace
+- Excalidraw integration: likely maintained as a fork or patch stack over the Obsidian Excalidraw plugin rather than reimplemented from zero
+
+The intent is:
+
+- each surface can stand on its own as an app
+- Yggterm can still host them as first-class item types in the virtual workspace tree
+- shared `yggui` automation, observability, and changelog-demo systems can travel across all of them
+
 ## Remote command surface
 
 For SSH machines, Yggterm now prefers a Yggterm-owned remote command surface over ad hoc remote helper scripts.
