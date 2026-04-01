@@ -2027,8 +2027,9 @@ impl ShellState {
     }
 
     fn toggle_maximized(&mut self) {
+        let next = !window().is_maximized();
         window().toggle_maximized();
-        self.maximized = !self.maximized;
+        self.maximized = next;
     }
 
     fn toggle_fullscreen(&mut self) {
@@ -12618,6 +12619,7 @@ fn app() -> Element {
                 | DesktopWindowEvent::Resized(_)
                 | DesktopWindowEvent::Focused(_)
                 | DesktopWindowEvent::ScaleFactorChanged { .. } => {
+                    state.with_mut(sync_window_frame_state);
                     window_epoch.with_mut(|epoch| *epoch += 1);
                 }
                 DesktopWindowEvent::ModifiersChanged(modifiers) => {
@@ -15357,7 +15359,8 @@ fn MainSurface(
                                         style: "width:min(1120px, 100%); margin:0 auto;",
                                         PreviewGraph {
                                             session: session.clone(),
-                                            visible_blocks: rendered_blocks.clone(),
+                                            visible_blocks: visible_blocks.clone(),
+                                            rendered_sections: rendered_sections.clone(),
                                             palette: snapshot.palette,
                                         }
                                     }
@@ -15942,145 +15945,154 @@ fn build_document_input(
 fn PreviewGraph(
     session: ManagedSessionView,
     visible_blocks: Vec<SessionPreviewBlock>,
+    rendered_sections: Vec<SessionRenderedSection>,
     palette: Palette,
 ) -> Element {
-    let summary_entries = session
-        .preview
-        .summary
+    let preview_summary = preview_summary_text(&session);
+    let rendered_section_nodes = rendered_sections
         .iter()
-        .filter(|entry| {
-            !matches!(
-                entry.label,
-                "Session" | "Storage" | "Cwd" | "Started" | "Updated"
-            ) && !entry.value.trim().is_empty()
+        .enumerate()
+        .map(|(index, section)| {
+            (
+                format!("section-{index}"),
+                section.title.to_ascii_uppercase(),
+                truncate_preview_excerpt(&section.lines.join(" "), 150),
+                metadata_value(&session, "Updated"),
+                true,
+                false,
+            )
         })
-        .take(4)
-        .cloned()
         .collect::<Vec<_>>();
-    let timeline_excerpt = visible_blocks
+    let block_nodes = visible_blocks
         .iter()
-        .rev()
-        .find_map(|block| preview_block_excerpt(block, 140))
-        .unwrap_or_else(|| preview_summary_text(&session));
+        .enumerate()
+        .filter_map(|(index, block)| {
+            let excerpt = preview_block_excerpt(block, 150)?;
+            Some((
+                format!("block-{index}"),
+                block.role.to_string(),
+                excerpt,
+                block.timestamp.clone(),
+                false,
+                block.tone == PreviewTone::User,
+            ))
+        })
+        .collect::<Vec<_>>();
+    let graph_nodes = rendered_section_nodes
+        .into_iter()
+        .chain(block_nodes)
+        .collect::<Vec<_>>();
+    let show_empty_state = graph_nodes.is_empty();
     rsx! {
         div {
-            style: "display:flex; flex-direction:column; gap:18px; padding:6px 0 4px 0;",
+            style: "display:flex; flex-direction:column; gap:14px; padding:4px 0 16px 0;",
             div {
-                style: "display:flex; flex-direction:column; gap:14px;",
+                style: "display:flex; flex-direction:column; gap:5px;",
                 div {
-                    style: "display:flex; align-items:flex-start; justify-content:space-between; gap:16px; flex-wrap:wrap;",
+                    style: "display:flex; flex-direction:column; gap:5px; min-width:0; flex:1;",
                     div {
-                        style: "display:flex; flex-direction:column; gap:6px; min-width:0; flex:1;",
-                        div {
-                            style: format!("font-size:13px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:{};", palette.muted),
-                            "Conversation Overview"
-                        }
-                        div {
-                            style: format!("font-size:15px; line-height:1.7; color:{}; max-width:720px; white-space:pre-wrap;", palette.text),
-                            "{timeline_excerpt}"
-                        }
-                    }
-                    div {
-                        style: "display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end;",
-                        OverviewStatCard {
-                            label: "Messages".to_string(),
-                            value: metadata_value(&session, "Messages"),
-                            palette,
-                        }
-                        OverviewStatCard {
-                            label: "Blocks".to_string(),
-                            value: metadata_value(&session, "Preview Blocks"),
-                            palette,
-                        }
-                        OverviewStatCard {
-                            label: "Updated".to_string(),
-                            value: metadata_value(&session, "Updated"),
-                            palette,
-                        }
-                    }
-                }
-                if !summary_entries.is_empty() {
-                    div {
-                        style: "display:flex; gap:10px; flex-wrap:wrap;",
-                        for entry in summary_entries {
-                            div {
-                                style: "display:flex; flex-direction:column; gap:4px; min-width:140px; max-width:240px; padding:12px 14px; border-radius:16px; background:rgba(255,255,255,0.78); box-shadow:inset 0 0 0 1px rgba(170,190,212,0.14);",
-                                div {
-                                    style: format!("font-size:11px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:{};", palette.muted),
-                                    "{entry.label}"
-                                }
-                                div {
-                                    style: format!("font-size:13px; line-height:1.5; color:{}; white-space:pre-wrap; overflow-wrap:anywhere;", palette.text),
-                                    "{entry.value}"
-                                }
-                            }
-                        }
-                    }
-                }
-                if !preview_rendered_sections(&session).is_empty() {
-                    RenderedSectionsStrip {
-                        sections: preview_rendered_sections(&session),
-                        palette,
-                    }
-                }
-            }
-            div {
-                style: "display:flex; flex-direction:column; gap:14px; padding-top:2px;",
-                for (ix, block) in visible_blocks.iter().enumerate() {
-                div {
-                    style: "display:grid; grid-template-columns:56px 1fr; gap:18px; align-items:flex-start;",
-                    div {
-                        style: "display:flex; flex-direction:column; align-items:center; gap:8px;",
-                        div {
-                            style: format!(
-                                "width:38px; height:38px; border-radius:999px; display:flex; align-items:center; justify-content:center; \
-                                 background:{}; color:{}; font-size:14px; font-weight:700; box-shadow:0 8px 18px rgba(148,163,184,0.18);",
-                                if block.tone == PreviewTone::User { "rgba(73,138,255,0.16)" } else { "rgba(255,255,255,0.95)" },
-                                if block.tone == PreviewTone::User { palette.accent } else { palette.text }
-                            ),
-                            {if block.tone == PreviewTone::User { "U" } else { "A" }}
-                        }
-                        if ix + 1 != visible_blocks.len() {
-                            div {
-                                style: "width:2px; min-height:54px; border-radius:999px; background:linear-gradient(180deg, rgba(120,153,189,0.42) 0%, rgba(120,153,189,0.08) 100%);"
-                            }
-                        }
+                        style: format!("font-size:12px; font-weight:700; letter-spacing:0.08em; text-transform:uppercase; color:{};", palette.muted),
+                        "Conversation Map"
                     }
                     div {
                         style: format!(
-                            "display:flex; flex-direction:column; gap:10px; padding:16px 18px; border-radius:18px; \
-                             background:{}; box-shadow:0 16px 28px rgba(148,163,184,0.08), inset 0 0 0 1px rgba(255,255,255,0.62);",
-                            if block.tone == PreviewTone::User { "rgba(232,244,255,0.96)" } else { "rgba(255,255,255,0.92)" }
+                            "font-size:14px; line-height:1.65; color:{}; max-width:760px; white-space:pre-wrap;",
+                            palette.text
+                        ),
+                        "{preview_summary}"
+                    }
+                }
+            }
+            div {
+                style: "position:relative; display:flex; flex-direction:column; gap:0; min-height:320px; padding:8px 0 12px 0; \
+                        background-image:radial-gradient(circle at 1px 1px, rgba(172,188,208,0.24) 1px, transparent 0); \
+                        background-size:20px 20px; border-radius:26px;",
+                div {
+                    style: "position:absolute; top:0; bottom:0; left:50%; width:2px; transform:translateX(-50%); \
+                            background:repeating-linear-gradient(180deg, rgba(122,146,180,0.65) 0 8px, rgba(122,146,180,0.0) 8px 18px);"
+                }
+                if show_empty_state {
+                    div {
+                        style: "position:relative; z-index:1; margin:auto; width:min(460px, 100%); padding:18px 20px; border-radius:18px; \
+                                background:rgba(255,255,255,0.9); box-shadow:0 16px 34px rgba(148,163,184,0.12), inset 0 0 0 1px rgba(170,190,212,0.18);",
+                        div {
+                            style: format!("font-size:13px; font-weight:700; color:{};", palette.text),
+                            "Overview will appear here once preview content is ready."
+                        }
+                    }
+                }
+                for (index, node) in graph_nodes.iter().enumerate() {
+                    div {
+                        key: "{node.0}",
+                        style: format!(
+                            "position:relative; z-index:1; display:flex; {} margin:{} 0;",
+                            if node.5 { "justify-content:flex-end;" } else { "justify-content:flex-start;" },
+                            if index == 0 { "0" } else { "18px" }
                         ),
                         div {
-                            style: "display:flex; align-items:center; justify-content:space-between; gap:12px;",
-                            span {
-                                style: format!("font-size:12px; font-weight:700; color:{};", palette.text),
-                                "{block.role}"
+                            style: format!(
+                                "position:relative; width:min(360px, calc(50% - 34px)); min-width:280px; padding:14px 16px 14px 18px; \
+                                 border-radius:18px; background:{}; box-shadow:0 18px 32px rgba(148,163,184,0.12), inset 0 0 0 1px {};",
+                                if node.4 {
+                                    "rgba(237,248,246,0.96)"
+                                } else if node.5 {
+                                    "rgba(232,244,255,0.98)"
+                                } else {
+                                    "rgba(255,255,255,0.94)"
+                                },
+                                if node.4 {
+                                    "rgba(74,163,153,0.18)"
+                                } else {
+                                    "rgba(170,190,212,0.18)"
+                                }
+                            ),
+                            div {
+                                style: format!(
+                                    "position:absolute; top:20px; {} width:14px; height:14px; border-radius:999px; background:{}; \
+                                     box-shadow:0 0 0 5px rgba(255,255,255,0.92); transform:{};",
+                                    if node.5 { "left:-24px;" } else { "right:-24px;" },
+                                    if node.4 {
+                                        "#4aa399"
+                                    } else if node.5 {
+                                        palette.accent
+                                    } else {
+                                        palette.text
+                                    },
+                                    if node.5 { "translateX(-50%);" } else { "translateX(50%);" }
+                                ),
                             }
-                            span {
-                                style: format!("font-size:11px; color:{};", palette.muted),
-                                "{block.timestamp}"
-                            }
-                        }
-                        div {
-                            style: format!("display:flex; flex-direction:column; gap:8px; color:{};", palette.text),
-                            if let Some(excerpt) = preview_block_excerpt(block, 220) {
+                            div {
+                                style: "display:flex; align-items:flex-start; justify-content:space-between; gap:12px;",
                                 div {
-                                    style: "font-size:13px; line-height:1.62; white-space:pre-wrap;",
-                                    "{excerpt}"
+                                    style: "display:flex; flex-direction:column; gap:4px; min-width:0;",
+                                    div {
+                                        style: format!(
+                                            "font-size:11px; font-weight:800; letter-spacing:0.06em; text-transform:uppercase; color:{};",
+                                            if node.4 { "#2c8c83" } else { palette.muted }
+                                        ),
+                                        "{node.1}"
+                                    }
+                                }
+                                if !node.3.trim().is_empty() {
+                                    div {
+                                        style: format!("font-size:10px; font-weight:700; color:{}; white-space:nowrap;", palette.muted),
+                                        "{node.3}"
+                                    }
                                 }
                             }
-                            if block.lines.len() > 2 {
+                            div {
+                                style: format!("font-size:13px; line-height:1.58; color:{}; white-space:pre-wrap; overflow-wrap:anywhere;", palette.text),
+                                "{node.2}"
+                            }
+                            if node.4 {
                                 div {
-                                    style: format!("font-size:11px; color:{};", palette.muted),
-                                    "+ {block.lines.len() - 2} more lines"
+                                    style: format!("font-size:11px; font-weight:700; color:{};", "#2c8c83"),
+                                    "Rendered context"
                                 }
                             }
                         }
                     }
                 }
-            }
             }
         }
     }
@@ -16157,23 +16169,6 @@ fn RenderedSectionCard(section: SessionRenderedSection, palette: Palette) -> Ele
                         "+ {section.lines.len() - visible_count} more"
                     }
                 }
-            }
-        }
-    }
-}
-
-#[component]
-fn OverviewStatCard(label: String, value: String, palette: Palette) -> Element {
-    rsx! {
-        div {
-            style: "display:flex; flex-direction:column; gap:4px; min-width:110px; padding:12px 14px; border-radius:16px; background:rgba(255,255,255,0.82); box-shadow:inset 0 0 0 1px rgba(170,190,212,0.14);",
-            div {
-                style: format!("font-size:11px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:{};", palette.muted),
-                "{label}"
-            }
-            div {
-                style: format!("font-size:14px; font-weight:700; color:{}; line-height:1.4;", palette.text),
-                "{value}"
             }
         }
     }
@@ -20617,6 +20612,16 @@ fn shell_style(
     } else {
         SHELL_FRAME_INSET_PX
     };
+    let frame_outline = if maximized {
+        "none".to_string()
+    } else {
+        "inset 0 0 0 1px rgba(214,222,232,0.72)".to_string()
+    };
+    let box_shadow = if frame_outline == "none" {
+        palette.shadow.to_string()
+    } else {
+        format!("{}, {}", palette.shadow, frame_outline)
+    };
     format!(
         "position:absolute; inset:{}px; display:flex; flex-direction:column; overflow:hidden; \
          border-radius:{}px; background-color:{}; background-image:{}; box-shadow:{}; backdrop-filter:{}; \
@@ -20625,11 +20630,15 @@ fn shell_style(
         radius,
         shell_tint,
         shell_gradient,
-        palette.shadow,
+        box_shadow,
         backdrop,
         backdrop,
         interface_font_family()
     )
+}
+
+fn sync_window_frame_state(shell: &mut ShellState) {
+    shell.maximized = window().is_maximized();
 }
 
 fn icon_button_style(palette: Palette) -> String {
