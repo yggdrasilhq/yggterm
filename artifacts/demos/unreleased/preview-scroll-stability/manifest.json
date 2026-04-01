@@ -1,0 +1,40 @@
+{
+  "bundle_version": 1,
+  "app_id": "yggterm",
+  "feature_id": "preview-scroll-stability",
+  "title": "Preview scroll stays stable under long remote sessions",
+  "status": "unreleased",
+  "category": "preview",
+  "user_value": "Long rendered previews stay stable while scrolling instead of blanking, changing width, or leaking stale scaffold content.",
+  "source_repo": "yggdrasilhq/yggterm",
+  "links": {
+    "changelog_section": "Unreleased",
+    "site_demo_path": "/demos/yggterm/preview-scroll-stability"
+  },
+  "macro": {
+    "script": "scripts/ui_preview_ui_scroll_23.py",
+    "args": [
+      "--launch-local",
+      "--count",
+      "23"
+    ]
+  },
+  "proof": {
+    "screenshots": true,
+    "recording": false,
+    "trace": true,
+    "app_state": true,
+    "summary_artifact": "/tmp/yggterm-preview-ui-scroll-23-after-normalizer-full3/summary.json"
+  },
+  "changelog": {
+    "section": "Fixed",
+    "summary": "keep long remote preview scrolling stable without blanking, width shifts, scaffold leaks, or daemon memory spikes"
+  },
+  "tags": [
+    "preview",
+    "scroll",
+    "stability",
+    "remote",
+    "proof-bundle"
+  ]
+}
