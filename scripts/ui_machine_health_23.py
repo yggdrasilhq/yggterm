@@ -19,6 +19,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--count", type=int, default=23)
     parser.add_argument("--timeout-ms", type=int, default=8000)
     parser.add_argument("--poll", type=float, default=0.5)
+    parser.add_argument("--startup-grace-sec", type=float, default=3.0)
     parser.add_argument("--out-dir", default="/tmp/yggterm-machine-health-23")
     return parser.parse_args()
 
@@ -79,9 +80,16 @@ def main() -> int:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     results: list[dict] = []
+    suite_start = time.time()
 
     for index in range(args.count):
-        trial = {"trial": index, "machines": [], "error": None}
+        elapsed_ms = int((time.time() - suite_start) * 1000)
+        trial = {
+            "trial": index,
+            "elapsed_ms": elapsed_ms,
+            "machines": [],
+            "error": None,
+        }
         try:
             state = app_state(args.bin, args.timeout_ms)
             ui_machines = {
@@ -100,11 +108,15 @@ def main() -> int:
                 ui_color = None if ui_machine is None else ui_machine.get("machine_indicator_color")
                 expected_health = "healthy" if truth["reachable"] else "offline"
                 expected_color = "#16a34a" if truth["reachable"] else None
+                in_startup_grace = elapsed_ms < int(args.startup_grace_sec * 1000)
                 mismatch = False
                 if truth["reachable"]:
-                    mismatch = ui_health != "healthy" or ui_color != expected_color
+                    mismatch = (
+                        not in_startup_grace
+                        and (ui_health != "healthy" or ui_color != expected_color)
+                    )
                 elif ui_health == "healthy":
-                    mismatch = True
+                    mismatch = not in_startup_grace
                 trial["machines"].append(
                     {
                         "host": host,
@@ -114,6 +126,13 @@ def main() -> int:
                         "ui_color": ui_color,
                         "expected_health": expected_health,
                         "expected_color": expected_color,
+                        "in_startup_grace": in_startup_grace,
+                        "matches_expected": not (
+                            truth["reachable"]
+                            and (ui_health != "healthy" or ui_color != expected_color)
+                        ) and not (
+                            not truth["reachable"] and ui_health == "healthy"
+                        ),
                         "mismatch": mismatch,
                     }
                 )
@@ -122,9 +141,41 @@ def main() -> int:
         results.append(trial)
         time.sleep(args.poll)
 
+    host_rollup = []
+    for host in args.hosts:
+        host_samples = [
+            machine
+            for item in results
+            for machine in item.get("machines", [])
+            if machine.get("host") == host
+        ]
+        first_match = next(
+            (
+                item["elapsed_ms"]
+                for item in results
+                for machine in item.get("machines", [])
+                if machine.get("host") == host and machine.get("matches_expected")
+            ),
+            None,
+        )
+        post_grace_mismatches = sum(
+            1
+            for machine in host_samples
+            if machine.get("mismatch")
+        )
+        host_rollup.append(
+            {
+                "host": host,
+                "time_to_expected_ms": first_match,
+                "post_grace_mismatches": post_grace_mismatches,
+                "never_reached_expected": first_match is None,
+            }
+        )
+
     summary = {
         "count": args.count,
         "hosts": args.hosts,
+        "startup_grace_sec": args.startup_grace_sec,
         "app_state_failures": len([item for item in results if item.get("error")]),
         "machine_mismatches": sum(
             1
@@ -132,6 +183,7 @@ def main() -> int:
             for machine in item.get("machines", [])
             if machine.get("mismatch")
         ),
+        "host_rollup": host_rollup,
         "results": results,
     }
     summary_path = out_dir / "summary.json"
