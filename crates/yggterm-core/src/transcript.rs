@@ -280,8 +280,30 @@ fn normalize_preview_text(text: &str) -> Vec<String> {
     text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
+        .filter(|line| !preview_transcript_scaffold_line(line))
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn preview_transcript_scaffold_line(trimmed: &str) -> bool {
+    let lower = trimmed.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    [
+        "<turn_id>",
+        "</turn_id>",
+        "<reason>",
+        "</reason>",
+        "<guidance>",
+        "</guidance>",
+        "<turn_aborted>",
+        "</turn_aborted>",
+        "the user interrupted the previous turn on purpose",
+        "any running unified exec processes were terminated",
+    ]
+    .iter()
+    .any(|needle| lower.starts_with(needle) || lower.contains(needle))
 }
 
 fn message_text_for_generation(message: &TranscriptMessage) -> Option<String> {
@@ -517,5 +539,30 @@ mod tests {
         assert!(context.contains("I changed the dev SSH target"));
         assert!(!context.contains("Open live terminal"));
         assert!(!context.contains("It's a screenshot of"));
+    }
+
+    #[test]
+    fn transcript_reader_filters_interrupted_turn_scaffold() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "yggterm-transcript-interrupted-{}-{}.jsonl",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-03-20T10:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<turn_id>8</turn_id>\n<reason>interrupted</reason>\n<guidance>The user interrupted the previous turn on purpose. Any running unified exec processes were terminated.</guidance>"}]}}"#,
+                r#"{"timestamp":"2026-03-20T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"real follow-up"}]}}"#,
+            ]
+            .join("\n"),
+        )?;
+
+        let messages = read_codex_transcript_messages(&path)?;
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert_eq!(messages[0].role, TranscriptRole::User);
+        assert_eq!(messages[0].lines, vec!["real follow-up".to_string()]);
+
+        let _ = fs::remove_file(path);
+        Ok(())
     }
 }
