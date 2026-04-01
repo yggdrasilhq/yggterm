@@ -37,6 +37,26 @@ yggterm-headless server trace bundle 200 --screenshot > yggterm-trace.json
 
 `server app ...` is the SSH-reachable YggUI control plane. `state` returns the live shell/window snapshot, `rows` dumps the merged visible sidebar tree exactly as the running app sees it, `open` queues a specific visible row into preview or terminal mode, `focus` raises the running window, `screenshot` asks the app to capture itself, and `screenrecord` captures a timed recording of the live app window through the native app backend. On Linux, app screenshots come from the embedded WebKitGTK surface instead of `spectacle`, `import`, or DOM-to-canvas hacks. On macOS, app screenshots and recordings are routed through the native `screencapture` window path tied to the live NSWindow. `server screenshot app ...` remains as a compatibility alias, and `trace bundle --screenshot` now includes the live app-state snapshot before falling back to external desktop tools when there is no app response. The trace lives at `~/.yggterm/event-trace.jsonl` and is designed to stay on during dogfooding, with lightweight rotation once it gets large.
 
+## Demo And Release Evidence
+
+Yggterm is also the first consumer of a broader `yggui` product pipeline for AI-first desktop apps:
+
+- deterministic app-control macros
+- always-on UI and daemon traces
+- proof bundles with screenshots, recordings, and state dumps
+- curated changelog entries backed by those proof bundles
+- release pages and marketing material generated from the same evidence
+
+The in-repo structure for that work lives here:
+
+- [docs/demos/ARCHITECTURE.md](/home/pi/gh/yggterm/docs/demos/ARCHITECTURE.md)
+- [docs/demos/FORMAT.md](/home/pi/gh/yggterm/docs/demos/FORMAT.md)
+- [docs/demos/STYLE.md](/home/pi/gh/yggterm/docs/demos/STYLE.md)
+- [artifacts/demos/unreleased/README.md](/home/pi/gh/yggterm/artifacts/demos/unreleased/README.md)
+- [.agents/skills/yggui-changelog-demo/SKILL.md](/home/pi/gh/yggterm/.agents/skills/yggui-changelog-demo/SKILL.md)
+
+The intent is to keep release notes, QA evidence, and demo capture as one pipeline rather than three disconnected chores. `yggterm` is the first proving ground; later `yggui` apps should be able to reuse the same manifest format, macros, proof bundle structure, and release-page generation flow.
+
 For apps built on `yggui`, keep one canonical SVG icon in-repo and regenerate the runtime PNG from it instead of hand-editing both assets. This repo uses:
 
 ```bash
