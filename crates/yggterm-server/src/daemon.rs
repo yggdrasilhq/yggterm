@@ -70,6 +70,30 @@ pub struct ServerRuntimeStatus {
     pub terminal_session_buffer_limit_bytes: usize,
     #[serde(default)]
     pub terminal_idle_buffer_limit_bytes: usize,
+    #[serde(default)]
+    pub managed_session_count: usize,
+    #[serde(default)]
+    pub session_metadata_entries: usize,
+    #[serde(default)]
+    pub session_metadata_bytes: usize,
+    #[serde(default)]
+    pub session_preview_block_count: usize,
+    #[serde(default)]
+    pub session_preview_line_count: usize,
+    #[serde(default)]
+    pub session_preview_bytes: usize,
+    #[serde(default)]
+    pub session_rendered_section_count: usize,
+    #[serde(default)]
+    pub session_rendered_line_count: usize,
+    #[serde(default)]
+    pub session_rendered_bytes: usize,
+    #[serde(default)]
+    pub session_terminal_line_count: usize,
+    #[serde(default)]
+    pub session_terminal_bytes: usize,
+    #[serde(default)]
+    pub session_payload_total_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,6 +304,7 @@ impl DaemonRuntime {
 
     fn status(&self) -> ServerRuntimeStatus {
         let terminal_stats = self.terminals.stats();
+        let payload_stats = self.server.payload_stats();
         ServerRuntimeStatus {
             server_version: SERVER_PROTOCOL_VERSION.to_string(),
             server_build_id: current_build_id(),
@@ -296,6 +321,18 @@ impl DaemonRuntime {
             terminal_retained_bytes: terminal_stats.retained_bytes,
             terminal_session_buffer_limit_bytes: crate::terminal::MAX_BUFFER_BYTES,
             terminal_idle_buffer_limit_bytes: crate::terminal::IDLE_TRIM_MAX_BYTES,
+            managed_session_count: payload_stats.session_count,
+            session_metadata_entries: payload_stats.metadata_entries,
+            session_metadata_bytes: payload_stats.metadata_bytes,
+            session_preview_block_count: payload_stats.preview_blocks,
+            session_preview_line_count: payload_stats.preview_lines,
+            session_preview_bytes: payload_stats.preview_bytes,
+            session_rendered_section_count: payload_stats.rendered_sections,
+            session_rendered_line_count: payload_stats.rendered_lines,
+            session_rendered_bytes: payload_stats.rendered_bytes,
+            session_terminal_line_count: payload_stats.terminal_lines,
+            session_terminal_bytes: payload_stats.terminal_bytes,
+            session_payload_total_bytes: payload_stats.total_bytes,
         }
     }
 
@@ -1994,6 +2031,7 @@ fn handle_unix_stream(
         },
     };
     write_response(&mut stream, &response)?;
+    trim_process_heap_if_supported();
     Ok(should_shutdown)
 }
 
@@ -2015,8 +2053,19 @@ fn handle_tcp_stream(
         },
     };
     write_response(&mut stream, &response)?;
+    trim_process_heap_if_supported();
     Ok(should_shutdown)
 }
+
+#[cfg(target_os = "linux")]
+fn trim_process_heap_if_supported() {
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn trim_process_heap_if_supported() {}
 
 fn send_request(endpoint: &ServerEndpoint, request: &ServerRequest) -> Result<ServerResponse> {
     match endpoint {
