@@ -329,6 +329,7 @@ struct PendingDeleteDialog {
 struct PreviewSyncFailure {
     message: String,
     retry_count: u32,
+    first_failed_at_ms: u64,
 }
 
 #[derive(Clone, PartialEq)]
@@ -992,11 +993,18 @@ impl ShellState {
                             active_session_path.as_deref(),
                         )
                 });
-        let preview_failure = active_session_path
+        let now_ms = current_millis();
+        let preview_failure_entry = active_session_path
             .as_deref()
-            .and_then(|path| self.remote_preview_failures.get(path))
-            .map(|failure| failure.message.clone());
+            .and_then(|path| self.remote_preview_failures.get(path));
+        let preview_failure =
+            preview_failure_entry.and_then(|failure| {
+                should_surface_preview_failure(failure, now_ms)
+                    .then(|| failure.message.clone())
+            });
+        let preview_failure_pending = preview_failure_entry.is_some() && preview_failure.is_none();
         let preview_loading = preview_request_in_flight
+            || preview_failure_pending
             || (preview_failure.is_none()
                 && active_session
                     .as_ref()
@@ -5782,6 +5790,10 @@ fn summarize_preview_refresh_error(error: &str) -> String {
     }
 }
 
+fn should_surface_preview_failure(failure: &PreviewSyncFailure, now_ms: u64) -> bool {
+    failure.retry_count >= 2 || now_ms.saturating_sub(failure.first_failed_at_ms) >= 6_000
+}
+
 fn spawn_remote_preview_payload_sync(
     state: Signal<ShellState>,
     session_path: String,
@@ -5837,6 +5849,11 @@ fn spawn_remote_preview_payload_sync(
                     .get(&session_path)
                     .map(|failure| failure.retry_count.saturating_add(1))
                     .unwrap_or(1);
+                let first_failed_at_ms = shell
+                    .remote_preview_failures
+                    .get(&session_path)
+                    .map(|failure| failure.first_failed_at_ms)
+                    .unwrap_or(now);
                 let backoff_ms = remote_preview_retry_backoff_ms(retry_count);
                 let retry_after_ms = now.saturating_add(backoff_ms);
                 let message = summarize_preview_refresh_error(&error.to_string());
@@ -5845,6 +5862,7 @@ fn spawn_remote_preview_payload_sync(
                     PreviewSyncFailure {
                         message: message.clone(),
                         retry_count,
+                        first_failed_at_ms,
                     },
                 );
                 shell
@@ -21797,6 +21815,25 @@ mod tests {
         assert_eq!(remote_preview_retry_backoff_ms(3), 30_000);
         assert_eq!(remote_preview_retry_backoff_ms(4), 60_000);
         assert_eq!(remote_preview_retry_backoff_ms(9), 60_000);
+    }
+
+    #[test]
+    fn preview_failure_surfaces_only_after_real_threshold() {
+        let first = PreviewSyncFailure {
+            message: "temporary".to_string(),
+            retry_count: 1,
+            first_failed_at_ms: 1_000,
+        };
+        assert!(!should_surface_preview_failure(&first, 1_500));
+        assert!(!should_surface_preview_failure(&first, 6_500));
+        assert!(should_surface_preview_failure(&first, 7_001));
+
+        let repeated = PreviewSyncFailure {
+            message: "repeated".to_string(),
+            retry_count: 2,
+            first_failed_at_ms: 1_000,
+        };
+        assert!(should_surface_preview_failure(&repeated, 1_500));
     }
 
     #[test]
