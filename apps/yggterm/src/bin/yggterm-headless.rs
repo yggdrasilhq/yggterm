@@ -6,9 +6,10 @@ use yggterm_server::{
     run_app_control_drag, run_app_control_dump_state, run_app_control_focus_window,
     run_app_control_open_path, run_app_control_remove_session, run_app_control_scroll_preview,
     run_app_control_send_terminal_input, run_app_control_set_fullscreen,
+    run_app_control_set_search,
     run_app_control_set_row_expanded, run_attach, run_daemon, run_remote_ensure_managed_cli,
-    run_remote_generation_context, run_remote_preview, run_remote_protocol_version,
-    run_remote_preview_head, run_remote_refresh_managed_cli, run_remote_resume_codex,
+    run_remote_generation_context, run_remote_preview, run_remote_preview_head,
+    run_remote_protocol_version, run_remote_refresh_managed_cli, run_remote_resume_codex,
     run_remote_scan, run_remote_stage_clipboard_png, run_remote_upsert_generated_copy,
     run_screenrecord_capture, run_screenshot_capture, run_trace_bundle, run_trace_follow,
     run_trace_tail, shutdown, status,
@@ -250,6 +251,32 @@ fn main() -> Result<()> {
                 run_app_control_set_row_expanded(row_path, args[2] == "expand", timeout_ms)
             }
             "focus" => run_app_control_focus_window(timeout_ms),
+            "search" => {
+                let action = args.get(3).map(String::as_str).unwrap_or("set");
+                match action {
+                    "set" => {
+                        let query = args
+                            .iter()
+                            .skip(4)
+                            .find(|value| !value.starts_with("--"))
+                            .map(String::as_str)
+                            .ok_or_else(|| anyhow::anyhow!("missing query for server app search set"))?;
+                        let focused = args.windows(2).find_map(|window| {
+                            if window[0] != "--focus" {
+                                return None;
+                            }
+                            match window[1].as_str() {
+                                "on" | "true" | "1" => Some(true),
+                                "off" | "false" | "0" => Some(false),
+                                _ => None,
+                            }
+                        });
+                        run_app_control_set_search(query, focused, timeout_ms)
+                    }
+                    "clear" => run_app_control_set_search("", Some(false), timeout_ms),
+                    other => anyhow::bail!("unsupported app search action: {other}"),
+                }
+            }
             "fullscreen" => {
                 let action = args
                     .iter()
