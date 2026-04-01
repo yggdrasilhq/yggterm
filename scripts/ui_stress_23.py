@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import random
+import shutil
 import shlex
 import subprocess
 import time
@@ -81,6 +82,55 @@ def run_json(host: str, command: str) -> dict:
     return json.loads(result.stdout)
 
 
+def local_yggterm_home() -> Path:
+    override = os.environ.get("YGGTERM_HOME", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".yggterm"
+
+
+def local_yggterm_path(*parts: str) -> Path:
+    return local_yggterm_home().joinpath(*parts)
+
+
+def scrub_local_runtime_artifacts(home: Path) -> None:
+    volatile_paths = [
+        home / "server-2-1-4.sock",
+        home / "client-instances",
+        home / "app-control-requests",
+        home / "app-control-responses",
+        home / "screenshot-requests",
+        home / "screenshot-responses",
+        home / "recordings",
+        home / "trace-snapshots",
+    ]
+    for path in volatile_paths:
+        try:
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            elif path.exists() or path.is_socket():
+                path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def local_x11_window_count(title: str = "Yggterm") -> int:
+    display = os.environ.get("DISPLAY", "").strip()
+    if not display or shutil.which("xwininfo") is None:
+        return 0
+    result = subprocess.run(
+        ["xwininfo", "-root", "-tree"],
+        check=False,
+        text=True,
+        capture_output=True,
+        env={**os.environ, "DISPLAY": display},
+    )
+    if result.returncode != 0:
+        return 0
+    marker = f'"{title}"'
+    return sum(1 for line in result.stdout.splitlines() if marker in line)
+
+
 def app_state(host: str, binary: str, timeout_ms: int) -> dict:
     payload = run_json(host, f"{binary} server app state --timeout-ms {timeout_ms}")
     return payload.get("data") or {}
@@ -107,7 +157,7 @@ def write_state_dump(out_dir: Path, name: str, state: dict) -> str:
 
 def server_inventory(host: str) -> dict:
     if host == "local":
-        path = Path.home() / ".yggterm" / "server-state.json"
+        path = local_yggterm_path("server-state.json")
         return json.loads(path.read_text(encoding="utf-8"))
     result = run_control(host, "cat ~/.yggterm/server-state.json")
     return json.loads(result.stdout)
@@ -115,7 +165,7 @@ def server_inventory(host: str) -> dict:
 
 def trace_events_since(host: str, start_ms: int, tail_lines: int = 4000) -> list[dict]:
     if host == "local":
-        path = Path.home() / ".yggterm" / "event-trace.jsonl"
+        path = local_yggterm_path("event-trace.jsonl")
         lines = path.read_text(encoding="utf-8").splitlines()[-tail_lines:]
     else:
         result = run_control(host, f"tail -n {tail_lines} ~/.yggterm/event-trace.jsonl")
@@ -179,7 +229,7 @@ def latest_window_spawn_event_for_pid(
 
 
 def local_client_instance_dir() -> Path:
-    return Path.home() / ".yggterm" / "client-instances"
+    return local_yggterm_path("client-instances")
 
 
 def kill_local_clients() -> None:
@@ -223,6 +273,7 @@ def kill_local_clients() -> None:
 def launch_local_client(binary: str, timeout_s: float = 3.0) -> tuple[subprocess.Popen, dict]:
     binary_path = str(Path(binary).resolve())
     kill_local_clients()
+    scrub_local_runtime_artifacts(local_yggterm_home())
     subprocess.run(
         ["bash", "-lc", f"pkill -f {shlex.quote(binary_path)} || true"],
         check=False,
@@ -232,6 +283,7 @@ def launch_local_client(binary: str, timeout_s: float = 3.0) -> tuple[subprocess
     env = os.environ.copy()
     env.setdefault("DISPLAY", ":10.0")
     env["YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF"] = "1"
+    baseline_window_count = local_x11_window_count()
     stdout_path = "/tmp/yggterm-ui-stress-launch.out"
     stderr_path = "/tmp/yggterm-ui-stress-launch.err"
     stdout = open(stdout_path, "w", encoding="utf-8")
@@ -246,6 +298,15 @@ def launch_local_client(binary: str, timeout_s: float = 3.0) -> tuple[subprocess
     )
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
+        if local_x11_window_count() > baseline_window_count:
+            return proc, {
+                "category": "startup",
+                "name": "window_spawned",
+                "payload": {
+                    "elapsed_ms": int(time.time() * 1000) - start_ms,
+                    "source": "x11_root_tree",
+                },
+            }
         event = latest_window_spawn_event_for_pid("local", proc.pid, start_ms)
         if event is not None:
             return proc, event
@@ -509,8 +570,8 @@ def open_trials(
         ready_pred = preview_ready if view == "preview" else terminal_ready
         started = time.monotonic()
         started_ms = int(time.time() * 1000)
-        app_open(args.host, args.bin, session_path, view, args.timeout_ms)
         try:
+            app_open(args.host, args.bin, session_path, view, args.timeout_ms)
             elapsed, state = wait_until(
                 f"open {session_path}",
                 args.ready_budget,
