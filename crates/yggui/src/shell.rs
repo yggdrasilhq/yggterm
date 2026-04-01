@@ -136,6 +136,7 @@ const BACKGROUND_REFRESH_NOTICE_MS: u64 = 12_000;
 const BACKGROUND_REFRESH_STARTUP_DEFER_MS: u64 = 20_000;
 const BACKGROUND_REFRESH_INTERACTIVE_DEFER_MS: u64 = 15_000;
 const BACKGROUND_REFRESH_POLL_MS: u64 = 1_000;
+const REMOTE_PREVIEW_NO_TARGET_RETRY_MS: u64 = 1_500;
 const THEME_EDITOR_PAD_SIZE: f64 = 286.0;
 const SEARCH_INPUT_ID: &str = "yggterm-search-input";
 const PREVIEW_HEADER_SEARCH_HIT_ID: &str = "__preview_header__";
@@ -401,6 +402,21 @@ struct RenderSnapshot {
 }
 
 type SharedSnapshot = Arc<RenderSnapshot>;
+
+fn active_viewport_zoom_label(snapshot: &RenderSnapshot) -> String {
+    match snapshot.active_view_mode {
+        WorkspaceViewMode::Terminal => "Terminal Zoom".to_string(),
+        WorkspaceViewMode::Rendered => snapshot
+            .selected_row
+            .as_ref()
+            .and_then(|row| row.document_kind)
+            .map(|kind| match kind {
+                yggterm_core::WorkspaceDocumentKind::Note => "Paper Zoom".to_string(),
+                yggterm_core::WorkspaceDocumentKind::TerminalRecipe => "Recipe Zoom".to_string(),
+            })
+            .unwrap_or_else(|| "Preview Zoom".to_string()),
+    }
+}
 
 #[derive(Clone, PartialEq, Eq)]
 struct SearchCommandSuggestion {
@@ -1355,6 +1371,7 @@ impl ShellState {
             Ok((snapshot, message)) => {
                 self.server.apply_snapshot(snapshot);
                 self.restore_active_preview_if_snapshot_regressed(previous_active_session);
+                self.mark_active_remote_preview_dirty_if_needed();
                 self.prune_terminal_attach_in_flight();
                 self.hydrate_generated_copy_from_remote_cache();
                 self.needs_initial_server_sync = false;
@@ -1401,6 +1418,7 @@ impl ShellState {
                 let snapshot = self.reconcile_snapshot_for_request(request_id, snapshot);
                 self.server.apply_snapshot(snapshot);
                 self.restore_active_preview_if_snapshot_regressed(previous_active_session);
+                self.mark_active_remote_preview_dirty_if_needed();
                 self.prune_terminal_attach_in_flight();
                 self.hydrate_generated_copy_from_remote_cache();
                 self.finish_busy_request_for(request_id);
@@ -1456,6 +1474,23 @@ impl ShellState {
             previous_active_session.preview,
             previous_active_session.rendered_sections,
         );
+    }
+
+    fn mark_active_remote_preview_dirty_if_needed(&mut self) {
+        if self.server.active_view_mode() != WorkspaceViewMode::Rendered {
+            return;
+        }
+        let Some(session) = self.server.active_session().cloned() else {
+            return;
+        };
+        if !session.session_path.starts_with("remote-session://") {
+            return;
+        }
+        if !remote_preview_needs_refresh(&session) {
+            return;
+        }
+        self.remote_preview_dirty_epoch
+            .insert(session.session_path, current_millis());
     }
 
     fn seed_dynamic_top_level_expansions(&mut self) {
@@ -5683,6 +5718,21 @@ fn remote_preview_retry_backoff_ms(retry_count: u32) -> u64 {
     }
 }
 
+fn schedule_remote_preview_retry_tick(
+    state: Signal<ShellState>,
+    session_path: String,
+    delay_ms: u64,
+) {
+    spawn(async move {
+        sleep(Duration::from_millis(delay_ms)).await;
+        let _ = safe_shell_mut(state, "remote_preview_retry_tick", |shell| {
+            shell
+                .remote_preview_dirty_epoch
+                .insert(session_path.clone(), current_millis());
+        });
+    });
+}
+
 fn summarize_preview_refresh_error(error: &str) -> String {
     let trimmed = error.trim();
     if trimmed.contains("Connection refused") || trimmed.contains("No such file or directory") {
@@ -5765,20 +5815,11 @@ fn spawn_remote_preview_payload_sync(
                     .insert(session_path.clone(), retry_after_ms);
                 shell.last_action = format!("preview refresh failed: {message}");
                 if retry_count <= 4 {
-                    let retry_state = state;
-                    let retry_session_path = retry_session_path.clone();
-                    spawn(async move {
-                        sleep(Duration::from_millis(backoff_ms)).await;
-                        let _ = safe_shell_mut(
-                            retry_state,
-                            "remote_preview_sync_retry_tick",
-                            |shell| {
-                                shell
-                                    .remote_preview_dirty_epoch
-                                    .insert(retry_session_path.clone(), current_millis());
-                            },
-                        );
-                    });
+                    schedule_remote_preview_retry_tick(
+                        state,
+                        retry_session_path.clone(),
+                        backoff_ms,
+                    );
                 }
             }
         });
@@ -12348,7 +12389,7 @@ fn app() -> Element {
     let terminal_mount_epoch = use_signal(|| 0_u64);
     let async_render_epoch = use_signal(|| 0_u64);
     let mut last_open_recovery_path = use_signal(|| None::<String>);
-    let mut last_preview_refresh_marker = use_signal(|| None::<(String, u64)>);
+    let mut last_preview_refresh_marker = use_signal(|| None::<(String, u64, bool)>);
     let mut last_sidebar_autoscroll_path = use_signal(|| None::<String>);
     let schedule_ui_update = schedule_update();
     #[cfg(target_os = "macos")]
@@ -12916,19 +12957,21 @@ fn app() -> Element {
             return;
         }
         let needs_refresh = remote_preview_needs_refresh(&session);
-        let refresh_marker = (session.session_path.clone(), dirty_epoch);
+        let refresh_marker = (session.session_path.clone(), dirty_epoch, needs_refresh);
         if *last_preview_refresh_marker.read() == Some(refresh_marker.clone()) {
             return;
         }
-        state.with_mut(|shell| {
-            shell.record_preview_issue_telemetry(if needs_refresh {
-                "preview_refresh_request_placeholder"
-            } else {
-                "preview_refresh_request_active"
-            })
-        });
-        last_preview_refresh_marker.set(Some(refresh_marker));
-        if remote_preview_fetch_target(&state.read().server, &session).is_some() {
+        let has_fetch_target =
+            remote_preview_fetch_target(&state.read().server, &session).is_some();
+        if has_fetch_target {
+            state.with_mut(|shell| {
+                shell.record_preview_issue_telemetry(if needs_refresh {
+                    "preview_refresh_request_placeholder"
+                } else {
+                    "preview_refresh_request_active"
+                })
+            });
+            last_preview_refresh_marker.set(Some(refresh_marker));
             spawn_remote_preview_payload_sync(
                 state,
                 session.session_path.clone(),
@@ -12939,9 +12982,24 @@ fn app() -> Element {
                 },
             );
         } else if needs_refresh {
-            state.with_mut(|shell| {
-                shell.record_preview_issue_telemetry("preview_refresh_no_target")
+            let scheduled = state.with_mut(|shell| {
+                shell.record_preview_issue_telemetry("preview_refresh_no_target");
+                schedule_remote_preview_sync(
+                    shell,
+                    &session.session_path,
+                    REMOTE_PREVIEW_NO_TARGET_RETRY_MS,
+                )
             });
+            if scheduled {
+                schedule_remote_preview_retry_tick(
+                    state,
+                    session.session_path.clone(),
+                    REMOTE_PREVIEW_NO_TARGET_RETRY_MS,
+                );
+            }
+            last_preview_refresh_marker.set(None);
+        } else {
+            last_preview_refresh_marker.set(Some(refresh_marker));
         }
     });
     use_effect(move || {
@@ -19282,10 +19340,13 @@ fn SettingsRailBody(
     } else {
         snapshot.settings.terminal_theme_name.clone()
     };
+    let main_zoom_label = active_viewport_zoom_label(&snapshot);
     rsx! {
-        RailHeader { title: "Interface Settings".to_string(), color: snapshot.palette.text.to_string() }
+        RailHeader { title: "Settings".to_string(), color: snapshot.palette.text.to_string() }
         RailScrollBody {
             content: rsx!{
+            div {
+                style: "display:flex; flex-direction:column; gap:12px; padding-bottom:8px;",
             MetadataGroup {
                 title: "Install".to_string(),
                 entries: vec![
@@ -19358,7 +19419,7 @@ fn SettingsRailBody(
                 on_increase: move |_| on_adjust_ui_zoom.call(1),
             }
             ZoomSettingRow {
-                label: "Terminal Zoom".to_string(),
+                label: main_zoom_label,
                 percent: zoom_percent(snapshot.settings.terminal_font_size, 10.0),
                 palette: snapshot.palette,
                 on_decrease: move |_| on_adjust_main_zoom.call(-1),
@@ -19431,6 +19492,7 @@ fn SettingsRailBody(
                     ],
                     palette: snapshot.palette,
                 }
+            }
             }
             }
         }
@@ -20338,7 +20400,7 @@ fn SettingsField(
 ) -> Element {
     rsx! {
         div {
-            style: "display:flex; flex-direction:column; gap:6px;",
+            style: "display:flex; flex-direction:column; gap:4px;",
             div {
                 style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", palette.muted),
                 "{label}"
@@ -20365,7 +20427,7 @@ fn ThemeSettingsSection(
 ) -> Element {
     rsx! {
         div {
-            style: "display:flex; flex-direction:column; gap:8px;",
+            style: "display:flex; flex-direction:column; gap:6px;",
             div {
                 style: "display:flex; align-items:center; justify-content:space-between; gap:8px;",
                 div {
@@ -20379,7 +20441,7 @@ fn ThemeSettingsSection(
             }
             div {
                 style: format!(
-                    "display:flex; flex-direction:column; gap:10px; padding:10px; border-radius:14px; \
+                    "display:flex; flex-direction:column; gap:8px; padding:9px; border-radius:14px; \
                      background:rgba(255,255,255,0.56); box-shadow: inset 0 0 0 1px rgba(196,214,228,0.42);"
                 ),
                 div {
@@ -20424,7 +20486,7 @@ fn NotificationSettingsSection(
 ) -> Element {
     rsx! {
         div {
-            style: "display:flex; flex-direction:column; gap:8px;",
+            style: "display:flex; flex-direction:column; gap:6px;",
             div {
                 style: "display:flex; align-items:center; justify-content:space-between; gap:8px;",
                 div {
@@ -20438,7 +20500,7 @@ fn NotificationSettingsSection(
             }
             div {
                 style: format!(
-                    "display:flex; flex-direction:column; gap:10px; padding:10px; border-radius:14px; \
+                    "display:flex; flex-direction:column; gap:8px; padding:9px; border-radius:14px; \
                      background:rgba(255,255,255,0.56); box-shadow: inset 0 0 0 1px rgba(196,214,228,0.42);"
                 ),
                 div {
@@ -20502,14 +20564,14 @@ fn ZoomSettingRow(
 ) -> Element {
     rsx! {
         div {
-            style: "display:flex; flex-direction:column; gap:6px;",
+            style: "display:flex; flex-direction:column; gap:4px;",
             div {
                 style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", palette.muted),
                 "{label}"
             }
             div {
                 style: format!(
-                    "display:flex; align-items:center; justify-content:space-between; height:32px; padding:0 6px; \
+                    "display:flex; align-items:center; justify-content:space-between; height:30px; padding:0 6px; \
                      border:none; border-radius:10px; background:rgba(255,255,255,0.58); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.34);"
                 ),
                 button {
@@ -20541,14 +20603,14 @@ fn TerminalThemeSettingRow(
     let mut open = use_signal(|| false);
     rsx! {
         div {
-            style: "display:flex; flex-direction:column; gap:6px; position:relative;",
+            style: "display:flex; flex-direction:column; gap:4px; position:relative;",
             div {
                 style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", palette.muted),
                 "Terminal Theme"
             }
             button {
                 style: format!(
-                    "width:100%; height:34px; border:none; border-radius:10px; padding:0 10px; \
+                    "width:100%; height:32px; border:none; border-radius:10px; padding:0 10px; \
                      background:rgba(255,255,255,0.72); color:{}; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.34); \
                      font-size:12px; font-weight:600; display:flex; align-items:center; justify-content:space-between; gap:10px;",
                     palette.text
@@ -20609,11 +20671,11 @@ fn TerminalThemeSettingRow(
 fn MetadataGroup(title: String, entries: Vec<SessionMetadataEntry>, palette: Palette) -> Element {
     rsx! {
         div {
-            style: "display:flex; flex-direction:column; gap:8px; padding-bottom:10px;",
+            style: "display:flex; flex-direction:column; gap:6px; padding-bottom:4px;",
             RailSectionTitle { title: title, muted_color: palette.muted.to_string() }
             for entry in entries.into_iter() {
                 div {
-                    style: "display:flex; flex-direction:column; gap:4px;",
+                    style: "display:flex; flex-direction:column; gap:2px;",
                     span {
                         style: format!(
                             "font-size:11px; font-weight:600; color:{}; text-rendering:optimizeLegibility; \
