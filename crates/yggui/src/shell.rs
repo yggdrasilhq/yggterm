@@ -31,7 +31,7 @@ use dioxus::desktop::{
 use dioxus::document;
 use dioxus::html::{InteractionElementOffset, input_data::MouseButton};
 use dioxus::prelude::*;
-use dioxus_core::schedule_update;
+use dioxus_core::{schedule_update, spawn_forever};
 use dioxus_desktop::UserWindowEvent as DesktopUserWindowEvent;
 use keyboard_types::{Key, Modifiers};
 use once_cell::sync::OnceCell;
@@ -72,13 +72,14 @@ use yggterm_core::{
 };
 use yggterm_platform::{DockRect, send_user_notification};
 use yggterm_server::{
-    AppControlCommand, AppControlDragCommand, AppControlDragPlacement, AppControlResponse,
-    AppControlViewMode, GhosttyTerminalHostMode, ManagedSessionView, PreviewTone,
-    RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession,
-    ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry,
-    SessionPreviewBlock, SessionRenderedSection, SshConnectTarget, TerminalBackend,
-    WorkspaceViewMode, YGG_LOADING_NOTIFICATION_AFTER_MS, YggOperationPriority, YggRequestMeta,
-    YggSurface, YggTarget, YggtermServer, app_control_requests_pending,
+    AppControlCommand, AppControlDragCommand, AppControlDragPlacement, AppControlPreviewLayout,
+    AppControlResponse, AppControlViewMode, GhosttyTerminalHostMode, ManagedSessionView,
+    PreviewTone, RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot,
+    RemoteScannedSession, ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind,
+    SessionMetadataEntry, SessionPreviewBlock, SessionRenderedSection, SshConnectTarget,
+    TerminalBackend, WorkspaceViewMode, YGG_LOADING_NOTIFICATION_AFTER_MS,
+    YggOperationPriority, YggRequestMeta, YggSurface, YggTarget, YggtermServer,
+    app_control_requests_pending,
     cleanup_legacy_daemons, complete_app_control_request, connect_ssh_custom,
     fetch_remote_generation_context, focus_live_with_view, open_remote_session_with_view,
     open_stored_session, open_stored_session_with_view, persist_remote_generated_copy, ping,
@@ -11013,6 +11014,35 @@ async fn process_pending_app_control_requests(
                 error: None,
             }
         }
+        AppControlCommand::SetPreviewLayout { layout } => {
+            let layout_mode = match layout {
+                AppControlPreviewLayout::Chat => PreviewLayoutMode::Chat,
+                AppControlPreviewLayout::Graph => PreviewLayoutMode::Graph,
+            };
+            let _ = safe_shell_mut(state, "app_control_set_preview_layout", |shell| {
+                shell.set_preview_layout(layout_mode);
+            });
+            sleep(Duration::from_millis(40)).await;
+            let dom_snapshot = capture_dom_debug_snapshot_for(active_session_path.as_deref()).await;
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(json!({
+                    "command": "set_preview_layout",
+                    "layout": match layout_mode {
+                        PreviewLayoutMode::Chat => "chat",
+                        PreviewLayoutMode::Graph => "graph",
+                    },
+                    "window": describe_window(&desktop),
+                    "active_view_mode": format!("{:?}", state.read().server.active_view_mode()),
+                    "active_session_path": state.read().server.active_session_path(),
+                    "dom": dom_snapshot,
+                })),
+                error: None,
+            }
+        }
         AppControlCommand::CaptureScreenRecording {
             output_path,
             duration_secs,
@@ -11047,6 +11077,23 @@ async fn process_pending_app_control_requests(
                 if shell.fullscreen != enabled {
                     shell.toggle_fullscreen();
                 }
+            });
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(json!({
+                    "enabled": enabled,
+                    "window": describe_window(&desktop),
+                })),
+                error: None,
+            }
+        }
+        AppControlCommand::SetMaximized { enabled } => {
+            state.with_mut(|shell| {
+                window().set_maximized(enabled);
+                shell.maximized = enabled;
             });
             AppControlResponse {
                 request_id: request.request_id.clone(),
@@ -12393,7 +12440,7 @@ fn app() -> Element {
             let mut app_control_drain_in_flight = app_control_drain_in_flight;
             let mut app_control_drain_started_ms = app_control_drain_started_ms;
             let window_spawn_traced = window_spawn_traced;
-            spawn(async move {
+            spawn_forever(async move {
                 let trace_home = perf_home_dir(&settings_path);
                 append_trace_event(
                     &trace_home,
