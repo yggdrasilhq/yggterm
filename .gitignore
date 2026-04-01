@@ -5,3 +5,4 @@ run.log
 *.swp
 *.swo
 .DS_Store
+__pycache__/
