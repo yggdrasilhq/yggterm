@@ -4232,7 +4232,6 @@ fn maybe_spawn_missing_remote_machine_refreshes(state: Signal<ShellState>) {
         "maybe_spawn_missing_remote_machine_refreshes_gate",
         |shell| {
             terminal_attach_blocks_background_work(shell)
-                || background_refreshes_deferred(shell)
                 || interactive_surface_request_in_flight(shell)
         },
     )
@@ -4245,7 +4244,6 @@ fn maybe_spawn_missing_remote_machine_refreshes(state: Signal<ShellState>) {
         "maybe_spawn_missing_remote_machine_refreshes_read",
         |shell| {
             if terminal_attach_blocks_background_work(shell)
-                || background_refreshes_deferred(shell)
                 || interactive_surface_request_in_flight(shell)
             {
                 return Vec::new();
