@@ -1757,31 +1757,37 @@ impl YggtermServer {
             prefix: machine.prefix.clone(),
             cwd: cwd.map(ToOwned::to_owned),
         };
-        let resolved_remote_launch = if launch_terminal {
+        let cached_remote_launch = self.cached_remote_launch_for_target(
+            &target.ssh_target,
+            target.prefix.as_deref(),
+        );
+        let resolved_remote_launch = if launch_terminal && cached_remote_launch.is_none() {
             resolve_remote_yggterm_binary(&target.ssh_target, target.prefix.as_deref()).ok()
         } else {
             None
         };
-        let (remote_binary, remote_deploy_state) =
-            if let Some((remote_binary, remote_deploy_state)) = resolved_remote_launch.clone() {
-                (remote_binary, remote_deploy_state)
-            } else if launch_terminal {
-                (
-                    preferred_remote_binary_fallback(),
-                    RemoteDeployState::Planned,
-                )
-            } else {
-                machine
-                    .remote_binary_expr
-                    .clone()
-                    .map(|binary_expr| (binary_expr, machine.remote_deploy_state))
-                    .unwrap_or_else(|| {
-                        (
-                            preferred_remote_binary_fallback(),
-                            machine.remote_deploy_state,
-                        )
-                    })
-            };
+        let (remote_binary, remote_deploy_state) = cached_remote_launch
+            .clone()
+            .or_else(|| resolved_remote_launch.clone())
+            .unwrap_or_else(|| {
+                if launch_terminal {
+                    (
+                        preferred_remote_binary_fallback(),
+                        RemoteDeployState::Planned,
+                    )
+                } else {
+                    machine
+                        .remote_binary_expr
+                        .clone()
+                        .map(|binary_expr| (binary_expr, machine.remote_deploy_state))
+                        .unwrap_or_else(|| {
+                            (
+                                preferred_remote_binary_fallback(),
+                                machine.remote_deploy_state,
+                            )
+                        })
+                }
+            });
         if let Some((remote_binary_expr, remote_deploy_state)) = resolved_remote_launch {
             self.promote_remote_machine_health(
                 &machine_key,
@@ -3248,6 +3254,28 @@ fn emit_terminal_snapshot(bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn emit_remote_multiplexer_snapshot_with_retry(
+    multiplexer: RemoteMultiplexer,
+    session_name: &str,
+    wait_budget: Duration,
+) -> anyhow::Result<bool> {
+    let deadline = Instant::now() + wait_budget;
+    loop {
+        let bytes = match multiplexer {
+            RemoteMultiplexer::Tmux => tmux_snapshot_bytes(session_name)?,
+            RemoteMultiplexer::Screen => screen_snapshot_bytes(session_name)?,
+        };
+        if !bytes.is_empty() {
+            emit_terminal_snapshot(&bytes)?;
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    }
+}
+
 fn remote_ssh_launch_command(
     ssh_target: &str,
     prefix: Option<&str>,
@@ -3269,38 +3297,7 @@ fn remote_ssh_launch_command(
         Some(prefix) => format!("{prefix} && {inner}"),
         None => inner,
     };
-    if cfg!(windows) {
-        return format!("ssh -tt {} {}", ssh_target, shell_single_quote(&remote));
-    }
-    let control_dir = local_ssh_control_dir();
-    let control_dir_str = control_dir.to_string_lossy();
-    let ssh = format!(
-        "ssh -o ControlMaster=auto -o ControlPersist=60 -o ControlPath={} -tt {} {}",
-        shell_single_quote(&format!("{control_dir_str}/%C")),
-        ssh_target,
-        shell_single_quote(&remote)
-    );
-    format!(
-        "mkdir -p {} >/dev/null 2>&1 && {ssh}",
-        shell_single_quote(&control_dir_str)
-    )
-}
-
-fn local_ssh_control_dir() -> PathBuf {
-    let home = resolve_yggterm_home().unwrap_or_else(|_| {
-        std::env::var_os("YGGTERM_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".yggterm")))
-            .unwrap_or_else(|| PathBuf::from(".yggterm"))
-    });
-    if cfg!(windows) {
-        return home.join("ssh-control");
-    }
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    home.hash(&mut hasher);
-    let suffix = format!("{:016x}", hasher.finish());
-    std::env::temp_dir().join(format!("yt-ssh-{suffix}"))
+    format!("ssh -tt {} {}", ssh_target, shell_single_quote(&remote))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -5655,15 +5652,17 @@ pub fn run_remote_resume_codex(session_id: &str, cwd: Option<&str>) -> anyhow::R
                 "saved_session_exists": saved_session_exists,
                 "mode": if saved_session_exists { "resume" } else { "resume_picker" },
             }));
+            let _ = emit_remote_multiplexer_snapshot_with_retry(
+                multiplexer,
+                &session_name,
+                Duration::from_millis(800),
+            );
         } else {
-            if matches!(multiplexer, RemoteMultiplexer::Tmux) {
-                let _ = tmux_snapshot_bytes(&session_name)
-                    .and_then(|bytes| emit_terminal_snapshot(&bytes));
-            }
-            if matches!(multiplexer, RemoteMultiplexer::Screen) {
-                let _ = screen_snapshot_bytes(&session_name)
-                    .and_then(|bytes| emit_terminal_snapshot(&bytes));
-            }
+            let _ = emit_remote_multiplexer_snapshot_with_retry(
+                multiplexer,
+                &session_name,
+                Duration::from_millis(120),
+            );
             finish_span(serde_json::json!({
                 "session_id": session_id,
                 "cwd": cwd,
@@ -8725,62 +8724,21 @@ mod tests {
 
     #[test]
     fn remote_ssh_launch_command_wraps_binary_args_and_prefix() {
-        let previous_home = std::env::var_os(yggterm_core::ENV_YGGTERM_HOME);
-        unsafe {
-            std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, "/tmp/yggterm-test-home");
-        }
         let command = remote_ssh_launch_command(
             "jojo",
             Some("tmux new-session -A -s yggterm"),
             "$HOME/.yggterm/bin/yggterm",
             &["server", "remote", "resume-codex", "abc123", "/srv/app"],
         );
-        let expected_control_dir = crate::local_ssh_control_dir();
-        match previous_home {
-            Some(previous_home) => unsafe {
-                std::env::set_var(yggterm_core::ENV_YGGTERM_HOME, previous_home);
-            },
-            None => unsafe {
-                std::env::remove_var(yggterm_core::ENV_YGGTERM_HOME);
-            },
-        }
-        let expected_control_dir = expected_control_dir.to_string_lossy();
-        assert!(command.starts_with(&format!(
-            "mkdir -p '{}' >/dev/null 2>&1 && ssh ",
-            expected_control_dir
-        )));
-        assert!(command.contains("-o ControlMaster=auto"));
-        assert!(command.contains("-o ControlPersist=60"));
-        assert!(command.contains(&format!("-o ControlPath='{}/%C'", expected_control_dir)));
-        assert!(!command.contains("$HOME/.yggterm/ssh-control"));
+        assert!(command.starts_with("ssh -tt jojo "));
         assert!(command.contains("-tt jojo "));
         assert!(command.contains("tmux new-session -A -s yggterm &&"));
         assert!(command.contains("$HOME/.yggterm/bin/yggterm"));
         assert!(command.contains("'resume-codex'"));
         assert!(command.contains("'/srv/app'"));
         assert!(!command.contains("YGGTERM_HOME"));
-    }
-
-    #[test]
-    fn local_ssh_control_dir_is_short_and_temp_rooted_on_unix() {
-        let control_dir = crate::local_ssh_control_dir();
-        if cfg!(windows) {
-            assert!(control_dir.ends_with("ssh-control"));
-            return;
-        }
-        assert!(control_dir.starts_with(std::env::temp_dir()));
-        assert!(
-            control_dir
-                .file_name()
-                .and_then(|value| value.to_str())
-                .is_some_and(|value| value.starts_with("yt-ssh-"))
-        );
-        assert!(
-            !control_dir
-                .to_string_lossy()
-                .contains(".yggterm/ssh-control")
-        );
-        assert!(control_dir.to_string_lossy().len() < 64);
+        assert!(!command.contains("ControlMaster"));
+        assert!(!command.contains("ControlPath"));
     }
 
     #[test]
