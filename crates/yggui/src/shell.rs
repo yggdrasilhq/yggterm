@@ -46,7 +46,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tao::event::ElementState;
 use tao::event::Event as TaoEvent;
 use tao::keyboard::Key as TaoKey;
@@ -65,10 +65,11 @@ use tracing::{info, warn};
 use yggterm_core::{
     AgentSessionProfile, AppSettings, BrowserRow, BrowserRowKind, InstallContext, PerfSpan,
     SessionBrowserState, SessionNode, SessionStore, UiTheme, WorkspaceDocumentInput,
-    WorkspaceDocumentKind, WorkspaceGroupKind, YgguiThemeSpec, append_trace_event,
-    check_for_update, install_release_update, looks_like_generated_fallback_title,
-    looks_like_low_signal_generated_copy, read_codex_session_identity_fields, resolve_yggterm_home,
-    save_settings_file, unique_session_short_ids_for_pairs, update_command_hint,
+    WorkspaceDocumentKind, WorkspaceGroupKind, YgguiThemeSpec, append_perf_event,
+    append_trace_event, check_for_update, install_release_update,
+    looks_like_generated_fallback_title, looks_like_low_signal_generated_copy,
+    read_codex_session_identity_fields, resolve_yggterm_home, save_settings_file,
+    unique_session_short_ids_for_pairs, update_command_hint,
 };
 use yggterm_platform::{DockRect, send_user_notification};
 use yggterm_server::{
@@ -867,7 +868,13 @@ impl ShellState {
         } else {
             expanded_paths.clone()
         };
-        let mut merged_rows = merged_sidebar_rows(
+        let mut merged_rows = merged_sidebar_rows_traced(
+            &self.bootstrap.settings_path,
+            if search_active {
+                "snapshot_search"
+            } else {
+                "snapshot"
+            },
             &stored_rows,
             self.server.remote_machines(),
             self.server.ssh_targets(),
@@ -1132,7 +1139,9 @@ impl ShellState {
             &live_sessions,
             &expanded_paths,
         );
-        let mut rows = merged_sidebar_rows(
+        let mut rows = merged_sidebar_rows_traced(
+            &self.bootstrap.settings_path,
+            "current_search_sidebar_matches",
             &stored_rows,
             self.server.remote_machines(),
             self.server.ssh_targets(),
@@ -1603,22 +1612,9 @@ impl ShellState {
                     && !active_cwd.trim().is_empty()
                 {
                     paths.extend(
-                        compressed_remote_folder_paths(
-                            &SidebarRemoteMachine {
-                                key: machine.machine_key.clone(),
-                                label: machine.label.clone(),
-                                health: match machine.health {
-                                    RemoteMachineHealth::Healthy => MachineHealth::Healthy,
-                                    RemoteMachineHealth::Cached => MachineHealth::Cached,
-                                    RemoteMachineHealth::Offline => MachineHealth::Offline,
-                                },
-                                remote_deploy_state: machine.remote_deploy_state,
-                                scanned_sessions: machine.sessions.clone(),
-                            },
-                            &active_cwd,
-                        )
-                        .into_iter()
-                        .map(|path| format!("__remote_folder__/{machine_key}{path}")),
+                        compressed_remote_folder_paths(&machine.sessions, &active_cwd)
+                            .into_iter()
+                            .map(|path| format!("__remote_folder__/{machine_key}{path}")),
                     );
                 }
             }
@@ -1650,22 +1646,9 @@ impl ShellState {
                     .unwrap_or_default()
             });
             paths.extend(
-                compressed_remote_folder_paths(
-                    &SidebarRemoteMachine {
-                        key: machine.machine_key.clone(),
-                        label: machine.label.clone(),
-                        health: match machine.health {
-                            RemoteMachineHealth::Healthy => MachineHealth::Healthy,
-                            RemoteMachineHealth::Cached => MachineHealth::Cached,
-                            RemoteMachineHealth::Offline => MachineHealth::Offline,
-                        },
-                        remote_deploy_state: machine.remote_deploy_state,
-                        scanned_sessions: machine.sessions.clone(),
-                    },
-                    &cwd,
-                )
-                .into_iter()
-                .map(|path| format!("__remote_folder__/{machine_key}{path}")),
+                compressed_remote_folder_paths(&machine.sessions, &cwd)
+                    .into_iter()
+                    .map(|path| format!("__remote_folder__/{machine_key}{path}")),
             );
         } else {
             let cwd = active_cwd.unwrap_or_default();
@@ -5074,7 +5057,9 @@ fn resolve_app_control_row(shell: &ShellState, session_path: &str) -> Option<Bro
         &shell.server.live_sessions(),
         &shell.browser.expanded_path_set(),
     );
-    let mut merged_rows = merged_sidebar_rows(
+    let mut merged_rows = merged_sidebar_rows_traced(
+        &shell.bootstrap.settings_path,
+        "resolve_app_control_row",
         &stored_rows,
         shell.server.remote_machines(),
         shell.server.ssh_targets(),
@@ -6265,17 +6250,21 @@ fn sidebar_merge_cache_key(
             RemoteMachineHealth::Offline => 3_u8,
         }
         .hash(&mut hasher);
+        match machine.remote_deploy_state {
+            RemoteDeployState::NotRequired => 1_u8,
+            RemoteDeployState::Planned => 2_u8,
+            RemoteDeployState::CopyingBinary => 3_u8,
+            RemoteDeployState::Ready => 4_u8,
+        }
+        .hash(&mut hasher);
+        machine.sessions.len().hash(&mut hasher);
         for session in &machine.sessions {
             session.session_path.hash(&mut hasher);
             session.session_id.hash(&mut hasher);
             session.cwd.hash(&mut hasher);
             session.started_at.hash(&mut hasher);
             session.modified_epoch.hash(&mut hasher);
-            session.event_count.hash(&mut hasher);
-            session.user_message_count.hash(&mut hasher);
-            session.assistant_message_count.hash(&mut hasher);
             session.title_hint.hash(&mut hasher);
-            session.storage_path.hash(&mut hasher);
             0xfd_u8.hash(&mut hasher);
         }
         0xfc_u8.hash(&mut hasher);
@@ -6289,12 +6278,22 @@ fn sidebar_merge_cache_key(
     }
     for session in live_sessions {
         session.session_path.hash(&mut hasher);
+        session.id.hash(&mut hasher);
         session.title.hash(&mut hasher);
+        match session.kind {
+            SessionKind::Codex => 1_u8,
+            SessionKind::CodexLiteLlm => 2_u8,
+            SessionKind::Shell => 3_u8,
+            SessionKind::SshShell => 4_u8,
+            SessionKind::Document => 5_u8,
+        }
+        .hash(&mut hasher);
         session.host_label.hash(&mut hasher);
         session.ssh_target.hash(&mut hasher);
         session.ssh_prefix.hash(&mut hasher);
-        session.preview.blocks.len().hash(&mut hasher);
-        session.metadata.len().hash(&mut hasher);
+        metadata_value(session, "Path").hash(&mut hasher);
+        metadata_value(session, "Target").hash(&mut hasher);
+        metadata_value(session, "Cwd").hash(&mut hasher);
         0xfa_u8.hash(&mut hasher);
     }
     let mut expanded = expanded_paths.iter().collect::<Vec<_>>();
@@ -7163,6 +7162,7 @@ fn search_expanded_paths(
                 health: MachineHealth::Cached,
                 remote_deploy_state: RemoteDeployState::Planned,
                 scanned_sessions: Vec::new(),
+                needs_resort: false,
             });
     }
     for machine in remote_machines {
@@ -7178,6 +7178,7 @@ fn search_expanded_paths(
                 },
                 remote_deploy_state: machine.remote_deploy_state,
                 scanned_sessions: machine.sessions.clone(),
+                needs_resort: false,
             },
         );
     }
@@ -7185,7 +7186,7 @@ fn search_expanded_paths(
     for machine in machine_rows.into_values() {
         expanded.insert(format!("__remote_machine__/{}", machine.key));
         for session in &machine.scanned_sessions {
-            for path in compressed_remote_folder_paths(&machine, &session.cwd) {
+            for path in compressed_remote_folder_paths(&machine.scanned_sessions, &session.cwd) {
                 expanded.insert(format!("__remote_folder__/{}{}", machine.key, path));
             }
         }
@@ -7602,6 +7603,12 @@ fn merged_sidebar_rows(
     live_sessions: &[ManagedSessionView],
     expanded_paths: &HashSet<String>,
 ) -> Vec<BrowserRow> {
+    let remote_session_count = remote_machines
+        .iter()
+        .map(|machine| machine.sessions.len())
+        .sum::<usize>();
+    let total_started_at = Instant::now();
+    let key_started_at = Instant::now();
     let key = sidebar_merge_cache_key(
         stored_rows,
         remote_machines,
@@ -7609,16 +7616,35 @@ fn merged_sidebar_rows(
         live_sessions,
         expanded_paths,
     );
+    let key_ms = key_started_at.elapsed().as_secs_f64() * 1000.0;
+    let cache_lookup_started_at = Instant::now();
     if let Ok(mut cache) = sidebar_merge_cache().lock() {
         if let Some(hit) = cache.entries.get(&key).cloned() {
             if let Some(ix) = cache.order.iter().position(|existing| *existing == key) {
                 cache.order.remove(ix);
             }
             cache.order.push_back(key);
+            maybe_record_sidebar_merge_breakdown(
+                remote_session_count,
+                json!({
+                    "cache_hit": true,
+                    "key_ms": key_ms,
+                    "cache_lookup_ms": cache_lookup_started_at.elapsed().as_secs_f64() * 1000.0,
+                    "uncached_ms": 0.0,
+                    "total_ms": total_started_at.elapsed().as_secs_f64() * 1000.0,
+                    "stored_row_count": stored_rows.len(),
+                    "merged_row_count": hit.len(),
+                    "expanded_path_count": expanded_paths.len(),
+                    "live_session_count": live_sessions.len(),
+                    "ssh_target_count": ssh_targets.len(),
+                }),
+            );
             return hit;
         }
     }
+    let cache_lookup_ms = cache_lookup_started_at.elapsed().as_secs_f64() * 1000.0;
 
+    let uncached_started_at = Instant::now();
     let rows = merged_sidebar_rows_uncached(
         stored_rows,
         remote_machines,
@@ -7626,6 +7652,7 @@ fn merged_sidebar_rows(
         live_sessions,
         expanded_paths,
     );
+    let uncached_ms = uncached_started_at.elapsed().as_secs_f64() * 1000.0;
 
     if let Ok(mut cache) = sidebar_merge_cache().lock() {
         cache.entries.insert(key, rows.clone());
@@ -7640,6 +7667,96 @@ fn merged_sidebar_rows(
         }
     }
 
+    maybe_record_sidebar_merge_breakdown(
+        remote_session_count,
+        json!({
+            "cache_hit": false,
+            "key_ms": key_ms,
+            "cache_lookup_ms": cache_lookup_ms,
+            "uncached_ms": uncached_ms,
+            "total_ms": total_started_at.elapsed().as_secs_f64() * 1000.0,
+            "stored_row_count": stored_rows.len(),
+            "merged_row_count": rows.len(),
+            "expanded_path_count": expanded_paths.len(),
+            "live_session_count": live_sessions.len(),
+            "ssh_target_count": ssh_targets.len(),
+        }),
+    );
+
+    rows
+}
+
+fn maybe_record_sidebar_merge_breakdown(remote_session_count: usize, payload: Value) {
+    let total_ms = payload
+        .get("total_ms")
+        .and_then(Value::as_f64)
+        .unwrap_or_default();
+    if remote_session_count < 500 && total_ms < 4.0 {
+        return;
+    }
+    let Ok(home) = resolve_yggterm_home() else {
+        return;
+    };
+    append_perf_event(&home, "sidebar", "merge_rows_breakdown", payload);
+}
+
+fn merged_sidebar_rows_traced(
+    settings_path: &Path,
+    source: &str,
+    stored_rows: &[BrowserRow],
+    remote_machines: &[RemoteMachineSnapshot],
+    ssh_targets: &[SshConnectTarget],
+    live_sessions: &[ManagedSessionView],
+    expanded_paths: &HashSet<String>,
+) -> Vec<BrowserRow> {
+    let remote_session_count = remote_machines
+        .iter()
+        .map(|machine| machine.sessions.len())
+        .sum::<usize>();
+    let should_trace = remote_session_count >= 200
+        || live_sessions.len() >= 20
+        || stored_rows.len() >= 200
+        || expanded_paths.len() >= 100;
+    if !should_trace {
+        return merged_sidebar_rows(
+            stored_rows,
+            remote_machines,
+            ssh_targets,
+            live_sessions,
+            expanded_paths,
+        );
+    }
+
+    let perf_home = perf_home_dir(settings_path);
+    let started_at = Instant::now();
+    let rows = merged_sidebar_rows(
+        stored_rows,
+        remote_machines,
+        ssh_targets,
+        live_sessions,
+        expanded_paths,
+    );
+    let duration_ms = started_at.elapsed().as_secs_f64() * 1000.0;
+    if duration_ms >= 4.0 || remote_session_count >= 500 {
+        append_perf_event(
+            &perf_home,
+            "sidebar",
+            "merge_rows",
+            json!({
+                "duration_ms": duration_ms,
+                "meta": {
+                    "source": source,
+                    "stored_row_count": stored_rows.len(),
+                    "remote_machine_count": remote_machines.len(),
+                    "remote_session_count": remote_session_count,
+                    "ssh_target_count": ssh_targets.len(),
+                    "live_session_count": live_sessions.len(),
+                    "expanded_path_count": expanded_paths.len(),
+                    "merged_row_count": rows.len(),
+                }
+            }),
+        );
+    }
     rows
 }
 
@@ -7650,15 +7767,25 @@ fn merged_sidebar_rows_uncached(
     live_sessions: &[ManagedSessionView],
     expanded_paths: &HashSet<String>,
 ) -> Vec<BrowserRow> {
+    let remote_session_count = remote_machines
+        .iter()
+        .map(|machine| machine.sessions.len())
+        .sum::<usize>();
+    let breakdown_enabled = remote_session_count >= 500;
+    let total_started_at = Instant::now();
+    let remote_session_index = build_remote_session_index(remote_machines);
+    let remote_index_ms = total_started_at.elapsed().as_secs_f64() * 1000.0;
+    let promoted_sort_started_at = Instant::now();
     let mut promoted_live_sessions = live_sessions
         .iter()
         .filter(|session| is_promoted_live_session(session))
         .collect::<Vec<_>>();
     promoted_live_sessions.sort_by(|a, b| {
-        live_session_recency_key(remote_machines, b)
-            .cmp(&live_session_recency_key(remote_machines, a))
+        live_session_recency_key(&remote_session_index, b)
+            .cmp(&live_session_recency_key(&remote_session_index, a))
             .then_with(|| a.session_path.cmp(&b.session_path))
     });
+    let promoted_sort_ms = promoted_sort_started_at.elapsed().as_secs_f64() * 1000.0;
 
     if ssh_targets.is_empty() && remote_machines.is_empty() && promoted_live_sessions.is_empty() {
         return stored_rows.to_vec();
@@ -7666,6 +7793,7 @@ fn merged_sidebar_rows_uncached(
 
     let mut rows = Vec::with_capacity(stored_rows.len() + remote_machines.len() * 6 + 8);
 
+    let machine_rows_init_started_at = Instant::now();
     let mut machine_rows = BTreeMap::<String, SidebarRemoteMachine>::new();
     for target in ssh_targets {
         let machine_key = machine_key_from_labelish(&target.ssh_target);
@@ -7677,6 +7805,7 @@ fn merged_sidebar_rows_uncached(
                 health: MachineHealth::Cached,
                 remote_deploy_state: RemoteDeployState::Planned,
                 scanned_sessions: Vec::new(),
+                needs_resort: false,
             });
     }
     for machine in remote_machines {
@@ -7692,10 +7821,15 @@ fn merged_sidebar_rows_uncached(
                 },
                 remote_deploy_state: machine.remote_deploy_state,
                 scanned_sessions: machine.sessions.clone(),
+                needs_resort: false,
             },
         );
     }
+    let machine_rows_init_ms = machine_rows_init_started_at.elapsed().as_secs_f64() * 1000.0;
+    let merge_live_started_at = Instant::now();
     merge_remote_live_sessions(&mut machine_rows, ssh_targets, live_sessions);
+    let merge_live_ms = merge_live_started_at.elapsed().as_secs_f64() * 1000.0;
+    let promoted_retain_started_at = Instant::now();
     let promoted_remote_paths = promoted_live_sessions
         .iter()
         .filter(|session| session.session_path.starts_with("remote-session://"))
@@ -7708,31 +7842,90 @@ fn merged_sidebar_rows_uncached(
                 .retain(|session| !promoted_remote_paths.contains(&session.session_path));
         }
     }
+    let promoted_retain_ms = promoted_retain_started_at.elapsed().as_secs_f64() * 1000.0;
+    let resort_started_at = Instant::now();
     for machine in machine_rows.values_mut() {
-        sort_remote_scanned_sessions_by_recency(&mut machine.scanned_sessions);
+        if machine.needs_resort {
+            sort_remote_scanned_sessions_by_recency(&mut machine.scanned_sessions);
+        }
     }
+    let resort_ms = resort_started_at.elapsed().as_secs_f64() * 1000.0;
+    let push_live_started_at = Instant::now();
     push_live_session_rows(
         &mut rows,
         &promoted_live_sessions,
-        remote_machines,
+        &remote_session_index,
         expanded_paths,
     );
+    let push_live_ms = push_live_started_at.elapsed().as_secs_f64() * 1000.0;
+    let push_remote_started_at = Instant::now();
     for machine in machine_rows.into_values() {
         push_remote_machine_rows(&mut rows, &machine, expanded_paths);
     }
+    let push_remote_ms = push_remote_started_at.elapsed().as_secs_f64() * 1000.0;
+    let extend_stored_started_at = Instant::now();
     rows.extend_from_slice(stored_rows);
+    let extend_stored_ms = extend_stored_started_at.elapsed().as_secs_f64() * 1000.0;
+    if breakdown_enabled {
+        maybe_record_sidebar_merge_breakdown(
+            remote_session_count,
+            json!({
+                "cache_hit": false,
+                "phase": "uncached_steps",
+                "remote_index_ms": remote_index_ms,
+                "promoted_sort_ms": promoted_sort_ms,
+                "machine_rows_init_ms": machine_rows_init_ms,
+                "merge_live_ms": merge_live_ms,
+                "promoted_retain_ms": promoted_retain_ms,
+                "resort_ms": resort_ms,
+                "push_live_ms": push_live_ms,
+                "push_remote_ms": push_remote_ms,
+                "extend_stored_ms": extend_stored_ms,
+                "total_ms": total_started_at.elapsed().as_secs_f64() * 1000.0,
+                "stored_row_count": stored_rows.len(),
+                "remote_machine_count": remote_machines.len(),
+                "remote_session_count": remote_session_count,
+                "merged_row_count": rows.len(),
+                "expanded_path_count": expanded_paths.len(),
+            }),
+        );
+    }
     rows
 }
 
+#[derive(Default)]
+struct RemoteSessionIndex {
+    modified_epoch_by_path: HashMap<String, i64>,
+    generated_title_by_path: HashMap<String, String>,
+}
+
+fn build_remote_session_index(remote_machines: &[RemoteMachineSnapshot]) -> RemoteSessionIndex {
+    let mut index = RemoteSessionIndex::default();
+    for machine in remote_machines {
+        for session in &machine.sessions {
+            index
+                .modified_epoch_by_path
+                .insert(session.session_path.clone(), session.modified_epoch);
+            let title = session.title_hint.trim();
+            if !title.is_empty() && !looks_like_generated_fallback_title(title) {
+                index
+                    .generated_title_by_path
+                    .entry(session.session_path.clone())
+                    .or_insert_with(|| title.to_string());
+            }
+        }
+    }
+    index
+}
+
 fn live_session_recency_key(
-    remote_machines: &[RemoteMachineSnapshot],
+    remote_session_index: &RemoteSessionIndex,
     session: &ManagedSessionView,
 ) -> (i64, String) {
-    let remote_epoch = remote_machines
-        .iter()
-        .flat_map(|machine| machine.sessions.iter())
-        .find(|candidate| candidate.session_path == session.session_path)
-        .map(|candidate| candidate.modified_epoch)
+    let remote_epoch = remote_session_index
+        .modified_epoch_by_path
+        .get(&session.session_path)
+        .copied()
         .unwrap_or(0);
     (remote_epoch, session.id.clone())
 }
@@ -7740,7 +7933,7 @@ fn live_session_recency_key(
 fn push_live_session_rows(
     rows: &mut Vec<BrowserRow>,
     sessions: &[&ManagedSessionView],
-    remote_machines: &[RemoteMachineSnapshot],
+    remote_session_index: &RemoteSessionIndex,
     expanded_paths: &HashSet<String>,
 ) {
     if sessions.is_empty() {
@@ -7777,7 +7970,7 @@ fn push_live_session_rows(
 
     for session in sessions {
         let cwd = metadata_value(session, "Cwd");
-        let label = live_session_label(remote_machines, session, &short_ids);
+        let label = live_session_label_with_index(remote_session_index, session, &short_ids);
         let full_path = if session.kind == SessionKind::Document {
             session
                 .metadata
@@ -7812,8 +8005,8 @@ fn push_live_session_rows(
     }
 }
 
-fn live_session_label(
-    remote_machines: &[RemoteMachineSnapshot],
+fn live_session_label_with_index(
+    remote_session_index: &RemoteSessionIndex,
     session: &ManagedSessionView,
     short_ids: &HashMap<String, String>,
 ) -> String {
@@ -7824,12 +8017,12 @@ fn live_session_label(
     {
         return session.title.clone();
     }
-    if let Some(remote_title) =
-        remote_generated_copy_from_machines(remote_machines, &session.session_path)
-            .map(|(title, _, _)| title)
-            .filter(|title| !title.trim().is_empty() && !looks_like_generated_fallback_title(title))
+    if let Some(remote_title) = remote_session_index
+        .generated_title_by_path
+        .get(&session.session_path)
+        .filter(|title| !title.trim().is_empty() && !looks_like_generated_fallback_title(title))
     {
-        return remote_title;
+        return remote_title.clone();
     }
     let target = metadata_value(session, "Target");
     if !target.trim().is_empty()
@@ -7854,6 +8047,16 @@ fn live_session_label(
         .unwrap_or_else(|| session.id.clone())
 }
 
+#[cfg(test)]
+fn live_session_label(
+    remote_machines: &[RemoteMachineSnapshot],
+    session: &ManagedSessionView,
+    short_ids: &HashMap<String, String>,
+) -> String {
+    let remote_session_index = build_remote_session_index(remote_machines);
+    live_session_label_with_index(&remote_session_index, session, short_ids)
+}
+
 fn is_promoted_live_session(session: &ManagedSessionView) -> bool {
     session.session_path.starts_with("remote-session://")
         || session.session_path.starts_with("ssh://")
@@ -7867,21 +8070,15 @@ fn enrich_sidebar_rows_with_live_titles(
     remote_machines: &[RemoteMachineSnapshot],
 ) {
     let mut title_by_path = HashMap::<String, String>::new();
+    let remote_session_index = build_remote_session_index(remote_machines);
     for session in live_sessions {
         let title = session.title.trim();
         if !title.is_empty() && !looks_like_generated_fallback_title(title) {
             title_by_path.insert(session.session_path.clone(), title.to_string());
         }
     }
-    for machine in remote_machines {
-        for session in &machine.sessions {
-            let title = session.title_hint.trim();
-            if !title.is_empty() && !looks_like_generated_fallback_title(title) {
-                title_by_path
-                    .entry(session.session_path.clone())
-                    .or_insert_with(|| title.to_string());
-            }
-        }
+    for (session_path, title) in remote_session_index.generated_title_by_path {
+        title_by_path.entry(session_path).or_insert(title);
     }
     for row in rows {
         let Some(title) = title_by_path.get(&row.full_path).cloned() else {
@@ -7919,6 +8116,7 @@ fn merge_remote_live_sessions(
                 health: MachineHealth::Healthy,
                 remote_deploy_state: RemoteDeployState::Ready,
                 scanned_sessions: Vec::new(),
+                needs_resort: false,
             });
         if let Some(existing) = machine
             .scanned_sessions
@@ -7953,6 +8151,7 @@ fn merge_remote_live_sessions(
                 session_id,
                 session,
             ));
+        machine.needs_resort = true;
     }
 }
 
@@ -8017,6 +8216,7 @@ struct SidebarRemoteMachine {
     health: MachineHealth,
     remote_deploy_state: RemoteDeployState,
     scanned_sessions: Vec<RemoteScannedSession>,
+    needs_resort: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -8127,21 +8327,35 @@ fn push_remote_machine_rows(
             .map(|session| (session.session_path.clone(), session.session_id.clone()))
             .collect::<Vec<_>>(),
     );
+    let session_labels = machine
+        .scanned_sessions
+        .iter()
+        .map(|session| {
+            (
+                session.session_path.clone(),
+                remote_scanned_session_label(session, &remote_short_ids),
+            )
+        })
+        .collect::<HashMap<_, _>>();
     let folder_tree = build_remote_folder_tree(&machine.scanned_sessions);
 
     for child in folder_tree.children.values() {
-        append_remote_folder_rows(rows, machine, child, expanded_paths, &remote_short_ids, 1);
+        append_remote_folder_rows(rows, machine, child, expanded_paths, &session_labels, 1);
     }
     for &session_idx in &folder_tree.root_session_indices {
         if let Some(scanned) = machine.scanned_sessions.get(session_idx) {
+            let label = session_labels
+                .get(&scanned.session_path)
+                .cloned()
+                .unwrap_or_else(|| remote_scanned_session_label(scanned, &remote_short_ids));
             rows.push(BrowserRow {
                 kind: BrowserRowKind::Session,
                 full_path: scanned.session_path.clone(),
-                label: remote_scanned_session_label(scanned, &remote_short_ids),
+                label: label.clone(),
                 detail_label: String::new(),
                 document_kind: None,
                 group_kind: None,
-                session_title: Some(remote_scanned_session_label(scanned, &remote_short_ids)),
+                session_title: Some(label),
                 depth: 1,
                 host_label: machine.key.clone(),
                 descendant_sessions: 1,
@@ -8260,8 +8474,8 @@ fn populate_remote_folder_descendant_counts(node: &mut RemoteFolderNode) -> usiz
     count
 }
 
-fn compressed_remote_folder_paths(machine: &SidebarRemoteMachine, cwd: &str) -> Vec<String> {
-    let tree = build_remote_folder_tree(&machine.scanned_sessions);
+fn compressed_remote_folder_paths(sessions: &[RemoteScannedSession], cwd: &str) -> Vec<String> {
+    let tree = build_remote_folder_tree(sessions);
     let mut paths = Vec::new();
     for child in tree.children.values() {
         if collect_compressed_remote_folder_paths(child, cwd, &mut paths) {
@@ -8297,7 +8511,7 @@ fn append_remote_folder_rows(
     machine: &SidebarRemoteMachine,
     node: &RemoteFolderNode,
     expanded_paths: &HashSet<String>,
-    short_ids: &HashMap<String, String>,
+    session_labels: &HashMap<String, String>,
     depth: usize,
 ) {
     let row_path = format!("__remote_folder__/{}{}", machine.key, node.full_path);
@@ -8321,18 +8535,29 @@ fn append_remote_folder_rows(
         return;
     }
     for child in node.children.values() {
-        append_remote_folder_rows(rows, machine, child, expanded_paths, short_ids, depth + 1);
+        append_remote_folder_rows(
+            rows,
+            machine,
+            child,
+            expanded_paths,
+            session_labels,
+            depth + 1,
+        );
     }
     for &session_idx in &node.session_indices {
         if let Some(scanned) = machine.scanned_sessions.get(session_idx) {
+            let label = session_labels
+                .get(&scanned.session_path)
+                .cloned()
+                .unwrap_or_else(|| scanned.title_hint.clone());
             rows.push(BrowserRow {
                 kind: BrowserRowKind::Session,
                 full_path: scanned.session_path.clone(),
-                label: remote_scanned_session_label(scanned, short_ids),
+                label: label.clone(),
                 detail_label: String::new(),
                 document_kind: None,
                 group_kind: None,
-                session_title: Some(remote_scanned_session_label(scanned, short_ids)),
+                session_title: Some(label),
                 depth: depth + 1,
                 host_label: machine.key.clone(),
                 descendant_sessions: 1,
@@ -22735,6 +22960,7 @@ mod tests {
             label: "jojo".to_string(),
             health: MachineHealth::Healthy,
             remote_deploy_state: RemoteDeployState::Ready,
+            needs_resort: false,
             scanned_sessions: vec![RemoteScannedSession {
                 session_path: "remote-session://jojo/1".to_string(),
                 session_id: "1".to_string(),
@@ -22753,7 +22979,10 @@ mod tests {
         };
 
         assert_eq!(
-            compressed_remote_folder_paths(&machine, "/run/smb4k/data/smbfs/dada/obsidian/codex"),
+            compressed_remote_folder_paths(
+                &machine.scanned_sessions,
+                "/run/smb4k/data/smbfs/dada/obsidian/codex",
+            ),
             vec!["/run/smb4k/data/smbfs/dada/obsidian/codex".to_string()]
         );
     }
