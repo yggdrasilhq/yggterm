@@ -15273,7 +15273,7 @@ fn MainSurface(
                             key: "{session.session_path}:{snapshot.active_view_mode as u8}",
                             style: "display:flex; flex-direction:column; min-width:0; min-height:0; width:100%; height:100%;",
                             div {
-                                style: "display:flex; align-items:flex-start; justify-content:flex-end; gap:16px; padding:14px 18px 2px 18px;",
+                                style: "display:flex; align-items:flex-start; justify-content:flex-end; gap:12px; padding:8px 24px 0 24px;",
                                 PreviewToolbar {
                                     palette: snapshot.palette,
                                     preview_layout: snapshot.preview_layout,
@@ -15289,7 +15289,7 @@ fn MainSurface(
                                 "data-preview-scroll": "1",
                                 "data-preview-scroll-active": "true",
                                 "data-preview-session-path": "{session.session_path}",
-                                style: "display:flex; flex-direction:column; gap:18px; min-width:0; min-height:0; overflow:auto; padding:24px; \
+                                style: "display:flex; flex-direction:column; gap:14px; min-width:0; min-height:0; overflow:auto; padding:8px 24px 24px 24px; \
                                         overscroll-behavior:contain; scrollbar-gutter:stable;",
                                 onscroll: move |evt: ScrollEvent| {
                                     preview_scroll_top.set(evt.data().scroll_top());
@@ -15311,7 +15311,7 @@ fn MainSurface(
                                         "data-preview-window-client-height": "{preview_window.viewport_height_px.round() as i64}",
                                         "data-preview-window-scroll-height": "{preview_window.scroll_height_px.round() as i64}",
                                         "data-preview-window-overscan": "{preview_window.overscan_px.round() as i64}",
-                                        style: "display:flex; flex-direction:column; gap:16px; min-width:0; width:min(1020px, 100%); margin:0 auto;",
+                                        style: "display:flex; flex-direction:column; gap:14px; min-width:0; width:min(1020px, 100%); margin:0 auto;",
                                         if !rendered_sections.is_empty() {
                                             RenderedSectionsStrip {
                                                 sections: rendered_sections.clone(),
@@ -15553,42 +15553,40 @@ fn PreviewToolbar(
 ) -> Element {
     rsx! {
         div {
-            style: "display:flex; flex-direction:column; gap:10px; margin-left:auto; min-width:250px;",
-            div {
-                style: "display:flex; align-items:center; justify-content:flex-end; gap:8px;",
-                IconToggleButton {
-                    active: preview_layout == PreviewLayoutMode::Chat,
-                    icon: "▤",
-                    label: "Chat View".to_string(),
+            style: format!(
+                "display:flex; align-items:center; justify-content:flex-end; gap:8px; flex-wrap:wrap; margin-left:auto; \
+                 max-width:min(100%, 760px); font-family:{};",
+                interface_font_family()
+            ),
+            IconToggleButton {
+                active: preview_layout == PreviewLayoutMode::Chat,
+                icon: "▤",
+                label: "Chat View".to_string(),
+                palette,
+                onclick: move |_| on_set_preview_layout.call(PreviewLayoutMode::Chat),
+            }
+            IconToggleButton {
+                active: preview_layout == PreviewLayoutMode::Graph,
+                icon: "◎",
+                label: "Graph View".to_string(),
+                palette,
+                onclick: move |_| on_set_preview_layout.call(PreviewLayoutMode::Graph),
+            }
+            if preview_loading {
+                LoadingStateChip {
+                    label: "Refreshing…".to_string(),
                     palette,
-                    onclick: move |_| on_set_preview_layout.call(PreviewLayoutMode::Chat),
-                }
-                IconToggleButton {
-                    active: preview_layout == PreviewLayoutMode::Graph,
-                    icon: "◎",
-                    label: "Graph View".to_string(),
-                    palette,
-                    onclick: move |_| on_set_preview_layout.call(PreviewLayoutMode::Graph),
                 }
             }
-            div {
-                style: "display:flex; justify-content:flex-end; gap:8px;",
-                if preview_loading {
-                    LoadingStateChip {
-                        label: "Refreshing…".to_string(),
-                        palette,
-                    }
-                }
-                button {
-                    style: chip_style(palette, server_busy),
-                    onclick: move |evt| on_expand_preview.call(evt),
-                    "Expand All"
-                }
-                button {
-                    style: chip_style(palette, server_busy),
-                    onclick: move |evt| on_collapse_preview.call(evt),
-                    "Collapse All"
-                }
+            button {
+                style: chip_style(palette, server_busy),
+                onclick: move |evt| on_expand_preview.call(evt),
+                "Expand All"
+            }
+            button {
+                style: chip_style(palette, server_busy),
+                onclick: move |evt| on_collapse_preview.call(evt),
+                "Collapse All"
             }
         }
     }
@@ -16614,7 +16612,10 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
                             div {
                                 style: "display:flex; align-items:center; justify-content:space-between; gap:12px; padding:10px 14px; border-bottom:1px solid rgba(255,255,255,0.08);",
                                 div {
-                                    style: "font-size:11px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:rgba(226,232,240,0.78);",
+                                    style: format!(
+                                        "font-size:11px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:rgba(226,232,240,0.78); font-family:{};",
+                                        interface_font_family()
+                                    ),
                                     "{language.clone().unwrap_or_else(|| \"Code\".to_string())}"
                                 }
                             }
