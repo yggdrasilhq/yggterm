@@ -4215,6 +4215,7 @@ fn maybe_spawn_missing_remote_machine_refreshes(state: Signal<ShellState>) {
         "maybe_spawn_missing_remote_machine_refreshes_gate",
         |shell| {
             terminal_attach_blocks_background_work(shell)
+                || background_refreshes_deferred(shell)
                 || interactive_surface_request_in_flight(shell)
         },
     )
@@ -4227,6 +4228,7 @@ fn maybe_spawn_missing_remote_machine_refreshes(state: Signal<ShellState>) {
         "maybe_spawn_missing_remote_machine_refreshes_read",
         |shell| {
             if terminal_attach_blocks_background_work(shell)
+                || background_refreshes_deferred(shell)
                 || interactive_surface_request_in_flight(shell)
             {
                 return Vec::new();
@@ -4320,8 +4322,10 @@ fn app_control_command_defers_background_refresh(command: &AppControlCommand) ->
     matches!(
         command,
         AppControlCommand::CreateTerminal { .. }
+            | AppControlCommand::OpenPath { .. }
             | AppControlCommand::SendTerminalInput { .. }
             | AppControlCommand::RemoveSession { .. }
+            | AppControlCommand::SetRowExpanded { .. }
             | AppControlCommand::Drag { .. }
     )
 }
@@ -18920,15 +18924,28 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
     };
     format!(
         r#"
+        const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
         const hostId = {host_id:?};
-        const host = document.getElementById(hostId);
+        let host = document.getElementById(hostId);
         dioxus.send({{ kind: "debug", message: `bootstrap host=${{hostId}} present=${{!!host}}` }});
         if (!host) {{
-            dioxus.send({{ kind: "debug", message: `bootstrap host missing for ${{hostId}}` }});
+            for (let attempt = 0; attempt < 80; attempt += 1) {{
+                await sleep(25);
+                host = document.getElementById(hostId);
+                if (host) {{
+                    dioxus.send({{
+                        kind: "debug",
+                        message: `bootstrap host=${{hostId}} mounted on retry=${{attempt + 1}}`
+                    }});
+                    break;
+                }}
+            }}
+        }}
+        if (!host) {{
+            dioxus.send({{ kind: "debug", message: `bootstrap host missing for ${{hostId}} after retries` }});
             dioxus.send({{ kind: "ready" }});
             return;
         }}
-        const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
         const ensureXtermAssets = async () => {{
             window.__yggtermXtermBootstrapError = null;
             const styleId = "yggterm-xterm-style";
@@ -21382,6 +21399,15 @@ mod tests {
     }
 
     #[test]
+    fn terminal_eval_script_waits_for_host_mount_before_giving_up() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme);
+        assert!(script.contains("mounted on retry"));
+        assert!(script.contains("after retries"));
+        assert!(script.contains("await sleep(25)"));
+    }
+
+    #[test]
     fn terminal_apply_script_updates_live_xterm_font_size() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 5.0, "");
         let script = terminal_apply_script("yggterm-terminal-test", &theme);
@@ -23614,6 +23640,25 @@ mod tests {
         );
 
         assert_eq!(pending, vec!["local".to_string(), "dev".to_string()]);
+    }
+
+    #[test]
+    fn app_control_open_and_expand_defer_background_refreshes() {
+        assert!(app_control_command_defers_background_refresh(
+            &AppControlCommand::OpenPath {
+                session_path: "remote-session://jojo/abc".to_string(),
+                view_mode: Some(AppControlViewMode::Terminal),
+            }
+        ));
+        assert!(app_control_command_defers_background_refresh(
+            &AppControlCommand::SetRowExpanded {
+                row_path: "__remote_machine__/jojo".to_string(),
+                expanded: true,
+            }
+        ));
+        assert!(!app_control_command_defers_background_refresh(
+            &AppControlCommand::DescribeState
+        ));
     }
 }
 
