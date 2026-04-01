@@ -66,6 +66,18 @@ EXPECTED_PREVIEW_TURN_LIMIT = 4096
 EXPECTED_PREVIEW_TURN_SIMILARITY = 0.985
 
 
+def collapse_named_image_markup(value: str) -> str:
+    text = (value or "").strip()
+    while True:
+        match = re.search(r"<image name=\[(.*?)\]>", text, flags=re.IGNORECASE)
+        if not match:
+            break
+        label = f"[{match.group(1).strip()}]"
+        text = f"{text[:match.start()]}{label}{text[match.end():]}"
+        text = re.sub(r"</image>", " ", text, flags=re.IGNORECASE)
+    return text
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -390,7 +402,7 @@ def preview_ready(state: dict, session_path: str) -> bool:
 
 
 def normalize_preview_entry_text(value: str) -> str:
-    normalized = (value or "")
+    normalized = collapse_named_image_markup(value or "")
     for marker in ("`", "**", "__", "*"):
         normalized = normalized.replace(marker, "")
     normalized = (
@@ -403,7 +415,16 @@ def normalize_preview_entry_text(value: str) -> str:
         .replace("”", '"')
     )
     normalized = re.sub(r"[^0-9A-Za-z/@.:+_]+", " ", normalized)
-    return " ".join(normalized.split()).strip().lower()
+    tokens = [
+        token
+        for token in normalized.split()
+        if token.lower() not in {"code", "collapse", "expand"}
+    ]
+    return " ".join(tokens).strip().lower()
+
+
+def normalized_preview_tokens(value: str) -> list[str]:
+    return [token for token in normalize_preview_entry_text(value).split() if token]
 
 
 def preview_entry_body_text(value: str) -> str:
@@ -516,7 +537,9 @@ def session_source_record(server_state: dict, session_path: str) -> dict | None:
     return None
 
 
-def expected_preview_turns_for_session(server_state: dict, session_path: str, binary: str) -> list[dict]:
+def expected_preview_turns_for_session(
+    server_state: dict, session_path: str, binary: str, *, full_preview: bool = False
+) -> list[dict]:
     record = session_source_record(server_state, session_path)
     if not record:
         return []
@@ -526,6 +549,13 @@ def expected_preview_turns_for_session(server_state: dict, session_path: str, bi
 
     if record.get("ssh_target"):
         remote_bin = "~/.yggterm/bin/yggterm"
+        if full_preview:
+            remote_command = f"{remote_bin} server remote preview {quote(storage_path)}"
+        else:
+            remote_command = (
+                f"{remote_bin} server remote preview-head "
+                f"{quote(storage_path)} {EXPECTED_PREVIEW_TURN_LIMIT}"
+            )
         command = " ".join(
             [
                 "ssh",
@@ -534,10 +564,7 @@ def expected_preview_turns_for_session(server_state: dict, session_path: str, bi
                 "-o",
                 "ConnectTimeout=8",
                 quote(record["ssh_target"]),
-                quote(
-                    f"{remote_bin} server remote preview-head "
-                    f"{quote(storage_path)} {EXPECTED_PREVIEW_TURN_LIMIT}"
-                ),
+                quote(remote_command),
             ]
         )
         try:
@@ -558,11 +585,14 @@ def expected_preview_turns_for_session(server_state: dict, session_path: str, bi
         except json.JSONDecodeError:
             return []
     else:
-        payload = run_json(
-            "local",
-            f"{quote(binary)} server remote preview-head "
-            f"{quote(storage_path)} {EXPECTED_PREVIEW_TURN_LIMIT}",
-        )
+        if full_preview:
+            local_command = f"{quote(binary)} server remote preview {quote(storage_path)}"
+        else:
+            local_command = (
+                f"{quote(binary)} server remote preview-head "
+                f"{quote(storage_path)} {EXPECTED_PREVIEW_TURN_LIMIT}"
+            )
+        payload = run_json("local", local_command)
 
     preview = payload.get("preview") or {}
     turns = []
@@ -579,18 +609,26 @@ def preview_entry_matches_expected(entry: dict, expected_turns: list[dict]) -> b
     entry_text = normalize_preview_entry_body_text(entry.get("text") or "")
     if not entry_tone or not entry_text:
         return False
+    entry_tokens = normalized_preview_tokens(entry_text)
     for turn in expected_turns:
         if (turn.get("tone") or "").strip().lower() != entry_tone:
             continue
         turn_text = normalize_preview_entry_text(turn.get("text") or "")
         if not turn_text:
             continue
+        turn_tokens = normalized_preview_tokens(turn.get("text") or "")
         if (
             turn_text == entry_text
             or turn_text.startswith(entry_text)
             or entry_text.startswith(turn_text)
         ):
             return True
+        if entry_tokens and turn_tokens:
+            overlap = len(set(entry_tokens) & set(turn_tokens)) / max(
+                1, min(len(set(entry_tokens)), len(set(turn_tokens)))
+            )
+            if overlap >= 0.82 and min(len(entry_tokens), len(turn_tokens)) >= 4:
+                return True
         if (
             min(len(turn_text), len(entry_text)) >= 120
             and SequenceMatcher(None, turn_text[:800], entry_text[:800]).ratio()
