@@ -827,6 +827,16 @@ fn collect_remote_copy_candidates(
 ) -> Vec<BackgroundCopyCandidate> {
     let mut out = Vec::new();
     for machine in remote_machines {
+        let machine_ref = RemoteMachineSnapshot {
+            machine_key: machine.machine_key.clone(),
+            label: machine.label.clone(),
+            ssh_target: machine.ssh_target.clone(),
+            prefix: machine.prefix.clone(),
+            remote_binary_expr: machine.remote_binary_expr.clone(),
+            remote_deploy_state: machine.remote_deploy_state,
+            health: machine.health,
+            sessions: Vec::new(),
+        };
         for session in &machine.sessions {
             out.push(BackgroundCopyCandidate {
                 session_path: session.session_path.clone(),
@@ -834,7 +844,7 @@ fn collect_remote_copy_candidates(
                 cwd: session.cwd.clone(),
                 title: session.title_hint.clone(),
                 source_updated_at: source_updated_at_for_remote_epoch(session.modified_epoch),
-                remote_machine: Some(machine.clone()),
+                remote_machine: Some(machine_ref.clone()),
                 remote_context: (!session.recent_context.trim().is_empty())
                     .then(|| session.recent_context.clone()),
                 storage_path: (!session.storage_path.trim().is_empty())
@@ -2100,5 +2110,70 @@ fn send_request(endpoint: &ServerEndpoint, request: &ServerRequest) -> Result<Se
                 .context("reading daemon response")?;
             serde_json::from_str(line.trim_end()).context("parsing daemon response")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collect_remote_copy_candidates;
+    use crate::{
+        RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession,
+        remote_scanned_session_path,
+    };
+
+    #[test]
+    fn collect_remote_copy_candidates_do_not_clone_machine_session_lists() {
+        let machines = vec![RemoteMachineSnapshot {
+            machine_key: "jojo".to_string(),
+            label: "jojo".to_string(),
+            ssh_target: "jojo".to_string(),
+            prefix: Some("sudo -u pi".to_string()),
+            remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+            remote_deploy_state: RemoteDeployState::Ready,
+            health: RemoteMachineHealth::Healthy,
+            sessions: vec![
+                RemoteScannedSession {
+                    session_path: remote_scanned_session_path("jojo", "one"),
+                    session_id: "one".to_string(),
+                    cwd: "/home/pi".to_string(),
+                    started_at: "2026-04-01T00:00:00Z".to_string(),
+                    modified_epoch: 1,
+                    event_count: 1,
+                    user_message_count: 1,
+                    assistant_message_count: 0,
+                    title_hint: "One".to_string(),
+                    recent_context: "USER: one".to_string(),
+                    cached_precis: None,
+                    cached_summary: None,
+                    storage_path: "/home/pi/.codex/sessions/one.jsonl".to_string(),
+                },
+                RemoteScannedSession {
+                    session_path: remote_scanned_session_path("jojo", "two"),
+                    session_id: "two".to_string(),
+                    cwd: "/srv/app".to_string(),
+                    started_at: "2026-04-01T00:01:00Z".to_string(),
+                    modified_epoch: 2,
+                    event_count: 2,
+                    user_message_count: 1,
+                    assistant_message_count: 1,
+                    title_hint: "Two".to_string(),
+                    recent_context: String::new(),
+                    cached_precis: Some("precis".to_string()),
+                    cached_summary: Some("summary".to_string()),
+                    storage_path: "/home/pi/.codex/sessions/two.jsonl".to_string(),
+                },
+            ],
+        }];
+
+        let candidates = collect_remote_copy_candidates(&machines);
+
+        assert_eq!(candidates.len(), 2);
+        for candidate in candidates {
+            let machine = candidate.remote_machine.expect("candidate should keep machine routing");
+            assert_eq!(machine.machine_key, "jojo");
+            assert!(machine.sessions.is_empty());
+            assert_eq!(machine.prefix.as_deref(), Some("sudo -u pi"));
+        }
+        assert_eq!(machines[0].sessions.len(), 2);
     }
 }

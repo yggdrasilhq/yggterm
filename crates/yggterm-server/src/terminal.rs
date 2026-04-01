@@ -166,26 +166,40 @@ impl TerminalManager {
         F: Fn(&str) -> Option<String>,
     {
         let keys = self.sessions.keys().cloned().collect::<Vec<_>>();
-        let mut handles = Vec::new();
+        let mut stopped = 0usize;
+        let mut errors = Vec::new();
+        let worker_limit = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1)
+            .clamp(1, 4);
+        let mut pending = Vec::new();
+
+        let flush_pending = |pending: &mut Vec<(String, thread::JoinHandle<Result<()>>)>,
+                             stopped: &mut usize,
+                             errors: &mut Vec<String>| {
+            for (key, handle) in pending.drain(..) {
+                match handle.join() {
+                    Ok(Ok(())) => *stopped += 1,
+                    Ok(Err(error)) => errors.push(format!("{key}: {error}")),
+                    Err(_) => errors.push(format!("{key}: terminal shutdown thread panicked")),
+                }
+            }
+        };
+
         for key in keys {
             let Some(runtime) = self.sessions.remove(&key) else {
                 continue;
             };
             let stop = stop_command(&key);
-            handles.push((
+            pending.push((
                 key,
                 thread::spawn(move || runtime.shutdown(stop.as_deref())),
             ));
-        }
-        let mut stopped = 0usize;
-        let mut errors = Vec::new();
-        for (key, handle) in handles {
-            match handle.join() {
-                Ok(Ok(())) => stopped += 1,
-                Ok(Err(error)) => errors.push(format!("{key}: {error}")),
-                Err(_) => errors.push(format!("{key}: terminal shutdown thread panicked")),
+            if pending.len() >= worker_limit {
+                flush_pending(&mut pending, &mut stopped, &mut errors);
             }
         }
+        flush_pending(&mut pending, &mut stopped, &mut errors);
         TerminalShutdownSummary { stopped, errors }
     }
 }
