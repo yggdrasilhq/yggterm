@@ -1944,6 +1944,7 @@ impl ShellState {
             if let Some(preferred_session) = preferred_session {
                 snapshot.active_session = Some(preferred_session);
             }
+            snapshot.active_view_mode = self.server.active_view_mode();
             return snapshot;
         }
         let preferred_path = match &request.target {
@@ -1971,6 +1972,11 @@ impl ShellState {
         if let Some(preferred_session) = preferred_session {
             snapshot.active_session = Some(preferred_session);
         }
+        snapshot.active_view_mode = match request_surface {
+            YggSurface::Terminal => WorkspaceViewMode::Terminal,
+            YggSurface::Preview => WorkspaceViewMode::Rendered,
+            _ => snapshot.active_view_mode,
+        };
         snapshot
     }
 
@@ -4819,13 +4825,22 @@ fn spawn_set_view_mode(mut state: Signal<ShellState>, mode: WorkspaceViewMode) {
 
 fn spawn_open_session_row(state: Signal<ShellState>, row: BrowserRow) {
     let prefer_terminal = state.read().server.active_view_mode() == WorkspaceViewMode::Terminal;
-    spawn_open_session_row_with_mode(state, row, prefer_terminal);
+    spawn_open_session_row_with_mode_retry(state, row, prefer_terminal, 2);
 }
 
 fn spawn_focus_live_session_row(
+    state: Signal<ShellState>,
+    row: BrowserRow,
+    mode: WorkspaceViewMode,
+) {
+    spawn_focus_live_session_row_retry(state, row, mode, 2);
+}
+
+fn spawn_focus_live_session_row_retry(
     mut state: Signal<ShellState>,
     row: BrowserRow,
     mode: WorkspaceViewMode,
+    retry_budget: u8,
 ) {
     let mut open_request_id = 0_u64;
     let request_meta = YggRequestMeta::interactive(
@@ -4898,6 +4913,24 @@ fn spawn_focus_live_session_row(
                 Ok(result) => shell.apply_daemon_snapshot_result_for(&request_id, Ok(result)),
                 Err(error) => {
                     shell.finish_busy_request_for(&request_id);
+                    if retry_budget > 0 && is_transient_local_daemon_connect_error(&error.to_string())
+                    {
+                        let retry_delay_ms = 180;
+                        shell.last_action = format!(
+                            "{pending_label} waiting for local daemon startup; retrying in {retry_delay_ms} ms"
+                        );
+                        let row = row.clone();
+                        spawn(async move {
+                            sleep(Duration::from_millis(retry_delay_ms)).await;
+                            spawn_focus_live_session_row_retry(
+                                state,
+                                row,
+                                mode,
+                                retry_budget.saturating_sub(1),
+                            );
+                        });
+                        return;
+                    }
                     shell.last_action = format!("{pending_label} task failed: {error}");
                     shell.push_notification(
                         NotificationTone::Error,
@@ -4913,9 +4946,18 @@ fn spawn_focus_live_session_row(
 }
 
 fn spawn_open_session_row_with_mode(
+    state: Signal<ShellState>,
+    row: BrowserRow,
+    prefer_terminal: bool,
+) {
+    spawn_open_session_row_with_mode_retry(state, row, prefer_terminal, 2);
+}
+
+fn spawn_open_session_row_with_mode_retry(
     mut state: Signal<ShellState>,
     row: BrowserRow,
     prefer_terminal: bool,
+    retry_budget: u8,
 ) {
     let staged_remote_preview_session = (!prefer_terminal)
         .then(|| parse_remote_scanned_session_path(&row.full_path).map(|_| row.full_path.clone()))
@@ -5069,6 +5111,24 @@ fn spawn_open_session_row_with_mode(
                 }
                 Err(error) => {
                     shell.finish_busy_request_for(&request_id);
+                    if retry_budget > 0 && is_transient_local_daemon_connect_error(&error.to_string())
+                    {
+                        let retry_delay_ms = 180;
+                        shell.last_action = format!(
+                            "{pending_label} waiting for local daemon startup; retrying in {retry_delay_ms} ms"
+                        );
+                        let row = row.clone();
+                        spawn(async move {
+                            sleep(Duration::from_millis(retry_delay_ms)).await;
+                            spawn_open_session_row_with_mode_retry(
+                                state,
+                                row,
+                                prefer_terminal,
+                                retry_budget.saturating_sub(1),
+                            );
+                        });
+                        return;
+                    }
                     shell.last_action = format!("{pending_label} task failed: {error}");
                     shell.push_notification(
                         NotificationTone::Error,
@@ -5788,6 +5848,13 @@ fn summarize_preview_refresh_error(error: &str) -> String {
     } else {
         "Yggterm could not refresh this remote view right now.".to_string()
     }
+}
+
+fn is_transient_local_daemon_connect_error(error: &str) -> bool {
+    let trimmed = error.trim();
+    trimmed.contains("Connection refused")
+        || trimmed.contains("No such file or directory")
+        || (trimmed.contains("connecting to ") && trimmed.contains("server-") && trimmed.contains(".sock"))
 }
 
 fn should_surface_preview_failure(failure: &PreviewSyncFailure, now_ms: u64) -> bool {
@@ -11009,6 +11076,8 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
     } else if active_view_mode == "Terminal" {
         if active_terminal_hosts.is_empty() {
             (false, Some("active terminal host is missing".to_string()))
+        } else if terminal_rendered {
+            (true, None)
         } else if terminal_attach_pending {
             (
                 false,
@@ -11016,13 +11085,11 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
             )
         } else if terminal_hosts.is_empty() {
             (false, Some("terminal host is missing".to_string()))
-        } else if !terminal_rendered {
+        } else {
             (
                 false,
                 Some("active terminal host exists but xterm surface is empty".to_string()),
             )
-        } else {
-            (true, None)
         }
     } else {
         (
@@ -16307,97 +16374,77 @@ fn PreviewLoadingPlaceholder(session: ManagedSessionView, palette: Palette) -> E
     let detail = metadata_value(&session, "Preview Hydration");
     let hydration_hint = if detail.eq_ignore_ascii_case("loading") {
         format!(
-            "Yggterm is talking to {host}, opening the remote session, and hydrating the latest {surface_noun}."
+            "Yggterm is talking to {host} and hydrating the latest remote {surface_noun}."
         )
     } else {
         format!(
-            "The remote session is awake, but the {surface_noun} is still being assembled into a clean viewport."
+            "Yggterm has the session, but the remote {surface_noun} is still being assembled into a clean viewport."
         )
     };
     rsx! {
         div {
             "data-preview-loading-placeholder": "1",
-            style: "display:flex; flex-direction:column; gap:18px; min-height:320px; justify-content:center; padding:30px 30px 34px 30px; border-radius:26px; background:linear-gradient(180deg, rgba(255,255,255,0.94) 0%, rgba(247,250,255,0.99) 100%); box-shadow:0 24px 48px rgba(148,163,184,0.12), inset 0 0 0 1px rgba(170,190,212,0.16);",
+            style: "position:relative; display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:320px; height:100%; padding:28px 28px 32px 28px; border-radius:26px; overflow:hidden; background:linear-gradient(180deg, rgba(255,255,255,0.96) 0%, rgba(247,250,255,0.99) 100%); box-shadow:0 24px 48px rgba(148,163,184,0.12), inset 0 0 0 1px rgba(170,190,212,0.16);",
             style {
                 "{TREE_LOADING_DOT_CSS}{REMOTE_SURFACE_STAGE_CSS}"
             }
             div {
-                style: "display:flex; align-items:center; gap:10px; flex-wrap:wrap;",
-                LoadingStateChip {
-                    label: format!("Loading remote {surface_noun}"),
-                    palette,
-                }
-                div {
-                    style: format!("font-size:12px; font-weight:700; letter-spacing:0.03em; text-transform:uppercase; color:{};", palette.muted),
-                    "{host}"
-                }
+                style: format!(
+                    "position:absolute; inset:0; opacity:0.72; background:radial-gradient(circle at 18% 18%, rgba(191,219,254,0.24) 0%, rgba(191,219,254,0.00) 34%), radial-gradient(circle at 82% 14%, rgba(251,191,36,0.10) 0%, rgba(251,191,36,0.00) 28%), linear-gradient(180deg, rgba(255,255,255,0.00) 0%, rgba(255,255,255,0.36) 100%);"
+                )
             }
             div {
-                style: "display:flex; flex-direction:column; gap:8px;",
+                style: "position:relative; z-index:1; display:flex; align-items:center; justify-content:center; width:100%;",
                 div {
-                    style: format!("font-size:24px; line-height:1.22; font-weight:760; color:{};", palette.text),
-                    "Loading remote session {surface_title}"
-                }
-                div {
-                    style: format!("font-size:14px; line-height:1.72; color:{}; max-width:66ch;", palette.muted),
-                    "{session.title}"
-                }
-            }
-            div {
-                style: format!("font-size:14px; line-height:1.72; color:{}; max-width:64ch;", palette.muted),
-                "{hydration_hint}"
-            }
-            div {
-                style: "display:grid; grid-template-columns:minmax(0, 1fr) minmax(240px, 340px) minmax(0, 1fr); gap:16px; width:100%; max-width:860px; align-items:center;",
-                for (ix, label, copy) in [
-                    (0_i32, "Reach Host", format!("Contacting {host} and checking the remote yggterm sidecar.")),
-                    (1_i32, "Open Session", "Restoring the selected session and matching it to the active viewport.".to_string()),
-                    (2_i32, "Hydrate View", format!("Painting the latest {surface_noun} content once the remote state is ready.")),
-                ] {
+                    style: "display:flex; flex-direction:column; align-items:center; gap:12px; width:min(392px, 100%); padding:20px 22px; border-radius:18px; background:rgba(255,255,255,0.86); box-shadow:0 18px 44px rgba(148,163,184,0.18), inset 0 0 0 1px rgba(170,190,212,0.18); backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);",
                     div {
-                        style: format!(
-                            "display:flex; flex-direction:column; gap:8px; padding:15px 16px; border-radius:18px; min-width:0; background:rgba(255,255,255,0.8); \
-                             box-shadow:0 12px 24px rgba(173,188,207,0.1), inset 0 0 0 1px rgba(170,190,212,0.12); animation:yggterm-remote-stage-float 3.2s ease-in-out infinite; animation-delay:{}ms;",
-                            ix * 140
-                        ),
-                        div {
-                            style: format!("font-size:11px; font-weight:800; letter-spacing:0.04em; text-transform:uppercase; color:{};", if ix == 2 { palette.accent } else { palette.muted }),
-                            "{label}"
-                        }
-                        div {
-                            style: format!("font-size:13px; line-height:1.62; color:{};", palette.text),
-                            "{copy}"
-                        }
-                    }
-                }
-            }
-            div {
-                style: "display:flex; align-items:center; justify-content:center; width:100%;",
-                div {
-                    style: "display:flex; flex-direction:column; gap:16px; width:min(560px, 100%); padding:18px 18px 16px 18px; border-radius:22px; background:linear-gradient(180deg, rgba(246,250,255,0.95) 0%, rgba(255,255,255,0.88) 100%); box-shadow:0 18px 34px rgba(164,180,201,0.11), inset 0 0 0 1px rgba(170,190,212,0.15);",
-                    div {
-                        style: "display:flex; align-items:center; justify-content:center; gap:18px;",
-                        div {
-                            style: "display:flex; align-items:center; gap:7px; color:rgba(96,118,146,0.95); font-size:12px; font-weight:700; letter-spacing:0.03em; text-transform:uppercase;",
-                            div {
-                                style: format!("width:10px; height:10px; border-radius:999px; background:{}; animation:yggterm-remote-stage-pulse 1.6s ease-in-out infinite;", palette.accent),
-                            }
-                            "{host}"
-                        }
-                        div {
-                            style: "flex:1; height:2px; border-radius:999px; background:linear-gradient(90deg, rgba(154,183,219,0.16) 0%, rgba(154,183,219,0.55) 50%, rgba(154,183,219,0.16) 100%); position:relative; overflow:hidden;",
-                            div {
-                                style: format!("position:absolute; inset:0; width:42%; border-radius:999px; background:linear-gradient(90deg, rgba(255,255,255,0.0) 0%, {} 52%, rgba(255,255,255,0.0) 100%); animation:yggterm-remote-stage-beam 2.4s ease-in-out infinite;", palette.accent_soft),
-                            }
-                        }
-                        div {
-                            style: format!("display:flex; align-items:center; gap:7px; color:{}; font-size:12px; font-weight:700; letter-spacing:0.03em; text-transform:uppercase;", palette.text),
-                            "{surface_title}"
+                        LoadingStateChip {
+                            label: format!("Loading remote {surface_noun}"),
+                            palette,
                         }
                     }
                     div {
-                        style: format!("font-size:13px; line-height:1.7; color:{}; text-align:center;", palette.muted),
-                        "You can keep browsing the workspace while this remote session catches up."
+                        style: format!("font-size:15px; font-weight:700; color:{}; text-align:center;", palette.text),
+                        "Loading remote session {surface_title}…"
+                    }
+                    div {
+                        style: format!("font-size:12px; font-weight:700; letter-spacing:0.03em; text-transform:uppercase; color:{};", palette.muted),
+                        "{host}"
+                    }
+                    div {
+                        style: format!("font-size:12px; line-height:1.65; color:{}; text-align:center; max-width:320px;", palette.muted),
+                        "{hydration_hint}"
+                    }
+                    div {
+                        style: format!("font-size:12px; line-height:1.65; color:{}; text-align:center; max-width:320px; opacity:0.92;", palette.muted),
+                        "{session.title}"
+                    }
+                    div {
+                        style: "width:min(240px, 100%); height:6px; border-radius:999px; overflow:hidden; background:rgba(191,219,254,0.26); box-shadow:inset 0 0 0 1px rgba(170,190,212,0.16);",
+                        div {
+                            style: format!(
+                                "width:38%; height:100%; border-radius:999px; background:linear-gradient(90deg, rgba(96,165,250,0.22) 0%, {} 55%, rgba(96,165,250,0.20) 100%); animation:yggterm-remote-surface-stage 1.2s ease-in-out infinite;",
+                                palette.accent
+                            )
+                        }
+                    }
+                    div {
+                        style: "display:flex; align-items:center; gap:6px;",
+                        for ix in 0..3 {
+                            div {
+                                key: "{ix}",
+                                style: format!(
+                                    "width:8px; height:8px; border-radius:999px; background:{}; opacity:{}; animation:yggterm-tree-loading-dot 1.05s ease-in-out infinite; animation-delay:{}ms;",
+                                    palette.accent,
+                                    0.92_f32 - (ix as f32 * 0.14),
+                                    ix * 140
+                                )
+                            }
+                        }
+                    }
+                    div {
+                        style: format!("font-size:12px; line-height:1.65; color:{}; text-align:center; max-width:320px;", palette.muted),
+                        "You can keep browsing while this remote session catches up."
                     }
                 }
             }
@@ -16412,7 +16459,6 @@ fn PreviewFailurePlaceholder(
     message: String,
 ) -> Element {
     let surface_noun = rendered_surface_noun(&session);
-    let surface_title = rendered_surface_title(&session);
     let host = session
         .ssh_target
         .clone()
@@ -16424,50 +16470,36 @@ fn PreviewFailurePlaceholder(
     rsx! {
         div {
             "data-preview-failure-placeholder": "1",
-            style: "display:flex; flex-direction:column; gap:16px; min-height:320px; justify-content:center; padding:30px 30px 34px 30px; border-radius:26px; background:linear-gradient(180deg, rgba(255,252,252,0.96) 0%, rgba(252,246,246,0.98) 100%); box-shadow:0 24px 48px rgba(148,163,184,0.12), inset 0 0 0 1px rgba(212,134,134,0.16);",
             div {
-                style: "display:flex; align-items:center; gap:10px; flex-wrap:wrap;",
+                style: "display:flex; align-items:center; justify-content:center; width:100%; min-height:320px;",
                 div {
-                    style: "display:inline-flex; align-items:center; gap:7px; padding:6px 10px; border-radius:999px; background:rgba(255,255,255,0.78); color:#a24a4a; font-size:11px; font-weight:700; box-shadow: inset 0 0 0 1px rgba(212,134,134,0.18); white-space:nowrap;",
+                    style: "display:flex; flex-direction:column; align-items:center; gap:12px; width:min(400px, 100%); padding:22px 22px 20px 22px; border-radius:18px; background:rgba(255,255,255,0.84); box-shadow:0 18px 44px rgba(148,163,184,0.18), inset 0 0 0 1px rgba(212,134,134,0.16);",
                     div {
-                        style: "width:7px; height:7px; border-radius:999px; background:#d04d4d; opacity:0.92;"
-                    }
-                    "Remote {surface_noun} unavailable"
-                }
-                div {
-                    style: format!("font-size:12px; font-weight:700; letter-spacing:0.03em; text-transform:uppercase; color:{};", palette.muted),
-                    "{host}"
-                }
-            }
-            div {
-                style: "display:flex; flex-direction:column; gap:8px;",
-                div {
-                    style: format!("font-size:24px; line-height:1.22; font-weight:760; color:{};", palette.text),
-                    "Could not load this remote {surface_noun}"
-                }
-                div {
-                    style: format!("font-size:14px; line-height:1.72; color:{}; max-width:66ch;", palette.muted),
-                    "{session.title}"
-                }
-            }
-            div {
-                style: format!("font-size:14px; line-height:1.72; color:{}; max-width:68ch;", palette.text),
-                "{message}"
-            }
-            div {
-                style: format!("font-size:13px; line-height:1.72; color:{}; max-width:68ch;", palette.muted),
-                "The session itself is still here. Yggterm will keep retrying quietly, and it will not paint stale content as if it were current."
-            }
-            div {
-                style: "display:flex; align-items:center; gap:10px; flex-wrap:wrap;",
-                div {
-                    style: "display:inline-flex; align-items:center; gap:8px; padding:8px 12px; border-radius:14px; background:rgba(255,255,255,0.78); box-shadow:inset 0 0 0 1px rgba(212,134,134,0.16);",
-                    div {
-                        style: "width:9px; height:9px; border-radius:999px; background:#d04d4d;"
+                        style: "display:inline-flex; align-items:center; gap:7px; padding:6px 10px; border-radius:999px; background:rgba(255,255,255,0.78); color:#a24a4a; font-size:11px; font-weight:700; box-shadow: inset 0 0 0 1px rgba(212,134,134,0.18); white-space:nowrap;",
+                        div {
+                            style: "width:7px; height:7px; border-radius:999px; background:#d04d4d; opacity:0.92;"
+                        }
+                        "Remote {surface_noun} unavailable"
                     }
                     div {
-                        style: format!("font-size:12px; font-weight:700; color:{};", palette.text),
-                        "Remote {surface_title} on {host}"
+                        style: format!("font-size:15px; font-weight:700; color:{}; text-align:center;", palette.text),
+                        "Could not load this remote {surface_noun}"
+                    }
+                    div {
+                        style: format!("font-size:12px; font-weight:700; letter-spacing:0.03em; text-transform:uppercase; color:{};", palette.muted),
+                        "{host}"
+                    }
+                    div {
+                        style: format!("font-size:12px; line-height:1.65; color:{}; text-align:center; max-width:330px;", palette.text),
+                        "{message}"
+                    }
+                    div {
+                        style: format!("font-size:12px; line-height:1.65; color:{}; text-align:center; max-width:330px;", palette.muted),
+                        "{session.title}"
+                    }
+                    div {
+                        style: format!("font-size:12px; line-height:1.65; color:{}; text-align:center; max-width:330px;", palette.muted),
+                        "The session itself is still here. Yggterm will keep retrying quietly, and it will not paint stale content as if it were current."
                     }
                 }
             }
@@ -17817,15 +17849,15 @@ fn TerminalCanvas(
     let trace_home = perf_home_dir(&state.read().bootstrap.settings_path);
     let is_remote_resume_session = session.session_path.starts_with("remote-session://");
     let terminal_has_meaningful_output = use_signal(|| !is_remote_resume_session);
-    let resume_overlay_expired = use_signal(|| !is_remote_resume_session);
+    let resume_overlay_slow = use_signal(|| false);
     {
-        let mut resume_overlay_expired = resume_overlay_expired;
+        let mut resume_overlay_slow = resume_overlay_slow;
         use_future(move || async move {
             if !is_remote_resume_session {
                 return;
             }
             sleep(Duration::from_secs(10)).await;
-            resume_overlay_expired.set(true);
+            resume_overlay_slow.set(true);
         });
     }
     {
@@ -17972,7 +18004,11 @@ fn TerminalCanvas(
                                     .await
                                 {
                                     cursor = next_cursor;
-                                    read_poll_ms = if chunks.is_empty() { 140 } else { 60 };
+                                    read_poll_ms = if chunks.is_empty() {
+                                        if is_remote_resume_session { 45 } else { 140 }
+                                    } else {
+                                        60
+                                    };
                                     let (
                                         batched_output,
                                         saw_visible_output,
@@ -18273,7 +18309,11 @@ fn TerminalCanvas(
                             Ok((next_cursor, chunks)) => {
                                 cursor = next_cursor;
                                 read_poll_ms = if chunks.is_empty() {
-                                    (read_poll_ms + 20).min(220)
+                                    if is_remote_resume_session && !traced_attach_ready {
+                                        45
+                                    } else {
+                                        (read_poll_ms + 20).min(220)
+                                    }
                                 } else {
                                     60
                                 };
@@ -18452,8 +18492,7 @@ fn TerminalCanvas(
             }
         }
     });
-    let show_resume_overlay =
-        is_remote_resume_session && !terminal_has_meaningful_output() && !resume_overlay_expired();
+    let show_resume_overlay = is_remote_resume_session && !terminal_has_meaningful_output();
     rsx! {
         div {
             key: "{instance_key}",
@@ -18491,11 +18530,19 @@ fn TerminalCanvas(
                             style: "display:flex; flex-direction:column; align-items:center; gap:10px; padding:18px 20px; border-radius:18px; background:rgba(255,255,255,0.82); box-shadow:0 18px 44px rgba(148,163,184,0.18), inset 0 0 0 1px rgba(170,190,212,0.18); min-width:280px;",
                             div {
                                 style: format!("font-size:14px; font-weight:700; color:{};", snapshot.palette.text),
-                                "Resuming remote Codex session…"
+                                if resume_overlay_slow() {
+                                    "Still connecting to remote terminal…"
+                                } else {
+                                    "Resuming remote Codex session…"
+                                }
                             }
                             div {
                                 style: format!("font-size:12px; line-height:1.65; color:{}; text-align:center; max-width:360px;", snapshot.palette.muted),
-                                "Yggterm is attaching to {session.host_label} and waiting for the remote Codex TUI to paint. The terminal will appear here as soon as meaningful output arrives."
+                                if resume_overlay_slow() {
+                                    "Yggterm is still attached to {session.host_label} and waiting for the remote terminal to paint. The terminal will appear here as soon as real output arrives."
+                                } else {
+                                    "Yggterm is attaching to {session.host_label} and waiting for the remote Codex TUI to paint. The terminal will appear here as soon as meaningful output arrives."
+                                }
                             }
                             div {
                                 style: "display:flex; align-items:center; gap:6px;",
