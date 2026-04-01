@@ -1409,11 +1409,8 @@ impl YggtermServer {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
-        let cwd = normalize_remote_attach_cwd(
-            &ssh_target,
-            prefix.as_deref(),
-            requested_cwd.as_deref(),
-        );
+        let cwd =
+            normalize_remote_attach_cwd(&ssh_target, prefix.as_deref(), requested_cwd.as_deref());
         let title = title_hint
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -4949,7 +4946,8 @@ fn normalize_remote_attach_cwd(
     let mut cmd = Command::new("ssh");
     cmd.arg("-o").arg("ConnectTimeout=5");
     cmd.arg("-o").arg("BatchMode=yes");
-    cmd.arg(ssh_target).arg(remote_shell_command(exec_prefix, &resolver));
+    cmd.arg(ssh_target)
+        .arg(remote_shell_command(exec_prefix, &resolver));
     match cmd.output() {
         Ok(output) if output.status.success() => {
             let resolved = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -6324,9 +6322,27 @@ fn app_control_open_path_ready(
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .unwrap_or("");
-            visible_block_count > 0 || rendered_sections || !text_sample.is_empty()
+            let placeholder = preview
+                .get("placeholder")
+                .and_then(Value::as_bool)
+                .unwrap_or_else(|| preview_text_looks_like_loading_placeholder(text_sample));
+            visible_block_count > 0
+                || rendered_sections
+                || (!text_sample.is_empty() && !placeholder)
         }
     }
+}
+
+fn preview_text_looks_like_loading_placeholder(text: &str) -> bool {
+    let normalized = text.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    normalized.contains("refreshing preview")
+        || normalized.contains("fetching rendered transcript")
+        || normalized.contains("preparing the remote preview surface")
+        || normalized.contains("waiting for transcript hydration")
+        || normalized.contains("preview unavailable")
 }
 
 fn wait_for_app_control_open_path_ready(
@@ -8492,6 +8508,7 @@ fn short_session_id(session_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::app_control_open_path_ready;
     use super::{
         GhosttyHostSupport, GhosttyTerminalHostMode, PersistedDaemonState, PersistedLiveSession,
         PersistedStoredSession, PreviewTone, REMOTE_OUTPUT_SENTINEL, RemoteCommandCacheEntry,
@@ -8514,9 +8531,32 @@ mod tests {
     };
     use crate::SessionRenderedSection;
     use anyhow::Result;
+    use serde_json::json;
     use std::fs;
     use std::path::PathBuf;
     use yggterm_core::TranscriptRole;
+
+    #[test]
+    fn app_control_open_path_ready_rejects_loading_placeholder_preview() {
+        let state = json!({
+            "viewport": {
+                "active_session_path": "remote-session://jojo/test",
+                "active_view_mode": "Rendered",
+                "ready": true,
+                "preview": {
+                    "text_sample": "Refreshing preview...\nJOJO\nFetching rendered transcript and metadata from the remote yggterm daemon.",
+                    "visible_block_count": 0,
+                    "rendered_sections": [],
+                    "placeholder": true,
+                }
+            }
+        });
+        assert!(!app_control_open_path_ready(
+            &state,
+            "remote-session://jojo/test",
+            Some(&super::AppControlViewMode::Preview),
+        ));
+    }
 
     #[test]
     fn parse_stored_transcript_counts_compacted_replacement_history() -> Result<()> {
@@ -8706,10 +8746,7 @@ mod tests {
         )));
         assert!(command.contains("-o ControlMaster=auto"));
         assert!(command.contains("-o ControlPersist=60"));
-        assert!(command.contains(&format!(
-            "-o ControlPath='{}/%C'",
-            expected_control_dir
-        )));
+        assert!(command.contains(&format!("-o ControlPath='{}/%C'", expected_control_dir)));
         assert!(!command.contains("$HOME/.yggterm/ssh-control"));
         assert!(command.contains("-tt jojo "));
         assert!(command.contains("tmux new-session -A -s yggterm &&"));
@@ -8733,7 +8770,11 @@ mod tests {
                 .and_then(|value| value.to_str())
                 .is_some_and(|value| value.starts_with("yt-ssh-"))
         );
-        assert!(!control_dir.to_string_lossy().contains(".yggterm/ssh-control"));
+        assert!(
+            !control_dir
+                .to_string_lossy()
+                .contains(".yggterm/ssh-control")
+        );
         assert!(control_dir.to_string_lossy().len() < 64);
     }
 
