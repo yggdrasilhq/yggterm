@@ -6339,10 +6339,15 @@ fn preview_text_looks_like_loading_placeholder(text: &str) -> bool {
         return false;
     }
     normalized.contains("refreshing preview")
+        || normalized.contains("loading remote session")
+        || normalized.contains("loading remote preview")
+        || normalized.contains("loading remote paper")
+        || normalized.contains("loading remote recipe")
         || normalized.contains("fetching rendered transcript")
         || normalized.contains("preparing the remote preview surface")
         || normalized.contains("waiting for transcript hydration")
         || normalized.contains("preview unavailable")
+        || normalized.contains("could not load this remote")
 }
 
 fn wait_for_app_control_open_path_ready(
