@@ -4321,7 +4321,8 @@ fn maybe_spawn_missing_managed_cli_refreshes(state: Signal<ShellState>) {
 fn app_control_command_defers_background_refresh(command: &AppControlCommand) -> bool {
     matches!(
         command,
-        AppControlCommand::CreateTerminal { .. }
+        AppControlCommand::SetSearch { .. }
+            | AppControlCommand::CreateTerminal { .. }
             | AppControlCommand::OpenPath { .. }
             | AppControlCommand::SendTerminalInput { .. }
             | AppControlCommand::RemoveSession { .. }
@@ -10453,6 +10454,41 @@ fn describe_app_state_snapshot(
 ) -> Value {
     let shell = state.read();
     let snapshot = shell.snapshot();
+    let search_sidebar_matches = snapshot
+        .search_sidebar_matches
+        .iter()
+        .take(8)
+        .map(|row| {
+            json!({
+                "full_path": row.full_path,
+                "label": row.label,
+                "detail_label": row.detail_label,
+                "kind": format!("{:?}", row.kind),
+            })
+        })
+        .collect::<Vec<_>>();
+    let search_content_hits = snapshot
+        .search_content_hits
+        .iter()
+        .take(8)
+        .map(|hit| {
+            json!({
+                "dom_id": hit.dom_id,
+                "label": hit.label,
+            })
+        })
+        .collect::<Vec<_>>();
+    let search_command_suggestions = snapshot
+        .search_command_suggestions
+        .iter()
+        .take(8)
+        .map(|suggestion| {
+            json!({
+                "command": suggestion.command,
+                "description": suggestion.description,
+            })
+        })
+        .collect::<Vec<_>>();
     let selected_path = snapshot.selected_path.clone();
     let browser_metrics = shell.browser.metrics();
     let active_requests = shell
@@ -10559,6 +10595,19 @@ fn describe_app_state_snapshot(
                     "persistent": notification.persistent,
                 })
             }).collect::<Vec<_>>(),
+        },
+        "search": {
+            "active": snapshot.search_active,
+            "query": snapshot.search_query,
+            "focused": snapshot.search_focused,
+            "sidebar_match_count": snapshot.search_sidebar_matches.len(),
+            "sidebar_match_index": snapshot.search_sidebar_match_index,
+            "sidebar_matches": search_sidebar_matches,
+            "content_hit_count": snapshot.search_content_hits.len(),
+            "content_hit_index": snapshot.search_content_hit_index,
+            "content_hits": search_content_hits,
+            "command_suggestion_count": snapshot.search_command_suggestions.len(),
+            "command_suggestions": search_command_suggestions,
         },
         "generation": {
             "title_requests_in_flight": shell.title_requests_in_flight.len(),
@@ -11315,6 +11364,42 @@ async fn process_pending_app_control_requests(
         .active_session_path()
         .map(str::to_string);
     let response = match command {
+        AppControlCommand::SetSearch { query, focused } => {
+            let query_trimmed = query.trim().to_string();
+            state.with_mut(|shell| {
+                shell.set_search(query.clone());
+                if let Some(focused) = focused {
+                    shell.set_search_focus(focused);
+                }
+                shell.refresh_search_state("app_control_set_search");
+            });
+            sleep(Duration::from_millis(40)).await;
+            let dom_snapshot = capture_dom_debug_snapshot_for(active_session_path.as_deref()).await;
+            let mut state_snapshot = describe_app_state_snapshot(&state, &desktop);
+            let viewport = describe_viewport_snapshot(&state_snapshot, &dom_snapshot);
+            if let Some(map) = state_snapshot.as_object_mut() {
+                map.insert("dom".to_string(), dom_snapshot.clone());
+                map.insert("viewport".to_string(), viewport);
+            }
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(json!({
+                    "command": "set_search",
+                    "query": query,
+                    "query_trimmed": query_trimmed,
+                    "focused": focused,
+                    "window": describe_window(&desktop),
+                    "active_view_mode": format!("{:?}", state.read().server.active_view_mode()),
+                    "active_session_path": state.read().server.active_session_path(),
+                    "dom": dom_snapshot,
+                    "state": state_snapshot,
+                })),
+                error: None,
+            }
+        }
         AppControlCommand::CaptureScreenshot {
             target,
             output_path,
@@ -23644,6 +23729,12 @@ mod tests {
 
     #[test]
     fn app_control_open_and_expand_defer_background_refreshes() {
+        assert!(app_control_command_defers_background_refresh(
+            &AppControlCommand::SetSearch {
+                query: "jojo".to_string(),
+                focused: Some(true),
+            }
+        ));
         assert!(app_control_command_defers_background_refresh(
             &AppControlCommand::OpenPath {
                 session_path: "remote-session://jojo/abc".to_string(),
