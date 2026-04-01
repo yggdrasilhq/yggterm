@@ -417,6 +417,22 @@ pub struct YggtermServer {
     live_session_order: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionPayloadStats {
+    pub session_count: usize,
+    pub metadata_entries: usize,
+    pub metadata_bytes: usize,
+    pub preview_blocks: usize,
+    pub preview_lines: usize,
+    pub preview_bytes: usize,
+    pub rendered_sections: usize,
+    pub rendered_lines: usize,
+    pub rendered_bytes: usize,
+    pub terminal_lines: usize,
+    pub terminal_bytes: usize,
+    pub total_bytes: usize,
+}
+
 impl YggtermServer {
     pub fn new(
         tree: &SessionNode,
@@ -922,6 +938,53 @@ impl YggtermServer {
             ssh_targets: self.ssh_targets.clone(),
             live_sessions,
         }
+    }
+
+    pub fn payload_stats(&self) -> SessionPayloadStats {
+        self.sessions.values().fold(
+            SessionPayloadStats {
+                session_count: self.sessions.len(),
+                ..SessionPayloadStats::default()
+            },
+            |mut stats, session| {
+                stats.metadata_entries += session.metadata.len() + session.preview.summary.len();
+                stats.metadata_bytes += session
+                    .metadata
+                    .iter()
+                    .map(|entry| entry.label.len() + entry.value.len())
+                    .sum::<usize>();
+                stats.metadata_bytes += session
+                    .preview
+                    .summary
+                    .iter()
+                    .map(|entry| entry.label.len() + entry.value.len())
+                    .sum::<usize>();
+                stats.preview_blocks += session.preview.blocks.len();
+                for block in &session.preview.blocks {
+                    stats.preview_lines += block.lines.len();
+                    stats.preview_bytes += block.role.len() + block.timestamp.len();
+                    stats.preview_bytes += block.lines.iter().map(|line| line.len()).sum::<usize>();
+                }
+                stats.rendered_sections += session.rendered_sections.len();
+                for section in &session.rendered_sections {
+                    stats.rendered_lines += section.lines.len();
+                    stats.rendered_bytes += section.title.len();
+                    stats.rendered_bytes +=
+                        section.lines.iter().map(|line| line.len()).sum::<usize>();
+                }
+                stats.terminal_lines += session.terminal_lines.len();
+                stats.terminal_bytes += session
+                    .terminal_lines
+                    .iter()
+                    .map(|line| line.len())
+                    .sum::<usize>();
+                stats.total_bytes = stats.metadata_bytes
+                    + stats.preview_bytes
+                    + stats.rendered_bytes
+                    + stats.terminal_bytes;
+                stats
+            },
+        )
     }
 
     pub fn apply_snapshot(&mut self, snapshot: ServerUiSnapshot) {
@@ -1744,9 +1807,8 @@ impl YggtermServer {
                         &target.ssh_target,
                     );
                     if !launch_terminal {
-                        if !try_apply_remote_preview_head_payload(session, &target, scanned) {
-                            clear_session_preview_for_loading(session);
-                        }
+                        clear_session_preview_for_loading(session);
+                        let _ = try_apply_remote_preview_head_payload(session, &target, scanned);
                     }
                 }
             }
@@ -1837,9 +1899,8 @@ impl YggtermServer {
                     &target.ssh_target,
                 );
                 if !launch_terminal {
-                    if !try_apply_remote_preview_head_payload(session, &target, scanned) {
-                        clear_session_preview_for_loading(session);
-                    }
+                    clear_session_preview_for_loading(session);
+                    let _ = try_apply_remote_preview_head_payload(session, &target, scanned);
                 }
             }
         }
@@ -3673,6 +3734,8 @@ fn apply_remote_scanned_session_preview(
 }
 
 fn clear_session_preview_for_loading(session: &mut ManagedSessionView) {
+    session.preview.blocks.clear();
+    session.rendered_sections.clear();
     upsert_session_metadata(
         &mut session.metadata,
         "Preview Hydration",
@@ -3723,14 +3786,14 @@ fn apply_remote_preview_payload(session: &mut ManagedSessionView, payload: Remot
             .summary
             .into_iter()
             .map(|entry| SessionMetadataEntry {
-                label: leak_label(entry.label),
+                label: canonical_static_label(entry.label),
                 value: entry.value,
             })
             .collect(),
         blocks: sanitize_snapshot_preview_blocks(payload.preview.blocks)
             .into_iter()
             .map(|block| SessionPreviewBlock {
-                role: leak_label(block.role),
+                role: canonical_static_label(block.role),
                 timestamp: block.timestamp,
                 tone: block.tone,
                 folded: block.folded,
@@ -3741,7 +3804,7 @@ fn apply_remote_preview_payload(session: &mut ManagedSessionView, payload: Remot
     session.rendered_sections = sanitize_snapshot_rendered_sections(payload.rendered_sections)
         .into_iter()
         .map(|section| SessionRenderedSection {
-            title: leak_label(section.title),
+            title: canonical_static_label(section.title),
             lines: section.lines,
         })
         .collect();
@@ -6062,17 +6125,25 @@ fn wait_for_app_control_open_path_ready(
 ) -> anyhow::Result<Value> {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(250));
     let mut last_state = None::<Value>;
+    let mut last_error = None::<String>;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let describe_timeout_ms = remaining
             .as_millis()
             .clamp(250, 1_000) as u64;
-        let response = request_app_control(home, AppControlCommand::DescribeState, describe_timeout_ms)?;
-        if let Some(data) = response.data {
-            if app_control_open_path_ready(&data, session_path, view_mode.as_ref()) {
-                return Ok(data);
+        match request_app_control(home, AppControlCommand::DescribeState, describe_timeout_ms) {
+            Ok(response) => {
+                last_error = None;
+                if let Some(data) = response.data {
+                    if app_control_open_path_ready(&data, session_path, view_mode.as_ref()) {
+                        return Ok(data);
+                    }
+                    last_state = Some(data);
+                }
             }
-            last_state = Some(data);
+            Err(error) => {
+                last_error = Some(error.to_string());
+            }
         }
         if Instant::now() >= deadline {
             let summary = last_state
@@ -6087,8 +6158,12 @@ fn wait_for_app_control_open_path_ready(
                     })
                 })
                 .unwrap_or(Value::Null);
+            let error_suffix = last_error
+                .as_deref()
+                .map(|error| format!(" last_error={error}"))
+                .unwrap_or_default();
             anyhow::bail!(
-                "timed out waiting for app open to settle for {session_path}: {summary}"
+                "timed out waiting for app open to settle for {session_path}: {summary}{error_suffix}"
             );
         }
         std::thread::sleep(Duration::from_millis(120));
@@ -6572,8 +6647,47 @@ pub fn snapshot_session_view_for_ui(session: ManagedSessionView) -> SnapshotSess
     snapshot_session_view(session)
 }
 
-fn leak_label(value: String) -> &'static str {
-    Box::leak(value.into_boxed_str())
+fn canonical_static_label(value: String) -> &'static str {
+    match value.as_str() {
+        "ASSISTANT" => "ASSISTANT",
+        "Backend" => "Backend",
+        "Bridge" => "Bridge",
+        "Bytes" => "Bytes",
+        "Cwd" => "Cwd",
+        "Deploy" => "Deploy",
+        "Document" => "Document",
+        "Host" => "Host",
+        "Kind" => "Kind",
+        "Launch" => "Launch",
+        "Launch Error" => "Launch Error",
+        "Launch PID" => "Launch PID",
+        "Messages" => "Messages",
+        "NOTE" => "NOTE",
+        "Prefix" => "Prefix",
+        "Preview Blocks" => "Preview Blocks",
+        "Preview Hydration" => "Preview Hydration",
+        "Primary User Goals" => "Primary User Goals",
+        "REPLAY" => "REPLAY",
+        "Recent Context" => "Recent Context",
+        "Rendered Session" => "Rendered Session",
+        "Replay" => "Replay",
+        "Replay Commands" => "Replay Commands",
+        "Restore" => "Restore",
+        "Server Notes" => "Server Notes",
+        "Session" => "Session",
+        "Source" => "Source",
+        "Source Cwd" => "Source Cwd",
+        "Started" => "Started",
+        "Status" => "Status",
+        "Storage" => "Storage",
+        "Summary" => "Summary",
+        "Target" => "Target",
+        "Theme" => "Theme",
+        "UUID" => "UUID",
+        "Updated" => "Updated",
+        "USER" => "USER",
+        _ => Box::leak(value.into_boxed_str()),
+    }
 }
 
 fn managed_session_from_snapshot(session: SnapshotSessionView) -> ManagedSessionView {
@@ -6596,7 +6710,7 @@ fn managed_session_from_snapshot(session: SnapshotSessionView) -> ManagedSession
             .rendered_sections
             .into_iter()
             .map(|section| SessionRenderedSection {
-                title: leak_label(section.title),
+                title: canonical_static_label(section.title),
                 lines: section.lines,
             })
             .collect(),
@@ -6606,14 +6720,14 @@ fn managed_session_from_snapshot(session: SnapshotSessionView) -> ManagedSession
                 .summary
                 .into_iter()
                 .map(|entry| SessionMetadataEntry {
-                    label: leak_label(entry.label),
+                    label: canonical_static_label(entry.label),
                     value: entry.value,
                 })
                 .collect(),
             blocks: preview_blocks
                 .into_iter()
                 .map(|block| SessionPreviewBlock {
-                    role: leak_label(block.role),
+                    role: canonical_static_label(block.role),
                     timestamp: block.timestamp,
                     tone: block.tone,
                     folded: block.folded,
@@ -6625,7 +6739,7 @@ fn managed_session_from_snapshot(session: SnapshotSessionView) -> ManagedSession
             .metadata
             .into_iter()
             .map(|entry| SessionMetadataEntry {
-                label: leak_label(entry.label),
+                label: canonical_static_label(entry.label),
                 value: entry.value,
             })
             .collect(),
@@ -8173,12 +8287,14 @@ mod tests {
         PersistedStoredSession, PreviewTone, REMOTE_OUTPUT_SENTINEL, RemoteCommandCacheEntry,
         RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot, RemotePreviewPayload,
         RemoteScannedSession, SessionKind, SessionNode, SessionNodeKind, SessionSource,
-        SessionPreviewBlock, SnapshotPreview, SnapshotPreviewBlock, SnapshotRenderedSection,
-        SnapshotSessionView, SshConnectTarget, StoredPreviewHydrationMode, TerminalBackend,
-        TerminalLaunchPhase, UiTheme, WorkspaceViewMode, YggtermServer,
+        SessionMetadataEntry, SessionPreview, SessionPreviewBlock, SnapshotPreview,
+        SnapshotPreviewBlock, SnapshotRenderedSection, SnapshotSessionView, SshConnectTarget,
+        StoredPreviewHydrationMode, TerminalBackend, TerminalLaunchPhase, UiTheme,
+        WorkspaceViewMode, YggtermServer,
         apply_remote_preview_payload, apply_remote_scanned_session_preview, build_session,
-        current_millis_u64, dedupe_remote_scanned_sessions,
-        load_remote_machine_sessions_from_mirror, managed_session_from_snapshot,
+        canonical_static_label, clear_session_preview_for_loading, current_millis_u64,
+        dedupe_remote_scanned_sessions, load_remote_machine_sessions_from_mirror,
+        managed_session_from_snapshot,
         mirror_remote_machine_sessions, parse_recent_context_sections, parse_screen_session_ref,
         parse_stored_transcript, push_preview_block, remote_cache_key, remote_command_cache,
         remote_resume_shell_command, remote_saved_codex_session_exists,
@@ -8187,6 +8303,7 @@ mod tests {
         stored_session_launch_command, strip_remote_payload_noise,
         synthesize_remote_scanned_session_view, upsert_session_metadata,
     };
+    use crate::SessionRenderedSection;
     use anyhow::Result;
     use std::fs;
     use std::path::PathBuf;
@@ -8244,6 +8361,112 @@ mod tests {
         assert!(command.contains("cd '/srv/workspace' && export NPM_CONFIG_PREFIX="));
         assert!(command.contains("codex resume"));
         assert!(command.contains("'019caa6f-b32c-7a73-b4d3-db83225663dc'"));
+    }
+
+    #[test]
+    fn payload_stats_counts_preview_rendered_and_terminal_bytes() {
+        let mut server = YggtermServer::new(
+            &SessionNode {
+                kind: SessionNodeKind::Group,
+                name: "root".to_string(),
+                title: Some("root".to_string()),
+                document_kind: None,
+                group_kind: None,
+                path: std::path::PathBuf::from("root"),
+                children: Vec::new(),
+                session_id: None,
+                cwd: None,
+            },
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.sessions.insert(
+            "session://one".to_string(),
+            super::ManagedSessionView {
+                id: "one".to_string(),
+                session_path: "session://one".to_string(),
+                title: "One".to_string(),
+                kind: SessionKind::Codex,
+                host_label: "local".to_string(),
+                source: SessionSource::Stored,
+                backend: TerminalBackend::Xterm,
+                bridge_available: false,
+                launch_phase: TerminalLaunchPhase::Running,
+                remote_deploy_state: RemoteDeployState::Ready,
+                launch_command: "cmd".to_string(),
+                status_line: String::new(),
+                terminal_lines: vec!["tail line".to_string()],
+                rendered_sections: vec![SessionRenderedSection {
+                    title: "Primary User Goals",
+                    lines: vec!["goal line".to_string()],
+                }],
+                preview: SessionPreview {
+                    summary: vec![SessionMetadataEntry {
+                        label: "Summary",
+                        value: "summary text".to_string(),
+                    }],
+                    blocks: vec![SessionPreviewBlock {
+                        role: "USER",
+                        timestamp: "now".to_string(),
+                        tone: PreviewTone::User,
+                        folded: false,
+                        lines: vec!["preview line".to_string()],
+                    }],
+                },
+                metadata: vec![SessionMetadataEntry {
+                    label: "Kind",
+                    value: "Codex".to_string(),
+                }],
+                terminal_process_id: None,
+                terminal_window_id: None,
+                terminal_host_token: None,
+                terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+                embedded_surface_id: None,
+                embedded_surface_detail: None,
+                last_launch_error: None,
+                last_window_error: None,
+                ssh_target: None,
+                ssh_prefix: None,
+                stored_preview_hydrated: true,
+            },
+        );
+
+        let stats = server.payload_stats();
+        assert_eq!(stats.session_count, 1);
+        assert_eq!(stats.metadata_entries, 2);
+        assert_eq!(stats.preview_blocks, 1);
+        assert_eq!(stats.preview_lines, 1);
+        assert_eq!(stats.rendered_sections, 1);
+        assert_eq!(stats.rendered_lines, 1);
+        assert_eq!(stats.terminal_lines, 1);
+        assert!(stats.metadata_bytes > 0);
+        assert!(stats.preview_bytes > 0);
+        assert!(stats.rendered_bytes > 0);
+        assert!(stats.terminal_bytes > 0);
+        assert_eq!(
+            stats.total_bytes,
+            stats.metadata_bytes
+                + stats.preview_bytes
+                + stats.rendered_bytes
+                + stats.terminal_bytes
+        );
+    }
+
+    #[test]
+    fn canonical_static_label_reuses_known_snapshot_labels() {
+        assert!(std::ptr::eq(
+            canonical_static_label("USER".to_string()),
+            canonical_static_label("USER".to_string()),
+        ));
+        assert!(std::ptr::eq(
+            canonical_static_label("Primary User Goals".to_string()),
+            canonical_static_label("Primary User Goals".to_string()),
+        ));
+        assert!(std::ptr::eq(
+            canonical_static_label("Summary".to_string()),
+            canonical_static_label("Summary".to_string()),
+        ));
     }
 
     #[test]
@@ -8892,6 +9115,42 @@ mod tests {
 
         assert_eq!(session.preview.blocks.len(), 1);
         assert_eq!(session.preview.blocks[0].lines, vec!["Hydrated preview block"]);
+    }
+
+    #[test]
+    fn clear_session_preview_for_loading_drops_stale_preview_content() {
+        let mut session = build_session(
+            SessionKind::SshShell,
+            "remote-session://jojo/loading123",
+            Some("loading123"),
+            Some("/home/pi"),
+            Some("Loading Session"),
+            None,
+            TerminalBackend::Xterm,
+            UiTheme::ZedLight,
+            false,
+            StoredPreviewHydrationMode::Eager,
+        );
+        session.preview.blocks = vec![SessionPreviewBlock {
+            role: "USER",
+            timestamp: "Mar 31, 2026 10:00 PM UTC+0530".to_string(),
+            tone: PreviewTone::User,
+            folded: false,
+            lines: vec!["Stale cached preview text".to_string()],
+        }];
+        session.rendered_sections = vec![SessionRenderedSection {
+            title: "Primary User Goals",
+            lines: vec!["Stale cached goal".to_string()],
+        }];
+
+        clear_session_preview_for_loading(&mut session);
+
+        assert!(session.preview.blocks.is_empty());
+        assert!(session.rendered_sections.is_empty());
+        assert_eq!(
+            session_metadata_value(&session, "Preview Hydration").as_deref(),
+            Some("loading")
+        );
     }
 
     #[test]
