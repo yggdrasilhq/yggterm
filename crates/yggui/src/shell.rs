@@ -5668,13 +5668,15 @@ fn remote_preview_needs_refresh(session: &ManagedSessionView) -> bool {
     session.session_path.starts_with("remote-session://")
         && (session.preview.blocks.is_empty()
             || metadata_value(session, "Preview Hydration") == "head"
+            || metadata_value(session, "Preview Hydration") == "loading"
             || session.preview.blocks.iter().any(|block| {
                 block.timestamp == "server:launch" || block.timestamp == "remote:scan"
             })
             || session
                 .rendered_sections
                 .iter()
-                .any(|section| section.title == "Recent Context"))
+                .any(|section| section.title == "Recent Context")
+            || preview_text_looks_like_loading_placeholder(&preview_summary_text(session)))
 }
 
 fn schedule_remote_preview_sync(
@@ -5718,6 +5720,7 @@ fn schedule_remote_preview_retry_tick(
                 .remote_preview_dirty_epoch
                 .insert(session_path.clone(), current_millis());
         });
+        let _ = kick_active_remote_preview_sync(state, "preview_refresh_retry_tick");
     });
 }
 
@@ -5812,6 +5815,59 @@ fn spawn_remote_preview_payload_sync(
             }
         });
     });
+}
+
+fn kick_active_remote_preview_sync(state: Signal<ShellState>, reason: &'static str) -> bool {
+    let action = safe_shell_mut(state, "kick_active_remote_preview_sync", |shell| {
+        if shell.server.active_view_mode() != WorkspaceViewMode::Rendered || shell.server_busy {
+            return None;
+        }
+        let Some(session) = shell.server.active_session().cloned() else {
+            return None;
+        };
+        if !session.session_path.starts_with("remote-session://")
+            || !remote_preview_needs_refresh(&session)
+        {
+            return None;
+        }
+        let now = current_millis();
+        shell
+            .remote_preview_dirty_epoch
+            .insert(session.session_path.clone(), now);
+        if remote_preview_fetch_target(&shell.server, &session).is_some() {
+            if schedule_remote_preview_sync(shell, &session.session_path, 0) {
+                shell.record_preview_issue_telemetry(reason);
+                return Some((session.session_path, true));
+            }
+            return None;
+        }
+        if schedule_remote_preview_sync(
+            shell,
+            &session.session_path,
+            REMOTE_PREVIEW_NO_TARGET_RETRY_MS,
+        ) {
+            shell.record_preview_issue_telemetry("preview_refresh_no_target");
+            return Some((session.session_path, false));
+        }
+        None
+    })
+    .ok()
+    .flatten();
+    match action {
+        Some((session_path, true)) => {
+            spawn_remote_preview_payload_sync(state, session_path, reason);
+            true
+        }
+        Some((session_path, false)) => {
+            schedule_remote_preview_retry_tick(
+                state,
+                session_path,
+                REMOTE_PREVIEW_NO_TARGET_RETRY_MS,
+            );
+            true
+        }
+        None => false,
+    }
 }
 
 fn background_copy_job_for_target(
@@ -10805,6 +10861,7 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
         .get("preview_visible_block_count")
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let preview_placeholder = preview_text_looks_like_loading_placeholder(&preview_text_sample);
     let terminal_rendered = active_terminal_hosts.iter().any(|host| {
         host.get("canvas_count")
             .and_then(Value::as_u64)
@@ -10858,9 +10915,15 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
             .and_then(Value::as_u64)
             .unwrap_or(0);
         let preview_has_content = preview_scroll_count > 0
-            && (!preview_text_sample.is_empty() || preview_visible_block_count > 0);
+            && ((preview_visible_block_count > 0 || !preview_rendered_sections.is_empty())
+                || (!preview_text_sample.is_empty() && !preview_placeholder));
         if preview_loading && !preview_has_content {
             (false, Some("preview still loading".to_string()))
+        } else if preview_placeholder {
+            (
+                false,
+                Some("preview placeholder is still visible".to_string()),
+            )
         } else if preview_scroll_count == 0 && document_editor_count == 0 {
             (false, Some("preview surface not mounted".to_string()))
         } else if preview_scroll_count > 0
@@ -10918,6 +10981,7 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
         "notifications": notifications,
         "preview": {
             "text_sample": preview_text_sample,
+            "placeholder": preview_placeholder,
             "viewport_rect": preview_viewport_rect,
             "visible_block_count": preview_visible_block_count,
             "visible_block_ids": preview_visible_block_ids,
@@ -10936,6 +11000,18 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
         "ready": ready,
         "reason": reason,
     })
+}
+
+fn preview_text_looks_like_loading_placeholder(text: &str) -> bool {
+    let normalized = text.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    normalized.contains("refreshing preview")
+        || normalized.contains("fetching rendered transcript")
+        || normalized.contains("preparing the remote preview surface")
+        || normalized.contains("waiting for transcript hydration")
+        || normalized.contains("preview unavailable")
 }
 
 async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Value {
@@ -12789,6 +12865,8 @@ fn app() -> Element {
     {
         let desktop = desktop.clone();
         let trace_home = trace_home.clone();
+        let state = state;
+        let schedule_ui_update = schedule_ui_update.clone();
         let window_spawn_traced = window_spawn_traced.clone();
         use_effect(move || {
             if window_spawn_traced.load(Ordering::SeqCst) {
@@ -12796,6 +12874,8 @@ fn app() -> Element {
             }
             let desktop = desktop.clone();
             let trace_home = trace_home.clone();
+            let state = state;
+            let schedule_ui_update = schedule_ui_update.clone();
             let started_at_ms = window_spawn_probe_started;
             let window_spawn_traced = window_spawn_traced.clone();
             spawn(async move {
@@ -12828,6 +12908,12 @@ fn app() -> Element {
                             }),
                         );
                         window_spawn_traced.store(true, Ordering::SeqCst);
+                        if kick_active_remote_preview_sync(
+                            state,
+                            "preview_refresh_after_window_spawn",
+                        ) {
+                            schedule_ui_update();
+                        }
                         return;
                     }
                     sleep(Duration::from_millis(50)).await;
@@ -23750,6 +23836,122 @@ mod tests {
         assert!(!app_control_command_defers_background_refresh(
             &AppControlCommand::DescribeState
         ));
+    }
+
+    #[test]
+    fn preview_placeholder_text_is_not_treated_as_real_content() {
+        assert!(preview_text_looks_like_loading_placeholder(
+            "Refreshing preview...\nJOJO\nFetching rendered transcript and metadata from the remote yggterm daemon."
+        ));
+        assert!(preview_text_looks_like_loading_placeholder(
+            "Refreshing preview…\nJOJO\nPreparing the remote preview surface and waiting for transcript hydration."
+        ));
+        assert!(!preview_text_looks_like_loading_placeholder(
+            "Nov 23, 2025 01:17PM UTC+0530\nWho are you?"
+        ));
+    }
+
+    #[test]
+    fn remote_preview_needs_refresh_for_loading_metadata() {
+        let session = ManagedSessionView {
+            id: "abc".to_string(),
+            session_path: "remote-session://jojo/abc".to_string(),
+            title: "Loading Session".to_string(),
+            kind: SessionKind::Codex,
+            host_label: "jojo".to_string(),
+            source: yggterm_server::SessionSource::LiveSsh,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: yggterm_server::RemoteDeployState::Ready,
+            launch_command: "codex".to_string(),
+            status_line: "ready".to_string(),
+            terminal_lines: Vec::new(),
+            rendered_sections: Vec::new(),
+            preview: yggterm_server::SessionPreview {
+                summary: Vec::new(),
+                blocks: vec![yggterm_server::SessionPreviewBlock {
+                    role: "assistant",
+                    timestamp: "now".to_string(),
+                    tone: yggterm_server::PreviewTone::Assistant,
+                    folded: false,
+                    lines: vec!["still loading".to_string()],
+                }],
+            },
+            metadata: vec![SessionMetadataEntry {
+                label: "Preview Hydration",
+                value: "loading".to_string(),
+            }],
+            terminal_process_id: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: Some("jojo".to_string()),
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+
+        assert!(remote_preview_needs_refresh(&session));
+    }
+
+    #[test]
+    fn remote_preview_needs_refresh_for_placeholder_summary_text() {
+        let session = ManagedSessionView {
+            id: "abc".to_string(),
+            session_path: "remote-session://jojo/abc".to_string(),
+            title: "Loading Session".to_string(),
+            kind: SessionKind::Codex,
+            host_label: "jojo".to_string(),
+            source: yggterm_server::SessionSource::LiveSsh,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: yggterm_server::RemoteDeployState::Ready,
+            launch_command: "codex".to_string(),
+            status_line: "ready".to_string(),
+            terminal_lines: Vec::new(),
+            rendered_sections: Vec::new(),
+            preview: yggterm_server::SessionPreview {
+                summary: Vec::new(),
+                blocks: vec![
+                    yggterm_server::SessionPreviewBlock {
+                        role: "assistant",
+                        timestamp: "now".to_string(),
+                        tone: yggterm_server::PreviewTone::Assistant,
+                        folded: false,
+                        lines: vec!["Refreshing preview…".to_string()],
+                    },
+                    yggterm_server::SessionPreviewBlock {
+                        role: "assistant",
+                        timestamp: "now".to_string(),
+                        tone: yggterm_server::PreviewTone::Assistant,
+                        folded: false,
+                        lines: vec![
+                            "Preparing the remote preview surface and waiting for transcript hydration."
+                                .to_string(),
+                        ],
+                    },
+                ],
+            },
+            metadata: Vec::new(),
+            terminal_process_id: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: Some("jojo".to_string()),
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+
+        assert!(remote_preview_needs_refresh(&session));
     }
 }
 
