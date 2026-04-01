@@ -917,7 +917,10 @@ impl ShellState {
             .any(|(surface, request)| {
                 matches!(surface, YggSurface::Preview | YggSurface::PreviewSync)
                     && active_surface_request_matches_session(request, active_session_path.as_deref())
-            });
+            })
+            || active_session
+                .as_ref()
+                .is_some_and(preview_should_hide_stale_placeholder_content);
         let terminal_loading = self
             .active_surface_requests
             .get(&YggSurface::Terminal)
@@ -5692,6 +5695,7 @@ fn spawn_remote_preview_payload_sync(
             move || refresh_preview(&endpoint, &path_for_task),
         )
         .await;
+        let retry_session_path = session_path.clone();
         let _ = safe_shell_mut(state, "remote_preview_sync_finish", |shell| match outcome {
             Ok(result) => {
                 shell.record_preview_issue_telemetry(reason);
@@ -5700,6 +5704,17 @@ fn spawn_remote_preview_payload_sync(
             Err(error) => {
                 shell.finish_busy_request_for(&request_id);
                 warn!(path=%session_path, error=%error, "failed to refresh remote preview");
+                let mut retry_state = state;
+                let retry_session_path = retry_session_path.clone();
+                spawn(async move {
+                    sleep(Duration::from_millis(3_000)).await;
+                    let _ = safe_shell_mut(retry_state, "remote_preview_sync_retry_tick", |shell| {
+                        shell.remote_preview_dirty_epoch.insert(
+                            retry_session_path.clone(),
+                            current_millis(),
+                        );
+                    });
+                });
             }
         });
     });
@@ -6212,6 +6227,9 @@ fn sidebar_search_cache_key(rows: &[BrowserRow], query: &str, mode: u8) -> u64 {
 }
 
 fn preview_rendered_sections(session: &ManagedSessionView) -> Vec<SessionRenderedSection> {
+    if preview_should_hide_stale_placeholder_content(session) {
+        return Vec::new();
+    }
     let visible_preview_texts = visible_preview_blocks(session)
         .into_iter()
         .map(|block| normalize_preview_semantic_text(&preview_block_text(&block)))
@@ -6327,6 +6345,9 @@ fn is_preview_scaffold_line(line: &str) -> bool {
 }
 
 fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlock> {
+    if preview_should_hide_stale_placeholder_content(session) {
+        return Vec::new();
+    }
     let key = preview_block_cache_key(&session.preview.blocks);
     if let Ok(mut cache) = preview_block_cache().lock() {
         if let Some(hit) = cache.entries.get(&key).cloned() {
@@ -6421,6 +6442,23 @@ fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlo
     }
 
     visible
+}
+
+fn preview_should_hide_stale_placeholder_content(session: &ManagedSessionView) -> bool {
+    if !session.session_path.starts_with("remote-session://") {
+        return false;
+    }
+    let hydration = metadata_value(session, "Preview Hydration");
+    if hydration == "full" {
+        return false;
+    }
+    let has_only_placeholder_blocks = !session.preview.blocks.is_empty()
+        && session.preview.blocks.iter().all(|block| {
+            matches!(block.timestamp.as_str(), "remote:scan" | "server:launch")
+        });
+    let has_only_placeholder_sections = session.preview.blocks.is_empty()
+        && !session.rendered_sections.is_empty();
+    has_only_placeholder_blocks || has_only_placeholder_sections
 }
 
 fn estimate_preview_block_height(block: &SessionPreviewBlock) -> f64 {
@@ -10256,6 +10294,10 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
         .cloned()
         .unwrap_or_default();
     let preview_window = dom.get("preview_window").cloned().unwrap_or(Value::Null);
+    let shell_text_sample = dom
+        .get("shell_text_sample")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let document_editor_count = dom
         .get("document_editor_count")
         .and_then(Value::as_u64)
@@ -10329,7 +10371,9 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
                         _ => false,
                     }
             })
-        });
+        })
+        || shell_text_sample.contains("Refreshing preview…")
+        || shell_text_sample.contains("Refreshing preview...");
     let (ready, reason) = if active_session_path.is_none() {
         (false, Some("no active session selected".to_string()))
     } else if active_view_mode == "Rendered" {
@@ -15138,6 +15182,7 @@ fn MainSurface(
                     }
                 } else {
                     let visible_blocks = visible_preview_blocks(&session);
+                    let rendered_sections = preview_rendered_sections(&session);
                     let preview_window = preview_virtual_window(
                         &visible_blocks,
                         *preview_scroll_top.read(),
@@ -15150,6 +15195,9 @@ fn MainSurface(
                         .to_vec();
                     let grouped_runs =
                         group_preview_runs(&rendered_blocks, preview_window.start_index);
+                    let show_loading_placeholder = snapshot.preview_loading
+                        && grouped_runs.is_empty()
+                        && rendered_sections.is_empty();
                     rsx! {
                         div {
                             key: "{session.session_path}:{snapshot.active_view_mode as u8}",
@@ -15194,9 +15242,15 @@ fn MainSurface(
                                         "data-preview-window-scroll-height": "{preview_window.scroll_height_px.round() as i64}",
                                         "data-preview-window-overscan": "{preview_window.overscan_px.round() as i64}",
                                         style: "display:flex; flex-direction:column; gap:16px; min-width:0; width:min(1020px, 100%); margin:0 auto;",
-                                        if !preview_rendered_sections(&session).is_empty() {
+                                        if !rendered_sections.is_empty() {
                                             RenderedSectionsStrip {
-                                                sections: preview_rendered_sections(&session),
+                                                sections: rendered_sections.clone(),
+                                                palette: snapshot.palette,
+                                            }
+                                        }
+                                        if show_loading_placeholder {
+                                            PreviewLoadingPlaceholder {
+                                                session: session.clone(),
                                                 palette: snapshot.palette,
                                             }
                                         }
@@ -15480,6 +15534,69 @@ fn LoadingStateChip(label: String, palette: Palette) -> Element {
                 )
             }
             "{label}"
+        }
+    }
+}
+
+#[component]
+fn PreviewLoadingPlaceholder(session: ManagedSessionView, palette: Palette) -> Element {
+    let host = session
+        .ssh_target
+        .clone()
+        .or_else(|| {
+            let label = session.host_label.trim();
+            (!label.is_empty()).then(|| label.to_string())
+        })
+        .unwrap_or_else(|| "remote host".to_string());
+    let detail = metadata_value(&session, "Preview Hydration");
+    let hydration_hint = if detail.eq_ignore_ascii_case("loading") {
+        "Fetching rendered transcript and metadata from the remote yggterm daemon."
+    } else {
+        "Preparing the remote preview surface and waiting for transcript hydration."
+    };
+    rsx! {
+        div {
+            "data-preview-loading-placeholder": "1",
+            style: "display:flex; flex-direction:column; gap:14px; min-height:320px; justify-content:center; padding:28px 30px; border-radius:26px; background:linear-gradient(180deg, rgba(255,255,255,0.92) 0%, rgba(248,251,255,0.98) 100%); box-shadow:0 24px 48px rgba(148,163,184,0.12), inset 0 0 0 1px rgba(170,190,212,0.16);",
+            div {
+                style: "display:flex; align-items:center; gap:10px; flex-wrap:wrap;",
+                LoadingStateChip {
+                    label: "Refreshing preview…".to_string(),
+                    palette,
+                }
+                div {
+                    style: format!("font-size:12px; font-weight:700; letter-spacing:0.03em; text-transform:uppercase; color:{};", palette.muted),
+                    "{host}"
+                }
+            }
+            div {
+                style: format!("font-size:22px; line-height:1.28; font-weight:700; color:{};", palette.text),
+                "{session.title}"
+            }
+            div {
+                style: format!("font-size:14px; line-height:1.72; color:{}; max-width:64ch;", palette.muted),
+                "{hydration_hint}"
+            }
+            div {
+                style: "display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:12px; width:100%; max-width:720px;",
+                for width in ["92%", "78%", "86%"] {
+                    div {
+                        style: "display:flex; flex-direction:column; gap:10px; padding:14px 15px; border-radius:18px; background:rgba(255,255,255,0.74); box-shadow:inset 0 0 0 1px rgba(170,190,212,0.12); min-width:0;",
+                        div {
+                            style: "width:72px; height:10px; border-radius:999px; background:rgba(125,155,192,0.18);"
+                        }
+                        div {
+                            style: format!("width:{}; height:12px; border-radius:999px; background:rgba(125,155,192,0.12);", width)
+                        }
+                        div {
+                            style: format!("width:{}; height:12px; border-radius:999px; background:rgba(125,155,192,0.12);", width)
+                        }
+                        div {
+                            style: format!("width:{}; height:12px; border-radius:999px; background:rgba(125,155,192,0.12);", width)
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -16093,7 +16210,7 @@ fn PreviewRunBlock(
         )
     } else {
         format!(
-            "display:flex; flex-direction:column; gap:0; width:min(100%, 980px); min-width:0; \
+            "display:flex; flex-direction:column; gap:0; width:min(100%, 740px); max-width:min(100%, 740px); min-width:0; \
              box-sizing:border-box; font-family:{};",
             serif_stack
         )
@@ -16623,6 +16740,9 @@ fn build_preview_content_blocks(lines: &[String]) -> Vec<PreviewContentBlock> {
             blocks.push(PreviewContentBlock::Quote(quote.trim().to_string()));
             continue;
         }
+        if trimmed == "</image>" {
+            continue;
+        }
         if let Some((label, residue)) = extract_named_image_reference_from_line(line) {
             flush_paragraph(&mut blocks, &mut paragraph);
             blocks.push(PreviewContentBlock::ImageReference {
@@ -16651,7 +16771,7 @@ fn build_preview_content_blocks(lines: &[String]) -> Vec<PreviewContentBlock> {
         flush_paragraph(&mut blocks, &mut paragraph);
     }
 
-    blocks
+    merge_adjacent_image_reference_blocks(blocks)
 }
 
 fn parse_numbered_preview_item(line: &str) -> Option<(usize, String)> {
@@ -16697,10 +16817,43 @@ fn extract_named_image_reference_from_line(line: &str) -> Option<(String, Option
     if trimmed.starts_with("[Image #") {
         let label_end = trimmed.find(']')?;
         let label = trimmed[..=label_end].to_string();
-        let residue = trimmed[label_end + 1..].trim();
+        let mut residue = trimmed[label_end + 1..].trim();
+        if let Some(stripped) = residue.strip_prefix("</image>") {
+            residue = stripped.trim();
+        }
         return Some((label, (!residue.is_empty()).then_some(residue.to_string())));
     }
     None
+}
+
+fn merge_adjacent_image_reference_blocks(
+    blocks: Vec<PreviewContentBlock>,
+) -> Vec<PreviewContentBlock> {
+    let mut merged = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        match block {
+            PreviewContentBlock::ImageReference { label, text } => {
+                if let Some(PreviewContentBlock::ImageReference {
+                    label: previous_label,
+                    text: previous_text,
+                }) = merged.last_mut()
+                {
+                    if *previous_label == label {
+                        if previous_text
+                            .as_ref()
+                            .is_none_or(|value| value.trim().is_empty())
+                        {
+                            *previous_text = text.filter(|value| !value.trim().is_empty());
+                        }
+                        continue;
+                    }
+                }
+                merged.push(PreviewContentBlock::ImageReference { label, text });
+            }
+            other => merged.push(other),
+        }
+    }
+    merged
 }
 
 fn looks_like_image_path(path: &str) -> bool {
@@ -21273,6 +21426,22 @@ mod tests {
             blocks.first(),
             Some(PreviewContentBlock::ImageReference { label, text })
                 if label == "[Image #1]" && text.as_deref() == Some("This is how excel looks.")
+        ));
+    }
+
+    #[test]
+    fn preview_content_blocks_collapse_split_named_image_markup() {
+        let blocks = preview_content_blocks(&[
+            "[Image #1]".to_string(),
+            "</image>".to_string(),
+            "[Image #1] We need to increase the disk size.".to_string(),
+        ]);
+
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(
+            blocks.first(),
+            Some(PreviewContentBlock::ImageReference { label, text })
+                if label == "[Image #1]" && text.as_deref() == Some("We need to increase the disk size.")
         ));
     }
 
