@@ -232,7 +232,9 @@ def main() -> int:
     try:
         for index, target in enumerate(targets):
             session_path = target["full_path"]
-            expected_turns = expected_preview_turns_for_session(server_state, session_path, args.bin)
+            expected_turns = expected_preview_turns_for_session(
+                server_state, session_path, args.bin, full_preview=True
+            )
             ratios = step_ratios(rng)
             entry = {
                 "path": session_path,
