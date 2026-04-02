@@ -188,7 +188,9 @@ fn colorfgbg_for_appearance(appearance: &str) -> &'static str {
     }
 }
 
-fn terminal_identity_env_pairs_with_home(include_yggterm_home: bool) -> Vec<(&'static str, String)> {
+fn terminal_identity_env_pairs_with_home(
+    include_yggterm_home: bool,
+) -> Vec<(&'static str, String)> {
     let appearance = ambient_terminal_appearance();
     let mut pairs = vec![
         ("TERM", "xterm-256color".to_string()),
@@ -393,9 +395,10 @@ pub(crate) fn managed_cli_shell_command(
         anyhow::bail!("session kind does not use a managed Codex CLI");
     };
     let paths = ManagedCliPaths::resolve()?;
+    let has_cwd = cwd.filter(|value| !value.trim().is_empty()).is_some();
     let mut parts = Vec::new();
-    if let Some(cwd) = cwd.filter(|value| !value.trim().is_empty()) {
-        parts.push(format!("cd {}", shell_single_quote(cwd)));
+    if let Some(preamble) = best_effort_cwd_shell_prefix(cwd) {
+        parts.push(preamble);
     }
     parts.push(paths.shell_exports(tool));
     let invocation = match action {
@@ -409,15 +412,47 @@ pub(crate) fn managed_cli_shell_command(
             persistent,
         } => {
             let prefix = if persistent { "exec " } else { "" };
-            format!(
-                "{prefix}{} resume {}",
-                tool.binary_name(),
-                shell_single_quote(session_id)
-            )
+            if matches!(kind, SessionKind::Codex) && has_cwd {
+                format!(
+                    "{prefix}{} resume -C \"$PWD\" {}",
+                    tool.binary_name(),
+                    shell_single_quote(session_id)
+                )
+            } else {
+                format!(
+                    "{prefix}{} resume {}",
+                    tool.binary_name(),
+                    shell_single_quote(session_id)
+                )
+            }
         }
     };
     parts.push(invocation);
     Ok(parts.join(" && "))
+}
+
+pub(crate) fn best_effort_cwd_shell_prefix(cwd: Option<&str>) -> Option<String> {
+    let requested = cwd.map(str::trim).filter(|value| !value.is_empty())?;
+    Some(format!(
+        "__yggterm_requested={requested}; \
+         __yggterm_cwd_ok=0; \
+         __yggterm_cwd=\"$__yggterm_requested\"; \
+         while [ -n \"$__yggterm_cwd\" ]; do \
+           if cd \"$__yggterm_cwd\" 2>/dev/null; then \
+             if [ \"$__yggterm_cwd\" = \"/\" ] && [ \"$__yggterm_requested\" != \"/\" ] && [ -n \"$HOME\" ]; then \
+               cd \"$HOME\" 2>/dev/null || true; \
+             fi; \
+             __yggterm_cwd_ok=1; \
+             break; \
+           fi; \
+           if [ \"$__yggterm_cwd\" = \"/\" ]; then break; fi; \
+           __yggterm_next=$(dirname -- \"$__yggterm_cwd\"); \
+           if [ \"$__yggterm_next\" = \"$__yggterm_cwd\" ]; then break; fi; \
+           __yggterm_cwd=\"$__yggterm_next\"; \
+         done; \
+         if [ \"$__yggterm_cwd_ok\" != 1 ] && [ -n \"$HOME\" ]; then cd \"$HOME\" 2>/dev/null || true; fi",
+        requested = shell_single_quote(requested)
+    ))
 }
 
 pub(crate) fn ensure_local_managed_cli(tool: ManagedCliTool) -> Result<ManagedCliToolStatus> {
