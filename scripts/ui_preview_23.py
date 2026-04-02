@@ -6,6 +6,7 @@ import os
 import random
 import re
 import shlex
+import shutil
 import struct
 import subprocess
 import time
@@ -123,6 +124,34 @@ def run_json(host: str, command: str) -> dict:
         ) from error
 
 
+def local_yggterm_home() -> Path:
+    override = os.environ.get("YGGTERM_HOME", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".yggterm"
+
+
+def local_yggterm_path(*parts: str) -> Path:
+    return local_yggterm_home().joinpath(*parts)
+
+
+def local_x11_window_count(title: str = "Yggterm") -> int:
+    display = os.environ.get("DISPLAY", "").strip()
+    if not display or shutil.which("xwininfo") is None:
+        return 0
+    result = subprocess.run(
+        ["xwininfo", "-root", "-tree"],
+        check=False,
+        text=True,
+        capture_output=True,
+        env={**os.environ, "DISPLAY": display},
+    )
+    if result.returncode != 0:
+        return 0
+    marker = f'"{title}"'
+    return sum(1 for line in result.stdout.splitlines() if marker in line)
+
+
 def quote(value: str) -> str:
     return shlex.quote(value)
 
@@ -186,7 +215,7 @@ def canonical_session_path(session_path: str | None) -> str | None:
 def latest_window_spawn_event_for_pid(host: str, pid: int, start_ms: int) -> dict | None:
     if host != "local":
         return None
-    path = Path.home() / ".yggterm" / "event-trace.jsonl"
+    path = local_yggterm_path("event-trace.jsonl")
     if not path.exists():
         return None
     for line in reversed(path.read_text(encoding="utf-8").splitlines()):
@@ -207,7 +236,7 @@ def latest_window_spawn_event_for_pid(host: str, pid: int, start_ms: int) -> dic
 
 def kill_local_clients(binary: str) -> None:
     binary_path = str(Path(binary).resolve())
-    instances_root = Path.home() / ".yggterm" / "client-instances"
+    instances_root = local_yggterm_path("client-instances")
     if instances_root.is_dir():
         for path in instances_root.glob("*/*.json"):
             try:
@@ -300,6 +329,7 @@ def launch_local_client(binary: str, timeout_s: float = 4.0) -> tuple[subprocess
     env.setdefault("XAUTHORITY", str(Path.home() / ".Xauthority"))
     env["YGGTERM_ALLOW_MULTI_WINDOW"] = "1"
     env["YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF"] = "1"
+    baseline_window_count = local_x11_window_count()
     proc = subprocess.Popen(
         [binary_path],
         cwd=str(Path(binary).resolve().parent.parent.parent),
@@ -310,6 +340,15 @@ def launch_local_client(binary: str, timeout_s: float = 4.0) -> tuple[subprocess
     start_ms = int(time.time() * 1000)
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
+        if local_x11_window_count() > baseline_window_count:
+            return proc, {
+                "category": "startup",
+                "name": "window_spawned",
+                "payload": {
+                    "elapsed_ms": int(time.time() * 1000) - start_ms,
+                    "source": "x11_root_tree",
+                },
+            }
         event = latest_window_spawn_event_for_pid("local", proc.pid, start_ms)
         if event is not None:
             return proc, event
@@ -506,7 +545,7 @@ def preview_semantic_issues_for_entries(entries: list[dict], rendered_sections: 
 
 
 def load_server_state() -> dict:
-    path = Path.home() / ".yggterm" / "server-state.json"
+    path = local_yggterm_path("server-state.json")
     if not path.exists():
         return {}
     try:
@@ -665,6 +704,15 @@ def read_png_size(path: Path) -> tuple[int, int]:
     return struct.unpack(">II", header[16:24])
 
 
+def wait_for_file(path: Path, timeout_s: float = 1.5, poll_s: float = 0.05) -> None:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() <= deadline:
+        if path.exists() and path.stat().st_size > 24:
+            return
+        time.sleep(poll_s)
+    raise FileNotFoundError(str(path))
+
+
 def collect_preview_targets(rows_payload: dict, rng: random.Random, count: int) -> list[dict]:
     candidates = []
     seen = set()
@@ -752,6 +800,7 @@ def main() -> int:
             )
             screenshot_path = out_dir / f"preview-{index:02d}.png"
             entry["screenshot"] = app_screenshot_preview(args.host, args.bin, screenshot_path, args.timeout_ms)
+            wait_for_file(screenshot_path)
             screenshot_dom = (((entry["screenshot"].get("data") or {}).get("dom")) or {})
             preview = ((state.get("viewport") or {}).get("preview") or {})
             screenshot_entries = screenshot_dom.get("preview_visible_entries") or []
