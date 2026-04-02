@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import signal
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -45,6 +46,34 @@ def run_json(command: str) -> dict:
         ) from error
 
 
+def local_yggterm_home() -> Path:
+    override = os.environ.get("YGGTERM_HOME", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".yggterm"
+
+
+def local_yggterm_path(*parts: str) -> Path:
+    return local_yggterm_home().joinpath(*parts)
+
+
+def local_x11_window_count(title: str = "Yggterm") -> int:
+    display = os.environ.get("DISPLAY", "").strip()
+    if not display or shutil.which("xwininfo") is None:
+        return 0
+    result = subprocess.run(
+        ["xwininfo", "-root", "-tree"],
+        check=False,
+        text=True,
+        capture_output=True,
+        env={**os.environ, "DISPLAY": display},
+    )
+    if result.returncode != 0:
+        return 0
+    marker = f'"{title}"'
+    return sum(1 for line in result.stdout.splitlines() if marker in line)
+
+
 def app_state(binary: str, timeout_ms: int) -> dict:
     payload = run_json(f"{Path(binary).resolve()} server app state --timeout-ms {timeout_ms}")
     return payload.get("data") or {}
@@ -52,7 +81,7 @@ def app_state(binary: str, timeout_ms: int) -> dict:
 
 def kill_local_clients(binary: str) -> None:
     binary_path = str(Path(binary).resolve())
-    instances_root = Path.home() / ".yggterm" / "client-instances"
+    instances_root = local_yggterm_path("client-instances")
     if instances_root.is_dir():
         for path in instances_root.glob("*/*.json"):
             try:
@@ -77,12 +106,42 @@ def kill_local_clients(binary: str) -> None:
                     os.kill(pid, signal.SIGKILL)
                 except Exception:
                     pass
-    run_process(["bash", "-lc", f"pkill -f {json.dumps(binary_path)} || true"], check=False)
-    run_process(["bash", "-lc", "pkill -f 'yggterm server daemon' || true"], check=False)
+    self_pid = os.getpid()
+    for proc_dir in Path("/proc").iterdir():
+        if not proc_dir.name.isdigit():
+            continue
+        pid = int(proc_dir.name)
+        if pid == self_pid:
+            continue
+        try:
+            raw = (proc_dir / "cmdline").read_bytes()
+        except Exception:
+            continue
+        if not raw:
+            continue
+        argv = [part.decode("utf-8", errors="ignore") for part in raw.split(b"\0") if part]
+        if not argv:
+            continue
+        is_local_client = argv[0] == binary_path
+        is_local_daemon = len(argv) >= 4 and argv[0] == binary_path and argv[1:4] == [
+            "server",
+            "daemon",
+            "--stdio",
+        ]
+        is_legacy_daemon = len(argv) >= 3 and "yggterm" in argv[0] and argv[1:3] == [
+            "server",
+            "daemon",
+        ]
+        if not (is_local_client or is_local_daemon or is_legacy_daemon):
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
 
 
 def latest_window_spawn_event_for_pid(pid: int, start_ms: int) -> dict | None:
-    path = Path.home() / ".yggterm" / "event-trace.jsonl"
+    path = local_yggterm_path("event-trace.jsonl")
     if not path.exists():
         return None
     for line in reversed(path.read_text(encoding="utf-8").splitlines()):
@@ -110,6 +169,7 @@ def launch_local_client(binary: str, timeout_s: float = 4.0) -> tuple[subprocess
     env.setdefault("XAUTHORITY", str(Path.home() / ".Xauthority"))
     env["YGGTERM_ALLOW_MULTI_WINDOW"] = "1"
     env["YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF"] = "1"
+    baseline_window_count = local_x11_window_count()
     proc = subprocess.Popen(
         [binary_path],
         cwd=str(Path(binary).resolve().parent.parent.parent),
@@ -120,6 +180,15 @@ def launch_local_client(binary: str, timeout_s: float = 4.0) -> tuple[subprocess
     start_ms = int(time.time() * 1000)
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
+        if local_x11_window_count() > baseline_window_count:
+            return proc, {
+                "category": "startup",
+                "name": "window_spawned",
+                "payload": {
+                    "elapsed_ms": int(time.time() * 1000) - start_ms,
+                    "source": "x11_root_tree",
+                },
+            }
         event = latest_window_spawn_event_for_pid(proc.pid, start_ms)
         if event is not None:
             return proc, event

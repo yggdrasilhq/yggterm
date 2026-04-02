@@ -4,6 +4,7 @@ import json
 import os
 import random
 import shlex
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -57,6 +58,34 @@ def run_json(host: str, command: str) -> dict:
         ) from error
 
 
+def local_yggterm_home() -> Path:
+    override = os.environ.get("YGGTERM_HOME", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".yggterm"
+
+
+def local_yggterm_path(*parts: str) -> Path:
+    return local_yggterm_home().joinpath(*parts)
+
+
+def local_x11_window_count(title: str = "Yggterm") -> int:
+    display = os.environ.get("DISPLAY", "").strip()
+    if not display or shutil.which("xwininfo") is None:
+        return 0
+    result = subprocess.run(
+        ["xwininfo", "-root", "-tree"],
+        check=False,
+        text=True,
+        capture_output=True,
+        env={**os.environ, "DISPLAY": display},
+    )
+    if result.returncode != 0:
+        return 0
+    marker = f'"{title}"'
+    return sum(1 for line in result.stdout.splitlines() if marker in line)
+
+
 def app_state(host: str, binary: str, timeout_ms: int) -> dict:
     payload = run_json(host, f"{shlex.quote(binary)} server app state --timeout-ms {timeout_ms}")
     return payload.get("data") or {}
@@ -92,7 +121,7 @@ def canonical_session_path(session_path: str | None) -> str | None:
 def latest_window_spawn_event_for_pid(host: str, pid: int, start_ms: int) -> dict | None:
     if host != "local":
         return None
-    path = Path.home() / ".yggterm" / "event-trace.jsonl"
+    path = local_yggterm_path("event-trace.jsonl")
     if not path.exists():
         return None
     for line in reversed(path.read_text(encoding="utf-8").splitlines()):
@@ -112,7 +141,7 @@ def latest_window_spawn_event_for_pid(host: str, pid: int, start_ms: int) -> dic
 
 
 def kill_local_clients(binary: str) -> None:
-    instances_root = Path.home() / ".yggterm" / "client-instances"
+    instances_root = local_yggterm_path("client-instances")
     if instances_root.is_dir():
         for path in instances_root.glob("*/*.json"):
             try:
@@ -146,6 +175,7 @@ def launch_local_client(binary: str, timeout_s: float = 4.0) -> tuple[subprocess
     env = os.environ.copy()
     env.setdefault("DISPLAY", ":10.0")
     env["YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF"] = "1"
+    baseline_window_count = local_x11_window_count()
     proc = subprocess.Popen(
         [binary_path],
         cwd=str(Path(binary).resolve().parent.parent.parent),
@@ -156,6 +186,15 @@ def launch_local_client(binary: str, timeout_s: float = 4.0) -> tuple[subprocess
     start_ms = int(time.time() * 1000)
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
+        if local_x11_window_count() > baseline_window_count:
+            return proc, {
+                "category": "startup",
+                "name": "window_spawned",
+                "payload": {
+                    "elapsed_ms": int(time.time() * 1000) - start_ms,
+                    "source": "x11_root_tree",
+                },
+            }
         event = latest_window_spawn_event_for_pid("local", proc.pid, start_ms)
         if event is not None:
             return proc, event
@@ -218,7 +257,7 @@ def viewport_ready(state: dict, session_path: str, view: str) -> bool:
 
 def trace_events_since(host: str, start_ms: int, tail_lines: int = 6000) -> list[dict]:
     if host == "local":
-        path = Path.home() / ".yggterm" / "event-trace.jsonl"
+        path = local_yggterm_path("event-trace.jsonl")
         if not path.exists():
             return []
         lines = path.read_text(encoding="utf-8").splitlines()[-tail_lines:]
