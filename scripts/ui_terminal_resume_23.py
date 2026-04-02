@@ -17,6 +17,14 @@ PLACEHOLDER_FRAGMENTS = (
     "still connecting to remote terminal",
 )
 
+GENERIC_IDLE_FRAGMENTS = (
+    "openai codex",
+    "/model to change",
+    "write tests for @filename",
+    "find and fix a bug in @filename",
+    "improve documentation in @filename",
+)
+
 ERROR_FRAGMENTS = (
     "mux_client_request_session",
     "session open refused by peer",
@@ -136,6 +144,7 @@ def latest_window_spawn_event_for_pid(host: str, pid: int, start_ms: int) -> dic
 
 def kill_local_clients() -> None:
     instances_root = local_yggterm_path("client-instances")
+    using_default_home = local_yggterm_home() == Path.home() / ".yggterm"
     if instances_root.is_dir():
         for path in instances_root.glob("*/*.json"):
             try:
@@ -160,7 +169,8 @@ def kill_local_clients() -> None:
                     os.kill(pid, 9)
                 except Exception:
                     pass
-    run_process(["bash", "-lc", "pkill -f 'yggterm server daemon' || true"], check=False)
+    if using_default_home:
+        run_process(["bash", "-lc", "pkill -f 'yggterm server daemon' || true"], check=False)
 
 
 def launch_local_client(binary: str, timeout_s: float = 4.0) -> tuple[subprocess.Popen, dict]:
@@ -286,6 +296,17 @@ def active_terminal_text(state: dict) -> str:
     return "\n".join((host.get("text_sample") or "") for host in hosts).strip()
 
 
+def terminal_resume_overlay(state: dict) -> dict:
+    viewport = state.get("viewport") or {}
+    overlay = viewport.get("terminal_resume_overlay") or {}
+    if not isinstance(overlay, dict):
+        return {"visible": False, "text_sample": ""}
+    return {
+        "visible": bool(overlay.get("visible")),
+        "text_sample": str(overlay.get("text_sample") or ""),
+    }
+
+
 def terminal_text_looks_like_placeholder(text: str) -> bool:
     normalized = " ".join(text.strip().lower().split())
     if not normalized:
@@ -298,6 +319,29 @@ def terminal_text_looks_like_error(text: str) -> bool:
     if not normalized:
         return False
     return any(fragment in normalized for fragment in ERROR_FRAGMENTS)
+
+
+def terminal_text_looks_like_generic_idle(text: str) -> bool:
+    normalized = " ".join(text.strip().lower().split())
+    if not normalized:
+        return False
+    return any(fragment in normalized for fragment in GENERIC_IDLE_FRAGMENTS)
+
+
+def terminal_text_looks_like_shell_prompt(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    if not lines or len(lines) > 4:
+        return False
+    for line in lines:
+        if line.endswith(("$", "#", "%", "$ ", "# ", "% ")):
+            continue
+        if "@" in line and ":" in line and (line.endswith("$") or line.endswith("#")):
+            continue
+        return False
+    return True
 
 
 def is_remote_machine_group(row: dict) -> bool:
@@ -393,10 +437,17 @@ def require_terminal_painted(state: dict, session_path: str) -> dict:
     if (viewport.get("active_terminal_host_count") or 0) <= 0:
         raise RuntimeError(viewport.get("reason") or "active terminal host missing")
     text = active_terminal_text(state)
+    overlay = terminal_resume_overlay(state)
+    if overlay.get("visible"):
+        return state
     if terminal_text_looks_like_placeholder(text):
         raise RuntimeError("terminal still showing placeholder content")
     if terminal_text_looks_like_error(text):
         raise RuntimeError("terminal painted transport/error output instead of the session")
+    if terminal_text_looks_like_generic_idle(text):
+        raise RuntimeError("terminal exposed generic Codex idle prompt instead of restored session UX")
+    if terminal_text_looks_like_shell_prompt(text):
+        raise RuntimeError("terminal exposed plain shell prompt instead of restored session UX")
     return state
 
 
@@ -441,6 +492,7 @@ def main() -> int:
             entry["reason"] = viewport.get("reason")
             entry["active_title"] = viewport.get("active_title")
             entry["active_summary"] = viewport.get("active_summary")
+            entry["terminal_resume_overlay"] = terminal_resume_overlay(state)
             entry["terminal_text_sample"] = active_terminal_text(state)
             entry["state_dump"] = write_json(out_dir / f"terminal-resume-{index:02d}.json", state)
         except Exception as error:  # noqa: BLE001
@@ -456,6 +508,7 @@ def main() -> int:
             entry["reason"] = viewport.get("reason")
             entry["active_title"] = viewport.get("active_title")
             entry["active_summary"] = viewport.get("active_summary")
+            entry["terminal_resume_overlay"] = terminal_resume_overlay(state)
             entry["terminal_text_sample"] = active_terminal_text(state)
             entry["state_dump"] = write_json(
                 out_dir / f"terminal-resume-{index:02d}-failure.json",
@@ -486,7 +539,25 @@ def main() -> int:
         "open_failures": len([item for item in results if item.get("open") is None]),
         "paint_budget_failures": len([item for item in results if not item.get("within_budget")]),
         "placeholder_failures": len(
-            [item for item in results if terminal_text_looks_like_placeholder(item.get("terminal_text_sample") or "")]
+            [
+                item for item in results
+                if not (item.get("terminal_resume_overlay") or {}).get("visible")
+                and terminal_text_looks_like_placeholder(item.get("terminal_text_sample") or "")
+            ]
+        ),
+        "generic_idle_failures": len(
+            [
+                item for item in results
+                if not (item.get("terminal_resume_overlay") or {}).get("visible")
+                and terminal_text_looks_like_generic_idle(item.get("terminal_text_sample") or "")
+            ]
+        ),
+        "shell_prompt_failures": len(
+            [
+                item for item in results
+                if not (item.get("terminal_resume_overlay") or {}).get("visible")
+                and terminal_text_looks_like_shell_prompt(item.get("terminal_text_sample") or "")
+            ]
         ),
         "terminal_error_failures": len(
             [item for item in results if terminal_text_looks_like_error(item.get("terminal_text_sample") or "")]
@@ -511,6 +582,8 @@ def main() -> int:
         and summary["open_failures"] == 0
         and summary["paint_budget_failures"] == 0
         and summary["placeholder_failures"] == 0
+        and summary["generic_idle_failures"] == 0
+        and summary["shell_prompt_failures"] == 0
         and summary["terminal_error_failures"] == 0
     ) else 1
 
