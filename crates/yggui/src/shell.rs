@@ -4991,15 +4991,27 @@ fn spawn_open_session_row_with_mode_retry(
         shell.selection_anchor = Some(row.full_path.clone());
         shell.browser.select_path(row.full_path.clone());
         if let Some((machine_key, session_id)) = parse_remote_scanned_session_path(&row.full_path) {
-            let _ = shell.server.stage_remote_scanned_session_with_view(
-                machine_key,
-                session_id,
-                if prefer_terminal {
-                    WorkspaceViewMode::Terminal
-                } else {
-                    WorkspaceViewMode::Rendered
-                },
-            );
+            let view_mode = if prefer_terminal {
+                WorkspaceViewMode::Terminal
+            } else {
+                WorkspaceViewMode::Rendered
+            };
+            if prefer_terminal {
+                let _ = shell.server.stage_remote_scanned_session_with_view(
+                    machine_key,
+                    session_id,
+                    view_mode,
+                );
+            } else {
+                let _ = shell.server.stage_remote_scanned_session_with_cached_preview(
+                    machine_key,
+                    session_id,
+                    view_mode,
+                );
+                shell
+                    .remote_preview_dirty_epoch
+                    .insert(row.full_path.clone(), current_millis());
+            }
         }
         shell.context_menu_row = None;
         shell.sync_browser_settings();
@@ -6746,7 +6758,7 @@ fn preview_should_hide_stale_placeholder_content(session: &ManagedSessionView) -
         return false;
     }
     let hydration = metadata_value(session, "Preview Hydration");
-    if hydration == "full" {
+    if matches!(hydration.as_str(), "full" | "scan") {
         return false;
     }
     let has_only_placeholder_blocks = !session.preview.blocks.is_empty()
@@ -24517,6 +24529,66 @@ mod tests {
         };
 
         assert!(remote_preview_needs_refresh(&session));
+    }
+
+    #[test]
+    fn preview_scan_hydration_remains_visible_while_refreshing() {
+        let session = ManagedSessionView {
+            id: "abc".to_string(),
+            session_path: "remote-session://jojo/abc".to_string(),
+            title: "Scanned Session".to_string(),
+            kind: SessionKind::Codex,
+            host_label: "jojo".to_string(),
+            source: yggterm_server::SessionSource::LiveSsh,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: yggterm_server::RemoteDeployState::Ready,
+            launch_command: "codex".to_string(),
+            status_line: "ready".to_string(),
+            terminal_lines: Vec::new(),
+            rendered_sections: vec![yggterm_server::SessionRenderedSection {
+                title: "Primary User Goals",
+                lines: vec!["Document the Traccar workflow.".to_string()],
+            }],
+            preview: yggterm_server::SessionPreview {
+                summary: Vec::new(),
+                blocks: vec![
+                    yggterm_server::SessionPreviewBlock {
+                        role: "USER",
+                        timestamp: "remote:scan".to_string(),
+                        tone: yggterm_server::PreviewTone::User,
+                        folded: false,
+                        lines: vec!["What should I set as the Android tracking URL?".to_string()],
+                    },
+                    yggterm_server::SessionPreviewBlock {
+                        role: "ASSISTANT",
+                        timestamp: "remote:scan".to_string(),
+                        tone: yggterm_server::PreviewTone::Assistant,
+                        folded: false,
+                        lines: vec!["Use http://trac.gour.top:5055 on LAN.".to_string()],
+                    },
+                ],
+            },
+            metadata: vec![SessionMetadataEntry {
+                label: "Preview Hydration",
+                value: "scan".to_string(),
+            }],
+            terminal_process_id: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: Some("jojo".to_string()),
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+
+        assert!(remote_preview_needs_refresh(&session));
+        assert!(!preview_should_hide_stale_placeholder_content(&session));
     }
 
     #[test]
