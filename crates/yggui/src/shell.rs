@@ -3669,19 +3669,8 @@ fn spawn_initial_server_sync(
         );
         async_render_epoch.with_mut(|epoch| *epoch += 1);
         schedule_ui();
-        let should_prioritize_active_terminal =
-            safe_shell_read(state, "initial_server_sync_background_gate", |shell| {
-                shell.server.active_view_mode() == WorkspaceViewMode::Terminal
-                    && shell
-                        .server
-                        .active_session_path()
-                        .is_some_and(|path| path.starts_with("remote-session://"))
-            })
-            .unwrap_or(false);
-        if !should_prioritize_active_terminal {
-            maybe_spawn_missing_remote_machine_refreshes(state);
-            maybe_spawn_missing_managed_cli_refreshes(state);
-        }
+        maybe_spawn_missing_remote_machine_refreshes(state);
+        maybe_spawn_missing_managed_cli_refreshes(state);
     });
 }
 
@@ -18163,6 +18152,7 @@ fn TerminalCanvas(
                                                 }),
                                             );
                                             traced_attach_ready = true;
+                                            terminal_overlay_dismissed.set(true);
                                             let _ = safe_shell_mut(
                                                 state,
                                                 "terminal_attach_ready",
@@ -18512,6 +18502,7 @@ fn TerminalCanvas(
                                             }),
                                         );
                                         traced_attach_ready = true;
+                                        terminal_overlay_dismissed.set(true);
                                         let _ = safe_shell_mut(
                                             state,
                                             "terminal_attach_ready",

@@ -309,17 +309,7 @@ def terminal_text_looks_like_placeholder(text: str) -> bool:
 
 
 def resume_overlay_counts_as_painted(viewport: dict, overlay: dict, terminal_text: str) -> bool:
-    if (terminal_text or "").strip():
-        return False
-    if not bool(overlay.get("visible")):
-        return False
-    overlay_text = str(overlay.get("text_sample") or "").strip().lower()
-    if any(
-        bad in overlay_text
-        for bad in ("live terminal is ready", "still connecting to remote terminal")
-    ):
-        return False
-    return bool((viewport.get("active_summary") or "").strip())
+    return False
 
 
 def terminal_text_looks_like_error(text: str) -> bool:
@@ -510,15 +500,12 @@ def require_terminal_painted(state: dict, session_path: str) -> dict:
         raise RuntimeError("resume overlay still uses the old misleading terminal-ready copy")
     if overlay_visible and "still connecting to remote terminal" in overlay_text:
         raise RuntimeError("resume overlay still uses indefinite connecting copy")
-    if resume_overlay_counts_as_painted(viewport, overlay, text):
-        return state
+    if overlay_visible:
+        raise RuntimeError("resume overlay still covers terminal after paint budget")
     if terminal_text_looks_like_placeholder(text):
         raise RuntimeError("terminal still showing placeholder content")
     if not text:
-        if not overlay_visible:
-            raise RuntimeError("terminal is blank without the resume overlay")
-        if not active_summary:
-            raise RuntimeError("resume overlay is visible but saved session context is missing")
+        raise RuntimeError("terminal is blank")
     return state
 
 
