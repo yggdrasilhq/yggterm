@@ -11090,9 +11090,19 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
             (true, None)
         }
     } else if active_view_mode == "Terminal" {
+        let terminal_overlay_visible = terminal_resume_overlay
+            .get("visible")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let terminal_overlay_has_context = active_summary
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|text| !text.is_empty());
         if active_terminal_hosts.is_empty() {
             (false, Some("active terminal host is missing".to_string()))
         } else if terminal_rendered {
+            (true, None)
+        } else if terminal_overlay_visible && terminal_overlay_has_context {
             (true, None)
         } else if terminal_attach_pending {
             (
@@ -17879,6 +17889,7 @@ fn TerminalCanvas(
     let terminal_overlay_dismissed = use_signal(|| !is_remote_resume_session);
     let resume_overlay_slow = use_signal(|| false);
     let resume_overlay_excerpt = remote_resume_overlay_excerpt(&session);
+    let resume_overlay_blocks = remote_resume_overlay_blocks(&session);
     {
         let mut resume_overlay_slow = resume_overlay_slow;
         use_future(move || async move {
@@ -17985,6 +17996,9 @@ fn TerminalCanvas(
             let mut traced_first_output = false;
             let mut traced_first_meaningful_output = false;
             let mut traced_attach_ready = false;
+            let attach_started_at = Instant::now();
+            let repaint_retry_schedule_ms = [650_u128, 1_350_u128];
+            let mut forced_remote_repaint_attempts = 0usize;
             loop {
                 tokio::select! {
                     event = eval.recv::<TerminalJsEvent>() => {
@@ -18374,6 +18388,32 @@ fn TerminalCanvas(
                                 if saw_visible_output {
                                     terminal_has_visible_output = true;
                                 }
+                                if is_remote_resume_session
+                                    && !terminal_has_visible_output
+                                    && forced_remote_repaint_attempts < repaint_retry_schedule_ms.len()
+                                    && attach_started_at.elapsed().as_millis()
+                                        >= repaint_retry_schedule_ms[forced_remote_repaint_attempts]
+                                {
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "resume_repaint_pulse",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "attempt": forced_remote_repaint_attempts + 1,
+                                            "elapsed_ms": attach_started_at.elapsed().as_millis(),
+                                        }),
+                                    );
+                                    let _ = terminal_write_async(
+                                        endpoint.clone(),
+                                        session_path.clone(),
+                                        "\u{000c}".to_string(),
+                                    )
+                                    .await;
+                                    forced_remote_repaint_attempts += 1;
+                                    read_poll_ms = 45;
+                                }
                                 if (saw_meaningful_output
                                     || saw_prompt_output
                                     || tail_prompt_only_output)
@@ -18551,33 +18591,25 @@ fn TerminalCanvas(
         }
     });
     let show_resume_overlay = is_remote_resume_session && !terminal_overlay_dismissed();
-    let resume_overlay_title = if terminal_prompt_only() {
-        "Resume live remote session"
-    } else if terminal_has_meaningful_output() {
-        "Live terminal is ready"
-    } else if resume_overlay_slow() {
-        "Still connecting to remote terminal…"
-    } else {
-        "Resuming remote Codex session…"
-    };
+    let resume_overlay_title = "Resume live remote session";
     let resume_overlay_body = if terminal_prompt_only() {
         format!(
-            "Yggterm reached {} but the live session is currently sitting at an idle prompt instead of the saved conversation view. The saved transcript context is shown here. Start typing to take over the live terminal.",
+            "Yggterm reached {} but the live terminal is sitting at an idle prompt instead of the saved conversation view. The saved transcript stays in front so you can re-enter the context first. Start typing whenever you want to take over.",
             session.host_label
         )
     } else if terminal_has_meaningful_output() {
         format!(
-            "Yggterm has attached to {}. The live terminal is running underneath this card. Start typing to take over, or stay here to use the saved transcript as your orientation point first.",
+            "Yggterm has attached to {}. The live terminal stays behind this card on purpose so the saved transcript remains your orientation point first. Start typing whenever you want to take over.",
             session.host_label
         )
     } else if resume_overlay_slow() {
         format!(
-            "Yggterm is still attached to {} and waiting for the remote terminal to paint. The saved transcript context stays here until the live session is ready or you decide to take over manually.",
+            "Yggterm is restoring the live terminal on {}. The saved transcript stays in front so you can pick up the thread immediately, and any typing from you takes over the live terminal.",
             session.host_label
         )
     } else {
         format!(
-            "Yggterm is attaching to {} and preparing the live terminal underneath this card. The saved conversation context stays visible until you decide to take over.",
+            "Yggterm is restoring the live terminal on {}. The saved transcript stays in front so you can re-enter the conversation immediately, and any typing from you takes over the live terminal.",
             session.host_label
         )
     };
@@ -18585,6 +18617,11 @@ fn TerminalCanvas(
         resume_overlay_title.to_string()
     } else {
         String::new()
+    };
+    let terminal_host_visibility = if show_resume_overlay {
+        "opacity:0; visibility:hidden;"
+    } else {
+        "opacity:1; visibility:visible;"
     };
     rsx! {
         div {
@@ -18607,8 +18644,9 @@ fn TerminalCanvas(
                     "data-terminal-resume-overlay-visible": if show_resume_overlay { "true" } else { "false" },
                     "data-terminal-resume-overlay-text": "{resume_overlay_attr_text}",
                     style: format!(
-                        "flex:1; min-width:0; min-height:0; height:100%; background:{}; overflow:hidden; {};",
+                        "flex:1; min-width:0; min-height:0; height:100%; background:{}; overflow:hidden; transition:opacity 140ms ease; {}; {};",
                         theme.background,
+                        terminal_host_visibility,
                         terminal_host_chrome,
                     )
                 }
@@ -18616,33 +18654,142 @@ fn TerminalCanvas(
                     div {
                         "data-terminal-resume-overlay": "true",
                         style: format!(
-                            "position:absolute; inset:0; z-index:2; display:flex; align-items:center; justify-content:center; pointer-events:none; \
-                             background:linear-gradient(180deg, rgba(255,255,255,0.72) 0%, rgba(255,255,255,0.38) 100%); \
+                            "position:absolute; inset:0; z-index:2; display:flex; align-items:stretch; justify-content:stretch; pointer-events:none; \
+                             background:linear-gradient(180deg, rgba(255,255,255,0.96) 0%, rgba(255,255,255,0.92) 100%); \
                              backdrop-filter:{}; -webkit-backdrop-filter:{};",
                             resume_overlay_blur, resume_overlay_blur
                         ),
                         div {
-                            style: "display:flex; flex-direction:column; align-items:center; gap:10px; padding:18px 20px; border-radius:18px; background:rgba(255,255,255,0.82); box-shadow:0 18px 44px rgba(148,163,184,0.18), inset 0 0 0 1px rgba(170,190,212,0.18); min-width:280px;",
+                            style: format!(
+                                "display:flex; flex-direction:column; gap:18px; width:100%; min-width:0; min-height:0; padding:26px 28px 24px 28px; \
+                                 border-radius:{}; background:linear-gradient(180deg, rgba(255,255,255,0.88) 0%, rgba(249,250,252,0.92) 100%); \
+                                 box-shadow:inset 0 0 0 1px rgba(170,190,212,0.14);",
+                                terminal_shell_radius
+                            ),
                             div {
-                                style: format!("font-size:14px; font-weight:700; color:{};", snapshot.palette.text),
-                                "{resume_overlay_title}"
-                            }
-                            div {
-                                style: format!("font-size:12px; line-height:1.65; color:{}; text-align:center; max-width:360px;", snapshot.palette.muted),
-                                "{resume_overlay_body}"
-                            }
-                            if let Some(excerpt) = resume_overlay_excerpt.clone() {
+                                style: "display:flex; align-items:flex-start; justify-content:space-between; gap:18px;",
                                 div {
-                                    style: format!(
-                                        "max-width:420px; padding:12px 14px; border-radius:14px; background:{}; color:{}; font-size:12px; line-height:1.6; box-shadow:inset 0 0 0 1px rgba(170,190,212,0.16); text-align:left;",
-                                        snapshot.palette.panel,
-                                        snapshot.palette.text,
-                                    ),
+                                    style: "display:flex; flex-direction:column; gap:8px; min-width:0;",
                                     div {
-                                        style: format!("font-size:10px; font-weight:800; letter-spacing:0.12em; text-transform:uppercase; color:{}; margin-bottom:6px;", snapshot.palette.muted),
+                                        style: format!("font-size:11px; font-weight:800; letter-spacing:0.12em; text-transform:uppercase; color:{};", snapshot.palette.muted),
+                                        "Remote Terminal Resume"
+                                    }
+                                    div {
+                                        style: format!("font-size:24px; line-height:1.15; font-weight:700; color:{}; letter-spacing:-0.02em;", snapshot.palette.text),
+                                        "{resume_overlay_title}"
+                                    }
+                                    div {
+                                        style: format!("font-size:13px; line-height:1.72; color:{}; max-width:620px;", snapshot.palette.muted),
+                                        "{resume_overlay_body}"
+                                    }
+                                }
+                                div {
+                                    style: "display:flex; flex-direction:column; align-items:flex-end; gap:8px; flex-shrink:0;",
+                                    div {
+                                        style: format!(
+                                            "display:inline-flex; align-items:center; gap:8px; padding:8px 12px; border-radius:999px; \
+                                             background:{}; box-shadow:inset 0 0 0 1px rgba(170,190,212,0.16);",
+                                            snapshot.palette.panel
+                                        ),
+                                        div {
+                                            style: format!(
+                                                "width:8px; height:8px; border-radius:999px; background:{}; box-shadow:0 0 0 5px rgba(59,130,246,0.08);",
+                                                snapshot.palette.accent
+                                            ),
+                                        }
+                                        div {
+                                            style: format!("font-size:11px; font-weight:700; letter-spacing:0.08em; text-transform:uppercase; color:{};", snapshot.palette.text),
+                                            "{session.host_label}"
+                                        }
+                                    }
+                                    if resume_overlay_slow() {
+                                        div {
+                                            style: format!("font-size:11px; font-weight:600; color:{};", snapshot.palette.muted),
+                                            "Live host is slower than usual"
+                                        }
+                                    }
+                                }
+                            }
+                            div {
+                                style: format!(
+                                    "display:flex; flex-direction:column; gap:12px; flex:1; min-height:0; min-width:0; padding:18px 18px 16px 18px; \
+                                     border-radius:22px; background:{}; box-shadow:inset 0 0 0 1px rgba(170,190,212,0.16); overflow:hidden;",
+                                    snapshot.palette.panel
+                                ),
+                                div {
+                                    style: "display:flex; align-items:center; justify-content:space-between; gap:12px;",
+                                    div {
+                                        style: format!("font-size:11px; font-weight:800; letter-spacing:0.12em; text-transform:uppercase; color:{};", snapshot.palette.muted),
                                         "Saved Transcript"
                                     }
-                                    div { "{excerpt}" }
+                                    div {
+                                        style: format!("font-size:11px; font-weight:600; color:{};", snapshot.palette.muted),
+                                        "Typing takes over the live terminal"
+                                    }
+                                }
+                                div {
+                                    style: "display:flex; flex-direction:column; gap:10px; min-height:0; overflow:hidden;",
+                                    if resume_overlay_blocks.is_empty() {
+                                        if let Some(excerpt) = resume_overlay_excerpt.clone() {
+                                            div {
+                                                style: format!(
+                                                    "font-size:13px; line-height:1.72; color:{}; white-space:pre-wrap; overflow-wrap:anywhere;",
+                                                    snapshot.palette.text,
+                                                ),
+                                                "{excerpt}"
+                                            }
+                                        } else {
+                                            div {
+                                                style: format!("font-size:13px; line-height:1.72; color:{};", snapshot.palette.muted),
+                                                "Saved terminal context will appear here while the live host reconnects."
+                                            }
+                                        }
+                                    } else {
+                                        for (index, block) in resume_overlay_blocks.iter().enumerate() {
+                                            div {
+                                                key: "{index}",
+                                                style: format!(
+                                                    "display:flex; justify-content:{}; width:100%;",
+                                                    if block.user { "flex-end" } else { "flex-start" }
+                                                ),
+                                                div {
+                                                    style: format!(
+                                                        "display:flex; flex-direction:column; gap:6px; width:{}; max-width:{}; padding:12px 14px; border-radius:18px; \
+                                                         background:{}; box-shadow:inset 0 0 0 1px {};",
+                                                        if block.user { "fit-content" } else { "min(100%, 720px)" },
+                                                        if block.user { "min(72%, 720px)" } else { "min(100%, 720px)" },
+                                                        if block.user { "rgba(241,243,246,0.98)" } else { "rgba(255,255,255,0.96)" },
+                                                        if block.user { "rgba(223,227,233,0.92)" } else { "rgba(170,190,212,0.16)" },
+                                                    ),
+                                                    div {
+                                                        style: "display:flex; align-items:center; justify-content:space-between; gap:10px;",
+                                                        div {
+                                                            style: format!(
+                                                                "font-size:10px; font-weight:800; letter-spacing:0.1em; text-transform:uppercase; color:{};",
+                                                                if block.user { snapshot.palette.accent } else { snapshot.palette.muted }
+                                                            ),
+                                                            "{block.role}"
+                                                        }
+                                                        if !block.timestamp.is_empty() {
+                                                            div {
+                                                                style: format!("font-size:10px; font-weight:600; color:{};", snapshot.palette.muted),
+                                                                "{block.timestamp}"
+                                                            }
+                                                        }
+                                                    }
+                                                    div {
+                                                        style: format!(
+                                                            "font-size:{}; line-height:{}; color:{}; white-space:pre-wrap; overflow-wrap:anywhere;",
+                                                            if block.user { "13px" } else { "14px" },
+                                                            if block.user { "1.62" } else { "1.7" },
+                                                            snapshot.palette.text
+                                                        ),
+                                                        "{block.text}"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             div {
@@ -18841,6 +18988,43 @@ fn remote_resume_overlay_excerpt(session: &ManagedSessionView) -> Option<String>
         .map(|line| line.trim())
         .find(|line| !line.is_empty())
         .map(|line| truncate_preview_excerpt(line, 240))
+}
+
+#[derive(Clone)]
+struct ResumeOverlayBlock {
+    role: String,
+    timestamp: String,
+    text: String,
+    user: bool,
+}
+
+fn remote_resume_overlay_blocks(session: &ManagedSessionView) -> Vec<ResumeOverlayBlock> {
+    let mut blocks = visible_preview_blocks(session)
+        .into_iter()
+        .filter_map(|block| {
+            let text = preview_block_excerpt(&block, 380).or_else(|| {
+                let compact = preview_block_text(&block);
+                (!compact.trim().is_empty()).then(|| truncate_preview_excerpt(compact.trim(), 380))
+            })?;
+            Some(ResumeOverlayBlock {
+                role: block.role.to_string(),
+                timestamp: format_preview_timestamp_for_overlay(&block.timestamp),
+                text,
+                user: block.tone == PreviewTone::User,
+            })
+        })
+        .collect::<Vec<_>>();
+    if blocks.len() > 4 {
+        blocks = blocks.split_off(blocks.len() - 4);
+    }
+    blocks
+}
+
+fn format_preview_timestamp_for_overlay(timestamp: &str) -> String {
+    match timestamp.trim() {
+        "" | "server:launch" | "remote:scan" => String::new(),
+        other => format_preview_timestamp_label(other, &mut None),
+    }
 }
 
 fn strip_terminal_control_sequences(data: &str) -> String {
