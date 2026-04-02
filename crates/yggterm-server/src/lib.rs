@@ -2040,6 +2040,52 @@ impl YggtermServer {
         Some(session_path)
     }
 
+    pub fn stage_remote_scanned_session_with_cached_preview(
+        &mut self,
+        machine_key: &str,
+        session_id: &str,
+        view_mode: WorkspaceViewMode,
+    ) -> Option<String> {
+        let machine_key = normalize_machine_key(machine_key);
+        let machine = self
+            .remote_machines
+            .iter()
+            .find(|machine| machine.machine_key == machine_key)?
+            .clone();
+        let scanned = machine
+            .sessions
+            .iter()
+            .find(|session| session.session_id == session_id)?
+            .clone();
+        let session_path = scanned.session_path.clone();
+        let staged = synthesize_remote_scanned_session_view(
+            &machine,
+            &scanned,
+            self.backend,
+            self.theme,
+            self.ghostty_host.bridge_enabled,
+        );
+        let mut staged = staged;
+        if view_mode == WorkspaceViewMode::Rendered {
+            upsert_session_metadata(
+                &mut staged.metadata,
+                "Preview Hydration",
+                "scan".to_string(),
+            );
+        }
+        self.sessions.insert(session_path.clone(), staged);
+        if !self
+            .live_session_order
+            .iter()
+            .any(|existing| existing == &session_path)
+        {
+            self.live_session_order.insert(0, session_path.clone());
+        }
+        self.active_session_path = Some(session_path.clone());
+        self.active_view_mode = view_mode;
+        Some(session_path)
+    }
+
     pub fn start_local_session(
         &mut self,
         kind: SessionKind,
