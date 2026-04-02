@@ -1,10 +1,10 @@
+use crate::terminal::TerminalBufferStats;
 use crate::{
     GhosttyHostSupport, PersistedDaemonState, RemoteMachineSnapshot, ServerUiSnapshot, SessionKind,
     SshConnectTarget, TerminalManager, WorkspaceViewMode, YggtermServer,
     active_client_instance_records, current_millis, fetch_remote_generation_context,
     persist_remote_generated_copy, terminate_remote_codex_session,
 };
-use crate::terminal::TerminalBufferStats;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -363,9 +363,11 @@ impl DaemonRuntime {
             );
         }
         if self.terminals.has_session(path) {
-            if !self
-                .terminals
-                .session_matches_spec(path, &launch_command, cwd.as_deref())
+            let requires_fresh_attach = terminal_session_requires_fresh_attach(path);
+            if requires_fresh_attach
+                || !self
+                    .terminals
+                    .session_matches_spec(path, &launch_command, cwd.as_deref())
             {
                 let stop_command = self.server.terminal_stop_command(path);
                 self.terminals.restart_session(
@@ -741,6 +743,10 @@ impl DaemonRuntime {
         );
         Ok(response)
     }
+}
+
+fn terminal_session_requires_fresh_attach(path: &str) -> bool {
+    path.starts_with("remote-session://")
 }
 
 fn trim_terminal_buffers(
@@ -1762,8 +1768,10 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                         }
                         #[cfg(unix)]
                         {
-                            let _ =
-                                wait_for_listener_ready(listener.as_raw_fd(), DAEMON_ACCEPT_POLL_MS)?;
+                            let _ = wait_for_listener_ready(
+                                listener.as_raw_fd(),
+                                DAEMON_ACCEPT_POLL_MS,
+                            )?;
                         }
                         #[cfg(not(unix))]
                         {
@@ -2093,7 +2101,15 @@ fn send_request(endpoint: &ServerEndpoint, request: &ServerRequest) -> Result<Se
             reader
                 .read_line(&mut line)
                 .context("reading daemon response")?;
-            serde_json::from_str(line.trim_end()).context("parsing daemon response")
+            serde_json::from_str(line.trim_end()).with_context(|| {
+                let trimmed = line.trim_end();
+                let snippet = if trimmed.len() > 240 {
+                    format!("{}...", &trimmed[..240])
+                } else {
+                    trimmed.to_string()
+                };
+                format!("parsing daemon response: {:?}", snippet)
+            })
         }
         ServerEndpoint::Tcp { host, port } => {
             let mut stream = std::net::TcpStream::connect((host.as_str(), *port))
@@ -2108,14 +2124,22 @@ fn send_request(endpoint: &ServerEndpoint, request: &ServerRequest) -> Result<Se
             reader
                 .read_line(&mut line)
                 .context("reading daemon response")?;
-            serde_json::from_str(line.trim_end()).context("parsing daemon response")
+            serde_json::from_str(line.trim_end()).with_context(|| {
+                let trimmed = line.trim_end();
+                let snippet = if trimmed.len() > 240 {
+                    format!("{}...", &trimmed[..240])
+                } else {
+                    trimmed.to_string()
+                };
+                format!("parsing daemon response: {:?}", snippet)
+            })
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::collect_remote_copy_candidates;
+    use super::{collect_remote_copy_candidates, terminal_session_requires_fresh_attach};
     use crate::{
         RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession,
         remote_scanned_session_path,
@@ -2169,11 +2193,21 @@ mod tests {
 
         assert_eq!(candidates.len(), 2);
         for candidate in candidates {
-            let machine = candidate.remote_machine.expect("candidate should keep machine routing");
+            let machine = candidate
+                .remote_machine
+                .expect("candidate should keep machine routing");
             assert_eq!(machine.machine_key, "jojo");
             assert!(machine.sessions.is_empty());
             assert_eq!(machine.prefix.as_deref(), Some("sudo -u pi"));
         }
         assert_eq!(machines[0].sessions.len(), 2);
+    }
+
+    #[test]
+    fn remote_session_paths_force_fresh_attach() {
+        assert!(terminal_session_requires_fresh_attach(
+            "remote-session://jojo/019c376c-8691-7810-8f91-bb5605e37a4e"
+        ));
+        assert!(!terminal_session_requires_fresh_attach("local://codex"));
     }
 }
