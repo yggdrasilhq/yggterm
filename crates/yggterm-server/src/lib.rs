@@ -38,8 +38,9 @@ pub use terminal::{TerminalChunk, TerminalManager, TerminalReadResult};
 
 use anyhow::Context;
 use codex_cli::{
-    ManagedCliAction, ManagedCliRefreshReport, ensure_local_managed_cli, managed_cli_shell_command,
-    refresh_local_managed_cli, summarize_managed_cli_report, sync_terminal_identity_env,
+    ManagedCliAction, ManagedCliRefreshReport, best_effort_cwd_shell_prefix,
+    ensure_local_managed_cli, managed_cli_shell_command, refresh_local_managed_cli,
+    summarize_managed_cli_report, sync_terminal_identity_env,
     terminal_identity_shell_exports_for_remote,
 };
 use rusqlite::{Connection, params};
@@ -1757,10 +1758,8 @@ impl YggtermServer {
             prefix: machine.prefix.clone(),
             cwd: cwd.map(ToOwned::to_owned),
         };
-        let cached_remote_launch = self.cached_remote_launch_for_target(
-            &target.ssh_target,
-            target.prefix.as_deref(),
-        );
+        let cached_remote_launch =
+            self.cached_remote_launch_for_target(&target.ssh_target, target.prefix.as_deref());
         let resolved_remote_launch = if launch_terminal && cached_remote_launch.is_none() {
             resolve_remote_yggterm_binary(&target.ssh_target, target.prefix.as_deref()).ok()
         } else {
@@ -3145,18 +3144,23 @@ fn screen_spawn_codex_session(session_name: &str, command: &str) -> anyhow::Resu
     }
 }
 
+fn screen_attach_shell_command(target: &str) -> String {
+    let quoted_target = shell_single_quote(target);
+    format!(
+        r#"(for delay in 0.18 0.50 0.85 1.40; do \
+             (sleep "$delay"; \
+              screen -S {target} -X redisplay >/dev/null 2>&1 || true; \
+              screen -S {target} -X stuff "$(printf '\f')" >/dev/null 2>&1 || true) \
+             & \
+         done; \
+         exec screen -D -r {target})"#,
+        target = quoted_target,
+    )
+}
+
 fn screen_attach_session(session_name: &str) -> anyhow::Result<()> {
     let target = screen_session_ref(session_name)?.unwrap_or_else(|| session_name.to_string());
-    let attach_command = format!(
-        "(sleep 0.2; \
-            screen -S {} -X redisplay >/dev/null 2>&1 || true; \
-            screen -S {} -X stuff \"$(printf '\\f')\" >/dev/null 2>&1 || true) \
-         & exec screen -D -RR {}",
-        shell_single_quote(&target),
-        shell_single_quote(&target),
-        shell_single_quote(&target)
-    );
-
+    let attach_command = screen_attach_shell_command(&target);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -3254,6 +3258,111 @@ fn emit_terminal_snapshot(bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn remote_snapshot_non_empty_lines(bytes: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(bytes);
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>()
+}
+
+fn remote_line_looks_like_shell_prompt(line: &str) -> bool {
+    let stripped = line.trim_matches(|ch: char| ch.is_control());
+    (stripped.contains('@') && stripped.contains(':') && stripped.ends_with('$'))
+        || (stripped.contains('@') && stripped.contains(':') && stripped.ends_with('#'))
+        || stripped.ends_with('$')
+        || stripped.ends_with('#')
+}
+
+fn remote_snapshot_looks_like_shell_prompt(bytes: &[u8]) -> bool {
+    let lines = remote_snapshot_non_empty_lines(bytes);
+    if lines.is_empty() || lines.len() > 4 {
+        return false;
+    }
+    lines
+        .iter()
+        .all(|line| remote_line_looks_like_shell_prompt(line))
+}
+
+fn remote_snapshot_is_generic_codex_idle(bytes: &[u8]) -> bool {
+    let lines = remote_snapshot_non_empty_lines(bytes);
+    if lines.is_empty() {
+        return false;
+    }
+    let stripped = String::from_utf8_lossy(bytes);
+    let has_codex_header =
+        stripped.contains("OpenAI Codex") && stripped.contains("/model to change");
+    if !has_codex_header {
+        return false;
+    }
+    let printable = stripped
+        .chars()
+        .filter(|ch| !ch.is_control() && !ch.is_whitespace())
+        .count();
+    if printable > 420 || lines.len() > 12 {
+        return false;
+    }
+    let transcript_like_lines = lines
+        .iter()
+        .filter(|line| {
+            let line = line.trim();
+            !line.starts_with("Tip:")
+                && !line.starts_with("model:")
+                && !line.starts_with("directory:")
+                && !line.starts_with(">_ OpenAI Codex")
+        })
+        .count();
+    transcript_like_lines <= 2
+}
+
+fn remote_snapshot_looks_like_codex(bytes: &[u8]) -> bool {
+    let lines = remote_snapshot_non_empty_lines(bytes);
+    let tail = lines
+        .iter()
+        .rev()
+        .take(12)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
+    if tail
+        .last()
+        .is_some_and(|line| remote_line_looks_like_shell_prompt(line))
+    {
+        return false;
+    }
+    let normalized_tail = tail.join("\n").to_ascii_lowercase();
+    if normalized_tail.contains("do you trust the contents of this directory")
+        || normalized_tail.contains("press enter to continue")
+    {
+        return false;
+    }
+    if remote_snapshot_is_generic_codex_idle(bytes) {
+        return false;
+    }
+    if normalized_tail.contains("openai codex")
+        || normalized_tail.contains("/model to change")
+        || normalized_tail.contains("gpt-5")
+        || normalized_tail.contains("gpt-4")
+        || normalized_tail.contains("codex")
+    {
+        return true;
+    }
+    !remote_snapshot_looks_like_shell_prompt(bytes)
+}
+
+fn remote_saved_session_can_reuse_existing_multiplexer(
+    saved_session_exists: bool,
+    snapshot: &[u8],
+) -> bool {
+    if saved_session_exists {
+        return false;
+    }
+    remote_snapshot_looks_like_codex(snapshot)
+}
+
 fn emit_remote_multiplexer_snapshot_with_retry(
     multiplexer: RemoteMultiplexer,
     session_name: &str,
@@ -3273,6 +3382,16 @@ fn emit_remote_multiplexer_snapshot_with_retry(
             return Ok(false);
         }
         std::thread::sleep(Duration::from_millis(40));
+    }
+}
+
+fn remote_multiplexer_snapshot_bytes(
+    multiplexer: RemoteMultiplexer,
+    session_name: &str,
+) -> anyhow::Result<Vec<u8>> {
+    match multiplexer {
+        RemoteMultiplexer::Tmux => tmux_snapshot_bytes(session_name),
+        RemoteMultiplexer::Screen => screen_snapshot_bytes(session_name),
     }
 }
 
@@ -5625,12 +5744,12 @@ pub fn run_remote_resume_codex(session_id: &str, cwd: Option<&str>) -> anyhow::R
     let _ = ensure_local_managed_cli(ManagedCliTool::Codex)?;
     if let Some(multiplexer) = preferred_remote_multiplexer()? {
         let session_name = remote_tmux_session_name(session_id);
+        let saved_session_exists = remote_saved_codex_session_exists(session_id)?;
         let existing_session = match multiplexer {
             RemoteMultiplexer::Tmux => tmux_has_session(&session_name)?,
             RemoteMultiplexer::Screen => screen_has_session(&session_name)?,
         };
         if !existing_session {
-            let saved_session_exists = remote_saved_codex_session_exists(session_id)?;
             let command = if saved_session_exists {
                 remote_persistent_resume_shell_command(session_id, cwd)
             } else {
@@ -5658,11 +5777,35 @@ pub fn run_remote_resume_codex(session_id: &str, cwd: Option<&str>) -> anyhow::R
                 Duration::from_millis(800),
             );
         } else {
-            let _ = emit_remote_multiplexer_snapshot_with_retry(
-                multiplexer,
-                &session_name,
-                Duration::from_millis(120),
+            let snapshot = remote_multiplexer_snapshot_bytes(multiplexer, &session_name)?;
+            let snapshot_looks_valid = remote_saved_session_can_reuse_existing_multiplexer(
+                saved_session_exists,
+                &snapshot,
             );
+            if !snapshot.is_empty() && snapshot_looks_valid {
+                let _ = emit_terminal_snapshot(&snapshot);
+            } else {
+                match multiplexer {
+                    RemoteMultiplexer::Tmux => tmux_kill_session(&session_name)?,
+                    RemoteMultiplexer::Screen => screen_kill_session(&session_name)?,
+                }
+                let command = if saved_session_exists {
+                    remote_persistent_resume_shell_command(session_id, cwd)
+                } else {
+                    remote_resume_picker_shell_command(session_id, cwd, None, true)
+                };
+                match multiplexer {
+                    RemoteMultiplexer::Tmux => tmux_spawn_codex_session(&session_name, &command)?,
+                    RemoteMultiplexer::Screen => {
+                        screen_spawn_codex_session(&session_name, &command)?
+                    }
+                }
+                let _ = emit_remote_multiplexer_snapshot_with_retry(
+                    multiplexer,
+                    &session_name,
+                    Duration::from_millis(800),
+                );
+            }
             finish_span(serde_json::json!({
                 "session_id": session_id,
                 "cwd": cwd,
@@ -5671,8 +5814,15 @@ pub fn run_remote_resume_codex(session_id: &str, cwd: Option<&str>) -> anyhow::R
                     RemoteMultiplexer::Screen => "screen",
                 },
                 "mux_session": session_name,
-                "mux_reused": true,
-                "mode": "attach_existing_multiplexer",
+                "mux_reused": snapshot_looks_valid,
+                "saved_session_exists": saved_session_exists,
+                "mode": if snapshot_looks_valid {
+                    "attach_existing_multiplexer"
+                } else if saved_session_exists {
+                    "replace_stale_multiplexer_with_resume"
+                } else {
+                    "replace_stale_multiplexer_with_picker"
+                },
             }));
         }
         return match multiplexer {
@@ -8036,39 +8186,30 @@ fn legacy_agent_launch_command(
     cwd: Option<&str>,
     session_id: Option<&str>,
 ) -> String {
+    let cwd_prefix = best_effort_cwd_shell_prefix(cwd)
+        .map(|prefix| format!("{prefix} && "))
+        .unwrap_or_default();
     match (kind, session_id) {
-        (SessionKind::Codex, Some(session_id)) => match cwd.filter(|cwd| !cwd.trim().is_empty()) {
-            Some(cwd) => format!(
-                "cd {} && codex resume {}",
-                shell_single_quote(cwd),
-                shell_single_quote(session_id)
-            ),
-            None => format!("codex resume {}", shell_single_quote(session_id)),
-        },
-        (SessionKind::CodexLiteLlm, Some(session_id)) => {
-            match cwd.filter(|cwd| !cwd.trim().is_empty()) {
-                Some(cwd) => format!(
-                    "cd {} && CODEX_HOME=\"$HOME/.codex-litellm\" codex-litellm resume {}",
-                    shell_single_quote(cwd),
+        (SessionKind::Codex, Some(session_id)) => {
+            if cwd_prefix.is_empty() {
+                format!("codex resume {}", shell_single_quote(session_id))
+            } else {
+                format!(
+                    "{cwd_prefix}codex resume -C \"$PWD\" {}",
                     shell_single_quote(session_id)
-                ),
-                None => format!(
-                    "CODEX_HOME=\"$HOME/.codex-litellm\" codex-litellm resume {}",
-                    shell_single_quote(session_id)
-                ),
+                )
             }
         }
-        (SessionKind::Codex, None) => match cwd.filter(|cwd| !cwd.trim().is_empty()) {
-            Some(cwd) => format!("cd {} && codex", shell_single_quote(cwd)),
-            None => "codex".to_string(),
-        },
-        (SessionKind::CodexLiteLlm, None) => match cwd.filter(|cwd| !cwd.trim().is_empty()) {
-            Some(cwd) => format!(
-                "cd {} && CODEX_HOME=\"$HOME/.codex-litellm\" codex-litellm",
-                shell_single_quote(cwd)
-            ),
-            None => "CODEX_HOME=\"$HOME/.codex-litellm\" codex-litellm".to_string(),
-        },
+        (SessionKind::CodexLiteLlm, Some(session_id)) => {
+            format!(
+                "{cwd_prefix}CODEX_HOME=\"$HOME/.codex-litellm\" codex-litellm resume {}",
+                shell_single_quote(session_id)
+            )
+        }
+        (SessionKind::Codex, None) => format!("{cwd_prefix}codex"),
+        (SessionKind::CodexLiteLlm, None) => {
+            format!("{cwd_prefix}CODEX_HOME=\"$HOME/.codex-litellm\" codex-litellm")
+        }
         _ => String::new(),
     }
 }
@@ -8523,15 +8664,17 @@ mod tests {
         TerminalBackend, TerminalLaunchPhase, UiTheme, WorkspaceViewMode, YggtermServer,
         apply_remote_preview_payload, apply_remote_scanned_session_preview, build_session,
         canonical_static_label, clear_session_preview_for_loading, current_millis_u64,
-        dedupe_remote_scanned_sessions, load_remote_machine_sessions_from_mirror,
-        managed_session_from_snapshot, mirror_remote_machine_sessions,
-        parse_recent_context_sections, parse_screen_session_ref, parse_stored_transcript,
-        push_preview_block, remote_cache_key, remote_command_cache, remote_resume_shell_command,
-        remote_saved_codex_session_exists, remote_scan_roots_with_parents,
-        remote_scanned_session_path, remote_ssh_launch_command, sanitize_recent_context_payload,
-        session_metadata_value, should_fallback_to_python, stored_session_launch_command,
-        strip_remote_payload_noise, synthesize_remote_scanned_session_view,
-        upsert_session_metadata,
+        dedupe_remote_scanned_sessions, legacy_agent_launch_command,
+        load_remote_machine_sessions_from_mirror, managed_session_from_snapshot,
+        mirror_remote_machine_sessions, parse_recent_context_sections, parse_screen_session_ref,
+        parse_stored_transcript, push_preview_block, remote_cache_key, remote_command_cache,
+        remote_resume_shell_command, remote_saved_codex_session_exists,
+        remote_saved_session_can_reuse_existing_multiplexer, remote_scan_roots_with_parents,
+        remote_scanned_session_path, remote_snapshot_looks_like_codex,
+        remote_snapshot_looks_like_shell_prompt, remote_ssh_launch_command,
+        sanitize_recent_context_payload, screen_attach_shell_command, session_metadata_value,
+        should_fallback_to_python, stored_session_launch_command, strip_remote_payload_noise,
+        synthesize_remote_scanned_session_view, upsert_session_metadata,
     };
     use crate::SessionRenderedSection;
     use anyhow::Result;
@@ -8611,9 +8754,24 @@ mod tests {
             Some("tmux new-session -A -s yggterm"),
         );
         assert!(command.contains("tmux new-session -A -s yggterm &&"));
-        assert!(command.contains("cd '/srv/workspace' && export NPM_CONFIG_PREFIX="));
-        assert!(command.contains("codex resume"));
+        assert!(command.contains("__yggterm_requested='/srv/workspace'"));
+        assert!(command.contains("export NPM_CONFIG_PREFIX="));
+        assert!(command.contains("codex resume -C \"$PWD\""));
         assert!(command.contains("'019caa6f-b32c-7a73-b4d3-db83225663dc'"));
+    }
+
+    #[test]
+    fn legacy_agent_launch_command_uses_best_effort_cwd_resolution() {
+        let command = legacy_agent_launch_command(
+            SessionKind::Codex,
+            Some("/root/project"),
+            Some("019caa6f-b32c-7a73-b4d3-db83225663dc"),
+        );
+        assert!(command.contains("__yggterm_requested='/root/project'"));
+        assert!(command.contains("dirname -- \"$__yggterm_cwd\""));
+        assert!(
+            command.contains("codex resume -C \"$PWD\" '019caa6f-b32c-7a73-b4d3-db83225663dc'")
+        );
     }
 
     #[test]
@@ -8742,6 +8900,49 @@ mod tests {
     }
 
     #[test]
+    fn remote_snapshot_shell_prompt_is_not_treated_as_codex() {
+        let shell = b"pi@openclaw:~$\n\npi@openclaw:~$\n";
+        assert!(remote_snapshot_looks_like_shell_prompt(shell));
+        assert!(!remote_snapshot_looks_like_codex(shell));
+    }
+
+    #[test]
+    fn remote_snapshot_codex_screen_is_treated_as_codex() {
+        let codex = b"m\n >_ OpenAI Codex (v0.118.0)\n model: gpt-5.4 high /model to change\n";
+        assert!(!remote_snapshot_looks_like_shell_prompt(codex));
+        assert!(!remote_snapshot_looks_like_codex(codex));
+    }
+
+    #[test]
+    fn remote_snapshot_transcript_like_codex_screen_is_treated_as_codex() {
+        let codex = b">_ OpenAI Codex (v0.118.0)\nmodel: gpt-5.4 high /model to change\ndirectory: ~\n\n> Run /review on my current changes\nassistant: I found the regression in terminal restore.\nassistant: Reusing a stale screen session is the root cause here.\n";
+        assert!(remote_snapshot_looks_like_codex(codex));
+    }
+
+    #[test]
+    fn remote_snapshot_prompt_tailed_scrollback_is_not_treated_as_codex() {
+        let shell = b"earlier output line\nanother transcript line\npi@openclaw:~$\n";
+        assert!(!remote_snapshot_looks_like_codex(shell));
+    }
+
+    #[test]
+    fn remote_snapshot_trust_prompt_is_not_treated_as_resumed_codex() {
+        let trust = b"> You are in /\nDo you trust the contents of this directory?\nPress enter to continue\n";
+        assert!(!remote_snapshot_looks_like_codex(trust));
+    }
+
+    #[test]
+    fn saved_session_never_reuses_existing_multiplexer_snapshot() {
+        let codex = b">_ OpenAI Codex (v0.118.0)\nmodel: gpt-5.4 high /model to change\ndirectory: ~\n\n> Run /review on my current changes\nassistant: I found the regression in terminal restore.\n";
+        assert!(!remote_saved_session_can_reuse_existing_multiplexer(
+            true, codex
+        ));
+        assert!(remote_saved_session_can_reuse_existing_multiplexer(
+            false, codex
+        ));
+    }
+
+    #[test]
     fn strip_remote_payload_noise_discards_shell_preamble() {
         let raw = format!("alias chicago='ssh'\nwelcome\n{REMOTE_OUTPUT_SENTINEL}\n2.0.12\n");
         assert_eq!(strip_remote_payload_noise(raw.as_bytes()), "2.0.12");
@@ -8754,6 +8955,15 @@ mod tests {
             parse_screen_session_ref(listing, "yggterm-abc123"),
             Some("4046775.yggterm-abc123".to_string())
         );
+    }
+    #[test]
+    fn screen_attach_shell_command_replays_exact_session_with_redraw_pulses() {
+        let command = screen_attach_shell_command("4046775.yggterm-abc123");
+        assert!(command.contains("screen -D -r '4046775.yggterm-abc123'"));
+        assert!(command.contains("screen -S '4046775.yggterm-abc123' -X redisplay"));
+        assert!(command.contains("screen -S '4046775.yggterm-abc123' -X stuff"));
+        assert!(command.contains("for delay in 0.18 0.50 0.85 1.40"));
+        assert!(!command.contains("screen -D -RR"));
     }
 
     #[test]
