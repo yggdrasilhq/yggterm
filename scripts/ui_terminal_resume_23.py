@@ -17,14 +17,6 @@ PLACEHOLDER_FRAGMENTS = (
     "still connecting to remote terminal",
 )
 
-GENERIC_IDLE_FRAGMENTS = (
-    "openai codex",
-    "/model to change",
-    "write tests for @filename",
-    "find and fix a bug in @filename",
-    "improve documentation in @filename",
-)
-
 ERROR_FRAGMENTS = (
     "mux_client_request_session",
     "session open refused by peer",
@@ -178,6 +170,8 @@ def launch_local_client(binary: str, timeout_s: float = 4.0) -> tuple[subprocess
     kill_local_clients()
     env = os.environ.copy()
     env.setdefault("DISPLAY", ":10.0")
+    env.pop("XRDP_SESSION", None)
+    env.pop("XRDP_SOCKET_PATH", None)
     env["YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF"] = "1"
     baseline_window_count = local_x11_window_count()
     proc = subprocess.Popen(
@@ -314,6 +308,20 @@ def terminal_text_looks_like_placeholder(text: str) -> bool:
     return any(fragment in normalized for fragment in PLACEHOLDER_FRAGMENTS)
 
 
+def resume_overlay_counts_as_painted(viewport: dict, overlay: dict, terminal_text: str) -> bool:
+    if (terminal_text or "").strip():
+        return False
+    if not bool(overlay.get("visible")):
+        return False
+    overlay_text = str(overlay.get("text_sample") or "").strip().lower()
+    if any(
+        bad in overlay_text
+        for bad in ("live terminal is ready", "still connecting to remote terminal")
+    ):
+        return False
+    return bool((viewport.get("active_summary") or "").strip())
+
+
 def terminal_text_looks_like_error(text: str) -> bool:
     normalized = " ".join(text.strip().lower().split())
     if not normalized:
@@ -322,10 +330,30 @@ def terminal_text_looks_like_error(text: str) -> bool:
 
 
 def terminal_text_looks_like_generic_idle(text: str) -> bool:
-    normalized = " ".join(text.strip().lower().split())
-    if not normalized:
+    stripped = text.strip()
+    if not stripped:
         return False
-    return any(fragment in normalized for fragment in GENERIC_IDLE_FRAGMENTS)
+    lowered = stripped.lower()
+    has_codex_header = "openai codex" in lowered and "/model to change" in lowered
+    if not has_codex_header:
+        return False
+    printable = sum(1 for ch in stripped if not ch.isspace() and ch.isprintable())
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    if printable > 420 or len(lines) > 12:
+        return False
+    transcript_like_lines = 0
+    for line in lines:
+        lower = line.lower()
+        if line.startswith(">_ OpenAI Codex"):
+            continue
+        if lower.startswith("tip:"):
+            continue
+        if lower.startswith("model:"):
+            continue
+        if lower.startswith("directory:"):
+            continue
+        transcript_like_lines += 1
+    return transcript_like_lines <= 2
 
 
 def terminal_text_looks_like_shell_prompt(text: str) -> bool:
@@ -420,10 +448,41 @@ def choose_remote_terminal_targets(rows_payload: dict, seed: int, count: int) ->
     candidates = collect_remote_terminal_targets(rows_payload)
     if not candidates:
         raise RuntimeError("no remote session rows available for terminal-resume test")
+
+    chosen: list[dict] = []
+    seen_paths: set[str] = set()
+
+    def add(candidate: dict) -> None:
+        path = candidate["full_path"]
+        if path in seen_paths or len(chosen) >= count:
+            return
+        chosen.append(candidate)
+        seen_paths.add(path)
+
+    # Always cover the first recent visible session per host before sampling broadly.
+    seen_hosts: set[str] = set()
+    for candidate in candidates:
+        host = candidate["full_path"].split("//", 1)[-1].split("/", 1)[0]
+        if host in seen_hosts:
+            continue
+        seen_hosts.add(host)
+        add(candidate)
+
+    # Then prioritize the top of the displayed tree, where user-facing regressions are most obvious.
+    for candidate in candidates:
+        add(candidate)
+        if len(chosen) >= min(count, max(8, count // 2)):
+            break
+
+    remaining = [candidate for candidate in candidates if candidate["full_path"] not in seen_paths]
     rng = random.Random(seed)
-    if len(candidates) > count:
-        return rng.sample(candidates, count)
-    return candidates
+    rng.shuffle(remaining)
+    for candidate in remaining:
+        add(candidate)
+        if len(chosen) >= count:
+            break
+
+    return chosen
 
 
 def require_terminal_painted(state: dict, session_path: str) -> dict:
@@ -438,16 +497,28 @@ def require_terminal_painted(state: dict, session_path: str) -> dict:
         raise RuntimeError(viewport.get("reason") or "active terminal host missing")
     text = active_terminal_text(state)
     overlay = terminal_resume_overlay(state)
-    if overlay.get("visible"):
-        return state
-    if terminal_text_looks_like_placeholder(text):
-        raise RuntimeError("terminal still showing placeholder content")
+    overlay_visible = bool(overlay.get("visible"))
+    overlay_text = (overlay.get("text_sample") or "").strip().lower()
+    active_summary = (viewport.get("active_summary") or "").strip()
     if terminal_text_looks_like_error(text):
         raise RuntimeError("terminal painted transport/error output instead of the session")
     if terminal_text_looks_like_generic_idle(text):
         raise RuntimeError("terminal exposed generic Codex idle prompt instead of restored session UX")
     if terminal_text_looks_like_shell_prompt(text):
         raise RuntimeError("terminal exposed plain shell prompt instead of restored session UX")
+    if overlay_visible and "live terminal is ready" in overlay_text:
+        raise RuntimeError("resume overlay still uses the old misleading terminal-ready copy")
+    if overlay_visible and "still connecting to remote terminal" in overlay_text:
+        raise RuntimeError("resume overlay still uses indefinite connecting copy")
+    if resume_overlay_counts_as_painted(viewport, overlay, text):
+        return state
+    if terminal_text_looks_like_placeholder(text):
+        raise RuntimeError("terminal still showing placeholder content")
+    if not text:
+        if not overlay_visible:
+            raise RuntimeError("terminal is blank without the resume overlay")
+        if not active_summary:
+            raise RuntimeError("resume overlay is visible but saved session context is missing")
     return state
 
 
@@ -541,22 +612,35 @@ def main() -> int:
         "placeholder_failures": len(
             [
                 item for item in results
-                if not (item.get("terminal_resume_overlay") or {}).get("visible")
-                and terminal_text_looks_like_placeholder(item.get("terminal_text_sample") or "")
+                if terminal_text_looks_like_placeholder(item.get("terminal_text_sample") or "")
+                and not resume_overlay_counts_as_painted(
+                    {
+                        "active_summary": item.get("active_summary") or "",
+                    },
+                    item.get("terminal_resume_overlay") or {},
+                    item.get("terminal_text_sample") or "",
+                )
             ]
         ),
         "generic_idle_failures": len(
             [
                 item for item in results
-                if not (item.get("terminal_resume_overlay") or {}).get("visible")
-                and terminal_text_looks_like_generic_idle(item.get("terminal_text_sample") or "")
+                if terminal_text_looks_like_generic_idle(item.get("terminal_text_sample") or "")
             ]
         ),
         "shell_prompt_failures": len(
             [
                 item for item in results
-                if not (item.get("terminal_resume_overlay") or {}).get("visible")
-                and terminal_text_looks_like_shell_prompt(item.get("terminal_text_sample") or "")
+                if terminal_text_looks_like_shell_prompt(item.get("terminal_text_sample") or "")
+            ]
+        ),
+        "overlay_copy_failures": len(
+            [
+                item for item in results
+                if any(
+                    bad in ((item.get("terminal_resume_overlay") or {}).get("text_sample") or "").lower()
+                    for bad in ("live terminal is ready", "still connecting to remote terminal")
+                )
             ]
         ),
         "terminal_error_failures": len(
@@ -585,6 +669,7 @@ def main() -> int:
         and summary["generic_idle_failures"] == 0
         and summary["shell_prompt_failures"] == 0
         and summary["terminal_error_failures"] == 0
+        and summary["overlay_copy_failures"] == 0
     ) else 1
 
 
