@@ -4,6 +4,7 @@ import json
 import os
 import random
 import re
+import shutil
 import shlex
 import subprocess
 import time
@@ -71,6 +72,34 @@ def quote(value: str) -> str:
     return shlex.quote(value)
 
 
+def local_yggterm_home() -> Path:
+    override = os.environ.get("YGGTERM_HOME", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".yggterm"
+
+
+def local_yggterm_path(*parts: str) -> Path:
+    return local_yggterm_home().joinpath(*parts)
+
+
+def local_x11_window_count(title: str = "Yggterm") -> int:
+    display = os.environ.get("DISPLAY", "").strip()
+    if not display or shutil.which("xwininfo") is None:
+        return 0
+    result = subprocess.run(
+        ["xwininfo", "-root", "-tree"],
+        check=False,
+        text=True,
+        capture_output=True,
+        env={**os.environ, "DISPLAY": display},
+    )
+    if result.returncode != 0:
+        return 0
+    marker = f'"{title}"'
+    return sum(1 for line in result.stdout.splitlines() if marker in line)
+
+
 def app_state(host: str, binary: str, timeout_ms: int) -> dict:
     payload = run_json(host, f"{quote(binary)} server app state --timeout-ms {timeout_ms}")
     return payload.get("data") or {}
@@ -116,7 +145,7 @@ def app_remove_session(host: str, binary: str, timeout_ms: int, session_path: st
 
 def server_inventory(host: str) -> dict:
     if host == "local":
-        path = Path.home() / ".yggterm" / "server-state.json"
+        path = local_yggterm_path("server-state.json")
         return json.loads(path.read_text(encoding="utf-8"))
     result = run_control(host, "cat ~/.yggterm/server-state.json")
     return json.loads(result.stdout)
@@ -124,7 +153,7 @@ def server_inventory(host: str) -> dict:
 
 def trace_events_since(host: str, start_ms: int, tail_lines: int = 4000) -> list[dict]:
     if host == "local":
-        path = Path.home() / ".yggterm" / "event-trace.jsonl"
+        path = local_yggterm_path("event-trace.jsonl")
         lines = path.read_text(encoding="utf-8").splitlines()[-tail_lines:]
     else:
         result = run_control(host, f"tail -n {tail_lines} ~/.yggterm/event-trace.jsonl")
@@ -142,7 +171,7 @@ def trace_events_since(host: str, start_ms: int, tail_lines: int = 4000) -> list
 
 def latest_window_spawn_event_for_pid(host: str, pid: int, start_ms: int) -> dict | None:
     if host == "local":
-        path = Path.home() / ".yggterm" / "event-trace.jsonl"
+        path = local_yggterm_path("event-trace.jsonl")
         if not path.exists():
             return None
         for line in reversed(path.read_text(encoding="utf-8").splitlines()):
@@ -170,11 +199,11 @@ def latest_window_spawn_event_for_pid(host: str, pid: int, start_ms: int) -> dic
 
 
 def local_client_instance_dir() -> Path:
-    return Path.home() / ".yggterm" / "client-instances"
+    return local_yggterm_path("client-instances")
 
 
 def clear_local_app_control_files() -> None:
-    home = Path.home() / ".yggterm"
+    home = local_yggterm_home()
     for rel in ("app-control-requests", "app-control-responses"):
         root = home / rel
         if not root.is_dir():
@@ -227,6 +256,7 @@ def launch_local_client(binary: str, timeout_s: float = 3.0) -> tuple[subprocess
     env = os.environ.copy()
     env.setdefault("DISPLAY", ":10.0")
     env["YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF"] = "1"
+    baseline_window_count = local_x11_window_count()
     stdout = open("/tmp/yggterm-terminal-23-launch.out", "w", encoding="utf-8")
     stderr = open("/tmp/yggterm-terminal-23-launch.err", "w", encoding="utf-8")
     start_ms = int(time.time() * 1000)
@@ -239,6 +269,15 @@ def launch_local_client(binary: str, timeout_s: float = 3.0) -> tuple[subprocess
     )
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
+        if local_x11_window_count() > baseline_window_count:
+            return proc, {
+                "category": "startup",
+                "name": "window_spawned",
+                "payload": {
+                    "elapsed_ms": int(time.time() * 1000) - start_ms,
+                    "source": "x11_root_tree",
+                },
+            }
         event = latest_window_spawn_event_for_pid("local", proc.pid, start_ms)
         if event is not None:
             return proc, event
@@ -377,6 +416,25 @@ def remote_dir_exists(ssh_target: str, path: str) -> bool:
     return rc == 0
 
 
+def remote_resolve_cwd(ssh_target: str, path: str) -> str | None:
+    command = (
+        f"p={quote(path)}; "
+        'while [ -n "$p" ] && [ ! -d "$p" ]; do '
+        'if [ "$p" = "/" ]; then break; fi; '
+        'next=$(dirname -- "$p"); '
+        'if [ "$next" = "$p" ]; then break; fi; '
+        'p="$next"; '
+        "done; "
+        'if [ -d "$p" ]; then printf "%s" "$p"; '
+        'elif [ -n "$HOME" ] && [ -d "$HOME" ]; then printf "%s" "$HOME"; fi'
+    )
+    rc, stdout, _ = run_capture(["ssh", ssh_target, command])
+    if rc != 0:
+        return None
+    resolved = stdout.strip()
+    return resolved or None
+
+
 def choose_terminal_targets(inventory: dict, rng: random.Random, count: int) -> list[dict]:
     candidates: list[dict] = []
     seen: set[tuple[str | None, str]] = set()
@@ -423,8 +481,7 @@ def choose_terminal_targets(inventory: dict, rng: random.Random, count: int) -> 
                     "machine_key": machine_key,
                     "cwd": cwd,
                     "label": f"{machine_key}:{cwd}",
-                    # Live remote inventory already observed this cwd on the target.
-                    "cwd_verified": True,
+                    "cwd_verified": False,
                 }
             )
 
@@ -432,20 +489,35 @@ def choose_terminal_targets(inventory: dict, rng: random.Random, count: int) -> 
         raise RuntimeError("no machine/cwd targets available for terminal-23 test")
     rng.shuffle(candidates)
     dir_exists_cache: dict[tuple[str | None, str], bool] = {}
+    resolved_remote_cwds: dict[tuple[str, str], str | None] = {}
     chosen: list[dict] = []
+    chosen_keys: set[tuple[str | None, str]] = set()
     for candidate in candidates:
         machine_key = candidate.get("machine_key")
         cwd = candidate.get("cwd") or ""
         key = (machine_key, cwd)
-        if candidate.get("cwd_verified"):
-            exists = True
-        elif machine_key:
+        if machine_key:
             ssh_target = machine_targets.get(machine_key) or ""
-            exists = dir_exists_cache.setdefault(key, bool(ssh_target) and remote_dir_exists(ssh_target, cwd))
+            resolved = resolved_remote_cwds.setdefault(
+                (machine_key, cwd),
+                remote_resolve_cwd(ssh_target, cwd) if ssh_target else None,
+            )
+            if not resolved:
+                continue
+            candidate = dict(candidate)
+            candidate["cwd"] = resolved
+            candidate["cwd_verified"] = resolved == cwd
+            candidate["label"] = f"{machine_key}:{resolved}"
+            if resolved != cwd:
+                candidate["requested_cwd"] = cwd
+            key = (machine_key, resolved)
         else:
             exists = dir_exists_cache.setdefault(key, local_dir_exists(cwd))
-        if not exists:
+            if not exists:
+                continue
+        if key in chosen_keys:
             continue
+        chosen_keys.add(key)
         chosen.append(candidate)
         if len(chosen) == count:
             return chosen
