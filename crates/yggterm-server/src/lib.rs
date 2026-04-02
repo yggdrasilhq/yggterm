@@ -76,6 +76,7 @@ const REMOTE_COMMAND_CACHE_VERIFY_TTL_MS: u64 = 10 * 60_000;
 struct RemoteCommandCacheEntry {
     binary_expr: String,
     verified_at_ms: u64,
+    local_build_id: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1760,14 +1761,14 @@ impl YggtermServer {
         };
         let cached_remote_launch =
             self.cached_remote_launch_for_target(&target.ssh_target, target.prefix.as_deref());
-        let resolved_remote_launch = if launch_terminal && cached_remote_launch.is_none() {
+        let resolved_remote_launch = if launch_terminal {
             resolve_remote_yggterm_binary(&target.ssh_target, target.prefix.as_deref()).ok()
         } else {
             None
         };
-        let (remote_binary, remote_deploy_state) = cached_remote_launch
+        let (remote_binary, remote_deploy_state) = resolved_remote_launch
             .clone()
-            .or_else(|| resolved_remote_launch.clone())
+            .or(cached_remote_launch.clone())
             .unwrap_or_else(|| {
                 if launch_terminal {
                     (
@@ -3403,8 +3404,20 @@ fn remote_saved_session_can_reuse_existing_multiplexer(
     saved_session_exists: bool,
     snapshot: &[u8],
 ) -> bool {
-    if saved_session_exists {
+    if snapshot.is_empty() {
         return false;
+    }
+    if saved_session_exists {
+        let normalized = String::from_utf8_lossy(snapshot).to_ascii_lowercase();
+        if normalized.contains("do you trust the contents of this directory")
+            || normalized.contains("press enter to continue")
+            || normalized.contains("saved codex session")
+                && normalized.contains("opening the resume picker")
+        {
+            return false;
+        }
+        return !remote_snapshot_is_generic_codex_idle(snapshot)
+            && !remote_snapshot_looks_like_shell_prompt(snapshot);
     }
     remote_snapshot_looks_like_codex(snapshot)
 }
@@ -5461,6 +5474,7 @@ fn resolve_remote_yggterm_binary(
         }
     };
     let cache_key = remote_cache_key(ssh_target, exec_prefix);
+    let local_build_id = current_local_build_id();
     let resolve_lock = remote_command_resolve_lock(&cache_key);
     let _resolve_guard = resolve_lock
         .lock()
@@ -5471,12 +5485,15 @@ fn resolve_remote_yggterm_binary(
         .and_then(|cache| cache.get(&cache_key).cloned())
     {
         let now_ms = current_millis_u64();
-        if now_ms.saturating_sub(cached.verified_at_ms) <= REMOTE_COMMAND_CACHE_VERIFY_TTL_MS {
+        if cached.local_build_id == local_build_id
+            && now_ms.saturating_sub(cached.verified_at_ms) <= REMOTE_COMMAND_CACHE_VERIFY_TTL_MS
+        {
             finish_span(serde_json::json!({
                 "ssh_target": ssh_target,
                 "result": "cache_hit",
                 "binary_expr": cached.binary_expr.clone(),
                 "protocol_version": daemon::SERVER_PROTOCOL_VERSION,
+                "build_id": cached.local_build_id,
             }));
             return Ok((cached.binary_expr, RemoteDeployState::Ready));
         }
@@ -5487,6 +5504,7 @@ fn resolve_remote_yggterm_binary(
                     RemoteCommandCacheEntry {
                         binary_expr: cached.binary_expr.clone(),
                         verified_at_ms: now_ms,
+                        local_build_id,
                     },
                 );
             }
@@ -5495,6 +5513,7 @@ fn resolve_remote_yggterm_binary(
                 "result": "cache_revalidated",
                 "binary_expr": cached.binary_expr.clone(),
                 "protocol_version": daemon::SERVER_PROTOCOL_VERSION,
+                "build_id": local_build_id,
             }));
             return Ok((cached.binary_expr, RemoteDeployState::Ready));
         }
@@ -5502,9 +5521,7 @@ fn resolve_remote_yggterm_binary(
             cache.remove(&cache_key);
         }
     }
-
     let installed_binary = "$HOME/.yggterm/bin/yggterm";
-    let local_build_id = current_local_build_id();
 
     match remote_protocol_descriptor_for_binary(ssh_target, exec_prefix, installed_binary) {
         Ok(descriptor)
@@ -5517,6 +5534,7 @@ fn resolve_remote_yggterm_binary(
                     RemoteCommandCacheEntry {
                         binary_expr: installed_binary.to_string(),
                         verified_at_ms: current_millis_u64(),
+                        local_build_id,
                     },
                 );
             }
@@ -5558,6 +5576,7 @@ fn resolve_remote_yggterm_binary(
                     RemoteCommandCacheEntry {
                         binary_expr: "yggterm".to_string(),
                         verified_at_ms: current_millis_u64(),
+                        local_build_id,
                     },
                 );
             }
@@ -5609,6 +5628,7 @@ fn resolve_remote_yggterm_binary(
             RemoteCommandCacheEntry {
                 binary_expr: installed.clone(),
                 verified_at_ms: current_millis_u64(),
+                local_build_id,
             },
         );
     }
@@ -8978,13 +8998,22 @@ mod tests {
     }
 
     #[test]
-    fn saved_session_never_reuses_existing_multiplexer_snapshot() {
-        let codex = b">_ OpenAI Codex (v0.118.0)\nmodel: gpt-5.4 high /model to change\ndirectory: ~\n\n> Run /review on my current changes\nassistant: I found the regression in terminal restore.\n";
-        assert!(!remote_saved_session_can_reuse_existing_multiplexer(
+    fn saved_session_reuses_transcript_like_existing_multiplexer_snapshot() {
+        let codex = b">_ OpenAI Codex (v0.118.0)\nmodel: gpt-5.4 high /model to change\ndirectory: ~\n\n: Just 30 mins ago, no client can connect with my GL-iNet Flint2 router.\n\n\" I need to diagnose an OpenWrt router issue where no clients can connect to Wi-Fi or even via wired connections.\n\n\" I am going to try to SSH to root@192.168.1.1 from here and pull the wireless + hostapd logs/status.\n\n\" Pulling wireless state, interface status, and hostapd/kernel logs from the router to see where the association is failing.\n\n\" Root cause: dnsmasq was not running, so WiFi clients could associate but would not get an IP address.\n";
+        assert!(remote_saved_session_can_reuse_existing_multiplexer(
             true, codex
         ));
         assert!(remote_saved_session_can_reuse_existing_multiplexer(
             false, codex
+        ));
+    }
+
+    #[test]
+    fn saved_session_still_rejects_generic_idle_existing_multiplexer_snapshot() {
+        let idle =
+            b">_ OpenAI Codex (v0.118.0)\nmodel: gpt-5.4 high /model to change\ndirectory: ~\n";
+        assert!(!remote_saved_session_can_reuse_existing_multiplexer(
+            true, idle
         ));
     }
 
@@ -9020,6 +9049,7 @@ mod tests {
                 RemoteCommandCacheEntry {
                     binary_expr: "yggterm".to_string(),
                     verified_at_ms: current_millis_u64(),
+                    local_build_id: 0,
                 },
             );
         }
