@@ -18,15 +18,26 @@ PLACEHOLDER_FRAGMENTS = (
 )
 
 ERROR_FRAGMENTS = (
+    "error: reading /tmp/yggterm-screen",
     "mux_client_request_session",
     "session open refused by peer",
     "controlsocket",
     "permission denied",
     "connection refused",
-    "could not resolve hostname",
     "no route to host",
     "connection timed out",
     "broken pipe",
+    "connection to ",
+)
+
+TRANSCRIPT_BROWSER_HINTS = (
+    "q to quit",
+    "to scroll",
+    "pgup/pgdn",
+    "home/end to jump",
+    "home end to jump",
+    "esc to edit prev",
+    "edit prev",
 )
 
 
@@ -293,11 +304,19 @@ def active_terminal_text(state: dict) -> str:
 def terminal_resume_overlay(state: dict) -> dict:
     viewport = state.get("viewport") or {}
     overlay = viewport.get("terminal_resume_overlay") or {}
+    hosts = viewport.get("active_terminal_hosts") or []
+    host_kind = ""
+    host_visible = False
+    if hosts:
+        first = hosts[0] or {}
+        host_kind = str(first.get("resume_overlay_kind") or "")
+        host_visible = bool(first.get("resume_overlay_visible"))
     if not isinstance(overlay, dict):
-        return {"visible": False, "text_sample": ""}
+        return {"visible": host_visible, "text_sample": "", "kind": host_kind}
     return {
-        "visible": bool(overlay.get("visible")),
+        "visible": bool(overlay.get("visible")) or host_visible,
         "text_sample": str(overlay.get("text_sample") or ""),
+        "kind": str(overlay.get("kind") or host_kind or ""),
     }
 
 
@@ -309,7 +328,26 @@ def terminal_text_looks_like_placeholder(text: str) -> bool:
 
 
 def resume_overlay_counts_as_painted(viewport: dict, overlay: dict, terminal_text: str) -> bool:
-    return False
+    if not overlay.get("visible"):
+        return False
+    overlay_text = str(overlay.get("text_sample") or "").strip()
+    source_text = terminal_text.strip() or overlay_text
+    if not source_text:
+        return False
+    overlay_has_saved_transcript = "saved transcript" in overlay_text.lower()
+    if source_text == overlay_text and not overlay_has_saved_transcript:
+        return False
+    if terminal_text_looks_like_placeholder(source_text) and not overlay_has_saved_transcript:
+        return False
+    if terminal_text_looks_like_error(source_text):
+        return False
+    if terminal_text_looks_like_generic_idle(source_text):
+        return False
+    if terminal_text_looks_like_shell_prompt(source_text):
+        return False
+    if terminal_text_looks_like_transcript_browser(source_text):
+        return False
+    return True
 
 
 def terminal_text_looks_like_error(text: str) -> bool:
@@ -333,14 +371,22 @@ def terminal_text_looks_like_generic_idle(text: str) -> bool:
         return False
     transcript_like_lines = 0
     for line in lines:
-        lower = line.lower()
-        if line.startswith(">_ OpenAI Codex"):
+        semantic = line.strip("╭╮╰╯─│ ")
+        lower = semantic.lower()
+        border_only = not semantic
+        if "openai codex" in lower:
             continue
         if lower.startswith("tip:"):
             continue
-        if lower.startswith("model:"):
+        if "model:" in lower:
             continue
-        if lower.startswith("directory:"):
+        if "directory:" in lower:
+            continue
+        if lower.startswith("›"):
+            continue
+        if "% left" in lower:
+            continue
+        if border_only:
             continue
         transcript_like_lines += 1
     return transcript_like_lines <= 2
@@ -360,6 +406,15 @@ def terminal_text_looks_like_shell_prompt(text: str) -> bool:
             continue
         return False
     return True
+
+
+def terminal_text_looks_like_transcript_browser(text: str) -> bool:
+    normalized = " ".join(text.strip().lower().split())
+    if not normalized or (
+        "transcript" not in normalized and "t r a n s c r i p t" not in normalized
+    ):
+        return False
+    return any(fragment in normalized for fragment in TRANSCRIPT_BROWSER_HINTS)
 
 
 def is_remote_machine_group(row: dict) -> bool:
@@ -423,11 +478,14 @@ def collect_remote_terminal_targets(rows_payload: dict) -> list[dict]:
             continue
         if path in seen_paths:
             continue
+        summary = str(row.get("summary") or "").strip()
+        if summary.lower().startswith("local codex terminal rooted at "):
+            continue
         candidates.append(
             {
                 "full_path": path,
                 "label": row.get("label") or path,
-                "summary": row.get("summary") or "",
+                "summary": summary,
             }
         )
         seen_paths.add(path)
@@ -489,18 +547,29 @@ def require_terminal_painted(state: dict, session_path: str) -> dict:
     overlay = terminal_resume_overlay(state)
     overlay_visible = bool(overlay.get("visible"))
     overlay_text = (overlay.get("text_sample") or "").strip().lower()
+    overlay_kind = (overlay.get("kind") or "").strip().lower()
     active_summary = (viewport.get("active_summary") or "").strip()
     if terminal_text_looks_like_error(text):
         raise RuntimeError("terminal painted transport/error output instead of the session")
+    if overlay_visible and overlay_kind == "chip":
+        if not resume_overlay_counts_as_painted(viewport, overlay, text):
+            raise RuntimeError("resume chip did not surface saved-session context")
+        if "live terminal is ready" in overlay_text:
+            raise RuntimeError("resume overlay still uses the old misleading terminal-ready copy")
+        if "still connecting to remote terminal" in overlay_text:
+            raise RuntimeError("resume overlay still uses indefinite connecting copy")
+        return state
     if terminal_text_looks_like_generic_idle(text):
         raise RuntimeError("terminal exposed generic Codex idle prompt instead of restored session UX")
     if terminal_text_looks_like_shell_prompt(text):
         raise RuntimeError("terminal exposed plain shell prompt instead of restored session UX")
+    if terminal_text_looks_like_transcript_browser(text):
+        raise RuntimeError("terminal exposed Codex transcript browser instead of live session surface")
     if overlay_visible and "live terminal is ready" in overlay_text:
         raise RuntimeError("resume overlay still uses the old misleading terminal-ready copy")
     if overlay_visible and "still connecting to remote terminal" in overlay_text:
         raise RuntimeError("resume overlay still uses indefinite connecting copy")
-    if overlay_visible:
+    if overlay_visible and overlay_kind != "chip":
         raise RuntimeError("resume overlay still covers terminal after paint budget")
     if terminal_text_looks_like_placeholder(text):
         raise RuntimeError("terminal still showing placeholder content")
@@ -621,6 +690,12 @@ def main() -> int:
                 if terminal_text_looks_like_shell_prompt(item.get("terminal_text_sample") or "")
             ]
         ),
+        "transcript_browser_failures": len(
+            [
+                item for item in results
+                if terminal_text_looks_like_transcript_browser(item.get("terminal_text_sample") or "")
+            ]
+        ),
         "overlay_copy_failures": len(
             [
                 item for item in results
@@ -628,6 +703,13 @@ def main() -> int:
                     bad in ((item.get("terminal_resume_overlay") or {}).get("text_sample") or "").lower()
                     for bad in ("live terminal is ready", "still connecting to remote terminal")
                 )
+            ]
+        ),
+        "overlay_visible_failures": len(
+            [
+                item for item in results
+                if bool((item.get("terminal_resume_overlay") or {}).get("visible"))
+                and ((item.get("terminal_resume_overlay") or {}).get("kind") or "").lower() != "chip"
             ]
         ),
         "terminal_error_failures": len(
@@ -655,8 +737,10 @@ def main() -> int:
         and summary["placeholder_failures"] == 0
         and summary["generic_idle_failures"] == 0
         and summary["shell_prompt_failures"] == 0
+        and summary["transcript_browser_failures"] == 0
         and summary["terminal_error_failures"] == 0
         and summary["overlay_copy_failures"] == 0
+        and summary["overlay_visible_failures"] == 0
     ) else 1
 
 
