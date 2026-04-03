@@ -1,3 +1,8 @@
+---
+name: yggui-changelog-demo
+description: Capture deterministic proof bundles, screenshots, traces, and curated changelog notes for YggUI app changes.
+---
+
 # YggUI Changelog Demo
 
 Use this workflow when a `yggui` app feature or fix should ship with proof, screenshots, and a curated changelog entry.
