@@ -1111,6 +1111,8 @@ pub fn looks_like_low_signal_generated_copy(text: &str) -> bool {
         "filesystem sandboxing",
         "request_user_input",
         "environment_context",
+        "local codex terminal rooted at ",
+        "ssh terminal on ",
         "open live terminal",
         "this session should land in the main viewport",
         "launch command prepared",
