@@ -307,17 +307,29 @@ def terminal_resume_overlay(state: dict) -> dict:
     hosts = viewport.get("active_terminal_hosts") or []
     host_kind = ""
     host_visible = False
+    host_excerpt = ""
     if hosts:
         first = hosts[0] or {}
         host_kind = str(first.get("resume_overlay_kind") or "")
         host_visible = bool(first.get("resume_overlay_visible"))
+        host_excerpt = str(first.get("resume_overlay_excerpt") or "")
     if not isinstance(overlay, dict):
-        return {"visible": host_visible, "text_sample": "", "kind": host_kind}
+        return {"visible": host_visible, "text_sample": "", "excerpt": host_excerpt, "kind": host_kind}
     return {
         "visible": bool(overlay.get("visible")) or host_visible,
         "text_sample": str(overlay.get("text_sample") or ""),
+        "excerpt": str(overlay.get("excerpt") or host_excerpt or ""),
         "kind": str(overlay.get("kind") or host_kind or ""),
     }
+
+
+def looks_like_low_signal_summary(text: str) -> bool:
+    normalized = " ".join(text.strip().lower().split())
+    if not normalized:
+        return True
+    return normalized.startswith("local codex terminal rooted at ") or normalized.startswith(
+        "ssh terminal on "
+    )
 
 
 def terminal_text_looks_like_placeholder(text: str) -> bool:
@@ -331,11 +343,15 @@ def resume_overlay_counts_as_painted(viewport: dict, overlay: dict, terminal_tex
     if not overlay.get("visible"):
         return False
     overlay_text = str(overlay.get("text_sample") or "").strip()
-    source_text = terminal_text.strip() or overlay_text
+    overlay_excerpt = str(overlay.get("excerpt") or "").strip()
+    source_text = terminal_text.strip() or overlay_excerpt or overlay_text
     if not source_text:
         return False
-    overlay_has_saved_transcript = "saved transcript" in overlay_text.lower()
+    overlay_has_saved_transcript = bool(overlay_excerpt) or "saved transcript" in overlay_text.lower()
+    active_summary = str(viewport.get("active_summary") or "").strip()
     if source_text == overlay_text and not overlay_has_saved_transcript:
+        return False
+    if overlay_has_saved_transcript and looks_like_low_signal_summary(active_summary) and not overlay_excerpt:
         return False
     if terminal_text_looks_like_placeholder(source_text) and not overlay_has_saved_transcript:
         return False
@@ -478,14 +494,11 @@ def collect_remote_terminal_targets(rows_payload: dict) -> list[dict]:
             continue
         if path in seen_paths:
             continue
-        summary = str(row.get("summary") or "").strip()
-        if summary.lower().startswith("local codex terminal rooted at "):
-            continue
         candidates.append(
             {
                 "full_path": path,
                 "label": row.get("label") or path,
-                "summary": summary,
+                "summary": str(row.get("summary") or "").strip(),
             }
         )
         seen_paths.add(path)
@@ -702,6 +715,12 @@ def main() -> int:
                 if any(
                     bad in ((item.get("terminal_resume_overlay") or {}).get("text_sample") or "").lower()
                     for bad in ("live terminal is ready", "still connecting to remote terminal")
+                )
+                or (
+                    "saved transcript is visible"
+                    in ((item.get("terminal_resume_overlay") or {}).get("text_sample") or "").lower()
+                    and not ((item.get("terminal_resume_overlay") or {}).get("excerpt") or "").strip()
+                    and looks_like_low_signal_summary(item.get("active_summary") or "")
                 )
             ]
         ),
