@@ -6642,12 +6642,6 @@ pub fn run_remote_resume_codex(session_id: &str, cwd: Option<&str>) -> anyhow::R
                     "replace_stale_multiplexer_with_picker"
                 },
             }));
-            if can_reuse_snapshot {
-                let mut stdout = std::io::stdout();
-                writeln!(stdout, "{REMOTE_ATTACH_READY_MARKER}")
-                    .context("writing remote attach-ready marker")?;
-                stdout.flush().ok();
-            }
         }
         return match multiplexer {
             RemoteMultiplexer::Tmux => tmux_attach_session(&attach_session_name),

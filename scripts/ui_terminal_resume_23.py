@@ -62,6 +62,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--paint-budget", type=float, default=0.45)
     parser.add_argument("--launch-local", action="store_true")
     parser.add_argument("--include-unreachable", action="store_true")
+    parser.add_argument(
+        "--no-roundtrip-preview",
+        action="store_true",
+        help="Skip the preview -> terminal round-trip and only measure cold terminal open.",
+    )
     parser.add_argument("--out-dir", default="/tmp/yggterm-terminal-resume-23")
     return parser.parse_args()
 
@@ -282,10 +287,10 @@ def app_rows(host: str, binary: str, timeout_ms: int) -> dict:
     return payload.get("data") or {}
 
 
-def app_open(host: str, binary: str, session_path: str, timeout_ms: int) -> dict:
+def app_open(host: str, binary: str, session_path: str, timeout_ms: int, view: str) -> dict:
     command = (
         f"{quote(binary)} server app open {json.dumps(session_path)} "
-        f"--view terminal --timeout-ms {timeout_ms}"
+        f"--view {quote(view)} --timeout-ms {timeout_ms}"
     )
     return run_json(host, command)
 
@@ -730,10 +735,20 @@ def require_overlay_resolved(state: dict, session_path: str) -> dict:
     return state
 
 
+def require_view_selected(state: dict, session_path: str, view_mode: str) -> dict:
+    viewport = state.get("viewport") or {}
+    if viewport.get("active_session_path") != session_path:
+        raise RuntimeError("viewport not on requested session")
+    if viewport.get("active_view_mode") != view_mode:
+        raise RuntimeError(f"viewport not in {view_mode.lower()} mode")
+    return state
+
+
 def main() -> int:
     args = parse_args()
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    roundtrip_preview = not args.no_roundtrip_preview
 
     launch = None
     launch_event = None
@@ -759,8 +774,14 @@ def main() -> int:
             "summary": target.get("summary"),
         }
         try:
-            entry["open"] = app_open(args.host, args.bin, session_path, args.timeout_ms)
-            elapsed, state = wait_until(
+            entry["open"] = app_open(
+                args.host,
+                args.bin,
+                session_path,
+                args.timeout_ms,
+                "terminal",
+            )
+            cold_elapsed, cold_state = wait_until(
                 f"terminal paint {session_path}",
                 args.paint_budget,
                 args.poll,
@@ -769,6 +790,49 @@ def main() -> int:
                     session_path,
                 ),
             )
+            entry["cold_elapsed_s"] = round(cold_elapsed, 3)
+            state = cold_state
+            elapsed = cold_elapsed
+            if roundtrip_preview:
+                entry["preview_open"] = app_open(
+                    args.host,
+                    args.bin,
+                    session_path,
+                    args.timeout_ms,
+                    "preview",
+                )
+                preview_elapsed, preview_state = wait_until(
+                    f"preview switch {session_path}",
+                    1.5,
+                    args.poll,
+                    lambda: require_view_selected(
+                        app_state(args.host, args.bin, args.timeout_ms),
+                        session_path,
+                        "Rendered",
+                    ),
+                )
+                entry["preview_switch_s"] = round(preview_elapsed, 3)
+                entry["roundtrip_open"] = app_open(
+                    args.host,
+                    args.bin,
+                    session_path,
+                    args.timeout_ms,
+                    "terminal",
+                )
+                elapsed, state = wait_until(
+                    f"terminal roundtrip paint {session_path}",
+                    args.paint_budget,
+                    args.poll,
+                    lambda: require_terminal_painted(
+                        app_state(args.host, args.bin, args.timeout_ms),
+                        session_path,
+                    ),
+                )
+                entry["roundtrip_elapsed_s"] = round(elapsed, 3)
+                entry["preview_state_dump"] = write_json(
+                    out_dir / f"terminal-resume-{index:02d}-preview.json",
+                    preview_state,
+                )
             viewport = state.get("viewport") or {}
             entry["elapsed_s"] = round(elapsed, 3)
             entry["within_budget"] = elapsed <= args.paint_budget
