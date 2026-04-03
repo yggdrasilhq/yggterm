@@ -3,7 +3,8 @@ use crate::{
     GhosttyHostSupport, PersistedDaemonState, RemoteMachineSnapshot, ServerUiSnapshot, SessionKind,
     SshConnectTarget, TerminalManager, WorkspaceViewMode, YggtermServer,
     active_client_instance_records, current_millis, fetch_remote_generation_context,
-    persist_remote_generated_copy, terminate_remote_codex_session,
+    persist_remote_generated_copy, remote_resume_runtime_output_requires_restart,
+    terminate_remote_codex_session,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -346,8 +347,15 @@ impl DaemonRuntime {
     fn ensure_terminal_for_path(&mut self, path: &str) -> Result<Option<String>> {
         let prepare_message = self.server.ensure_managed_cli_for_session_path(path)?;
         self.server.request_terminal_launch_for_path(path);
-        let Some((launch_command, cwd)) = self.server.terminal_spec(path) else {
+        let Some((stored_launch_command, cwd)) = self.server.terminal_spec(path) else {
             bail!("no terminal spec for session: {path}");
+        };
+        let launch_command = if path.starts_with("remote-session://") {
+            self.server
+                .remote_direct_attach_launch_command_for_path(path)
+                .unwrap_or(stored_launch_command)
+        } else {
+            stored_launch_command
         };
         if let Ok(home) = crate::resolve_yggterm_home() {
             append_trace_event(
@@ -362,10 +370,28 @@ impl DaemonRuntime {
                 }),
             );
         }
+        let seed_prefill = if path.starts_with("remote-session://") {
+            self.server.remote_resume_seed_fallback_for_path(path)
+        } else {
+            None
+        };
         if self.terminals.has_session(path) {
             let still_running = self.terminals.session_is_running(path);
-            let stale_remote_attach =
-                path.starts_with("remote-session://") && !self.terminals.session_has_output(path);
+            let has_runtime_output = self.terminals.session_has_runtime_output(path);
+            let stale_remote_attach = path.starts_with("remote-session://")
+                && (!has_runtime_output
+                    || self
+                        .terminals
+                        .read(path, 0)
+                        .map(|stream| {
+                            let snapshot = stream
+                                .chunks
+                                .into_iter()
+                                .map(|chunk| chunk.data)
+                                .collect::<String>();
+                            remote_resume_runtime_output_requires_restart(snapshot.as_bytes())
+                        })
+                        .unwrap_or(false));
             if !still_running
                 || stale_remote_attach
                 || !self
@@ -379,11 +405,17 @@ impl DaemonRuntime {
                     cwd.as_deref(),
                     stop_command.as_deref(),
                 )?;
+                if let Some(prefill) = seed_prefill.as_deref() {
+                    self.terminals.seed_session(path, prefill)?;
+                }
             }
             return Ok(prepare_message);
         }
         self.terminals
             .ensure_session(path, &launch_command, cwd.as_deref())?;
+        if let Some(prefill) = seed_prefill.as_deref() {
+            self.terminals.seed_session(path, prefill)?;
+        }
         Ok(prepare_message)
     }
 
@@ -441,17 +473,31 @@ impl DaemonRuntime {
                     title_hint.as_deref(),
                     document.as_ref(),
                 );
+                let mut opened_in_terminal = false;
                 match view_mode.unwrap_or(WorkspaceViewMode::Rendered) {
                     WorkspaceViewMode::Rendered => {
                         self.server.set_view_mode(WorkspaceViewMode::Rendered);
                     }
                     WorkspaceViewMode::Terminal => {
-                        self.server.set_view_mode(WorkspaceViewMode::Terminal);
-                        self.ensure_terminal_for_active()?;
+                        if self.server.active_session_supports_terminal() {
+                            self.server.set_view_mode(WorkspaceViewMode::Terminal);
+                            self.ensure_terminal_for_active()?;
+                            opened_in_terminal = true;
+                        } else {
+                            self.server.set_view_mode(WorkspaceViewMode::Rendered);
+                        }
                     }
                 }
                 self.persist()?;
-                self.snapshot_response(Some(format!("opened {path}")))
+                self.snapshot_response(Some(if opened_in_terminal {
+                    format!("opened {path}")
+                } else if session_kind == SessionKind::Document
+                    && view_mode == Some(WorkspaceViewMode::Terminal)
+                {
+                    format!("opened {path} in preview")
+                } else {
+                    format!("opened {path}")
+                }))
             }
             ServerRequest::ConnectSsh { target_ix } => {
                 let (key, reused) = self.server.connect_ssh_target(target_ix);
@@ -502,14 +548,30 @@ impl DaemonRuntime {
                     title_hint.as_deref(),
                     view_mode,
                 )?;
+                let mut opened_in_terminal = false;
                 if let Some(mode) = view_mode {
-                    self.server.set_view_mode(mode);
-                    if mode == WorkspaceViewMode::Terminal {
+                    if mode == WorkspaceViewMode::Terminal
+                        && !self.server.active_session_supports_terminal()
+                    {
+                        self.server.set_view_mode(WorkspaceViewMode::Rendered);
+                    } else {
+                        self.server.set_view_mode(mode);
+                    }
+                    if mode == WorkspaceViewMode::Terminal
+                        && self.server.active_session_supports_terminal()
+                    {
                         self.ensure_terminal_for_active()?;
+                        opened_in_terminal = true;
                     }
                 }
                 self.persist()?;
-                self.snapshot_response(Some(format!("opened {key}")))
+                self.snapshot_response(Some(
+                    if view_mode == Some(WorkspaceViewMode::Terminal) && !opened_in_terminal {
+                        format!("opened {key} in preview")
+                    } else {
+                        format!("opened {key}")
+                    },
+                ))
             }
             ServerRequest::RefreshRemoteMachine { machine_key } => {
                 self.server.refresh_remote_machine_by_key(&machine_key)?;
@@ -625,22 +687,48 @@ impl DaemonRuntime {
             }
             ServerRequest::FocusLive { key, view_mode } => {
                 self.server.focus_live_session(&key);
+                let mut focused_in_terminal = false;
                 if let Some(mode) = view_mode {
-                    self.server.set_view_mode(mode);
-                    if mode == WorkspaceViewMode::Terminal {
+                    if mode == WorkspaceViewMode::Terminal
+                        && !self.server.active_session_supports_terminal()
+                    {
+                        self.server.set_view_mode(WorkspaceViewMode::Rendered);
+                    } else {
+                        self.server.set_view_mode(mode);
+                    }
+                    if mode == WorkspaceViewMode::Terminal
+                        && self.server.active_session_supports_terminal()
+                    {
                         self.ensure_terminal_for_active()?;
+                        focused_in_terminal = true;
                     }
                 }
                 self.persist()?;
-                self.snapshot_response(Some(format!("focused {key}")))
+                self.snapshot_response(Some(
+                    if view_mode == Some(WorkspaceViewMode::Terminal) && !focused_in_terminal {
+                        format!("focused {key} in preview")
+                    } else {
+                        format!("focused {key}")
+                    },
+                ))
             }
             ServerRequest::SetViewMode { mode } => {
-                self.server.set_view_mode(mode);
-                if mode == WorkspaceViewMode::Terminal {
+                let mut effective_mode = mode;
+                if mode == WorkspaceViewMode::Terminal
+                    && !self.server.active_session_supports_terminal()
+                {
+                    self.server.set_view_mode(WorkspaceViewMode::Rendered);
+                    effective_mode = WorkspaceViewMode::Rendered;
+                } else {
+                    self.server.set_view_mode(mode);
+                }
+                if mode == WorkspaceViewMode::Terminal
+                    && self.server.active_session_supports_terminal()
+                {
                     self.ensure_terminal_for_active()?;
                 }
                 self.persist()?;
-                self.snapshot_response(Some(match mode {
+                self.snapshot_response(Some(match effective_mode {
                     WorkspaceViewMode::Rendered => "preview mode".to_string(),
                     WorkspaceViewMode::Terminal => "terminal mode".to_string(),
                 }))

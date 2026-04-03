@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use yggterm_core::{append_trace_event, resolve_yggterm_home};
 
 const DEFAULT_COLS: u16 = 120;
 const DEFAULT_ROWS: u16 = 36;
@@ -92,6 +93,12 @@ impl TerminalManager {
             .is_some_and(|session| session.has_output())
     }
 
+    pub fn session_has_runtime_output(&self, key: &str) -> bool {
+        self.sessions
+            .get(key)
+            .is_some_and(|session| session.has_runtime_output())
+    }
+
     pub fn read(&self, key: &str, cursor: u64) -> Result<TerminalReadResult> {
         let session = self
             .sessions
@@ -118,6 +125,15 @@ impl TerminalManager {
 
     pub fn has_session(&self, key: &str) -> bool {
         self.sessions.contains_key(key)
+    }
+
+    pub fn seed_session(&self, key: &str, data: &str) -> Result<()> {
+        let session = self
+            .sessions
+            .get(key)
+            .with_context(|| format!("terminal session not found: {key}"))?;
+        session.seed_snapshot(data);
+        Ok(())
     }
 
     pub fn stats(&self) -> TerminalBufferStats {
@@ -158,6 +174,15 @@ impl TerminalManager {
         cwd: Option<&str>,
         stop_command: Option<&str>,
     ) -> Result<()> {
+        trace_terminal_event(
+            "restart",
+            serde_json::json!({
+                "path": key,
+                "cwd": cwd,
+                "launch_command": launch_command,
+                "stop_command": stop_command,
+            }),
+        );
         if let Some(runtime) = self.sessions.remove(key) {
             runtime.shutdown(stop_command)?;
         }
@@ -225,12 +250,21 @@ struct PtySessionRuntime {
     retained_bytes: Arc<AtomicUsize>,
     seq: Arc<AtomicU64>,
     last_activity_ms: Arc<AtomicU64>,
+    runtime_output_seen: Arc<std::sync::atomic::AtomicBool>,
     launch_command: String,
     cwd: Option<String>,
 }
 
 impl PtySessionRuntime {
     fn spawn(key: &str, launch_command: &str, cwd: Option<&str>) -> Result<Self> {
+        trace_terminal_event(
+            "spawn",
+            serde_json::json!({
+                "path": key,
+                "cwd": cwd,
+                "launch_command": launch_command,
+            }),
+        );
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -256,16 +290,20 @@ impl PtySessionRuntime {
         let retained_bytes = Arc::new(AtomicUsize::new(0));
         let seq = Arc::new(AtomicU64::new(0));
         let last_activity_ms = Arc::new(AtomicU64::new(now_millis()));
+        let runtime_output_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reader_chunks = Arc::clone(&chunks);
         let reader_retained_bytes = Arc::clone(&retained_bytes);
         let reader_seq = Arc::clone(&seq);
         let reader_activity = Arc::clone(&last_activity_ms);
+        let reader_runtime_output_seen = Arc::clone(&runtime_output_seen);
         let key_label = key.to_string();
+        let launch_command_label = launch_command.to_string();
 
         thread::Builder::new()
             .name(format!("pty-reader-{key}"))
             .spawn(move || {
                 let mut buffer = [0u8; 8192];
+                let mut saw_any_output = false;
                 loop {
                     match reader.read(&mut buffer) {
                         Ok(0) => break,
@@ -274,6 +312,20 @@ impl PtySessionRuntime {
                             if data.is_empty() {
                                 continue;
                             }
+                            if !saw_any_output {
+                                saw_any_output = true;
+                                trace_terminal_event(
+                                    "first_bytes",
+                                    serde_json::json!({
+                                        "path": key_label,
+                                        "bytes": bytes,
+                                        "launch_command": launch_command_label,
+                                        "visible_text": terminal_chunk_has_visible_text(&data),
+                                        "sample": truncate_terminal_trace_sample(&strip_terminal_control_sequences(&data)),
+                                    }),
+                                );
+                            }
+                            reader_runtime_output_seen.store(true, Ordering::SeqCst);
                             reader_activity.store(now_millis(), Ordering::SeqCst);
                             let seq_value = reader_seq.fetch_add(1, Ordering::SeqCst) + 1;
                             let mut chunks = reader_chunks.lock().expect("pty chunk lock poisoned");
@@ -287,6 +339,17 @@ impl PtySessionRuntime {
                             reader_retained_bytes.store(retained, Ordering::SeqCst);
                         }
                         Err(error) => {
+                            if !saw_any_output {
+                                trace_terminal_event(
+                                    "reader_error_before_output",
+                                    serde_json::json!({
+                                        "path": key_label,
+                                        "launch_command": launch_command_label,
+                                        "error": error.to_string(),
+                                    }),
+                                );
+                            }
+                            reader_runtime_output_seen.store(true, Ordering::SeqCst);
                             reader_activity.store(now_millis(), Ordering::SeqCst);
                             let seq_value = reader_seq.fetch_add(1, Ordering::SeqCst) + 1;
                             let mut chunks = reader_chunks.lock().expect("pty chunk lock poisoned");
@@ -302,6 +365,15 @@ impl PtySessionRuntime {
                         }
                     }
                 }
+                if !saw_any_output {
+                    trace_terminal_event(
+                        "eof_without_output",
+                        serde_json::json!({
+                            "path": key_label,
+                            "launch_command": launch_command_label,
+                        }),
+                    );
+                }
             })
             .context("spawning pty reader thread")?;
 
@@ -313,6 +385,7 @@ impl PtySessionRuntime {
             retained_bytes,
             seq,
             last_activity_ms,
+            runtime_output_seen,
             launch_command: launch_command.to_string(),
             cwd: cwd.map(|value| value.to_string()),
         })
@@ -339,6 +412,10 @@ impl PtySessionRuntime {
                 .lock()
                 .expect("pty chunk lock poisoned")
                 .is_empty()
+    }
+
+    fn has_runtime_output(&self) -> bool {
+        self.runtime_output_seen.load(Ordering::SeqCst)
     }
 
     fn read(&self, cursor: u64) -> TerminalReadResult {
@@ -372,6 +449,24 @@ impl PtySessionRuntime {
             .context("writing to pty")?;
         writer.flush().context("flushing pty writer")?;
         Ok(())
+    }
+
+    fn seed_snapshot(&self, data: &str) {
+        if data.is_empty() {
+            return;
+        }
+        self.runtime_output_seen.store(true, Ordering::SeqCst);
+        self.last_activity_ms.store(now_millis(), Ordering::SeqCst);
+        let seq_value = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut chunks = self.chunks.lock().expect("pty chunk lock poisoned");
+        let mut retained = self.retained_bytes.load(Ordering::SeqCst);
+        chunks.push_back(TerminalChunk {
+            seq: seq_value,
+            data: data.to_string(),
+        });
+        retained = retained.saturating_add(data.len());
+        trim_chunk_buffer(&mut chunks, &mut retained, MAX_CHUNKS, MAX_BUFFER_BYTES);
+        self.retained_bytes.store(retained, Ordering::SeqCst);
     }
 
     fn recent_activity(&self, within: Duration) -> bool {
@@ -440,6 +535,20 @@ impl PtySessionRuntime {
         let _ = child.kill();
         let _ = child.wait();
         Ok(())
+    }
+}
+
+fn truncate_terminal_trace_sample(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= 180 {
+        return trimmed.to_string();
+    }
+    trimmed.chars().take(180).collect::<String>()
+}
+
+fn trace_terminal_event(name: &str, payload: serde_json::Value) {
+    if let Ok(home) = resolve_yggterm_home() {
+        append_trace_event(&home, "server", "terminal_runtime", name, payload);
     }
 }
 
@@ -532,10 +641,7 @@ fn select_initial_attach_chunks(chunks: &VecDeque<TerminalChunk>) -> Vec<Termina
         return select_initial_attach_tail(chunks, None);
     };
 
-    let preserved_trailing = trailing_noise
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>();
+    let preserved_trailing = trailing_noise.into_iter().rev().collect::<Vec<_>>();
     let trailing_chunk_budget = preserved_trailing.len();
     let trailing_byte_budget = preserved_trailing
         .iter()
@@ -633,7 +739,11 @@ fn strip_terminal_control_sequences(input: &str) -> String {
                 _ => {}
             },
             State::OscEscape => {
-                state = if ch == '\\' { State::Normal } else { State::Osc };
+                state = if ch == '\\' {
+                    State::Normal
+                } else {
+                    State::Osc
+                };
             }
             State::StringTerminator => {
                 if ch == '\u{1b}' {
@@ -723,7 +833,9 @@ mod tests {
 
     #[test]
     fn terminal_chunk_visible_text_ignores_ansi_noise() {
-        assert!(!terminal_chunk_has_visible_text("\u{1b}[20;3H \r \n\u{1b}[K"));
+        assert!(!terminal_chunk_has_visible_text(
+            "\u{1b}[20;3H \r \n\u{1b}[K"
+        ));
         assert!(terminal_chunk_has_visible_text(
             "\u{1b}[2J\u{1b}[HOpenAI Codex (v0.118.0)\n"
         ));
