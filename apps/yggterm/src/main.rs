@@ -19,8 +19,9 @@ use yggterm_server::{
     run_app_control_drag, run_app_control_dump_state, run_app_control_focus_window,
     run_app_control_open_path, run_app_control_remove_session, run_app_control_scroll_preview,
     run_app_control_send_terminal_input, run_app_control_set_fullscreen,
-    run_app_control_set_maximized, run_app_control_set_preview_layout,
-    run_app_control_set_row_expanded, run_app_control_set_search, run_attach, run_daemon, run_remote_generation_context,
+    run_app_control_set_main_zoom, run_app_control_set_maximized,
+    run_app_control_set_preview_layout, run_app_control_set_row_expanded,
+    run_app_control_set_search, run_attach, run_daemon, run_remote_generation_context,
     run_remote_preview, run_remote_preview_head, run_remote_protocol_version,
     run_remote_resume_codex, run_remote_scan, run_remote_stage_clipboard_png,
     run_remote_terminate_codex, run_remote_upsert_generated_copy, run_screenrecord_capture,
@@ -268,6 +269,26 @@ fn main() -> Result<()> {
                     other => anyhow::bail!("unsupported app preview action: {other}"),
                 }
             }
+            "zoom" => {
+                let value = args
+                    .windows(2)
+                    .find_map(|window| {
+                        (window[0] == "--value").then(|| window[1].parse::<f32>().ok())
+                    })
+                    .flatten()
+                    .context("missing --value for server app zoom")?;
+                let view_mode = args.windows(2).find_map(|window| {
+                    if window[0] != "--view" {
+                        return None;
+                    }
+                    match window[1].as_str() {
+                        "preview" | "rendered" => Some(AppControlViewMode::Preview),
+                        "terminal" => Some(AppControlViewMode::Terminal),
+                        _ => None,
+                    }
+                });
+                run_app_control_set_main_zoom(value, view_mode, timeout_ms)
+            }
             "expand" | "collapse" => {
                 let row_path = args
                     .iter()
@@ -279,10 +300,7 @@ fn main() -> Result<()> {
             }
             "focus" => run_app_control_focus_window(timeout_ms),
             "search" => {
-                let action = args
-                    .get(3)
-                    .map(String::as_str)
-                    .unwrap_or("set");
+                let action = args.get(3).map(String::as_str).unwrap_or("set");
                 match action {
                     "set" => {
                         let query = args

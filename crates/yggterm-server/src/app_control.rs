@@ -57,6 +57,11 @@ pub enum AppControlDragCommand {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AppControlCommand {
+    SetMainZoom {
+        value: f32,
+        #[serde(default)]
+        view_mode: Option<AppControlViewMode>,
+    },
     SetSearch {
         query: String,
         #[serde(default)]
@@ -120,6 +125,7 @@ pub enum AppControlCommand {
 impl AppControlCommand {
     pub fn name(&self) -> &'static str {
         match self {
+            Self::SetMainZoom { .. } => "set_main_zoom",
             Self::SetSearch { .. } => "set_search",
             Self::CaptureScreenshot { .. } => "capture_screenshot",
             Self::ScrollPreview { .. } => "scroll_preview",

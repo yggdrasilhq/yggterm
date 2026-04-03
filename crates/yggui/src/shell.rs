@@ -450,6 +450,26 @@ fn adjust_main_zoom_settings_for_view(
     }
 }
 
+fn set_main_zoom_settings_for_view(
+    settings: &mut AppSettings,
+    view_mode: WorkspaceViewMode,
+    value: f32,
+) -> (f32, f32) {
+    let clamped = clamp_zoom_value_main(value);
+    match view_mode {
+        WorkspaceViewMode::Terminal => {
+            let before = settings.terminal_font_size;
+            settings.terminal_font_size = clamped;
+            (before, settings.terminal_font_size)
+        }
+        WorkspaceViewMode::Rendered => {
+            let before = settings.rendered_font_size;
+            settings.rendered_font_size = clamped;
+            (before, settings.rendered_font_size)
+        }
+    }
+}
+
 fn row_supports_terminal(shell: &ShellState, row: &BrowserRow) -> bool {
     match row.kind {
         BrowserRowKind::Session => true,
@@ -1959,6 +1979,27 @@ impl ShellState {
             active_label.to_ascii_lowercase(),
             zoom_percent(after, 10.0)
         );
+    }
+
+    fn set_main_zoom(&mut self, view_mode: WorkspaceViewMode, value: f32) {
+        let label = match view_mode {
+            WorkspaceViewMode::Terminal => "terminal zoom",
+            WorkspaceViewMode::Rendered => "preview zoom",
+        };
+        let (before, after) = set_main_zoom_settings_for_view(&mut self.settings, view_mode, value);
+        self.persist_settings();
+        self.last_terminal_debug = if let Some(session) = self.server.active_session() {
+            format!(
+                "zoom {} -> {} for {} ({})",
+                before,
+                after,
+                session.session_path,
+                terminal_host_id(&session.session_path)
+            )
+        } else {
+            format!("zoom {} -> {} with no active session", before, after)
+        };
+        self.last_action = format!("{label} {}%", zoom_percent(after, 10.0));
     }
 
     fn set_terminal_theme_name(&mut self, value: String) {
@@ -11791,6 +11832,42 @@ async fn process_pending_app_control_requests(
         .active_session_path()
         .map(str::to_string);
     let response = match command {
+        AppControlCommand::SetMainZoom { value, view_mode } => {
+            let target_view = match view_mode {
+                Some(AppControlViewMode::Preview) => WorkspaceViewMode::Rendered,
+                Some(AppControlViewMode::Terminal) => WorkspaceViewMode::Terminal,
+                None => state.read().snapshot().active_view_mode,
+            };
+            let _ = safe_shell_mut(state, "app_control_set_main_zoom", |shell| {
+                shell.set_main_zoom(target_view, value);
+            });
+            if target_view == WorkspaceViewMode::Terminal {
+                apply_active_terminal_zoom(state);
+            }
+            sleep(Duration::from_millis(40)).await;
+            let dom_snapshot = capture_dom_debug_snapshot_for(active_session_path.as_deref()).await;
+            let state_snapshot = describe_app_state_snapshot(&state, &desktop);
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(json!({
+                    "command": "set_main_zoom",
+                    "requested_value": value,
+                    "target_view_mode": match target_view {
+                        WorkspaceViewMode::Rendered => "preview",
+                        WorkspaceViewMode::Terminal => "terminal",
+                    },
+                    "window": describe_window(&desktop),
+                    "active_view_mode": format!("{:?}", state.read().server.active_view_mode()),
+                    "active_session_path": state.read().server.active_session_path(),
+                    "dom": dom_snapshot,
+                    "state": state_snapshot,
+                })),
+                error: None,
+            }
+        }
         AppControlCommand::SetSearch { query, focused } => {
             let query_trimmed = query.trim().to_string();
             state.with_mut(|shell| {
@@ -23154,6 +23231,32 @@ mod tests {
         assert_eq!(after, 12.0);
         assert_eq!(settings.rendered_font_size, 9.0);
         assert_eq!(settings.terminal_font_size, 12.0);
+    }
+
+    #[test]
+    fn set_rendered_zoom_updates_only_rendered_font_size() {
+        let mut settings = AppSettings::default();
+        settings.rendered_font_size = 10.0;
+        settings.terminal_font_size = 13.0;
+        let (before, after) =
+            set_main_zoom_settings_for_view(&mut settings, WorkspaceViewMode::Rendered, 9.0);
+        assert_eq!(before, 10.0);
+        assert_eq!(after, 9.0);
+        assert_eq!(settings.rendered_font_size, 9.0);
+        assert_eq!(settings.terminal_font_size, 13.0);
+    }
+
+    #[test]
+    fn set_terminal_zoom_updates_only_terminal_font_size() {
+        let mut settings = AppSettings::default();
+        settings.rendered_font_size = 9.0;
+        settings.terminal_font_size = 13.0;
+        let (before, after) =
+            set_main_zoom_settings_for_view(&mut settings, WorkspaceViewMode::Terminal, 14.0);
+        assert_eq!(before, 13.0);
+        assert_eq!(after, 14.0);
+        assert_eq!(settings.rendered_font_size, 9.0);
+        assert_eq!(settings.terminal_font_size, 14.0);
     }
 
     #[test]
