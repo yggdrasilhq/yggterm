@@ -16,6 +16,7 @@ pub const IDLE_TRIM_MAX_CHUNKS: usize = 64;
 pub const IDLE_TRIM_MAX_BYTES: usize = 128 * 1024;
 const INITIAL_ATTACH_MAX_CHUNKS: usize = 192;
 const INITIAL_ATTACH_MAX_BYTES: usize = 512 * 1024;
+const INITIAL_ATTACH_TRAILING_NOISE_CHUNKS: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct TerminalChunk {
@@ -77,6 +78,18 @@ impl TerminalManager {
         self.sessions
             .get(key)
             .is_some_and(|session| session.matches_spec(launch_command, cwd))
+    }
+
+    pub fn session_is_running(&self, key: &str) -> bool {
+        self.sessions
+            .get(key)
+            .is_some_and(|session| session.is_running())
+    }
+
+    pub fn session_has_output(&self, key: &str) -> bool {
+        self.sessions
+            .get(key)
+            .is_some_and(|session| session.has_output())
     }
 
     pub fn read(&self, key: &str, cursor: u64) -> Result<TerminalReadResult> {
@@ -309,25 +322,30 @@ impl PtySessionRuntime {
         self.launch_command == launch_command && self.cwd.as_deref() == cwd
     }
 
+    fn is_running(&self) -> bool {
+        let mut child = self.child.lock().expect("pty child lock poisoned");
+        match child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(_)) => false,
+            Err(_) => false,
+        }
+    }
+
+    fn has_output(&self) -> bool {
+        self.seq.load(Ordering::SeqCst) > 0
+            || self.retained_bytes.load(Ordering::SeqCst) > 0
+            || !self
+                .chunks
+                .lock()
+                .expect("pty chunk lock poisoned")
+                .is_empty()
+    }
+
     fn read(&self, cursor: u64) -> TerminalReadResult {
         let chunks = self.chunks.lock().expect("pty chunk lock poisoned");
         let next_cursor = self.seq.load(Ordering::SeqCst);
         let chunks = if cursor == 0 {
-            let mut selected = Vec::new();
-            let mut bytes = 0usize;
-            for chunk in chunks.iter().rev() {
-                let chunk_len = chunk.data.len();
-                if !selected.is_empty()
-                    && (selected.len() >= INITIAL_ATTACH_MAX_CHUNKS
-                        || bytes.saturating_add(chunk_len) > INITIAL_ATTACH_MAX_BYTES)
-                {
-                    break;
-                }
-                bytes = bytes.saturating_add(chunk_len);
-                selected.push(chunk.clone());
-            }
-            selected.reverse();
-            selected
+            select_initial_attach_chunks(&chunks)
         } else {
             chunks
                 .iter()
@@ -343,10 +361,7 @@ impl PtySessionRuntime {
 
     fn buffer_usage(&self) -> (usize, usize) {
         let chunks = self.chunks.lock().expect("pty chunk lock poisoned");
-        (
-            chunks.len(),
-            self.retained_bytes.load(Ordering::SeqCst),
-        )
+        (chunks.len(), self.retained_bytes.load(Ordering::SeqCst))
     }
 
     fn write(&self, data: &str) -> Result<()> {
@@ -496,6 +511,141 @@ fn trim_chunk_buffer(
     }
 }
 
+fn select_initial_attach_chunks(chunks: &VecDeque<TerminalChunk>) -> Vec<TerminalChunk> {
+    if chunks.is_empty() {
+        return Vec::new();
+    }
+
+    let mut trailing_noise = Vec::new();
+    let mut anchor_index = None;
+    for (ix, chunk) in chunks.iter().enumerate().rev() {
+        if terminal_chunk_has_visible_text(&chunk.data) {
+            anchor_index = Some(ix);
+            break;
+        }
+        if trailing_noise.len() < INITIAL_ATTACH_TRAILING_NOISE_CHUNKS {
+            trailing_noise.push(ix);
+        }
+    }
+
+    let Some(anchor_index) = anchor_index else {
+        return select_initial_attach_tail(chunks, None);
+    };
+
+    let preserved_trailing = trailing_noise
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
+    let trailing_chunk_budget = preserved_trailing.len();
+    let trailing_byte_budget = preserved_trailing
+        .iter()
+        .filter_map(|ix| chunks.get(*ix))
+        .map(|chunk| chunk.data.len())
+        .sum::<usize>();
+
+    let available_chunk_budget =
+        INITIAL_ATTACH_MAX_CHUNKS.saturating_sub(trailing_chunk_budget.max(1));
+    let available_byte_budget = INITIAL_ATTACH_MAX_BYTES.saturating_sub(trailing_byte_budget);
+    let leading = select_initial_attach_tail(
+        chunks,
+        Some((anchor_index, available_chunk_budget, available_byte_budget)),
+    );
+
+    let mut selected = leading;
+    for ix in preserved_trailing {
+        if let Some(chunk) = chunks.get(ix).cloned() {
+            selected.push(chunk);
+        }
+    }
+    selected
+}
+
+fn select_initial_attach_tail(
+    chunks: &VecDeque<TerminalChunk>,
+    anchor: Option<(usize, usize, usize)>,
+) -> Vec<TerminalChunk> {
+    let mut selected = Vec::new();
+    let mut bytes = 0usize;
+    let (limit_index, chunk_budget, byte_budget) = anchor.unwrap_or((
+        chunks.len().saturating_sub(1),
+        INITIAL_ATTACH_MAX_CHUNKS,
+        INITIAL_ATTACH_MAX_BYTES,
+    ));
+    for (ix, chunk) in chunks.iter().enumerate().rev() {
+        if ix > limit_index {
+            continue;
+        }
+        let chunk_len = chunk.data.len();
+        if !selected.is_empty()
+            && (selected.len() >= chunk_budget || bytes.saturating_add(chunk_len) > byte_budget)
+        {
+            break;
+        }
+        bytes = bytes.saturating_add(chunk_len);
+        selected.push(chunk.clone());
+    }
+    selected.reverse();
+    selected
+}
+
+fn terminal_chunk_has_visible_text(data: &str) -> bool {
+    let stripped = strip_terminal_control_sequences(data);
+    stripped.chars().any(|ch| !ch.is_whitespace())
+}
+
+fn strip_terminal_control_sequences(input: &str) -> String {
+    #[derive(Clone, Copy)]
+    enum State {
+        Normal,
+        Escape,
+        Csi,
+        Osc,
+        OscEscape,
+        StringTerminator,
+    }
+
+    let mut state = State::Normal;
+    let mut out = String::with_capacity(input.len());
+
+    for ch in input.chars() {
+        match state {
+            State::Normal => {
+                if ch == '\u{1b}' {
+                    state = State::Escape;
+                } else if !ch.is_control() || matches!(ch, '\n' | '\r' | '\t') {
+                    out.push(ch);
+                }
+            }
+            State::Escape => match ch {
+                '[' => state = State::Csi,
+                ']' => state = State::Osc,
+                'P' | 'X' | '^' | '_' => state = State::StringTerminator,
+                _ => state = State::Normal,
+            },
+            State::Csi => {
+                if ('@'..='~').contains(&ch) {
+                    state = State::Normal;
+                }
+            }
+            State::Osc => match ch {
+                '\u{7}' => state = State::Normal,
+                '\u{1b}' => state = State::OscEscape,
+                _ => {}
+            },
+            State::OscEscape => {
+                state = if ch == '\\' { State::Normal } else { State::Osc };
+            }
+            State::StringTerminator => {
+                if ch == '\u{1b}' {
+                    state = State::OscEscape;
+                }
+            }
+        }
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,5 +692,40 @@ mod tests {
         );
         assert!(chunks.len() <= IDLE_TRIM_MAX_CHUNKS);
         assert!(retained <= IDLE_TRIM_MAX_BYTES);
+    }
+
+    #[test]
+    fn initial_attach_selection_keeps_last_meaningful_surface_ahead_of_trailing_noise() {
+        let mut chunks = VecDeque::new();
+        chunks.push_back(TerminalChunk {
+            seq: 1,
+            data: "saved transcript line\n".to_string(),
+        });
+        chunks.push_back(TerminalChunk {
+            seq: 2,
+            data: "\u{1b}[2J\u{1b}[HOpenAI Codex (v0.118.0)\n/model to change\n".to_string(),
+        });
+        for seq in 3..260 {
+            chunks.push_back(TerminalChunk {
+                seq,
+                data: "\u{1b}[20;3H \r \n".to_string(),
+            });
+        }
+
+        let selected = select_initial_attach_chunks(&chunks);
+        let combined = selected
+            .iter()
+            .map(|chunk| chunk.data.as_str())
+            .collect::<String>();
+
+        assert!(combined.contains("OpenAI Codex"));
+    }
+
+    #[test]
+    fn terminal_chunk_visible_text_ignores_ansi_noise() {
+        assert!(!terminal_chunk_has_visible_text("\u{1b}[20;3H \r \n\u{1b}[K"));
+        assert!(terminal_chunk_has_visible_text(
+            "\u{1b}[2J\u{1b}[HOpenAI Codex (v0.118.0)\n"
+        ));
     }
 }

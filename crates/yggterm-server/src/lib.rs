@@ -3030,6 +3030,19 @@ fn remote_tmux_session_name(session_id: &str) -> String {
     let suffix = session_id
         .chars()
         .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>();
+    let suffix = if suffix.len() <= 24 {
+        suffix
+    } else {
+        format!("{}{}", &suffix[..12], &suffix[suffix.len() - 12..])
+    };
+    format!("yggterm-{suffix}")
+}
+
+fn legacy_remote_tmux_session_name(session_id: &str) -> String {
+    let suffix = session_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
         .take(24)
         .collect::<String>();
     format!("yggterm-{suffix}")
@@ -3226,12 +3239,11 @@ fn screen_spawn_codex_session(session_name: &str, command: &str) -> anyhow::Resu
 fn screen_attach_shell_command(target: &str) -> String {
     let quoted_target = shell_single_quote(target);
     format!(
-        r#"(screen -S {target} -X redisplay >/dev/null 2>&1 || true; \
-         screen -S {target} -X stuff "$(printf '\f')" >/dev/null 2>&1 || true; \
+        r#"(export TERM='xterm-256color' COLORTERM='truecolor'; \
+         screen -S {target} -X redisplay >/dev/null 2>&1 || true; \
          for delay in 0.08 0.20 0.38 0.62 0.95; do \
              (sleep "$delay"; \
-              screen -S {target} -X redisplay >/dev/null 2>&1 || true; \
-              screen -S {target} -X stuff "$(printf '\f')" >/dev/null 2>&1 || true) \
+              screen -S {target} -X redisplay >/dev/null 2>&1 || true) \
              & \
          done; \
          exec screen -D -r {target})"#,
@@ -3328,7 +3340,7 @@ fn screen_snapshot_bytes_with_history(
     }
     let mut bytes = None;
     let mut last_error = None;
-    for _ in 0..8 {
+    for _ in 0..40 {
         match fs::read(&path) {
             Ok(read) => {
                 bytes = Some(read);
@@ -3336,7 +3348,7 @@ fn screen_snapshot_bytes_with_history(
             }
             Err(error) => {
                 last_error = Some(error.to_string());
-                std::thread::sleep(Duration::from_millis(25));
+                std::thread::sleep(Duration::from_millis(50));
             }
         }
     }
@@ -3581,17 +3593,41 @@ fn remote_snapshot_matches_saved_session(
     snapshot: &[u8],
 ) -> anyhow::Result<bool> {
     let fragments = remote_saved_session_match_fragments(session_id)?;
+    Ok(remote_snapshot_matches_saved_session_fragments(
+        &fragments,
+        snapshot,
+        true,
+    ))
+}
+
+fn remote_snapshot_matches_saved_session_strict(
+    session_id: &str,
+    snapshot: &[u8],
+) -> anyhow::Result<bool> {
+    let fragments = remote_saved_session_match_fragments(session_id)?;
+    Ok(remote_snapshot_matches_saved_session_fragments(
+        &fragments,
+        snapshot,
+        false,
+    ))
+}
+
+fn remote_snapshot_matches_saved_session_fragments(
+    fragments: &[String],
+    snapshot: &[u8],
+    allow_empty_fragments: bool,
+) -> bool {
     if fragments.is_empty() {
-        return Ok(true);
+        return allow_empty_fragments;
     }
     let normalized_snapshot =
         normalize_remote_semantic_match_text(&String::from_utf8_lossy(snapshot));
     if normalized_snapshot.is_empty() {
-        return Ok(false);
+        return false;
     }
-    Ok(fragments
+    fragments
         .iter()
-        .any(|fragment| normalized_snapshot.contains(fragment)))
+        .any(|fragment| normalized_snapshot.contains(fragment))
 }
 
 fn remote_saved_session_can_reuse_existing_multiplexer(
@@ -3605,6 +3641,9 @@ fn remote_saved_session_can_reuse_existing_multiplexer(
         return false;
     }
     if remote_snapshot_has_resume_breakage(snapshot) {
+        return false;
+    }
+    if remote_snapshot_is_generic_codex_idle(snapshot) {
         return false;
     }
     if saved_session_exists {
@@ -6070,11 +6109,70 @@ pub fn run_remote_resume_codex(session_id: &str, cwd: Option<&str>) -> anyhow::R
     let _ = ensure_local_managed_cli(ManagedCliTool::Codex)?;
     if let Some(multiplexer) = preferred_remote_multiplexer()? {
         let session_name = remote_tmux_session_name(session_id);
+        let legacy_session_name = legacy_remote_tmux_session_name(session_id);
         let saved_session_exists = remote_saved_codex_session_exists(session_id)?;
         let mut preattach_snapshot_emitted = false;
-        let existing_session = match multiplexer {
-            RemoteMultiplexer::Tmux => tmux_has_session(&session_name)?,
-            RemoteMultiplexer::Screen => screen_has_session(&session_name)?,
+        let has_named_session = |name: &str| match multiplexer {
+            RemoteMultiplexer::Tmux => tmux_has_session(name),
+            RemoteMultiplexer::Screen => screen_has_session(name),
+        };
+        let mut attach_session_name = session_name.clone();
+        let existing_session = if has_named_session(&session_name)? {
+            true
+        } else if legacy_session_name != session_name && has_named_session(&legacy_session_name)? {
+            let full_snapshot = remote_multiplexer_snapshot_bytes(multiplexer, &legacy_session_name)
+                .unwrap_or_default();
+            let visible_snapshot =
+                remote_multiplexer_visible_snapshot_bytes(multiplexer, &legacy_session_name)?;
+            let snapshot_looks_valid = remote_saved_session_can_reuse_existing_multiplexer(
+                saved_session_exists,
+                &visible_snapshot,
+            );
+            let full_snapshot_matches_saved_session = if saved_session_exists && !full_snapshot.is_empty() {
+                match remote_snapshot_matches_saved_session_strict(session_id, &full_snapshot) {
+                    Ok(matches) => matches,
+                    Err(error) => {
+                        warn!(
+                            session_id = %session_id,
+                            mux_session = %legacy_session_name,
+                            error = %error,
+                            "failed to validate legacy remote multiplexer against saved session"
+                        );
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            let snapshot_matches_saved_session = if saved_session_exists && snapshot_looks_valid {
+                let candidate = if full_snapshot.is_empty() {
+                    &visible_snapshot
+                } else {
+                    &full_snapshot
+                };
+                match remote_snapshot_matches_saved_session_strict(session_id, candidate) {
+                    Ok(matches) => matches,
+                    Err(error) => {
+                        warn!(
+                            session_id = %session_id,
+                            mux_session = %legacy_session_name,
+                            error = %error,
+                            "failed to validate legacy remote multiplexer against saved session"
+                        );
+                        false
+                    }
+                }
+            } else {
+                snapshot_looks_valid
+            };
+            if full_snapshot_matches_saved_session || snapshot_matches_saved_session {
+                attach_session_name = legacy_session_name.clone();
+                true
+            } else {
+                false
+            }
+        } else {
+            false
         };
         if !existing_session {
             let command = if saved_session_exists {
@@ -6088,7 +6186,7 @@ pub fn run_remote_resume_codex(session_id: &str, cwd: Option<&str>) -> anyhow::R
             }
             preattach_snapshot_emitted = maybe_emit_remote_resume_snapshot(
                 multiplexer,
-                &session_name,
+                &attach_session_name,
                 session_id,
                 saved_session_exists,
                 Duration::from_millis(900),
@@ -6100,7 +6198,7 @@ pub fn run_remote_resume_codex(session_id: &str, cwd: Option<&str>) -> anyhow::R
                     RemoteMultiplexer::Tmux => "tmux",
                     RemoteMultiplexer::Screen => "screen",
                 },
-                "mux_session": session_name,
+                "mux_session": attach_session_name,
                 "mux_reused": false,
                 "saved_session_exists": saved_session_exists,
                 "snapshot_emitted": preattach_snapshot_emitted,
@@ -6108,13 +6206,30 @@ pub fn run_remote_resume_codex(session_id: &str, cwd: Option<&str>) -> anyhow::R
             }));
         } else {
             let full_snapshot =
-                remote_multiplexer_snapshot_bytes(multiplexer, &session_name).unwrap_or_default();
+                remote_multiplexer_snapshot_bytes(multiplexer, &attach_session_name)
+                    .unwrap_or_default();
             let visible_snapshot =
-                remote_multiplexer_visible_snapshot_bytes(multiplexer, &session_name)?;
+                remote_multiplexer_visible_snapshot_bytes(multiplexer, &attach_session_name)?;
             let snapshot_looks_valid = remote_saved_session_can_reuse_existing_multiplexer(
                 saved_session_exists,
                 &visible_snapshot,
             );
+            let full_snapshot_matches_saved_session = if saved_session_exists && !full_snapshot.is_empty() {
+                match remote_snapshot_matches_saved_session(session_id, &full_snapshot) {
+                    Ok(matches) => matches,
+                    Err(error) => {
+                        warn!(
+                            session_id = %session_id,
+                            mux_session = %attach_session_name,
+                            error = %error,
+                            "failed to validate full remote multiplexer snapshot against saved session"
+                        );
+                        false
+                    }
+                }
+            } else {
+                false
+            };
             let snapshot_matches_saved_session = if saved_session_exists && snapshot_looks_valid {
                 let candidate = if full_snapshot.is_empty() {
                     &visible_snapshot
@@ -6126,7 +6241,7 @@ pub fn run_remote_resume_codex(session_id: &str, cwd: Option<&str>) -> anyhow::R
                     Err(error) => {
                         warn!(
                             session_id = %session_id,
-                            mux_session = %session_name,
+                            mux_session = %attach_session_name,
                             error = %error,
                             "failed to validate existing remote multiplexer against saved session"
                         );
@@ -6136,12 +6251,18 @@ pub fn run_remote_resume_codex(session_id: &str, cwd: Option<&str>) -> anyhow::R
             } else {
                 snapshot_looks_valid
             };
-            let can_reuse_snapshot =
-                !visible_snapshot.is_empty() && snapshot_looks_valid && snapshot_matches_saved_session;
+            let can_reuse_snapshot = if saved_session_exists {
+                full_snapshot_matches_saved_session
+                    || (!visible_snapshot.is_empty()
+                        && snapshot_looks_valid
+                        && snapshot_matches_saved_session)
+            } else {
+                !visible_snapshot.is_empty() && snapshot_looks_valid && snapshot_matches_saved_session
+            };
             if !can_reuse_snapshot {
                 match multiplexer {
-                    RemoteMultiplexer::Tmux => tmux_kill_session(&session_name)?,
-                    RemoteMultiplexer::Screen => screen_kill_session(&session_name)?,
+                    RemoteMultiplexer::Tmux => tmux_kill_session(&attach_session_name)?,
+                    RemoteMultiplexer::Screen => screen_kill_session(&attach_session_name)?,
                 }
                 let command = if saved_session_exists {
                     remote_persistent_resume_shell_command(session_id, cwd)
@@ -6154,9 +6275,10 @@ pub fn run_remote_resume_codex(session_id: &str, cwd: Option<&str>) -> anyhow::R
                         screen_spawn_codex_session(&session_name, &command)?
                     }
                 }
+                attach_session_name = session_name.clone();
                 preattach_snapshot_emitted = maybe_emit_remote_resume_snapshot(
                     multiplexer,
-                    &session_name,
+                    &attach_session_name,
                     session_id,
                     saved_session_exists,
                     Duration::from_millis(900),
@@ -6169,7 +6291,7 @@ pub fn run_remote_resume_codex(session_id: &str, cwd: Option<&str>) -> anyhow::R
                     RemoteMultiplexer::Tmux => "tmux",
                     RemoteMultiplexer::Screen => "screen",
                 },
-                "mux_session": session_name,
+                "mux_session": attach_session_name,
                 "mux_reused": can_reuse_snapshot,
                 "saved_session_exists": saved_session_exists,
                 "full_snapshot_bytes": full_snapshot.len(),
@@ -6184,11 +6306,15 @@ pub fn run_remote_resume_codex(session_id: &str, cwd: Option<&str>) -> anyhow::R
                 },
             }));
             if can_reuse_snapshot {
-                let _ = emit_remote_multiplexer_snapshot_with_retry(
-                    multiplexer,
-                    &session_name,
-                    Duration::from_millis(280),
-                );
+                if full_snapshot_matches_saved_session {
+                    let _ = emit_terminal_snapshot(&full_snapshot);
+                } else {
+                    let _ = emit_remote_multiplexer_snapshot_with_retry(
+                        multiplexer,
+                        &attach_session_name,
+                        Duration::from_millis(280),
+                    );
+                }
                 let mut stdout = std::io::stdout();
                 writeln!(stdout, "{REMOTE_ATTACH_READY_MARKER}")
                     .context("writing remote attach-ready marker")?;
@@ -6196,8 +6322,8 @@ pub fn run_remote_resume_codex(session_id: &str, cwd: Option<&str>) -> anyhow::R
             }
         }
         return match multiplexer {
-            RemoteMultiplexer::Tmux => tmux_attach_session(&session_name),
-            RemoteMultiplexer::Screen => screen_attach_session(&session_name),
+            RemoteMultiplexer::Tmux => tmux_attach_session(&attach_session_name),
+            RemoteMultiplexer::Screen => screen_attach_session(&attach_session_name),
         };
     }
 
@@ -9035,16 +9161,18 @@ mod tests {
         apply_remote_preview_payload, apply_remote_scanned_session_preview, build_session,
         canonical_static_label, clear_session_preview_for_loading, current_millis_u64,
         dedupe_remote_scanned_sessions, legacy_agent_launch_command,
-        load_remote_machine_sessions_from_mirror, managed_session_from_snapshot,
+        legacy_remote_tmux_session_name, load_remote_machine_sessions_from_mirror,
+        managed_session_from_snapshot,
         mirror_remote_machine_sessions, parse_recent_context_sections, parse_screen_session_ref,
         parse_stored_transcript, push_preview_block, remote_cache_key, remote_command_cache,
         remote_resume_shell_command, remote_saved_codex_session_exists,
         remote_saved_session_can_reuse_existing_multiplexer, remote_scan_roots_with_parents,
         remote_scanned_session_path, remote_snapshot_looks_like_codex,
         remote_snapshot_looks_like_shell_prompt, remote_ssh_launch_command,
-        sanitize_recent_context_payload, screen_attach_shell_command, session_metadata_value,
-        should_fallback_to_python, stored_session_launch_command, strip_remote_payload_noise,
-        synthesize_remote_scanned_session_view, upsert_session_metadata,
+        remote_tmux_session_name, sanitize_recent_context_payload, screen_attach_shell_command,
+        session_metadata_value, should_fallback_to_python, stored_session_launch_command,
+        strip_remote_payload_noise, synthesize_remote_scanned_session_view,
+        upsert_session_metadata,
     };
     use crate::SessionRenderedSection;
     use anyhow::Result;
@@ -9315,7 +9443,7 @@ mod tests {
     #[test]
     fn saved_session_reuses_generic_idle_existing_multiplexer_snapshot() {
         let idle = "╭───────────────────────────────────────────────────╮\n│ >_ OpenAI Codex (v0.118.0)                        │\n│                                                   │\n│ model:     gpt-5.4 high   fast   /model to change │\n│ directory: ~                                      │\n╰───────────────────────────────────────────────────╯\n\n› Improve documentation in @filename\n  gpt-5.4 high fast · 100% left · ~\n";
-        assert!(remote_saved_session_can_reuse_existing_multiplexer(
+        assert!(!remote_saved_session_can_reuse_existing_multiplexer(
             true,
             idle.as_bytes()
         ));
@@ -9354,12 +9482,24 @@ mod tests {
             Some("4046775.yggterm-abc123".to_string())
         );
     }
+
     #[test]
-    fn screen_attach_shell_command_replays_exact_session_with_redraw_pulses() {
+    fn remote_multiplexer_session_name_uses_full_session_id_to_avoid_prefix_collisions() {
+        let a = remote_tmux_session_name("019c6a41-bef6-71c0-b799-8de1452efa1d");
+        let b = remote_tmux_session_name("019c6a41-bef6-71c0-b799-8de1ffffffff");
+        let legacy_a = legacy_remote_tmux_session_name("019c6a41-bef6-71c0-b799-8de1452efa1d");
+        let legacy_b = legacy_remote_tmux_session_name("019c6a41-bef6-71c0-b799-8de1ffffffff");
+        assert_ne!(a, b);
+        assert_eq!(legacy_a, legacy_b);
+    }
+
+    #[test]
+    fn screen_attach_shell_command_replays_exact_session_without_injecting_ctrl_l() {
         let command = screen_attach_shell_command("4046775.yggterm-abc123");
+        assert!(command.contains("export TERM='xterm-256color' COLORTERM='truecolor'"));
         assert!(command.contains("screen -D -r '4046775.yggterm-abc123'"));
         assert!(command.contains("screen -S '4046775.yggterm-abc123' -X redisplay"));
-        assert!(command.contains("screen -S '4046775.yggterm-abc123' -X stuff"));
+        assert!(!command.contains("screen -S '4046775.yggterm-abc123' -X stuff"));
         assert!(command.contains("for delay in 0.08 0.20 0.38 0.62 0.95"));
         assert!(!command.contains("screen -D -RR"));
     }
