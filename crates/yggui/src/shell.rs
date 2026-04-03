@@ -20300,6 +20300,16 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
         const fitAddon = new window.FitAddon.FitAddon();
         term.loadAddon(fitAddon);
         term.open(host);
+        const handleWheel = (event) => {{
+            if (!event || !Number.isFinite(event.deltaY) || event.deltaY === 0) {{
+                return;
+            }}
+            const deltaLines = Math.max(1, Math.round(Math.abs(event.deltaY) / 40));
+            term.scrollLines(event.deltaY > 0 ? deltaLines : -deltaLines);
+            event.preventDefault();
+            event.stopPropagation();
+        }};
+        host.addEventListener("wheel", handleWheel, {{ passive: false }});
         term.attachCustomKeyEventHandler((event) => {{
             const accel = event.ctrlKey || event.metaKey;
             const key = (event.key || '').toLowerCase();
@@ -20380,6 +20390,9 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
         window.__yggtermXtermCleanup = () => {{
             try {{
                 resizeObserver.disconnect();
+            }} catch (_error) {{}}
+            try {{
+                host.removeEventListener("wheel", handleWheel);
             }} catch (_error) {{}}
             try {{
                 term.dispose();
