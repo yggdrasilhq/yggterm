@@ -26,10 +26,8 @@ ERROR_FRAGMENTS = (
     "controlsocket",
     "permission denied",
     "connection refused",
-    "no route to host",
     "connection timed out",
     "broken pipe",
-    "connection to ",
 )
 
 TRANSCRIPT_BROWSER_HINTS = (
@@ -40,6 +38,11 @@ TRANSCRIPT_BROWSER_HINTS = (
     "home end to jump",
     "esc to edit prev",
     "edit prev",
+)
+
+SAVED_TRANSCRIPT_HINTS = (
+    "saved transcript ·",
+    "typing takes over the live terminal",
 )
 
 
@@ -400,10 +403,17 @@ def resume_overlay_counts_as_painted(viewport: dict, overlay: dict, terminal_tex
 
 
 def terminal_text_looks_like_error(text: str) -> bool:
-    normalized = " ".join(text.strip().lower().split())
-    if not normalized:
+    lines = [line.strip().lower() for line in text.splitlines() if line.strip()]
+    if not lines:
         return False
-    return any(fragment in normalized for fragment in ERROR_FRAGMENTS)
+    head = " ".join(lines[:4])
+    if any(fragment in head for fragment in ERROR_FRAGMENTS):
+        return True
+    return any(
+        line.startswith("connection to ")
+        and (" closed" in line or "refused" in line or "timed out" in line)
+        for line in lines[:4]
+    ) or any("no route to host" in line for line in lines[:2])
 
 
 def terminal_text_looks_like_generic_idle(text: str) -> bool:
@@ -464,6 +474,29 @@ def terminal_text_looks_like_transcript_browser(text: str) -> bool:
     ):
         return False
     return any(fragment in normalized for fragment in TRANSCRIPT_BROWSER_HINTS)
+
+
+def terminal_text_looks_like_saved_transcript_prefill(text: str) -> bool:
+    normalized = " ".join(text.strip().lower().split())
+    if not normalized:
+        return False
+    return normalized.startswith("saved transcript") and all(
+        fragment in normalized for fragment in SAVED_TRANSCRIPT_HINTS
+    )
+
+
+def overlay_resolved(overlay: dict) -> bool:
+    if not bool(overlay.get("visible")):
+        return True
+    text = " ".join(str(overlay.get("text_sample") or "").strip().lower().split())
+    if not text:
+        return False
+    return (
+        "remote host is unavailable" in text
+        or "remote terminal needs attention" in text
+        or "still not interactive" in text
+        or "has not become interactive" in text
+    )
 
 
 def is_remote_machine_group(row: dict) -> bool:
@@ -646,24 +679,54 @@ def require_terminal_painted(state: dict, session_path: str) -> dict:
     overlay_kind = (overlay.get("kind") or "").strip().lower()
     if terminal_text_looks_like_error(text):
         raise RuntimeError("terminal painted transport/error output instead of the session")
+    if terminal_text_looks_like_generic_idle(text):
+        raise RuntimeError("terminal resumed into generic Codex idle surface")
     if terminal_text_looks_like_shell_prompt(text):
         raise RuntimeError("terminal exposed plain shell prompt instead of restored session UX")
     if terminal_text_looks_like_transcript_browser(text):
         raise RuntimeError("terminal exposed Codex transcript browser instead of live session surface")
+    if terminal_text_looks_like_saved_transcript_prefill(text):
+        raise RuntimeError("terminal still showing saved transcript prefill instead of the live host")
     if overlay_visible:
+        if overlay_kind != "chip":
+            raise RuntimeError("resume overlay still covers terminal after paint budget")
         raise RuntimeError("resume chip still visible after paint budget")
-    if overlay_visible and overlay_kind != "chip":
-        raise RuntimeError("resume overlay still covers terminal after paint budget")
-    if overlay_visible and "live terminal is ready" in overlay_text:
+    if "live terminal is ready" in overlay_text:
         raise RuntimeError("resume overlay still uses the old misleading terminal-ready copy")
-    if overlay_visible and "still connecting to remote terminal" in overlay_text:
+    if "still connecting to remote terminal" in overlay_text:
         raise RuntimeError("resume overlay still uses indefinite connecting copy")
     if terminal_text_looks_like_placeholder(text):
         raise RuntimeError("terminal still showing placeholder content")
     if not text:
         raise RuntimeError("terminal is blank")
-    if not (resume_overlay_counts_as_painted(viewport, overlay, text) or len(text.strip()) > 24):
+    if len(text.strip()) <= 24:
         raise RuntimeError("terminal did not paint meaningful saved/live context")
+    return state
+
+
+def overlay_reports_failure(overlay: dict) -> bool:
+    text = " ".join(str(overlay.get("text_sample") or "").strip().lower().split())
+    if not text:
+        return False
+    return (
+        "remote host is unavailable" in text
+        or "remote terminal needs attention" in text
+        or "still not interactive" in text
+        or "has not become interactive" in text
+    )
+
+
+def require_overlay_resolved(state: dict, session_path: str) -> dict:
+    viewport = state.get("viewport") or {}
+    if viewport.get("active_view_mode") != "Terminal":
+        raise RuntimeError("viewport not in terminal mode")
+    if viewport.get("active_session_path") != session_path:
+        raise RuntimeError("viewport not on requested session")
+    overlay = terminal_resume_overlay(state)
+    if overlay_reports_failure(overlay):
+        raise RuntimeError("resume settled into failure card")
+    if bool(overlay.get("visible")):
+        raise RuntimeError("resume chip still visible")
     return state
 
 
@@ -715,6 +778,18 @@ def main() -> int:
             entry["active_summary"] = viewport.get("active_summary")
             entry["terminal_resume_overlay"] = terminal_resume_overlay(state)
             entry["terminal_text_sample"] = active_terminal_text(state)
+            overlay_elapsed, overlay_state = wait_until(
+                f"overlay settle {session_path}",
+                args.paint_budget,
+                args.poll,
+                lambda: require_overlay_resolved(
+                    app_state(args.host, args.bin, args.timeout_ms),
+                    session_path,
+                ),
+            )
+            entry["overlay_resolved_s"] = round(overlay_elapsed, 3)
+            entry["overlay_resolved_within_budget"] = overlay_elapsed <= args.paint_budget
+            entry["terminal_resume_overlay_after_settle"] = terminal_resume_overlay(overlay_state)
             entry["state_dump"] = write_json(out_dir / f"terminal-resume-{index:02d}.json", state)
         except Exception as error:  # noqa: BLE001
             state = {}
@@ -731,6 +806,7 @@ def main() -> int:
             entry["active_summary"] = viewport.get("active_summary")
             entry["terminal_resume_overlay"] = terminal_resume_overlay(state)
             entry["terminal_text_sample"] = active_terminal_text(state)
+            entry["overlay_resolved_within_budget"] = False
             entry["state_dump"] = write_json(
                 out_dir / f"terminal-resume-{index:02d}-failure.json",
                 state,
@@ -809,8 +885,35 @@ def main() -> int:
         "overlay_visible_failures": len(
             [
                 item for item in results
-                if bool((item.get("terminal_resume_overlay") or {}).get("visible"))
-                and ((item.get("terminal_resume_overlay") or {}).get("kind") or "").lower() != "chip"
+                if bool(
+                    (
+                        item.get("terminal_resume_overlay_after_settle")
+                        or item.get("terminal_resume_overlay")
+                        or {}
+                    ).get("visible")
+                )
+                and (
+                    (
+                        item.get("terminal_resume_overlay_after_settle")
+                        or item.get("terminal_resume_overlay")
+                        or {}
+                    ).get("kind")
+                    or ""
+                ).lower()
+                != "chip"
+            ]
+        ),
+        "overlay_resolve_failures": len(
+            [item for item in results if not item.get("overlay_resolved_within_budget")]
+        ),
+        "failure_card_failures": len(
+            [
+                item for item in results
+                if overlay_reports_failure(
+                    item.get("terminal_resume_overlay_after_settle")
+                    or item.get("terminal_resume_overlay")
+                    or {}
+                )
             ]
         ),
         "terminal_error_failures": len(
@@ -849,6 +952,8 @@ def main() -> int:
         and summary["terminal_error_failures"] == 0
         and summary["overlay_copy_failures"] == 0
         and summary["overlay_visible_failures"] == 0
+        and summary["overlay_resolve_failures"] == 0
+        and summary["failure_card_failures"] == 0
     ) else 1
 
 
