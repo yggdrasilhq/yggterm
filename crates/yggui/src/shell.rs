@@ -17994,7 +17994,7 @@ fn TerminalCanvas(
         .active_summary
         .as_deref()
         .map(str::trim)
-        .filter(|text| !text.is_empty() && !looks_like_low_signal_generated_copy(text))
+        .filter(|text| terminal_resume_excerpt_is_meaningful(text))
         .map(|text| truncate_preview_excerpt(text, 240));
     let initial_resume_overlay_excerpt = remote_resume_overlay_excerpt(&session)
         .or_else(|| remote_resume_overlay_seed_excerpt(&session));
@@ -18003,6 +18003,7 @@ fn TerminalCanvas(
     let resume_overlay_excerpt = terminal_resume_overlay_excerpt()
         .or_else(|| initial_resume_overlay_excerpt.clone())
         .or(snapshot_resume_overlay_excerpt);
+    let terminal_resume_prefill = terminal_placeholder.clone();
     let resume_ready_from_shell = state
         .read()
         .terminal_resume_ready_paths
@@ -18029,14 +18030,13 @@ fn TerminalCanvas(
     }
     {
         let mut resume_overlay_failed = resume_overlay_failed;
-        let terminal_overlay_dismissed = terminal_overlay_dismissed;
         let terminal_live_host_connected = terminal_live_host_connected;
         use_future(move || async move {
             if !is_remote_resume_session {
                 return;
             }
-            sleep(Duration::from_millis(5_000)).await;
-            if !terminal_overlay_dismissed() && !terminal_live_host_connected() {
+            sleep(Duration::from_millis(1_000)).await;
+            if !terminal_live_host_connected() {
                 resume_overlay_failed.set(true);
             }
         });
@@ -18054,7 +18054,7 @@ fn TerminalCanvas(
         let host_id = future_host_id.clone();
         let title = terminal_title.clone();
         let theme = future_theme.clone();
-        let placeholder = terminal_placeholder.clone();
+        let placeholder = terminal_resume_prefill.clone();
         let trace_home = trace_home.clone();
         let mut state = state;
         let mut terminal_has_meaningful_output = terminal_has_meaningful_output;
@@ -18080,6 +18080,17 @@ fn TerminalCanvas(
                     "mount_epoch": mount_epoch,
                 }),
             );
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "terminal_mount",
+                "js_wait_begin",
+                json!({
+                    "session_path": session_path.clone(),
+                    "host_id": host_id.clone(),
+                }),
+            );
+            let mut eval = document::eval(&terminal_eval_script(&host_id, &theme));
             append_trace_event(
                 &trace_home,
                 "ui",
@@ -18125,17 +18136,6 @@ fn TerminalCanvas(
                     "session_path": session_path.clone(),
                 }),
             );
-            append_trace_event(
-                &trace_home,
-                "ui",
-                "terminal_mount",
-                "js_wait_begin",
-                json!({
-                    "session_path": session_path.clone(),
-                    "host_id": host_id.clone(),
-                }),
-            );
-            let mut eval = document::eval(&terminal_eval_script(&host_id, &theme));
             let mut cursor = 0u64;
             let mut js_ready = false;
             let mut read_poll_ms = if is_remote_resume_session {
@@ -18148,9 +18148,6 @@ fn TerminalCanvas(
             let mut traced_first_output = false;
             let mut traced_first_meaningful_output = false;
             let mut traced_attach_ready = false;
-            let attach_started_at = Instant::now();
-            let repaint_retry_schedule_ms = [160_u128, 360_u128, 720_u128];
-            let mut forced_remote_repaint_attempts = 0usize;
             loop {
                 let still_active = {
                     let shell = state.read();
@@ -18245,11 +18242,42 @@ fn TerminalCanvas(
                                     {
                                         terminal_resume_overlay_excerpt.set(Some(excerpt));
                                     }
-                                    if saw_meaningful_output
-                                        || saw_prompt_output
-                                        || tail_prompt_only_output
-                                        || saw_attach_ready_marker
+                                    let saw_generic_idle_output = batched_output
+                                        .as_deref()
+                                        .is_some_and(terminal_chunk_is_generic_codex_idle);
+                                    let tail_generic_idle_output = batched_output
+                                        .as_deref()
+                                        .is_some_and(terminal_chunk_tail_is_generic_codex_idle);
+                                    let saw_shell_prompt_output =
+                                        (saw_prompt_output || tail_prompt_only_output)
+                                            && !saw_generic_idle_output
+                                            && !tail_generic_idle_output;
+                                    if batched_output
+                                        .as_deref()
+                                        .is_some_and(terminal_chunk_is_transport_error)
                                     {
+                                        resume_overlay_failed.set(true);
+                                        terminal_live_host_connected.set(false);
+                                        let _ = safe_shell_mut(state, "terminal_attach_transport_error", |shell| {
+                                            shell.terminal_attach_in_flight.remove(&session_path);
+                                            shell.terminal_resume_ready_paths.remove(&session_path);
+                                        });
+                                    }
+                                    let connected_for_resume = if is_remote_resume_session {
+                                        remote_resume_surface_connected(
+                                            saw_meaningful_output,
+                                            saw_visible_output,
+                                            saw_attach_ready_marker,
+                                            saw_transcript_browser_output,
+                                            saw_generic_idle_output || tail_generic_idle_output,
+                                        )
+                                    } else {
+                                        saw_meaningful_output
+                                            || saw_prompt_output
+                                            || tail_prompt_only_output
+                                            || saw_attach_ready_marker
+                                    };
+                                    if connected_for_resume {
                                         terminal_live_host_connected.set(true);
                                         resume_overlay_failed.set(false);
                                     }
@@ -18292,7 +18320,13 @@ fn TerminalCanvas(
                                             && !terminal_overlay_dismissed()
                                             && !saw_meaningful_output
                                             && !saw_transcript_browser_output
-                                            && (saw_prompt_output || tail_prompt_only_output);
+                                            && saw_shell_prompt_output;
+                                        let suppress_resume_control_only_output =
+                                            is_remote_resume_session
+                                                && !terminal_overlay_dismissed()
+                                                && !saw_visible_output
+                                                && !saw_attach_ready_marker
+                                                && !terminal_chunk_is_transport_error(&data);
                                         if !traced_first_output {
                                             append_trace_event(
                                                 &trace_home,
@@ -18308,7 +18342,9 @@ fn TerminalCanvas(
                                             );
                                             traced_first_output = true;
                                         }
-                                        if !suppress_resume_idle_output {
+                                        if !suppress_resume_idle_output
+                                            && !suppress_resume_control_only_output
+                                        {
                                             let _ = eval.send(TerminalJsCommand::Write { data });
                                             terminal_resume_surface_staged.set(true);
                                         }
@@ -18333,12 +18369,16 @@ fn TerminalCanvas(
                                         let _ = eval.send(TerminalJsCommand::Write { data });
                                         placeholder_rendered = true;
                                         terminal_resume_surface_staged.set(true);
+                                        terminal_overlay_dismissed.set(true);
                                     }
                                     let attach_ready = if is_remote_resume_session {
-                                        saw_meaningful_output
-                                            && !saw_attach_ready_marker
-                                            && !tail_prompt_only_output
-                                            && !saw_transcript_browser_output
+                                        remote_resume_surface_connected(
+                                            saw_meaningful_output,
+                                            saw_visible_output,
+                                            saw_attach_ready_marker,
+                                            saw_transcript_browser_output,
+                                            saw_generic_idle_output || tail_generic_idle_output,
+                                        )
                                     } else {
                                         saw_meaningful_output
                                             || saw_prompt_output
@@ -18362,23 +18402,14 @@ fn TerminalCanvas(
                                             );
                                             traced_attach_ready = true;
                                             resume_overlay_failed.set(false);
-                                            let action = if is_remote_resume_session {
-                                                "terminal_attach_staged"
-                                            } else {
-                                                "terminal_attach_ready"
-                                            };
-                                            let _ = safe_shell_mut(state, action, |shell| {
-                                                if !is_remote_resume_session {
-                                                    shell.terminal_resume_ready_paths
-                                                        .insert(session_path.clone());
-                                                }
+                                            let _ = safe_shell_mut(state, "terminal_attach_ready", |shell| {
+                                                shell.terminal_resume_ready_paths
+                                                    .insert(session_path.clone());
                                                 shell.terminal_attach_in_flight.remove(
                                                     &session_path,
                                                 );
                                             });
-                                            if !is_remote_resume_session {
-                                                terminal_overlay_dismissed.set(true);
-                                            }
+                                            terminal_overlay_dismissed.set(true);
                                             maybe_spawn_missing_remote_machine_refreshes(state);
                                             maybe_spawn_missing_managed_cli_refreshes(state);
                                         }
@@ -18405,15 +18436,14 @@ fn TerminalCanvas(
                                             traced_first_meaningful_output = true;
                                         }
                                         terminal_has_meaningful_output.set(
-                                            saw_meaningful_output
-                                                && !tail_prompt_only_output
+                                            (saw_meaningful_output
+                                                || saw_generic_idle_output
+                                                || tail_generic_idle_output)
                                                 && !saw_transcript_browser_output,
                                         );
                                         terminal_prompt_only.set(
                                             !saw_transcript_browser_output
-                                                && (tail_prompt_only_output
-                                                    || (!saw_meaningful_output
-                                                        && saw_prompt_output)),
+                                                && saw_shell_prompt_output,
                                         );
                                     }
                                     if saw_meaningful_output
@@ -18628,42 +18658,46 @@ fn TerminalCanvas(
                                 {
                                     terminal_resume_overlay_excerpt.set(Some(excerpt));
                                 }
-                                if saw_meaningful_output
-                                    || saw_prompt_output
-                                    || tail_prompt_only_output
-                                    || saw_attach_ready_marker
+                                let saw_generic_idle_output = batched_output
+                                    .as_deref()
+                                    .is_some_and(terminal_chunk_is_generic_codex_idle);
+                                let tail_generic_idle_output = batched_output
+                                    .as_deref()
+                                    .is_some_and(terminal_chunk_tail_is_generic_codex_idle);
+                                let saw_shell_prompt_output =
+                                    (saw_prompt_output || tail_prompt_only_output)
+                                        && !saw_generic_idle_output
+                                        && !tail_generic_idle_output;
+                                if batched_output
+                                    .as_deref()
+                                    .is_some_and(terminal_chunk_is_transport_error)
                                 {
+                                    resume_overlay_failed.set(true);
+                                    terminal_live_host_connected.set(false);
+                                    let _ = safe_shell_mut(state, "terminal_attach_transport_error", |shell| {
+                                        shell.terminal_attach_in_flight.remove(&session_path);
+                                        shell.terminal_resume_ready_paths.remove(&session_path);
+                                    });
+                                }
+                                if if is_remote_resume_session {
+                                    remote_resume_surface_connected(
+                                        saw_meaningful_output,
+                                        saw_visible_output,
+                                        saw_attach_ready_marker,
+                                        saw_transcript_browser_output,
+                                        saw_generic_idle_output || tail_generic_idle_output,
+                                    )
+                                } else {
+                                    saw_meaningful_output
+                                        || saw_prompt_output
+                                        || tail_prompt_only_output
+                                        || saw_attach_ready_marker
+                                } {
                                     terminal_live_host_connected.set(true);
                                     resume_overlay_failed.set(false);
                                 }
                                 if saw_transcript_browser_output {
                                     resume_overlay_failed.set(true);
-                                }
-                                if is_remote_resume_session
-                                    && !terminal_has_visible_output
-                                    && forced_remote_repaint_attempts < repaint_retry_schedule_ms.len()
-                                    && attach_started_at.elapsed().as_millis()
-                                        >= repaint_retry_schedule_ms[forced_remote_repaint_attempts]
-                                {
-                                    append_trace_event(
-                                        &trace_home,
-                                        "ui",
-                                        "terminal_mount",
-                                        "resume_repaint_pulse",
-                                        json!({
-                                            "session_path": session_path.clone(),
-                                            "attempt": forced_remote_repaint_attempts + 1,
-                                            "elapsed_ms": attach_started_at.elapsed().as_millis(),
-                                        }),
-                                    );
-                                    let _ = terminal_write_async(
-                                        endpoint.clone(),
-                                        session_path.clone(),
-                                        "\u{000c}".to_string(),
-                                    )
-                                    .await;
-                                    forced_remote_repaint_attempts += 1;
-                                    read_poll_ms = 45;
                                 }
                                 if (saw_meaningful_output
                                     || saw_prompt_output
@@ -18701,7 +18735,13 @@ fn TerminalCanvas(
                                         && !terminal_overlay_dismissed()
                                         && !saw_meaningful_output
                                         && !saw_transcript_browser_output
-                                        && (saw_prompt_output || tail_prompt_only_output);
+                                        && saw_shell_prompt_output;
+                                    let suppress_resume_control_only_output =
+                                        is_remote_resume_session
+                                            && !terminal_overlay_dismissed()
+                                            && !saw_visible_output
+                                            && !saw_attach_ready_marker
+                                            && !terminal_chunk_is_transport_error(&data);
                                     if !traced_first_output {
                                         append_trace_event(
                                             &trace_home,
@@ -18717,7 +18757,9 @@ fn TerminalCanvas(
                                         );
                                         traced_first_output = true;
                                     }
-                                    if !suppress_resume_idle_output {
+                                    if !suppress_resume_idle_output
+                                        && !suppress_resume_control_only_output
+                                    {
                                         let _ = eval.send(TerminalJsCommand::Write { data });
                                         terminal_resume_surface_staged.set(true);
                                     }
@@ -18742,12 +18784,16 @@ fn TerminalCanvas(
                                     let _ = eval.send(TerminalJsCommand::Write { data });
                                     placeholder_rendered = true;
                                     terminal_resume_surface_staged.set(true);
+                                    terminal_overlay_dismissed.set(true);
                                 }
                                 let attach_ready = if is_remote_resume_session {
-                                    saw_meaningful_output
-                                        && !saw_attach_ready_marker
-                                        && !tail_prompt_only_output
-                                        && !saw_transcript_browser_output
+                                    remote_resume_surface_connected(
+                                        saw_meaningful_output,
+                                        saw_visible_output,
+                                        saw_attach_ready_marker,
+                                        saw_transcript_browser_output,
+                                        saw_generic_idle_output || tail_generic_idle_output,
+                                    )
                                 } else {
                                     saw_meaningful_output
                                         || saw_prompt_output
@@ -18771,34 +18817,34 @@ fn TerminalCanvas(
                                         );
                                         traced_attach_ready = true;
                                         resume_overlay_failed.set(false);
-                                        let action = if is_remote_resume_session {
-                                            "terminal_attach_staged"
-                                        } else {
-                                            "terminal_attach_ready"
-                                        };
-                                        let _ = safe_shell_mut(state, action, |shell| {
-                                            if !is_remote_resume_session {
-                                                shell.terminal_resume_ready_paths
-                                                    .insert(session_path.clone());
-                                            }
+                                        let _ = safe_shell_mut(state, "terminal_attach_ready", |shell| {
+                                            shell.terminal_resume_ready_paths
+                                                .insert(session_path.clone());
                                             shell.terminal_attach_in_flight.remove(
                                                 &session_path,
                                             );
                                         });
-                                        if !is_remote_resume_session {
-                                            terminal_overlay_dismissed.set(true);
-                                        }
+                                        terminal_overlay_dismissed.set(true);
                                         maybe_spawn_missing_remote_machine_refreshes(state);
                                         maybe_spawn_missing_managed_cli_refreshes(state);
                                     }
                                 }
-                                if saw_meaningful_output
-                                    || saw_prompt_output
-                                    || tail_prompt_only_output
-                                    || saw_transcript_browser_output
-                                    || saw_attach_ready_marker
-                                {
-                                    if saw_prompt_output || tail_prompt_only_output {
+                                let connected_for_resume = if is_remote_resume_session {
+                                    remote_resume_surface_connected(
+                                        saw_meaningful_output,
+                                        saw_visible_output,
+                                        saw_attach_ready_marker,
+                                        saw_transcript_browser_output,
+                                        saw_generic_idle_output || tail_generic_idle_output,
+                                    )
+                                } else {
+                                    saw_meaningful_output
+                                        || saw_prompt_output
+                                        || tail_prompt_only_output
+                                        || saw_attach_ready_marker
+                                };
+                                if connected_for_resume || saw_transcript_browser_output {
+                                    if connected_for_resume {
                                         terminal_live_host_connected.set(true);
                                     }
                                     if !traced_first_meaningful_output {
@@ -18817,15 +18863,14 @@ fn TerminalCanvas(
                                         traced_first_meaningful_output = true;
                                     }
                                     terminal_has_meaningful_output.set(
-                                        saw_meaningful_output
-                                            && !tail_prompt_only_output
+                                        (saw_meaningful_output
+                                            || saw_generic_idle_output
+                                            || tail_generic_idle_output)
                                             && !saw_transcript_browser_output,
                                     );
                                     terminal_prompt_only.set(
                                         !saw_transcript_browser_output
-                                            && (tail_prompt_only_output
-                                                || (!saw_meaningful_output
-                                                    && saw_prompt_output)),
+                                            && saw_shell_prompt_output,
                                     );
                                 }
                                 if saw_meaningful_output
@@ -18882,44 +18927,57 @@ fn TerminalCanvas(
             }
         }
     });
-    let show_resume_overlay =
-        is_remote_resume_session && !terminal_overlay_dismissed() && !terminal_resume_surface_staged();
+    let show_resume_overlay = false;
     let show_resume_chip =
-        is_remote_resume_session && !terminal_overlay_dismissed() && terminal_resume_surface_staged();
+        is_remote_resume_session && (resume_overlay_failed() || !terminal_overlay_dismissed());
     let show_resume_panel = show_resume_overlay || show_resume_chip;
+    let resume_overlay_has_transport_error = resume_overlay_excerpt
+        .as_deref()
+        .is_some_and(terminal_chunk_is_transport_error);
     let resume_overlay_title = if resume_overlay_failed() {
-        "Remote terminal needs attention"
+        if resume_overlay_has_transport_error {
+            "Remote host is unavailable"
+        } else {
+            "Remote terminal needs attention"
+        }
     } else {
         "Resume live remote session"
     };
     let resume_overlay_body = if resume_overlay_failed() {
-        format!(
-            "Yggterm still has the saved context for {}, but the live terminal has not become interactive yet. You can keep reading here, switch to Preview, or reopen the session once the machine is reachable again.",
-            session.host_label
-        )
+        if resume_overlay_has_transport_error {
+            format!(
+                "Yggterm could not reach {} for a live terminal restore. Fix the machine or network path, then reopen the session.",
+                session.host_label
+            )
+        } else {
+            format!(
+                "Yggterm still has the saved context for {}, but the live terminal did not become interactive in time. Check the machine, reopen the session, or switch to Preview while reconnecting.",
+                session.host_label
+            )
+        }
     } else if terminal_prompt_only() {
         format!(
-            "Yggterm reached {} but the live terminal is sitting at an idle prompt instead of the saved conversation view. The saved transcript stays in front so you can re-enter the context first. Start typing whenever you want to take over.",
+            "Yggterm reached {} but landed on an idle prompt instead of the saved conversation. The terminal surface is visible behind this chip, but this state is not accepted as a real restore.",
             session.host_label
         )
     } else if terminal_has_meaningful_output() {
         format!(
-            "Yggterm has attached to {}. The live terminal stays behind this card on purpose so the saved transcript remains your orientation point first. Start typing whenever you want to take over.",
+            "Yggterm has attached to {}. The terminal is visible now and this chip should clear shortly.",
             session.host_label
         )
     } else if terminal_live_host_connected() {
         format!(
-            "The live terminal on {} is connected. The saved transcript stays in front so you can pick up the thread first, and any typing from you takes over the live terminal immediately.",
+            "The live terminal on {} is connected. Yggterm is waiting for the saved context or prompt to paint.",
             session.host_label
         )
     } else if resume_overlay_slow() {
         format!(
-            "Yggterm is restoring the live terminal on {}. The saved transcript stays in front so you can pick up the thread immediately, and any typing from you takes over the live terminal.",
+            "Yggterm is still restoring the live terminal on {}. If this chip survives past a second, it is a real failure.",
             session.host_label
         )
     } else {
         format!(
-            "Yggterm is restoring the live terminal on {}. The saved transcript stays in front so you can re-enter the conversation immediately, and any typing from you takes over the live terminal.",
+            "Yggterm is restoring the live terminal on {}.",
             session.host_label
         )
     };
@@ -18937,11 +18995,7 @@ fn TerminalCanvas(
     } else {
         "hidden"
     };
-    let terminal_host_visibility = if show_resume_panel {
-        "opacity:0; pointer-events:none;"
-    } else {
-        "opacity:1; visibility:visible;"
-    };
+    let terminal_host_visibility = "opacity:1; visibility:visible;";
     rsx! {
         div {
             key: "{instance_key}",
@@ -18975,11 +19029,11 @@ fn TerminalCanvas(
                     div {
                         "data-terminal-resume-overlay": "true",
                         "data-terminal-resume-overlay-kind": "chip",
-                        style: "position:absolute; top:50%; left:50%; transform:translate(-50%, -50%); z-index:2; width:min(440px, calc(100% - 44px)); pointer-events:none;",
+                        style: "position:absolute; top:18px; left:50%; transform:translateX(-50%); z-index:2; width:min(520px, calc(100% - 44px)); pointer-events:none;",
                         div {
                             style: format!(
-                                "position:relative; display:flex; flex-direction:column; align-items:center; gap:12px; width:100%; min-width:0; \
-                                 padding:20px 22px 18px 22px; border-radius:18px; \
+                                "position:relative; display:flex; flex-direction:column; gap:10px; width:100%; min-width:0; \
+                                 padding:14px 16px 14px 16px; border-radius:18px; \
                                  background:rgba(255,255,255,0.9); box-shadow:0 18px 44px rgba(148,163,184,0.16), inset 0 0 0 1px rgba(170,190,212,0.16); \
                                  backdrop-filter:{}; -webkit-backdrop-filter:{};",
                                 resume_overlay_blur,
@@ -18989,9 +19043,9 @@ fn TerminalCanvas(
                                 style: "position:absolute; inset:0; border-radius:18px; opacity:0.72; background:radial-gradient(circle at 18% 18%, rgba(191,219,254,0.20) 0%, rgba(191,219,254,0.00) 34%), radial-gradient(circle at 82% 14%, rgba(251,191,36,0.08) 0%, rgba(251,191,36,0.00) 28%), linear-gradient(180deg, rgba(255,255,255,0.00) 0%, rgba(255,255,255,0.28) 100%);"
                             }
                             div {
-                                style: "position:relative; z-index:1; display:flex; align-items:center; justify-content:space-between; gap:14px; width:100%;",
+                                style: "position:relative; z-index:1; display:flex; align-items:flex-start; justify-content:space-between; gap:14px; width:100%;",
                                 div {
-                                    style: "display:flex; flex-direction:column; gap:7px; min-width:0; flex:1;",
+                                    style: "display:flex; flex-direction:column; gap:6px; min-width:0; flex:1;",
                                     div {
                                         LoadingStateChip {
                                             label: "Remote terminal resume".to_string(),
@@ -18999,19 +19053,19 @@ fn TerminalCanvas(
                                         }
                                     }
                                     div {
-                                        style: format!("font-size:15px; line-height:1.3; font-weight:700; color:{}; text-align:left;", snapshot.palette.text),
+                                        style: format!("font-size:14px; line-height:1.3; font-weight:700; color:{}; text-align:left;", snapshot.palette.text),
                                         "{resume_overlay_title}"
                                     }
                                     div {
-                                        style: format!("font-size:12px; line-height:1.68; color:{}; max-width:320px;", snapshot.palette.muted),
+                                        style: format!("font-size:11px; line-height:1.55; color:{}; max-width:340px;", snapshot.palette.muted),
                                         "{resume_overlay_body}"
                                     }
                                 }
                                 div {
-                                    style: "display:flex; flex-direction:column; align-items:flex-end; gap:7px; flex-shrink:0;",
+                                    style: "display:flex; flex-direction:column; align-items:flex-end; gap:6px; flex-shrink:0;",
                                     div {
                                         style: format!(
-                                            "display:inline-flex; align-items:center; gap:8px; padding:8px 12px; border-radius:999px; \
+                                            "display:inline-flex; align-items:center; gap:8px; padding:7px 11px; border-radius:999px; \
                                              background:{}; box-shadow:inset 0 0 0 1px rgba(170,190,212,0.16);",
                                             snapshot.palette.panel
                                         ),
@@ -19050,13 +19104,13 @@ fn TerminalCanvas(
                                     div {
                                         "data-terminal-resume-excerpt": "true",
                                         style: format!(
-                                            "display:flex; flex-direction:column; gap:8px; min-width:0; padding:13px 14px 12px 14px; \
+                                            "display:flex; flex-direction:column; gap:8px; min-width:0; padding:10px 12px 9px 12px; \
                                              border-radius:14px; background:{}; box-shadow:inset 0 0 0 1px rgba(170,190,212,0.14);",
                                             snapshot.palette.panel
                                         ),
                                         div {
                                             style: format!(
-                                                "font-size:12px; line-height:1.68; color:{}; white-space:pre-wrap; overflow-wrap:anywhere;",
+                                                "font-size:11px; line-height:1.55; color:{}; white-space:pre-wrap; overflow-wrap:anywhere;",
                                                 snapshot.palette.text,
                                             ),
                                             "{excerpt}"
@@ -19073,7 +19127,7 @@ fn TerminalCanvas(
                                 }
                             }
                             div {
-                                style: "position:relative; z-index:1; display:flex; align-items:center; gap:6px;",
+                                style: "position:relative; z-index:1; display:flex; align-items:center; justify-content:center; gap:6px;",
                                 for ix in 0..3 {
                                     div {
                                         key: "{ix}",
@@ -19087,7 +19141,7 @@ fn TerminalCanvas(
                                 }
                             }
                             div {
-                                style: format!("position:relative; z-index:1; font-size:12px; line-height:1.65; color:{}; text-align:center; max-width:330px;", snapshot.palette.muted),
+                                style: format!("position:relative; z-index:1; font-size:11px; line-height:1.5; color:{}; text-align:center; max-width:360px;", snapshot.palette.muted),
                                 if resume_overlay_failed() {
                                     "The live terminal still has not become interactive."
                                 } else {
@@ -19264,22 +19318,13 @@ fn batch_terminal_chunks(
         return (None, false, false, false, false, false, false);
     }
     let mut combined = String::new();
-    let mut saw_visible_output = false;
-    let mut saw_meaningful_output = false;
-    let mut saw_prompt_output = false;
     for chunk in chunks {
-        if !saw_visible_output && terminal_chunk_has_visible_output(&chunk.data) {
-            saw_visible_output = true;
-        }
-        if !saw_meaningful_output && terminal_chunk_has_meaningful_output(&chunk.data) {
-            saw_meaningful_output = true;
-        }
-        if !saw_prompt_output && terminal_chunk_has_prompt_output(&chunk.data) {
-            saw_prompt_output = true;
-        }
         combined.push_str(&chunk.data);
     }
     let (combined, saw_attach_ready_marker) = strip_terminal_attach_ready_marker(&combined);
+    let saw_visible_output = terminal_chunk_has_visible_output(&combined);
+    let saw_meaningful_output = terminal_chunk_has_meaningful_output(&combined);
+    let saw_prompt_output = terminal_chunk_has_prompt_output(&combined);
     let tail_prompt_only_output = terminal_chunk_tail_is_idle(&combined);
     let saw_transcript_browser_output = terminal_chunk_is_transcript_browser(&combined);
     (
@@ -19314,6 +19359,50 @@ fn terminal_chunk_tail_is_idle(data: &str) -> bool {
         || terminal_chunk_is_loading_placeholder(&tail)
 }
 
+fn terminal_chunk_tail_is_generic_codex_idle(data: &str) -> bool {
+    let tail = terminal_tail_excerpt(data, 1_400);
+    terminal_chunk_is_generic_codex_idle(&tail)
+}
+
+fn remote_resume_surface_connected(
+    saw_meaningful_output: bool,
+    saw_visible_output: bool,
+    saw_attach_ready_marker: bool,
+    saw_transcript_browser_output: bool,
+    saw_generic_idle_output: bool,
+) -> bool {
+    !saw_transcript_browser_output
+        && (saw_meaningful_output
+            || saw_generic_idle_output
+            || (saw_attach_ready_marker && saw_visible_output))
+}
+
+fn terminal_chunk_is_transport_error(data: &str) -> bool {
+    let normalized = strip_terminal_control_sequences(data)
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.is_empty() {
+        return false;
+    }
+    [
+        "error: reading /tmp/yggterm-screen",
+        "mux_client_request_session",
+        "session open refused by peer",
+        "controlsocket",
+        "permission denied",
+        "connection refused",
+        "no route to host",
+        "connection timed out",
+        "broken pipe",
+        "connection to ",
+        "[screen is terminating]",
+    ]
+    .iter()
+    .any(|fragment| normalized.contains(fragment))
+}
+
 fn terminal_tail_excerpt(data: &str, max_chars: usize) -> String {
     let chars = data.chars().collect::<Vec<_>>();
     if chars.len() <= max_chars {
@@ -19324,11 +19413,20 @@ fn terminal_tail_excerpt(data: &str, max_chars: usize) -> String {
         .collect()
 }
 
+fn terminal_resume_excerpt_is_meaningful(text: &str) -> bool {
+    let trimmed = text.trim();
+    !trimmed.is_empty()
+        && !looks_like_low_signal_generated_copy(trimmed)
+        && !terminal_chunk_is_loading_placeholder(trimmed)
+        && !terminal_chunk_is_generic_codex_idle(trimmed)
+        && !terminal_chunk_is_transcript_browser(trimmed)
+        && !terminal_chunk_has_prompt_output(trimmed)
+}
+
 fn remote_resume_overlay_seed_excerpt(session: &ManagedSessionView) -> Option<String> {
     let precis = terminal_precis(session);
     let precis = precis.trim();
-    (!precis.is_empty() && !looks_like_low_signal_generated_copy(precis))
-        .then(|| truncate_preview_excerpt(precis, 240))
+    terminal_resume_excerpt_is_meaningful(precis).then(|| truncate_preview_excerpt(precis, 240))
 }
 
 fn terminal_resume_output_excerpt(data: &str) -> Option<String> {
@@ -19360,7 +19458,7 @@ fn terminal_resume_output_excerpt(data: &str) -> Option<String> {
     }
     let excerpt = lines.join(" ");
     let excerpt = excerpt.trim();
-    (!excerpt.is_empty()).then(|| truncate_preview_excerpt(excerpt, 240))
+    terminal_resume_excerpt_is_meaningful(excerpt).then(|| truncate_preview_excerpt(excerpt, 240))
 }
 
 fn remote_resume_overlay_excerpt(session: &ManagedSessionView) -> Option<String> {
@@ -19381,7 +19479,7 @@ fn remote_resume_overlay_excerpt(session: &ManagedSessionView) -> Option<String>
         .map(|line| truncate_preview_excerpt(line, 240))
         .or_else(|| {
             let summary = preview_summary_metadata_value(session, "Summary").unwrap_or_default();
-            (!summary.trim().is_empty() && !looks_like_low_signal_generated_copy(&summary))
+            terminal_resume_excerpt_is_meaningful(&summary)
                 .then(|| truncate_preview_excerpt(summary.trim(), 240))
         })
 }
@@ -25050,6 +25148,41 @@ Waiting for the remote terminal to paint...\n";
     }
 
     #[test]
+    fn batch_terminal_chunks_rejects_split_generic_codex_idle() {
+        let chunks = vec![
+            yggterm_server::TerminalStreamChunk {
+                seq: 1,
+                data: "╭───────────────────────────────────────────────────╮\n│ >_ OpenAI Codex (v0.118.0)                        │\n".to_string(),
+            },
+            yggterm_server::TerminalStreamChunk {
+                seq: 2,
+                data: "│                                                   │\n│ model:     gpt-5.4 high   fast   /model to change │\n│ directory: ~                                      │\n".to_string(),
+            },
+            yggterm_server::TerminalStreamChunk {
+                seq: 3,
+                data: "╰───────────────────────────────────────────────────╯\n› Summarize recent commits\n  gpt-5.4 high fast · 100% left · ~\n".to_string(),
+            },
+        ];
+
+        let (
+            _combined,
+            saw_visible_output,
+            saw_meaningful_output,
+            saw_prompt_output,
+            tail_prompt_only_output,
+            saw_transcript_browser_output,
+            saw_attach_ready_marker,
+        ) = batch_terminal_chunks(chunks);
+
+        assert!(saw_visible_output);
+        assert!(!saw_meaningful_output);
+        assert!(!saw_prompt_output);
+        assert!(tail_prompt_only_output);
+        assert!(!saw_transcript_browser_output);
+        assert!(!saw_attach_ready_marker);
+    }
+
+    #[test]
     fn remote_resume_agent_session_excludes_plain_remote_shells() {
         let mut session = ManagedSessionView {
             id: "abc".to_string(),
@@ -25246,6 +25379,20 @@ I will inspect the wireless logs next.\r\n";
                 "The machine has ip 192.168.0.144 but I can ssh from 192.168.0.138. I will inspect the wireless logs next."
             )
         );
+    }
+
+    #[test]
+    fn terminal_resume_output_excerpt_rejects_generic_codex_idle() {
+        let data = "\
+ >_ OpenAI Codex (v0.118.0)\n\
+model:     gpt-5.4 high   /model to change\n\
+directory: ~\n\
+\n\
+Run /review on my current changes\n\
+gpt-5.4 high · 100% left · ~\n";
+
+        assert_eq!(terminal_resume_output_excerpt(data), None);
+        assert!(!terminal_resume_excerpt_is_meaningful(data));
     }
 }
 

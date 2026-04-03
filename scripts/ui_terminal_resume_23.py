@@ -4,7 +4,9 @@ import json
 import os
 import random
 import shlex
+import signal
 import shutil
+import statistics
 import subprocess
 import time
 from pathlib import Path
@@ -54,8 +56,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=23)
     parser.add_argument("--timeout-ms", type=int, default=8000)
     parser.add_argument("--poll", type=float, default=0.08)
-    parser.add_argument("--paint-budget", type=float, default=1.0)
+    parser.add_argument("--paint-budget", type=float, default=0.45)
     parser.add_argument("--launch-local", action="store_true")
+    parser.add_argument("--include-unreachable", action="store_true")
     parser.add_argument("--out-dir", default="/tmp/yggterm-terminal-resume-23")
     return parser.parse_args()
 
@@ -145,9 +148,9 @@ def latest_window_spawn_event_for_pid(host: str, pid: int, start_ms: int) -> dic
     return None
 
 
-def kill_local_clients() -> None:
+def kill_local_clients(binary: str) -> None:
+    binary_path = str(Path(binary).resolve())
     instances_root = local_yggterm_path("client-instances")
-    using_default_home = local_yggterm_home() == Path.home() / ".yggterm"
     if instances_root.is_dir():
         for path in instances_root.glob("*/*.json"):
             try:
@@ -157,7 +160,7 @@ def kill_local_clients() -> None:
             pid = int(record.get("pid") or 0)
             if pid > 0:
                 try:
-                    os.kill(pid, 15)
+                    os.kill(pid, signal.SIGTERM)
                 except Exception:
                     pass
         time.sleep(0.3)
@@ -169,20 +172,52 @@ def kill_local_clients() -> None:
             pid = int(record.get("pid") or 0)
             if pid > 0:
                 try:
-                    os.kill(pid, 9)
+                    os.kill(pid, signal.SIGKILL)
                 except Exception:
                     pass
-    if using_default_home:
-        run_process(["bash", "-lc", "pkill -f 'yggterm server daemon' || true"], check=False)
+    self_pid = os.getpid()
+    for proc_dir in Path("/proc").iterdir():
+        if not proc_dir.name.isdigit():
+            continue
+        pid = int(proc_dir.name)
+        if pid == self_pid:
+            continue
+        try:
+            raw = (proc_dir / "cmdline").read_bytes()
+        except Exception:
+            continue
+        if not raw:
+            continue
+        argv = [part.decode("utf-8", errors="ignore") for part in raw.split(b"\0") if part]
+        if not argv:
+            continue
+        is_local_client = argv[0] == binary_path
+        is_local_daemon = len(argv) >= 4 and argv[0] == binary_path and argv[1:4] == [
+            "server",
+            "daemon",
+            "--stdio",
+        ]
+        is_legacy_daemon = len(argv) >= 3 and "yggterm" in argv[0] and argv[1:3] == [
+            "server",
+            "daemon",
+        ]
+        if not (is_local_client or is_local_daemon or is_legacy_daemon):
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
 
 
 def launch_local_client(binary: str, timeout_s: float = 4.0) -> tuple[subprocess.Popen, dict]:
     binary_path = str(Path(binary).resolve())
-    kill_local_clients()
+    kill_local_clients(binary_path)
     env = os.environ.copy()
     env.setdefault("DISPLAY", ":10.0")
+    env.setdefault("XAUTHORITY", str(Path.home() / ".Xauthority"))
     env.pop("XRDP_SESSION", None)
     env.pop("XRDP_SOCKET_PATH", None)
+    env["YGGTERM_ALLOW_MULTI_WINDOW"] = "1"
     env["YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF"] = "1"
     baseline_window_count = local_x11_window_count()
     proc = subprocess.Popen(
@@ -357,8 +392,6 @@ def resume_overlay_counts_as_painted(viewport: dict, overlay: dict, terminal_tex
         return False
     if terminal_text_looks_like_error(source_text):
         return False
-    if terminal_text_looks_like_generic_idle(source_text):
-        return False
     if terminal_text_looks_like_shell_prompt(source_text):
         return False
     if terminal_text_looks_like_transcript_browser(source_text):
@@ -497,6 +530,7 @@ def collect_remote_terminal_targets(rows_payload: dict) -> list[dict]:
         candidates.append(
             {
                 "full_path": path,
+                "remote_host": path.split("//", 1)[-1].split("/", 1)[0],
                 "label": row.get("label") or path,
                 "summary": str(row.get("summary") or "").strip(),
             }
@@ -505,10 +539,44 @@ def collect_remote_terminal_targets(rows_payload: dict) -> list[dict]:
     return candidates
 
 
-def choose_remote_terminal_targets(rows_payload: dict, seed: int, count: int) -> list[dict]:
+def probe_remote_host(host: str) -> tuple[bool, str]:
+    result = run_process(
+        ["bash", "-lc", f"timeout 5s ssh {quote(host)} 'true'"],
+        check=False,
+    )
+    stderr = (result.stderr or "").strip()
+    stdout = (result.stdout or "").strip()
+    message = stderr or stdout
+    return result.returncode == 0, message
+
+
+def choose_remote_terminal_targets(
+    rows_payload: dict,
+    seed: int,
+    count: int,
+    *,
+    include_unreachable: bool,
+) -> tuple[list[dict], dict[str, dict]]:
     candidates = collect_remote_terminal_targets(rows_payload)
     if not candidates:
         raise RuntimeError("no remote session rows available for terminal-resume test")
+
+    host_probe: dict[str, dict] = {}
+    for candidate in candidates:
+        remote_host = candidate["remote_host"]
+        if remote_host in host_probe:
+            continue
+        reachable, detail = probe_remote_host(remote_host)
+        host_probe[remote_host] = {"reachable": reachable, "detail": detail}
+
+    if not include_unreachable:
+        candidates = [
+            candidate
+            for candidate in candidates
+            if host_probe.get(candidate["remote_host"], {}).get("reachable")
+        ]
+        if not candidates:
+            raise RuntimeError("no SSH-reachable remote sessions available for terminal-resume test")
 
     chosen: list[dict] = []
     seen_paths: set[str] = set()
@@ -543,7 +611,22 @@ def choose_remote_terminal_targets(rows_payload: dict, seed: int, count: int) ->
         if len(chosen) >= count:
             break
 
-    return chosen
+    return chosen, host_probe
+
+
+def percentile(values: list[float], pct: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    index = max(0.0, min(len(ordered) - 1, (len(ordered) - 1) * pct))
+    lower = int(index)
+    upper = min(lower + 1, len(ordered) - 1)
+    if lower == upper:
+        return ordered[lower]
+    fraction = index - lower
+    return ordered[lower] * (1 - fraction) + ordered[upper] * fraction
 
 
 def require_terminal_painted(state: dict, session_path: str) -> dict:
@@ -561,33 +644,26 @@ def require_terminal_painted(state: dict, session_path: str) -> dict:
     overlay_visible = bool(overlay.get("visible"))
     overlay_text = (overlay.get("text_sample") or "").strip().lower()
     overlay_kind = (overlay.get("kind") or "").strip().lower()
-    active_summary = (viewport.get("active_summary") or "").strip()
     if terminal_text_looks_like_error(text):
         raise RuntimeError("terminal painted transport/error output instead of the session")
-    if overlay_visible and overlay_kind == "chip":
-        if not resume_overlay_counts_as_painted(viewport, overlay, text):
-            raise RuntimeError("resume chip did not surface saved-session context")
-        if "live terminal is ready" in overlay_text:
-            raise RuntimeError("resume overlay still uses the old misleading terminal-ready copy")
-        if "still connecting to remote terminal" in overlay_text:
-            raise RuntimeError("resume overlay still uses indefinite connecting copy")
-        return state
-    if terminal_text_looks_like_generic_idle(text):
-        raise RuntimeError("terminal exposed generic Codex idle prompt instead of restored session UX")
     if terminal_text_looks_like_shell_prompt(text):
         raise RuntimeError("terminal exposed plain shell prompt instead of restored session UX")
     if terminal_text_looks_like_transcript_browser(text):
         raise RuntimeError("terminal exposed Codex transcript browser instead of live session surface")
+    if overlay_visible:
+        raise RuntimeError("resume chip still visible after paint budget")
+    if overlay_visible and overlay_kind != "chip":
+        raise RuntimeError("resume overlay still covers terminal after paint budget")
     if overlay_visible and "live terminal is ready" in overlay_text:
         raise RuntimeError("resume overlay still uses the old misleading terminal-ready copy")
     if overlay_visible and "still connecting to remote terminal" in overlay_text:
         raise RuntimeError("resume overlay still uses indefinite connecting copy")
-    if overlay_visible and overlay_kind != "chip":
-        raise RuntimeError("resume overlay still covers terminal after paint budget")
     if terminal_text_looks_like_placeholder(text):
         raise RuntimeError("terminal still showing placeholder content")
     if not text:
         raise RuntimeError("terminal is blank")
+    if not (resume_overlay_counts_as_painted(viewport, overlay, text) or len(text.strip()) > 24):
+        raise RuntimeError("terminal did not paint meaningful saved/live context")
     return state
 
 
@@ -603,7 +679,12 @@ def main() -> int:
 
     wait_for_window(args.host, args.bin, args.timeout_ms)
     rows_payload = expand_groups_until_target(args.host, args.bin, args.timeout_ms, args.count)
-    targets = choose_remote_terminal_targets(rows_payload, args.seed, args.count)
+    targets, host_probe = choose_remote_terminal_targets(
+        rows_payload,
+        args.seed,
+        args.count,
+        include_unreachable=args.include_unreachable,
+    )
     results: list[dict] = []
 
     for index, target in enumerate(targets):
@@ -672,6 +753,14 @@ def main() -> int:
         "unique_target_count": len({item["path"] for item in results}),
         "seed": args.seed,
         "paint_budget_s": args.paint_budget,
+        "reachable_hosts": sorted(
+            host for host, payload in host_probe.items() if payload.get("reachable")
+        ),
+        "unreachable_hosts": {
+            host: payload.get("detail")
+            for host, payload in host_probe.items()
+            if not payload.get("reachable")
+        },
         "window_spawn_elapsed_ms": ((launch_event or {}).get("payload") or {}).get("elapsed_ms"),
         "window_spawn_within_900ms": (
             (((launch_event or {}).get("payload") or {}).get("elapsed_ms") or 10_000) <= 900
@@ -682,16 +771,9 @@ def main() -> int:
             [
                 item for item in results
                 if terminal_text_looks_like_placeholder(item.get("terminal_text_sample") or "")
-                and not resume_overlay_counts_as_painted(
-                    {
-                        "active_summary": item.get("active_summary") or "",
-                    },
-                    item.get("terminal_resume_overlay") or {},
-                    item.get("terminal_text_sample") or "",
-                )
             ]
         ),
-        "generic_idle_failures": len(
+        "generic_idle_surfaces": len(
             [
                 item for item in results
                 if terminal_text_looks_like_generic_idle(item.get("terminal_text_sample") or "")
@@ -736,6 +818,14 @@ def main() -> int:
         ),
         "results": results,
     }
+    elapsed_values = [float(item["elapsed_s"]) for item in results if item.get("elapsed_s") is not None]
+    summary["latency_stats_s"] = {
+        "min": min(elapsed_values) if elapsed_values else None,
+        "mean": statistics.fmean(elapsed_values) if elapsed_values else None,
+        "median": statistics.median(elapsed_values) if elapsed_values else None,
+        "p95": percentile(elapsed_values, 0.95),
+        "max": max(elapsed_values) if elapsed_values else None,
+    }
     summary_path = out_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(summary_path)
@@ -754,7 +844,6 @@ def main() -> int:
         and summary["open_failures"] == 0
         and summary["paint_budget_failures"] == 0
         and summary["placeholder_failures"] == 0
-        and summary["generic_idle_failures"] == 0
         and summary["shell_prompt_failures"] == 0
         and summary["transcript_browser_failures"] == 0
         and summary["terminal_error_failures"] == 0

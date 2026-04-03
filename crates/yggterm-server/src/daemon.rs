@@ -363,8 +363,11 @@ impl DaemonRuntime {
             );
         }
         if self.terminals.has_session(path) {
-            let requires_fresh_attach = terminal_session_requires_fresh_attach(path);
-            if requires_fresh_attach
+            let still_running = self.terminals.session_is_running(path);
+            let stale_remote_attach =
+                path.starts_with("remote-session://") && !self.terminals.session_has_output(path);
+            if !still_running
+                || stale_remote_attach
                 || !self
                     .terminals
                     .session_matches_spec(path, &launch_command, cwd.as_deref())
@@ -743,10 +746,6 @@ impl DaemonRuntime {
         );
         Ok(response)
     }
-}
-
-fn terminal_session_requires_fresh_attach(path: &str) -> bool {
-    path.starts_with("remote-session://")
 }
 
 fn trim_terminal_buffers(
@@ -2139,7 +2138,7 @@ fn send_request(endpoint: &ServerEndpoint, request: &ServerRequest) -> Result<Se
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_remote_copy_candidates, terminal_session_requires_fresh_attach};
+    use super::collect_remote_copy_candidates;
     use crate::{
         RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession,
         remote_scanned_session_path,
@@ -2204,10 +2203,88 @@ mod tests {
     }
 
     #[test]
-    fn remote_session_paths_force_fresh_attach() {
-        assert!(terminal_session_requires_fresh_attach(
-            "remote-session://jojo/019c376c-8691-7810-8f91-bb5605e37a4e"
-        ));
-        assert!(!terminal_session_requires_fresh_attach("local://codex"));
+    fn collect_remote_copy_candidates_preserve_machine_order_across_duplicates() {
+        let machines = vec![
+            RemoteMachineSnapshot {
+                machine_key: "jojo".to_string(),
+                label: "jojo".to_string(),
+                ssh_target: "jojo".to_string(),
+                prefix: None,
+                remote_binary_expr: None,
+                remote_deploy_state: RemoteDeployState::Ready,
+                health: RemoteMachineHealth::Healthy,
+                sessions: vec![
+                    RemoteScannedSession {
+                        session_path: remote_scanned_session_path("jojo", "one"),
+                        session_id: "one".to_string(),
+                        cwd: "/home/pi".to_string(),
+                        started_at: "2026-04-01T00:00:00Z".to_string(),
+                        modified_epoch: 1,
+                        event_count: 1,
+                        user_message_count: 1,
+                        assistant_message_count: 0,
+                        title_hint: "One".to_string(),
+                        recent_context: String::new(),
+                        cached_precis: None,
+                        cached_summary: None,
+                        storage_path: "/home/pi/.codex/sessions/one.jsonl".to_string(),
+                    },
+                    RemoteScannedSession {
+                        session_path: remote_scanned_session_path("jojo", "two"),
+                        session_id: "two".to_string(),
+                        cwd: "/home/pi".to_string(),
+                        started_at: "2026-04-01T00:01:00Z".to_string(),
+                        modified_epoch: 2,
+                        event_count: 2,
+                        user_message_count: 1,
+                        assistant_message_count: 1,
+                        title_hint: "Two".to_string(),
+                        recent_context: String::new(),
+                        cached_precis: None,
+                        cached_summary: None,
+                        storage_path: "/home/pi/.codex/sessions/two.jsonl".to_string(),
+                    },
+                ],
+            },
+            RemoteMachineSnapshot {
+                machine_key: "oc".to_string(),
+                label: "oc".to_string(),
+                ssh_target: "oc".to_string(),
+                prefix: None,
+                remote_binary_expr: None,
+                remote_deploy_state: RemoteDeployState::Ready,
+                health: RemoteMachineHealth::Healthy,
+                sessions: vec![RemoteScannedSession {
+                    session_path: remote_scanned_session_path("oc", "three"),
+                    session_id: "three".to_string(),
+                    cwd: "/root".to_string(),
+                    started_at: "2026-04-01T00:02:00Z".to_string(),
+                    modified_epoch: 3,
+                    event_count: 3,
+                    user_message_count: 2,
+                    assistant_message_count: 1,
+                    title_hint: "Three".to_string(),
+                    recent_context: String::new(),
+                    cached_precis: None,
+                    cached_summary: None,
+                    storage_path: "/root/.codex/sessions/three.jsonl".to_string(),
+                }],
+            },
+        ];
+
+        let candidates = collect_remote_copy_candidates(&machines);
+        let keys = candidates
+            .into_iter()
+            .map(|candidate| {
+                candidate
+                    .remote_machine
+                    .expect("remote machine")
+                    .machine_key
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            vec!["jojo".to_string(), "jojo".to_string(), "oc".to_string()]
+        );
     }
 }
