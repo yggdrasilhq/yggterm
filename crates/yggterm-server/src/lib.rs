@@ -7106,6 +7106,21 @@ pub fn run_app_control_scroll_preview(
     Ok(())
 }
 
+pub fn run_app_control_set_main_zoom(
+    value: f32,
+    view_mode: Option<AppControlViewMode>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::SetMainZoom { value, view_mode },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 pub fn run_app_control_set_search(
     query: &str,
     focused: Option<bool>,
