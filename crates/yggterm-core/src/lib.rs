@@ -144,6 +144,7 @@ pub struct AppSettings {
     pub show_tree: bool,
     pub show_settings: bool,
     pub tree_width: f32,
+    pub rendered_font_size: f32,
     pub terminal_font_size: f32,
     pub terminal_theme_name: String,
     pub ui_font_size: f32,
@@ -167,6 +168,7 @@ impl Default for AppSettings {
             show_tree: true,
             show_settings: false,
             tree_width: 300.0,
+            rendered_font_size: 10.0,
             terminal_font_size: 13.0,
             terminal_theme_name: String::new(),
             ui_font_size: 14.0,
@@ -560,6 +562,10 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
         settings.tree_width =
             serde_json::from_value(value.clone()).context("failed to parse tree_width")?;
     }
+    if let Some(value) = object.get("rendered_font_size") {
+        settings.rendered_font_size =
+            serde_json::from_value(value.clone()).context("failed to parse rendered_font_size")?;
+    }
     if let Some(value) = object.get("terminal_font_size") {
         settings.terminal_font_size =
             serde_json::from_value(value.clone()).context("failed to parse terminal_font_size")?;
@@ -622,6 +628,7 @@ fn serialize_settings_value(settings: &AppSettings) -> Value {
         "show_tree": settings.show_tree,
         "show_settings": settings.show_settings,
         "tree_width": settings.tree_width,
+        "rendered_font_size": settings.rendered_font_size,
         "terminal_font_size": settings.terminal_font_size,
         "terminal_theme_name": settings.terminal_theme_name,
         "ui_font_size": settings.ui_font_size,

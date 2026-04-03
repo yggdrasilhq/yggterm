@@ -396,15 +396,23 @@ def collect_open_targets(rows_payload: dict, rng: random.Random) -> list[dict]:
         if kind not in {"Session", "Document"} or not session_path or session_path in seen_paths:
             continue
         if kind == "Document":
-            view = "preview"
+            document_kind = (row.get("document_kind") or "").strip().lower()
+            requested_view = rng.choice(["preview", "terminal"])
+            if document_kind == "terminal_recipe":
+                expected_view = requested_view
+            else:
+                expected_view = "preview"
         else:
-            view = rng.choice(["preview", "terminal"])
+            requested_view = rng.choice(["preview", "terminal"])
+            expected_view = requested_view
         candidates.append(
             {
                 "full_path": session_path,
                 "label": row.get("label") or session_path,
                 "kind": kind,
-                "view": view,
+                "document_kind": row.get("document_kind"),
+                "requested_view": requested_view,
+                "expected_view": expected_view,
             }
         )
         seen_paths.add(session_path)
@@ -438,17 +446,20 @@ def main() -> int:
 
     for index, target in enumerate(targets):
         session_path = target["full_path"]
-        view = target["view"]
+        requested_view = target["requested_view"]
+        expected_view = target["expected_view"]
         started_ms = int(time.time() * 1000)
         deadline_ms = started_ms + int(args.ready_budget * 1000)
         entry = {
             "path": session_path,
             "label": target.get("label"),
             "kind": target.get("kind"),
-            "view": view,
+            "document_kind": target.get("document_kind"),
+            "requested_view": requested_view,
+            "expected_view": expected_view,
         }
         try:
-            entry["open"] = app_open(args.host, args.bin, session_path, view, args.timeout_ms)
+            entry["open"] = app_open(args.host, args.bin, session_path, requested_view, args.timeout_ms)
             elapsed, state = wait_until(
                 f"open {session_path}",
                 args.ready_budget,
@@ -456,7 +467,7 @@ def main() -> int:
                 lambda: _require_viewport_ready(
                     app_state(args.host, args.bin, args.timeout_ms),
                     session_path,
-                    view,
+                    expected_view,
                     args.host,
                     started_ms,
                     deadline_ms,
@@ -481,7 +492,7 @@ def main() -> int:
             entry["state_dump"] = write_json(out_dir / f"open-{index:02d}.json", state)
             entry["attach_ready_before_deadline"] = (
                 terminal_attach_ready_seen(args.host, session_path, started_ms, deadline_ms)
-                if view == "terminal"
+                if expected_view == "terminal"
                 else None
             )
         except Exception as error:  # noqa: BLE001
@@ -509,7 +520,7 @@ def main() -> int:
             entry["state_dump"] = write_json(out_dir / f"open-{index:02d}-failure.json", state)
             entry["attach_ready_before_deadline"] = (
                 terminal_attach_ready_seen(args.host, session_path, started_ms, deadline_ms)
-                if view == "terminal"
+                if expected_view == "terminal"
                 else None
             )
         results.append(entry)
