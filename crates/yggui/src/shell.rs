@@ -1362,6 +1362,36 @@ impl ShellState {
             self.busy_request_id = Some(request_meta.request_id.clone());
             self.server_busy = true;
         }
+        if matches!(request_surface, YggSurface::Preview | YggSurface::Terminal) {
+            let conflicting_surface = match request_surface {
+                YggSurface::Preview => Some(YggSurface::Terminal),
+                YggSurface::Terminal => Some(YggSurface::Preview),
+                _ => None,
+            };
+            if let Some(conflicting_surface) = conflicting_surface {
+                if let Some(conflicting_request) =
+                    self.active_surface_requests.remove(&conflicting_surface)
+                {
+                    self.clear_job_notification(&format!("loading:{}", conflicting_request.request_id));
+                    if let Ok(store) = SessionStore::open_or_init() {
+                        append_trace_event(
+                            store.home_dir(),
+                            "ui",
+                            "surface_request",
+                            "cleared_conflict",
+                            json!({
+                                "request_id": conflicting_request.request_id,
+                                "conflicting_surface": format!("{conflicting_surface:?}"),
+                                "replacement_request_id": request_id,
+                                "replacement_surface": format!("{request_surface:?}"),
+                                "replacement_operation": request_operation,
+                                "replacement_target": serde_json::to_value(&request_target).unwrap_or(Value::Null),
+                            }),
+                        );
+                    }
+                }
+            }
+        }
         let replaced = self.active_surface_requests.insert(
             request_surface,
             ActiveSurfaceRequest {
