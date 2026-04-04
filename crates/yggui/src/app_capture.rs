@@ -59,7 +59,8 @@ pub fn focus_app_window(desktop: &DesktopContext) -> Result<Value> {
     desktop.set_minimized(false);
     desktop.set_focus();
     Ok(json!({
-        "focused": true,
+        "focused_requested": true,
+        "focused": desktop.is_focused(),
         "window": describe_window(desktop),
     }))
 }
@@ -71,8 +72,14 @@ pub fn describe_window(desktop: &DesktopContext) -> Value {
     json!({
         "title": desktop.title(),
         "visible": desktop.is_visible(),
+        "focused": desktop.is_focused(),
         "maximized": desktop.is_maximized(),
         "decorated": desktop.is_decorated(),
+        "display": std::env::var("DISPLAY").ok(),
+        "wayland_display": std::env::var("WAYLAND_DISPLAY").ok(),
+        "xdg_session_id": std::env::var("XDG_SESSION_ID").ok(),
+        "xdg_runtime_dir": std::env::var("XDG_RUNTIME_DIR").ok(),
+        "xauthority": std::env::var("XAUTHORITY").ok(),
         "inner_size": {
             "width": inner.width,
             "height": inner.height,
