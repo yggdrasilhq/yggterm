@@ -29,6 +29,7 @@ pub use daemon::{
     snapshot, start_command_session, start_local_session, start_local_session_at,
     start_ssh_session_at, status, switch_agent_session_mode, sync_external_window, sync_theme,
     terminal_ensure, terminal_read, terminal_resize, terminal_write, toggle_preview_block,
+    ensure_remote_runtime_codex_session as daemon_ensure_remote_runtime_codex_session,
 };
 pub use host::{GhosttyHostKind, GhosttyHostSupport, GhosttyTerminalHostMode, detect_ghostty_host};
 pub use protocol::{
@@ -2272,6 +2273,120 @@ impl YggtermServer {
         key
     }
 
+    pub fn ensure_remote_runtime_codex_session(
+        &mut self,
+        session_id: &str,
+        cwd: Option<&str>,
+        require_existing: bool,
+    ) -> anyhow::Result<String> {
+        let saved_session_exists = remote_saved_codex_session_exists(session_id)?;
+        if remote_resume_requires_missing_saved_session_failure(require_existing, saved_session_exists)
+        {
+            anyhow::bail!(remote_resume_missing_saved_session_error(session_id));
+        }
+        let key = remote_runtime_codex_session_key(session_id);
+        let target = local_session_target(SessionKind::Codex, cwd);
+        let fallback_title = format!("Remote Codex {}", session_id.chars().take(8).collect::<String>());
+        let title = self
+            .sessions
+            .get(&key)
+            .map(|session| session.title.clone())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(fallback_title);
+        if !self.sessions.contains_key(&key) {
+            self.insert_live_session_with_launch(
+                &key,
+                session_id,
+                SessionKind::Codex,
+                &target,
+                Some(title.clone()),
+                false,
+            );
+        }
+        let launch_command = if saved_session_exists {
+            remote_persistent_resume_shell_command(session_id, cwd)
+        } else {
+            remote_resume_picker_shell_command(session_id, cwd, None, true)
+        };
+        let home = resolve_yggterm_home()?;
+        let registry = RemoteRuntimeRegistry::open(&home)?;
+        let _ = registry.register_session(RemoteRuntimeSessionInput {
+            session_id: Some(session_id.to_string()),
+            machine_key: "local".to_string(),
+            runtime_kind: RemoteRuntimeKind::Codex,
+            title: title.clone(),
+            cwd: target.cwd.clone(),
+            summary: Some(if saved_session_exists {
+                "Daemon-owned remote Codex session".to_string()
+            } else {
+                "Daemon-owned remote resume picker".to_string()
+            }),
+            requires_terminal: true,
+        })?;
+        let _ = registry.transition_session(
+            session_id,
+            RemoteRuntimeSessionState::AttachingPty,
+            Some("ensuring daemon-owned codex runtime"),
+            &json!({
+                "saved_session_exists": saved_session_exists,
+                "cwd": target.cwd,
+            }),
+        )?;
+        if let Some(session) = self.sessions.get_mut(&key) {
+            session.id = session_id.to_string();
+            session.session_path = key.clone();
+            session.title = title;
+            session.kind = SessionKind::Codex;
+            session.launch_command = launch_command.clone();
+            session.launch_phase = TerminalLaunchPhase::Queued;
+            session.remote_deploy_state = RemoteDeployState::NotRequired;
+            session.status_line = describe_status_line(
+                session.backend,
+                self.theme,
+                session.source,
+                session.launch_phase,
+                session.remote_deploy_state,
+                session.bridge_available,
+            );
+            upsert_session_metadata(
+                &mut session.metadata,
+                "Source",
+                "daemon-owned-remote-runtime".to_string(),
+            );
+            upsert_session_metadata(
+                &mut session.metadata,
+                "Restore",
+                format!("yggterm server remote resume-codex {session_id} --require-existing"),
+            );
+            if let Some(cwd) = target.cwd.as_deref() {
+                upsert_session_metadata(&mut session.metadata, "Cwd", cwd.to_string());
+            }
+            upsert_session_metadata(
+                &mut session.metadata,
+                "Runtime Session",
+                key.clone(),
+            );
+            upsert_session_metadata(
+                &mut session.metadata,
+                "Runtime Ownership",
+                "yggterm daemon".to_string(),
+            );
+            session.terminal_lines = vec![
+                format!("$ {launch_command}"),
+                format!("Queue daemon-owned remote Codex session {session_id}"),
+                format!(
+                    "Workspace: {}",
+                    target.cwd.clone().unwrap_or_else(local_default_cwd)
+                ),
+                "Runtime owner: yggterm daemon".to_string(),
+                "Transport bridge: stdio attach to daemon PTY".to_string(),
+            ];
+        }
+        self.active_session_path = Some(key.clone());
+        self.active_view_mode = WorkspaceViewMode::Terminal;
+        Ok(key)
+    }
+
     pub fn restore_live_session(&mut self, live: PersistedLiveSession) {
         let remote_scanned_key =
             parse_remote_scanned_session_path(&live.key).map(|(raw_machine_key, session_id)| {
@@ -3050,6 +3165,14 @@ fn parse_remote_scanned_session_path(path: &str) -> Option<(&str, &str)> {
     let rest = path.strip_prefix("remote-session://")?;
     let (machine_key, session_id) = rest.split_once('/')?;
     Some((machine_key, session_id))
+}
+
+fn remote_runtime_codex_session_key(session_id: &str) -> String {
+    format!("codex-runtime://{session_id}")
+}
+
+fn parse_remote_runtime_codex_session_key(path: &str) -> Option<&str> {
+    path.strip_prefix("codex-runtime://")
 }
 
 fn remote_resume_shell_command(
@@ -6814,241 +6937,191 @@ pub fn run_remote_resume_codex(
         }
     };
     let _ = ensure_local_managed_cli(ManagedCliTool::Codex)?;
-    if let Some(multiplexer) = preferred_remote_multiplexer()? {
-        let session_name = remote_tmux_session_name(session_id);
-        let legacy_session_name = legacy_remote_tmux_session_name(session_id);
-        let saved_session_exists = remote_saved_codex_session_exists(session_id)?;
-        let missing_saved_session_error = remote_resume_missing_saved_session_error(session_id);
-        if remote_resume_requires_missing_saved_session_failure(
-            require_existing,
-            saved_session_exists,
-        ) {
-            finish_span(serde_json::json!({
-                "session_id": session_id,
-                "cwd": cwd,
-                "multiplexer": match multiplexer {
-                    RemoteMultiplexer::Tmux => "tmux",
-                    RemoteMultiplexer::Screen => "screen",
-                },
-                "mux_session": session_name,
-                "mux_reused": false,
-                "saved_session_exists": false,
-                "full_snapshot_bytes": 0,
-                "visible_snapshot_bytes": 0,
-                "snapshot_emitted": false,
-                "mode": "missing_saved_session",
-                "require_existing": true,
-            }));
-            anyhow::bail!(missing_saved_session_error);
-        }
-        if matches!(multiplexer, RemoteMultiplexer::Screen) {
-            let command = if saved_session_exists {
-                remote_persistent_resume_shell_command(session_id, cwd)
-            } else {
-                remote_resume_picker_shell_command(session_id, cwd, None, true)
-            };
-            let attach_command = screen_resume_or_spawn_shell_command(
-                &session_name,
-                (legacy_session_name != session_name).then_some(legacy_session_name.as_str()),
-                &command,
-            );
-            finish_span(serde_json::json!({
-                "session_id": session_id,
-                "cwd": cwd,
-                "multiplexer": "screen",
-                "mux_session": session_name,
-                "mux_reused": false,
-                "saved_session_exists": saved_session_exists,
-                "full_snapshot_bytes": 0,
-                "visible_snapshot_bytes": 0,
-                "snapshot_emitted": false,
-                "mode": if saved_session_exists {
-                    "screen_attach_or_resume"
-                } else {
-                    "screen_attach_or_picker"
-                },
-                "require_existing": require_existing,
-            }));
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::CommandExt;
-                let error = Command::new("sh").args(["-lc", &attach_command]).exec();
-                return Err(anyhow::anyhow!(
-                    "failed to exec screen attach/resume for {session_name}: {error}"
-                ));
-            }
-
-            #[cfg(not(unix))]
-            {
-                let status = Command::new("sh")
-                    .args(["-lc", &attach_command])
-                    .status()
-                    .with_context(|| format!("attaching/resuming screen session {session_name}"))?;
-                if status.success() {
-                    return Ok(());
-                }
-                anyhow::bail!("screen attach/resume failed for {session_name}: {status}");
-            }
-        }
-        let has_named_session = |name: &str| match multiplexer {
-            RemoteMultiplexer::Tmux => tmux_has_session(name),
-            RemoteMultiplexer::Screen => screen_has_session(name),
-        };
-        let mut attach_session_name = session_name.clone();
-        let mut mux_reused = false;
-        let mut full_snapshot_bytes = 0usize;
-        let mut visible_snapshot_bytes = 0usize;
-        let mode: &'static str;
-        let existing_session = if has_named_session(&session_name)? {
-            true
-        } else if legacy_session_name != session_name && has_named_session(&legacy_session_name)? {
-            let full_snapshot =
-                remote_multiplexer_snapshot_bytes(multiplexer, &legacy_session_name)
-                    .unwrap_or_default();
-            let visible_snapshot =
-                remote_multiplexer_visible_snapshot_bytes(multiplexer, &legacy_session_name)?;
-            if remote_saved_session_screen_is_attachable(
-                session_id,
-                saved_session_exists,
-                &visible_snapshot,
-                &full_snapshot,
-            ) {
-                attach_session_name = legacy_session_name.clone();
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        if !existing_session {
-            let command = if saved_session_exists {
-                remote_persistent_resume_shell_command(session_id, cwd)
-            } else {
-                remote_resume_picker_shell_command(session_id, cwd, None, true)
-            };
-            match multiplexer {
-                RemoteMultiplexer::Tmux => tmux_spawn_codex_session(&session_name, &command)?,
-                RemoteMultiplexer::Screen => screen_spawn_codex_session(&session_name, &command)?,
-            };
-            mode = if saved_session_exists {
-                "resume"
-            } else {
-                "resume_picker"
-            };
-        } else {
-            let full_snapshot =
-                remote_multiplexer_snapshot_bytes(multiplexer, &attach_session_name)
-                    .unwrap_or_default();
-            let visible_snapshot =
-                remote_multiplexer_visible_snapshot_bytes(multiplexer, &attach_session_name)?;
-            full_snapshot_bytes = full_snapshot.len();
-            visible_snapshot_bytes = visible_snapshot.len();
-            let can_reuse_snapshot = remote_saved_session_screen_is_attachable(
-                session_id,
-                saved_session_exists,
-                &visible_snapshot,
-                &full_snapshot,
-            );
-            if !can_reuse_snapshot {
-                match multiplexer {
-                    RemoteMultiplexer::Tmux => tmux_kill_session(&attach_session_name)?,
-                    RemoteMultiplexer::Screen => screen_kill_session(&attach_session_name)?,
-                }
-                let command = if saved_session_exists {
-                    remote_persistent_resume_shell_command(session_id, cwd)
-                } else {
-                    remote_resume_picker_shell_command(session_id, cwd, None, true)
-                };
-                match multiplexer {
-                    RemoteMultiplexer::Tmux => tmux_spawn_codex_session(&session_name, &command)?,
-                    RemoteMultiplexer::Screen => {
-                        screen_spawn_codex_session(&session_name, &command)?
-                    }
-                }
-                attach_session_name = session_name.clone();
-            }
-            mux_reused = can_reuse_snapshot;
-            mode = if can_reuse_snapshot {
-                "attach_existing_multiplexer"
-            } else if saved_session_exists {
-                "replace_stale_multiplexer_with_resume"
-            } else {
-                "replace_stale_multiplexer_with_picker"
-            };
-        }
-        finish_span(serde_json::json!({
-            "session_id": session_id,
-            "cwd": cwd,
-            "multiplexer": match multiplexer {
-                RemoteMultiplexer::Tmux => "tmux",
-                RemoteMultiplexer::Screen => "screen",
-            },
-            "mux_session": attach_session_name,
-            "mux_reused": mux_reused,
-            "saved_session_exists": saved_session_exists,
-            "full_snapshot_bytes": full_snapshot_bytes,
-            "visible_snapshot_bytes": visible_snapshot_bytes,
-            "snapshot_emitted": false,
-            "mode": mode,
-            "require_existing": require_existing,
-        }));
-        return match multiplexer {
-            RemoteMultiplexer::Tmux => tmux_attach_session(&attach_session_name),
-            RemoteMultiplexer::Screen => screen_attach_session(&attach_session_name),
-        };
-    }
-
-    let saved_session_exists = remote_saved_codex_session_exists(session_id)?;
-    if remote_resume_requires_missing_saved_session_failure(require_existing, saved_session_exists)
-    {
-        finish_span(serde_json::json!({
-            "session_id": session_id,
-            "cwd": cwd,
-            "tmux": false,
-            "saved_session_exists": false,
-            "mode": "missing_saved_session",
-            "require_existing": true,
-        }));
-        anyhow::bail!(remote_resume_missing_saved_session_error(session_id));
-    }
-    let command = if saved_session_exists {
-        remote_resume_shell_command(session_id, cwd, None)
-    } else {
-        remote_resume_picker_shell_command(session_id, cwd, None, true)
-    };
+    let endpoint = default_endpoint(&resolve_yggterm_home()?);
+    ensure_local_daemon_running(&endpoint)?;
+    let key =
+        daemon_ensure_remote_runtime_codex_session(&endpoint, session_id, cwd, require_existing)?;
     finish_span(serde_json::json!({
         "session_id": session_id,
         "cwd": cwd,
-        "tmux": false,
-        "saved_session_exists": saved_session_exists,
-        "mode": if saved_session_exists { "resume" } else { "resume_picker" },
+        "path": key,
+        "mode": "daemon_runtime_bridge",
         "require_existing": require_existing,
     }));
+    bridge_remote_runtime_session_stdio(&endpoint, &key)
+}
+
+fn ensure_local_daemon_running(endpoint: &ServerEndpoint) -> anyhow::Result<()> {
+    let current_exe = std::env::current_exe().context("resolving current yggterm executable")?;
+    cleanup_legacy_daemons(endpoint, &current_exe)?;
+    if ping(endpoint).is_ok() {
+        return Ok(());
+    }
+    prepare_endpoint_for_spawn(endpoint)?;
+    spawn_local_daemon_process(&current_exe)?;
+    for _ in 0..100 {
+        std::thread::sleep(Duration::from_millis(150));
+        if ping(endpoint).is_ok() {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("local yggterm daemon did not become reachable")
+}
+
+fn prepare_endpoint_for_spawn(endpoint: &ServerEndpoint) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    if let ServerEndpoint::UnixSocket(path) = endpoint
+        && path.exists()
+        && ping(endpoint).is_err()
+    {
+        let _ = fs::remove_file(path);
+    }
+    Ok(())
+}
+
+fn spawn_local_daemon_process(current_exe: &Path) -> anyhow::Result<()> {
+    let mut command = Command::new(current_exe);
+    command
+        .arg("server")
+        .arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        let error = Command::new("sh").arg("-lc").arg(command).exec();
-        Err(anyhow::anyhow!(
-            "failed to exec remote codex resume: {error}"
-        ))
-    }
-
-    #[cfg(not(unix))]
-    {
-        let status = Command::new("sh")
-            .arg("-lc")
-            .arg(command)
-            .status()
-            .context("running remote codex resume")?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!(
-                "remote codex resume exited with status {status}"
-            ))
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
         }
     }
+    command.spawn().context("spawning local yggterm daemon")?;
+    Ok(())
+}
+
+fn bridge_remote_runtime_session_stdio(
+    endpoint: &ServerEndpoint,
+    path: &str,
+) -> anyhow::Result<()> {
+    let session_id = parse_remote_runtime_codex_session_key(path)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| path.to_string());
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer_stop = stop.clone();
+    let writer_endpoint = endpoint.clone();
+    let writer_path = path.to_string();
+    std::thread::spawn(move || {
+        let mut stdin = std::io::stdin();
+        let mut buffer = [0_u8; 4096];
+        while !writer_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            let read = match stdin.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(_) => break,
+            };
+            let data = String::from_utf8_lossy(&buffer[..read]).to_string();
+            if terminal_write(&writer_endpoint, &writer_path, &data).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut cursor = 0_u64;
+    let mut stdout = std::io::stdout();
+    let start = Instant::now();
+    let mut last_size = None::<(u16, u16)>;
+    let mut marked_interactive = false;
+    let registry_home = resolve_yggterm_home().ok();
+    loop {
+        if let Some((cols, rows)) = current_tty_size()
+            && last_size != Some((cols, rows))
+        {
+            let _ = terminal_resize(endpoint, path, cols, rows);
+            last_size = Some((cols, rows));
+        }
+        let (next_cursor, chunks, running, runtime_output_seen, eof_without_output) =
+            terminal_read(endpoint, path, cursor)?;
+        cursor = next_cursor;
+        if runtime_output_seen && !marked_interactive {
+            if let Some(home) = registry_home.as_deref() {
+                let _ = RemoteRuntimeRegistry::open(home).and_then(|registry| {
+                    registry.transition_session(
+                        &session_id,
+                        RemoteRuntimeSessionState::Interactive,
+                        Some("bridge output observed"),
+                        &json!({ "path": path }),
+                    )
+                });
+            }
+            marked_interactive = true;
+        }
+        for chunk in chunks {
+            stdout.write_all(chunk.data.as_bytes())?;
+        }
+        stdout.flush()?;
+        if !running && (!runtime_output_seen || eof_without_output) {
+            if let Some(home) = registry_home.as_deref() {
+                let detail = if eof_without_output {
+                    "runtime exited before producing output"
+                } else {
+                    "runtime stopped"
+                };
+                let _ = RemoteRuntimeRegistry::open(home).and_then(|registry| {
+                    registry.transition_session(
+                        &session_id,
+                        if runtime_output_seen {
+                            RemoteRuntimeSessionState::Degraded
+                        } else {
+                            RemoteRuntimeSessionState::Failed
+                        },
+                        Some(detail),
+                        &json!({
+                            "path": path,
+                            "elapsed_ms": start.elapsed().as_millis(),
+                            "runtime_output_seen": runtime_output_seen,
+                            "eof_without_output": eof_without_output,
+                        }),
+                    )
+                });
+            }
+        }
+        if !running && runtime_output_seen {
+            break;
+        }
+        if !running && !runtime_output_seen && start.elapsed() >= Duration::from_secs(2) {
+            anyhow::bail!(
+                "yggterm: daemon-owned runtime for {session_id} exited before becoming interactive"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn current_tty_size() -> Option<(u16, u16)> {
+    let mut winsz = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let rc = unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut winsz) };
+    if rc == 0 && winsz.ws_col > 0 && winsz.ws_row > 0 {
+        Some((winsz.ws_col, winsz.ws_row))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(unix))]
+fn current_tty_size() -> Option<(u16, u16)> {
+    None
 }
 
 fn refresh_remote_managed_cli(
@@ -7076,6 +7149,12 @@ fn refresh_remote_managed_cli(
 }
 
 pub fn run_remote_terminate_codex(session_id: &str) -> anyhow::Result<()> {
+    if let Ok(home) = resolve_yggterm_home() {
+        let endpoint = default_endpoint(&home);
+        if ensure_local_daemon_running(&endpoint).is_ok() {
+            let _ = remove_session(&endpoint, &remote_runtime_codex_session_key(session_id));
+        }
+    }
     let session_name = remote_tmux_session_name(session_id);
     match preferred_remote_multiplexer()? {
         Some(RemoteMultiplexer::Tmux) => {
