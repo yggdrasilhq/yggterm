@@ -29,7 +29,9 @@ Use this workflow when a `yggui` app feature or fix should ship with proof, scre
    - optional recording
    - app-state snapshot
    - event trace / perf evidence
+   - `active_surface_requests` when a terminal load/restore claim depends on whether the request is still truthfully in flight
    - when terminal open/restore is involved, the exact `terminal_open_attempt` object, `active_terminal_surface`, `interactive`, and `terminal_settled_kind`
+   - for terminal geometry bugs, include whether `active_terminal_surface.geometry_problem` was set
 4. Create or update the proof bundle:
    - `manifest.json`
    - `summary.md`
@@ -50,6 +52,11 @@ Use this workflow when a `yggui` app feature or fix should ship with proof, scre
 - If terminal settle happens through the saved-context chip, record that explicitly as `terminal_settled_kind == "overlay_context"` and keep `active_terminal_surface.live_problem` in the bundle so the proof preserves both the user-visible result and the live PTY caveat.
 - For startup timing, prefer the app trace `startup/window_spawned` event over slower X11 root-tree detection when both are available. Use X11 tree timing only as fallback evidence.
 - For terminal session-switch bugs, capture both the source and destination terminal surfaces on a second X11 display and verify the destination screenshot text matches the destination `active_session_path`, not stale text from the previous session.
+- When a proof bundle uses `server app screenshot` on Linux X11, state whether the branch includes the real-window screenshot path. Older WebKit-only captures could miss embedded xterm content and produce false blank-terminal evidence.
+- For terminal geometry or overdraw bugs, include `terminal_hosts[].host_rect`, `terminal_hosts[].screen_rect`, and `terminal_hosts[].viewport_rect` alongside the screenshot and attempt ledger.
+- Include `terminal_hosts[].host_content_width`, `host_content_height`, `host_padding_left_px`, `host_padding_right_px`, `host_padding_top_px`, and `host_padding_bottom_px` when the fix uses xterm gutter compensation or any host-content-box adjustment.
+- Treat any non-null `active_terminal_surface.geometry_problem` as a failed terminal proof, even if the surface otherwise looks rendered.
+- For loading-truth bugs, capture one state while `active_surface_requests` still contains the terminal request and one after settle so the bundle shows that the UI did not silently drop the request before attach finished.
 - Keep changelog language user-visible and concise.
 - Treat demo assets as release material, not disposable debugging leftovers.
 - When a result is not live-verified, say so explicitly.

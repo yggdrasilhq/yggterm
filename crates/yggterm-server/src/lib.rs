@@ -21,7 +21,8 @@ pub use attach::{AttachMetadata, run_attach};
 pub use codex_cli::{ManagedCliTool, ManagedCliToolStatus};
 pub use daemon::{
     ServerEndpoint, ServerRequest, ServerResponse, ServerRuntimeStatus, TerminalStreamChunk,
-    cleanup_legacy_daemons, connect_ssh, connect_ssh_custom, default_endpoint, focus_live,
+    cleanup_legacy_daemons, connect_ssh, connect_ssh_custom, default_endpoint,
+    ensure_remote_runtime_codex_session as daemon_ensure_remote_runtime_codex_session, focus_live,
     focus_live_with_view, open_remote_session, open_remote_session_with_view, open_stored_session,
     open_stored_session_with_view, ping, raise_external_window, refresh_managed_cli,
     refresh_preview, refresh_remote_machine, remove_session, remove_ssh_target,
@@ -29,7 +30,6 @@ pub use daemon::{
     snapshot, start_command_session, start_local_session, start_local_session_at,
     start_ssh_session_at, status, switch_agent_session_mode, sync_external_window, sync_theme,
     terminal_ensure, terminal_read, terminal_resize, terminal_write, toggle_preview_block,
-    ensure_remote_runtime_codex_session as daemon_ensure_remote_runtime_codex_session,
 };
 pub use host::{GhosttyHostKind, GhosttyHostSupport, GhosttyTerminalHostMode, detect_ghostty_host};
 pub use protocol::{
@@ -1214,6 +1214,15 @@ impl YggtermServer {
         state: PersistedDaemonState,
         store: Option<&SessionStore>,
     ) {
+        self.restore_persisted_state_with_launch_policy(state, store, true);
+    }
+
+    pub fn restore_persisted_state_with_launch_policy(
+        &mut self,
+        state: PersistedDaemonState,
+        store: Option<&SessionStore>,
+        launch_active_terminal: bool,
+    ) {
         let perf_home = resolve_yggterm_home().ok();
         let total_restore_perf = perf_home
             .clone()
@@ -1432,7 +1441,7 @@ impl YggtermServer {
                 {
                     let _ = self.refresh_stored_session_preview(&active_path, &existing);
                 }
-                if self.active_view_mode == WorkspaceViewMode::Terminal {
+                if launch_active_terminal && self.active_view_mode == WorkspaceViewMode::Terminal {
                     self.request_terminal_launch_for_path(&active_path);
                 }
             }
@@ -2280,13 +2289,18 @@ impl YggtermServer {
         require_existing: bool,
     ) -> anyhow::Result<String> {
         let saved_session_exists = remote_saved_codex_session_exists(session_id)?;
-        if remote_resume_requires_missing_saved_session_failure(require_existing, saved_session_exists)
-        {
+        if remote_resume_requires_missing_saved_session_failure(
+            require_existing,
+            saved_session_exists,
+        ) {
             anyhow::bail!(remote_resume_missing_saved_session_error(session_id));
         }
         let key = remote_runtime_codex_session_key(session_id);
         let target = local_session_target(SessionKind::Codex, cwd);
-        let fallback_title = format!("Remote Codex {}", session_id.chars().take(8).collect::<String>());
+        let fallback_title = format!(
+            "Remote Codex {}",
+            session_id.chars().take(8).collect::<String>()
+        );
         let title = self
             .sessions
             .get(&key)
@@ -2361,11 +2375,7 @@ impl YggtermServer {
             if let Some(cwd) = target.cwd.as_deref() {
                 upsert_session_metadata(&mut session.metadata, "Cwd", cwd.to_string());
             }
-            upsert_session_metadata(
-                &mut session.metadata,
-                "Runtime Session",
-                key.clone(),
-            );
+            upsert_session_metadata(&mut session.metadata, "Runtime Session", key.clone());
             upsert_session_metadata(
                 &mut session.metadata,
                 "Runtime Ownership",
@@ -2490,6 +2500,17 @@ impl YggtermServer {
         let Some(path) = self.active_session_path.as_ref() else {
             return;
         };
+        if let Ok(home) = resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "server",
+                "session",
+                "request_terminal_launch_for_active_begin",
+                serde_json::json!({
+                    "path": path,
+                }),
+            );
+        }
         let cached_live_ssh_launch = self.sessions.get(path).and_then(|session| {
             if !live_session_uses_remote_runtime(session) {
                 return None;
@@ -2647,13 +2668,27 @@ impl YggtermServer {
                         session.ssh_prefix.clone()
                     };
                     let (remote_binary, remote_deploy_state) = cached_launch.unwrap_or_else(|| {
-                        resolve_remote_yggterm_binary(&ssh_target, ssh_prefix.as_deref())
-                            .unwrap_or_else(|_| {
-                                (
-                                    preferred_remote_binary_fallback(),
-                                    RemoteDeployState::Planned,
-                                )
-                            })
+                        let fallback_state = match session.remote_deploy_state {
+                            RemoteDeployState::Ready => RemoteDeployState::Ready,
+                            RemoteDeployState::CopyingBinary => RemoteDeployState::CopyingBinary,
+                            RemoteDeployState::Planned | RemoteDeployState::NotRequired => {
+                                RemoteDeployState::Planned
+                            }
+                        };
+                        if let Ok(home) = resolve_yggterm_home() {
+                            append_trace_event(
+                                &home,
+                                "server",
+                                "remote_runtime",
+                                "launch_binary_cache_miss",
+                                serde_json::json!({
+                                    "session_path": session.session_path,
+                                    "ssh_target": ssh_target,
+                                    "fallback_state": format!("{:?}", fallback_state),
+                                }),
+                            );
+                        }
+                        (preferred_remote_binary_fallback(), fallback_state)
                     });
                     session.remote_deploy_state = remote_deploy_state;
                     session.launch_command =
@@ -2723,6 +2758,18 @@ impl YggtermServer {
                     session.bridge_available,
                 );
             }
+        }
+        if let Ok(home) = resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "server",
+                "session",
+                "request_terminal_launch_for_active_end",
+                serde_json::json!({
+                    "path": path,
+                    "active_view_mode": format!("{:?}", self.active_view_mode),
+                }),
+            );
         }
     }
 
@@ -7196,7 +7243,11 @@ pub fn request_app_control(
     command: AppControlCommand,
     timeout_ms: u64,
 ) -> anyhow::Result<AppControlResponse> {
-    let request = enqueue_app_control_request(home, command, preferred_app_control_pid(home))?;
+    let request = enqueue_app_control_request(
+        home,
+        command,
+        ensure_live_app_control_pid(home, timeout_ms)?,
+    )?;
     wait_for_app_control_response(
         home,
         &request.request_id,
@@ -7242,8 +7293,12 @@ fn capture_embedded_app_screenshot(
     output_path: Option<std::path::PathBuf>,
     timeout_ms: u64,
 ) -> anyhow::Result<AppControlResponse> {
-    let request =
-        enqueue_screenshot_request(home, target, output_path, preferred_app_control_pid(home))?;
+    let request = enqueue_screenshot_request(
+        home,
+        target,
+        output_path,
+        ensure_live_app_control_pid(home, timeout_ms)?,
+    )?;
     wait_for_app_control_response(
         home,
         &request.request_id,
@@ -7261,7 +7316,7 @@ fn capture_embedded_app_screen_recording(
         home,
         output_path,
         duration_secs,
-        preferred_app_control_pid(home),
+        ensure_live_app_control_pid(home, timeout_ms)?,
     )?;
     wait_for_app_control_response(
         home,
@@ -7328,6 +7383,20 @@ fn preferred_app_control_pid(home: &Path) -> Option<u32> {
         }
     }
     newest.map(|record| record.pid)
+}
+
+fn ensure_live_app_control_pid(home: &Path, timeout_ms: u64) -> anyhow::Result<Option<u32>> {
+    let wait_budget_ms = timeout_ms.min(750).max(100);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_budget_ms);
+    loop {
+        if let Some(pid) = preferred_app_control_pid(home) {
+            return Ok(Some(pid));
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("no live Yggterm GUI client is registered for app control");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    }
 }
 
 pub(crate) fn active_client_instance_records(
@@ -7726,6 +7795,25 @@ fn app_control_open_path_ready(
             if active_view_mode != "Terminal" {
                 return false;
             }
+            if viewport.get("interactive").and_then(Value::as_bool) != Some(true) {
+                return false;
+            }
+            if viewport
+                .get("terminal_settled_kind")
+                .and_then(Value::as_str)
+                != Some("interactive")
+            {
+                return false;
+            }
+            if viewport
+                .get("active_terminal_surface")
+                .and_then(|value| value.get("problem"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty())
+            {
+                return false;
+            }
             let first_host = viewport
                 .get("active_terminal_hosts")
                 .and_then(Value::as_array)
@@ -7821,6 +7909,27 @@ fn app_control_open_path_failure(
         Some(AppControlViewMode::Terminal) => {
             if viewport.get("active_view_mode").and_then(Value::as_str) != Some("Terminal") {
                 return None;
+            }
+            if let Some(attempt) = viewport
+                .get("terminal_open_attempt")
+                .and_then(Value::as_object)
+                && attempt.get("state").and_then(Value::as_str) == Some("failed")
+                && let Some(reason) = attempt
+                    .get("latched_failure_reason")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            {
+                return Some(reason.to_string());
+            }
+            if let Some(problem) = viewport
+                .get("active_terminal_surface")
+                .and_then(|value| value.get("problem"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                return Some(problem.to_string());
             }
             let overlay = viewport
                 .get("terminal_resume_overlay")
@@ -10092,6 +10201,11 @@ mod tests {
                 "active_session_path": "remote-session://jojo/test",
                 "active_view_mode": "Terminal",
                 "ready": true,
+                "interactive": true,
+                "terminal_settled_kind": "interactive",
+                "active_terminal_surface": {
+                    "problem": null
+                },
                 "terminal_hosts": [{
                     "cols": null,
                     "rows": null,
@@ -10104,6 +10218,34 @@ mod tests {
             }
         });
         assert!(app_control_open_path_ready(
+            &state,
+            "remote-session://jojo/test",
+            Some(&super::AppControlViewMode::Terminal),
+        ));
+    }
+
+    #[test]
+    fn app_control_open_path_ready_rejects_terminal_geometry_problem() {
+        let state = json!({
+            "viewport": {
+                "active_session_path": "remote-session://jojo/test",
+                "active_view_mode": "Terminal",
+                "ready": true,
+                "interactive": true,
+                "terminal_settled_kind": "interactive",
+                "active_terminal_surface": {
+                    "problem": "active terminal host geometry does not match the xterm screen width"
+                },
+                "terminal_hosts": [{
+                    "xterm_present": true,
+                    "screen_present": true,
+                    "viewport_present": true,
+                    "resume_overlay_visible": false,
+                    "text_sample": "chatgpt/gpt-5.3-codex-spark smoke test passed (HTTP 200)."
+                }]
+            }
+        });
+        assert!(!app_control_open_path_ready(
             &state,
             "remote-session://jojo/test",
             Some(&super::AppControlViewMode::Terminal),
