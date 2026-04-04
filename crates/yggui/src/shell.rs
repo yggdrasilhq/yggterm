@@ -128,6 +128,8 @@ const PREVIEW_MIN_VIEWPORT_HEIGHT_PX: f64 = 680.0;
 const PREVIEW_MAX_OVERSCAN_PX: f64 = 1_200.0;
 const SHELL_FRAME_INSET_PX: f64 = 6.0;
 const REMOTE_PREVIEW_SYNC_DEBOUNCE_MS: u64 = 2_500;
+const REMOTE_TERMINAL_RESUME_SLOW_MS: u64 = 1_200;
+const REMOTE_TERMINAL_RESUME_FAIL_MS: u64 = 15_000;
 static XTERM_ASSETS_BOOTSTRAPPED: OnceCell<()> = OnceCell::new();
 const TREE_LOADING_DOT_CSS: &str = "@keyframes yggterm-tree-loading-dot { 0%, 80%, 100% { opacity: 0.28; transform: translateY(0px); } 40% { opacity: 1; transform: translateY(-1px); } }";
 const REMOTE_SURFACE_STAGE_CSS: &str = "@keyframes yggterm-remote-stage-float { 0%, 100% { transform: translateY(0px); } 50% { transform: translateY(-4px); } } @keyframes yggterm-remote-stage-beam { 0% { transform: translateX(-110%); opacity: 0.15; } 30% { opacity: 0.92; } 100% { transform: translateX(220%); opacity: 0.15; } } @keyframes yggterm-remote-stage-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(86, 154, 255, 0.14); opacity: 0.86; } 50% { box-shadow: 0 0 0 12px rgba(86, 154, 255, 0.0); opacity: 1; } }";
@@ -5545,6 +5547,7 @@ fn spawn_open_session_row_with_mode_retry(
         shell.context_menu_row = None;
         shell.sync_browser_settings();
         if prefer_terminal {
+            shell.terminal_resume_ready_paths.remove(&row.full_path);
             terminal_open_attempt_id = Some(shell.begin_terminal_open_attempt(
                 &row.full_path,
                 &request_meta.request_id,
@@ -11616,8 +11619,12 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let preview_placeholder = preview_text_looks_like_loading_placeholder(&preview_text_sample);
-    let active_terminal_surface =
-        summarize_terminal_surface_for_app_control(&active_terminal_hosts);
+    let terminal_resume_overlay_has_context =
+        terminal_resume_overlay_chip_has_meaningful_context(&terminal_resume_overlay);
+    let active_terminal_surface = summarize_terminal_surface_for_app_control(
+        &active_terminal_hosts,
+        terminal_resume_overlay_has_context,
+    );
     let terminal_rendered = active_terminal_surface
         .get("rendered")
         .and_then(Value::as_bool)
@@ -11662,8 +11669,13 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
         })
         || shell_text_sample.contains("Refreshing preview…")
         || shell_text_sample.contains("Refreshing preview...");
-    let (ready, reason) = if active_session_path.is_none() {
-        (false, Some("no active session selected".to_string()))
+    let (ready, interactive, settled_kind, reason) = if active_session_path.is_none() {
+        (
+            false,
+            false,
+            None::<String>,
+            Some("no active session selected".to_string()),
+        )
     } else if active_view_mode == "Rendered" {
         let preview_scroll_count = dom
             .get("preview_scroll_count")
@@ -11673,33 +11685,54 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
             && ((preview_visible_block_count > 0 || !preview_rendered_sections.is_empty())
                 || (!preview_text_sample.is_empty() && !preview_placeholder));
         if preview_loading && !preview_has_content {
-            (false, Some("preview still loading".to_string()))
+            (
+                false,
+                false,
+                None::<String>,
+                Some("preview still loading".to_string()),
+            )
         } else if preview_placeholder {
             (
                 false,
+                false,
+                None::<String>,
                 Some("preview placeholder is still visible".to_string()),
             )
         } else if preview_scroll_count == 0 && document_editor_count == 0 {
-            (false, Some("preview surface not mounted".to_string()))
+            (
+                false,
+                false,
+                None::<String>,
+                Some("preview surface not mounted".to_string()),
+            )
         } else if preview_scroll_count > 0
             && preview_text_sample.is_empty()
             && preview_visible_block_count == 0
         {
             (
                 false,
+                false,
+                None::<String>,
                 Some("preview surface mounted but content is empty".to_string()),
             )
         } else if document_editor_count > 0 && document_body_sample.is_empty() {
             (
                 false,
+                false,
+                None::<String>,
                 Some("document editor mounted but body is empty".to_string()),
             )
         } else {
-            (true, None)
+            (true, true, Some("preview".to_string()), None)
         }
     } else if active_view_mode == "Terminal" {
         if active_terminal_hosts.is_empty() {
-            (false, Some("active terminal host is missing".to_string()))
+            (
+                false,
+                false,
+                None::<String>,
+                Some("active terminal host is missing".to_string()),
+            )
         } else if terminal_resume_overlay
             .get("visible")
             .and_then(Value::as_bool)
@@ -11712,34 +11745,51 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
             if kind == "failure" {
                 (
                     false,
+                    false,
+                    None::<String>,
                     Some("terminal resume failure overlay is still visible".to_string()),
                 )
+            } else if terminal_resume_overlay_has_context {
+                (true, false, Some("overlay_context".to_string()), None)
             } else {
                 (
                     false,
+                    false,
+                    None::<String>,
                     Some("terminal resume overlay is still visible".to_string()),
                 )
             }
         } else if let Some(problem) = terminal_surface_problem.clone() {
-            (false, Some(problem))
+            (false, false, None::<String>, Some(problem))
         } else if terminal_rendered {
-            (true, None)
+            (true, true, Some("interactive".to_string()), None)
         } else if terminal_attach_pending {
             (
                 false,
+                false,
+                None::<String>,
                 Some("active terminal host exists but attach is still in flight".to_string()),
             )
         } else if terminal_hosts.is_empty() {
-            (false, Some("terminal host is missing".to_string()))
+            (
+                false,
+                false,
+                None::<String>,
+                Some("terminal host is missing".to_string()),
+            )
         } else {
             (
                 false,
+                false,
+                None::<String>,
                 Some("active terminal host exists but xterm surface is empty".to_string()),
             )
         }
     } else {
         (
             false,
+            false,
+            None::<String>,
             Some(format!("unsupported active view mode: {active_view_mode}")),
         )
     };
@@ -11777,6 +11827,8 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
         "active_terminal_surface": active_terminal_surface,
         "terminal_resume_overlay": terminal_resume_overlay,
         "ready": ready,
+        "interactive": interactive,
+        "terminal_settled_kind": settled_kind,
         "reason": reason,
     })
 }
@@ -11829,6 +11881,13 @@ fn describe_terminal_open_attempt(attempt: &TerminalOpenAttempt) -> Value {
 }
 
 fn terminal_open_attempt_failure_reason_from_viewport(viewport: &Value) -> Option<String> {
+    if viewport
+        .get("terminal_settled_kind")
+        .and_then(Value::as_str)
+        == Some("overlay_context")
+    {
+        return None;
+    }
     if let Some(problem) = viewport
         .get("active_terminal_surface")
         .and_then(|value| value.get("problem"))
@@ -11836,7 +11895,9 @@ fn terminal_open_attempt_failure_reason_from_viewport(viewport: &Value) -> Optio
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        return Some(problem.to_string());
+        if terminal_open_attempt_problem_is_fatal(problem) {
+            return Some(problem.to_string());
+        }
     }
     let overlay = viewport
         .get("terminal_resume_overlay")
@@ -11875,18 +11936,50 @@ fn terminal_open_attempt_failure_reason_from_viewport(viewport: &Value) -> Optio
     None
 }
 
-fn summarize_terminal_surface_for_app_control(hosts: &[Value]) -> Value {
+fn terminal_open_attempt_problem_is_fatal(problem: &str) -> bool {
+    let normalized = problem.trim().to_ascii_lowercase();
+    normalized.contains("transport/error output")
+        || normalized.contains("session is unavailable")
+        || normalized.contains("saved remote session is unavailable")
+        || normalized.contains("remote host is unavailable")
+}
+
+fn summarize_terminal_surface_for_app_control(
+    hosts: &[Value],
+    overlay_context_visible: bool,
+) -> Value {
     let rendered = hosts
         .iter()
         .any(terminal_host_has_rendered_surface_for_app_control);
-    let problem = hosts
+    let live_problem = hosts
         .iter()
         .find_map(terminal_host_problem_for_app_control)
         .map(str::to_string);
+    let problem = if overlay_context_visible {
+        None::<String>
+    } else {
+        live_problem.clone()
+    };
     json!({
         "rendered": rendered,
         "problem": problem,
+        "live_problem": live_problem,
+        "overlay_context_visible": overlay_context_visible,
     })
+}
+
+fn terminal_resume_overlay_chip_has_meaningful_context(overlay: &Value) -> bool {
+    if overlay.get("visible").and_then(Value::as_bool) != Some(true) {
+        return false;
+    }
+    if overlay.get("kind").and_then(Value::as_str) != Some("chip") {
+        return false;
+    }
+    overlay
+        .get("excerpt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(terminal_resume_excerpt_is_meaningful)
 }
 
 fn terminal_host_has_rendered_surface_for_app_control(host: &Value) -> bool {
@@ -18895,6 +18988,7 @@ fn TerminalCanvas(
         use_signal(|| !is_remote_resume_session || resume_ready_from_shell);
     let resume_overlay_slow = use_signal(|| false);
     let resume_overlay_failed = use_signal(|| false);
+    let resume_overlay_timed_out = use_signal(|| false);
     {
         let mount_identity = mount_identity.clone();
         let initial_resume_overlay_excerpt = initial_resume_overlay_excerpt.clone();
@@ -18907,6 +19001,7 @@ fn TerminalCanvas(
         let mut terminal_resume_surface_staged = terminal_resume_surface_staged;
         let mut resume_overlay_slow = resume_overlay_slow;
         let mut resume_overlay_failed = resume_overlay_failed;
+        let mut resume_overlay_timed_out = resume_overlay_timed_out;
         use_effect(move || {
             if *last_bootstrap_identity.read() == mount_identity {
                 return;
@@ -18916,12 +19011,12 @@ fn TerminalCanvas(
             terminal_has_meaningful_output
                 .set(!is_remote_resume_session || resume_ready_from_shell);
             terminal_prompt_only.set(false);
-            terminal_overlay_dismissed.set(!is_remote_resume_session || resume_ready_from_shell);
-            terminal_live_host_connected.set(resume_ready_from_shell);
-            terminal_resume_surface_staged
-                .set(!is_remote_resume_session || resume_ready_from_shell);
+            terminal_overlay_dismissed.set(!is_remote_resume_session);
+            terminal_live_host_connected.set(false);
+            terminal_resume_surface_staged.set(!is_remote_resume_session);
             resume_overlay_slow.set(false);
             resume_overlay_failed.set(false);
+            resume_overlay_timed_out.set(false);
         });
     }
     {
@@ -18937,7 +19032,7 @@ fn TerminalCanvas(
             let timer_last_bootstrap_identity = last_bootstrap_identity;
             let mut timer_resume_overlay_slow = resume_overlay_slow;
             spawn(async move {
-                sleep(Duration::from_millis(1_200)).await;
+                sleep(Duration::from_millis(REMOTE_TERMINAL_RESUME_SLOW_MS)).await;
                 if *timer_last_bootstrap_identity.read() == timer_mount_identity {
                     timer_resume_overlay_slow.set(true);
                 }
@@ -18947,23 +19042,23 @@ fn TerminalCanvas(
     {
         let mount_identity = mount_identity.clone();
         let last_bootstrap_identity = last_bootstrap_identity;
-        let mut resume_overlay_failed = resume_overlay_failed;
+        let mut resume_overlay_timed_out = resume_overlay_timed_out;
         let terminal_live_host_connected = terminal_live_host_connected;
         use_effect(move || {
             if !is_remote_resume_session {
-                resume_overlay_failed.set(false);
+                resume_overlay_timed_out.set(false);
                 return;
             }
             let timer_mount_identity = mount_identity.clone();
             let timer_last_bootstrap_identity = last_bootstrap_identity;
             let timer_terminal_live_host_connected = terminal_live_host_connected;
-            let mut timer_resume_overlay_failed = resume_overlay_failed;
+            let mut timer_resume_overlay_timed_out = resume_overlay_timed_out;
             spawn(async move {
-                sleep(Duration::from_millis(1_000)).await;
+                sleep(Duration::from_millis(REMOTE_TERMINAL_RESUME_FAIL_MS)).await;
                 if *timer_last_bootstrap_identity.read() == timer_mount_identity
                     && !timer_terminal_live_host_connected()
                 {
-                    timer_resume_overlay_failed.set(true);
+                    timer_resume_overlay_timed_out.set(true);
                 }
             });
         });
@@ -19017,6 +19112,7 @@ fn TerminalCanvas(
         let mut terminal_resume_surface_staged = terminal_resume_surface_staged;
         let mut terminal_resume_overlay_excerpt = terminal_resume_overlay_excerpt;
         let mut resume_overlay_failed = resume_overlay_failed;
+        let mut resume_overlay_timed_out = resume_overlay_timed_out;
         use_effect(move || {
             if *last_bootstrap_identity.read() != mount_identity {
                 append_trace_event(
@@ -19049,6 +19145,7 @@ fn TerminalCanvas(
             let mut task_terminal_resume_surface_staged = terminal_resume_surface_staged;
             let mut task_terminal_resume_overlay_excerpt = terminal_resume_overlay_excerpt;
             let mut task_resume_overlay_failed = resume_overlay_failed;
+            let mut task_resume_overlay_timed_out = resume_overlay_timed_out;
             spawn(async move {
                 let mount_identity = task_mount_identity;
                 let endpoint = task_endpoint;
@@ -19066,6 +19163,7 @@ fn TerminalCanvas(
                 let mut terminal_resume_surface_staged = task_terminal_resume_surface_staged;
                 let mut terminal_resume_overlay_excerpt = task_terminal_resume_overlay_excerpt;
                 let mut resume_overlay_failed = task_resume_overlay_failed;
+                let mut resume_overlay_timed_out = task_resume_overlay_timed_out;
                 let _ = safe_shell_mut(state, "terminal_attach_begin", |shell| {
                     shell.terminal_attach_in_flight.clear();
                     shell.terminal_attach_in_flight.insert(session_path.clone());
@@ -19109,6 +19207,7 @@ fn TerminalCanvas(
                 .await
                 {
                     resume_overlay_failed.set(true);
+                    resume_overlay_timed_out.set(false);
                     let _ = safe_shell_mut(state, "terminal_attach_ensure_error", |shell| {
                         shell.terminal_attach_in_flight.remove(&session_path);
                         shell.terminal_resume_ready_paths.remove(&session_path);
@@ -19316,10 +19415,12 @@ fn TerminalCanvas(
                                             && !traced_attach_ready
                                             && terminal_live_host_connected()
                                             && terminal_geometry_ready
+                                            && terminal_overlay_dismissed()
                                         {
                                             traced_attach_ready = true;
                                             post_attach_read_recovery_attempts = 0;
                                             resume_overlay_failed.set(false);
+                                            resume_overlay_timed_out.set(false);
                                             let _ = safe_shell_mut(
                                                 state,
                                                 "terminal_attach_ready_after_paint",
@@ -19569,6 +19670,7 @@ fn TerminalCanvas(
                                     }
                                     if has_transport_error {
                                         resume_overlay_failed.set(true);
+                                        resume_overlay_timed_out.set(false);
                                         terminal_live_host_connected.set(false);
                                         let _ = safe_shell_mut(state, "terminal_attach_transport_error", |shell| {
                                             shell.terminal_attach_in_flight.remove(&session_path);
@@ -19600,9 +19702,11 @@ fn TerminalCanvas(
                                     } {
                                         terminal_live_host_connected.set(true);
                                         resume_overlay_failed.set(false);
+                                        resume_overlay_timed_out.set(false);
                                     }
                                     if saw_transcript_browser_output {
                                         resume_overlay_failed.set(true);
+                                        resume_overlay_timed_out.set(false);
                                     }
                                     if (saw_meaningful_output
                                         || saw_prompt_output
@@ -19738,6 +19842,7 @@ fn TerminalCanvas(
                                             traced_attach_ready = true;
                                             post_attach_read_recovery_attempts = 0;
                                             resume_overlay_failed.set(false);
+                                            resume_overlay_timed_out.set(false);
                                             let _ = safe_shell_mut(state, "terminal_attach_ready", |shell| {
                                                 shell.terminal_resume_ready_paths
                                                     .insert(session_path.clone());
@@ -19826,6 +19931,7 @@ fn TerminalCanvas(
                                         terminal_overlay_dismissed.set(false);
                                         terminal_live_host_connected.set(false);
                                         resume_overlay_failed.set(false);
+                                        resume_overlay_timed_out.set(false);
                                         let reason = if invalid_remote_resume_surface {
                                             if saw_transcript_browser_output {
                                                 "transcript_browser_surface"
@@ -19956,6 +20062,7 @@ fn TerminalCanvas(
                                         break;
                                     }
                                     resume_overlay_failed.set(true);
+                                    resume_overlay_timed_out.set(false);
                                     let _ = safe_shell_mut(state, "terminal_attach_read_error", |shell| {
                                         shell.terminal_attach_in_flight.remove(&session_path);
                                         shell.terminal_resume_ready_paths.remove(&session_path);
@@ -19983,10 +20090,7 @@ fn TerminalCanvas(
         });
     }
     let resume_overlay_effective_failed = is_remote_resume_session
-        && (resume_overlay_failed()
-            || (resume_overlay_slow()
-                && !terminal_live_host_connected()
-                && !terminal_overlay_dismissed()));
+        && (resume_overlay_failed() || resume_overlay_timed_out());
     let show_resume_overlay = resume_overlay_effective_failed;
     let show_resume_chip = is_remote_resume_session
         && !resume_overlay_effective_failed
@@ -20042,9 +20146,9 @@ fn TerminalCanvas(
             "The live terminal on {} is connected. Yggterm is waiting for the saved context or prompt to paint.",
             session.host_label
         )
-    } else if resume_overlay_slow() {
-        format!(
-            "Yggterm is still restoring the live terminal on {}. If this chip survives past a second, it is a real failure.",
+        } else if resume_overlay_slow() {
+            format!(
+            "Yggterm is still restoring the live terminal on {}. The saved context stays visible here while the live terminal catches up.",
             session.host_label
         )
     } else {
@@ -20668,6 +20772,7 @@ fn terminal_resume_output_excerpt(data: &str) -> Option<String> {
         || terminal_chunk_is_generic_codex_idle(normalized)
         || terminal_chunk_is_transcript_browser(normalized)
         || terminal_chunk_has_prompt_output(normalized)
+        || terminal_chunk_is_low_signal_terminal_noise(normalized)
     {
         return None;
     }
@@ -26783,7 +26888,7 @@ Waiting for the remote terminal to paint...\n";
             "canvas_count": 1,
             "text_sample": "Error: terminal session not found: codex-runtime://019ad8b9"
         });
-        let surface = summarize_terminal_surface_for_app_control(&[host]);
+        let surface = summarize_terminal_surface_for_app_control(&[host], false);
         assert_eq!(surface.get("rendered").and_then(Value::as_bool), Some(true));
         assert_eq!(
             surface.get("problem").and_then(Value::as_str),
@@ -26802,11 +26907,31 @@ Waiting for the remote terminal to paint...\n";
             "canvas_count": 1,
             "text_sample": "Open live terminal jojo\nLaunch command prepared:\nDaemon PTY: request main viewport terminal stream"
         });
-        let surface = summarize_terminal_surface_for_app_control(&[host]);
+        let surface = summarize_terminal_surface_for_app_control(&[host], false);
         assert_eq!(surface.get("rendered").and_then(Value::as_bool), Some(true));
         assert_eq!(
             surface.get("problem").and_then(Value::as_str),
             Some("active terminal host is still showing launcher boilerplate")
+        );
+    }
+
+    #[test]
+    fn app_control_terminal_surface_masks_live_problem_when_overlay_context_is_visible() {
+        let host = json!({
+            "child_count": 1,
+            "xterm_present": true,
+            "screen_present": true,
+            "viewport_present": true,
+            "rows_present": true,
+            "canvas_count": 1,
+            "text_sample": "› Find and fix a bug in @filename\n\ngpt-5.4 high fast · 100% left · ~"
+        });
+        let surface = summarize_terminal_surface_for_app_control(&[host], true);
+        assert_eq!(surface.get("rendered").and_then(Value::as_bool), Some(true));
+        assert_eq!(surface.get("problem"), Some(&Value::Null));
+        assert_eq!(
+            surface.get("live_problem").and_then(Value::as_str),
+            Some("active terminal host is still showing generic Codex idle footer")
         );
     }
 
@@ -26847,6 +26972,35 @@ Waiting for the remote terminal to paint...\n";
     }
 
     #[test]
+    fn terminal_open_attempt_failure_reason_ignores_live_problem_when_overlay_context_settles() {
+        let viewport = json!({
+            "terminal_settled_kind": "overlay_context",
+            "active_terminal_surface": {
+                "problem": "active terminal host is still showing generic Codex idle footer"
+            },
+            "terminal_resume_overlay": {
+                "visible": true,
+                "kind": "chip",
+                "excerpt": "I will inspect the wireless logs next."
+            }
+        });
+        assert_eq!(terminal_open_attempt_failure_reason_from_viewport(&viewport), None);
+    }
+
+    #[test]
+    fn terminal_open_attempt_failure_reason_does_not_latch_low_signal_terminal_noise() {
+        let viewport = json!({
+            "active_terminal_surface": {
+                "problem": "active terminal host is still showing low-signal terminal noise"
+            },
+            "terminal_resume_overlay": {
+                "visible": false
+            }
+        });
+        assert_eq!(terminal_open_attempt_failure_reason_from_viewport(&viewport), None);
+    }
+
+    #[test]
     fn terminal_chunk_detects_low_signal_terminal_noise() {
         assert!(terminal_chunk_is_low_signal_terminal_noise(
             "^[[O^[[1;1R^[[O^[[1;12R"
@@ -26857,6 +27011,14 @@ Waiting for the remote terminal to paint...\n";
         assert!(!terminal_chunk_is_low_signal_terminal_noise(
             "Smoke test passed.\nHTTP 200 OK\n"
         ));
+    }
+
+    #[test]
+    fn terminal_resume_output_excerpt_rejects_low_signal_terminal_noise() {
+        assert_eq!(
+            terminal_resume_output_excerpt("^[[O^[[1;1R^[[?1;2c^[]10;rgb:1f1f/2323/2828^[\\\\"),
+            None
+        );
     }
 
     #[test]

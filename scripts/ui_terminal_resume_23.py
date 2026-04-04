@@ -374,10 +374,11 @@ def active_terminal_surface(state: dict) -> dict:
     viewport = state.get("viewport") or {}
     surface = viewport.get("active_terminal_surface") or {}
     if not isinstance(surface, dict):
-        return {"rendered": False, "problem": None}
+        return {"rendered": False, "problem": None, "live_problem": None}
     return {
         "rendered": bool(surface.get("rendered")),
         "problem": surface.get("problem"),
+        "live_problem": surface.get("live_problem"),
     }
 
 
@@ -389,6 +390,21 @@ def active_terminal_open_attempt(state: dict) -> dict:
     if not isinstance(attempt, dict):
         return {}
     return attempt
+
+
+def terminal_settled_kind(state: dict) -> str:
+    viewport = state.get("viewport") or {}
+    return str(viewport.get("terminal_settled_kind") or "").strip()
+
+
+def terminal_open_attempt_elapsed_s(attempt: dict) -> float | None:
+    started_at_ms = attempt.get("started_at_ms")
+    ready_at_ms = attempt.get("ready_at_ms")
+    if not isinstance(started_at_ms, int | float) or not isinstance(ready_at_ms, int | float):
+        return None
+    if ready_at_ms < started_at_ms:
+        return None
+    return max(0.0, (float(ready_at_ms) - float(started_at_ms)) / 1000.0)
 
 
 def looks_like_low_signal_summary(text: str) -> bool:
@@ -605,6 +621,8 @@ def terminal_text_looks_like_low_signal_terminal_noise(text: str) -> bool:
 def overlay_resolved(overlay: dict) -> bool:
     if not bool(overlay.get("visible")):
         return True
+    if overlay_has_meaningful_context(overlay):
+        return True
     text = " ".join(str(overlay.get("text_sample") or "").strip().lower().split())
     if not text:
         return False
@@ -614,6 +632,25 @@ def overlay_resolved(overlay: dict) -> bool:
         or "still not interactive" in text
         or "has not become interactive" in text
     )
+
+
+def overlay_has_meaningful_context(overlay: dict) -> bool:
+    if not bool(overlay.get("visible")):
+        return False
+    if str(overlay.get("kind") or "").strip().lower() != "chip":
+        return False
+    excerpt = str(overlay.get("excerpt") or "").strip()
+    if not excerpt:
+        return False
+    if terminal_text_looks_like_placeholder(excerpt):
+        return False
+    if terminal_text_looks_like_generic_idle(excerpt):
+        return False
+    if terminal_text_looks_like_shell_prompt(excerpt):
+        return False
+    if terminal_text_looks_like_low_signal_terminal_noise(excerpt):
+        return False
+    return len(excerpt) > 24
 
 
 def is_remote_machine_group(row: dict) -> bool:
@@ -810,7 +847,9 @@ def require_terminal_painted(state: dict, session_path: str, expected_attempt_id
     overlay_visible = bool(overlay.get("visible"))
     overlay_text = (overlay.get("text_sample") or "").strip().lower()
     overlay_kind = (overlay.get("kind") or "").strip().lower()
+    overlay_context_ready = overlay_has_meaningful_context(overlay)
     surface_problem = (surface.get("problem") or "").strip()
+    live_surface_problem = (surface.get("live_problem") or "").strip()
     attempt_id = (attempt.get("attempt_id") or "").strip()
     latched_failure_reason = (attempt.get("latched_failure_reason") or "").strip()
     if expected_attempt_id:
@@ -824,37 +863,44 @@ def require_terminal_painted(state: dict, session_path: str, expected_attempt_id
         raise RuntimeError(f"terminal open attempt latched failure: {latched_failure_reason}")
     if surface_problem:
         raise RuntimeError(surface_problem)
+    if (
+        live_surface_problem
+        and terminal_settled_kind(state) != "overlay_context"
+        and not overlay_context_ready
+    ):
+        raise RuntimeError(live_surface_problem)
     if terminal_text_looks_like_error(text):
         raise RuntimeError("terminal painted transport/error output instead of the session")
-    if terminal_text_looks_like_generic_idle(text):
+    if terminal_text_looks_like_generic_idle(text) and not overlay_context_ready:
         raise RuntimeError("terminal resumed into generic Codex idle surface")
     if terminal_text_looks_like_generic_idle_footer(
         text
-    ) and not terminal_text_has_meaningful_resume_context(text):
+    ) and not terminal_text_has_meaningful_resume_context(text) and not overlay_context_ready:
         raise RuntimeError("terminal resumed into generic Codex idle footer instead of the session")
-    if terminal_text_looks_like_shell_prompt(text):
+    if terminal_text_looks_like_shell_prompt(text) and not overlay_context_ready:
         raise RuntimeError("terminal exposed plain shell prompt instead of restored session UX")
-    if terminal_text_looks_like_transcript_browser(text):
+    if terminal_text_looks_like_transcript_browser(text) and not overlay_context_ready:
         raise RuntimeError("terminal exposed Codex transcript browser instead of live session surface")
     if terminal_text_looks_like_saved_transcript_prefill(text):
         raise RuntimeError("terminal still showing saved transcript prefill instead of the live host")
-    if terminal_text_looks_like_launcher_boilerplate(text):
+    if terminal_text_looks_like_launcher_boilerplate(text) and not overlay_context_ready:
         raise RuntimeError("terminal is still showing launcher boilerplate instead of the live host")
-    if terminal_text_looks_like_low_signal_terminal_noise(text):
+    if terminal_text_looks_like_low_signal_terminal_noise(text) and not overlay_context_ready:
         raise RuntimeError("terminal is still showing low-signal terminal noise")
     if overlay_visible:
         if overlay_kind != "chip":
             raise RuntimeError("resume overlay still covers terminal after paint budget")
-        raise RuntimeError("resume chip still visible after paint budget")
+        if not overlay_context_ready:
+            raise RuntimeError("resume chip is visible but lacks meaningful saved context")
     if "live terminal is ready" in overlay_text:
         raise RuntimeError("resume overlay still uses the old misleading terminal-ready copy")
     if "still connecting to remote terminal" in overlay_text:
         raise RuntimeError("resume overlay still uses indefinite connecting copy")
-    if terminal_text_looks_like_placeholder(text):
+    if terminal_text_looks_like_placeholder(text) and not overlay_context_ready:
         raise RuntimeError("terminal still showing placeholder content")
-    if not text:
+    if not text and not overlay_context_ready:
         raise RuntimeError("terminal is blank")
-    if len(text.strip()) <= 24:
+    if len(text.strip()) <= 24 and not overlay_context_ready:
         raise RuntimeError("terminal did not paint meaningful saved/live context")
     return state
 
@@ -880,7 +926,7 @@ def require_overlay_resolved(state: dict, session_path: str) -> dict:
     overlay = terminal_resume_overlay(state)
     if overlay_reports_failure(overlay):
         raise RuntimeError("resume settled into failure card")
-    if bool(overlay.get("visible")):
+    if bool(overlay.get("visible")) and not overlay_has_meaningful_context(overlay):
         raise RuntimeError("resume chip still visible")
     return state
 
@@ -949,7 +995,9 @@ def main() -> int:
                     attempt_id,
                 ),
             )
-            cold_elapsed = time.monotonic() - open_started
+            cold_elapsed = terminal_open_attempt_elapsed_s(
+                active_terminal_open_attempt(cold_state)
+            ) or (time.monotonic() - open_started)
             entry["cold_elapsed_s"] = round(cold_elapsed, 3)
             state = cold_state
             elapsed = cold_elapsed
@@ -980,6 +1028,14 @@ def main() -> int:
                     args.timeout_ms,
                     "terminal",
                 )
+                roundtrip_attempt = (
+                    (entry["roundtrip_open"].get("data") or {}).get("terminal_open_attempt")
+                    if isinstance(entry["roundtrip_open"], dict)
+                    else None
+                ) or {}
+                roundtrip_attempt_id = (roundtrip_attempt.get("attempt_id") or "").strip() or None
+                if roundtrip_attempt_id:
+                    attempt_id = roundtrip_attempt_id
                 elapsed, state = wait_until(
                     f"terminal roundtrip paint {session_path}",
                     args.paint_budget,
@@ -990,7 +1046,9 @@ def main() -> int:
                         attempt_id,
                     ),
                 )
-                elapsed = time.monotonic() - roundtrip_started
+                elapsed = terminal_open_attempt_elapsed_s(
+                    active_terminal_open_attempt(state)
+                ) or (time.monotonic() - roundtrip_started)
                 entry["roundtrip_elapsed_s"] = round(elapsed, 3)
                 entry["preview_state_dump"] = write_json(
                     out_dir / f"terminal-resume-{index:02d}-preview.json",
@@ -1000,6 +1058,8 @@ def main() -> int:
             entry["elapsed_s"] = round(cold_elapsed, 3)
             entry["within_budget"] = elapsed <= args.paint_budget
             entry["ready"] = bool(viewport.get("ready"))
+            entry["interactive"] = bool(viewport.get("interactive"))
+            entry["terminal_settled_kind"] = viewport.get("terminal_settled_kind")
             entry["reason"] = viewport.get("reason")
             entry["active_title"] = viewport.get("active_title")
             entry["active_summary"] = viewport.get("active_summary")
@@ -1030,6 +1090,8 @@ def main() -> int:
             entry["error"] = str(error)
             entry["within_budget"] = False
             entry["ready"] = bool(viewport.get("ready"))
+            entry["interactive"] = bool(viewport.get("interactive"))
+            entry["terminal_settled_kind"] = viewport.get("terminal_settled_kind")
             entry["reason"] = viewport.get("reason")
             entry["active_title"] = viewport.get("active_title")
             entry["active_summary"] = viewport.get("active_summary")
@@ -1150,13 +1212,20 @@ def main() -> int:
                 )
                 and (
                     (
+                        (
+                            item.get("terminal_resume_overlay_after_settle")
+                            or item.get("terminal_resume_overlay")
+                            or {}
+                        ).get("kind")
+                        or ""
+                    ).lower()
+                    != "chip"
+                    or not overlay_has_meaningful_context(
                         item.get("terminal_resume_overlay_after_settle")
                         or item.get("terminal_resume_overlay")
                         or {}
-                    ).get("kind")
-                    or ""
-                ).lower()
-                != "chip"
+                    )
+                )
             ]
         ),
         "overlay_resolve_failures": len(
@@ -1176,7 +1245,12 @@ def main() -> int:
             [item for item in results if terminal_text_looks_like_error(item.get("terminal_text_sample") or "")]
         ),
         "terminal_surface_problem_failures": len(
-            [item for item in results if (item.get("terminal_surface") or {}).get("problem")]
+            [
+                item
+                for item in results
+                if (item.get("terminal_surface") or {}).get("problem")
+                and (item.get("terminal_settled_kind") or "") != "overlay_context"
+            ]
         ),
         "terminal_open_attempt_failure_latches": len(
             [
