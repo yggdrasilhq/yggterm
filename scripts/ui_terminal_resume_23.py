@@ -30,6 +30,8 @@ ERROR_FRAGMENTS = (
     "connection refused",
     "connection timed out",
     "broken pipe",
+    "shared connection to ",
+    "terminal session not found",
 )
 
 TRANSCRIPT_BROWSER_HINTS = (
@@ -365,6 +367,17 @@ def terminal_resume_overlay(state: dict) -> dict:
         "text_sample": str(overlay.get("text_sample") or ""),
         "excerpt": str(overlay.get("excerpt") or host_excerpt or ""),
         "kind": str(overlay.get("kind") or host_kind or ""),
+    }
+
+
+def active_terminal_surface(state: dict) -> dict:
+    viewport = state.get("viewport") or {}
+    surface = viewport.get("active_terminal_surface") or {}
+    if not isinstance(surface, dict):
+        return {"rendered": False, "problem": None}
+    return {
+        "rendered": bool(surface.get("rendered")),
+        "problem": surface.get("problem"),
     }
 
 
@@ -771,9 +784,13 @@ def require_terminal_painted(state: dict, session_path: str) -> dict:
         )
     text = active_terminal_text(state)
     overlay = terminal_resume_overlay(state)
+    surface = active_terminal_surface(state)
     overlay_visible = bool(overlay.get("visible"))
     overlay_text = (overlay.get("text_sample") or "").strip().lower()
     overlay_kind = (overlay.get("kind") or "").strip().lower()
+    surface_problem = (surface.get("problem") or "").strip()
+    if surface_problem:
+        raise RuntimeError(surface_problem)
     if terminal_text_looks_like_error(text):
         raise RuntimeError("terminal painted transport/error output instead of the session")
     if terminal_text_looks_like_generic_idle(text):
@@ -943,6 +960,7 @@ def main() -> int:
             entry["active_title"] = viewport.get("active_title")
             entry["active_summary"] = viewport.get("active_summary")
             entry["terminal_resume_overlay"] = terminal_resume_overlay(state)
+            entry["terminal_surface"] = active_terminal_surface(state)
             entry["terminal_text_sample"] = active_terminal_text(state)
             overlay_elapsed, overlay_state = wait_until(
                 f"overlay settle {session_path}",
@@ -971,6 +989,7 @@ def main() -> int:
             entry["active_title"] = viewport.get("active_title")
             entry["active_summary"] = viewport.get("active_summary")
             entry["terminal_resume_overlay"] = terminal_resume_overlay(state)
+            entry["terminal_surface"] = active_terminal_surface(state)
             entry["terminal_text_sample"] = active_terminal_text(state)
             entry["overlay_resolved_within_budget"] = False
             entry["state_dump"] = write_json(
@@ -1102,6 +1121,9 @@ def main() -> int:
         "terminal_error_failures": len(
             [item for item in results if terminal_text_looks_like_error(item.get("terminal_text_sample") or "")]
         ),
+        "terminal_surface_problem_failures": len(
+            [item for item in results if (item.get("terminal_surface") or {}).get("problem")]
+        ),
         "results": results,
     }
     elapsed_values = [float(item["elapsed_s"]) for item in results if item.get("elapsed_s") is not None]
@@ -1134,6 +1156,7 @@ def main() -> int:
         and summary["transcript_browser_failures"] == 0
         and summary["launcher_boilerplate_failures"] == 0
         and summary["terminal_error_failures"] == 0
+        and summary["terminal_surface_problem_failures"] == 0
         and summary["overlay_copy_failures"] == 0
         and summary["overlay_visible_failures"] == 0
         and summary["overlay_resolve_failures"] == 0
