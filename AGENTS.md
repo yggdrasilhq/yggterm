@@ -110,4 +110,5 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 - Use `docs/demos/` for the durable system design, `artifacts/demos/` for bundle layout, and `.agents/skills/` for operator workflow.
 - Prefer release notes that cite proof bundles and screenshots over vague summaries.
 - When adding new app-control or automation powers, update the demo/changelog docs and skill in the same change rather than letting the workflow drift out of sync.
+- When touching observability, app-control, proof capture, or terminal-resume verification, always update the relevant skill file in the same change so the debugging workflow stays current.
 - Visual changelog assets should be deterministic, reusable, and cleanly composited, with restrained motion and annotation rather than flashy effects.
