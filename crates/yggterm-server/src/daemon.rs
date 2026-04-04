@@ -12,6 +12,8 @@ use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -33,6 +35,8 @@ const DEFAULT_DAEMON_IDLE_SHUTDOWN_MS: u64 = 90_000;
 const DEFAULT_TERMINAL_IDLE_TRIM_AFTER_MS: u64 = 45_000;
 #[cfg(target_os = "linux")]
 const DEFAULT_ORPHAN_DAEMON_REAP_AFTER_MS: u64 = 180_000;
+#[cfg(target_os = "linux")]
+const DUPLICATE_SAME_HOME_GRACE_MS: u64 = 2_000;
 const REMOTE_ATTACH_STARTUP_GRACE_MS: u64 = 900;
 
 fn uses_runtime_owned_terminal_path(path: &str) -> bool {
@@ -296,7 +300,9 @@ impl DaemonRuntime {
             restored_stored_sessions = saved.stored_sessions.len();
             restored_live_sessions = saved.live_sessions.len();
             restored_remote_machines = saved.remote_machines.len();
-            server.restore_persisted_state(saved, Some(&store));
+            // Do not block daemon boot on active terminal launch. Bind the control socket first,
+            // then let explicit terminal-open requests or later recovery drive runtime startup.
+            server.restore_persisted_state_with_launch_policy(saved, Some(&store), false);
         }
         let runtime = Self {
             support,
@@ -359,10 +365,46 @@ impl DaemonRuntime {
 
     fn ensure_terminal_for_path(&mut self, path: &str) -> Result<Option<String>> {
         let prepare_message = self.server.ensure_managed_cli_for_session_path(path)?;
+        if let Ok(home) = crate::resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "daemon",
+                "terminal_ensure",
+                "before_request_terminal_launch",
+                serde_json::json!({
+                    "path": path,
+                    "prepare_message": prepare_message,
+                }),
+            );
+        }
         self.server.request_terminal_launch_for_path(path);
+        if let Ok(home) = crate::resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "daemon",
+                "terminal_ensure",
+                "after_request_terminal_launch",
+                serde_json::json!({
+                    "path": path,
+                }),
+            );
+        }
         let Some((stored_launch_command, cwd)) = self.server.terminal_spec(path) else {
             bail!("no terminal spec for session: {path}");
         };
+        if let Ok(home) = crate::resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "daemon",
+                "terminal_ensure",
+                "terminal_spec_resolved",
+                serde_json::json!({
+                    "path": path,
+                    "cwd": cwd,
+                    "stored_launch_command": stored_launch_command,
+                }),
+            );
+        }
         let launch_command = if path.starts_with("remote-session://") {
             self.server
                 .remote_direct_attach_launch_command_for_path(path)
@@ -445,20 +487,69 @@ impl DaemonRuntime {
             }
             if !still_running || stale_remote_attach || !spec_matches {
                 let stop_command = self.server.terminal_stop_command(path);
+                if let Ok(home) = crate::resolve_yggterm_home() {
+                    append_trace_event(
+                        &home,
+                        "daemon",
+                        "terminal_ensure",
+                        "restart_session_begin",
+                        serde_json::json!({
+                            "path": path,
+                            "cwd": cwd,
+                            "launch_command": launch_command,
+                            "stop_command": stop_command,
+                        }),
+                    );
+                }
                 self.terminals.restart_session(
                     path,
                     &launch_command,
                     cwd.as_deref(),
                     stop_command.as_deref(),
                 )?;
+                if let Ok(home) = crate::resolve_yggterm_home() {
+                    append_trace_event(
+                        &home,
+                        "daemon",
+                        "terminal_ensure",
+                        "restart_session_end",
+                        serde_json::json!({
+                            "path": path,
+                        }),
+                    );
+                }
                 if let Some(prefill) = seed_prefill.as_deref() {
                     self.terminals.seed_session(path, prefill)?;
                 }
             }
             return Ok(prepare_message);
         }
+        if let Ok(home) = crate::resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "daemon",
+                "terminal_ensure",
+                "ensure_session_begin",
+                serde_json::json!({
+                    "path": path,
+                    "cwd": cwd,
+                    "launch_command": launch_command,
+                }),
+            );
+        }
         self.terminals
             .ensure_session(path, &launch_command, cwd.as_deref())?;
+        if let Ok(home) = crate::resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "daemon",
+                "terminal_ensure",
+                "ensure_session_end",
+                serde_json::json!({
+                    "path": path,
+                }),
+            );
+        }
         if let Some(prefill) = seed_prefill.as_deref() {
             self.terminals.seed_session(path, prefill)?;
         }
@@ -1313,7 +1404,9 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::StartLocalSession { .. } => "start_local_session",
         ServerRequest::SwitchAgentSessionMode { .. } => "switch_agent_session_mode",
         ServerRequest::StartCommandSession { .. } => "start_command_session",
-        ServerRequest::EnsureRemoteRuntimeCodexSession { .. } => "ensure_remote_runtime_codex_session",
+        ServerRequest::EnsureRemoteRuntimeCodexSession { .. } => {
+            "ensure_remote_runtime_codex_session"
+        }
         ServerRequest::FocusLive { .. } => "focus_live",
         ServerRequest::SetViewMode { .. } => "set_view_mode",
         ServerRequest::TogglePreviewBlock { .. } => "toggle_preview_block",
@@ -2116,6 +2209,25 @@ fn terminate_linux_process(pid: u32) {
 }
 
 #[cfg(target_os = "linux")]
+fn linux_socket_inode(path: &Path) -> Option<u64> {
+    fs::metadata(path).ok().map(|metadata| metadata.ino())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_has_socket_inode(pid: u32, inode: u64) -> bool {
+    let fd_dir = PathBuf::from(format!("/proc/{pid}/fd"));
+    let Ok(entries) = fs::read_dir(fd_dir) else {
+        return false;
+    };
+    let target = format!("socket:[{inode}]");
+    entries.flatten().any(|entry| {
+        fs::read_link(entry.path())
+            .ok()
+            .is_some_and(|link| link.to_string_lossy() == target)
+    })
+}
+
+#[cfg(target_os = "linux")]
 fn cleanup_legacy_linux_daemon_processes(
     endpoint: &ServerEndpoint,
     current_exe: &Path,
@@ -2127,9 +2239,15 @@ fn cleanup_legacy_linux_daemon_processes(
         ServerEndpoint::Tcp { .. } => None,
     };
     let reap_after_ms = daemon_orphan_reap_after_ms();
+    let current_socket_inode = match endpoint {
+        #[cfg(unix)]
+        ServerEndpoint::UnixSocket(path) => linux_socket_inode(path),
+        ServerEndpoint::Tcp { .. } => None,
+    };
     let mut daemon_candidates = 0usize;
     let mut killed_legacy = 0usize;
     let mut killed_orphan = 0usize;
+    let mut killed_duplicate_same_home = 0usize;
     let proc_entries = fs::read_dir("/proc").context("reading /proc for stale daemon cleanup")?;
     for entry in proc_entries {
         let entry = entry?;
@@ -2178,10 +2296,16 @@ fn cleanup_legacy_linux_daemon_processes(
         let is_orphan_clientless = !has_clients
             && age_ms >= reap_after_ms
             && daemon_home.as_deref() != current_home.as_deref();
-        if is_legacy_binary || is_orphan_clientless {
+        let is_duplicate_same_home = daemon_home.as_deref() == current_home.as_deref()
+            && age_ms >= DUPLICATE_SAME_HOME_GRACE_MS
+            && current_socket_inode
+                .is_some_and(|inode| !linux_process_has_socket_inode(pid, inode));
+        if is_legacy_binary || is_orphan_clientless || is_duplicate_same_home {
             terminate_linux_process(pid);
             if is_legacy_binary {
                 killed_legacy += 1;
+            } else if is_duplicate_same_home {
+                killed_duplicate_same_home += 1;
             } else {
                 killed_orphan += 1;
             }
@@ -2197,7 +2321,9 @@ fn cleanup_legacy_linux_daemon_processes(
                 "candidates": daemon_candidates,
                 "killed_legacy": killed_legacy,
                 "killed_orphan": killed_orphan,
+                "killed_duplicate_same_home": killed_duplicate_same_home,
                 "reap_after_ms": reap_after_ms,
+                "current_socket_inode": current_socket_inode,
             }),
         );
     }

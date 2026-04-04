@@ -12,6 +12,8 @@ use tao::platform::macos::WindowExtMacOS;
 use webkit2gtk::{SnapshotOptions, SnapshotRegion, WebViewExt};
 #[cfg(target_os = "linux")]
 use wry::WebViewExtUnix;
+#[cfg(target_os = "linux")]
+use yggterm_platform::capture_linux_x11_window_screenshot;
 #[cfg(target_os = "macos")]
 use yggterm_platform::{capture_macos_window_recording, capture_macos_window_screenshot};
 
@@ -179,6 +181,13 @@ async fn platform_capture_visible_app_surface(
     target: ScreenshotTarget,
     dom_snapshot: Option<&Value>,
 ) -> Result<()> {
+    if target == ScreenshotTarget::App
+        && std::env::var_os("DISPLAY").is_some()
+        && std::env::var_os("WAYLAND_DISPLAY").is_none()
+        && capture_linux_x11_window_screenshot(std::process::id(), output_path).is_ok()
+    {
+        return Ok(());
+    }
     let gtk_webview = desktop.webview.webview();
     let surface = gtk_webview
         .snapshot_future(SnapshotRegion::Visible, SnapshotOptions::NONE)

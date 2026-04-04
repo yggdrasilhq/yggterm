@@ -1,10 +1,10 @@
 use anyhow::{Context, Result, bail};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 #[cfg(target_os = "macos")]
 use objc2::{msg_send, runtime::AnyObject};
-#[cfg(target_os = "macos")]
-use std::path::Path;
 
 #[derive(Debug, Clone, Copy)]
 pub enum HostPlatform {
@@ -84,6 +84,45 @@ pub fn send_user_notification(title: &str, message: &str) -> Result<()> {
         let _ = message;
         bail!("native notifications are not implemented for this platform yet");
     }
+}
+
+#[cfg(target_os = "linux")]
+pub fn capture_linux_x11_window_screenshot(pid: u32, output_path: &Path) -> Result<()> {
+    let window_id = xdotool_search(["search", "--onlyvisible", "--pid", &pid.to_string()])
+        .context("resolving current X11 window for screenshot")?;
+    let temp_xwd = output_path.with_extension("xwd");
+    let capture_status = Command::new("xwd")
+        .args([
+            "-silent",
+            "-id",
+            &window_id,
+            "-out",
+            temp_xwd.to_string_lossy().as_ref(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("running xwd for window screenshot")?;
+    if !capture_status.success() {
+        let _ = std::fs::remove_file(&temp_xwd);
+        bail!("xwd exited with status {capture_status}");
+    }
+    let convert_status = Command::new("convert")
+        .args([
+            temp_xwd.to_string_lossy().as_ref(),
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("running ImageMagick convert for window screenshot")?;
+    let _ = std::fs::remove_file(&temp_xwd);
+    if !convert_status.success() {
+        bail!("convert exited with status {convert_status}");
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
