@@ -29,6 +29,9 @@ pub struct TerminalChunk {
 pub struct TerminalReadResult {
     pub cursor: u64,
     pub chunks: Vec<TerminalChunk>,
+    pub running: bool,
+    pub runtime_output_seen: bool,
+    pub eof_without_output: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -81,6 +84,12 @@ impl TerminalManager {
             .is_some_and(|session| session.matches_spec(launch_command, cwd))
     }
 
+    pub fn session_matches_remote_resume_spec(&self, key: &str, cwd: Option<&str>) -> bool {
+        self.sessions
+            .get(key)
+            .is_some_and(|session| session.matches_remote_resume_spec(cwd))
+    }
+
     pub fn session_is_running(&self, key: &str) -> bool {
         self.sessions
             .get(key)
@@ -97,6 +106,20 @@ impl TerminalManager {
         self.sessions
             .get(key)
             .is_some_and(|session| session.has_runtime_output())
+    }
+
+    pub fn session_hit_eof_without_output(&self, key: &str) -> bool {
+        self.sessions
+            .get(key)
+            .is_some_and(|session| session.hit_eof_without_output())
+    }
+
+    pub fn session_runtime_age_ms(&self, key: &str) -> Option<u64> {
+        self.sessions.get(key).map(|session| session.age_ms())
+    }
+
+    pub fn session_snapshot(&self, key: &str) -> Option<String> {
+        self.sessions.get(key).map(|session| session.snapshot())
     }
 
     pub fn read(&self, key: &str, cursor: u64) -> Result<TerminalReadResult> {
@@ -249,8 +272,10 @@ struct PtySessionRuntime {
     chunks: Arc<Mutex<VecDeque<TerminalChunk>>>,
     retained_bytes: Arc<AtomicUsize>,
     seq: Arc<AtomicU64>,
+    started_at_ms: u64,
     last_activity_ms: Arc<AtomicU64>,
     runtime_output_seen: Arc<std::sync::atomic::AtomicBool>,
+    eof_without_output: Arc<std::sync::atomic::AtomicBool>,
     launch_command: String,
     cwd: Option<String>,
 }
@@ -289,13 +314,16 @@ impl PtySessionRuntime {
         let chunks = Arc::new(Mutex::new(VecDeque::new()));
         let retained_bytes = Arc::new(AtomicUsize::new(0));
         let seq = Arc::new(AtomicU64::new(0));
-        let last_activity_ms = Arc::new(AtomicU64::new(now_millis()));
+        let started_at_ms = now_millis();
+        let last_activity_ms = Arc::new(AtomicU64::new(started_at_ms));
         let runtime_output_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let eof_without_output = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reader_chunks = Arc::clone(&chunks);
         let reader_retained_bytes = Arc::clone(&retained_bytes);
         let reader_seq = Arc::clone(&seq);
         let reader_activity = Arc::clone(&last_activity_ms);
         let reader_runtime_output_seen = Arc::clone(&runtime_output_seen);
+        let reader_eof_without_output = Arc::clone(&eof_without_output);
         let key_label = key.to_string();
         let launch_command_label = launch_command.to_string();
 
@@ -366,6 +394,7 @@ impl PtySessionRuntime {
                     }
                 }
                 if !saw_any_output {
+                    reader_eof_without_output.store(true, Ordering::SeqCst);
                     trace_terminal_event(
                         "eof_without_output",
                         serde_json::json!({
@@ -384,8 +413,10 @@ impl PtySessionRuntime {
             chunks,
             retained_bytes,
             seq,
+            started_at_ms,
             last_activity_ms,
             runtime_output_seen,
+            eof_without_output,
             launch_command: launch_command.to_string(),
             cwd: cwd.map(|value| value.to_string()),
         })
@@ -393,6 +424,11 @@ impl PtySessionRuntime {
 
     fn matches_spec(&self, launch_command: &str, cwd: Option<&str>) -> bool {
         self.launch_command == launch_command && self.cwd.as_deref() == cwd
+    }
+
+    fn matches_remote_resume_spec(&self, cwd: Option<&str>) -> bool {
+        self.cwd.as_deref() == cwd
+            && launch_command_looks_like_remote_resume_attach(&self.launch_command)
     }
 
     fn is_running(&self) -> bool {
@@ -418,6 +454,22 @@ impl PtySessionRuntime {
         self.runtime_output_seen.load(Ordering::SeqCst)
     }
 
+    fn hit_eof_without_output(&self) -> bool {
+        self.eof_without_output.load(Ordering::SeqCst)
+    }
+
+    fn age_ms(&self) -> u64 {
+        now_millis().saturating_sub(self.started_at_ms)
+    }
+
+    fn snapshot(&self) -> String {
+        let chunks = self.chunks.lock().expect("pty chunk lock poisoned");
+        chunks
+            .iter()
+            .map(|chunk| chunk.data.as_str())
+            .collect::<String>()
+    }
+
     fn read(&self, cursor: u64) -> TerminalReadResult {
         let chunks = self.chunks.lock().expect("pty chunk lock poisoned");
         let next_cursor = self.seq.load(Ordering::SeqCst);
@@ -433,6 +485,9 @@ impl PtySessionRuntime {
         TerminalReadResult {
             cursor: next_cursor,
             chunks,
+            running: self.is_running(),
+            runtime_output_seen: self.has_runtime_output(),
+            eof_without_output: self.eof_without_output.load(Ordering::SeqCst),
         }
     }
 
@@ -591,6 +646,10 @@ fn shell_command(launch_command: &str, cwd: Option<&str>) -> CommandBuilder {
         command.cwd(cwd);
     }
     command
+}
+
+fn launch_command_looks_like_remote_resume_attach(launch_command: &str) -> bool {
+    launch_command.contains("server'\\'' '\\''remote'\\'' '\\''resume-codex")
 }
 
 fn shell_uses_bash_prompt_cwd() -> bool {
@@ -838,6 +897,18 @@ mod tests {
         ));
         assert!(terminal_chunk_has_visible_text(
             "\u{1b}[2J\u{1b}[HOpenAI Codex (v0.118.0)\n"
+        ));
+    }
+
+    #[test]
+    fn launch_command_detects_remote_resume_attach() {
+        let launch_command = "ssh -tt jojo 'exec $HOME/.yggterm/bin/yggterm '\\''server'\\'' '\\''remote'\\'' '\\''resume-codex'\\'' '\\''019ce5d8-c94c-7b62-ae19-3818ae400b65'\\'' '\\''/home/pi'\\'''";
+
+        assert!(launch_command_looks_like_remote_resume_attach(
+            launch_command
+        ));
+        assert!(!launch_command_looks_like_remote_resume_attach(
+            "bash -lc 'ls'"
         ));
     }
 }
