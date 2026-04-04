@@ -732,7 +732,7 @@ fn load_initial_server_snapshot_fast(
         .ok()
         .and_then(|json| serde_json::from_str::<PersistedDaemonState>(&json).ok())?;
     let mut server = YggtermServer::new(browser_tree, prefer_ghostty_backend, host.clone(), theme);
-    server.restore_persisted_state(saved, Some(store));
+    server.restore_persisted_state_with_launch_policy(saved, Some(store), false);
     Some(server.snapshot())
 }
 
