@@ -791,7 +791,7 @@ fn maybe_focus_existing_client(home_dir: &std::path::Path, args: &[String]) -> R
         return Ok(());
     }
     let endpoint = default_endpoint(home_dir);
-    if live_signal_client_count(home_dir, &endpoint)? == 0 {
+    if compatible_signal_client_count(home_dir, &endpoint)? == 0 {
         return Ok(());
     }
     if run_app_control_focus_window(3_000).is_ok() {
@@ -887,7 +887,7 @@ fn unregister_signal_client_instance(
     Ok(remaining)
 }
 
-fn live_signal_client_count(
+fn compatible_signal_client_count(
     home_dir: &std::path::Path,
     endpoint: &yggterm_server::ServerEndpoint,
 ) -> Result<usize> {
@@ -895,6 +895,7 @@ fn live_signal_client_count(
     fs::create_dir_all(&dir)?;
     let entries = fs::read_dir(&dir)
         .with_context(|| format!("reading client instances {}", dir.display()))?;
+    let current_scope = current_signal_client_scope();
     let mut live = 0_usize;
     for entry in entries {
         let entry = entry?;
@@ -903,13 +904,133 @@ fn live_signal_client_count(
             let _ = fs::remove_file(&path);
             continue;
         };
-        if signal_process_is_alive(pid) {
-            live += 1;
-        } else {
+        if !signal_process_is_alive(pid) {
             let _ = fs::remove_file(&path);
+            continue;
+        }
+        if signal_client_scope_matches_pid(pid, &path, &current_scope) {
+            live += 1;
         }
     }
     Ok(live)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SignalClientScope {
+    display: Option<String>,
+    wayland_display: Option<String>,
+    xdg_session_id: Option<String>,
+    xdg_runtime_dir: Option<String>,
+    xauthority: Option<String>,
+}
+
+fn current_signal_client_scope() -> SignalClientScope {
+    SignalClientScope {
+        display: signal_env_var("DISPLAY"),
+        wayland_display: signal_env_var("WAYLAND_DISPLAY"),
+        xdg_session_id: signal_env_var("XDG_SESSION_ID"),
+        xdg_runtime_dir: signal_env_var("XDG_RUNTIME_DIR"),
+        xauthority: signal_env_var("XAUTHORITY"),
+    }
+}
+
+fn signal_env_var(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn signal_client_scope_matches_pid(
+    pid: u32,
+    path: &std::path::Path,
+    current: &SignalClientScope,
+) -> bool {
+    if let Some(scope) = read_signal_client_scope_from_record(path) {
+        return signal_client_scope_matches(&scope, current);
+    }
+    #[cfg(unix)]
+    if let Some(scope) = read_signal_client_scope_from_proc(pid) {
+        return signal_client_scope_matches(&scope, current);
+    }
+    false
+}
+
+fn read_signal_client_scope_from_record(path: &std::path::Path) -> Option<SignalClientScope> {
+    let payload = fs::read(path).ok()?;
+    let value = serde_json::from_slice::<serde_json::Value>(&payload).ok()?;
+    Some(SignalClientScope {
+        display: value
+            .get("display")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .filter(|value| !value.is_empty()),
+        wayland_display: value
+            .get("wayland_display")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .filter(|value| !value.is_empty()),
+        xdg_session_id: value
+            .get("xdg_session_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .filter(|value| !value.is_empty()),
+        xdg_runtime_dir: value
+            .get("xdg_runtime_dir")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .filter(|value| !value.is_empty()),
+        xauthority: value
+            .get("xauthority")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .filter(|value| !value.is_empty()),
+    })
+}
+
+#[cfg(unix)]
+fn read_signal_client_scope_from_proc(pid: u32) -> Option<SignalClientScope> {
+    let payload = fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let mut scope = SignalClientScope {
+        display: None,
+        wayland_display: None,
+        xdg_session_id: None,
+        xdg_runtime_dir: None,
+        xauthority: None,
+    };
+    for entry in payload.split(|byte| *byte == 0) {
+        let Ok(text) = std::str::from_utf8(entry) else {
+            continue;
+        };
+        let Some((key, value)) = text.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        match key {
+            "DISPLAY" => scope.display = Some(value.to_string()),
+            "WAYLAND_DISPLAY" => scope.wayland_display = Some(value.to_string()),
+            "XDG_SESSION_ID" => scope.xdg_session_id = Some(value.to_string()),
+            "XDG_RUNTIME_DIR" => scope.xdg_runtime_dir = Some(value.to_string()),
+            "XAUTHORITY" => scope.xauthority = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    Some(scope)
+}
+
+fn signal_client_scope_matches(candidate: &SignalClientScope, current: &SignalClientScope) -> bool {
+    if candidate.wayland_display.is_some() || current.wayland_display.is_some() {
+        return candidate.wayland_display == current.wayland_display
+            && candidate.xdg_runtime_dir == current.xdg_runtime_dir;
+    }
+    if candidate.display.is_some() || current.display.is_some() {
+        return candidate.display == current.display && candidate.xauthority == current.xauthority;
+    }
+    candidate.xdg_session_id == current.xdg_session_id
+        && candidate.xdg_runtime_dir == current.xdg_runtime_dir
 }
 
 fn install_panic_logging(home_dir: &std::path::Path) {
@@ -1093,4 +1214,41 @@ fn run_server_smoke() -> Result<()> {
     let _ = child.wait();
     let _ = fs::remove_dir_all(&temp_home);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SignalClientScope, signal_client_scope_matches};
+
+    #[test]
+    fn signal_client_scope_rejects_different_x11_display() {
+        let current = SignalClientScope {
+            display: Some(":10.0".to_string()),
+            wayland_display: None,
+            xdg_session_id: None,
+            xdg_runtime_dir: None,
+            xauthority: Some("/run/user/1000/gdm/Xauthority".to_string()),
+        };
+        let hidden = SignalClientScope {
+            display: Some(":99".to_string()),
+            wayland_display: None,
+            xdg_session_id: None,
+            xdg_runtime_dir: None,
+            xauthority: Some("/tmp/xvfb-run.ABC/Xauthority".to_string()),
+        };
+        assert!(!signal_client_scope_matches(&hidden, &current));
+    }
+
+    #[test]
+    fn signal_client_scope_accepts_same_x11_display() {
+        let current = SignalClientScope {
+            display: Some(":10.0".to_string()),
+            wayland_display: None,
+            xdg_session_id: None,
+            xdg_runtime_dir: None,
+            xauthority: Some("/run/user/1000/gdm/Xauthority".to_string()),
+        };
+        let same = current.clone();
+        assert!(signal_client_scope_matches(&same, &current));
+    }
 }
