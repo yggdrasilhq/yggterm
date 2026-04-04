@@ -35,6 +35,10 @@ const DEFAULT_TERMINAL_IDLE_TRIM_AFTER_MS: u64 = 45_000;
 const DEFAULT_ORPHAN_DAEMON_REAP_AFTER_MS: u64 = 180_000;
 const REMOTE_ATTACH_STARTUP_GRACE_MS: u64 = 900;
 
+fn uses_runtime_owned_terminal_path(path: &str) -> bool {
+    path.starts_with("remote-session://") || path.starts_with("codex-runtime://")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerEndpoint {
     #[cfg(unix)]
@@ -168,6 +172,11 @@ pub enum ServerRequest {
         title_hint: Option<String>,
         launch_command: String,
         source_label: Option<String>,
+    },
+    EnsureRemoteRuntimeCodexSession {
+        session_id: String,
+        cwd: Option<String>,
+        require_existing: bool,
     },
     FocusLive {
         key: String,
@@ -374,7 +383,7 @@ impl DaemonRuntime {
                 }),
             );
         }
-        let seed_prefill = if path.starts_with("remote-session://") {
+        let seed_prefill = if uses_runtime_owned_terminal_path(path) {
             None
         } else {
             self.server.remote_resume_seed_fallback_for_path(path)
@@ -722,6 +731,20 @@ impl DaemonRuntime {
                 self.persist()?;
                 self.snapshot_response(Some(format!("started {key}")))
             }
+            ServerRequest::EnsureRemoteRuntimeCodexSession {
+                session_id,
+                cwd,
+                require_existing,
+            } => {
+                let key = self.server.ensure_remote_runtime_codex_session(
+                    &session_id,
+                    cwd.as_deref(),
+                    require_existing,
+                )?;
+                let _ = self.ensure_terminal_for_path(&key)?;
+                self.persist()?;
+                ServerResponse::Ack { message: Some(key) }
+            }
             ServerRequest::FocusLive { key, view_mode } => {
                 self.server.focus_live_session(&key);
                 let mut focused_in_terminal = false;
@@ -795,7 +818,7 @@ impl DaemonRuntime {
                 ServerResponse::Ack { message }
             }
             ServerRequest::TerminalRead { path, cursor } => {
-                if path.starts_with("remote-session://")
+                if uses_runtime_owned_terminal_path(&path)
                     && self.terminals.session_hit_eof_without_output(&path)
                     && !self.terminals.session_has_runtime_output(&path)
                     && let Some((stored_launch_command, cwd)) = self.server.terminal_spec(&path)
@@ -1290,6 +1313,7 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::StartLocalSession { .. } => "start_local_session",
         ServerRequest::SwitchAgentSessionMode { .. } => "switch_agent_session_mode",
         ServerRequest::StartCommandSession { .. } => "start_command_session",
+        ServerRequest::EnsureRemoteRuntimeCodexSession { .. } => "ensure_remote_runtime_codex_session",
         ServerRequest::FocusLive { .. } => "focus_live",
         ServerRequest::SetViewMode { .. } => "set_view_mode",
         ServerRequest::TogglePreviewBlock { .. } => "toggle_preview_block",
@@ -1580,6 +1604,23 @@ pub fn start_command_session(
             source_label: source_label.map(ToOwned::to_owned),
         },
     )?)
+}
+
+pub fn ensure_remote_runtime_codex_session(
+    endpoint: &ServerEndpoint,
+    session_id: &str,
+    cwd: Option<&str>,
+    require_existing: bool,
+) -> Result<String> {
+    expect_ack(send_request(
+        endpoint,
+        &ServerRequest::EnsureRemoteRuntimeCodexSession {
+            session_id: session_id.to_string(),
+            cwd: cwd.map(ToOwned::to_owned),
+            require_existing,
+        },
+    )?)?
+    .with_context(|| format!("missing runtime session key for {session_id}"))
 }
 
 pub fn focus_live(
