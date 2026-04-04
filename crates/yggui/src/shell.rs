@@ -11955,6 +11955,9 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     if terminal_chunk_is_launcher_boilerplate(text_sample) {
         return Some("active terminal host is still showing launcher boilerplate");
     }
+    if terminal_chunk_is_low_signal_terminal_noise(text_sample) {
+        return Some("active terminal host is still showing low-signal terminal noise");
+    }
     None
 }
 
@@ -20550,6 +20553,25 @@ fn terminal_chunk_is_launcher_boilerplate(data: &str) -> bool {
         || stripped.contains("__YGGTERM_CWD_OK=")
 }
 
+fn terminal_chunk_is_low_signal_terminal_noise(data: &str) -> bool {
+    let stripped = strip_terminal_control_sequences(data);
+    let normalized = stripped.trim();
+    if normalized.is_empty() {
+        return false;
+    }
+    let compact = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.len() > 96 || !compact.contains("^[") {
+        return false;
+    }
+    compact.chars().all(|ch| {
+        ch.is_ascii_alphanumeric()
+            || matches!(
+                ch,
+                '^' | '[' | ']' | ';' | '?' | ':' | '-' | '_' | '<' | '>' | '=' | '/' | '\\' | '.'
+            )
+    })
+}
+
 fn terminal_prefill_should_render_to_host(data: &str) -> bool {
     let stripped = strip_terminal_control_sequences(data);
     let normalized = stripped.trim();
@@ -26822,6 +26844,19 @@ Waiting for the remote terminal to paint...\n";
             terminal_open_attempt_failure_reason_from_viewport(&viewport).as_deref(),
             Some("Remote terminal needs attention\nStill not interactive")
         );
+    }
+
+    #[test]
+    fn terminal_chunk_detects_low_signal_terminal_noise() {
+        assert!(terminal_chunk_is_low_signal_terminal_noise(
+            "^[[O^[[1;1R^[[O^[[1;12R"
+        ));
+        assert!(terminal_chunk_is_low_signal_terminal_noise(
+            "^[[O^[[1;1R^[[?1;2c^[]10;rgb:1f1f/2323/2828^[\\"
+        ));
+        assert!(!terminal_chunk_is_low_signal_terminal_noise(
+            "Smoke test passed.\nHTTP 200 OK\n"
+        ));
     }
 
     #[test]
