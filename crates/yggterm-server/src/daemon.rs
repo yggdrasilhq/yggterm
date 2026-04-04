@@ -1,8 +1,8 @@
 use crate::terminal::TerminalBufferStats;
 use crate::{
-    GhosttyHostSupport, PersistedDaemonState, RemoteMachineSnapshot, ServerUiSnapshot, SessionKind,
-    SshConnectTarget, TerminalManager, WorkspaceViewMode, YggtermServer,
-    active_client_instance_records, current_millis, fetch_remote_generation_context,
+    GhosttyHostSupport, PersistedDaemonState, RemoteMachineSnapshot, RemoteRuntimeRegistry,
+    ServerUiSnapshot, SessionKind, SshConnectTarget, TerminalManager, WorkspaceViewMode,
+    YggtermServer, active_client_instance_records, current_millis, fetch_remote_generation_context,
     persist_remote_generated_copy, remote_resume_runtime_output_requires_restart,
     terminate_remote_codex_session,
 };
@@ -33,6 +33,7 @@ const DEFAULT_DAEMON_IDLE_SHUTDOWN_MS: u64 = 90_000;
 const DEFAULT_TERMINAL_IDLE_TRIM_AFTER_MS: u64 = 45_000;
 #[cfg(target_os = "linux")]
 const DEFAULT_ORPHAN_DAEMON_REAP_AFTER_MS: u64 = 180_000;
+const REMOTE_ATTACH_STARTUP_GRACE_MS: u64 = 900;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerEndpoint {
@@ -218,6 +219,9 @@ pub enum ServerResponse {
     TerminalStream {
         cursor: u64,
         chunks: Vec<TerminalStreamChunk>,
+        running: bool,
+        runtime_output_seen: bool,
+        eof_without_output: bool,
     },
     Ack {
         message: Option<String>,
@@ -371,16 +375,31 @@ impl DaemonRuntime {
             );
         }
         let seed_prefill = if path.starts_with("remote-session://") {
-            self.server.remote_resume_seed_fallback_for_path(path)
-        } else {
             None
+        } else {
+            self.server.remote_resume_seed_fallback_for_path(path)
         };
         if self.terminals.has_session(path) {
             let still_running = self.terminals.session_is_running(path);
             let has_runtime_output = self.terminals.session_has_runtime_output(path);
+            let runtime_age_ms = self.terminals.session_runtime_age_ms(path).unwrap_or(0);
+            let runtime_snapshot = if path.starts_with("remote-session://") && has_runtime_output {
+                self.terminals.session_snapshot(path)
+            } else {
+                None
+            };
+            let runtime_saved_session_mismatch = path
+                .strip_prefix("remote-session://")
+                .and_then(|_| {
+                    runtime_snapshot.as_deref().map(|snapshot| {
+                        self.server
+                            .remote_resume_runtime_output_mismatches_path(path, snapshot.as_bytes())
+                    })
+                })
+                .unwrap_or(false);
             let stale_remote_attach = path.starts_with("remote-session://")
-                && (!has_runtime_output
-                    || self
+                && ((has_runtime_output
+                    && self
                         .terminals
                         .read(path, 0)
                         .map(|stream| {
@@ -391,13 +410,31 @@ impl DaemonRuntime {
                                 .collect::<String>();
                             remote_resume_runtime_output_requires_restart(snapshot.as_bytes())
                         })
-                        .unwrap_or(false));
-            if !still_running
-                || stale_remote_attach
-                || !self
-                    .terminals
-                    .session_matches_spec(path, &launch_command, cwd.as_deref())
-            {
+                        .unwrap_or(false))
+                    || runtime_saved_session_mismatch
+                    || (!has_runtime_output && runtime_age_ms >= REMOTE_ATTACH_STARTUP_GRACE_MS));
+            let spec_matches =
+                self.terminals
+                    .session_matches_spec(path, &launch_command, cwd.as_deref());
+            if let Ok(home) = crate::resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "server",
+                    "terminal_spec",
+                    "reuse_check",
+                    serde_json::json!({
+                        "path": path,
+                        "still_running": still_running,
+                        "has_runtime_output": has_runtime_output,
+                        "runtime_age_ms": runtime_age_ms,
+                        "stale_remote_attach": stale_remote_attach,
+                        "runtime_saved_session_mismatch": runtime_saved_session_mismatch,
+                        "spec_matches": spec_matches,
+                        "remote_resume_path": path.starts_with("remote-session://"),
+                    }),
+                );
+            }
+            if !still_running || stale_remote_attach || !spec_matches {
                 let stop_command = self.server.terminal_stop_command(path);
                 self.terminals.restart_session(
                     path,
@@ -758,6 +795,35 @@ impl DaemonRuntime {
                 ServerResponse::Ack { message }
             }
             ServerRequest::TerminalRead { path, cursor } => {
+                if path.starts_with("remote-session://")
+                    && self.terminals.session_hit_eof_without_output(&path)
+                    && !self.terminals.session_has_runtime_output(&path)
+                    && let Some((stored_launch_command, cwd)) = self.server.terminal_spec(&path)
+                {
+                    let launch_command = self
+                        .server
+                        .remote_direct_attach_launch_command_for_path(&path)
+                        .unwrap_or(stored_launch_command);
+                    let stop_command = self.server.terminal_stop_command(&path);
+                    if let Ok(home) = crate::resolve_yggterm_home() {
+                        append_trace_event(
+                            &home,
+                            "server",
+                            "terminal_runtime",
+                            "restart_before_read",
+                            serde_json::json!({
+                                "path": path,
+                                "reason": "eof_without_output",
+                            }),
+                        );
+                    }
+                    self.terminals.restart_session(
+                        &path,
+                        &launch_command,
+                        cwd.as_deref(),
+                        stop_command.as_deref(),
+                    )?;
+                }
                 let stream = self.terminals.read(&path, cursor)?;
                 ServerResponse::TerminalStream {
                     cursor: stream.cursor,
@@ -769,6 +835,9 @@ impl DaemonRuntime {
                             data: chunk.data,
                         })
                         .collect(),
+                    running: stream.running,
+                    runtime_output_seen: stream.runtime_output_seen,
+                    eof_without_output: stream.eof_without_output,
                 }
             }
             ServerRequest::TerminalWrite { path, data } => {
@@ -1600,7 +1669,7 @@ pub fn terminal_read(
     endpoint: &ServerEndpoint,
     path: &str,
     cursor: u64,
-) -> Result<(u64, Vec<TerminalStreamChunk>)> {
+) -> Result<(u64, Vec<TerminalStreamChunk>, bool, bool, bool)> {
     match send_request(
         endpoint,
         &ServerRequest::TerminalRead {
@@ -1608,7 +1677,19 @@ pub fn terminal_read(
             cursor,
         },
     )? {
-        ServerResponse::TerminalStream { cursor, chunks } => Ok((cursor, chunks)),
+        ServerResponse::TerminalStream {
+            cursor,
+            chunks,
+            running,
+            runtime_output_seen,
+            eof_without_output,
+        } => Ok((
+            cursor,
+            chunks,
+            running,
+            runtime_output_seen,
+            eof_without_output,
+        )),
         ServerResponse::Error { message } => bail!(message),
         other => bail!("unexpected terminal stream response: {:?}", other),
     }
@@ -1680,6 +1761,19 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
         let runtime = runtime.lock().expect("daemon runtime lock poisoned");
         runtime.store.home_dir().to_path_buf()
     };
+    match RemoteRuntimeRegistry::open(&home_dir) {
+        Ok(registry) => append_trace_event(
+            &home_dir,
+            "daemon",
+            "remote_runtime",
+            "bootstrap",
+            serde_json::json!({
+                "db_path": registry.paths().db_path.display().to_string(),
+                "sessions_dir": registry.paths().sessions_dir.display().to_string(),
+            }),
+        ),
+        Err(error) => warn!(error=%error, "failed to initialize remote runtime registry"),
+    }
     #[cfg(target_os = "linux")]
     if let Ok(current_exe) = std::env::current_exe() {
         let _ = cleanup_legacy_linux_daemon_processes(endpoint, &current_exe);

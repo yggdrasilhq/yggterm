@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import random
+import re
 import shlex
 import signal
 import shutil
@@ -24,6 +25,7 @@ ERROR_FRAGMENTS = (
     "mux_client_request_session",
     "session open refused by peer",
     "controlsocket",
+    "exec: export: not found",
     "permission denied",
     "connection refused",
     "connection timed out",
@@ -456,6 +458,59 @@ def terminal_text_looks_like_generic_idle(text: str) -> bool:
     return transcript_like_lines <= 2
 
 
+def strip_ansi(text: str) -> str:
+    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+
+
+def terminal_text_looks_like_generic_idle_footer(text: str) -> bool:
+    normalized = " ".join(text.strip().lower().split())
+    if not normalized:
+        return False
+    mentions_generic_prompt = (
+        "implement {feature}" in normalized
+        or "explain this codebase" in normalized
+        or "find and fix a bug" in normalized
+        or "resume a previous session" in normalized
+    )
+    mentions_model_footer = (
+        ("gpt-5" in normalized or "gpt-4" in normalized or "claude" in normalized)
+        and "% left" in normalized
+    )
+    return mentions_generic_prompt and mentions_model_footer
+
+
+def terminal_text_has_meaningful_resume_context(text: str) -> bool:
+    stripped = strip_ansi(text)
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    if not lines:
+        return False
+    kept = []
+    for line in lines:
+        lower = line.lower()
+        semantic = line.strip("╭╮╰╯─│ ")
+        if not semantic:
+            continue
+        if "openai codex" in lower:
+            continue
+        if lower.startswith("tip:"):
+            continue
+        if "model:" in lower:
+            continue
+        if "directory:" in lower:
+            continue
+        if lower.startswith("›"):
+            continue
+        if "% left" in lower:
+            continue
+        if terminal_text_looks_like_generic_idle_footer(line):
+            continue
+        kept.append(semantic)
+    if not kept:
+        return False
+    printable = sum(1 for ch in " ".join(kept) if ch.isprintable() and not ch.isspace())
+    return printable >= 80 or len(kept) >= 4
+
+
 def terminal_text_looks_like_shell_prompt(text: str) -> bool:
     stripped = text.strip()
     if not stripped:
@@ -474,9 +529,18 @@ def terminal_text_looks_like_shell_prompt(text: str) -> bool:
 
 def terminal_text_looks_like_transcript_browser(text: str) -> bool:
     normalized = " ".join(text.strip().lower().split())
-    if not normalized or (
-        "transcript" not in normalized and "t r a n s c r i p t" not in normalized
+    if not normalized:
+        return False
+    if (
+        "resume a previous session" in normalized
+        and (
+            "sort updated at" in normalized
+            or "sort: updated at" in normalized
+            or "conversation" in normalized
+        )
     ):
+        return True
+    if "transcript" not in normalized and "t r a n s c r i p t" not in normalized:
         return False
     return any(fragment in normalized for fragment in TRANSCRIPT_BROWSER_HINTS)
 
@@ -487,6 +551,20 @@ def terminal_text_looks_like_saved_transcript_prefill(text: str) -> bool:
         return False
     return normalized.startswith("saved transcript") and all(
         fragment in normalized for fragment in SAVED_TRANSCRIPT_HINTS
+    )
+
+
+def terminal_text_looks_like_launcher_boilerplate(text: str) -> bool:
+    normalized = " ".join(text.strip().lower().split())
+    if not normalized:
+        return False
+    return (
+        "open live terminal " in normalized
+        or "launch command prepared:" in normalized
+        or "daemon pty:" in normalized
+        or "queue remote yggterm resume " in normalized
+        or "__yggterm_requested=" in text
+        or "__yggterm_cwd_ok=" in text
     )
 
 
@@ -677,6 +755,20 @@ def require_terminal_painted(state: dict, session_path: str) -> dict:
         raise RuntimeError("titlebar not in sync with viewport")
     if (viewport.get("active_terminal_host_count") or 0) <= 0:
         raise RuntimeError(viewport.get("reason") or "active terminal host missing")
+    first = (viewport.get("active_terminal_hosts") or [{}])[0]
+    child_count = int(first.get("child_count") or 0)
+    xterm_present = bool(first.get("xterm_present"))
+    screen_present = bool(first.get("screen_present"))
+    viewport_present = bool(first.get("viewport_present"))
+    rows_present = bool(first.get("rows_present"))
+    cols = int(first.get("cols") or 0)
+    rows = int(first.get("rows") or 0)
+    if not (child_count > 0 or xterm_present or screen_present or viewport_present or rows_present):
+        raise RuntimeError("terminal host exists but no visible xterm paint landed")
+    if cols < 20 or rows < 4:
+        raise RuntimeError(
+            f"terminal geometry is still degenerate cols={cols} rows={rows}"
+        )
     text = active_terminal_text(state)
     overlay = terminal_resume_overlay(state)
     overlay_visible = bool(overlay.get("visible"))
@@ -686,12 +778,18 @@ def require_terminal_painted(state: dict, session_path: str) -> dict:
         raise RuntimeError("terminal painted transport/error output instead of the session")
     if terminal_text_looks_like_generic_idle(text):
         raise RuntimeError("terminal resumed into generic Codex idle surface")
+    if terminal_text_looks_like_generic_idle_footer(
+        text
+    ) and not terminal_text_has_meaningful_resume_context(text):
+        raise RuntimeError("terminal resumed into generic Codex idle footer instead of the session")
     if terminal_text_looks_like_shell_prompt(text):
         raise RuntimeError("terminal exposed plain shell prompt instead of restored session UX")
     if terminal_text_looks_like_transcript_browser(text):
         raise RuntimeError("terminal exposed Codex transcript browser instead of live session surface")
     if terminal_text_looks_like_saved_transcript_prefill(text):
         raise RuntimeError("terminal still showing saved transcript prefill instead of the live host")
+    if terminal_text_looks_like_launcher_boilerplate(text):
+        raise RuntimeError("terminal is still showing launcher boilerplate instead of the live host")
     if overlay_visible:
         if overlay_kind != "chip":
             raise RuntimeError("resume overlay still covers terminal after paint budget")
@@ -774,6 +872,7 @@ def main() -> int:
             "summary": target.get("summary"),
         }
         try:
+            open_started = time.monotonic()
             entry["open"] = app_open(
                 args.host,
                 args.bin,
@@ -790,6 +889,7 @@ def main() -> int:
                     session_path,
                 ),
             )
+            cold_elapsed = time.monotonic() - open_started
             entry["cold_elapsed_s"] = round(cold_elapsed, 3)
             state = cold_state
             elapsed = cold_elapsed
@@ -812,6 +912,7 @@ def main() -> int:
                     ),
                 )
                 entry["preview_switch_s"] = round(preview_elapsed, 3)
+                roundtrip_started = time.monotonic()
                 entry["roundtrip_open"] = app_open(
                     args.host,
                     args.bin,
@@ -828,13 +929,14 @@ def main() -> int:
                         session_path,
                     ),
                 )
+                elapsed = time.monotonic() - roundtrip_started
                 entry["roundtrip_elapsed_s"] = round(elapsed, 3)
                 entry["preview_state_dump"] = write_json(
                     out_dir / f"terminal-resume-{index:02d}-preview.json",
                     preview_state,
                 )
             viewport = state.get("viewport") or {}
-            entry["elapsed_s"] = round(elapsed, 3)
+            entry["elapsed_s"] = round(cold_elapsed, 3)
             entry["within_budget"] = elapsed <= args.paint_budget
             entry["ready"] = bool(viewport.get("ready"))
             entry["reason"] = viewport.get("reason")
@@ -919,6 +1021,15 @@ def main() -> int:
                 if terminal_text_looks_like_generic_idle(item.get("terminal_text_sample") or "")
             ]
         ),
+        "generic_idle_footer_surfaces": len(
+            [
+                item for item in results
+                if terminal_text_looks_like_generic_idle_footer(item.get("terminal_text_sample") or "")
+                and not terminal_text_has_meaningful_resume_context(
+                    item.get("terminal_text_sample") or ""
+                )
+            ]
+        ),
         "shell_prompt_failures": len(
             [
                 item for item in results
@@ -929,6 +1040,14 @@ def main() -> int:
             [
                 item for item in results
                 if terminal_text_looks_like_transcript_browser(item.get("terminal_text_sample") or "")
+            ]
+        ),
+        "launcher_boilerplate_failures": len(
+            [
+                item for item in results
+                if terminal_text_looks_like_launcher_boilerplate(
+                    item.get("terminal_text_sample") or ""
+                )
             ]
         ),
         "overlay_copy_failures": len(
@@ -1013,6 +1132,7 @@ def main() -> int:
         and summary["placeholder_failures"] == 0
         and summary["shell_prompt_failures"] == 0
         and summary["transcript_browser_failures"] == 0
+        and summary["launcher_boilerplate_failures"] == 0
         and summary["terminal_error_failures"] == 0
         and summary["overlay_copy_failures"] == 0
         and summary["overlay_visible_failures"] == 0
