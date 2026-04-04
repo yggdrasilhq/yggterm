@@ -591,6 +591,17 @@ def terminal_text_looks_like_launcher_boilerplate(text: str) -> bool:
     )
 
 
+def terminal_text_looks_like_low_signal_terminal_noise(text: str) -> bool:
+    normalized = " ".join(text.strip().split())
+    if not normalized or len(normalized) > 96 or "^[" not in normalized:
+        return False
+    return all(
+        ch.isalnum() or ch in "^[];?:-_<>=/\\."
+        for ch in normalized
+    )
+
+
+
 def overlay_resolved(overlay: dict) -> bool:
     if not bool(overlay.get("visible")):
         return True
@@ -829,6 +840,8 @@ def require_terminal_painted(state: dict, session_path: str, expected_attempt_id
         raise RuntimeError("terminal still showing saved transcript prefill instead of the live host")
     if terminal_text_looks_like_launcher_boilerplate(text):
         raise RuntimeError("terminal is still showing launcher boilerplate instead of the live host")
+    if terminal_text_looks_like_low_signal_terminal_noise(text):
+        raise RuntimeError("terminal is still showing low-signal terminal noise")
     if overlay_visible:
         if overlay_kind != "chip":
             raise RuntimeError("resume overlay still covers terminal after paint budget")
@@ -1102,6 +1115,14 @@ def main() -> int:
                 )
             ]
         ),
+        "low_signal_terminal_noise_failures": len(
+            [
+                item for item in results
+                if terminal_text_looks_like_low_signal_terminal_noise(
+                    item.get("terminal_text_sample") or ""
+                )
+            ]
+        ),
         "overlay_copy_failures": len(
             [
                 item for item in results
@@ -1195,6 +1216,7 @@ def main() -> int:
         and summary["shell_prompt_failures"] == 0
         and summary["transcript_browser_failures"] == 0
         and summary["launcher_boilerplate_failures"] == 0
+        and summary["low_signal_terminal_noise_failures"] == 0
         and summary["terminal_error_failures"] == 0
         and summary["terminal_surface_problem_failures"] == 0
         and summary["terminal_open_attempt_failure_latches"] == 0
