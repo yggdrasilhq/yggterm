@@ -381,6 +381,16 @@ def active_terminal_surface(state: dict) -> dict:
     }
 
 
+def active_terminal_open_attempt(state: dict) -> dict:
+    viewport = state.get("viewport") or {}
+    attempt = viewport.get("terminal_open_attempt")
+    if not isinstance(attempt, dict):
+        attempt = state.get("terminal_open_attempt")
+    if not isinstance(attempt, dict):
+        return {}
+    return attempt
+
+
 def looks_like_low_signal_summary(text: str) -> bool:
     normalized = " ".join(text.strip().lower().split())
     if not normalized:
@@ -758,7 +768,7 @@ def percentile(values: list[float], pct: float) -> float | None:
     return ordered[lower] * (1 - fraction) + ordered[upper] * fraction
 
 
-def require_terminal_painted(state: dict, session_path: str) -> dict:
+def require_terminal_painted(state: dict, session_path: str, expected_attempt_id: str | None = None) -> dict:
     viewport = state.get("viewport") or {}
     if viewport.get("active_view_mode") != "Terminal":
         raise RuntimeError("viewport not in terminal mode")
@@ -785,10 +795,22 @@ def require_terminal_painted(state: dict, session_path: str) -> dict:
     text = active_terminal_text(state)
     overlay = terminal_resume_overlay(state)
     surface = active_terminal_surface(state)
+    attempt = active_terminal_open_attempt(state)
     overlay_visible = bool(overlay.get("visible"))
     overlay_text = (overlay.get("text_sample") or "").strip().lower()
     overlay_kind = (overlay.get("kind") or "").strip().lower()
     surface_problem = (surface.get("problem") or "").strip()
+    attempt_id = (attempt.get("attempt_id") or "").strip()
+    latched_failure_reason = (attempt.get("latched_failure_reason") or "").strip()
+    if expected_attempt_id:
+        if not attempt_id:
+            raise RuntimeError("terminal open attempt is missing from app state")
+        if attempt_id != expected_attempt_id:
+            raise RuntimeError(
+                f"terminal open attempt drifted expected={expected_attempt_id} actual={attempt_id}"
+            )
+    if latched_failure_reason:
+        raise RuntimeError(f"terminal open attempt latched failure: {latched_failure_reason}")
     if surface_problem:
         raise RuntimeError(surface_problem)
     if terminal_text_looks_like_error(text):
@@ -897,6 +919,13 @@ def main() -> int:
                 args.timeout_ms,
                 "terminal",
             )
+            attempt = (
+                (entry["open"].get("data") or {}).get("terminal_open_attempt")
+                if isinstance(entry["open"], dict)
+                else None
+            ) or {}
+            attempt_id = (attempt.get("attempt_id") or "").strip() or None
+            entry["terminal_open_attempt"] = attempt
             cold_elapsed, cold_state = wait_until(
                 f"terminal paint {session_path}",
                 args.paint_budget,
@@ -904,6 +933,7 @@ def main() -> int:
                 lambda: require_terminal_painted(
                     app_state(args.host, args.bin, args.timeout_ms),
                     session_path,
+                    attempt_id,
                 ),
             )
             cold_elapsed = time.monotonic() - open_started
@@ -944,6 +974,7 @@ def main() -> int:
                     lambda: require_terminal_painted(
                         app_state(args.host, args.bin, args.timeout_ms),
                         session_path,
+                        attempt_id,
                     ),
                 )
                 elapsed = time.monotonic() - roundtrip_started
@@ -961,6 +992,7 @@ def main() -> int:
             entry["active_summary"] = viewport.get("active_summary")
             entry["terminal_resume_overlay"] = terminal_resume_overlay(state)
             entry["terminal_surface"] = active_terminal_surface(state)
+            entry["terminal_open_attempt"] = active_terminal_open_attempt(state)
             entry["terminal_text_sample"] = active_terminal_text(state)
             overlay_elapsed, overlay_state = wait_until(
                 f"overlay settle {session_path}",
@@ -990,6 +1022,7 @@ def main() -> int:
             entry["active_summary"] = viewport.get("active_summary")
             entry["terminal_resume_overlay"] = terminal_resume_overlay(state)
             entry["terminal_surface"] = active_terminal_surface(state)
+            entry["terminal_open_attempt"] = active_terminal_open_attempt(state)
             entry["terminal_text_sample"] = active_terminal_text(state)
             entry["overlay_resolved_within_budget"] = False
             entry["state_dump"] = write_json(
@@ -1124,6 +1157,13 @@ def main() -> int:
         "terminal_surface_problem_failures": len(
             [item for item in results if (item.get("terminal_surface") or {}).get("problem")]
         ),
+        "terminal_open_attempt_failure_latches": len(
+            [
+                item
+                for item in results
+                if ((item.get("terminal_open_attempt") or {}).get("latched_failure_reason") or "").strip()
+            ]
+        ),
         "results": results,
     }
     elapsed_values = [float(item["elapsed_s"]) for item in results if item.get("elapsed_s") is not None]
@@ -1157,6 +1197,7 @@ def main() -> int:
         and summary["launcher_boilerplate_failures"] == 0
         and summary["terminal_error_failures"] == 0
         and summary["terminal_surface_problem_failures"] == 0
+        and summary["terminal_open_attempt_failure_latches"] == 0
         and summary["overlay_copy_failures"] == 0
         and summary["overlay_visible_failures"] == 0
         and summary["overlay_resolve_failures"] == 0
