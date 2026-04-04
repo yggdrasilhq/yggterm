@@ -29,6 +29,7 @@ Use this workflow when a `yggui` app feature or fix should ship with proof, scre
    - optional recording
    - app-state snapshot
    - event trace / perf evidence
+   - when terminal open/restore is involved, the exact `terminal_open_attempt` object and `active_terminal_surface`
 4. Create or update the proof bundle:
    - `manifest.json`
    - `summary.md`
@@ -44,6 +45,7 @@ Use this workflow when a `yggui` app feature or fix should ship with proof, scre
 ## Standards
 
 - Prefer exact screenshots and traces over vague prose.
+- For terminal restore claims, bind the proof to one attempt id and fail the claim if that attempt latched any failure, even if a later state looks healthy.
 - Keep changelog language user-visible and concise.
 - Treat demo assets as release material, not disposable debugging leftovers.
 - When a result is not live-verified, say so explicitly.
