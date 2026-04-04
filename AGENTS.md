@@ -111,4 +111,5 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 - Prefer release notes that cite proof bundles and screenshots over vague summaries.
 - When adding new app-control or automation powers, update the demo/changelog docs and skill in the same change rather than letting the workflow drift out of sync.
 - When touching observability, app-control, proof capture, or terminal-resume verification, always update the relevant skill file in the same change so the debugging workflow stays current.
+- Terminal geometry classification in app-control is part of observability. If `active_terminal_surface.geometry_problem` changes semantics, update the relevant skill files in the same commit.
 - Visual changelog assets should be deterministic, reusable, and cleanly composited, with restrained motion and annotation rather than flashy effects.

@@ -574,7 +574,9 @@ pub fn unique_session_short_ids_for_pairs(
                 continue;
             }
             let suffix = session_id_suffix(&sessions[ix].1, width);
-            if counts.get(&suffix).copied().unwrap_or_default() == 1 || width >= sessions[ix].1.chars().count() {
+            if counts.get(&suffix).copied().unwrap_or_default() == 1
+                || width >= sessions[ix].1.chars().count()
+            {
                 out.insert(sessions[ix].0.clone(), suffix);
             } else {
                 next_unresolved.push(ix);
