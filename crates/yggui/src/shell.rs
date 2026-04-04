@@ -11909,6 +11909,20 @@ fn terminal_open_attempt_failure_reason_from_viewport(viewport: &Value) -> Optio
     if !visible {
         return None;
     }
+    let active_session_path = viewport
+        .get("active_session_path")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let attach_in_flight = !active_session_path.is_empty()
+        && viewport
+            .get("shell")
+            .and_then(|value| value.get("terminal_attach_in_flight"))
+            .and_then(Value::as_array)
+            .is_some_and(|paths| {
+                paths.iter()
+                    .filter_map(Value::as_str)
+                    .any(|path| path == active_session_path)
+            });
     let kind = overlay
         .get("kind")
         .and_then(Value::as_str)
@@ -11920,6 +11934,9 @@ fn terminal_open_attempt_failure_reason_from_viewport(viewport: &Value) -> Optio
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
+    if kind == "failure" && attach_in_flight {
+        return None;
+    }
     let normalized = text.to_ascii_lowercase();
     if kind == "failure"
         || normalized.contains("remote host is unavailable")
@@ -11942,6 +11959,16 @@ fn terminal_open_attempt_problem_is_fatal(problem: &str) -> bool {
         || normalized.contains("session is unavailable")
         || normalized.contains("saved remote session is unavailable")
         || normalized.contains("remote host is unavailable")
+}
+
+fn remote_resume_overlay_shows_failure(
+    is_remote_resume_session: bool,
+    resume_overlay_failed: bool,
+    resume_overlay_timed_out: bool,
+    attach_in_flight: bool,
+) -> bool {
+    is_remote_resume_session
+        && (resume_overlay_timed_out || (resume_overlay_failed && !attach_in_flight))
 }
 
 fn summarize_terminal_surface_for_app_control(
@@ -14016,7 +14043,7 @@ fn app() -> Element {
     let window_spawn_probe_started = use_hook(current_millis);
     let window_spawn_traced = use_hook(|| Arc::new(AtomicBool::new(false))).clone();
     let mut window_epoch = use_signal(|| 0_u64);
-    let mut terminal_mount_epoch = use_signal(|| 0_u64);
+    let terminal_mount_epoch = use_signal(|| 0_u64);
     let async_render_epoch = use_signal(|| 0_u64);
     let mut last_open_recovery_path = use_signal(|| None::<String>);
     let mut last_preview_refresh_marker = use_signal(|| None::<(String, u64, bool)>);
@@ -18123,8 +18150,9 @@ fn preview_summary_text(session: &ManagedSessionView) -> String {
 }
 
 fn terminal_session_still_active(shell: &ShellState, session_path: &str, host_id: &str) -> bool {
-    shell.server.active_session_path() == Some(session_path)
-        && shell.active_terminal_host_id.as_deref() == Some(host_id)
+    shell.terminal_attach_in_flight.contains(session_path)
+        || (shell.server.active_session_path() == Some(session_path)
+            && shell.active_terminal_host_id.as_deref() == Some(host_id))
 }
 
 fn terminal_precis(session: &ManagedSessionView) -> String {
@@ -18968,8 +18996,9 @@ fn TerminalCanvas(
     let host_prefill_meaningful = terminal_placeholder
         .as_deref()
         .is_some_and(terminal_prefill_should_render_to_host);
-    let terminal_resume_overlay_excerpt = use_signal(|| initial_resume_overlay_excerpt.clone());
-    let last_bootstrap_identity = use_signal(String::new);
+    let mut terminal_resume_overlay_excerpt = use_signal(|| initial_resume_overlay_excerpt.clone());
+    let mut last_bootstrap_identity = use_signal(String::new);
+    let mut mount_bootstrap_generation = use_signal(|| 0_u64);
     let resume_overlay_excerpt = terminal_resume_overlay_excerpt()
         .or_else(|| initial_resume_overlay_excerpt.clone())
         .or(snapshot_resume_overlay_excerpt);
@@ -18978,52 +19007,37 @@ fn TerminalCanvas(
         .read()
         .terminal_resume_ready_paths
         .contains(&session_path);
-    let terminal_has_meaningful_output =
+    let mut terminal_has_meaningful_output =
         use_signal(|| !is_remote_resume_session || resume_ready_from_shell);
-    let terminal_prompt_only = use_signal(|| false);
-    let terminal_overlay_dismissed =
+    let mut terminal_prompt_only = use_signal(|| false);
+    let mut terminal_overlay_dismissed =
         use_signal(|| !is_remote_resume_session || resume_ready_from_shell);
-    let terminal_live_host_connected = use_signal(|| resume_ready_from_shell);
-    let terminal_resume_surface_staged =
+    let mut terminal_live_host_connected = use_signal(|| resume_ready_from_shell);
+    let mut terminal_resume_surface_staged =
         use_signal(|| !is_remote_resume_session || resume_ready_from_shell);
-    let resume_overlay_slow = use_signal(|| false);
-    let resume_overlay_failed = use_signal(|| false);
-    let resume_overlay_timed_out = use_signal(|| false);
-    {
-        let mount_identity = mount_identity.clone();
-        let initial_resume_overlay_excerpt = initial_resume_overlay_excerpt.clone();
-        let mut last_bootstrap_identity = last_bootstrap_identity;
-        let mut terminal_resume_overlay_excerpt = terminal_resume_overlay_excerpt;
-        let mut terminal_has_meaningful_output = terminal_has_meaningful_output;
-        let mut terminal_prompt_only = terminal_prompt_only;
-        let mut terminal_overlay_dismissed = terminal_overlay_dismissed;
-        let mut terminal_live_host_connected = terminal_live_host_connected;
-        let mut terminal_resume_surface_staged = terminal_resume_surface_staged;
-        let mut resume_overlay_slow = resume_overlay_slow;
-        let mut resume_overlay_failed = resume_overlay_failed;
-        let mut resume_overlay_timed_out = resume_overlay_timed_out;
-        use_effect(move || {
-            if *last_bootstrap_identity.read() == mount_identity {
-                return;
-            }
-            last_bootstrap_identity.set(mount_identity.clone());
-            terminal_resume_overlay_excerpt.set(initial_resume_overlay_excerpt.clone());
-            terminal_has_meaningful_output
-                .set(!is_remote_resume_session || resume_ready_from_shell);
-            terminal_prompt_only.set(false);
-            terminal_overlay_dismissed.set(!is_remote_resume_session);
-            terminal_live_host_connected.set(false);
-            terminal_resume_surface_staged.set(!is_remote_resume_session);
-            resume_overlay_slow.set(false);
-            resume_overlay_failed.set(false);
-            resume_overlay_timed_out.set(false);
-        });
+    let mut resume_overlay_slow = use_signal(|| false);
+    let mut resume_overlay_failed = use_signal(|| false);
+    let mut resume_overlay_timed_out = use_signal(|| false);
+    if *last_bootstrap_identity.read() != mount_identity {
+        last_bootstrap_identity.set(mount_identity.clone());
+        mount_bootstrap_generation.set(mount_bootstrap_generation().saturating_add(1));
+        terminal_resume_overlay_excerpt.set(initial_resume_overlay_excerpt.clone());
+        terminal_has_meaningful_output.set(!is_remote_resume_session || resume_ready_from_shell);
+        terminal_prompt_only.set(false);
+        terminal_overlay_dismissed.set(!is_remote_resume_session);
+        terminal_live_host_connected.set(false);
+        terminal_resume_surface_staged.set(!is_remote_resume_session);
+        resume_overlay_slow.set(false);
+        resume_overlay_failed.set(false);
+        resume_overlay_timed_out.set(false);
     }
     {
         let mount_identity = mount_identity.clone();
         let last_bootstrap_identity = last_bootstrap_identity;
+        let mount_bootstrap_generation = mount_bootstrap_generation;
         let mut resume_overlay_slow = resume_overlay_slow;
         use_effect(move || {
+            let _generation = mount_bootstrap_generation();
             if !is_remote_resume_session {
                 resume_overlay_slow.set(false);
                 return;
@@ -19042,9 +19056,11 @@ fn TerminalCanvas(
     {
         let mount_identity = mount_identity.clone();
         let last_bootstrap_identity = last_bootstrap_identity;
+        let mount_bootstrap_generation = mount_bootstrap_generation;
         let mut resume_overlay_timed_out = resume_overlay_timed_out;
         let terminal_live_host_connected = terminal_live_host_connected;
         use_effect(move || {
+            let _generation = mount_bootstrap_generation();
             if !is_remote_resume_session {
                 resume_overlay_timed_out.set(false);
                 return;
@@ -19066,8 +19082,10 @@ fn TerminalCanvas(
     {
         let host_id = host_id.clone();
         let session_path = session_path.clone();
+        let mount_bootstrap_generation = mount_bootstrap_generation;
         let mut state = state;
         use_effect(move || {
+            let _generation = mount_bootstrap_generation();
             state.with_mut(|shell| {
                 if shell.server.active_view_mode() == WorkspaceViewMode::Terminal
                     && shell.server.active_session_path() == Some(session_path.as_str())
@@ -19080,7 +19098,9 @@ fn TerminalCanvas(
     {
         let host_id = host_id.clone();
         let theme = theme.clone();
+        let mount_bootstrap_generation = mount_bootstrap_generation;
         use_effect(move || {
+            let _generation = mount_bootstrap_generation();
             let _ = document::eval(&terminal_apply_script(&host_id, &theme));
         });
     }
@@ -19088,7 +19108,9 @@ fn TerminalCanvas(
         let session_path = session_path.clone();
         let theme = theme.clone();
         let active_view_mode = snapshot.active_view_mode;
+        let mount_bootstrap_generation = mount_bootstrap_generation;
         use_effect(move || {
+            let _generation = mount_bootstrap_generation();
             if active_view_mode == WorkspaceViewMode::Terminal {
                 let _ = document::eval(&terminal_apply_script_for_session(&session_path, &theme));
             }
@@ -19103,17 +19125,22 @@ fn TerminalCanvas(
         let theme = future_theme.clone();
         let placeholder = terminal_resume_prefill.clone();
         let trace_home = trace_home.clone();
-        let mut state = state;
+        let mount_bootstrap_generation = mount_bootstrap_generation;
+        let state = state;
         let last_bootstrap_identity = last_bootstrap_identity;
-        let mut terminal_has_meaningful_output = terminal_has_meaningful_output;
-        let mut terminal_prompt_only = terminal_prompt_only;
-        let mut terminal_overlay_dismissed = terminal_overlay_dismissed;
-        let mut terminal_live_host_connected = terminal_live_host_connected;
-        let mut terminal_resume_surface_staged = terminal_resume_surface_staged;
-        let mut terminal_resume_overlay_excerpt = terminal_resume_overlay_excerpt;
-        let mut resume_overlay_failed = resume_overlay_failed;
-        let mut resume_overlay_timed_out = resume_overlay_timed_out;
+        let terminal_has_meaningful_output = terminal_has_meaningful_output;
+        let terminal_prompt_only = terminal_prompt_only;
+        let terminal_overlay_dismissed = terminal_overlay_dismissed;
+        let terminal_live_host_connected = terminal_live_host_connected;
+        let terminal_resume_surface_staged = terminal_resume_surface_staged;
+        let terminal_resume_overlay_excerpt = terminal_resume_overlay_excerpt;
+        let resume_overlay_failed = resume_overlay_failed;
+        let resume_overlay_timed_out = resume_overlay_timed_out;
         use_effect(move || {
+            let generation = mount_bootstrap_generation();
+            if generation == 0 {
+                return;
+            }
             if *last_bootstrap_identity.read() != mount_identity {
                 append_trace_event(
                     &trace_home,
@@ -19137,15 +19164,15 @@ fn TerminalCanvas(
             let task_theme = theme.clone();
             let task_placeholder = placeholder.clone();
             let task_trace_home = trace_home.clone();
-            let mut task_state = state;
-            let mut task_terminal_has_meaningful_output = terminal_has_meaningful_output;
-            let mut task_terminal_prompt_only = terminal_prompt_only;
-            let mut task_terminal_overlay_dismissed = terminal_overlay_dismissed;
-            let mut task_terminal_live_host_connected = terminal_live_host_connected;
-            let mut task_terminal_resume_surface_staged = terminal_resume_surface_staged;
-            let mut task_terminal_resume_overlay_excerpt = terminal_resume_overlay_excerpt;
-            let mut task_resume_overlay_failed = resume_overlay_failed;
-            let mut task_resume_overlay_timed_out = resume_overlay_timed_out;
+            let task_state = state;
+            let task_terminal_has_meaningful_output = terminal_has_meaningful_output;
+            let task_terminal_prompt_only = terminal_prompt_only;
+            let task_terminal_overlay_dismissed = terminal_overlay_dismissed;
+            let task_terminal_live_host_connected = terminal_live_host_connected;
+            let task_terminal_resume_surface_staged = terminal_resume_surface_staged;
+            let task_terminal_resume_overlay_excerpt = terminal_resume_overlay_excerpt;
+            let task_resume_overlay_failed = resume_overlay_failed;
+            let task_resume_overlay_timed_out = resume_overlay_timed_out;
             spawn(async move {
                 let mount_identity = task_mount_identity;
                 let endpoint = task_endpoint;
@@ -19167,6 +19194,11 @@ fn TerminalCanvas(
                 let _ = safe_shell_mut(state, "terminal_attach_begin", |shell| {
                     shell.terminal_attach_in_flight.clear();
                     shell.terminal_attach_in_flight.insert(session_path.clone());
+                    if shell.server.active_view_mode() == WorkspaceViewMode::Terminal
+                        && shell.server.active_session_path() == Some(session_path.as_str())
+                    {
+                        shell.active_terminal_host_id = Some(host_id.clone());
+                    }
                 });
                 append_trace_event(
                     &trace_home,
@@ -20091,9 +20123,18 @@ fn TerminalCanvas(
     }
     let resume_overlay_effective_failed = is_remote_resume_session
         && (resume_overlay_failed() || resume_overlay_timed_out());
-    let show_resume_overlay = resume_overlay_effective_failed;
+    let attach_recovery_in_flight = state
+        .read()
+        .terminal_attach_in_flight
+        .contains(&session_path);
+    let show_resume_overlay = remote_resume_overlay_shows_failure(
+        is_remote_resume_session,
+        resume_overlay_failed(),
+        resume_overlay_timed_out(),
+        attach_recovery_in_flight,
+    );
     let show_resume_chip = is_remote_resume_session
-        && !resume_overlay_effective_failed
+        && !show_resume_overlay
         && !terminal_overlay_dismissed()
         && !host_prefill_meaningful;
     let show_resume_panel = show_resume_overlay || show_resume_chip;
@@ -20103,7 +20144,7 @@ fn TerminalCanvas(
     let resume_overlay_has_transport_error = resume_overlay_excerpt
         .as_deref()
         .is_some_and(terminal_chunk_is_transport_error);
-    let resume_overlay_title = if resume_overlay_effective_failed {
+    let resume_overlay_title = if show_resume_overlay {
         if resume_overlay_has_missing_session {
             "Saved remote session is unavailable"
         } else if resume_overlay_has_transport_error {
@@ -20114,7 +20155,7 @@ fn TerminalCanvas(
     } else {
         "Resume live remote session"
     };
-    let resume_overlay_body = if resume_overlay_effective_failed {
+    let resume_overlay_body = if show_resume_overlay {
         if resume_overlay_has_missing_session {
             format!(
                 "Yggterm still has cached context for {}, but the saved live Codex session is gone on that machine. This row can open in Preview, but terminal restore is no longer possible.",
@@ -20131,6 +20172,11 @@ fn TerminalCanvas(
                 session.host_label
             )
         }
+    } else if attach_recovery_in_flight && resume_overlay_failed() {
+        format!(
+            "Yggterm hit a bad intermediate terminal surface on {} and is retrying the live restore.",
+            session.host_label
+        )
     } else if terminal_prompt_only() {
         format!(
             "Yggterm reached {} but landed on an idle prompt instead of the saved conversation. The terminal surface is visible behind this chip, but this state is not accepted as a real restore.",
@@ -20499,7 +20545,9 @@ fn batch_terminal_chunks(
         combined.push_str(&chunk.data);
     }
     let (combined, saw_attach_ready_marker) = strip_terminal_attach_ready_marker(&combined);
-    let combined = sanitize_terminal_resume_runtime_output(&combined);
+    let combined = strip_low_signal_terminal_noise_lines(&sanitize_terminal_resume_runtime_output(
+        &combined,
+    ));
     let saw_visible_output = terminal_chunk_has_visible_output(&combined);
     let saw_meaningful_output = terminal_chunk_has_meaningful_output(&combined);
     let saw_prompt_output = terminal_chunk_has_prompt_output(&combined);
@@ -20514,6 +20562,19 @@ fn batch_terminal_chunks(
         saw_transcript_browser_output,
         saw_attach_ready_marker,
     )
+}
+
+fn strip_low_signal_terminal_noise_lines(data: &str) -> String {
+    let kept = data
+        .lines()
+        .filter(|line| !terminal_chunk_is_low_signal_terminal_noise(line))
+        .collect::<Vec<_>>();
+    let cleaned = kept.join("\n");
+    if cleaned.trim().is_empty() {
+        String::new()
+    } else {
+        cleaned
+    }
 }
 
 fn sanitize_terminal_resume_runtime_output(data: &str) -> String {
@@ -20701,34 +20762,52 @@ fn remote_resume_surface_connected(
 }
 
 fn terminal_chunk_is_transport_error(data: &str) -> bool {
-    let normalized = strip_terminal_control_sequences(data)
-        .to_ascii_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    if normalized.is_empty() {
+    let stripped = strip_terminal_control_sequences(data);
+    let lines = stripped
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(4)
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
         return false;
     }
-    [
+    let head = lines.join(" ");
+    if [
         "error: reading /tmp/yggterm-screen",
         "mux_client_request_session",
         "session open refused by peer",
         "controlsocket",
         "exec: export: not found",
-        "permission denied",
-        "connection refused",
-        "no route to host",
-        "connection timed out",
-        "broken pipe",
-        "connection to ",
-        "shared connection to ",
         "terminal session not found",
         "[screen is terminating]",
         "saved codex session",
         "cannot be restored as a live terminal",
     ]
     .iter()
-    .any(|fragment| normalized.contains(fragment))
+    .any(|fragment| head.contains(fragment))
+    {
+        return true;
+    }
+    lines.iter().any(|line| {
+        let line = line.trim();
+        (line.starts_with("shared connection to ")
+            && (line.contains(" closed") || line.contains("refused") || line.contains("timed out")))
+            || (line.starts_with("connection to ")
+                && (line.contains(" closed")
+                    || line.contains("refused")
+                    || line.contains("timed out")))
+            || ((line.starts_with("ssh:")
+                || line.starts_with("error:")
+                || line.starts_with("fatal:")
+                || line.starts_with("rsync:"))
+                && (line.contains("permission denied")
+                    || line.contains("connection refused")
+                    || line.contains("no route to host")
+                    || line.contains("connection timed out")
+                    || line.contains("broken pipe")))
+    })
 }
 
 fn terminal_tail_excerpt(data: &str, max_chars: usize) -> String {
@@ -26897,6 +26976,22 @@ Waiting for the remote terminal to paint...\n";
     }
 
     #[test]
+    fn app_control_terminal_surface_does_not_flag_narrative_no_route_to_host() {
+        let host = json!({
+            "child_count": 1,
+            "xterm_present": true,
+            "screen_present": true,
+            "viewport_present": true,
+            "rows_present": true,
+            "canvas_count": 1,
+            "text_sample": "Validation:\n- nginx -t passed\n- nginx reloaded successfully\nThat should stop the stale upstream No route to host noise for those retired services."
+        });
+        let surface = summarize_terminal_surface_for_app_control(&[host], false);
+        assert_eq!(surface.get("rendered").and_then(Value::as_bool), Some(true));
+        assert_eq!(surface.get("problem"), Some(&Value::Null));
+    }
+
+    #[test]
     fn app_control_terminal_surface_flags_launcher_boilerplate() {
         let host = json!({
             "child_count": 1,
@@ -27001,6 +27096,25 @@ Waiting for the remote terminal to paint...\n";
     }
 
     #[test]
+    fn terminal_open_attempt_failure_reason_ignores_failure_overlay_while_attach_in_flight() {
+        let viewport = json!({
+            "active_session_path": "remote-session://jojo/36f8",
+            "shell": {
+                "terminal_attach_in_flight": ["remote-session://jojo/36f8"]
+            },
+            "active_terminal_surface": {
+                "problem": null
+            },
+            "terminal_resume_overlay": {
+                "visible": true,
+                "kind": "failure",
+                "text_sample": "Remote terminal needs attention\nStill not interactive"
+            }
+        });
+        assert_eq!(terminal_open_attempt_failure_reason_from_viewport(&viewport), None);
+    }
+
+    #[test]
     fn terminal_chunk_detects_low_signal_terminal_noise() {
         assert!(terminal_chunk_is_low_signal_terminal_noise(
             "^[[O^[[1;1R^[[O^[[1;12R"
@@ -27019,6 +27133,27 @@ Waiting for the remote terminal to paint...\n";
             terminal_resume_output_excerpt("^[[O^[[1;1R^[[?1;2c^[]10;rgb:1f1f/2323/2828^[\\\\"),
             None
         );
+    }
+
+    #[test]
+    fn batch_terminal_chunks_strips_low_signal_terminal_noise_lines() {
+        let (combined, saw_visible_output, saw_meaningful_output, _, _, _, _) =
+            batch_terminal_chunks(vec![
+                yggterm_server::TerminalStreamChunk {
+                    seq: 1,
+                    data: "^[[46;3R^[[46;3Rot\n".to_string(),
+                },
+                yggterm_server::TerminalStreamChunk {
+                    seq: 2,
+                    data: "After reboot, I'll immediately re-check whether 83:00.0 now exposes sriov_numvfs.\n".to_string(),
+                },
+            ]);
+        assert_eq!(
+            combined.as_deref(),
+            Some("After reboot, I'll immediately re-check whether 83:00.0 now exposes sriov_numvfs.")
+        );
+        assert!(saw_visible_output);
+        assert!(!saw_meaningful_output);
     }
 
     #[test]
@@ -27315,6 +27450,13 @@ Updated at   Branch  Conversation\n\
         assert!(!remote_resume_surface_connected(
             false, true, false, false, false, false, true,
         ));
+    }
+
+    #[test]
+    fn remote_resume_overlay_shows_failure_waits_for_attach_to_finish() {
+        assert!(!remote_resume_overlay_shows_failure(true, true, false, true));
+        assert!(remote_resume_overlay_shows_failure(true, true, false, false));
+        assert!(remote_resume_overlay_shows_failure(true, false, true, true));
     }
 
     #[test]

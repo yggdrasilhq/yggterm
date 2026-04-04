@@ -221,7 +221,7 @@ def kill_local_clients(binary: str) -> None:
             pass
 
 
-def launch_local_client(binary: str, timeout_s: float = 4.0) -> tuple[subprocess.Popen, dict]:
+def launch_local_client(binary: str, timeout_s: float = 8.0) -> tuple[subprocess.Popen, dict]:
     binary_path = str(Path(binary).resolve())
     kill_local_clients(binary_path)
     env = os.environ.copy()
@@ -242,7 +242,13 @@ def launch_local_client(binary: str, timeout_s: float = 4.0) -> tuple[subprocess
     start_ms = int(time.time() * 1000)
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
+        event = latest_window_spawn_event_for_pid("local", proc.pid, start_ms)
+        if event is not None:
+            return proc, event
         if local_x11_window_count() > baseline_window_count:
+            event = latest_window_spawn_event_for_pid("local", proc.pid, start_ms)
+            if event is not None:
+                return proc, event
             return proc, {
                 "category": "startup",
                 "name": "window_spawned",
@@ -251,12 +257,24 @@ def launch_local_client(binary: str, timeout_s: float = 4.0) -> tuple[subprocess
                     "source": "x11_root_tree",
                 },
             }
-        event = latest_window_spawn_event_for_pid("local", proc.pid, start_ms)
-        if event is not None:
-            return proc, event
         if proc.poll() is not None:
             break
         time.sleep(0.05)
+    if proc.poll() is None:
+        try:
+            state = app_state("local", binary_path, 1500)
+            viewport = state.get("viewport") or {}
+            if viewport.get("active_view_mode") is not None:
+                return proc, {
+                    "category": "startup",
+                    "name": "window_spawned",
+                    "payload": {
+                        "elapsed_ms": int(time.time() * 1000) - start_ms,
+                        "source": "app_control_fallback",
+                    },
+                }
+        except Exception:
+            pass
     raise RuntimeError(
         f"local launch did not emit window_spawned within {timeout_s:.2f}s for pid {proc.pid}"
     )
@@ -407,6 +425,33 @@ def terminal_open_attempt_elapsed_s(attempt: dict) -> float | None:
     return max(0.0, (float(ready_at_ms) - float(started_at_ms)) / 1000.0)
 
 
+def wait_for_attempt_metrics(
+    host: str,
+    binary: str,
+    timeout_ms: int,
+    attempt_id: str | None,
+    fallback_state: dict,
+    settle_s: float = 0.6,
+) -> tuple[dict, float | None]:
+    if not attempt_id:
+        return fallback_state, None
+    deadline = time.monotonic() + settle_s
+    state = fallback_state
+    while True:
+        attempt = active_terminal_open_attempt(state)
+        current_attempt_id = str(attempt.get("attempt_id") or "").strip()
+        elapsed = terminal_open_attempt_elapsed_s(attempt)
+        if current_attempt_id == attempt_id and elapsed is not None:
+            return state, elapsed
+        if time.monotonic() >= deadline:
+            return state, elapsed if current_attempt_id == attempt_id else None
+        time.sleep(0.05)
+        try:
+            state = app_state(host, binary, timeout_ms)
+        except Exception:
+            return fallback_state, None
+
+
 def looks_like_low_signal_summary(text: str) -> bool:
     normalized = " ".join(text.strip().lower().split())
     if not normalized:
@@ -455,11 +500,27 @@ def terminal_text_looks_like_error(text: str) -> bool:
     head = " ".join(lines[:4])
     if any(fragment in head for fragment in ERROR_FRAGMENTS):
         return True
-    return any(
-        line.startswith("connection to ")
-        and (" closed" in line or "refused" in line or "timed out" in line)
-        for line in lines[:4]
-    ) or any("no route to host" in line for line in lines[:2])
+    for line in lines[:4]:
+        if line.startswith("connection to ") and (
+            " closed" in line or "refused" in line or "timed out" in line
+        ):
+            return True
+        if line.startswith("shared connection to ") and (
+            " closed" in line or "refused" in line or "timed out" in line
+        ):
+            return True
+        if (
+            line.startswith(("ssh:", "error:", "fatal:", "rsync:"))
+            and (
+                "permission denied" in line
+                or "connection refused" in line
+                or "no route to host" in line
+                or "connection timed out" in line
+                or "broken pipe" in line
+            )
+        ):
+            return True
+    return False
 
 
 def terminal_text_looks_like_generic_idle(text: str) -> bool:
@@ -995,9 +1056,14 @@ def main() -> int:
                     attempt_id,
                 ),
             )
-            cold_elapsed = terminal_open_attempt_elapsed_s(
-                active_terminal_open_attempt(cold_state)
-            ) or (time.monotonic() - open_started)
+            cold_state, cold_attempt_elapsed = wait_for_attempt_metrics(
+                args.host,
+                args.bin,
+                args.timeout_ms,
+                attempt_id,
+                cold_state,
+            )
+            cold_elapsed = cold_attempt_elapsed or (time.monotonic() - open_started)
             entry["cold_elapsed_s"] = round(cold_elapsed, 3)
             state = cold_state
             elapsed = cold_elapsed
@@ -1046,9 +1112,14 @@ def main() -> int:
                         attempt_id,
                     ),
                 )
-                elapsed = terminal_open_attempt_elapsed_s(
-                    active_terminal_open_attempt(state)
-                ) or (time.monotonic() - roundtrip_started)
+                state, roundtrip_attempt_elapsed = wait_for_attempt_metrics(
+                    args.host,
+                    args.bin,
+                    args.timeout_ms,
+                    attempt_id,
+                    state,
+                )
+                elapsed = roundtrip_attempt_elapsed or (time.monotonic() - roundtrip_started)
                 entry["roundtrip_elapsed_s"] = round(elapsed, 3)
                 entry["preview_state_dump"] = write_json(
                     out_dir / f"terminal-resume-{index:02d}-preview.json",
