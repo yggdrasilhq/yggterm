@@ -227,6 +227,9 @@ struct ShellState {
     terminal_attach_in_flight: HashSet<String>,
     terminal_resume_ready_paths: HashSet<String>,
     active_terminal_host_id: Option<String>,
+    terminal_open_attempts: HashMap<String, TerminalOpenAttempt>,
+    terminal_open_attempt_order: VecDeque<String>,
+    terminal_open_attempt_by_session: HashMap<String, String>,
     remote_preview_sync_after_ms: HashMap<String, u64>,
     remote_preview_failures: HashMap<String, PreviewSyncFailure>,
     remote_preview_dirty_epoch: HashMap<String, u64>,
@@ -772,6 +775,34 @@ struct ActiveSurfaceRequest {
     target: YggTarget,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TerminalOpenAttemptState {
+    Pending,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+struct TerminalOpenAttempt {
+    attempt_id: String,
+    session_path: String,
+    request_id: String,
+    open_request_id: u64,
+    source: String,
+    started_at_ms: u64,
+    state: TerminalOpenAttemptState,
+    observations: u64,
+    ready_at_ms: Option<u64>,
+    latched_failure_at_ms: Option<u64>,
+    latched_failure_reason: Option<String>,
+    last_observed_ready: bool,
+    last_observed_reason: Option<String>,
+    last_surface_problem: Option<String>,
+    last_overlay_visible: bool,
+    last_overlay_kind: Option<String>,
+    last_overlay_text: Option<String>,
+}
+
 fn active_request_session_target_path(
     request: &ActiveSurfaceRequest,
     fallback_active_path: Option<&str>,
@@ -921,6 +952,9 @@ impl ShellState {
             terminal_attach_in_flight: HashSet::new(),
             terminal_resume_ready_paths: HashSet::new(),
             active_terminal_host_id: None,
+            terminal_open_attempts: HashMap::new(),
+            terminal_open_attempt_order: VecDeque::new(),
+            terminal_open_attempt_by_session: HashMap::new(),
             remote_preview_sync_after_ms: HashMap::new(),
             remote_preview_failures: HashMap::new(),
             remote_preview_dirty_epoch: HashMap::new(),
@@ -1584,6 +1618,229 @@ impl ShellState {
             .retain(|_, request| request.request_id != request_id);
         if self.active_surface_requests.is_empty() {
             self.server_busy = false;
+        }
+    }
+
+    fn begin_terminal_open_attempt(
+        &mut self,
+        session_path: &str,
+        request_id: &str,
+        open_request_id: u64,
+        source: &str,
+    ) -> String {
+        const MAX_TERMINAL_OPEN_ATTEMPTS: usize = 64;
+        let attempt_id = format!("terminal-open-{}-{open_request_id}", current_millis());
+        let attempt = TerminalOpenAttempt {
+            attempt_id: attempt_id.clone(),
+            session_path: session_path.to_string(),
+            request_id: request_id.to_string(),
+            open_request_id,
+            source: source.to_string(),
+            started_at_ms: current_millis(),
+            state: TerminalOpenAttemptState::Pending,
+            observations: 0,
+            ready_at_ms: None,
+            latched_failure_at_ms: None,
+            latched_failure_reason: None,
+            last_observed_ready: false,
+            last_observed_reason: None,
+            last_surface_problem: None,
+            last_overlay_visible: false,
+            last_overlay_kind: None,
+            last_overlay_text: None,
+        };
+        self.terminal_open_attempts
+            .insert(attempt_id.clone(), attempt.clone());
+        self.terminal_open_attempt_order
+            .push_back(attempt_id.clone());
+        self.terminal_open_attempt_by_session
+            .insert(session_path.to_string(), attempt_id.clone());
+        while self.terminal_open_attempt_order.len() > MAX_TERMINAL_OPEN_ATTEMPTS {
+            let Some(oldest_attempt_id) = self.terminal_open_attempt_order.pop_front() else {
+                break;
+            };
+            let removed = self.terminal_open_attempts.remove(&oldest_attempt_id);
+            if removed.as_ref().is_some_and(|entry| {
+                self.terminal_open_attempt_by_session
+                    .get(&entry.session_path)
+                    .is_some_and(|active| active == &oldest_attempt_id)
+            }) {
+                self.terminal_open_attempt_by_session
+                    .remove(&removed.unwrap().session_path);
+            }
+        }
+        self.record_terminal_open_attempt_event("begin", &attempt, None);
+        attempt_id
+    }
+
+    fn latest_terminal_open_attempt_for_path(
+        &self,
+        session_path: &str,
+    ) -> Option<&TerminalOpenAttempt> {
+        let attempt_id = self.terminal_open_attempt_by_session.get(session_path)?;
+        self.terminal_open_attempts.get(attempt_id)
+    }
+
+    fn latest_terminal_open_attempt_snapshot_for_path(&self, session_path: &str) -> Option<Value> {
+        self.latest_terminal_open_attempt_for_path(session_path)
+            .map(describe_terminal_open_attempt)
+    }
+
+    fn observe_terminal_open_attempt_from_viewport(&mut self, viewport: &Value) {
+        let active_session_path = viewport
+            .get("active_session_path")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if active_session_path.is_empty()
+            || viewport.get("active_view_mode").and_then(Value::as_str) != Some("Terminal")
+        {
+            return;
+        }
+        let Some(attempt_id) = self
+            .terminal_open_attempt_by_session
+            .get(active_session_path)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(attempt) = self.terminal_open_attempts.get_mut(&attempt_id) else {
+            return;
+        };
+        let now_ms = current_millis();
+        let ready = viewport
+            .get("ready")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let reason = viewport
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let overlay = viewport
+            .get("terminal_resume_overlay")
+            .and_then(Value::as_object);
+        let overlay_visible = overlay
+            .and_then(|value| value.get("visible"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let overlay_kind = overlay
+            .and_then(|value| value.get("kind"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let overlay_text = overlay
+            .and_then(|value| value.get("text_sample"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let surface_problem = viewport
+            .get("active_terminal_surface")
+            .and_then(|value| value.get("problem"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let failure_reason = terminal_open_attempt_failure_reason_from_viewport(viewport);
+        attempt.observations = attempt.observations.saturating_add(1);
+        attempt.last_observed_ready = ready;
+        attempt.last_observed_reason = reason.clone();
+        attempt.last_surface_problem = surface_problem.clone();
+        attempt.last_overlay_visible = overlay_visible;
+        attempt.last_overlay_kind = overlay_kind.clone();
+        attempt.last_overlay_text = overlay_text.clone();
+        if let Some(failure_reason) = failure_reason {
+            if attempt.latched_failure_reason.is_none() {
+                attempt.latched_failure_at_ms = Some(now_ms);
+                attempt.latched_failure_reason = Some(failure_reason.clone());
+                attempt.state = TerminalOpenAttemptState::Failed;
+                let attempt_snapshot = attempt.clone();
+                self.record_terminal_open_attempt_event(
+                    "latched_failure",
+                    &attempt_snapshot,
+                    Some(json!({
+                        "reason": failure_reason,
+                        "ready": ready,
+                        "viewport_reason": reason,
+                        "surface_problem": surface_problem,
+                        "overlay_visible": overlay_visible,
+                        "overlay_kind": overlay_kind,
+                        "overlay_text": overlay_text,
+                    })),
+                );
+            }
+            return;
+        }
+        if ready && attempt.ready_at_ms.is_none() {
+            attempt.ready_at_ms = Some(now_ms);
+            if attempt.latched_failure_reason.is_none() {
+                attempt.state = TerminalOpenAttemptState::Ready;
+            }
+            let attempt_snapshot = attempt.clone();
+            self.record_terminal_open_attempt_event(
+                "ready",
+                &attempt_snapshot,
+                Some(json!({
+                    "ready": ready,
+                    "viewport_reason": reason,
+                    "surface_problem": surface_problem,
+                    "overlay_visible": overlay_visible,
+                })),
+            );
+        }
+    }
+
+    fn fail_terminal_open_attempt_for_request(&mut self, request_id: &str, reason: String) {
+        let Some(attempt) = self
+            .terminal_open_attempts
+            .values_mut()
+            .find(|attempt| attempt.request_id == request_id)
+        else {
+            return;
+        };
+        if attempt.latched_failure_reason.is_some() {
+            return;
+        }
+        attempt.latched_failure_at_ms = Some(current_millis());
+        attempt.latched_failure_reason = Some(reason.clone());
+        attempt.state = TerminalOpenAttemptState::Failed;
+        let attempt_snapshot = attempt.clone();
+        self.record_terminal_open_attempt_event(
+            "request_failed",
+            &attempt_snapshot,
+            Some(json!({ "reason": reason })),
+        );
+    }
+
+    fn record_terminal_open_attempt_event(
+        &mut self,
+        name: &str,
+        attempt: &TerminalOpenAttempt,
+        extra: Option<Value>,
+    ) {
+        let payload = json!({
+            "attempt_id": attempt.attempt_id,
+            "session_path": attempt.session_path,
+            "request_id": attempt.request_id,
+            "open_request_id": attempt.open_request_id,
+            "source": attempt.source,
+            "started_at_ms": attempt.started_at_ms,
+            "state": terminal_open_attempt_state_label(&attempt.state),
+            "observations": attempt.observations,
+            "ready_at_ms": attempt.ready_at_ms,
+            "latched_failure_at_ms": attempt.latched_failure_at_ms,
+            "latched_failure_reason": attempt.latched_failure_reason,
+            "last_observed_ready": attempt.last_observed_ready,
+            "last_observed_reason": attempt.last_observed_reason,
+            "last_surface_problem": attempt.last_surface_problem,
+            "last_overlay_visible": attempt.last_overlay_visible,
+            "last_overlay_kind": attempt.last_overlay_kind,
+            "last_overlay_text": attempt.last_overlay_text,
+            "extra": extra,
+        });
+        self.record_ui_telemetry("terminal_open_attempt", payload.clone());
+        if let Ok(store) = SessionStore::open_or_init() {
+            append_trace_event(
+                store.home_dir(),
+                "ui",
+                "terminal_open_attempt",
+                name,
+                payload,
+            );
         }
     }
 
@@ -5232,6 +5489,7 @@ fn spawn_open_session_row_with_mode_retry(
         return;
     }
     let mut open_request_id = 0_u64;
+    let mut terminal_open_attempt_id = None::<String>;
     let request_meta = YggRequestMeta::interactive(
         format!("open-row-{}", current_millis()),
         "open_row",
@@ -5286,6 +5544,14 @@ fn spawn_open_session_row_with_mode_retry(
         }
         shell.context_menu_row = None;
         shell.sync_browser_settings();
+        if prefer_terminal {
+            terminal_open_attempt_id = Some(shell.begin_terminal_open_attempt(
+                &row.full_path,
+                &request_meta.request_id,
+                open_request_id,
+                "open_row",
+            ));
+        }
         shell.begin_surface_request(
             request_meta.clone(),
             format!("opening {}", row.label),
@@ -5358,6 +5624,7 @@ fn spawn_open_session_row_with_mode_retry(
             "open_row_outcome",
             json!({
                 "request_id": request_id,
+                "terminal_open_attempt_id": terminal_open_attempt_id,
                 "ok": outcome.is_ok(),
                 "error": outcome.as_ref().err().map(|error| error.to_string()),
             }),
@@ -5397,6 +5664,10 @@ fn spawn_open_session_row_with_mode_retry(
                 }
                 Err(error) => {
                     shell.finish_busy_request_for(&request_id);
+                    if prefer_terminal {
+                        shell
+                            .fail_terminal_open_attempt_for_request(&request_id, error.to_string());
+                    }
                     if retry_budget > 0
                         && is_transient_local_daemon_connect_error(&error.to_string())
                     {
@@ -11527,6 +11798,83 @@ fn preview_text_looks_like_loading_placeholder(text: &str) -> bool {
         || normalized.contains("could not load this remote")
 }
 
+fn terminal_open_attempt_state_label(state: &TerminalOpenAttemptState) -> &'static str {
+    match state {
+        TerminalOpenAttemptState::Pending => "pending",
+        TerminalOpenAttemptState::Ready => "ready",
+        TerminalOpenAttemptState::Failed => "failed",
+    }
+}
+
+fn describe_terminal_open_attempt(attempt: &TerminalOpenAttempt) -> Value {
+    json!({
+        "attempt_id": attempt.attempt_id,
+        "session_path": attempt.session_path,
+        "request_id": attempt.request_id,
+        "open_request_id": attempt.open_request_id,
+        "source": attempt.source,
+        "started_at_ms": attempt.started_at_ms,
+        "state": terminal_open_attempt_state_label(&attempt.state),
+        "observations": attempt.observations,
+        "ready_at_ms": attempt.ready_at_ms,
+        "latched_failure_at_ms": attempt.latched_failure_at_ms,
+        "latched_failure_reason": attempt.latched_failure_reason,
+        "last_observed_ready": attempt.last_observed_ready,
+        "last_observed_reason": attempt.last_observed_reason,
+        "last_surface_problem": attempt.last_surface_problem,
+        "last_overlay_visible": attempt.last_overlay_visible,
+        "last_overlay_kind": attempt.last_overlay_kind,
+        "last_overlay_text": attempt.last_overlay_text,
+    })
+}
+
+fn terminal_open_attempt_failure_reason_from_viewport(viewport: &Value) -> Option<String> {
+    if let Some(problem) = viewport
+        .get("active_terminal_surface")
+        .and_then(|value| value.get("problem"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(problem.to_string());
+    }
+    let overlay = viewport
+        .get("terminal_resume_overlay")
+        .and_then(Value::as_object)?;
+    let visible = overlay
+        .get("visible")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !visible {
+        return None;
+    }
+    let kind = overlay
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let text = overlay
+        .get("text_sample")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let normalized = text.to_ascii_lowercase();
+    if kind == "failure"
+        || normalized.contains("remote host is unavailable")
+        || normalized.contains("still not interactive")
+        || normalized.contains("has not become interactive")
+        || normalized.contains("needs attention")
+    {
+        return Some(if text.is_empty() {
+            "terminal resume failure overlay is still visible".to_string()
+        } else {
+            text.to_string()
+        });
+    }
+    None
+}
+
 fn summarize_terminal_surface_for_app_control(hosts: &[Value]) -> Value {
     let rendered = hosts
         .iter()
@@ -12765,6 +13113,7 @@ async fn process_pending_app_control_requests(
             );
             match maybe_row {
                 Some(row) => {
+                    let mut terminal_open_attempt = None::<Value>;
                     if let Some(mode) = resolved_view_mode {
                         state.with_mut(|shell| {
                             shell.server.set_view_mode(mode);
@@ -12774,8 +13123,16 @@ async fn process_pending_app_control_requests(
                             row.clone(),
                             mode == WorkspaceViewMode::Terminal,
                         );
+                        if mode == WorkspaceViewMode::Terminal {
+                            terminal_open_attempt = state.with(|shell| {
+                                shell.latest_terminal_open_attempt_snapshot_for_path(&session_path)
+                            });
+                        }
                     } else {
                         spawn_open_session_row(state, row.clone());
+                        terminal_open_attempt = state.with(|shell| {
+                            shell.latest_terminal_open_attempt_snapshot_for_path(&session_path)
+                        });
                     }
                     AppControlResponse {
                         request_id: request.request_id.clone(),
@@ -12786,6 +13143,7 @@ async fn process_pending_app_control_requests(
                             "queued": true,
                             "session_path": session_path,
                             "view_mode": resolved_view_mode.map(|mode| format!("{mode:?}")),
+                            "terminal_open_attempt": terminal_open_attempt,
                         })),
                         error: None,
                     }
@@ -12836,9 +13194,26 @@ async fn process_pending_app_control_requests(
             data: Some({
                 let mut snapshot = describe_app_state_snapshot(&state, &desktop);
                 let dom = capture_dom_debug_snapshot_for(active_session_path.as_deref()).await;
-                let viewport = describe_viewport_snapshot(&snapshot, &dom);
+                let mut viewport = describe_viewport_snapshot(&snapshot, &dom);
+                let terminal_open_attempt = state.with_mut(|shell| {
+                    shell.observe_terminal_open_attempt_from_viewport(&viewport);
+                    viewport
+                        .get("active_session_path")
+                        .and_then(Value::as_str)
+                        .and_then(|path| shell.latest_terminal_open_attempt_snapshot_for_path(path))
+                });
+                if let Some(map) = viewport.as_object_mut() {
+                    map.insert(
+                        "terminal_open_attempt".to_string(),
+                        terminal_open_attempt.clone().unwrap_or(Value::Null),
+                    );
+                }
                 if let Some(map) = snapshot.as_object_mut() {
                     map.insert("dom".to_string(), dom.clone());
+                    map.insert(
+                        "terminal_open_attempt".to_string(),
+                        terminal_open_attempt.unwrap_or(Value::Null),
+                    );
                     map.insert("viewport".to_string(), viewport);
                 }
                 snapshot
@@ -26410,6 +26785,42 @@ Waiting for the remote terminal to paint...\n";
         assert_eq!(
             surface.get("problem").and_then(Value::as_str),
             Some("active terminal host is still showing launcher boilerplate")
+        );
+    }
+
+    #[test]
+    fn terminal_open_attempt_failure_reason_uses_surface_problem_first() {
+        let viewport = json!({
+            "active_terminal_surface": {
+                "problem": "active terminal host is showing transport/error output"
+            },
+            "terminal_resume_overlay": {
+                "visible": true,
+                "kind": "failure",
+                "text_sample": "Remote terminal needs attention"
+            }
+        });
+        assert_eq!(
+            terminal_open_attempt_failure_reason_from_viewport(&viewport).as_deref(),
+            Some("active terminal host is showing transport/error output")
+        );
+    }
+
+    #[test]
+    fn terminal_open_attempt_failure_reason_uses_failure_overlay_copy() {
+        let viewport = json!({
+            "active_terminal_surface": {
+                "problem": null
+            },
+            "terminal_resume_overlay": {
+                "visible": true,
+                "kind": "failure",
+                "text_sample": "Remote terminal needs attention\nStill not interactive"
+            }
+        });
+        assert_eq!(
+            terminal_open_attempt_failure_reason_from_viewport(&viewport).as_deref(),
+            Some("Remote terminal needs attention\nStill not interactive")
         );
     }
 
