@@ -46,7 +46,10 @@ Use this workflow when a `yggui` app feature or fix should ship with proof, scre
 
 - Prefer exact screenshots and traces over vague prose.
 - For terminal restore claims, bind the proof to one attempt id and fail the claim if that attempt latched any failure, even if a later state looks healthy.
+- Do not treat a visible terminal failure overlay as final proof if `shell.terminal_attach_in_flight` still contains the active session path. That is an in-flight recovery state, not a finished verdict.
 - If terminal settle happens through the saved-context chip, record that explicitly as `terminal_settled_kind == "overlay_context"` and keep `active_terminal_surface.live_problem` in the bundle so the proof preserves both the user-visible result and the live PTY caveat.
+- For startup timing, prefer the app trace `startup/window_spawned` event over slower X11 root-tree detection when both are available. Use X11 tree timing only as fallback evidence.
+- For terminal session-switch bugs, capture both the source and destination terminal surfaces on a second X11 display and verify the destination screenshot text matches the destination `active_session_path`, not stale text from the previous session.
 - Keep changelog language user-visible and concise.
 - Treat demo assets as release material, not disposable debugging leftovers.
 - When a result is not live-verified, say so explicitly.
