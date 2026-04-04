@@ -134,6 +134,7 @@ const REMOTE_TERMINAL_RESUME_SLOW_MS: u64 = 1_200;
 const REMOTE_TERMINAL_RESUME_FAIL_MS: u64 = 15_000;
 const REMOTE_TERMINAL_RESUME_RECOVERY_STALL_MS: u64 = 3_000;
 const REMOTE_TERMINAL_RESUME_HARD_FAIL_MS: u64 = 9_000;
+const REMOTE_TERMINAL_ATTACH_CONFIRMATION_MIN_MS: u64 = 3_000;
 const RECENT_DAEMON_START_GRACE_MS: u64 = 3_000;
 static XTERM_ASSETS_BOOTSTRAPPED: OnceCell<()> = OnceCell::new();
 const TREE_LOADING_DOT_CSS: &str = "@keyframes yggterm-tree-loading-dot { 0%, 80%, 100% { opacity: 0.28; transform: translateY(0px); } 40% { opacity: 1; transform: translateY(-1px); } }";
@@ -208,6 +209,7 @@ struct ShellState {
     alt_overlay_active: bool,
     alt_overlay_sequence: String,
     selected_tree_paths: HashSet<String>,
+    user_collapsed_synthetic_paths: HashSet<String>,
     selection_anchor: Option<String>,
     context_menu_row: Option<BrowserRow>,
     context_menu_position: Option<(f64, f64)>,
@@ -298,6 +300,16 @@ impl Drop for DaemonSpawnLock {
 struct ClientInstanceRecord {
     pid: u32,
     started_at_ms: u64,
+    #[serde(default)]
+    display: Option<String>,
+    #[serde(default)]
+    wayland_display: Option<String>,
+    #[serde(default)]
+    xdg_session_id: Option<String>,
+    #[serde(default)]
+    xdg_runtime_dir: Option<String>,
+    #[serde(default)]
+    xauthority: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -935,6 +947,7 @@ impl ShellState {
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             selected_tree_paths: HashSet::new(),
+            user_collapsed_synthetic_paths: HashSet::new(),
             selection_anchor: None,
             context_menu_row: None,
             context_menu_position: None,
@@ -2142,11 +2155,32 @@ impl ShellState {
     }
 
     fn ensure_active_session_expanded(&mut self) {
-        let remote_paths = self.active_session_visibility_paths();
+        let remote_paths = self
+            .active_session_visibility_paths()
+            .into_iter()
+            .filter(|path| !self.user_collapsed_synthetic_paths.contains(path))
+            .collect::<Vec<_>>();
         if !remote_paths.is_empty() {
             self.browser.ensure_expanded_paths(remote_paths);
         } else if let Some(active_path) = self.active_browser_selection_path_for_session() {
             self.browser.ensure_visible_path(&active_path);
+        }
+    }
+
+    fn clear_user_collapsed_synthetic_ancestors_for_path(&mut self, session_path: &str) {
+        let Some((machine_key, _session_id)) = parse_remote_scanned_session_path(session_path)
+        else {
+            return;
+        };
+        self.user_collapsed_synthetic_paths
+            .retain(|path| !path.starts_with(&format!("__remote_machine__/{machine_key}")));
+    }
+
+    fn update_synthetic_group_collapse_state(&mut self, path: &str, expanded: bool) {
+        if expanded {
+            self.user_collapsed_synthetic_paths.remove(path);
+        } else {
+            self.user_collapsed_synthetic_paths.insert(path.to_string());
         }
     }
 
@@ -2287,6 +2321,7 @@ impl ShellState {
             BrowserRowKind::Group => {
                 if is_synthetic_sidebar_row(row) {
                     self.browser.toggle_virtual_group(&row.full_path);
+                    self.update_synthetic_group_collapse_state(&row.full_path, !row.expanded);
                 } else {
                     self.browser.toggle_group(&row.full_path);
                 }
@@ -2300,6 +2335,7 @@ impl ShellState {
             }
             BrowserRowKind::Session | BrowserRowKind::Document => {
                 self.context_menu_row = None;
+                self.clear_user_collapsed_synthetic_ancestors_for_path(&row.full_path);
                 self.apply_daemon_snapshot_result(open_stored_session(
                     &self.bootstrap.server_endpoint,
                     session_kind_for_row(row.kind),
@@ -6161,6 +6197,7 @@ fn set_app_control_row_expanded(shell: &mut ShellState, row: &BrowserRow, expand
     }
     if is_synthetic_sidebar_row(row) {
         shell.browser.toggle_virtual_group(&row.full_path);
+        shell.update_synthetic_group_collapse_state(&row.full_path, expanded);
     } else {
         shell.browser.toggle_group(&row.full_path);
     }
@@ -6386,10 +6423,19 @@ fn is_local_stored_session_row(row: &BrowserRow) -> bool {
         && !is_remote_scanned_sidebar_row(row)
 }
 
+fn is_local_stored_session_path(path: &str) -> bool {
+    !path.trim().is_empty()
+        && !path.starts_with("__")
+        && !is_local_live_session_path(path)
+        && !path.starts_with("remote-session://")
+        && !path.starts_with("ssh://")
+}
+
 fn supports_generated_session_copy(session: &ManagedSessionView) -> bool {
     session.kind.is_agent()
         || session.kind == SessionKind::SshShell
         || is_local_live_session_path(&session.session_path)
+        || is_local_stored_session_path(&session.session_path)
         || session.session_path.starts_with("remote-session://")
         || session.session_path.starts_with("ssh://")
 }
@@ -11673,6 +11719,14 @@ fn describe_app_state_snapshot(
     });
     json!({
         "window": describe_window(desktop),
+        "client_instance": {
+            "pid": std::process::id(),
+            "display": env_var("DISPLAY"),
+            "wayland_display": env_var("WAYLAND_DISPLAY"),
+            "xdg_session_id": env_var("XDG_SESSION_ID"),
+            "xdg_runtime_dir": env_var("XDG_RUNTIME_DIR"),
+            "xauthority": env_var("XAUTHORITY"),
+        },
         "active_view_mode": format!("{:?}", snapshot.active_view_mode),
         "active_session_path": snapshot.active_session_path.clone(),
         "active_session_source": snapshot.active_session.as_ref().map(|session| format!("{:?}", session.source)),
@@ -13970,7 +14024,15 @@ fn register_client_instance(
     let pid = std::process::id();
     let started_at_ms = current_millis();
     let path = dir.join(format!("{pid}-{started_at_ms}.json"));
-    let record = ClientInstanceRecord { pid, started_at_ms };
+    let record = ClientInstanceRecord {
+        pid,
+        started_at_ms,
+        display: env_var("DISPLAY"),
+        wayland_display: env_var("WAYLAND_DISPLAY"),
+        xdg_session_id: env_var("XDG_SESSION_ID"),
+        xdg_runtime_dir: env_var("XDG_RUNTIME_DIR"),
+        xauthority: env_var("XAUTHORITY"),
+    };
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -13988,9 +14050,21 @@ fn register_client_instance(
             "pid": pid,
             "path": path.display().to_string(),
             "started_at_ms": started_at_ms,
+            "display": record.display,
+            "wayland_display": record.wayland_display,
+            "xdg_session_id": record.xdg_session_id,
+            "xdg_runtime_dir": record.xdg_runtime_dir,
+            "xauthority": record.xauthority,
         }),
     );
     Ok(ClientInstanceRegistration { path })
+}
+
+fn env_var(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn maybe_shutdown_daemon_for_last_client(
@@ -19733,7 +19807,7 @@ fn TerminalCanvas(
     }
     {
         let mount_identity = mount_identity.clone();
-        let last_bootstrap_identity = last_bootstrap_identity;
+        let _last_bootstrap_identity = last_bootstrap_identity;
         let mount_bootstrap_generation = mount_bootstrap_generation;
         let mut resume_overlay_slow = resume_overlay_slow;
         use_effect(move || {
@@ -19827,7 +19901,6 @@ fn TerminalCanvas(
         let trace_home = trace_home.clone();
         let mount_bootstrap_generation = mount_bootstrap_generation;
         let state = state;
-        let last_bootstrap_identity = last_bootstrap_identity;
         let terminal_has_meaningful_output = terminal_has_meaningful_output;
         let terminal_prompt_only = terminal_prompt_only;
         let terminal_overlay_dismissed = terminal_overlay_dismissed;
@@ -19986,6 +20059,7 @@ fn TerminalCanvas(
                 let mut traced_first_output = false;
                 let mut traced_first_meaningful_output = false;
                 let mut traced_attach_ready = false;
+                let mut remote_resume_meaningful_observations = 0_u64;
                 let mount_started_ms = current_millis();
                 let mut resume_recovery_attempts = 0_u64;
                 let mut post_attach_read_recovery_attempts = 0_u64;
@@ -20383,6 +20457,29 @@ fn TerminalCanvas(
                                         terminal_has_visible_output = true;
                                         terminal_resume_surface_staged.set(true);
                                     }
+                                    if is_remote_resume_session {
+                                        if saw_meaningful_output
+                                            && !saw_transcript_browser_output
+                                            && !saw_generic_idle_output
+                                            && !tail_generic_idle_output
+                                            && !saw_generic_idle_footer_output
+                                            && !tail_generic_idle_footer_output
+                                            && !saw_prompt_only_surface
+                                        {
+                                            remote_resume_meaningful_observations =
+                                                remote_resume_meaningful_observations
+                                                    .saturating_add(1);
+                                        } else if has_transport_error
+                                            || saw_transcript_browser_output
+                                            || saw_generic_idle_output
+                                            || tail_generic_idle_output
+                                            || saw_generic_idle_footer_output
+                                            || tail_generic_idle_footer_output
+                                            || saw_prompt_only_surface
+                                        {
+                                            remote_resume_meaningful_observations = 0;
+                                        }
+                                    }
                                     if has_transport_error {
                                         resume_overlay_failed.set(true);
                                         resume_overlay_timed_out.set(false);
@@ -20524,16 +20621,21 @@ fn TerminalCanvas(
                                     let attach_ready = if is_remote_resume_session {
                                         terminal_paint_seen
                                             && terminal_geometry_ready
-                                            && remote_resume_surface_connected(
-                                            saw_meaningful_output,
-                                            visible_resume_surface,
-                                            saw_attach_ready_marker,
-                                            saw_transcript_browser_output,
-                                            saw_generic_idle_output || tail_generic_idle_output,
-                                            saw_generic_idle_footer_output
-                                                || tail_generic_idle_footer_output,
-                                            saw_prompt_only_surface,
-                                        )
+                                            && (saw_attach_ready_marker
+                                                || (remote_resume_surface_connected(
+                                                    saw_meaningful_output,
+                                                    visible_resume_surface,
+                                                    saw_attach_ready_marker,
+                                                    saw_transcript_browser_output,
+                                                    saw_generic_idle_output
+                                                        || tail_generic_idle_output,
+                                                    saw_generic_idle_footer_output
+                                                        || tail_generic_idle_footer_output,
+                                                    saw_prompt_only_surface,
+                                                ) && (remote_resume_meaningful_observations >= 2
+                                                    || current_millis()
+                                                        .saturating_sub(mount_started_ms)
+                                                        >= REMOTE_TERMINAL_ATTACH_CONFIRMATION_MIN_MS)))
                                     } else {
                                         terminal_paint_seen
                                             && terminal_geometry_ready
@@ -20937,12 +21039,12 @@ fn TerminalCanvas(
         )
     } else if terminal_has_meaningful_output() {
         format!(
-            "Yggterm has attached to {}. The terminal is visible now and this chip should clear shortly.",
+            "Yggterm has live output from {}, but it is still validating the terminal surface before calling this interactive.",
             session.host_label
         )
     } else if terminal_live_host_connected() {
         format!(
-            "The live terminal on {} is connected. Yggterm is waiting for the saved context or prompt to paint.",
+            "The live terminal on {} is connected. Yggterm is still waiting for a trustworthy interactive surface.",
             session.host_label
         )
     } else if resume_overlay_slow() {
@@ -22590,7 +22692,6 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
             runtimeStyle.id = runtimeStyleId;
             runtimeStyle.textContent = `
                 #${{hostId}} .xterm,
-                #${{hostId}} .xterm-screen,
                 #${{hostId}} .xterm-helpers,
                 #${{hostId}} .xterm-rows {{
                     margin: 0 !important;
@@ -22598,13 +22699,15 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
                     width: 100% !important;
                     box-sizing: border-box !important;
                 }}
+                #${{hostId}} .xterm {{
+                    height: 100% !important;
+                    width: 100% !important;
+                }}
                 #${{hostId}} .xterm-screen {{
                     overflow: hidden !important;
                 }}
                 #${{hostId}} .xterm-viewport {{
-                    width: 100% !important;
                     overflow-x: hidden !important;
-                    overflow-y: hidden !important;
                     scrollbar-width: none !important;
                     -ms-overflow-style: none !important;
                 }}
@@ -22616,63 +22719,36 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
             `;
             document.head.appendChild(runtimeStyle);
         }}
-        const reconcileHostContentBox = () => {{
-            const screen = host.querySelector('.xterm-screen');
-            if (!screen) {{
-                host.style.paddingLeft = '0px';
-                host.style.paddingRight = '0px';
-                host.style.boxSizing = 'border-box';
-                return;
-            }}
-            const hostRect = host.getBoundingClientRect();
-            const screenRect = screen.getBoundingClientRect();
-            const leftGutter = Math.max(0, Math.round(screenRect.left - hostRect.left));
-            const rightGutter = Math.max(0, Math.round(hostRect.right - screenRect.right));
-            const totalGutter = leftGutter + rightGutter;
-            if (hostRect.width >= 240 && totalGutter >= 8 && totalGutter <= 36) {{
-                host.style.boxSizing = 'border-box';
-                host.style.paddingLeft = `${{leftGutter}}px`;
-                host.style.paddingRight = `${{rightGutter}}px`;
-            }} else {{
-                host.style.paddingLeft = '0px';
-                host.style.paddingRight = '0px';
-                host.style.boxSizing = 'border-box';
-            }}
-        }};
         const stretchXtermRoot = () => {{
             const xtermRoot = host.querySelector('.xterm');
             const screen = host.querySelector('.xterm-screen');
             const viewport = host.querySelector('.xterm-viewport');
             const rowsLayer = host.querySelector('.xterm-rows');
             host.style.boxSizing = 'border-box';
+            host.style.paddingLeft = '0px';
+            host.style.paddingRight = '0px';
+            host.style.paddingTop = '0px';
+            host.style.paddingBottom = '0px';
             if (xtermRoot) {{
                 xtermRoot.style.height = '100%';
                 xtermRoot.style.width = '100%';
-                xtermRoot.style.display = 'flex';
-                xtermRoot.style.flexDirection = 'column';
                 xtermRoot.style.position = 'relative';
                 xtermRoot.style.overflow = 'hidden';
             }}
             if (screen) {{
-                screen.style.height = '100%';
                 screen.style.width = '100%';
-                screen.style.flex = '1 1 auto';
                 screen.style.position = 'relative';
                 screen.style.overflow = 'hidden';
             }}
             if (viewport) {{
-                viewport.style.height = '100%';
                 viewport.style.width = '100%';
-                viewport.style.flex = '1 1 auto';
                 viewport.style.overflowX = 'hidden';
-                viewport.style.overflowY = 'hidden';
                 viewport.style.scrollbarWidth = 'none';
                 viewport.style.msOverflowStyle = 'none';
             }}
             if (rowsLayer) {{
                 rowsLayer.style.width = '100%';
             }}
-            reconcileHostContentBox();
         }};
         stretchXtermRoot();
         let paintCount = 0;
@@ -26817,6 +26893,86 @@ mod tests {
 
         target.storage_path = Some("/home/pi/.codex/sessions/foo.jsonl".to_string());
         assert!(target_can_fetch_remote_generation_context(&target));
+    }
+
+    #[test]
+    fn supports_generated_session_copy_accepts_local_stored_session_paths() {
+        let session = ManagedSessionView {
+            id: "019d0000-1111-2222-3333-444444444444".to_string(),
+            session_path: "/home/pi/.codex/sessions/2026/04/01/rollout-2026-04-01T06-18-55.jsonl"
+                .to_string(),
+            title: "019d0000".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "dev".to_string(),
+            source: yggterm_server::SessionSource::Stored,
+            backend: TerminalBackend::Xterm,
+            bridge_available: true,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Queued,
+            remote_deploy_state: yggterm_server::RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: vec![],
+            rendered_sections: vec![],
+            preview: yggterm_server::SessionPreview {
+                summary: vec![],
+                blocks: vec![],
+            },
+            metadata: vec![SessionMetadataEntry {
+                label: "Cwd",
+                value: "/home/pi".to_string(),
+            }],
+            terminal_process_id: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: true,
+        };
+
+        assert!(supports_generated_session_copy(&session));
+    }
+
+    #[test]
+    fn supports_generated_session_copy_rejects_virtual_sidebar_paths() {
+        let session = ManagedSessionView {
+            id: "virtual".to_string(),
+            session_path: "__remote_machine__/jojo".to_string(),
+            title: "jojo".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "jojo".to_string(),
+            source: yggterm_server::SessionSource::Stored,
+            backend: TerminalBackend::Xterm,
+            bridge_available: true,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Queued,
+            remote_deploy_state: yggterm_server::RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: vec![],
+            rendered_sections: vec![],
+            preview: yggterm_server::SessionPreview {
+                summary: vec![],
+                blocks: vec![],
+            },
+            metadata: vec![],
+            terminal_process_id: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+
+        assert!(!supports_generated_session_copy(&session));
     }
 
     #[test]
