@@ -7,11 +7,8 @@ use yggterm_server::{
     run_app_control_open_path, run_app_control_remove_session, run_app_control_scroll_preview,
     run_app_control_send_terminal_input, run_app_control_set_fullscreen,
     run_app_control_set_main_zoom, run_app_control_set_row_expanded, run_app_control_set_search,
-    run_attach, run_daemon, run_remote_ensure_managed_cli, run_remote_generation_context,
-    run_remote_preview, run_remote_preview_head, run_remote_protocol_version,
-    run_remote_refresh_managed_cli, run_remote_resume_codex, run_remote_scan,
-    run_remote_stage_clipboard_png, run_remote_upsert_generated_copy, run_screenrecord_capture,
-    run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, status,
+    run_attach, run_daemon, run_screenrecord_capture, run_screenshot_capture, run_trace_bundle,
+    run_trace_follow, run_trace_tail, shutdown, status, try_run_remote_server_command,
 };
 
 fn main() -> Result<()> {
@@ -41,48 +38,8 @@ fn main() -> Result<()> {
                 .filter(|value| !value.is_empty()),
         );
     }
-    if args.as_slice() == ["server", "remote", "stage-clipboard-png"] {
-        return run_remote_stage_clipboard_png();
-    }
-    if args.as_slice() == ["server", "remote", "protocol-version"] {
-        return run_remote_protocol_version();
-    }
-    if args.len() >= 4 && args[0] == "server" && args[1] == "remote" && args[2] == "resume-codex" {
-        return run_remote_resume_codex(
-            &args[3],
-            args.get(4)
-                .map(String::as_str)
-                .filter(|value| !value.is_empty()),
-        );
-    }
-    if args.len() >= 4
-        && args[0] == "server"
-        && args[1] == "remote"
-        && args[2] == "refresh-managed-cli"
-    {
-        return run_remote_refresh_managed_cli(args[3] == "background");
-    }
-    if args.len() >= 4
-        && args[0] == "server"
-        && args[1] == "remote"
-        && args[2] == "ensure-managed-cli"
-    {
-        let tool = match args[3].as_str() {
-            "codex" => yggterm_server::ManagedCliTool::Codex,
-            "codex-litellm" => yggterm_server::ManagedCliTool::CodexLiteLlm,
-            other => anyhow::bail!("unknown managed cli tool: {other}"),
-        };
-        return run_remote_ensure_managed_cli(tool);
-    }
-    if args.len() >= 3 && args[0] == "server" && args[1] == "remote" && args[2] == "scan" {
-        return run_remote_scan(args.get(3).map(String::as_str));
-    }
-    if args.len() >= 4 && args[0] == "server" && args[1] == "remote" && args[2] == "preview-head" {
-        let blocks = args
-            .get(4)
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(8);
-        return run_remote_preview_head(&args[3], blocks);
+    if try_run_remote_server_command(&args)? {
+        return Ok(());
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "trace" && args[2] == "tail" {
         let lines = args
@@ -443,23 +400,6 @@ fn main() -> Result<()> {
             }
             other => anyhow::bail!("unsupported app control command: {other}"),
         };
-    }
-    if args.len() == 4 && args[0] == "server" && args[1] == "remote" && args[2] == "preview" {
-        return run_remote_preview(&args[3]);
-    }
-    if args.len() == 4
-        && args[0] == "server"
-        && args[1] == "remote"
-        && args[2] == "generation-context"
-    {
-        return run_remote_generation_context(&args[3]);
-    }
-    if args.len() == 4
-        && args[0] == "server"
-        && args[1] == "remote"
-        && args[2] == "upsert-generated-copy"
-    {
-        return run_remote_upsert_generated_copy(&args[3]);
     }
     if args.as_slice() == ["server", "shutdown"] {
         let endpoint = default_endpoint(store.home_dir());
