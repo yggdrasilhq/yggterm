@@ -11345,36 +11345,16 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let preview_placeholder = preview_text_looks_like_loading_placeholder(&preview_text_sample);
-    let terminal_rendered = active_terminal_hosts.iter().any(|host| {
-        let child_count = host.get("child_count").and_then(Value::as_u64).unwrap_or(0);
-        let xterm_present = host
-            .get("xterm_present")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let screen_present = host
-            .get("screen_present")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let viewport_present = host
-            .get("viewport_present")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let rows_present = host
-            .get("rows_present")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let canvas_count = host
-            .get("canvas_count")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let text_sample = host
-            .get("text_sample")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .unwrap_or("");
-        (child_count > 0 || xterm_present || screen_present || viewport_present || rows_present)
-            && (canvas_count > 0 || !text_sample.is_empty())
-    });
+    let active_terminal_surface =
+        summarize_terminal_surface_for_app_control(&active_terminal_hosts);
+    let terminal_rendered = active_terminal_surface
+        .get("rendered")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let terminal_surface_problem = active_terminal_surface
+        .get("problem")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let terminal_attach_pending = active_session_path.as_deref().is_some_and(|path| {
         terminal_attach_in_flight.iter().any(|candidate| {
             candidate
@@ -11469,6 +11449,8 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
                     Some("terminal resume overlay is still visible".to_string()),
                 )
             }
+        } else if let Some(problem) = terminal_surface_problem.clone() {
+            (false, Some(problem))
         } else if terminal_rendered {
             (true, None)
         } else if terminal_attach_pending {
@@ -11521,6 +11503,7 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
         "terminal_hosts": terminal_hosts,
         "active_terminal_host_count": active_terminal_hosts.len(),
         "active_terminal_hosts": active_terminal_hosts,
+        "active_terminal_surface": active_terminal_surface,
         "terminal_resume_overlay": terminal_resume_overlay,
         "ready": ready,
         "reason": reason,
@@ -11542,6 +11525,89 @@ fn preview_text_looks_like_loading_placeholder(text: &str) -> bool {
         || normalized.contains("waiting for transcript hydration")
         || normalized.contains("preview unavailable")
         || normalized.contains("could not load this remote")
+}
+
+fn summarize_terminal_surface_for_app_control(hosts: &[Value]) -> Value {
+    let rendered = hosts
+        .iter()
+        .any(terminal_host_has_rendered_surface_for_app_control);
+    let problem = hosts
+        .iter()
+        .find_map(terminal_host_problem_for_app_control)
+        .map(str::to_string);
+    json!({
+        "rendered": rendered,
+        "problem": problem,
+    })
+}
+
+fn terminal_host_has_rendered_surface_for_app_control(host: &Value) -> bool {
+    let child_count = host.get("child_count").and_then(Value::as_u64).unwrap_or(0);
+    let xterm_present = host
+        .get("xterm_present")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let screen_present = host
+        .get("screen_present")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let viewport_present = host
+        .get("viewport_present")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let rows_present = host
+        .get("rows_present")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let canvas_count = host
+        .get("canvas_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let text_sample = host
+        .get("text_sample")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    (child_count > 0 || xterm_present || screen_present || viewport_present || rows_present)
+        && (canvas_count > 0 || !text_sample.is_empty())
+}
+
+fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
+    let text_sample = host
+        .get("text_sample")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if text_sample.is_empty() {
+        return None;
+    }
+    if terminal_chunk_is_transport_error(text_sample) {
+        return Some("active terminal host is showing transport/error output");
+    }
+    if terminal_chunk_is_loading_placeholder(text_sample) {
+        return Some("active terminal host is still showing resume placeholder content");
+    }
+    if terminal_chunk_is_generic_codex_idle(text_sample) {
+        return Some("active terminal host is still showing generic Codex idle chrome");
+    }
+    if terminal_chunk_has_generic_codex_idle_footer(text_sample)
+        && !terminal_chunk_has_meaningful_output(text_sample)
+    {
+        return Some("active terminal host is still showing generic Codex idle footer");
+    }
+    if terminal_chunk_has_prompt_output(text_sample) {
+        return Some("active terminal host is only showing a plain shell prompt");
+    }
+    if terminal_chunk_is_transcript_browser(text_sample) {
+        return Some("active terminal host is still showing the transcript browser");
+    }
+    if terminal_chunk_is_saved_transcript_prefill(text_sample) {
+        return Some("active terminal host is still showing saved transcript prefill");
+    }
+    if terminal_chunk_is_launcher_boilerplate(text_sample) {
+        return Some("active terminal host is still showing launcher boilerplate");
+    }
+    None
 }
 
 async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Value {
@@ -20083,6 +20149,32 @@ fn terminal_chunk_is_missing_saved_session_error(data: &str) -> bool {
             || normalized.contains("cannot be restored as a live terminal"))
 }
 
+fn terminal_chunk_is_saved_transcript_prefill(data: &str) -> bool {
+    let normalized = strip_terminal_control_sequences(data)
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    normalized.starts_with("saved transcript")
+        && normalized.contains("saved transcript ·")
+        && normalized.contains("typing takes over the live terminal")
+}
+
+fn terminal_chunk_is_launcher_boilerplate(data: &str) -> bool {
+    let stripped = strip_terminal_control_sequences(data);
+    let normalized = stripped
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    normalized.contains("open live terminal ")
+        || normalized.contains("launch command prepared:")
+        || normalized.contains("daemon pty:")
+        || normalized.contains("queue remote yggterm resume ")
+        || stripped.contains("__YGGTERM_REQUESTED=")
+        || stripped.contains("__YGGTERM_CWD_OK=")
+}
+
 fn terminal_prefill_should_render_to_host(data: &str) -> bool {
     let stripped = strip_terminal_control_sequences(data);
     let normalized = stripped.trim();
@@ -20128,6 +20220,8 @@ fn terminal_chunk_is_transport_error(data: &str) -> bool {
         "connection timed out",
         "broken pipe",
         "connection to ",
+        "shared connection to ",
+        "terminal session not found",
         "[screen is terminating]",
         "saved codex session",
         "cannot be restored as a live terminal",
@@ -26259,6 +26353,64 @@ Waiting for the remote terminal to paint...\n";
         let data = "bash: line 1: exec: export: not found\r\n";
         assert!(terminal_chunk_is_transport_error(data));
         assert!(!terminal_chunk_has_meaningful_output(data));
+    }
+
+    #[test]
+    fn terminal_chunk_marks_shared_connection_closed_as_transport_error() {
+        let data = "Shared connection to 192.168.0.133 closed.\r\n";
+        assert!(terminal_chunk_is_transport_error(data));
+        assert!(!terminal_chunk_has_meaningful_output(data));
+    }
+
+    #[test]
+    fn terminal_chunk_marks_terminal_session_not_found_as_transport_error() {
+        let data = "Error: terminal session not found: codex-runtime://019ad8b9\r\n";
+        assert!(terminal_chunk_is_transport_error(data));
+        assert!(!terminal_chunk_has_meaningful_output(data));
+    }
+
+    #[test]
+    fn terminal_chunk_detects_launcher_boilerplate() {
+        let data = "Open live terminal jojo\nLaunch command prepared:\nDaemon PTY: request main viewport terminal stream\n";
+        assert!(terminal_chunk_is_launcher_boilerplate(data));
+    }
+
+    #[test]
+    fn app_control_terminal_surface_flags_transport_error_output() {
+        let host = json!({
+            "child_count": 1,
+            "xterm_present": true,
+            "screen_present": true,
+            "viewport_present": true,
+            "rows_present": true,
+            "canvas_count": 1,
+            "text_sample": "Error: terminal session not found: codex-runtime://019ad8b9"
+        });
+        let surface = summarize_terminal_surface_for_app_control(&[host]);
+        assert_eq!(surface.get("rendered").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            surface.get("problem").and_then(Value::as_str),
+            Some("active terminal host is showing transport/error output")
+        );
+    }
+
+    #[test]
+    fn app_control_terminal_surface_flags_launcher_boilerplate() {
+        let host = json!({
+            "child_count": 1,
+            "xterm_present": true,
+            "screen_present": true,
+            "viewport_present": true,
+            "rows_present": true,
+            "canvas_count": 1,
+            "text_sample": "Open live terminal jojo\nLaunch command prepared:\nDaemon PTY: request main viewport terminal stream"
+        });
+        let surface = summarize_terminal_surface_for_app_control(&[host]);
+        assert_eq!(surface.get("rendered").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            surface.get("problem").and_then(Value::as_str),
+            Some("active terminal host is still showing launcher boilerplate")
+        );
     }
 
     #[test]
