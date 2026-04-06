@@ -7001,11 +7001,12 @@ fn next_background_copy_job(
     _settings: &AppSettings,
     _local_root: &SessionNode,
     remote_machines: &[RemoteMachineSnapshot],
+    live_targets: Vec<CopyGenerationTarget>,
     active_target: Option<CopyGenerationTarget>,
     copy_retry_after_ms: &HashMap<String, u64>,
 ) -> Option<BackgroundCopyJob> {
     let store = SessionStore::open_or_init().ok()?;
-    let mut targets = Vec::new();
+    let mut targets = live_targets;
     for machine in remote_machines {
         for session in &machine.sessions {
             targets.push(CopyGenerationTarget {
@@ -7058,6 +7059,14 @@ fn maybe_spawn_background_copy_generation(mut state: Signal<ShellState>) {
                 shell.server.remote_machines().to_vec(),
                 shell
                     .server
+                    .live_sessions()
+                    .into_iter()
+                    .filter_map(|session| {
+                        copy_generation_target_for_session(&shell.server, &session)
+                    })
+                    .collect::<Vec<_>>(),
+                shell
+                    .server
                     .active_session()
                     .and_then(|session| copy_generation_target_for_session(&shell.server, session)),
                 shell.copy_retry_after_ms.clone(),
@@ -7069,6 +7078,7 @@ fn maybe_spawn_background_copy_generation(mut state: Signal<ShellState>) {
         settings,
         local_root,
         remote_machines,
+        live_targets,
         active_target,
         copy_retry_after_ms,
         perf_home,
@@ -7084,6 +7094,7 @@ fn maybe_spawn_background_copy_generation(mut state: Signal<ShellState>) {
                 &settings,
                 &local_root,
                 &remote_machines,
+                live_targets,
                 active_target,
                 &copy_retry_after_ms,
             )
@@ -9289,7 +9300,7 @@ fn enrich_sidebar_rows_with_live_titles(
             continue;
         };
         row.session_title = Some(title.clone());
-        if matches!(row.kind, BrowserRowKind::Session)
+        if matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document)
             && (row.label.trim().is_empty() || looks_like_generated_fallback_title(&row.label))
         {
             row.label = title;
@@ -12101,8 +12112,24 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
             .map(str::trim)
             .is_some_and(terminal_resume_excerpt_is_meaningful)
     });
+    let active_terminal_surface_raw =
+        summarize_terminal_surface_for_app_control(&active_terminal_hosts, false);
+    let terminal_surface_live_problem = active_terminal_surface_raw
+        .get("live_problem")
+        .and_then(Value::as_str);
+    let terminal_surface_geometry_problem = active_terminal_surface_raw
+        .get("geometry_problem")
+        .and_then(Value::as_str);
+    let terminal_rendered_raw = active_terminal_surface_raw
+        .get("rendered")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let overlay_context_visible = preview_has_context
-        && (terminal_resume_overlay_has_context || terminal_host_prefill_visible);
+        && (terminal_resume_overlay_has_context
+            || (terminal_host_prefill_visible
+                && (!terminal_rendered_raw
+                    || terminal_surface_geometry_problem.is_some()
+                    || terminal_surface_live_problem.is_some())));
     let active_terminal_surface =
         summarize_terminal_surface_for_app_control(&active_terminal_hosts, overlay_context_visible);
     let terminal_rendered = active_terminal_surface
@@ -12241,12 +12268,12 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
                     Some("terminal resume overlay is still visible".to_string()),
                 )
             }
-        } else if overlay_context_visible {
-            (true, false, Some("overlay_context".to_string()), None)
         } else if let Some(problem) = terminal_surface_problem.clone() {
             (false, false, None::<String>, Some(problem))
         } else if terminal_rendered {
             (true, true, Some("interactive".to_string()), None)
+        } else if overlay_context_visible {
+            (true, false, Some("overlay_context".to_string()), None)
         } else if terminal_attach_pending {
             (
                 false,
@@ -17431,7 +17458,20 @@ fn SidebarRow(
                             "display:inline-flex; align-items:center; justify-content:center; width:20px; min-width:20px; height:20px; color:{};",
                             icon_color
                         ),
-                        TreeIcon { row: row.clone() }
+                        if row.kind == BrowserRowKind::Group {
+                            DisclosureIcon { expanded: row.expanded }
+                        } else {
+                            TreeIcon { row: row.clone() }
+                        }
+                    }
+                    if row.kind == BrowserRowKind::Group {
+                        div {
+                            style: format!(
+                                "display:inline-flex; align-items:center; justify-content:center; width:20px; min-width:20px; height:20px; color:{};",
+                                icon_color
+                            ),
+                            TreeIcon { row: row.clone() }
+                        }
                     }
                     if renaming {
                         input {
@@ -17730,6 +17770,20 @@ fn TreeIcon(row: BrowserRow) -> Element {
                     stroke_opacity: "0.42",
                 }
             }
+        }
+    }
+}
+
+#[component]
+fn DisclosureIcon(expanded: bool) -> Element {
+    let rotation = if expanded { "90deg" } else { "0deg" };
+    rsx! {
+        span {
+            style: format!(
+                "display:inline-flex; align-items:center; justify-content:center; width:14px; height:14px; \
+                 font-size:10px; font-weight:800; line-height:1; transform:rotate({rotation}); transition:transform 120ms ease;"
+            ),
+            "▸"
         }
     }
 }
@@ -21921,12 +21975,15 @@ fn terminal_prefill_should_render_to_host(data: &str) -> bool {
 fn remote_resume_surface_connected(
     saw_meaningful_output: bool,
     _saw_visible_output: bool,
-    _saw_attach_ready_marker: bool,
+    saw_attach_ready_marker: bool,
     saw_transcript_browser_output: bool,
     saw_generic_idle_output: bool,
     saw_generic_idle_footer_output: bool,
     saw_prompt_only_surface: bool,
 ) -> bool {
+    if saw_attach_ready_marker {
+        return true;
+    }
     if saw_transcript_browser_output || saw_generic_idle_output || saw_prompt_only_surface {
         return false;
     }
@@ -27372,6 +27429,64 @@ mod tests {
     }
 
     #[test]
+    fn enrich_sidebar_rows_with_live_titles_updates_document_rows() {
+        let live_sessions = vec![ManagedSessionView {
+            id: "ddf8f1ee-8e64-4201-ab3a-2b07424f9b77".to_string(),
+            session_path: "document://ddf8f1ee-8e64-4201-ab3a-2b07424f9b77".to_string(),
+            title: "Remove Them Entirely".to_string(),
+            kind: SessionKind::Document,
+            host_label: "localhost".to_string(),
+            source: yggterm_server::SessionSource::LiveSsh,
+            backend: TerminalBackend::Xterm,
+            bridge_available: true,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: vec![],
+            rendered_sections: vec![],
+            preview: yggterm_server::SessionPreview {
+                summary: vec![],
+                blocks: vec![],
+            },
+            metadata: vec![],
+            terminal_process_id: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: true,
+        }];
+        let mut rows = vec![BrowserRow {
+            kind: BrowserRowKind::Document,
+            full_path: "document://ddf8f1ee-8e64-4201-ab3a-2b07424f9b77".to_string(),
+            label: "local::ddf8f1ee-8e64-4201-ab3a-2b07424f9b77".to_string(),
+            detail_label: String::new(),
+            document_kind: Some(WorkspaceDocumentKind::Note),
+            group_kind: None,
+            session_title: Some("local::ddf8f1ee-8e64-4201-ab3a-2b07424f9b77".to_string()),
+            depth: 1,
+            host_label: "localhost".to_string(),
+            descendant_sessions: 1,
+            expanded: true,
+            session_id: Some("ddf8f1ee-8e64-4201-ab3a-2b07424f9b77".to_string()),
+            session_cwd: Some("/home/pi".to_string()),
+        }];
+
+        enrich_sidebar_rows_with_live_titles(&mut rows, &live_sessions, &[]);
+        assert_eq!(rows[0].label, "Remove Them Entirely");
+        assert_eq!(
+            rows[0].session_title.as_deref(),
+            Some("Remove Them Entirely")
+        );
+    }
+
+    #[test]
     fn merged_sidebar_rows_break_compression_when_middle_folder_has_sessions() {
         let expanded_paths = HashSet::from([
             "__remote_machine__/jojo".to_string(),
@@ -28715,6 +28830,86 @@ Waiting for the remote terminal to paint...\n";
     }
 
     #[test]
+    fn describe_viewport_snapshot_prefers_interactive_terminal_over_saved_context() {
+        let snapshot = json!({
+            "active_session_path": "remote-session://oc/test",
+            "active_view_mode": "Terminal",
+            "active_title": "Media Controls Thinkbook Layer Too",
+            "active_summary": "Done. Added the ThinkBook x-layer media controls and restarted the service.",
+            "shell": {
+                "terminal_attach_in_flight": [],
+                "notifications": []
+            },
+            "active_surface_requests": []
+        });
+        let dom = json!({
+            "titlebar_title_text": "Media Controls Thinkbook Layer Too",
+            "titlebar_summary_text": "",
+            "titlebar_button_tooltip": "",
+            "titlebar_menu_open": false,
+            "preview_text_sample": "",
+            "preview_viewport_rect": null,
+            "preview_visible_block_ids": [],
+            "preview_font_family": "Inter",
+            "preview_visible_entries": [],
+            "preview_rendered_sections": [],
+            "preview_fallback_context_visible": true,
+            "preview_fallback_context_text": "Saved terminal context\nDone. Added the ThinkBook x-layer media controls and restarted the service.",
+            "preview_timestamp_labels": [],
+            "preview_window": null,
+            "shell_text_sample": "",
+            "document_editor_count": 0,
+            "document_body_sample": "",
+            "terminal_hosts": [{
+                "session_path": "remote-session://oc/test",
+                "child_count": 1,
+                "xterm_present": true,
+                "screen_present": true,
+                "viewport_present": true,
+                "rows_present": true,
+                "canvas_count": 1,
+                "text_sample": "Done. Added these in the ThinkBook x layer:\n- x+q -> play/pause\n› git commit/push\n• Committed and pushed.",
+                "resume_overlay_visible": false,
+                "resume_overlay_text": "",
+                "resume_overlay_excerpt": "Done. Added these in the ThinkBook x layer.",
+                "resume_overlay_kind": "hidden",
+                "resume_overlay_phase": "hidden",
+                "resume_overlay_effective_failed": false
+            }],
+            "terminal_resume_overlay": {
+                "visible": false,
+                "text_sample": "",
+                "excerpt": "",
+                "kind": "",
+                "phase": "hidden",
+                "effective_failed": false
+            },
+            "preview_visible_block_count": 0,
+            "preview_scroll_count": 1
+        });
+
+        let viewport = describe_viewport_snapshot(&snapshot, &dom);
+        assert_eq!(viewport.get("ready").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            viewport.get("interactive").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            viewport
+                .get("terminal_settled_kind")
+                .and_then(Value::as_str),
+            Some("interactive")
+        );
+        assert_eq!(
+            viewport
+                .get("active_terminal_surface")
+                .and_then(|surface| surface.get("overlay_context_visible"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
     fn terminal_open_attempt_failure_reason_uses_surface_problem_first() {
         let viewport = json!({
             "active_terminal_surface": {
@@ -29204,6 +29399,13 @@ Updated at   Branch  Conversation\n\
     fn remote_resume_surface_connected_accepts_meaningful_codex_surface_with_prompt() {
         assert!(remote_resume_surface_connected(
             true, true, false, false, false, false, false,
+        ));
+    }
+
+    #[test]
+    fn remote_resume_surface_connected_accepts_attach_ready_marker() {
+        assert!(remote_resume_surface_connected(
+            false, true, true, false, true, true, true,
         ));
     }
 
