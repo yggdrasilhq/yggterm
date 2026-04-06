@@ -56,7 +56,7 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -1734,6 +1734,22 @@ impl YggtermServer {
                 statuses: vec![status],
             },
         )))
+    }
+
+    pub fn validate_remote_saved_session_for_path(&self, path: &str) -> anyhow::Result<()> {
+        let Some((machine_key, session_id)) = parse_remote_scanned_session_path(path) else {
+            return Ok(());
+        };
+        let target = self.remote_target_for_machine_key(machine_key)?;
+        let saved_session_exists = remote_saved_codex_session_exists_via_yggterm(
+            &target.ssh_target,
+            target.prefix.as_deref(),
+            session_id,
+        )?;
+        if !saved_session_exists {
+            anyhow::bail!(remote_resume_missing_saved_session_error(session_id));
+        }
+        Ok(())
     }
 
     pub fn refresh_managed_cli(
@@ -3469,6 +3485,30 @@ fn remote_saved_codex_session_exists(session_id: &str) -> anyhow::Result<bool> {
     Ok(false)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RemoteSavedCodexSessionExistsResponse {
+    session_id: String,
+    exists: bool,
+}
+
+fn remote_saved_codex_session_exists_via_yggterm(
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+    session_id: &str,
+) -> anyhow::Result<bool> {
+    let output = run_remote_yggterm_command(
+        ssh_target,
+        exec_prefix,
+        &["server", "remote", "codex-session-exists", session_id],
+        None,
+    )?;
+    let response: RemoteSavedCodexSessionExistsResponse = serde_json::from_str(output.trim())
+        .with_context(|| {
+            format!("parsing remote codex-session-exists response for {ssh_target}")
+        })?;
+    Ok(response.exists)
+}
+
 fn remote_tmux_session_name(session_id: &str) -> String {
     let suffix = session_id
         .chars()
@@ -3936,18 +3976,25 @@ pub(crate) fn remote_snapshot_is_generic_codex_idle(bytes: &[u8]) -> bool {
 }
 
 fn remote_snapshot_has_generic_codex_idle_footer(bytes: &[u8]) -> bool {
-    let normalized = String::from_utf8_lossy(bytes)
-        .to_ascii_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let lines = remote_snapshot_non_empty_lines(bytes);
+    if lines.is_empty() || lines.len() > 5 {
+        return false;
+    }
+    let normalized = lines.join("\n").to_ascii_lowercase();
     if normalized.is_empty() {
         return false;
     }
-    let mentions_generic_prompt = normalized.contains("implement {feature}")
-        || normalized.contains("explain this codebase")
-        || normalized.contains("find and fix a bug")
-        || normalized.contains("resume a previous session");
+    let mentions_generic_prompt = lines.iter().any(|line| {
+        let semantic = line
+            .trim()
+            .trim_matches(|ch: char| matches!(ch, '╭' | '╮' | '╰' | '╯' | '─' | '│' | ' '));
+        let lower = semantic.to_ascii_lowercase();
+        lower.starts_with('›')
+            && (lower.contains("implement {feature}")
+                || lower.contains("explain this codebase")
+                || lower.contains("find and fix a bug")
+                || lower.contains("resume a previous session"))
+    });
     let mentions_model_footer = (normalized.contains("gpt-5")
         || normalized.contains("gpt-4")
         || normalized.contains("claude"))
@@ -4059,10 +4106,7 @@ fn remote_snapshot_has_resume_breakage(bytes: &[u8]) -> bool {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    normalized.contains("conversation interrupted")
-        || normalized.contains("something went wrong")
-        || normalized.contains("explain this codebase")
-        || normalized.contains("find and fix a bug")
+    normalized.contains("conversation interrupted") || normalized.contains("something went wrong")
 }
 
 fn remote_snapshot_requires_trust_continue(bytes: &[u8]) -> bool {
@@ -4124,11 +4168,7 @@ fn remote_resume_seed_snapshot_prefill(bytes: &[u8]) -> Option<String> {
         {
             continue;
         }
-        if lower.contains("conversation interrupted")
-            || lower.contains("something went wrong")
-            || lower.contains("explain this codebase")
-            || lower.contains("find and fix a bug")
-        {
+        if lower.contains("conversation interrupted") || lower.contains("something went wrong") {
             break;
         }
         if remote_snapshot_is_generic_codex_idle(trimmed.as_bytes())
@@ -6969,6 +7009,15 @@ pub fn run_remote_protocol_version() -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn run_remote_saved_codex_session_exists(session_id: &str) -> anyhow::Result<()> {
+    let response = RemoteSavedCodexSessionExistsResponse {
+        session_id: session_id.to_string(),
+        exists: remote_saved_codex_session_exists(session_id)?,
+    };
+    println!("{}", serde_json::to_string(&response)?);
+    Ok(())
+}
+
 pub fn run_remote_resume_codex(
     session_id: &str,
     cwd: Option<&str>,
@@ -7004,15 +7053,13 @@ fn ensure_local_daemon_running(endpoint: &ServerEndpoint) -> anyhow::Result<()> 
     if ping(endpoint).is_ok() {
         return Ok(());
     }
+    let _spawn_lock = acquire_daemon_spawn_lock(endpoint)?;
+    if ping(endpoint).is_ok() {
+        return Ok(());
+    }
     prepare_endpoint_for_spawn(endpoint)?;
     spawn_local_daemon_process(&current_exe)?;
-    for _ in 0..100 {
-        std::thread::sleep(Duration::from_millis(150));
-        if ping(endpoint).is_ok() {
-            return Ok(());
-        }
-    }
-    anyhow::bail!("local yggterm daemon did not become reachable")
+    wait_for_local_daemon(endpoint)
 }
 
 fn prepare_endpoint_for_spawn(endpoint: &ServerEndpoint) -> anyhow::Result<()> {
@@ -7048,6 +7095,98 @@ fn spawn_local_daemon_process(current_exe: &Path) -> anyhow::Result<()> {
     }
     command.spawn().context("spawning local yggterm daemon")?;
     Ok(())
+}
+
+fn wait_for_local_daemon(endpoint: &ServerEndpoint) -> anyhow::Result<()> {
+    for _ in 0..100 {
+        std::thread::sleep(Duration::from_millis(150));
+        if ping(endpoint).is_ok() {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("local yggterm daemon did not become reachable")
+}
+
+fn daemon_spawn_lock_path(endpoint: &ServerEndpoint) -> PathBuf {
+    match endpoint {
+        #[cfg(unix)]
+        ServerEndpoint::UnixSocket(path) => path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("daemon.spawn.lock"),
+        ServerEndpoint::Tcp { .. } => PathBuf::from("daemon.spawn.lock"),
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DaemonSpawnLockRecord {
+    pid: u32,
+    created_at_ms: u64,
+}
+
+fn daemon_spawn_lock_is_stale(path: &Path) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return true;
+    };
+    let record = serde_json::from_slice::<DaemonSpawnLockRecord>(&bytes).ok();
+    let now = current_millis() as u64;
+    if let Some(record) = record {
+        if process_is_alive(record.pid) {
+            return now.saturating_sub(record.created_at_ms) > 15_000;
+        }
+        return true;
+    }
+    let modified_age_ms = fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.elapsed().ok())
+        .map(|elapsed| elapsed.as_millis() as u64);
+    modified_age_ms.is_none_or(|age_ms| age_ms > 15_000)
+}
+
+struct DaemonSpawnLock {
+    path: Option<PathBuf>,
+}
+
+impl Drop for DaemonSpawnLock {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn acquire_daemon_spawn_lock(endpoint: &ServerEndpoint) -> anyhow::Result<DaemonSpawnLock> {
+    let path = daemon_spawn_lock_path(endpoint);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating daemon spawn lock dir {}", parent.display()))?;
+    }
+    for _ in 0..120 {
+        match OpenOptions::new().create_new(true).write(true).open(&path) {
+            Ok(mut file) => {
+                let record = DaemonSpawnLockRecord {
+                    pid: std::process::id(),
+                    created_at_ms: current_millis() as u64,
+                };
+                let _ = file.write_all(&serde_json::to_vec(&record)?);
+                return Ok(DaemonSpawnLock { path: Some(path) });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if ping(endpoint).is_ok() {
+                    return Ok(DaemonSpawnLock { path: None });
+                }
+                if daemon_spawn_lock_is_stale(&path) {
+                    let _ = fs::remove_file(&path);
+                    std::thread::sleep(Duration::from_millis(25));
+                    continue;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(error).context("acquiring daemon spawn lock"),
+        }
+    }
+    anyhow::bail!("timed out waiting for daemon spawn lock {}", path.display())
 }
 
 fn bridge_remote_runtime_session_stdio(
@@ -10561,6 +10700,18 @@ mod tests {
     fn remote_resume_runtime_output_allows_codex_header_with_real_transcript() {
         let transcript = b"m\n >_ OpenAI Codex (v0.118.0)\n model: gpt-5.4 high   fast   /model to change\n directory: ~\n\n Tip: New 2x rate limits until April 2nd.\n\n: I have a winxp vm.\n\" You want a local FTP server exposing ~/wine/xp so the Windows XP VM can move files.\n";
         assert!(!remote_resume_runtime_output_requires_restart(transcript));
+    }
+
+    #[test]
+    fn remote_resume_runtime_output_allows_real_transcript_with_common_prompt_text() {
+        let transcript = b"\xe2\x80\xa2 Committed and pushed.\n\n  - Commit: f49ab56\n  - Message: add ThinkBook x-layer media controls\n  - Branch: main\n  - Push: origin/main updated successfully (2f6b4ac..f49ab56)\n\n\n\xe2\x80\xba Explain this codebase\n\n  gpt-5.4 high fast \xc2\xb7 100% left \xc2\xb7 ~/git\n";
+        assert!(!remote_resume_runtime_output_requires_restart(transcript));
+    }
+
+    #[test]
+    fn remote_resume_runtime_output_rejects_only_small_generic_idle_footer() {
+        let idle = b"\xe2\x95\xad\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x95\xae\n\xe2\x94\x82 >_ OpenAI Codex (v0.118.0) \xe2\x94\x82\n\xe2\x95\xb0\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x95\xaf\n\n\xe2\x80\xba Explain this codebase\n  gpt-5.4 high fast \xc2\xb7 100% left \xc2\xb7 ~/git\n";
+        assert!(remote_resume_runtime_output_requires_restart(idle));
     }
 
     #[test]
