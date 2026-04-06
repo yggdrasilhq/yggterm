@@ -134,6 +134,7 @@ const REMOTE_TERMINAL_RESUME_SLOW_MS: u64 = 1_200;
 const REMOTE_TERMINAL_RESUME_FAIL_MS: u64 = 30_000;
 const REMOTE_TERMINAL_RESUME_RECOVERY_STALL_MS: u64 = 3_000;
 const REMOTE_TERMINAL_RESUME_HARD_FAIL_MS: u64 = 24_000;
+const REMOTE_TERMINAL_RESUME_VISUAL_REVEAL_MS: u64 = 180;
 const REMOTE_TERMINAL_ATTACH_CONFIRMATION_MIN_MS: u64 = 1_500;
 const RECENT_DAEMON_START_GRACE_MS: u64 = 3_000;
 static XTERM_ASSETS_BOOTSTRAPPED: OnceCell<()> = OnceCell::new();
@@ -12099,37 +12100,7 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let preview_placeholder = preview_text_looks_like_loading_placeholder(&preview_text_sample);
-    let preview_has_context = preview_visible_block_count > 0
-        || !preview_rendered_sections.is_empty()
-        || (!preview_text_sample.is_empty() && !preview_placeholder)
-        || preview_fallback_context_visible
-        || !preview_fallback_context_text.is_empty();
-    let terminal_resume_overlay_has_context =
-        terminal_resume_overlay_chip_has_meaningful_context(&terminal_resume_overlay);
-    let terminal_host_prefill_visible = active_terminal_hosts.iter().any(|host| {
-        host.get("text_sample")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .is_some_and(terminal_resume_excerpt_is_meaningful)
-    });
-    let active_terminal_surface_raw =
-        summarize_terminal_surface_for_app_control(&active_terminal_hosts, false);
-    let terminal_surface_live_problem = active_terminal_surface_raw
-        .get("live_problem")
-        .and_then(Value::as_str);
-    let terminal_surface_geometry_problem = active_terminal_surface_raw
-        .get("geometry_problem")
-        .and_then(Value::as_str);
-    let terminal_rendered_raw = active_terminal_surface_raw
-        .get("rendered")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let overlay_context_visible = preview_has_context
-        && (terminal_resume_overlay_has_context
-            || (terminal_host_prefill_visible
-                && (!terminal_rendered_raw
-                    || terminal_surface_geometry_problem.is_some()
-                    || terminal_surface_live_problem.is_some())));
+    let overlay_context_visible = false;
     let active_terminal_surface =
         summarize_terminal_surface_for_app_control(&active_terminal_hosts, overlay_context_visible);
     let terminal_rendered = active_terminal_surface
@@ -12256,15 +12227,11 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
                     None::<String>,
                     Some("terminal resume failure overlay is still visible".to_string()),
                 )
-            } else if overlay_context_visible {
-                (true, false, Some("overlay_context".to_string()), None)
-            } else if terminal_resume_overlay_has_context {
-                (false, false, Some("recovering".to_string()), None)
             } else {
                 (
                     false,
                     false,
-                    None::<String>,
+                    Some("recovering".to_string()),
                     Some("terminal resume overlay is still visible".to_string()),
                 )
             }
@@ -12272,8 +12239,6 @@ fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value {
             (false, false, None::<String>, Some(problem))
         } else if terminal_rendered {
             (true, true, Some("interactive".to_string()), None)
-        } else if overlay_context_visible {
-            (true, false, Some("overlay_context".to_string()), None)
         } else if terminal_attach_pending {
             (
                 false,
@@ -12535,20 +12500,6 @@ fn summarize_terminal_surface_for_app_control(
         "live_problem": live_problem,
         "overlay_context_visible": overlay_context_visible,
     })
-}
-
-fn terminal_resume_overlay_chip_has_meaningful_context(overlay: &Value) -> bool {
-    if overlay.get("visible").and_then(Value::as_bool) != Some(true) {
-        return false;
-    }
-    if overlay.get("kind").and_then(Value::as_str) != Some("chip") {
-        return false;
-    }
-    overlay
-        .get("excerpt")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .is_some_and(terminal_resume_excerpt_is_meaningful)
 }
 
 fn terminal_host_has_rendered_surface_for_app_control(host: &Value) -> bool {
@@ -17968,42 +17919,10 @@ fn MainSurface(
                 !grouped_runs.is_empty() || !rendered_sections.is_empty();
             let terminal_resume_context_fallback =
                 terminal_resume_context_fallback(snapshot.as_ref(), &session);
-            let fallback_context_available = terminal_resume_context_fallback.is_some();
             let visible_terminal_resume_context_fallback = (!preview_context_available)
                 .then(|| terminal_resume_context_fallback.clone())
                 .flatten();
-            let preview_overlay_context_visible = terminal_surface_visible
-                && is_remote_resume_agent_session(&session)
-                && state
-                    .read()
-                    .terminal_attach_in_flight
-                    .contains(&session.session_path)
-                && (preview_context_available || fallback_context_available);
-            let effective_preview_layer_visible =
-                preview_surface_visible || preview_overlay_context_visible;
-            let effective_preview_layer_style = format!(
-                "position:absolute; inset:0; display:flex; flex-direction:column; min-width:0; min-height:0; overflow:hidden; \
-                 padding:{}; background:{}; border-radius:{}; box-shadow:{}; opacity:{}; visibility:{}; pointer-events:{}; transition:opacity 120ms ease;",
-                if snapshot.fullscreen { "0" } else { "24px" },
-                snapshot.palette.panel,
-                if snapshot.fullscreen { "0" } else { "11px" },
-                snapshot.palette.panel_shadow,
-                if effective_preview_layer_visible {
-                    "1"
-                } else {
-                    "0"
-                },
-                if effective_preview_layer_visible {
-                    "visible"
-                } else {
-                    "hidden"
-                },
-                if effective_preview_layer_visible {
-                    "auto"
-                } else {
-                    "none"
-                },
-            );
+            let effective_preview_layer_style = preview_layer_style.clone();
             let show_failure_placeholder = preview_failure.is_some()
                 && grouped_runs.is_empty()
                 && rendered_sections.is_empty();
@@ -18088,10 +18007,10 @@ fn MainSurface(
                                             }
                                         }
                                         if show_loading_placeholder {
-                                            PreviewLoadingPlaceholder {
-                                                session: session.clone(),
-                                                palette: snapshot.palette,
-                                            }
+                                    PreviewLoadingPlaceholder {
+                                        session: session.clone(),
+                                        palette: snapshot.palette,
+                                    }
                                         }
                                         if let Some(message) = preview_failure.clone().filter(|_| show_failure_placeholder) {
                                             PreviewFailurePlaceholder {
@@ -20295,6 +20214,7 @@ fn TerminalCanvas(
             let mut resume_resize_nudged = false;
             let mut resume_runtime_linger_traced = false;
             let mut post_attach_read_recovery_attempts = 0_u64;
+            let mut resume_visual_reveal_after_ms = None::<u64>;
             loop {
                 let still_active = {
                     let shell = state.read();
@@ -20463,9 +20383,26 @@ fn TerminalCanvas(
                                                 );
                                             },
                                         );
-                                        terminal_overlay_dismissed.set(true);
+                                        resume_visual_reveal_after_ms = Some(
+                                            current_millis()
+                                                .saturating_add(
+                                                    REMOTE_TERMINAL_RESUME_VISUAL_REVEAL_MS,
+                                                ),
+                                        );
                                         maybe_spawn_missing_remote_machine_refreshes(state);
                                         maybe_spawn_missing_managed_cli_refreshes(state);
+                                    }
+                                    if is_remote_resume_session
+                                        && traced_attach_ready
+                                        && !terminal_overlay_dismissed()
+                                        && terminal_live_host_connected()
+                                        && terminal_geometry_ready
+                                        && resume_visual_reveal_after_ms.is_some_and(|deadline_ms| {
+                                            current_millis() >= deadline_ms
+                                        })
+                                    {
+                                        terminal_overlay_dismissed.set(true);
+                                        resume_visual_reveal_after_ms = None;
                                     }
                                 }
                             }
@@ -20933,7 +20870,12 @@ fn TerminalCanvas(
                                             );
                                         });
                                         let _ = eval.send(TerminalJsCommand::Refit);
-                                        terminal_overlay_dismissed.set(true);
+                                        resume_visual_reveal_after_ms = Some(
+                                            current_millis()
+                                                .saturating_add(
+                                                    REMOTE_TERMINAL_RESUME_VISUAL_REVEAL_MS,
+                                                ),
+                                        );
                                         maybe_spawn_missing_remote_machine_refreshes(state);
                                         maybe_spawn_missing_managed_cli_refreshes(state);
                                     }
@@ -21079,6 +21021,7 @@ fn TerminalCanvas(
                                 {
                                     resume_recovery_attempts += 1;
                                     terminal_overlay_dismissed.set(false);
+                                    resume_visual_reveal_after_ms = None;
                                     terminal_live_host_connected.set(false);
                                     resume_overlay_failed.set(false);
                                     resume_overlay_timed_out.set(false);
@@ -21151,6 +21094,7 @@ fn TerminalCanvas(
                                             );
                                         }
                                         terminal_overlay_dismissed.set(false);
+                                        resume_visual_reveal_after_ms = None;
                                         resume_overlay_failed.set(false);
                                         resume_overlay_timed_out.set(false);
                                         read_poll_ms = 60;
@@ -21394,7 +21338,7 @@ fn TerminalCanvas(
         )
     } else if resume_overlay_slow() {
         format!(
-            "Yggterm is still restoring the live terminal on {}. The saved context stays visible here while the live terminal catches up.",
+            "Yggterm is still restoring the live terminal on {}. Open Preview if you want the saved context while the live terminal catches up.",
             session.host_label
         )
     } else {
@@ -21428,7 +21372,11 @@ fn TerminalCanvas(
     } else {
         "hidden"
     };
-    let terminal_host_visibility = "opacity:1; visibility:visible;";
+    let terminal_host_visibility = if is_remote_resume_session && show_resume_panel {
+        "opacity:0; visibility:hidden; pointer-events:none;"
+    } else {
+        "opacity:1; visibility:visible;"
+    };
     rsx! {
         div {
             key: "{instance_key}",
@@ -21554,7 +21502,7 @@ fn TerminalCanvas(
                                 if resume_overlay_effective_failed {
                                     "The live terminal still has not become interactive."
                                 } else {
-                                    "The saved terminal context stays visible while Yggterm reconnects."
+                                    "Open Preview to inspect the saved context while Yggterm reconnects."
                                 }
                             }
                         }
@@ -28675,7 +28623,7 @@ Waiting for the remote terminal to paint...\n";
     }
 
     #[test]
-    fn describe_viewport_snapshot_accepts_terminal_resume_fallback_context() {
+    fn describe_viewport_snapshot_treats_terminal_resume_fallback_context_as_recovering() {
         let snapshot = json!({
             "active_session_path": "remote-session://oc/test",
             "active_view_mode": "Terminal",
@@ -28723,7 +28671,7 @@ Waiting for the remote terminal to paint...\n";
             }],
             "terminal_resume_overlay": {
                 "visible": true,
-                "text_sample": "Remote terminal resume\nResume live remote session\nThe saved terminal context stays visible while Yggterm reconnects.",
+                "text_sample": "Remote terminal resume\nResume live remote session\nOpen Preview to inspect the saved context while Yggterm reconnects.",
                 "excerpt": "Done. Added the ThinkBook x-layer media controls and restarted the service.",
                 "kind": "chip",
                 "phase": "chip",
@@ -28734,7 +28682,7 @@ Waiting for the remote terminal to paint...\n";
         });
 
         let viewport = describe_viewport_snapshot(&snapshot, &dom);
-        assert_eq!(viewport.get("ready").and_then(Value::as_bool), Some(true));
+        assert_eq!(viewport.get("ready").and_then(Value::as_bool), Some(false));
         assert_eq!(
             viewport.get("interactive").and_then(Value::as_bool),
             Some(false)
@@ -28743,9 +28691,12 @@ Waiting for the remote terminal to paint...\n";
             viewport
                 .get("terminal_settled_kind")
                 .and_then(Value::as_str),
-            Some("overlay_context")
+            Some("recovering")
         );
-        assert_eq!(viewport.get("reason"), Some(&Value::Null));
+        assert_eq!(
+            viewport.get("reason").and_then(Value::as_str),
+            Some("terminal resume overlay is still visible")
+        );
         assert_eq!(
             viewport
                 .get("preview")
@@ -28756,7 +28707,7 @@ Waiting for the remote terminal to paint...\n";
     }
 
     #[test]
-    fn describe_viewport_snapshot_accepts_terminal_host_prefill_as_overlay_context() {
+    fn describe_viewport_snapshot_keeps_terminal_host_prefill_in_recovering_state() {
         let snapshot = json!({
             "active_session_path": "remote-session://oc/test",
             "active_view_mode": "Terminal",
@@ -28795,19 +28746,19 @@ Waiting for the remote terminal to paint...\n";
                 "rows_present": true,
                 "canvas_count": 0,
                 "text_sample": "Done. Added the ThinkBook x-layer media controls and restarted the service.",
-                "resume_overlay_visible": false,
-                "resume_overlay_text": "",
+                "resume_overlay_visible": true,
+                "resume_overlay_text": "Resume live remote session\nOpen Preview to inspect the saved context while Yggterm reconnects.",
                 "resume_overlay_excerpt": "Done. Added the ThinkBook x-layer media controls and restarted the service.",
-                "resume_overlay_kind": "hidden",
-                "resume_overlay_phase": "hidden",
+                "resume_overlay_kind": "chip",
+                "resume_overlay_phase": "chip",
                 "resume_overlay_effective_failed": false
             }],
             "terminal_resume_overlay": {
-                "visible": false,
-                "text_sample": "",
-                "excerpt": "",
-                "kind": "",
-                "phase": "hidden",
+                "visible": true,
+                "text_sample": "Remote terminal resume\nResume live remote session\nOpen Preview to inspect the saved context while Yggterm reconnects.",
+                "excerpt": "Done. Added the ThinkBook x-layer media controls and restarted the service.",
+                "kind": "chip",
+                "phase": "chip",
                 "effective_failed": false
             },
             "preview_visible_block_count": 0,
@@ -28815,7 +28766,7 @@ Waiting for the remote terminal to paint...\n";
         });
 
         let viewport = describe_viewport_snapshot(&snapshot, &dom);
-        assert_eq!(viewport.get("ready").and_then(Value::as_bool), Some(true));
+        assert_eq!(viewport.get("ready").and_then(Value::as_bool), Some(false));
         assert_eq!(
             viewport.get("interactive").and_then(Value::as_bool),
             Some(false)
@@ -28824,9 +28775,12 @@ Waiting for the remote terminal to paint...\n";
             viewport
                 .get("terminal_settled_kind")
                 .and_then(Value::as_str),
-            Some("overlay_context")
+            Some("recovering")
         );
-        assert_eq!(viewport.get("reason"), Some(&Value::Null));
+        assert_eq!(
+            viewport.get("reason").and_then(Value::as_str),
+            Some("terminal resume overlay is still visible")
+        );
     }
 
     #[test]
