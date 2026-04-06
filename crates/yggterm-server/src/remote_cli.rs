@@ -1,8 +1,9 @@
 use crate::{
     ManagedCliTool, run_remote_ensure_managed_cli, run_remote_generation_context,
     run_remote_preview, run_remote_preview_head, run_remote_protocol_version,
-    run_remote_refresh_managed_cli, run_remote_resume_codex, run_remote_scan,
-    run_remote_stage_clipboard_png, run_remote_terminate_codex, run_remote_upsert_generated_copy,
+    run_remote_refresh_managed_cli, run_remote_resume_codex, run_remote_saved_codex_session_exists,
+    run_remote_scan, run_remote_stage_clipboard_png, run_remote_terminate_codex,
+    run_remote_upsert_generated_copy,
 };
 use anyhow::{Result, bail};
 
@@ -10,6 +11,9 @@ use anyhow::{Result, bail};
 pub enum RemoteServerCommand {
     StageClipboardPng,
     ProtocolVersion,
+    SavedCodexSessionExists {
+        session_id: String,
+    },
     ResumeCodex {
         session_id: String,
         cwd: Option<String>,
@@ -57,6 +61,9 @@ fn parse_remote_server_command(args: &[String]) -> Result<Option<RemoteServerCom
     let command = match args[2].as_str() {
         "stage-clipboard-png" if args.len() == 3 => RemoteServerCommand::StageClipboardPng,
         "protocol-version" if args.len() == 3 => RemoteServerCommand::ProtocolVersion,
+        "codex-session-exists" if args.len() == 4 => RemoteServerCommand::SavedCodexSessionExists {
+            session_id: args[3].clone(),
+        },
         "resume-codex" if args.len() >= 4 => RemoteServerCommand::ResumeCodex {
             session_id: args[3].clone(),
             cwd: args
@@ -104,6 +111,9 @@ fn run_remote_server_command(command: RemoteServerCommand) -> Result<()> {
     match command {
         RemoteServerCommand::StageClipboardPng => run_remote_stage_clipboard_png(),
         RemoteServerCommand::ProtocolVersion => run_remote_protocol_version(),
+        RemoteServerCommand::SavedCodexSessionExists { session_id } => {
+            run_remote_saved_codex_session_exists(&session_id)
+        }
         RemoteServerCommand::ResumeCodex {
             session_id,
             cwd,
@@ -161,6 +171,25 @@ mod tests {
                 session_id: "019ad8".to_string(),
                 cwd: Some("/home/pi".to_string()),
                 require_existing: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_saved_codex_session_exists_command() {
+        let args = vec![
+            "server".to_string(),
+            "remote".to_string(),
+            "codex-session-exists".to_string(),
+            "019ad8".to_string(),
+        ];
+        let command = parse_remote_server_command(&args)
+            .expect("parse command")
+            .expect("remote command");
+        assert_eq!(
+            command,
+            RemoteServerCommand::SavedCodexSessionExists {
+                session_id: "019ad8".to_string(),
             }
         );
     }
