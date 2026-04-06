@@ -18,6 +18,7 @@ pub const IDLE_TRIM_MAX_BYTES: usize = 128 * 1024;
 const INITIAL_ATTACH_MAX_CHUNKS: usize = 192;
 const INITIAL_ATTACH_MAX_BYTES: usize = 512 * 1024;
 const INITIAL_ATTACH_TRAILING_NOISE_CHUNKS: usize = 16;
+const ATTACH_READY_MARKER: &str = "__YGGTERM_ATTACH_READY__\n";
 
 #[derive(Debug, Clone)]
 pub struct TerminalChunk {
@@ -473,7 +474,7 @@ impl PtySessionRuntime {
     fn read(&self, cursor: u64) -> TerminalReadResult {
         let chunks = self.chunks.lock().expect("pty chunk lock poisoned");
         let next_cursor = self.seq.load(Ordering::SeqCst);
-        let chunks = if cursor == 0 {
+        let mut chunks = if cursor == 0 {
             select_initial_attach_chunks(&chunks)
         } else {
             chunks
@@ -482,6 +483,16 @@ impl PtySessionRuntime {
                 .cloned()
                 .collect()
         };
+        if cursor == 0
+            && !chunks.is_empty()
+            && self.is_running()
+            && launch_command_looks_like_remote_resume_attach(&self.launch_command)
+        {
+            chunks.push(TerminalChunk {
+                seq: next_cursor.saturating_add(1),
+                data: ATTACH_READY_MARKER.to_string(),
+            });
+        }
         TerminalReadResult {
             cursor: next_cursor,
             chunks,
@@ -1085,5 +1096,46 @@ mod tests {
         assert!(!launch_command_looks_like_remote_resume_attach(
             "bash -lc 'ls'"
         ));
+    }
+
+    #[test]
+    fn initial_remote_resume_attach_appends_attach_ready_marker() {
+        let runtime = PtySessionRuntime::spawn(
+            "remote-session://oc/test",
+            "ssh -tt oc 'exec $HOME/.yggterm/bin/yggterm '\\''server'\\'' '\\''remote'\\'' '\\''resume-codex'\\'' '\\''test-session'\\'' '\\''/home/pi'\\'''",
+            None,
+        )
+        .expect("spawn test runtime");
+        runtime.seed_snapshot(
+            "› Use /skills to list available skills\n\n  gpt-5.4 high fast · 100% left · ~/git\n",
+        );
+
+        let result = runtime.read(0);
+        let combined = result
+            .chunks
+            .iter()
+            .map(|chunk| chunk.data.as_str())
+            .collect::<String>();
+
+        assert!(combined.contains("__YGGTERM_ATTACH_READY__"));
+        runtime.shutdown(None).expect("shutdown test runtime");
+    }
+
+    #[test]
+    fn initial_local_attach_does_not_append_attach_ready_marker() {
+        let runtime =
+            PtySessionRuntime::spawn("local://test", "bash -lc 'printf hello'", None)
+                .expect("spawn local test runtime");
+        runtime.seed_snapshot("hello\n");
+
+        let result = runtime.read(0);
+        let combined = result
+            .chunks
+            .iter()
+            .map(|chunk| chunk.data.as_str())
+            .collect::<String>();
+
+        assert!(!combined.contains("__YGGTERM_ATTACH_READY__"));
+        runtime.shutdown(None).expect("shutdown test runtime");
     }
 }
