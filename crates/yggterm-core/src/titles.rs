@@ -925,6 +925,12 @@ mod tests {
     fn fallback_title_detection_matches_hash_titles() {
         assert!(looks_like_generated_fallback_title("Q4fc63d"));
         assert!(looks_like_generated_fallback_title("25663dc"));
+        assert!(looks_like_generated_fallback_title(
+            "local::ddf8f1ee-8e64-4201-ab3a-2b07424f9b77"
+        ));
+        assert!(looks_like_generated_fallback_title(
+            "document::ddf8f1ee-8e64-4201-ab3a-2b07424f9b77"
+        ));
         assert!(!looks_like_generated_fallback_title("Remove Them Entirely"));
     }
 }
@@ -1093,12 +1099,24 @@ fn heuristic_title_from_context(context: &str) -> Option<String> {
 
 pub fn looks_like_generated_fallback_title(title: &str) -> bool {
     let compact = title.trim();
+    let prefixed_session_uuid = [
+        "local::",
+        "live::",
+        "document::",
+        "codex::",
+        "codex-litellm::",
+    ]
+    .iter()
+    .find_map(|prefix| compact.strip_prefix(prefix))
+    .is_some_and(|tail| {
+        tail.len() == 36 && tail.chars().all(|ch| ch.is_ascii_hexdigit() || ch == '-')
+    });
     let prefixed_hash = (compact.len() == 7 || compact.len() == 8)
         && compact.starts_with('Q')
         && compact.chars().skip(1).all(|ch| ch.is_ascii_hexdigit());
     let bare_hash = (compact.len() == 7 || compact.len() == 8)
         && compact.chars().all(|ch| ch.is_ascii_hexdigit());
-    prefixed_hash || bare_hash
+    prefixed_session_uuid || prefixed_hash || bare_hash
 }
 
 pub fn looks_like_low_signal_generated_copy(text: &str) -> bool {
