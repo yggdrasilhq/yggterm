@@ -722,7 +722,27 @@ fn select_initial_attach_chunks(chunks: &VecDeque<TerminalChunk>) -> Vec<Termina
             selected.push(chunk);
         }
     }
+    trim_initial_attach_low_signal_suffix(&mut selected);
     selected
+}
+
+fn trim_initial_attach_low_signal_suffix(selected: &mut Vec<TerminalChunk>) {
+    if selected.is_empty()
+        || !selected
+            .iter()
+            .any(|chunk| terminal_chunk_has_meaningful_attach_text(&chunk.data))
+    {
+        return;
+    }
+    while selected.len() > 1 {
+        let Some(last) = selected.last() else {
+            break;
+        };
+        if !terminal_chunk_is_disposable_initial_attach_suffix(&last.data) {
+            break;
+        }
+        selected.pop();
+    }
 }
 
 fn select_initial_attach_tail(
@@ -756,6 +776,103 @@ fn select_initial_attach_tail(
 fn terminal_chunk_has_visible_text(data: &str) -> bool {
     let stripped = strip_terminal_control_sequences(data);
     stripped.chars().any(|ch| !ch.is_whitespace())
+}
+
+fn terminal_chunk_has_meaningful_attach_text(data: &str) -> bool {
+    let stripped = strip_terminal_control_sequences(data);
+    let lines = stripped
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if lines.is_empty() || terminal_chunk_has_generic_attach_idle_footer(&stripped) {
+        return false;
+    }
+    let printable = stripped
+        .chars()
+        .filter(|ch| !ch.is_control() && !ch.is_whitespace())
+        .count();
+    let word_count = lines
+        .iter()
+        .map(|line| line.split_whitespace().count())
+        .sum::<usize>();
+    let prompt_like = lines.len() <= 2
+        && printable < 40
+        && lines.iter().any(|line| {
+            line.starts_with('›')
+                || line.ends_with('$')
+                || line.ends_with('#')
+                || line.ends_with('>')
+                || line.ends_with('%')
+        });
+    if prompt_like {
+        return false;
+    }
+    printable >= 48 || lines.len() >= 2 || word_count >= 8
+}
+
+fn terminal_chunk_is_disposable_initial_attach_suffix(data: &str) -> bool {
+    if data.contains("__YGGTERM_ATTACH_READY__") {
+        return false;
+    }
+    let stripped = strip_terminal_control_sequences(data);
+    let trimmed = stripped.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if terminal_chunk_has_generic_attach_idle_footer(&stripped) {
+        return true;
+    }
+    if terminal_chunk_has_meaningful_attach_text(&stripped) {
+        return false;
+    }
+    terminal_chunk_is_low_signal_attach_fragment(&stripped)
+}
+
+fn terminal_chunk_is_low_signal_attach_fragment(data: &str) -> bool {
+    let stripped = strip_terminal_control_sequences(data);
+    let lines = stripped
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return true;
+    }
+    let printable = stripped
+        .chars()
+        .filter(|ch| !ch.is_control() && !ch.is_whitespace())
+        .count();
+    let max_line_len = lines.iter().map(|line| line.len()).max().unwrap_or(0);
+    printable <= 6 || (lines.len() == 1 && max_line_len <= 18)
+}
+
+fn terminal_chunk_has_generic_attach_idle_footer(data: &str) -> bool {
+    let lines = data
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if lines.is_empty() || lines.len() > 5 {
+        return false;
+    }
+    let normalized = lines.join("\n").to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    let mentions_generic_prompt = lines.iter().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.starts_with('›')
+            && (lower.contains("implement {feature}")
+                || lower.contains("explain this codebase")
+                || lower.contains("find and fix a bug")
+                || lower.contains("resume a previous session"))
+    });
+    let mentions_model_footer = (normalized.contains("gpt-5")
+        || normalized.contains("gpt-4")
+        || normalized.contains("claude"))
+        && normalized.contains("% left");
+    mentions_generic_prompt && mentions_model_footer
 }
 
 fn strip_terminal_control_sequences(input: &str) -> String {
@@ -888,6 +1005,64 @@ mod tests {
             .collect::<String>();
 
         assert!(combined.contains("OpenAI Codex"));
+    }
+
+    #[test]
+    fn initial_attach_selection_trims_low_signal_suffix_after_meaningful_transcript() {
+        let mut chunks = VecDeque::new();
+        chunks.push_back(TerminalChunk {
+            seq: 1,
+            data: "  - Push: origin/main updated successfully (2f6b4ac..f49ab56)\n".to_string(),
+        });
+        chunks.push_back(TerminalChunk {
+            seq: 2,
+            data: "B".to_string(),
+        });
+        chunks.push_back(TerminalChunk {
+            seq: 3,
+            data: "oo".to_string(),
+        });
+        chunks.push_back(TerminalChunk {
+            seq: 4,
+            data: "rvco".to_string(),
+        });
+        chunks.push_back(TerminalChunk {
+            seq: 5,
+            data: "›Explain this codebase  gpt-5.4 high fast · 100% left · ~/git\n".to_string(),
+        });
+        chunks.push_back(TerminalChunk {
+            seq: 6,
+            data: "\n".to_string(),
+        });
+
+        let selected = select_initial_attach_chunks(&chunks);
+        let seqs = selected.iter().map(|chunk| chunk.seq).collect::<Vec<_>>();
+        let combined = selected
+            .iter()
+            .map(|chunk| chunk.data.as_str())
+            .collect::<String>();
+
+        assert_eq!(seqs, vec![1]);
+        assert!(combined.contains("origin/main updated successfully"));
+        assert!(!combined.contains("Explain this codebase"));
+    }
+
+    #[test]
+    fn initial_attach_selection_keeps_prompt_only_surface_when_no_meaningful_history_exists() {
+        let mut chunks = VecDeque::new();
+        chunks.push_back(TerminalChunk {
+            seq: 1,
+            data: "pi@oc:~$ ".to_string(),
+        });
+        chunks.push_back(TerminalChunk {
+            seq: 2,
+            data: "\u{1b}[?25h".to_string(),
+        });
+
+        let selected = select_initial_attach_chunks(&chunks);
+        let seqs = selected.iter().map(|chunk| chunk.seq).collect::<Vec<_>>();
+
+        assert_eq!(seqs, vec![1, 2]);
     }
 
     #[test]

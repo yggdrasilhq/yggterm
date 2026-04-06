@@ -1,13 +1,14 @@
 use crate::terminal::TerminalBufferStats;
 use crate::{
-    GhosttyHostSupport, PersistedDaemonState, RemoteMachineSnapshot, RemoteRuntimeRegistry,
-    ServerUiSnapshot, SessionKind, SshConnectTarget, TerminalManager, WorkspaceViewMode,
-    YggtermServer, active_client_instance_records, current_millis, fetch_remote_generation_context,
-    persist_remote_generated_copy, remote_resume_runtime_output_requires_restart,
-    terminate_remote_codex_session,
+    GhosttyHostSupport, ManagedSessionView, PersistedDaemonState, RemoteMachineSnapshot,
+    RemoteRuntimeRegistry, ServerUiSnapshot, SessionKind, SshConnectTarget, TerminalManager,
+    WorkspaceViewMode, YggtermServer, active_client_instance_records, current_millis,
+    fetch_remote_generation_context, persist_remote_generated_copy,
+    remote_resume_runtime_output_requires_restart, terminate_remote_codex_session,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 #[cfg(unix)]
@@ -41,6 +42,23 @@ const REMOTE_ATTACH_STARTUP_GRACE_MS: u64 = 900;
 
 fn uses_runtime_owned_terminal_path(path: &str) -> bool {
     path.starts_with("remote-session://") || path.starts_with("codex-runtime://")
+}
+
+fn terminal_launch_command_for_path(
+    _path: &str,
+    stored_launch_command: String,
+    _legacy_direct_attach_launch_command: Option<String>,
+) -> String {
+    stored_launch_command
+}
+
+fn remote_resume_stale_attach(
+    has_runtime_output: bool,
+    runtime_age_ms: u64,
+    runtime_output_requires_restart: bool,
+) -> bool {
+    runtime_output_requires_restart
+        || (!has_runtime_output && runtime_age_ms >= REMOTE_ATTACH_STARTUP_GRACE_MS)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,7 +282,7 @@ struct BackgroundCopyCandidate {
     title: String,
     source_updated_at: Option<OffsetDateTime>,
     remote_machine: Option<RemoteMachineSnapshot>,
-    remote_context: Option<String>,
+    generation_context: Option<String>,
     storage_path: Option<String>,
     cached_summary: Option<String>,
 }
@@ -364,6 +382,49 @@ impl DaemonRuntime {
     }
 
     fn ensure_terminal_for_path(&mut self, path: &str) -> Result<Option<String>> {
+        if path.starts_with("remote-session://") {
+            if let Ok(home) = crate::resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "daemon",
+                    "terminal_ensure",
+                    "remote_saved_session_preflight_begin",
+                    serde_json::json!({
+                        "path": path,
+                    }),
+                );
+            }
+            match self.server.validate_remote_saved_session_for_path(path) {
+                Ok(()) => {
+                    if let Ok(home) = crate::resolve_yggterm_home() {
+                        append_trace_event(
+                            &home,
+                            "daemon",
+                            "terminal_ensure",
+                            "remote_saved_session_preflight_end",
+                            serde_json::json!({
+                                "path": path,
+                            }),
+                        );
+                    }
+                }
+                Err(error) => {
+                    if let Ok(home) = crate::resolve_yggterm_home() {
+                        append_trace_event(
+                            &home,
+                            "daemon",
+                            "terminal_ensure",
+                            "remote_saved_session_preflight_error",
+                            serde_json::json!({
+                                "path": path,
+                                "error": error.to_string(),
+                            }),
+                        );
+                    }
+                    return Err(error);
+                }
+            }
+        }
         let prepare_message = self.server.ensure_managed_cli_for_session_path(path)?;
         if let Ok(home) = crate::resolve_yggterm_home() {
             append_trace_event(
@@ -405,13 +466,15 @@ impl DaemonRuntime {
                 }),
             );
         }
-        let launch_command = if path.starts_with("remote-session://") {
+        // The server-owned session model updates the managed session launch command
+        // before terminal ensure runs. Recomputing a legacy direct-attach command here
+        // can silently bypass the daemon-owned remote runtime path on startup restore.
+        let launch_command = terminal_launch_command_for_path(
+            path,
+            stored_launch_command,
             self.server
-                .remote_direct_attach_launch_command_for_path(path)
-                .unwrap_or(stored_launch_command)
-        } else {
-            stored_launch_command
-        };
+                .remote_direct_attach_launch_command_for_path(path),
+        );
         if let Ok(home) = crate::resolve_yggterm_home() {
             append_trace_event(
                 &home,
@@ -448,22 +511,25 @@ impl DaemonRuntime {
                     })
                 })
                 .unwrap_or(false);
+            let remote_runtime_output_requires_restart = has_runtime_output
+                && self
+                    .terminals
+                    .read(path, 0)
+                    .map(|stream| {
+                        let snapshot = stream
+                            .chunks
+                            .into_iter()
+                            .map(|chunk| chunk.data)
+                            .collect::<String>();
+                        remote_resume_runtime_output_requires_restart(snapshot.as_bytes())
+                    })
+                    .unwrap_or(false);
             let stale_remote_attach = path.starts_with("remote-session://")
-                && ((has_runtime_output
-                    && self
-                        .terminals
-                        .read(path, 0)
-                        .map(|stream| {
-                            let snapshot = stream
-                                .chunks
-                                .into_iter()
-                                .map(|chunk| chunk.data)
-                                .collect::<String>();
-                            remote_resume_runtime_output_requires_restart(snapshot.as_bytes())
-                        })
-                        .unwrap_or(false))
-                    || runtime_saved_session_mismatch
-                    || (!has_runtime_output && runtime_age_ms >= REMOTE_ATTACH_STARTUP_GRACE_MS));
+                && remote_resume_stale_attach(
+                    has_runtime_output,
+                    runtime_age_ms,
+                    remote_runtime_output_requires_restart,
+                );
             let spec_matches =
                 self.terminals
                     .session_matches_spec(path, &launch_command, cwd.as_deref());
@@ -478,6 +544,7 @@ impl DaemonRuntime {
                         "still_running": still_running,
                         "has_runtime_output": has_runtime_output,
                         "runtime_age_ms": runtime_age_ms,
+                        "remote_runtime_output_requires_restart": remote_runtime_output_requires_restart,
                         "stale_remote_attach": stale_remote_attach,
                         "runtime_saved_session_mismatch": runtime_saved_session_mismatch,
                         "spec_matches": spec_matches,
@@ -914,10 +981,10 @@ impl DaemonRuntime {
                     && !self.terminals.session_has_runtime_output(&path)
                     && let Some((stored_launch_command, cwd)) = self.server.terminal_spec(&path)
                 {
-                    let launch_command = self
-                        .server
-                        .remote_direct_attach_launch_command_for_path(&path)
-                        .unwrap_or(stored_launch_command);
+                    // Runtime-owned terminals must stay on their stored daemon-owned launch path.
+                    // Falling back to a legacy direct-attach command here can silently switch
+                    // the recovery path back to the old semantics after startup.
+                    let launch_command = stored_launch_command;
                     let stop_command = self.server.terminal_stop_command(&path);
                     if let Ok(home) = crate::resolve_yggterm_home() {
                         append_trace_event(
@@ -1087,7 +1154,7 @@ fn collect_local_copy_candidates(node: &SessionNode, out: &mut Vec<BackgroundCop
                 title: node.title.clone().unwrap_or_else(|| node.name.clone()),
                 source_updated_at: source_updated_at_for_path(&node.path),
                 remote_machine: None,
-                remote_context: None,
+                generation_context: None,
                 storage_path: None,
                 cached_summary: None,
             });
@@ -1095,6 +1162,56 @@ fn collect_local_copy_candidates(node: &SessionNode, out: &mut Vec<BackgroundCop
     }
     for child in &node.children {
         collect_local_copy_candidates(child, out);
+    }
+}
+
+fn session_cwd_for_background_copy(session: &ManagedSessionView) -> String {
+    session
+        .metadata
+        .iter()
+        .find(|entry| entry.label == "Cwd")
+        .map(|entry| entry.value.clone())
+        .unwrap_or_default()
+}
+
+fn collect_live_copy_candidates(
+    store: &SessionStore,
+    live_sessions: &[ManagedSessionView],
+    out: &mut Vec<BackgroundCopyCandidate>,
+) {
+    for session in live_sessions {
+        if session.session_path.starts_with("remote-session://") {
+            continue;
+        }
+        let generation_context = if session.kind == SessionKind::Document {
+            store
+                .load_document(&session.session_path)
+                .ok()
+                .flatten()
+                .and_then(|document| {
+                    let trimmed = document.body.trim();
+                    (!trimmed.is_empty()).then(|| trimmed.to_string())
+                })
+        } else {
+            None
+        };
+        if generation_context.is_none()
+            && !(Path::new(&session.session_path).exists()
+                && session.session_path.ends_with(".jsonl"))
+        {
+            continue;
+        }
+        out.push(BackgroundCopyCandidate {
+            session_path: session.session_path.clone(),
+            session_id: session.id.clone(),
+            cwd: session_cwd_for_background_copy(session),
+            title: session.title.clone(),
+            source_updated_at: None,
+            remote_machine: None,
+            generation_context,
+            storage_path: None,
+            cached_summary: None,
+        });
     }
 }
 
@@ -1121,7 +1238,7 @@ fn collect_remote_copy_candidates(
                 title: session.title_hint.clone(),
                 source_updated_at: source_updated_at_for_remote_epoch(session.modified_epoch),
                 remote_machine: Some(machine_ref.clone()),
-                remote_context: (!session.recent_context.trim().is_empty())
+                generation_context: (!session.recent_context.trim().is_empty())
                     .then(|| session.recent_context.clone()),
                 storage_path: (!session.storage_path.trim().is_empty())
                     .then(|| session.storage_path.clone()),
@@ -1136,7 +1253,7 @@ fn copy_target_context(
     candidate: &BackgroundCopyCandidate,
     ssh_targets: &[SshConnectTarget],
 ) -> Result<Option<String>> {
-    if let Some(context) = candidate.remote_context.as_ref()
+    if let Some(context) = candidate.generation_context.as_ref()
         && !context.trim().is_empty()
     {
         return Ok(Some(context.clone()));
@@ -1160,15 +1277,22 @@ fn build_background_copy_updates(
     store: &SessionStore,
     settings: &AppSettings,
     local_root: &SessionNode,
+    live_sessions: &[ManagedSessionView],
     remote_machines: &[RemoteMachineSnapshot],
     ssh_targets: &[SshConnectTarget],
 ) -> Result<Vec<BackgroundCopyUpdate>> {
     let mut candidates = Vec::new();
     collect_local_copy_candidates(local_root, &mut candidates);
+    collect_live_copy_candidates(store, live_sessions, &mut candidates);
     candidates.extend(collect_remote_copy_candidates(remote_machines));
 
     let mut updates = Vec::new();
-    for candidate in candidates.into_iter().take(BACKGROUND_COPY_BUDGET_PER_TICK) {
+    let mut seen_candidates = HashSet::new();
+    for candidate in candidates
+        .into_iter()
+        .filter(|candidate| seen_candidates.insert(candidate.session_path.clone()))
+        .take(BACKGROUND_COPY_BUDGET_PER_TICK)
+    {
         let stored_title = store
             .resolve_title_for_session_id(&candidate.session_id)
             .ok()
@@ -1198,10 +1322,8 @@ fn build_background_copy_updates(
             continue;
         }
 
-        let (title, summary) = if candidate.remote_machine.is_some() {
-            let Some(context) = copy_target_context(&candidate, ssh_targets)? else {
-                continue;
-            };
+        let maybe_context = copy_target_context(&candidate, ssh_targets)?;
+        let (title, summary) = if let Some(context) = maybe_context {
             let title = if title_missing {
                 store.generate_title_for_context(
                     settings,
@@ -1264,7 +1386,7 @@ fn build_background_copy_updates(
 }
 
 fn run_background_copy_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usize> {
-    let (store, settings, local_root, remote_machines, ssh_targets, perf_home) = {
+    let (store, settings, local_root, live_sessions, remote_machines, ssh_targets, perf_home) = {
         let runtime = runtime.lock().expect("daemon runtime lock poisoned");
         let settings = runtime.store.load_settings().unwrap_or_default();
         let local_root = runtime.store.load_codex_tree(&settings)?;
@@ -1272,6 +1394,7 @@ fn run_background_copy_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usiz
             runtime.store.clone(),
             settings,
             local_root,
+            runtime.server.live_sessions().to_vec(),
             runtime.server.remote_machines().to_vec(),
             runtime.server.ssh_targets().to_vec(),
             runtime.store.home_dir().to_path_buf(),
@@ -1282,11 +1405,13 @@ fn run_background_copy_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usiz
         &store,
         &settings,
         &local_root,
+        &live_sessions,
         &remote_machines,
         &ssh_targets,
     )?;
     perf.finish(serde_json::json!({
         "updates": updates.len(),
+        "live_sessions": live_sessions.len(),
         "remote_machines": remote_machines.len(),
     }));
 
@@ -1886,6 +2011,64 @@ pub fn cleanup_legacy_daemons(endpoint: &ServerEndpoint, current_exe: &Path) -> 
     Ok(())
 }
 
+fn spawn_active_terminal_prewarm(
+    runtime: Arc<Mutex<DaemonRuntime>>,
+    last_activity_ms: Arc<AtomicU64>,
+    home_dir: PathBuf,
+) {
+    std::thread::spawn(move || {
+        let active_path = {
+            let runtime = runtime.lock().expect("daemon runtime lock poisoned");
+            if runtime.server.active_view_mode() == WorkspaceViewMode::Terminal
+                && runtime.server.active_session_supports_terminal()
+            {
+                runtime.server.active_session_path().map(ToOwned::to_owned)
+            } else {
+                None
+            }
+        };
+        let Some(active_path) = active_path else {
+            return;
+        };
+        append_trace_event(
+            &home_dir,
+            "daemon",
+            "startup_prewarm",
+            "begin",
+            serde_json::json!({ "path": active_path }),
+        );
+        let outcome = {
+            let mut runtime = runtime.lock().expect("daemon runtime lock poisoned");
+            runtime.ensure_terminal_for_active()
+        };
+        match outcome {
+            Ok(()) => {
+                mark_daemon_activity(last_activity_ms.as_ref());
+                append_trace_event(
+                    &home_dir,
+                    "daemon",
+                    "startup_prewarm",
+                    "end",
+                    serde_json::json!({ "path": active_path }),
+                );
+            }
+            Err(error) => {
+                append_trace_event(
+                    &home_dir,
+                    "daemon",
+                    "startup_prewarm",
+                    "error",
+                    serde_json::json!({
+                        "path": active_path,
+                        "error": error.to_string(),
+                    }),
+                );
+                warn!(path=%active_path, error=%error, "daemon startup terminal prewarm failed");
+            }
+        }
+    });
+}
+
 pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Result<()> {
     let runtime = Arc::new(Mutex::new(DaemonRuntime::load(runtime)?));
     let last_activity_ms = Arc::new(AtomicU64::new(current_millis_u64()));
@@ -1998,6 +2181,7 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
             runtime.support.kind.as_str().to_string()
         };
         info!(path=%path.display(), host=%host, "yggterm server daemon listening");
+        spawn_active_terminal_prewarm(runtime.clone(), last_activity_ms.clone(), home_dir.clone());
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
@@ -2053,6 +2237,11 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                 runtime.support.kind.as_str().to_string()
             };
             info!(host=%host, port, host_kind=%host_kind, "yggterm server daemon listening");
+            spawn_active_terminal_prewarm(
+                runtime.clone(),
+                last_activity_ms.clone(),
+                home_dir.clone(),
+            );
             loop {
                 match listener.accept() {
                     Ok((stream, _)) => {
@@ -2488,6 +2677,8 @@ fn send_request(endpoint: &ServerEndpoint, request: &ServerRequest) -> Result<Se
 #[cfg(test)]
 mod tests {
     use super::collect_remote_copy_candidates;
+    use super::remote_resume_stale_attach;
+    use super::terminal_launch_command_for_path;
     use crate::{
         RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession,
         remote_scanned_session_path,
@@ -2635,5 +2826,25 @@ mod tests {
             keys,
             vec!["jojo".to_string(), "jojo".to_string(), "oc".to_string()]
         );
+    }
+
+    #[test]
+    fn terminal_launch_command_for_remote_session_keeps_server_owned_resume_command() {
+        let stored =
+            "ssh oc '$HOME/.yggterm/bin/yggterm' server remote resume-codex 019c --require-existing"
+                .to_string();
+        let legacy = Some("ssh oc legacy-direct-attach 019c".to_string());
+
+        let selected =
+            terminal_launch_command_for_path("remote-session://oc/019c", stored.clone(), legacy);
+
+        assert_eq!(selected, stored);
+    }
+
+    #[test]
+    fn remote_resume_stale_attach_ignores_semantic_mismatch_without_breakage() {
+        assert!(!remote_resume_stale_attach(true, 3_500, false));
+        assert!(remote_resume_stale_attach(false, 901, false));
+        assert!(remote_resume_stale_attach(true, 3_500, true));
     }
 }
