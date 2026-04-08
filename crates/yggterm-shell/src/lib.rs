@@ -2,6 +2,7 @@
 
 mod app_capture;
 mod shell;
+mod terminal_observe;
 mod terminal_protocol;
 mod terminal_themes;
 mod window_icon;

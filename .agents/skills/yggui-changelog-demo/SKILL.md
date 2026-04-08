@@ -7,6 +7,8 @@ description: Capture deterministic proof bundles, screenshots, traces, and curat
 
 Use this workflow when a `yggui` app feature or fix should ship with proof, screenshots, and a curated changelog entry.
 
+Observability note: the terminal attempt ledger, viewport classifier, and app-control terminal-surface helpers now live in `crates/yggterm-shell/src/terminal_observe.rs`. Do not keep spelunking only in `shell.rs` when validating or extending proof semantics.
+
 ## Goals
 
 - capture deterministic evidence
