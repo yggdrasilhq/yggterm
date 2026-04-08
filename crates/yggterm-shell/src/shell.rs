@@ -1,28 +1,8 @@
 use crate::app_capture::{
     capture_visible_app_surface, describe_window, focus_app_window, record_visible_app_surface,
 };
-use crate::chrome::{
-    ChromePalette, HoveredChromeControl as HoveredControl, TitlebarChrome, WindowControlsStrip,
-    search_input_style,
-};
-use crate::drag_tree::{
-    DragDropPlacement, DragDropTarget, TreeDropPlacement as WorkspaceDropPlacement,
-    TreeReorderItem, TreeReorderPlanItem, build_tree_reorder_plan,
-    resolve_drag_drop_target as resolve_tree_drag_drop_target, resolve_tree_drop_placement,
-    tree_parent_path, tree_path_contains, valid_drop_target as valid_tree_drop_target,
-};
-use crate::drag_visuals::{DragGhostCard, DragGhostPalette};
-use crate::notifications::{
-    TOAST_CSS, ToastCard, ToastItem as ToastNotification, ToastPalette,
-    ToastTone as NotificationTone, ToastViewport,
-};
-use crate::rails::{RailHeader, RailScrollBody, RailSectionTitle, SideRailShell};
 use crate::terminal_protocol::{TerminalJsCommand, TerminalJsEvent};
 use crate::terminal_themes::{terminal_theme_by_name, terminal_theme_names};
-use crate::theme::{
-    THEME_EDITOR_SWATCHES, append_theme_stop, clamp_theme_spec, default_theme_editor_spec,
-    dominant_accent, gradient_css, preview_surface_css, shell_tint,
-};
 use crate::window_icon;
 use anyhow::{Context, Result, anyhow};
 use dioxus::desktop::{
@@ -65,12 +45,11 @@ use tokio::time::sleep;
 use tracing::{info, warn};
 use yggterm_core::{
     AgentSessionProfile, AppSettings, BrowserRow, BrowserRowKind, InstallContext, PerfSpan,
-    SessionBrowserState, SessionNode, SessionStore, UiTheme, WorkspaceDocumentInput,
-    WorkspaceDocumentKind, WorkspaceGroupKind, YgguiThemeSpec, append_perf_event,
-    append_trace_event, check_for_update, install_release_update,
-    looks_like_generated_fallback_title, looks_like_low_signal_generated_copy,
-    read_codex_session_identity_fields, resolve_yggterm_home, save_settings_file,
-    unique_session_short_ids_for_pairs, update_command_hint,
+    SessionBrowserState, SessionNode, SessionStore, WorkspaceDocumentInput, WorkspaceDocumentKind,
+    WorkspaceGroupKind, append_perf_event, append_trace_event, check_for_update,
+    install_release_update, looks_like_generated_fallback_title,
+    looks_like_low_signal_generated_copy, read_codex_session_identity_fields, resolve_yggterm_home,
+    save_settings_file, unique_session_short_ids_for_pairs, update_command_hint,
 };
 use yggterm_platform::{DockRect, send_user_notification};
 use yggterm_server::{
@@ -92,6 +71,19 @@ use yggterm_server::{
     start_ssh_session_at, status, take_next_app_control_request, terminal_ensure, terminal_read,
     terminal_resize, terminal_write, toggle_preview_block as daemon_toggle_preview_block,
 };
+use yggui::{
+    ChromePalette, DragDropPlacement, DragDropTarget, DragGhostCard, DragGhostPalette,
+    HoveredChromeControl as HoveredControl, RailHeader, RailScrollBody, RailSectionTitle,
+    SideRailShell, THEME_EDITOR_SWATCHES, TOAST_CSS, TitlebarChrome, ToastCard,
+    ToastItem as ToastNotification, ToastPalette, ToastTone as NotificationTone, ToastViewport,
+    TreeDropPlacement as WorkspaceDropPlacement, TreeReorderItem, TreeReorderPlanItem,
+    WindowControlsStrip, append_theme_stop, build_tree_reorder_plan, clamp_theme_spec,
+    default_theme_editor_spec, dominant_accent, gradient_css, preview_surface_css,
+    resolve_drag_drop_target as resolve_tree_drag_drop_target, resolve_tree_drop_placement,
+    search_input_style, shell_tint, tree_parent_path, tree_path_contains,
+    valid_drop_target as valid_tree_drop_target,
+};
+use yggui_contract::{UiTheme, YgguiThemeSpec};
 
 static BOOTSTRAP: OnceCell<ShellBootstrap> = OnceCell::new();
 static PASSIVE_COPY_SUSPENDED: AtomicBool = AtomicBool::new(false);
@@ -26182,8 +26174,7 @@ mod tests {
             session_id: Some("paper-a-id".to_string()),
             session_cwd: Some("/home/pi/gh/notes".to_string()),
         };
-        let destination =
-            crate::drag_tree::ordered_tree_child_path("/home/pi/gh/notes", &item.full_path, 0);
+        let destination = yggui::ordered_tree_child_path("/home/pi/gh/notes", &item.full_path, 0);
 
         assert_eq!(destination, "/home/pi/gh/notes/0000-paper-a");
     }

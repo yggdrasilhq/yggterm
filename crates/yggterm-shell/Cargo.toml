@@ -1,27 +1,32 @@
 [package]
-name = "yggui"
+name = "yggterm-shell"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license = "Apache-2.0"
 
 [dependencies]
-yggui-contract = { path = "../yggui-contract" }
 anyhow.workspace = true
 base64 = "0.22"
 cairo-rs = { version = "0.18.5", features = ["png"] }
 dioxus = { version = "0.7.3", features = ["desktop"] }
 dioxus-desktop = "0.7.3"
 include_dir = "0.7"
+keyboard-types = "0.7"
+libc = "0.2"
 once_cell = "1"
 png = "0.17"
-libc = "0.2"
 serde.workspace = true
 serde_json.workspace = true
-tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tao = "0.34.6"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tracing.workspace = true
+yggterm-core = { path = "../yggterm-core" }
+yggterm-platform = { path = "../yggterm-platform" }
+yggterm-server = { path = "../yggterm-server" }
+yggui = { path = "../yggui" }
+yggui-contract = { path = "../yggui-contract" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 webkit2gtk = { version = "=2.0.1", features = ["v2_38"] }

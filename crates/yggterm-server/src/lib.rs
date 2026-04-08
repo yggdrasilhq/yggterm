@@ -67,12 +67,13 @@ use tracing::warn;
 use uuid::Uuid;
 use yggterm_core::{
     PerfSpan, SessionNode, SessionNodeKind, SessionStore, SessionTitleStore, TranscriptRole,
-    UiTheme, WorkspaceDocument, WorkspaceDocumentKind, append_trace_event, event_trace_path,
+    WorkspaceDocument, WorkspaceDocumentKind, append_trace_event, event_trace_path,
     follow_trace_lines, generation_context_from_messages, looks_like_generated_fallback_title,
     looks_like_low_signal_generated_copy, read_codex_session_identity_fields,
     read_codex_transcript_messages, read_codex_transcript_messages_limited, read_trace_tail,
     resolve_yggterm_home,
 };
+use yggui_contract::UiTheme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkspaceViewMode {
@@ -7294,10 +7295,7 @@ impl Drop for BridgeStdinRawModeGuard {
 }
 
 #[cfg(unix)]
-fn enable_bridge_stdin_raw_mode(
-    path: &str,
-    session_id: &str,
-) -> Option<BridgeStdinRawModeGuard> {
+fn enable_bridge_stdin_raw_mode(path: &str, session_id: &str) -> Option<BridgeStdinRawModeGuard> {
     let fd = libc::STDIN_FILENO;
     let mut payload = json!({
         "path": path,
