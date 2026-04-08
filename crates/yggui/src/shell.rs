@@ -238,6 +238,8 @@ struct ShellState {
     terminal_image_paste_ms: HashMap<String, u64>,
     terminal_attach_in_flight: HashSet<String>,
     terminal_resume_ready_paths: HashSet<String>,
+    retained_terminal_session_paths: HashSet<String>,
+    terminal_mount_epochs: HashMap<String, u64>,
     active_terminal_host_id: Option<String>,
     terminal_open_attempts: HashMap<String, TerminalOpenAttempt>,
     terminal_open_attempt_order: VecDeque<String>,
@@ -384,6 +386,8 @@ struct RenderSnapshot {
     active_session: Option<ManagedSessionView>,
     active_session_path: Option<String>,
     active_view_mode: WorkspaceViewMode,
+    retained_terminal_sessions: Vec<ManagedSessionView>,
+    terminal_mount_epochs: HashMap<String, u64>,
     ssh_targets: Vec<SshConnectTarget>,
     live_sessions: Vec<ManagedSessionView>,
     total_leaf_sessions: usize,
@@ -980,6 +984,8 @@ impl ShellState {
             terminal_image_paste_ms: HashMap::new(),
             terminal_attach_in_flight: HashSet::new(),
             terminal_resume_ready_paths: HashSet::new(),
+            retained_terminal_session_paths: HashSet::new(),
+            terminal_mount_epochs: HashMap::new(),
             active_terminal_host_id: None,
             terminal_open_attempts: HashMap::new(),
             terminal_open_attempt_order: VecDeque::new(),
@@ -1145,6 +1151,25 @@ impl ShellState {
                     })
                     .cloned()
             });
+        let mut retained_terminal_sessions = live_sessions
+            .iter()
+            .filter(|session| {
+                self.retained_terminal_session_paths
+                    .contains(&session.session_path)
+                    && self.server.session_supports_terminal(&session.session_path)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(active_session) = active_session.clone()
+            && self
+                .server
+                .session_supports_terminal(&active_session.session_path)
+            && !retained_terminal_sessions
+                .iter()
+                .any(|session| session.session_path == active_session.session_path)
+        {
+            retained_terminal_sessions.push(active_session);
+        }
         let active_title = active_session
             .as_ref()
             .and_then(|session| resolved_session_title(self, session))
@@ -1246,6 +1271,8 @@ impl ShellState {
             active_session,
             active_session_path,
             active_view_mode,
+            retained_terminal_sessions,
+            terminal_mount_epochs: self.terminal_mount_epochs.clone(),
             ssh_targets: self.server.ssh_targets().to_vec(),
             live_sessions,
             total_leaf_sessions: self.browser.total_sessions(),
@@ -2139,24 +2166,59 @@ impl ShellState {
         self.sync_browser_settings();
     }
 
+    fn retain_terminal_session_path(&mut self, session_path: &str) -> u64 {
+        self.retained_terminal_session_paths
+            .insert(session_path.to_string());
+        let epoch = self
+            .terminal_mount_epochs
+            .entry(session_path.to_string())
+            .or_insert(1);
+        *epoch
+    }
+
+    fn bump_terminal_mount_epoch_for_session(&mut self, session_path: &str) -> u64 {
+        self.retained_terminal_session_paths
+            .insert(session_path.to_string());
+        let epoch = self
+            .terminal_mount_epochs
+            .entry(session_path.to_string())
+            .or_insert(0);
+        *epoch = epoch.saturating_add(1).max(1);
+        *epoch
+    }
+
+    fn terminal_session_host_id(&self, session_path: &str) -> Option<String> {
+        self.terminal_mount_epochs
+            .get(session_path)
+            .copied()
+            .map(|epoch| terminal_mount_host_id(session_path, epoch))
+    }
+
+    fn terminal_session_is_retained_live(&self, session_path: &str) -> bool {
+        self.retained_terminal_session_paths.contains(session_path)
+            && self.terminal_resume_ready_paths.contains(session_path)
+            && !self.terminal_attach_in_flight.contains(session_path)
+    }
+
     fn prune_terminal_attach_in_flight(&mut self) {
-        let Some(active_path) = self.server.active_session_path().map(str::to_owned) else {
-            self.terminal_attach_in_flight.clear();
-            self.active_terminal_host_id = None;
-            return;
-        };
+        let mut keep_paths = self.retained_terminal_session_paths.clone();
+        if let Some(active_path) = self.server.active_session_path() {
+            keep_paths.insert(active_path.to_string());
+        }
         self.terminal_attach_in_flight
-            .retain(|session_path| session_path == &active_path);
+            .retain(|session_path| keep_paths.contains(session_path));
     }
 
     fn prune_terminal_resume_ready_paths(&mut self) {
-        let Some(active_path) = self.server.active_session_path().map(str::to_owned) else {
-            self.terminal_resume_ready_paths.clear();
-            self.active_terminal_host_id = None;
-            return;
-        };
+        let mut keep_paths = self.retained_terminal_session_paths.clone();
+        if let Some(active_path) = self.server.active_session_path() {
+            keep_paths.insert(active_path.to_string());
+        }
         self.terminal_resume_ready_paths
-            .retain(|session_path| session_path == &active_path);
+            .retain(|session_path| keep_paths.contains(session_path));
+        if self.server.active_session_path().is_none() {
+            self.active_terminal_host_id = None;
+        }
     }
 
     fn ensure_active_session_expanded(&mut self) {
@@ -5697,6 +5759,7 @@ fn spawn_focus_live_session_row_retry(
     retry_budget: u8,
 ) {
     let mut open_request_id = 0_u64;
+    let mut retained_live_terminal = false;
     let request_meta = YggRequestMeta::interactive(
         format!("focus-live-{}", current_millis()),
         "focus_live",
@@ -5718,8 +5781,13 @@ fn spawn_focus_live_session_row_retry(
     state.with_mut(|shell| {
         shell.latest_open_request_id = shell.latest_open_request_id.saturating_add(1);
         open_request_id = shell.latest_open_request_id;
+        retained_live_terminal = mode == WorkspaceViewMode::Terminal
+            && shell.terminal_session_is_retained_live(&row.full_path);
         shell.browser.select_path(row.full_path.clone());
         shell.context_menu_row = None;
+        if mode == WorkspaceViewMode::Terminal {
+            shell.retain_terminal_session_path(&row.full_path);
+        }
         shell.sync_browser_settings();
         shell.ensure_active_session_visible();
         shell.begin_surface_request(
@@ -5732,15 +5800,17 @@ fn spawn_focus_live_session_row_retry(
         WorkspaceViewMode::Terminal => "terminal",
         WorkspaceViewMode::Rendered => row_surface_noun(&row, false),
     };
-    spawn_loading_notice(
-        state,
-        request_meta.clone(),
-        format!("Loading Remote {surface_noun}"),
-        format!(
-            "{} is still opening on the remote machine. Yggterm will keep the workspace responsive while the {} catches up.",
-            row.label, surface_noun
-        ),
-    );
+    if !retained_live_terminal {
+        spawn_loading_notice(
+            state,
+            request_meta.clone(),
+            format!("Loading Remote {surface_noun}"),
+            format!(
+                "{} is still opening on the remote machine. Yggterm will keep the workspace responsive while the {} catches up.",
+                row.label, surface_noun
+            ),
+        );
+    }
     let endpoint = state.read().bootstrap.server_endpoint.clone();
     let request_id = request_meta.request_id.clone();
     let pending_label = format!("focusing {}", row.label);
@@ -5835,6 +5905,7 @@ fn spawn_open_session_row_with_mode_retry(
 ) {
     let requested_terminal = prefer_terminal;
     let prefer_terminal = prefer_terminal && state.with(|shell| row_supports_terminal(shell, &row));
+    let mut retained_live_terminal = false;
     let staged_remote_preview_session = (!prefer_terminal)
         .then(|| parse_remote_scanned_session_path(&row.full_path).map(|_| row.full_path.clone()))
         .flatten();
@@ -5904,13 +5975,17 @@ fn spawn_open_session_row_with_mode_retry(
         shell.context_menu_row = None;
         shell.sync_browser_settings();
         if prefer_terminal {
-            shell.terminal_resume_ready_paths.remove(&row.full_path);
-            terminal_open_attempt_id = Some(shell.begin_terminal_open_attempt(
-                &row.full_path,
-                &request_meta.request_id,
-                open_request_id,
-                "open_row",
-            ));
+            retained_live_terminal = shell.terminal_session_is_retained_live(&row.full_path);
+            shell.retain_terminal_session_path(&row.full_path);
+            if !retained_live_terminal {
+                shell.terminal_resume_ready_paths.remove(&row.full_path);
+                terminal_open_attempt_id = Some(shell.begin_terminal_open_attempt(
+                    &row.full_path,
+                    &request_meta.request_id,
+                    open_request_id,
+                    "open_row",
+                ));
+            }
         }
         shell.begin_surface_request(
             request_meta.clone(),
@@ -5919,15 +5994,17 @@ fn spawn_open_session_row_with_mode_retry(
         );
     });
     let surface_noun = row_surface_noun(&row, prefer_terminal);
-    spawn_loading_notice(
-        state,
-        request_meta.clone(),
-        format!("Loading Remote {surface_noun}"),
-        format!(
-            "{} is still opening on the remote machine. Yggterm will keep the workspace responsive while the {} catches up.",
-            row.label, surface_noun
-        ),
-    );
+    if !retained_live_terminal {
+        spawn_loading_notice(
+            state,
+            request_meta.clone(),
+            format!("Loading Remote {surface_noun}"),
+            format!(
+                "{} is still opening on the remote machine. Yggterm will keep the workspace responsive while the {} catches up.",
+                row.label, surface_noun
+            ),
+        );
+    }
     let endpoint = state.read().bootstrap.server_endpoint.clone();
     let pending_label = format!("opening {}", row.label);
     spawn(async move {
@@ -14844,7 +14921,6 @@ fn app() -> Element {
     let window_spawn_probe_started = use_hook(current_millis);
     let window_spawn_traced = use_hook(|| Arc::new(AtomicBool::new(false))).clone();
     let mut window_epoch = use_signal(|| 0_u64);
-    let mut terminal_mount_epoch = use_signal(|| 0_u64);
     let async_render_epoch = use_signal(|| 0_u64);
     let mut last_open_recovery_path = use_signal(|| None::<String>);
     let mut last_terminal_mount_key = use_signal(|| None::<String>);
@@ -15329,18 +15405,36 @@ fn app() -> Element {
             return;
         }
         last_terminal_mount_key.set(Some(mount_key.clone()));
-        let next_mount_epoch = terminal_mount_epoch().saturating_add(1);
-        terminal_mount_epoch.set(next_mount_epoch);
+        let (mount_epoch, reused_live_host) = state.with_mut(|shell| {
+            let reused_live_host = shell.terminal_session_is_retained_live(&active_session_path);
+            let mount_epoch = if reused_live_host {
+                shell.retain_terminal_session_path(&active_session_path)
+            } else {
+                shell.bump_terminal_mount_epoch_for_session(&active_session_path)
+            };
+            if shell.server.active_view_mode() == WorkspaceViewMode::Terminal
+                && shell.server.active_session_path() == Some(active_session_path.as_str())
+            {
+                shell.active_terminal_host_id =
+                    shell.terminal_session_host_id(&active_session_path);
+            }
+            (mount_epoch, reused_live_host)
+        });
         append_trace_event(
             &trace_home_for_mount_epoch,
             "ui",
             "terminal_mount",
-            "mount_epoch_bump",
+            if reused_live_host {
+                "mount_epoch_reused"
+            } else {
+                "mount_epoch_bump"
+            },
             json!({
                 "session_path": active_session_path,
                 "latest_open_request_id": latest_open_request_id,
                 "mount_key": mount_key,
-                "mount_epoch": next_mount_epoch,
+                "mount_epoch": mount_epoch,
+                "reused_live_host": reused_live_host,
             }),
         );
     });
@@ -16184,7 +16278,6 @@ fn app() -> Element {
                         MainSurface {
                             state,
                             snapshot: main_snapshot,
-                            terminal_mount_epoch: *terminal_mount_epoch.read(),
                             on_expand_preview: move || spawn_surface_snapshot_action(
                             state,
                             "expanding preview".to_string(),
@@ -17848,7 +17941,6 @@ fn BellIcon() -> Element {
 fn MainSurface(
     state: Signal<ShellState>,
     snapshot: SharedSnapshot,
-    terminal_mount_epoch: u64,
     on_expand_preview: EventHandler<()>,
     on_collapse_preview: EventHandler<()>,
     on_toggle_preview_block: EventHandler<usize>,
@@ -17858,10 +17950,11 @@ fn MainSurface(
 ) -> Element {
     let active_session_path = snapshot.active_session_path.clone();
     let surface_key = format!(
-        "{}:{terminal_mount_epoch}",
+        "{}:{}",
         active_session_path
             .clone()
-            .unwrap_or_else(|| "__empty__".to_string())
+            .unwrap_or_else(|| "__empty__".to_string()),
+        snapshot.active_view_mode as u8,
     );
     let mut preview_scroll_top = use_signal(|| 0.0_f64);
     let mut preview_scroll_client_height = use_signal(|| PREVIEW_MIN_VIEWPORT_HEIGHT_PX);
@@ -17963,6 +18056,7 @@ fn MainSurface(
             "none"
         },
     );
+    let retained_terminal_sessions = snapshot.retained_terminal_sessions.clone();
     let body = if let Some(session) = snapshot.active_session.clone() {
         if session.kind == SessionKind::Document {
             rsx! {
@@ -18015,15 +18109,36 @@ fn MainSurface(
                     style: "position:relative; flex:1; min-width:0; min-height:0; overflow:hidden;",
                     div {
                         style: "{terminal_layer_style}",
-                        div {
-                            key: "{session.session_path}:{snapshot.settings.terminal_font_size}:{terminal_mount_epoch}",
-                            style: "display:flex; flex-direction:column; flex:1 1 auto; min-width:0; min-height:0; width:100%;",
-                            TerminalCanvas {
-                                key: "{terminal_instance_key(&session.session_path, snapshot.settings.terminal_font_size)}:{terminal_mount_epoch}",
-                                session: session.clone(),
-                                snapshot: snapshot.clone(),
-                                state,
-                                mount_epoch: terminal_mount_epoch,
+                        for terminal_session in retained_terminal_sessions.iter().cloned() {
+                            {
+                                let session_mount_epoch = snapshot
+                                    .terminal_mount_epochs
+                                    .get(&terminal_session.session_path)
+                                    .copied()
+                                    .unwrap_or(1);
+                                let terminal_visible = terminal_surface_visible
+                                    && snapshot.active_session_path.as_deref()
+                                        == Some(terminal_session.session_path.as_str());
+                                let terminal_canvas_style = format!(
+                                    "position:absolute; inset:0; display:flex; flex-direction:column; flex:1 1 auto; min-width:0; min-height:0; width:100%; \
+                                     opacity:{}; visibility:{}; pointer-events:{};",
+                                    if terminal_visible { "1" } else { "0" },
+                                    if terminal_visible { "visible" } else { "hidden" },
+                                    if terminal_visible { "auto" } else { "none" },
+                                );
+                                rsx! {
+                                    div {
+                                        key: "{terminal_session.session_path}:{snapshot.settings.terminal_font_size}:{session_mount_epoch}",
+                                        style: "{terminal_canvas_style}",
+                                        TerminalCanvas {
+                                            key: "{terminal_instance_key(&terminal_session.session_path, snapshot.settings.terminal_font_size)}:{session_mount_epoch}",
+                                            session: terminal_session.clone(),
+                                            snapshot: snapshot.clone(),
+                                            state,
+                                            mount_epoch: session_mount_epoch,
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -19051,6 +19166,8 @@ fn terminal_resume_context_fallback(
 
 fn terminal_session_still_active(shell: &ShellState, session_path: &str, host_id: &str) -> bool {
     shell.terminal_attach_in_flight.contains(session_path)
+        || (shell.retained_terminal_session_paths.contains(session_path)
+            && shell.terminal_session_host_id(session_path).as_deref() == Some(host_id))
         || (shell.server.active_session_path() == Some(session_path)
             && shell.active_terminal_host_id.as_deref() == Some(host_id))
 }
@@ -19964,6 +20081,7 @@ fn TerminalCanvas(
     let mut apply_host_theme_identity = use_signal(String::new);
     let mut apply_session_theme_identity = use_signal(String::new);
     let mut active_terminal_host_identity = use_signal(String::new);
+    let mut input_enable_identity = use_signal(String::new);
     let resume_overlay_excerpt = terminal_resume_overlay_excerpt()
         .or_else(|| initial_resume_overlay_excerpt.clone())
         .or(snapshot_resume_overlay_excerpt);
@@ -20140,6 +20258,29 @@ fn TerminalCanvas(
             });
         }
     }
+    let host_should_accept_input = snapshot.active_view_mode == WorkspaceViewMode::Terminal
+        && snapshot.active_session_path.as_deref() == Some(session_path.as_str())
+        && (!is_remote_resume_session
+            || state
+                .read()
+                .terminal_resume_ready_paths
+                .contains(&session_path))
+        && !state
+            .read()
+            .terminal_attach_in_flight
+            .contains(&session_path);
+    let input_enable_key = format!("input:{host_id}:{host_should_accept_input}");
+    if *input_enable_identity.read() != input_enable_key {
+        input_enable_identity.set(input_enable_key);
+        let host_id = host_id.clone();
+        spawn(async move {
+            let _ = document::eval(&terminal_set_input_enabled_script(
+                &host_id,
+                host_should_accept_input,
+                host_should_accept_input,
+            ));
+        });
+    }
     if !wait_for_mount_epoch_sync && *bootstrap_task_identity.read() != bootstrap_identity {
         bootstrap_task_identity.set(bootstrap_identity.clone());
         let mount_identity = mount_identity.clone();
@@ -20205,7 +20346,7 @@ fn TerminalCanvas(
                         "startup_restore",
                     );
                 }
-                shell.terminal_attach_in_flight.clear();
+                shell.retain_terminal_session_path(&session_path);
                 shell.terminal_attach_in_flight.insert(session_path.clone());
                 if shell.server.active_view_mode() == WorkspaceViewMode::Terminal
                     && shell.server.active_session_path() == Some(session_path.as_str())
@@ -23542,6 +23683,27 @@ fn terminal_apply_script(host_id: &str, theme: &TerminalTheme) -> String {
         bright_magenta = bright_magenta,
         bright_cyan = bright_cyan,
         bright_white = bright_white,
+    )
+}
+
+fn terminal_set_input_enabled_script(host_id: &str, enabled: bool, focus: bool) -> String {
+    format!(
+        r#"
+        (() => {{
+          const hostId = {host_id:?};
+          const registry = window.__yggtermXtermHosts || {{}};
+          const entry = registry[hostId];
+          if (!entry || typeof entry.setInputEnabled !== "function") {{
+            return;
+          }}
+          try {{
+            entry.setInputEnabled({enabled}, {focus});
+          }} catch (_error) {{}}
+        }})();
+        "#,
+        host_id = host_id,
+        enabled = if enabled { "true" } else { "false" },
+        focus = if focus { "true" } else { "false" },
     )
 }
 
