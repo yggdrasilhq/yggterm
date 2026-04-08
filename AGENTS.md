@@ -75,6 +75,7 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 - For every release build, always generate the `.deb` package (and checksum) in `dist/` so laptop-side GUI/runtime testing can be done outside the SSH server environment.
 - For incremental development releases, always bump the patch version (e.g. `0.1.0` -> `0.1.1`) before packaging.
 - For GUI fixes, do not mark the issue as solved until it has been self-tested live on a different X11 display. Use `x11automation` when helpful for reliable interaction/click targeting. If only build/test validation was done, state that explicitly instead of claiming the GUI issue is fixed.
+- When touching terminal UX, resume behavior, or app-control truth, update and run the local checklist at `.todos/terminal-ux-smoketests.md` before handover. Keep the checklist untracked, but keep this reference in sync.
 
 ## Licensing
 
@@ -113,4 +114,5 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 - When touching observability, app-control, proof capture, or terminal-resume verification, always update the relevant skill file in the same change so the debugging workflow stays current.
 - Terminal geometry classification in app-control is part of observability. If `active_terminal_surface.geometry_problem` changes semantics, update the relevant skill files in the same commit.
 - GUI singleton and focus behavior are part of observability too. If client-instance registration, app-control window metadata, or display/session matching changes, update the relevant skill files in the same commit.
+- Terminal input gating is part of observability too. If `terminal_hosts[].input_enabled` or the startup recovery input/focus contract changes, update the relevant skill files in the same commit.
 - Visual changelog assets should be deterministic, reusable, and cleanly composited, with restrained motion and annotation rather than flashy effects.
