@@ -10,12 +10,12 @@ mod terminal;
 
 pub use app_control::{
     AppControlCommand, AppControlDragCommand, AppControlDragPlacement, AppControlPreviewLayout,
-    AppControlRequest, AppControlResponse, AppControlViewMode, ScreenshotTarget,
-    app_control_captures_dir, app_control_requests_dir, app_control_requests_pending,
-    app_control_responses_dir, complete_app_control_request, current_millis,
-    default_recording_output_path, default_screenshot_output_path, enqueue_app_control_request,
-    enqueue_screen_recording_request, enqueue_screenshot_request, take_next_app_control_request,
-    wait_for_app_control_response,
+    AppControlRequest, AppControlResponse, AppControlViewMode, ProbeTerminalViewportInputMode,
+    ScreenshotTarget, app_control_captures_dir, app_control_requests_dir,
+    app_control_requests_pending, app_control_responses_dir, complete_app_control_request,
+    current_millis, default_recording_output_path, default_screenshot_output_path,
+    enqueue_app_control_request, enqueue_screen_recording_request, enqueue_screenshot_request,
+    take_next_app_control_request, wait_for_app_control_response,
 };
 pub use attach::{AttachMetadata, run_attach};
 pub use codex_cli::{ManagedCliTool, ManagedCliToolStatus};
@@ -3442,7 +3442,8 @@ fn remote_resume_picker_shell_command(
 }
 
 fn remote_persistent_resume_shell_command(session_id: &str, cwd: Option<&str>) -> String {
-    persistent_agent_resume_command(SessionKind::Codex, cwd, session_id)
+    let base = persistent_agent_resume_command(SessionKind::Codex, cwd, session_id);
+    format!("stty raw -echo </dev/tty >/dev/tty 2>/dev/null || true; {base}")
 }
 
 fn resolve_remote_codex_home() -> std::path::PathBuf {
@@ -8391,20 +8392,393 @@ pub fn run_app_control_send_terminal_input(
     Ok(())
 }
 
-pub fn run_app_control_probe_terminal_viewport_input(
+fn app_control_state_response(home: &Path, timeout_ms: u64) -> anyhow::Result<AppControlResponse> {
+    request_app_control(home, AppControlCommand::DescribeState, timeout_ms)
+}
+
+fn app_control_state_data<'a>(response: &'a AppControlResponse) -> anyhow::Result<&'a Value> {
+    response
+        .data
+        .as_ref()
+        .context("app-control state response did not include data")
+}
+
+fn json_f64(value: Option<&Value>) -> Option<f64> {
+    value.and_then(Value::as_f64)
+}
+
+fn json_u32(value: Option<&Value>) -> Option<u32> {
+    value
+        .and_then(Value::as_u64)
+        .and_then(|number| u32::try_from(number).ok())
+}
+
+#[derive(Debug, Clone)]
+struct X11TerminalProbeContext {
+    pid: u32,
+    display: String,
+    xauthority: Option<String>,
+    session_path: String,
+    x: i32,
+    y: i32,
+    before: Value,
+}
+
+fn terminal_host_probe_snapshot(host: &Value) -> Value {
+    json!({
+        "session_path": host.get("session_path").and_then(Value::as_str).unwrap_or_default(),
+        "input_enabled": host.get("input_enabled").and_then(Value::as_bool),
+        "helper_textarea_focused": host.get("helper_textarea_has_focus").and_then(Value::as_bool)
+            .or_else(|| host.get("helper_textarea_focused").and_then(Value::as_bool)),
+        "host_has_active_element": host.get("host_has_active_element").and_then(Value::as_bool),
+        "viewport_y": host.get("viewport_y").and_then(Value::as_i64),
+        "base_y": host.get("base_y").and_then(Value::as_i64),
+        "cols": host.get("cols").and_then(Value::as_u64),
+        "rows": host.get("rows").and_then(Value::as_u64),
+        "text_tail": host.get("text_sample").and_then(Value::as_str).unwrap_or_default(),
+    })
+}
+
+fn active_terminal_probe_context(
+    home: &Path,
+    session_path: &str,
+    timeout_ms: u64,
+) -> anyhow::Result<X11TerminalProbeContext> {
+    let response = app_control_state_response(home, timeout_ms)?;
+    let data = app_control_state_data(&response)?;
+    let active_session_path = data
+        .get("active_session_path")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if active_session_path != session_path {
+        anyhow::bail!(
+            "active session path mismatch for terminal probe: expected {session_path}, got {active_session_path}"
+        );
+    }
+    let display = data
+        .get("client_instance")
+        .and_then(|value| value.get("display"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .context("active GUI client is not on an X11 display")?
+        .to_string();
+    let xauthority = data
+        .get("client_instance")
+        .and_then(|value| value.get("xauthority"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let viewport = data
+        .get("viewport")
+        .context("app-control state missing viewport payload")?;
+    let host = viewport
+        .get("terminal_hosts")
+        .and_then(Value::as_array)
+        .and_then(|hosts| {
+            hosts.iter().find(|host| {
+                host.get("session_path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    == session_path
+            })
+        })
+        .context("active terminal host missing for terminal probe")?;
+    let rect = host
+        .get("viewport_rect")
+        .or_else(|| host.get("host_rect"))
+        .context("terminal probe host does not expose viewport geometry")?;
+    let left = json_f64(rect.get("left")).context("terminal viewport left missing")?;
+    let top = json_f64(rect.get("top")).context("terminal viewport top missing")?;
+    let width = json_f64(rect.get("width")).context("terminal viewport width missing")?;
+    let height = json_f64(rect.get("height")).context("terminal viewport height missing")?;
+    let pid = json_u32(
+        data.get("client_instance")
+            .and_then(|value| value.get("pid")),
+    )
+    .unwrap_or(response.handled_by_pid);
+    let x = (left + width.min(120.0) * 0.2).round() as i32;
+    let y = (top + height - 24.0).round() as i32;
+    Ok(X11TerminalProbeContext {
+        pid,
+        display,
+        xauthority,
+        session_path: session_path.to_string(),
+        x,
+        y,
+        before: terminal_host_probe_snapshot(host),
+    })
+}
+
+fn xdotool_command(display: &str, xauthority: Option<&str>) -> Command {
+    let mut command = Command::new("xdotool");
+    command.env("DISPLAY", display);
+    if let Some(xauthority) = xauthority {
+        command.env("XAUTHORITY", xauthority);
+    }
+    command
+}
+
+fn run_xdotool_checked(
+    display: &str,
+    xauthority: Option<&str>,
+    args: &[&str],
+) -> anyhow::Result<String> {
+    let output = xdotool_command(display, xauthority)
+        .args(args)
+        .output()
+        .with_context(|| format!("running xdotool {}", args.join(" ")))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "xdotool {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn run_xdotool_checked_owned(
+    display: &str,
+    xauthority: Option<&str>,
+    args: &[String],
+) -> anyhow::Result<String> {
+    let rendered = args.join(" ");
+    let output = xdotool_command(display, xauthority)
+        .args(args)
+        .output()
+        .with_context(|| format!("running xdotool {rendered}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "xdotool {rendered} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn visible_window_id_for_pid(
+    display: &str,
+    xauthority: Option<&str>,
+    pid: u32,
+) -> anyhow::Result<String> {
+    let output = run_xdotool_checked(
+        display,
+        xauthority,
+        &[
+            "search",
+            "--onlyvisible",
+            "--pid",
+            &pid.to_string(),
+            "--name",
+            "Yggterm",
+        ],
+    )?;
+    output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .last()
+        .map(str::to_string)
+        .context("no visible Yggterm X11 window found for terminal probe")
+}
+
+fn focus_terminal_viewport_via_x11(context: &X11TerminalProbeContext) -> anyhow::Result<String> {
+    let window_id =
+        visible_window_id_for_pid(&context.display, context.xauthority.as_deref(), context.pid)?;
+    let _ = run_xdotool_checked_owned(
+        &context.display,
+        context.xauthority.as_deref(),
+        &[
+            "windowfocus".to_string(),
+            "--sync".to_string(),
+            window_id.clone(),
+        ],
+    );
+    run_xdotool_checked_owned(
+        &context.display,
+        context.xauthority.as_deref(),
+        &[
+            "mousemove".to_string(),
+            "--sync".to_string(),
+            "--window".to_string(),
+            window_id.clone(),
+            context.x.to_string(),
+            context.y.to_string(),
+            "click".to_string(),
+            "1".to_string(),
+        ],
+    )?;
+    std::thread::sleep(Duration::from_millis(80));
+    Ok(window_id)
+}
+
+fn x11_keyboard_probe_input(
     session_path: &str,
     data: &str,
     press_enter: bool,
     press_tab: bool,
     press_ctrl_c: bool,
     timeout_ms: u64,
+) -> anyhow::Result<Value> {
+    let home = resolve_yggterm_home()?;
+    let before_context = active_terminal_probe_context(&home, session_path, timeout_ms)?;
+    let window_id = focus_terminal_viewport_via_x11(&before_context)?;
+    let mut command = vec![
+        "mousemove".to_string(),
+        "--sync".to_string(),
+        "--window".to_string(),
+        window_id.clone(),
+        before_context.x.to_string(),
+        before_context.y.to_string(),
+        "click".to_string(),
+        "1".to_string(),
+    ];
+    if press_ctrl_c {
+        command.extend([
+            "key".to_string(),
+            "--window".to_string(),
+            window_id.clone(),
+            "--clearmodifiers".to_string(),
+            "ctrl+c".to_string(),
+        ]);
+    }
+    if !data.is_empty() {
+        command.extend([
+            "type".to_string(),
+            "--window".to_string(),
+            window_id.clone(),
+            "--clearmodifiers".to_string(),
+            "--delay".to_string(),
+            "1".to_string(),
+            "--".to_string(),
+            data.to_string(),
+        ]);
+    }
+    if press_tab {
+        command.extend([
+            "key".to_string(),
+            "--window".to_string(),
+            window_id.clone(),
+            "--clearmodifiers".to_string(),
+            "Tab".to_string(),
+        ]);
+    }
+    if press_enter {
+        command.extend([
+            "key".to_string(),
+            "--window".to_string(),
+            window_id.clone(),
+            "--clearmodifiers".to_string(),
+            "Return".to_string(),
+        ]);
+    }
+    run_xdotool_checked_owned(
+        &before_context.display,
+        before_context.xauthority.as_deref(),
+        &command,
+    )?;
+    std::thread::sleep(Duration::from_millis(if press_enter { 220 } else { 120 }));
+    let after_context = active_terminal_probe_context(&home, session_path, timeout_ms)?;
+    Ok(json!({
+        "accepted": true,
+        "session_path": session_path,
+        "host_id": null,
+        "before": before_context.before,
+        "after": after_context.before,
+        "typed_text": data,
+        "press_enter": press_enter,
+        "press_tab": press_tab,
+        "press_ctrl_c": press_ctrl_c,
+        "mode": "keyboard",
+        "used_core_trigger": false,
+        "used_term_input": false,
+        "keyboard_backend": "xdotool",
+        "window_id": window_id,
+        "click_point": {
+            "x": before_context.x,
+            "y": before_context.y,
+        },
+    }))
+}
+
+fn x11_scroll_probe_input(
+    session_path: &str,
+    lines: i32,
+    timeout_ms: u64,
+) -> anyhow::Result<Value> {
+    let home = resolve_yggterm_home()?;
+    let before_context = active_terminal_probe_context(&home, session_path, timeout_ms)?;
+    let window_id = focus_terminal_viewport_via_x11(&before_context)?;
+    if lines != 0 {
+        let button = if lines > 0 { "5" } else { "4" };
+        let repeat = lines.unsigned_abs().max(1).to_string();
+        run_xdotool_checked_owned(
+            &before_context.display,
+            before_context.xauthority.as_deref(),
+            &[
+                "mousemove".to_string(),
+                "--sync".to_string(),
+                "--window".to_string(),
+                window_id.clone(),
+                before_context.x.to_string(),
+                before_context.y.to_string(),
+                "click".to_string(),
+                "1".to_string(),
+                "click".to_string(),
+                "--repeat".to_string(),
+                repeat,
+                "--delay".to_string(),
+                "25".to_string(),
+                button.to_string(),
+            ],
+        )?;
+        std::thread::sleep(Duration::from_millis(120));
+    }
+    let after_context = active_terminal_probe_context(&home, session_path, timeout_ms)?;
+    Ok(json!({
+        "accepted": true,
+        "session_path": session_path,
+        "before": before_context.before,
+        "after": after_context.before,
+        "lines": lines,
+        "mode": "keyboard",
+        "keyboard_backend": "xdotool",
+        "window_id": window_id,
+        "click_point": {
+            "x": before_context.x,
+            "y": before_context.y,
+        },
+    }))
+}
+
+pub fn run_app_control_probe_terminal_viewport_input(
+    session_path: &str,
+    data: &str,
+    mode: ProbeTerminalViewportInputMode,
+    press_enter: bool,
+    press_tab: bool,
+    press_ctrl_c: bool,
+    timeout_ms: u64,
 ) -> anyhow::Result<()> {
+    if mode == ProbeTerminalViewportInputMode::Keyboard {
+        let response = x11_keyboard_probe_input(
+            session_path,
+            data,
+            press_enter,
+            press_tab,
+            press_ctrl_c,
+            timeout_ms,
+        )?;
+        write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+        return Ok(());
+    }
     let home = resolve_yggterm_home()?;
     let response = request_app_control(
         &home,
         AppControlCommand::ProbeTerminalViewportInput {
             session_path: session_path.to_string(),
             data: data.to_string(),
+            mode,
             press_enter,
             press_tab,
             press_ctrl_c,
@@ -8420,15 +8794,7 @@ pub fn run_app_control_probe_terminal_viewport_scroll(
     lines: i32,
     timeout_ms: u64,
 ) -> anyhow::Result<()> {
-    let home = resolve_yggterm_home()?;
-    let response = request_app_control(
-        &home,
-        AppControlCommand::ProbeTerminalViewportScroll {
-            session_path: session_path.to_string(),
-            lines,
-        },
-        timeout_ms,
-    )?;
+    let response = x11_scroll_probe_input(session_path, lines, timeout_ms)?;
     write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
     Ok(())
 }
