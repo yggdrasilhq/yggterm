@@ -1084,8 +1084,7 @@ impl ShellState {
         let mut retained_terminal_sessions = live_sessions
             .iter()
             .filter(|session| {
-                self.retained_terminal_session_paths
-                    .contains(&session.session_path)
+                self.terminal_session_is_retained_live(&session.session_path)
                     && self.server.session_supports_terminal(&session.session_path)
             })
             .cloned()
@@ -1954,6 +1953,7 @@ impl ShellState {
                 self.mark_active_remote_preview_dirty_if_needed();
                 self.prune_terminal_attach_in_flight();
                 self.prune_terminal_resume_ready_paths();
+                self.prune_terminal_resume_notifications();
                 self.hydrate_generated_copy_from_remote_cache();
                 self.needs_initial_server_sync = false;
                 self.next_background_copy_scan_after_ms = 0;
@@ -2002,6 +2002,7 @@ impl ShellState {
                 self.mark_active_remote_preview_dirty_if_needed();
                 self.prune_terminal_attach_in_flight();
                 self.prune_terminal_resume_ready_paths();
+                self.prune_terminal_resume_notifications();
                 self.hydrate_generated_copy_from_remote_cache();
                 self.finish_busy_request_for(request_id);
                 self.needs_initial_server_sync = false;
@@ -2107,8 +2108,6 @@ impl ShellState {
     }
 
     fn bump_terminal_mount_epoch_for_session(&mut self, session_path: &str) -> u64 {
-        self.retained_terminal_session_paths
-            .insert(session_path.to_string());
         let epoch = self
             .terminal_mount_epochs
             .entry(session_path.to_string())
@@ -2128,6 +2127,27 @@ impl ShellState {
         self.retained_terminal_session_paths.contains(session_path)
             && self.terminal_resume_ready_paths.contains(session_path)
             && !self.terminal_attach_in_flight.contains(session_path)
+    }
+
+    fn clear_terminal_resume_notifications_except(&mut self, keep_session_path: Option<&str>) {
+        self.notifications.retain(|notification| {
+            let Some(job_key) = notification.job_key.as_deref() else {
+                return true;
+            };
+            let Some(session_path) = terminal_resume_notification_session_path(job_key) else {
+                return true;
+            };
+            keep_session_path.is_some_and(|keep_path| keep_path == session_path)
+        });
+    }
+
+    fn prune_terminal_resume_notifications(&mut self) {
+        let keep_session_path = if self.server.active_view_mode() == WorkspaceViewMode::Terminal {
+            self.server.active_session_path().map(str::to_string)
+        } else {
+            None
+        };
+        self.clear_terminal_resume_notifications_except(keep_session_path.as_deref());
     }
 
     fn prune_terminal_attach_in_flight(&mut self) {
@@ -3502,6 +3522,19 @@ fn terminal_resume_notification_job_key(session_path: &str) -> String {
     format!("terminal-resume:{session_path}")
 }
 
+fn terminal_resume_notification_session_path(job_key: &str) -> Option<&str> {
+    job_key.strip_prefix("terminal-resume:")
+}
+
+fn terminal_resume_notification_should_be_visible(
+    active_view_mode: WorkspaceViewMode,
+    active_session_path: Option<&str>,
+    session_path: &str,
+) -> bool {
+    active_view_mode == WorkspaceViewMode::Terminal
+        && active_session_path.is_some_and(|active_path| active_path == session_path)
+}
+
 fn upsert_terminal_resume_notification(
     state: Signal<ShellState>,
     session_path: &str,
@@ -3509,15 +3542,31 @@ fn upsert_terminal_resume_notification(
     title: impl Into<String>,
     message: impl Into<String>,
 ) {
-    safe_upsert_job_notification(
-        state,
-        terminal_resume_notification_job_key(session_path),
-        tone,
-        title,
-        message,
-        None,
-        false,
-    );
+    let session_path = session_path.to_string();
+    let title = title.into();
+    let message = message.into();
+    let job_key = terminal_resume_notification_job_key(&session_path);
+    let job_key_for_write = job_key.clone();
+    let title_for_write = title.clone();
+    let message_for_write = message.clone();
+    let _ = safe_shell_mut(state, "upsert_terminal_resume_notification", move |shell| {
+        if !terminal_resume_notification_should_be_visible(
+            shell.server.active_view_mode(),
+            shell.server.active_session_path(),
+            &session_path,
+        ) {
+            shell.clear_job_notification(&job_key_for_write);
+            return;
+        }
+        shell.upsert_job_notification(
+            job_key_for_write,
+            tone,
+            title_for_write,
+            message_for_write,
+            None,
+            false,
+        );
+    });
 }
 
 fn clear_terminal_resume_notification(state: Signal<ShellState>, session_path: &str) {
@@ -5715,9 +5764,12 @@ fn spawn_focus_live_session_row_retry(
             && shell.terminal_session_is_retained_live(&row.full_path);
         shell.browser.select_path(row.full_path.clone());
         shell.context_menu_row = None;
-        if mode == WorkspaceViewMode::Terminal {
+        if mode == WorkspaceViewMode::Terminal && retained_live_terminal {
             shell.retain_terminal_session_path(&row.full_path);
         }
+        shell.clear_terminal_resume_notifications_except(
+            (mode == WorkspaceViewMode::Terminal).then_some(row.full_path.as_str()),
+        );
         shell.sync_browser_settings();
         shell.ensure_active_session_visible();
         shell.begin_surface_request(
@@ -5906,7 +5958,9 @@ fn spawn_open_session_row_with_mode_retry(
         shell.sync_browser_settings();
         if prefer_terminal {
             retained_live_terminal = shell.terminal_session_is_retained_live(&row.full_path);
-            shell.retain_terminal_session_path(&row.full_path);
+            shell.terminal_attach_in_flight.retain(|session_path| {
+                shell.retained_terminal_session_paths.contains(session_path)
+            });
             if !retained_live_terminal {
                 shell.terminal_resume_ready_paths.remove(&row.full_path);
                 terminal_open_attempt_id = Some(shell.begin_terminal_open_attempt(
@@ -5915,8 +5969,13 @@ fn spawn_open_session_row_with_mode_retry(
                     open_request_id,
                     "open_row",
                 ));
+            } else {
+                shell.retain_terminal_session_path(&row.full_path);
             }
         }
+        shell.clear_terminal_resume_notifications_except(
+            prefer_terminal.then_some(row.full_path.as_str()),
+        );
         shell.begin_surface_request(
             request_meta.clone(),
             format!("opening {}", row.label),
@@ -19096,7 +19155,7 @@ fn terminal_resume_context_fallback(
 
 fn terminal_session_still_active(shell: &ShellState, session_path: &str, host_id: &str) -> bool {
     shell.terminal_attach_in_flight.contains(session_path)
-        || (shell.retained_terminal_session_paths.contains(session_path)
+        || (shell.terminal_session_is_retained_live(session_path)
             && shell.terminal_session_host_id(session_path).as_deref() == Some(host_id))
         || (shell.server.active_session_path() == Some(session_path)
             && shell.active_terminal_host_id.as_deref() == Some(host_id))
@@ -20276,7 +20335,9 @@ fn TerminalCanvas(
                         "startup_restore",
                     );
                 }
-                shell.retain_terminal_session_path(&session_path);
+                shell
+                    .terminal_attach_in_flight
+                    .retain(|candidate| shell.retained_terminal_session_paths.contains(candidate));
                 shell.terminal_attach_in_flight.insert(session_path.clone());
                 if shell.server.active_view_mode() == WorkspaceViewMode::Terminal
                     && shell.server.active_session_path() == Some(session_path.as_str())
@@ -20596,6 +20657,7 @@ fn TerminalCanvas(
                                             state,
                                             "terminal_attach_visual_reveal",
                                             |shell| {
+                                                shell.retain_terminal_session_path(&session_path);
                                                 shell.terminal_resume_ready_paths
                                                     .insert(session_path.clone());
                                                 shell.terminal_attach_in_flight
@@ -21432,6 +21494,7 @@ fn TerminalCanvas(
                                         state,
                                         "terminal_attach_read_error_after_attach",
                                         |shell| {
+                                            shell.retain_terminal_session_path(&session_path);
                                             shell.terminal_attach_in_flight.remove(&session_path);
                                             shell.terminal_resume_ready_paths
                                                 .insert(session_path.clone());
@@ -23224,6 +23287,8 @@ fn terminal_eval_script(
                 }} catch (_error) {{}}
                 return;
             }}
+            scrollLiveCursorIntoView();
+            requestVisiblePaint();
             if (focus) {{
                 focusTerminal();
             }}
@@ -29460,6 +29525,38 @@ Updated at   Branch  Conversation\n\
         assert!(!terminal_chunk_requires_terminal_emulator_forward(
             "Shared connection to 192.168.0.133 closed.\n"
         ));
+    }
+
+    #[test]
+    fn terminal_resume_notification_visibility_requires_active_terminal_session() {
+        assert!(terminal_resume_notification_should_be_visible(
+            WorkspaceViewMode::Terminal,
+            Some("remote-session://oc/test"),
+            "remote-session://oc/test",
+        ));
+        assert!(!terminal_resume_notification_should_be_visible(
+            WorkspaceViewMode::Rendered,
+            Some("remote-session://oc/test"),
+            "remote-session://oc/test",
+        ));
+        assert!(!terminal_resume_notification_should_be_visible(
+            WorkspaceViewMode::Terminal,
+            Some("remote-session://jojo/test"),
+            "remote-session://oc/test",
+        ));
+    }
+
+    #[test]
+    fn terminal_resume_notification_job_key_round_trips_session_path() {
+        let job_key = terminal_resume_notification_job_key("remote-session://oc/test");
+        assert_eq!(
+            terminal_resume_notification_session_path(&job_key),
+            Some("remote-session://oc/test")
+        );
+        assert_eq!(
+            terminal_resume_notification_session_path("loading:123"),
+            None
+        );
     }
 }
 
