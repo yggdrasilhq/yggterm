@@ -475,7 +475,7 @@ impl PtySessionRuntime {
         let chunks = self.chunks.lock().expect("pty chunk lock poisoned");
         let next_cursor = self.seq.load(Ordering::SeqCst);
         let mut chunks = if cursor == 0 {
-            select_initial_attach_chunks(&chunks)
+            select_initial_attach_chunks_for_launch(&chunks, &self.launch_command)
         } else {
             chunks
                 .iter()
@@ -735,6 +735,16 @@ fn select_initial_attach_chunks(chunks: &VecDeque<TerminalChunk>) -> Vec<Termina
     }
     trim_initial_attach_low_signal_suffix(&mut selected);
     selected
+}
+
+fn select_initial_attach_chunks_for_launch(
+    chunks: &VecDeque<TerminalChunk>,
+    launch_command: &str,
+) -> Vec<TerminalChunk> {
+    if launch_command_looks_like_remote_resume_attach(launch_command) {
+        return chunks.iter().cloned().collect();
+    }
+    select_initial_attach_chunks(chunks)
 }
 
 fn trim_initial_attach_low_signal_suffix(selected: &mut Vec<TerminalChunk>) {
@@ -1096,6 +1106,26 @@ mod tests {
         assert!(!launch_command_looks_like_remote_resume_attach(
             "bash -lc 'ls'"
         ));
+    }
+
+    #[test]
+    fn initial_remote_resume_attach_keeps_full_retained_stream() {
+        let mut chunks = VecDeque::new();
+        for seq in 1..=260 {
+            chunks.push_back(TerminalChunk {
+                seq,
+                data: format!("chunk-{seq}\n"),
+            });
+        }
+
+        let selected = select_initial_attach_chunks_for_launch(
+            &chunks,
+            "ssh -tt oc 'exec $HOME/.yggterm/bin/yggterm '\\''server'\\'' '\\''remote'\\'' '\\''resume-codex'\\'' '\\''test-session'\\'' '\\''/home/pi'\\'''",
+        );
+
+        assert_eq!(selected.len(), chunks.len());
+        assert_eq!(selected.first().map(|chunk| chunk.seq), Some(1));
+        assert_eq!(selected.last().map(|chunk| chunk.seq), Some(260));
     }
 
     #[test]

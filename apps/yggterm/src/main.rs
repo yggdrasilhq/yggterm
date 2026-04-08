@@ -17,15 +17,15 @@ use yggterm_server::{
     cleanup_legacy_daemons, default_endpoint, detect_ghostty_host, ping,
     run_app_control_create_terminal, run_app_control_describe_rows, run_app_control_describe_state,
     run_app_control_drag, run_app_control_dump_state, run_app_control_focus_window,
-    run_app_control_list_clients, run_app_control_open_path, run_app_control_remove_session,
-    run_app_control_probe_terminal_viewport_input,
-    run_app_control_probe_terminal_viewport_scroll,
-    run_app_control_scroll_preview, run_app_control_send_terminal_input,
-    run_app_control_set_fullscreen, run_app_control_set_main_zoom,
-    run_app_control_set_maximized, run_app_control_set_preview_layout,
-    run_app_control_set_row_expanded, run_app_control_set_search, run_attach, run_daemon,
-    run_screenrecord_capture, run_screenshot_capture, run_trace_bundle, run_trace_follow,
-    run_trace_tail, shutdown, start_local_session, status, try_run_remote_server_command,
+    run_app_control_list_clients, run_app_control_open_path,
+    run_app_control_probe_terminal_viewport_input, run_app_control_probe_terminal_viewport_scroll,
+    run_app_control_remove_session, run_app_control_scroll_preview,
+    run_app_control_send_terminal_input, run_app_control_set_fullscreen,
+    run_app_control_set_main_zoom, run_app_control_set_maximized,
+    run_app_control_set_preview_layout, run_app_control_set_row_expanded,
+    run_app_control_set_search, run_attach, run_daemon, run_screenrecord_capture,
+    run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown,
+    start_local_session, status, try_run_remote_server_command,
 };
 use yggterm_shell::{ShellBootstrap, launch_shell, warm_daemon_start};
 use yggui_contract::UiTheme;
@@ -261,7 +261,10 @@ fn main() -> Result<()> {
                         run_app_control_scroll_preview(top_px, ratio, timeout_ms)
                     }
                     "layout" => {
-                        let layout = cli_positional_args(&args, 4).into_iter().next().unwrap_or("chat");
+                        let layout = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
+                            .unwrap_or("chat");
                         let layout = match layout {
                             "chat" => AppControlPreviewLayout::Chat,
                             "graph" | "overview" => AppControlPreviewLayout::Graph,
@@ -325,7 +328,10 @@ fn main() -> Result<()> {
                 }
             }
             "fullscreen" => {
-                let action = cli_positional_args(&args, 3).into_iter().next().unwrap_or("toggle");
+                let action = cli_positional_args(&args, 3)
+                    .into_iter()
+                    .next()
+                    .unwrap_or("toggle");
                 let enabled = match action {
                     "on" | "true" | "1" => true,
                     "off" | "false" | "0" => false,
@@ -349,7 +355,10 @@ fn main() -> Result<()> {
                 run_app_control_set_fullscreen(enabled, timeout_ms)
             }
             "maximize" | "maximized" => {
-                let action = cli_positional_args(&args, 3).into_iter().next().unwrap_or("toggle");
+                let action = cli_positional_args(&args, 3)
+                    .into_iter()
+                    .next()
+                    .unwrap_or("toggle");
                 let enabled = match action {
                     "on" | "true" | "1" => true,
                     "off" | "false" | "0" => false,
@@ -468,11 +477,13 @@ fn main() -> Result<()> {
                             .context("missing --data for server app terminal probe-type")?;
                         let press_enter = args.iter().any(|arg| arg == "--enter");
                         let press_tab = args.iter().any(|arg| arg == "--tab");
+                        let press_ctrl_c = args.iter().any(|arg| arg == "--ctrl-c");
                         run_app_control_probe_terminal_viewport_input(
                             session_path,
                             data,
                             press_enter,
                             press_tab,
+                            press_ctrl_c,
                             timeout_ms,
                         )
                     }
@@ -480,9 +491,7 @@ fn main() -> Result<()> {
                         let session_path = cli_positional_args(&args, 4)
                             .into_iter()
                             .next()
-                            .context(
-                                "missing session path for server app terminal probe-scroll",
-                            )?;
+                            .context("missing session path for server app terminal probe-scroll")?;
                         let lines = args
                             .windows(2)
                             .find_map(|window| {
