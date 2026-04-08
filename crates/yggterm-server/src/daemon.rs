@@ -382,50 +382,21 @@ impl DaemonRuntime {
     }
 
     fn ensure_terminal_for_path(&mut self, path: &str) -> Result<Option<String>> {
-        if path.starts_with("remote-session://") {
-            if let Ok(home) = crate::resolve_yggterm_home() {
-                append_trace_event(
-                    &home,
-                    "daemon",
-                    "terminal_ensure",
-                    "remote_saved_session_preflight_begin",
-                    serde_json::json!({
-                        "path": path,
-                    }),
-                );
-            }
-            match self.server.validate_remote_saved_session_for_path(path) {
-                Ok(()) => {
-                    if let Ok(home) = crate::resolve_yggterm_home() {
-                        append_trace_event(
-                            &home,
-                            "daemon",
-                            "terminal_ensure",
-                            "remote_saved_session_preflight_end",
-                            serde_json::json!({
-                                "path": path,
-                            }),
-                        );
-                    }
-                }
-                Err(error) => {
-                    if let Ok(home) = crate::resolve_yggterm_home() {
-                        append_trace_event(
-                            &home,
-                            "daemon",
-                            "terminal_ensure",
-                            "remote_saved_session_preflight_error",
-                            serde_json::json!({
-                                "path": path,
-                                "error": error.to_string(),
-                            }),
-                        );
-                    }
-                    return Err(error);
-                }
-            }
-        }
         let prepare_message = self.server.ensure_managed_cli_for_session_path(path)?;
+        if path.starts_with("remote-session://")
+            && let Ok(home) = crate::resolve_yggterm_home()
+        {
+            append_trace_event(
+                &home,
+                "daemon",
+                "terminal_ensure",
+                "remote_saved_session_preflight_elided_runtime_launch",
+                serde_json::json!({
+                    "path": path,
+                    "reason": "resume_command_owns_missing_session_failure",
+                }),
+            );
+        }
         if let Ok(home) = crate::resolve_yggterm_home() {
             append_trace_event(
                 &home,
@@ -533,6 +504,7 @@ impl DaemonRuntime {
             let spec_matches =
                 self.terminals
                     .session_matches_spec(path, &launch_command, cwd.as_deref());
+            let needs_restart = !still_running || stale_remote_attach || !spec_matches;
             if let Ok(home) = crate::resolve_yggterm_home() {
                 append_trace_event(
                     &home,
@@ -549,10 +521,14 @@ impl DaemonRuntime {
                         "runtime_saved_session_mismatch": runtime_saved_session_mismatch,
                         "spec_matches": spec_matches,
                         "remote_resume_path": path.starts_with("remote-session://"),
+                        "needs_restart": needs_restart,
                     }),
                 );
             }
-            if !still_running || stale_remote_attach || !spec_matches {
+            if !needs_restart {
+                return Ok(prepare_message);
+            }
+            if needs_restart {
                 let stop_command = self.server.terminal_stop_command(path);
                 if let Ok(home) = crate::resolve_yggterm_home() {
                     append_trace_event(
