@@ -6,7 +6,8 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use yggterm_core::{ENV_YGGTERM_HOME, PerfSpan, UiTheme, append_trace_event, resolve_yggterm_home};
+use yggterm_core::{ENV_YGGTERM_HOME, PerfSpan, append_trace_event, resolve_yggterm_home};
+use yggui_contract::UiTheme;
 
 const MANAGED_NPM_DIRNAME: &str = "npm";
 const MANAGED_NPM_CACHE_DIRNAME: &str = "npm-cache";

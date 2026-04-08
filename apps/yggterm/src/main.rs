@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use yggterm_core::{
     ENV_YGGTERM_DIRECT_INSTALL_ROOT, ENV_YGGTERM_HOME, InstallContext, PerfSpan, SessionNode,
-    SessionNodeKind, SessionStore, UiTheme, UpdatePolicy, WorkspaceDocumentKind,
-    WorkspaceGroupKind, append_trace_event, check_for_update, current_version,
-    detect_install_context, install_release_update, refresh_desktop_integration,
+    SessionNodeKind, SessionStore, UpdatePolicy, WorkspaceDocumentKind, WorkspaceGroupKind,
+    append_trace_event, check_for_update, current_version, detect_install_context,
+    install_release_update, refresh_desktop_integration,
 };
 use yggterm_server::{
     AppControlPreviewLayout, AppControlViewMode, PersistedDaemonState, SessionKind, YggtermServer,
@@ -25,6 +25,8 @@ use yggterm_server::{
     run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown,
     start_local_session, status, try_run_remote_server_command,
 };
+use yggterm_shell::{ShellBootstrap, launch_shell, warm_daemon_start};
+use yggui_contract::UiTheme;
 
 const DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT_ENV: &str =
     "YGGTERM_DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT";
@@ -536,7 +538,7 @@ fn main() -> Result<()> {
     let cleanup_span = PerfSpan::start(&startup_home, "startup", "cleanup_legacy_daemons");
     let _ = cleanup_legacy_daemons(&endpoint, &current_exe);
     cleanup_span.finish(serde_json::json!({}));
-    yggui::warm_daemon_start(endpoint.clone(), Some(startup_home.clone()));
+    warm_daemon_start(endpoint.clone(), Some(startup_home.clone()));
     let linux_window_profile = detect_linux_window_profile();
     append_trace_event(
         &startup_home,
@@ -584,7 +586,7 @@ fn main() -> Result<()> {
         }),
     );
 
-    let launch_result = yggui::launch_shell(yggui::ShellBootstrap {
+    let launch_result = launch_shell(ShellBootstrap {
         tree,
         browser_tree,
         browser_tree_loaded,
