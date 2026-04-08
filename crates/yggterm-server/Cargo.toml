@@ -20,6 +20,7 @@ time.workspace = true
 tracing.workspace = true
 rusqlite = { version = "0.34", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
+yggui-contract = { path = "../yggui-contract" }
 yggterm-core = { path = "../yggterm-core" }
 yggterm-ghostty-bridge = { path = "../yggterm-ghostty-bridge", default-features = false }
 yggterm-gtk-glue = { path = "../yggterm-gtk-glue" }

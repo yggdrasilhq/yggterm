@@ -1,4 +1,4 @@
-use yggterm_core::{UiTheme, YgguiThemeColorStop, YgguiThemeSpec};
+use yggui_contract::{UiTheme, YgguiThemeColorStop, YgguiThemeSpec};
 
 pub const MAX_THEME_STOPS: usize = 6;
 pub const THEME_EDITOR_SWATCHES: [&str; 8] = [
