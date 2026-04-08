@@ -800,7 +800,18 @@ fn terminal_host_geometry_problem_for_app_control(host: &Value) -> Option<&'stat
         .and_then(|value| value.get("top"))
         .and_then(Value::as_f64)
         .unwrap_or(host_top);
-    if host_width >= 240.0 && screen_width >= 200.0 && (host_width - screen_width).abs() > 12.0 {
+    let width_delta = (host_width - screen_width).abs();
+    let compensated_screen_width_gap = host_width >= 240.0
+        && screen_width >= 200.0
+        && helpers_width >= 200.0
+        && viewport_width >= 200.0
+        && width_delta > 12.0
+        && width_delta <= 18.0
+        && (screen_width - helpers_width).abs() <= 4.0
+        && (host_width - viewport_width).abs() <= 4.0;
+    if host_width >= 240.0 && screen_width >= 200.0 && width_delta > 12.0
+        && !compensated_screen_width_gap
+    {
         return Some("active terminal host geometry does not match the xterm screen width");
     }
     if host_outer_width >= 240.0 && host_width >= 200.0 && (host_outer_width - host_width) > 28.0 {
@@ -811,6 +822,7 @@ fn terminal_host_geometry_problem_for_app_control(host: &Value) -> Option<&'stat
     if screen_width >= 200.0
         && viewport_width >= 200.0
         && (screen_width - viewport_width).abs() > 12.0
+        && !compensated_screen_width_gap
     {
         return Some("active terminal host geometry does not match the xterm viewport width");
     }
@@ -832,7 +844,11 @@ fn terminal_host_geometry_problem_for_app_control(host: &Value) -> Option<&'stat
     {
         return Some("active terminal host geometry does not match the xterm viewport height");
     }
-    if helpers_width >= 200.0 && host_width >= 200.0 && (helpers_width - host_width).abs() > 12.0 {
+    if helpers_width >= 200.0
+        && host_width >= 200.0
+        && (helpers_width - host_width).abs() > 12.0
+        && !compensated_screen_width_gap
+    {
         return Some("active terminal host helper layer is wider than the visible host");
     }
     if helpers_height >= 120.0
