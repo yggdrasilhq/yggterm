@@ -59,6 +59,17 @@ fn linux_kde_wayland_safe_mode() -> bool {
     }
 }
 
+fn linux_x11_safe_mode() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        env::var_os("DISPLAY").is_some() && env::var_os("WAYLAND_DISPLAY").is_none()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 #[component]
 pub fn ToastViewport(
     items: Vec<ToastItem>,
@@ -78,6 +89,9 @@ pub fn ToastViewport(
         })
         .take(max_visible)
         .collect::<Vec<_>>();
+    if visible.is_empty() {
+        return rsx! {};
+    }
     let stack_key = visible
         .iter()
         .map(|notification| notification.id.to_string())
@@ -119,7 +133,7 @@ pub fn ToastCard(
     on_clear: EventHandler<MouseEvent>,
 ) -> Element {
     let (tone_accent, tone_fg) = toast_tone_colors(item.tone, palette);
-    let blur_style = if linux_kde_wayland_safe_mode() {
+    let blur_style = if linux_kde_wayland_safe_mode() || linux_x11_safe_mode() {
         "backdrop-filter:none; -webkit-backdrop-filter:none;"
     } else {
         "backdrop-filter: blur(28px) saturate(165%); -webkit-backdrop-filter: blur(28px) saturate(165%);"

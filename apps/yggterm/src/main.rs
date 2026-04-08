@@ -13,15 +13,15 @@ use yggterm_core::{
     install_release_update, refresh_desktop_integration,
 };
 use yggterm_server::{
-    AppControlPreviewLayout, AppControlViewMode, PersistedDaemonState, SessionKind, YggtermServer,
-    cleanup_legacy_daemons, default_endpoint, detect_ghostty_host, ping,
-    run_app_control_create_terminal, run_app_control_describe_rows, run_app_control_describe_state,
-    run_app_control_drag, run_app_control_dump_state, run_app_control_focus_window,
-    run_app_control_list_clients, run_app_control_open_path,
-    run_app_control_probe_terminal_viewport_input, run_app_control_probe_terminal_viewport_scroll,
-    run_app_control_remove_session, run_app_control_scroll_preview,
-    run_app_control_send_terminal_input, run_app_control_set_fullscreen,
-    run_app_control_set_main_zoom, run_app_control_set_maximized,
+    AppControlPreviewLayout, AppControlViewMode, PersistedDaemonState,
+    ProbeTerminalViewportInputMode, SessionKind, YggtermServer, cleanup_legacy_daemons,
+    default_endpoint, detect_ghostty_host, ping, run_app_control_create_terminal,
+    run_app_control_describe_rows, run_app_control_describe_state, run_app_control_drag,
+    run_app_control_dump_state, run_app_control_focus_window, run_app_control_list_clients,
+    run_app_control_open_path, run_app_control_probe_terminal_viewport_input,
+    run_app_control_probe_terminal_viewport_scroll, run_app_control_remove_session,
+    run_app_control_scroll_preview, run_app_control_send_terminal_input,
+    run_app_control_set_fullscreen, run_app_control_set_main_zoom, run_app_control_set_maximized,
     run_app_control_set_preview_layout, run_app_control_set_row_expanded,
     run_app_control_set_search, run_attach, run_daemon, run_screenrecord_capture,
     run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown,
@@ -478,9 +478,24 @@ fn main() -> Result<()> {
                         let press_enter = args.iter().any(|arg| arg == "--enter");
                         let press_tab = args.iter().any(|arg| arg == "--tab");
                         let press_ctrl_c = args.iter().any(|arg| arg == "--ctrl-c");
+                        let mode = args
+                            .windows(2)
+                            .find_map(|window| {
+                                if window[0] != "--mode" {
+                                    return None;
+                                }
+                                match window[1].as_str() {
+                                    "auto" => Some(ProbeTerminalViewportInputMode::Auto),
+                                    "keyboard" => Some(ProbeTerminalViewportInputMode::Keyboard),
+                                    "xterm" => Some(ProbeTerminalViewportInputMode::Xterm),
+                                    _ => None,
+                                }
+                            })
+                            .unwrap_or(ProbeTerminalViewportInputMode::Auto);
                         run_app_control_probe_terminal_viewport_input(
                             session_path,
                             data,
+                            mode,
                             press_enter,
                             press_tab,
                             press_ctrl_c,
