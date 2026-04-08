@@ -1012,7 +1012,12 @@ pub(crate) fn terminal_chunk_has_generic_codex_idle_footer(data: &str) -> bool {
             && (lower.contains("implement {feature}")
                 || lower.contains("explain this codebase")
                 || lower.contains("find and fix a bug")
-                || lower.contains("resume a previous session"))
+                || lower.contains("resume a previous session")
+                || lower.contains("write tests for")
+                || lower.contains("@filename")
+                || lower.contains("review my changes")
+                || lower.contains("summarize recent commits")
+                || lower.contains("create a pr"))
     });
     let mentions_model_footer = (normalized.contains("gpt-5")
         || normalized.contains("gpt-4")
