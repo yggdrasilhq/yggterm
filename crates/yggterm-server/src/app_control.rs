@@ -32,6 +32,15 @@ pub enum AppControlPreviewLayout {
     Graph,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeTerminalViewportInputMode {
+    #[default]
+    Auto,
+    Keyboard,
+    Xterm,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AppControlDragPlacement {
@@ -108,6 +117,8 @@ pub enum AppControlCommand {
     ProbeTerminalViewportInput {
         session_path: String,
         data: String,
+        #[serde(default)]
+        mode: ProbeTerminalViewportInputMode,
         #[serde(default)]
         press_enter: bool,
         #[serde(default)]
