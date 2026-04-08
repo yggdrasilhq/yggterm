@@ -7427,11 +7427,8 @@ pub fn request_app_control(
     command: AppControlCommand,
     timeout_ms: u64,
 ) -> anyhow::Result<AppControlResponse> {
-    let request = enqueue_app_control_request(
-        home,
-        command,
-        ensure_live_app_control_pid(home, timeout_ms)?,
-    )?;
+    let preferred_pid = ensure_live_app_control_pid(home, timeout_ms, &command)?;
+    let request = enqueue_app_control_request(home, command, preferred_pid)?;
     wait_for_app_control_response(
         home,
         &request.request_id,
@@ -7477,11 +7474,18 @@ fn capture_embedded_app_screenshot(
     output_path: Option<std::path::PathBuf>,
     timeout_ms: u64,
 ) -> anyhow::Result<AppControlResponse> {
+    let command = AppControlCommand::CaptureScreenshot {
+        target,
+        output_path: output_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+    };
     let request = enqueue_screenshot_request(
         home,
         target,
         output_path,
-        ensure_live_app_control_pid(home, timeout_ms)?,
+        ensure_live_app_control_pid(home, timeout_ms, &command)?,
     )?;
     wait_for_app_control_response(
         home,
@@ -7496,11 +7500,18 @@ fn capture_embedded_app_screen_recording(
     duration_secs: u64,
     timeout_ms: u64,
 ) -> anyhow::Result<AppControlResponse> {
+    let command = AppControlCommand::CaptureScreenRecording {
+        output_path: output_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+        duration_secs,
+    };
     let request = enqueue_screen_recording_request(
         home,
         output_path,
         duration_secs,
-        ensure_live_app_control_pid(home, timeout_ms)?,
+        ensure_live_app_control_pid(home, timeout_ms, &command)?,
     )?;
     wait_for_app_control_response(
         home,
@@ -7511,10 +7522,20 @@ fn capture_embedded_app_screen_recording(
     )
 }
 
-#[derive(Debug, Deserialize)]
-struct ClientInstanceRecord {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientInstanceRecord {
     pid: u32,
     started_at_ms: u128,
+    #[serde(default)]
+    pub display: Option<String>,
+    #[serde(default)]
+    pub wayland_display: Option<String>,
+    #[serde(default)]
+    pub xdg_session_id: Option<String>,
+    #[serde(default)]
+    pub xdg_runtime_dir: Option<String>,
+    #[serde(default)]
+    pub xauthority: Option<String>,
 }
 
 fn client_instance_scope(endpoint: &ServerEndpoint) -> String {
@@ -7555,26 +7576,89 @@ fn process_is_alive(pid: u32) -> bool {
     pid != 0
 }
 
-fn preferred_app_control_pid(home: &Path) -> Option<u32> {
-    let endpoint = default_endpoint(home);
-    let mut newest: Option<ClientInstanceRecord> = None;
-    for record in active_client_instance_records(home, &endpoint).ok()? {
-        if newest
-            .as_ref()
-            .is_none_or(|candidate| record.started_at_ms > candidate.started_at_ms)
-        {
-            newest = Some(record);
-        }
-    }
-    newest.map(|record| record.pid)
+fn app_control_command_requires_explicit_target(command: &AppControlCommand) -> bool {
+    !matches!(
+        command,
+        AppControlCommand::DescribeState
+            | AppControlCommand::DescribeRows
+            | AppControlCommand::CaptureScreenshot { .. }
+            | AppControlCommand::CaptureScreenRecording { .. }
+    )
 }
 
-fn ensure_live_app_control_pid(home: &Path, timeout_ms: u64) -> anyhow::Result<Option<u32>> {
+fn requested_app_control_pid_from_env() -> Option<u32> {
+    std::env::var("YGGTERM_APP_CONTROL_PID")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|pid| *pid > 0)
+}
+
+fn format_available_client_instances(records: &[ClientInstanceRecord]) -> String {
+    if records.is_empty() {
+        return "none".to_string();
+    }
+    records
+        .iter()
+        .map(|record| {
+            format!(
+                "pid={} display={} wayland={} session={}",
+                record.pid,
+                record.display.as_deref().unwrap_or("-"),
+                record.wayland_display.as_deref().unwrap_or("-"),
+                record.xdg_session_id.as_deref().unwrap_or("-"),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn choose_app_control_pid(
+    records: &[ClientInstanceRecord],
+    requested_pid: Option<u32>,
+    require_explicit_target: bool,
+) -> anyhow::Result<Option<u32>> {
+    if let Some(requested_pid) = requested_pid {
+        return records
+            .iter()
+            .find(|record| record.pid == requested_pid)
+            .map(|record| Some(record.pid))
+            .with_context(|| {
+                format!(
+                    "no live Yggterm GUI client with pid {requested_pid}; available: {}",
+                    format_available_client_instances(records)
+                )
+            });
+    }
+    match records {
+        [] => Ok(None),
+        [record] => Ok(Some(record.pid)),
+        many if require_explicit_target => anyhow::bail!(
+            "multiple live Yggterm GUI clients are registered; rerun with --pid <pid> or set YGGTERM_APP_CONTROL_PID. available: {}",
+            format_available_client_instances(many)
+        ),
+        many => Ok(many
+            .iter()
+            .max_by_key(|record| record.started_at_ms)
+            .map(|record| record.pid)),
+    }
+}
+
+fn ensure_live_app_control_pid(
+    home: &Path,
+    timeout_ms: u64,
+    command: &AppControlCommand,
+) -> anyhow::Result<Option<u32>> {
     let wait_budget_ms = timeout_ms.min(750).max(100);
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_budget_ms);
+    let endpoint = default_endpoint(home);
+    let requested_pid = requested_app_control_pid_from_env();
+    let require_explicit_target = app_control_command_requires_explicit_target(command);
     loop {
-        if let Some(pid) = preferred_app_control_pid(home) {
-            return Ok(Some(pid));
+        let records = active_client_instance_records(home, &endpoint)?;
+        match choose_app_control_pid(&records, requested_pid, require_explicit_target) {
+            Ok(Some(pid)) => return Ok(Some(pid)),
+            Ok(None) => {}
+            Err(error) => return Err(error),
         }
         if std::time::Instant::now() >= deadline {
             anyhow::bail!("no live Yggterm GUI client is registered for app control");
@@ -7615,6 +7699,18 @@ pub(crate) fn active_client_instance_records(
         }
     }
     Ok(active)
+}
+
+pub fn run_app_control_list_clients() -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let endpoint = default_endpoint(&home);
+    let mut records = active_client_instance_records(&home, &endpoint)?;
+    records.sort_by_key(|record| std::cmp::Reverse(record.started_at_ms));
+    write_stdout_payload(&serde_json::to_string_pretty(&json!({
+        "count": records.len(),
+        "clients": records,
+    }))?)?;
+    Ok(())
 }
 
 fn capture_trace_screenshot(home: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -10323,6 +10419,7 @@ fn short_session_id(session_id: &str) -> String {
 mod tests {
     use super::app_control_open_path_ready;
     use super::{
+        ClientInstanceRecord,
         GhosttyHostSupport, GhosttyTerminalHostMode, ManagedSessionView, PersistedDaemonState,
         PersistedLiveSession, PersistedStoredSession, PreviewTone, REMOTE_OUTPUT_SENTINEL,
         RemoteCommandCacheEntry, RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot,
@@ -10346,7 +10443,7 @@ mod tests {
         remote_snapshot_looks_like_shell_prompt, remote_ssh_launch_command,
         remote_tmux_session_name, sanitize_recent_context_payload, screen_attach_shell_command,
         screen_resume_or_spawn_shell_command, session_metadata_value, should_fallback_to_python,
-        stored_session_launch_command, strip_remote_payload_noise,
+        stored_session_launch_command, strip_remote_payload_noise, choose_app_control_pid,
         synthesize_remote_scanned_session_view, upsert_session_metadata,
     };
     use crate::SessionRenderedSection;
@@ -12687,5 +12784,43 @@ mod tests {
         assert!(exists);
         assert!(!missing);
         Ok(())
+    }
+
+    fn client_record(pid: u32, started_at_ms: u128, display: &str) -> ClientInstanceRecord {
+        ClientInstanceRecord {
+            pid,
+            started_at_ms,
+            display: Some(display.to_string()),
+            wayland_display: None,
+            xdg_session_id: Some("test-session".to_string()),
+            xdg_runtime_dir: None,
+            xauthority: None,
+        }
+    }
+
+    #[test]
+    fn choose_app_control_pid_prefers_requested_pid() {
+        let records = vec![client_record(100, 10, ":10"), client_record(200, 20, ":11")];
+        let pid =
+            choose_app_control_pid(&records, Some(100), true).expect("requested pid should exist");
+        assert_eq!(pid, Some(100));
+    }
+
+    #[test]
+    fn choose_app_control_pid_requires_explicit_target_for_mutations() {
+        let records = vec![client_record(100, 10, ":10"), client_record(200, 20, ":11")];
+        let error = choose_app_control_pid(&records, None, true).expect_err("should refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("multiple live Yggterm GUI clients are registered")
+        );
+    }
+
+    #[test]
+    fn choose_app_control_pid_uses_newest_for_read_only_commands() {
+        let records = vec![client_record(100, 10, ":10"), client_record(200, 20, ":11")];
+        let pid = choose_app_control_pid(&records, None, false).expect("should choose newest");
+        assert_eq!(pid, Some(200));
     }
 }
