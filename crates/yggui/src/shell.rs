@@ -23126,6 +23126,15 @@ fn terminal_eval_script(
             const screen = host.querySelector('.xterm-screen');
             const viewport = host.querySelector('.xterm-viewport');
             const rowsLayer = host.querySelector('.xterm-rows');
+            const viewportScrollbarGutter = viewport
+                ? Math.max(0, Math.round((viewport.offsetWidth || 0) - (viewport.clientWidth || 0)))
+                : 0;
+            const compensatedWidth = viewportScrollbarGutter > 0
+                ? `calc(100% + ${{viewportScrollbarGutter}}px)`
+                : '100%';
+            const compensatedMarginRight = viewportScrollbarGutter > 0
+                ? `-${{viewportScrollbarGutter}}px`
+                : '0px';
             host.style.boxSizing = 'border-box';
             host.style.paddingLeft = '0px';
             host.style.paddingRight = '0px';
@@ -23140,6 +23149,7 @@ fn terminal_eval_script(
             if (helpers) {{
                 helpers.style.position = 'absolute';
                 helpers.style.inset = '0';
+                helpers.style.width = compensatedWidth;
                 helpers.style.overflow = 'hidden';
                 helpers.style.pointerEvents = 'none';
             }}
@@ -23152,14 +23162,15 @@ fn terminal_eval_script(
                 helperTextarea.style.opacity = '0';
             }}
             if (screen) {{
-                screen.style.width = '100%';
+                screen.style.width = compensatedWidth;
                 screen.style.height = '100%';
                 screen.style.position = 'relative';
                 screen.style.overflow = 'hidden';
             }}
             if (viewport) {{
-                viewport.style.width = '100%';
+                viewport.style.width = compensatedWidth;
                 viewport.style.height = '100%';
+                viewport.style.marginRight = compensatedMarginRight;
                 viewport.style.overflowX = 'hidden';
                 viewport.style.scrollbarWidth = 'none';
                 viewport.style.msOverflowStyle = 'none';
