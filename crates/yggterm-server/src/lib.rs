@@ -7162,6 +7162,7 @@ fn bridge_remote_runtime_session_stdio(
     let session_id = parse_remote_runtime_codex_session_key(path)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| path.to_string());
+    let _stdin_raw_mode = enable_bridge_stdin_raw_mode(path, &session_id);
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let writer_stop = stop.clone();
     let writer_endpoint = endpoint.clone();
@@ -7253,6 +7254,86 @@ fn bridge_remote_runtime_session_stdio(
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
+}
+
+fn trace_remote_bridge_event(name: &str, payload: serde_json::Value) {
+    if let Ok(home) = resolve_yggterm_home() {
+        append_trace_event(&home, "server", "remote_stdio_bridge", name, payload);
+    }
+}
+
+#[cfg(unix)]
+struct BridgeStdinRawModeGuard {
+    fd: libc::c_int,
+    original: libc::termios,
+    trace_path: String,
+    trace_session_id: String,
+}
+
+#[cfg(unix)]
+impl Drop for BridgeStdinRawModeGuard {
+    fn drop(&mut self) {
+        let restore_rc =
+            unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original as *const _) };
+        let payload = if restore_rc == 0 {
+            json!({
+                "path": self.trace_path,
+                "session_id": self.trace_session_id,
+                "restored": true,
+            })
+        } else {
+            json!({
+                "path": self.trace_path,
+                "session_id": self.trace_session_id,
+                "restored": false,
+                "error": std::io::Error::last_os_error().to_string(),
+            })
+        };
+        trace_remote_bridge_event("bridge_stdin_raw_mode_restore", payload);
+    }
+}
+
+#[cfg(unix)]
+fn enable_bridge_stdin_raw_mode(
+    path: &str,
+    session_id: &str,
+) -> Option<BridgeStdinRawModeGuard> {
+    let fd = libc::STDIN_FILENO;
+    let mut payload = json!({
+        "path": path,
+        "session_id": session_id,
+    });
+    let tty = unsafe { libc::isatty(fd) } == 1;
+    payload["is_tty"] = json!(tty);
+    if !tty {
+        trace_remote_bridge_event("bridge_stdin_raw_mode_skip", payload);
+        return None;
+    }
+    let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
+    if unsafe { libc::tcgetattr(fd, &mut original as *mut _) } != 0 {
+        payload["error"] = json!(std::io::Error::last_os_error().to_string());
+        trace_remote_bridge_event("bridge_stdin_raw_mode_error", payload);
+        return None;
+    }
+    let mut raw = original;
+    unsafe { libc::cfmakeraw(&mut raw as *mut _) };
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw as *const _) } != 0 {
+        payload["error"] = json!(std::io::Error::last_os_error().to_string());
+        trace_remote_bridge_event("bridge_stdin_raw_mode_error", payload);
+        return None;
+    }
+    trace_remote_bridge_event("bridge_stdin_raw_mode_enable", payload);
+    Some(BridgeStdinRawModeGuard {
+        fd,
+        original,
+        trace_path: path.to_string(),
+        trace_session_id: session_id.to_string(),
+    })
+}
+
+#[cfg(not(unix))]
+fn enable_bridge_stdin_raw_mode(_path: &str, _session_id: &str) -> Option<()> {
+    None
 }
 
 #[cfg(unix)]
