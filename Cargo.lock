@@ -5519,7 +5519,9 @@ dependencies = [
  "tracing-subscriber",
  "yggterm-core",
  "yggterm-server",
+ "yggterm-shell",
  "yggui",
+ "yggui-contract",
 ]
 
 [[package]]
@@ -5540,6 +5542,7 @@ dependencies = [
  "time",
  "tracing",
  "uuid",
+ "yggui-contract",
 ]
 
 [[package]]
@@ -5582,6 +5585,36 @@ dependencies = [
  "yggterm-ghostty-bridge",
  "yggterm-gtk-glue",
  "yggterm-platform",
+ "yggui-contract",
+]
+
+[[package]]
+name = "yggterm-shell"
+version = "2.1.4"
+dependencies = [
+ "anyhow",
+ "base64",
+ "cairo-rs",
+ "dioxus",
+ "dioxus-desktop",
+ "include_dir",
+ "keyboard-types",
+ "libc",
+ "once_cell",
+ "png",
+ "serde",
+ "serde_json",
+ "tao",
+ "time",
+ "tokio",
+ "tracing",
+ "webkit2gtk",
+ "wry",
+ "yggterm-core",
+ "yggterm-platform",
+ "yggterm-server",
+ "yggui",
+ "yggui-contract",
 ]
 
 [[package]]
@@ -5605,9 +5638,14 @@ dependencies = [
  "tracing",
  "webkit2gtk",
  "wry",
- "yggterm-core",
- "yggterm-platform",
- "yggterm-server",
+ "yggui-contract",
+]
+
+[[package]]
+name = "yggui-contract"
+version = "2.1.4"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

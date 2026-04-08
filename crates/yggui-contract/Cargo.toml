@@ -1,0 +1,9 @@
+[package]
+name = "yggui-contract"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license = "Apache-2.0"
+
+[dependencies]
+serde.workspace = true
