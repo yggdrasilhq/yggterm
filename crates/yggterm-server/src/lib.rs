@@ -1736,22 +1736,6 @@ impl YggtermServer {
         )))
     }
 
-    pub fn validate_remote_saved_session_for_path(&self, path: &str) -> anyhow::Result<()> {
-        let Some((machine_key, session_id)) = parse_remote_scanned_session_path(path) else {
-            return Ok(());
-        };
-        let target = self.remote_target_for_machine_key(machine_key)?;
-        let saved_session_exists = remote_saved_codex_session_exists_via_yggterm(
-            &target.ssh_target,
-            target.prefix.as_deref(),
-            session_id,
-        )?;
-        if !saved_session_exists {
-            anyhow::bail!(remote_resume_missing_saved_session_error(session_id));
-        }
-        Ok(())
-    }
-
     pub fn refresh_managed_cli(
         &self,
         machine_key: Option<&str>,
@@ -3489,24 +3473,6 @@ fn remote_saved_codex_session_exists(session_id: &str) -> anyhow::Result<bool> {
 struct RemoteSavedCodexSessionExistsResponse {
     session_id: String,
     exists: bool,
-}
-
-fn remote_saved_codex_session_exists_via_yggterm(
-    ssh_target: &str,
-    exec_prefix: Option<&str>,
-    session_id: &str,
-) -> anyhow::Result<bool> {
-    let output = run_remote_yggterm_command(
-        ssh_target,
-        exec_prefix,
-        &["server", "remote", "codex-session-exists", session_id],
-        None,
-    )?;
-    let response: RemoteSavedCodexSessionExistsResponse = serde_json::from_str(output.trim())
-        .with_context(|| {
-            format!("parsing remote codex-session-exists response for {ssh_target}")
-        })?;
-    Ok(response.exists)
 }
 
 fn remote_tmux_session_name(session_id: &str) -> String {
