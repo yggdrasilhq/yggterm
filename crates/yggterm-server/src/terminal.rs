@@ -1123,9 +1123,8 @@ mod tests {
 
     #[test]
     fn initial_local_attach_does_not_append_attach_ready_marker() {
-        let runtime =
-            PtySessionRuntime::spawn("local://test", "bash -lc 'printf hello'", None)
-                .expect("spawn local test runtime");
+        let runtime = PtySessionRuntime::spawn("local://test", "bash -lc 'printf hello'", None)
+            .expect("spawn local test runtime");
         runtime.seed_snapshot("hello\n");
 
         let result = runtime.read(0);
