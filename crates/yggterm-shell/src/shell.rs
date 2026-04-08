@@ -2108,7 +2108,20 @@ impl ShellState {
             && !self.terminal_attach_in_flight.contains(session_path)
     }
 
+    fn terminal_session_has_ready_attempt(&self, session_path: &str) -> bool {
+        self.latest_terminal_open_attempt_for_path(session_path)
+            .is_some_and(|attempt| {
+                matches!(attempt.state, TerminalOpenAttemptState::Ready)
+                    && attempt.latched_failure_reason.is_none()
+            })
+    }
+
     fn clear_terminal_resume_notifications_except(&mut self, keep_session_path: Option<&str>) {
+        let keep_path = keep_session_path.map(str::to_string);
+        let keep_is_still_recovering = keep_path.as_deref().is_some_and(|session_path| {
+            self.terminal_attach_in_flight.contains(session_path)
+                || !self.terminal_session_has_ready_attempt(session_path)
+        });
         self.notifications.retain(|notification| {
             let Some(job_key) = notification.job_key.as_deref() else {
                 return true;
@@ -2116,7 +2129,8 @@ impl ShellState {
             let Some(session_path) = terminal_resume_notification_session_path(job_key) else {
                 return true;
             };
-            keep_session_path.is_some_and(|keep_path| keep_path == session_path)
+            keep_path.as_deref().is_some_and(|keep_path| keep_path == session_path)
+                && keep_is_still_recovering
         });
     }
 
@@ -19426,21 +19440,24 @@ fn TerminalCanvas(
             });
         }
     }
-    let host_should_accept_input = snapshot.active_view_mode == WorkspaceViewMode::Terminal
-        && snapshot.active_session_path.as_deref() == Some(session_path.as_str())
-        && (!is_remote_resume_session
-            || state
-                .read()
-                .terminal_resume_ready_paths
-                .contains(&session_path))
-        && !state
-            .read()
-            .terminal_attach_in_flight
-            .contains(&session_path);
+    let host_should_accept_input = {
+        let shell = state.read();
+        let remote_resume_ready = !is_remote_resume_session
+            || shell.terminal_resume_ready_paths.contains(&session_path)
+            || shell.terminal_session_has_ready_attempt(&session_path);
+        snapshot.active_view_mode == WorkspaceViewMode::Terminal
+            && snapshot.active_session_path.as_deref() == Some(session_path.as_str())
+            && remote_resume_ready
+            && !shell.terminal_attach_in_flight.contains(&session_path)
+    };
     let input_enable_key = format!("input:{host_id}:{host_should_accept_input}");
     if *input_enable_identity.read() != input_enable_key {
         input_enable_identity.set(input_enable_key);
         let host_id = host_id.clone();
+        let session_path = session_path.clone();
+        if host_should_accept_input {
+            clear_terminal_resume_notification(state, &session_path);
+        }
         spawn(async move {
             let _ = document::eval(&terminal_set_input_enabled_script(
                 &host_id,
@@ -27561,6 +27578,28 @@ Waiting for the remote terminal to paint...\n";
         });
         let surface = summarize_terminal_surface_for_app_control(&[host], false);
         assert_eq!(surface.get("geometry_problem"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn app_control_terminal_surface_accepts_compensated_screen_gap_with_full_viewport() {
+        let host = json!({
+            "child_count": 1,
+            "xterm_present": true,
+            "helpers_present": true,
+            "screen_present": true,
+            "viewport_present": true,
+            "rows_present": true,
+            "canvas_count": 1,
+            "text_sample": "normal terminal output",
+            "host_content_width": 840.0,
+            "host_rect": { "width": 840.0 },
+            "screen_rect": { "width": 824.0 },
+            "helpers_rect": { "width": 824.0 },
+            "viewport_rect": { "width": 840.0 }
+        });
+        let surface = summarize_terminal_surface_for_app_control(&[host], false);
+        assert_eq!(surface.get("geometry_problem"), Some(&Value::Null));
+        assert_eq!(surface.get("problem"), Some(&Value::Null));
     }
 
     #[test]
