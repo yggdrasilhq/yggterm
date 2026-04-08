@@ -32,6 +32,7 @@ Use this workflow when a `yggui` app feature or fix should ship with proof, scre
    - `active_surface_requests` when a terminal load/restore claim depends on whether the request is still truthfully in flight
    - when terminal open/restore is involved, the exact `terminal_open_attempt` object, `active_terminal_surface`, `interactive`, and `terminal_settled_kind`
    - for terminal geometry bugs, include whether `active_terminal_surface.geometry_problem` was set
+   - for input/focus bugs, include `dom.active_element`, `terminal_hosts[].helper_textarea_focused`, and `terminal_hosts[].host_has_active_element`
 4. Create or update the proof bundle:
    - `manifest.json`
    - `summary.md`
@@ -55,6 +56,7 @@ Use this workflow when a `yggui` app feature or fix should ship with proof, scre
 - In `Terminal` mode, saved preview context is no longer accepted as a terminal-ready settle. Expect `terminal_settled_kind == "recovering"` until the resume chip clears and the live terminal is visually revealed.
 - If the terminal host already has staged transcript bytes while the resume chip is still up, treat that as `recovering`, not `overlay_context` and not `interactive`.
 - Do not call a terminal `overlay_context` just because the host has meaningful text. `overlay_context_visible` only applies when the saved-context fallback is still the user-visible truth. Terminal-mode recovery should now stay `recovering` instead.
+- The main viewport should stay available during terminal recovery. Resume progress belongs in notifications/toasts, not as a full-viewport curtain over the host. If a proof screenshot shows the terminal surface replaced by a recovery card, treat that as a UX regression.
 - For startup timing, prefer the app trace `startup/window_spawned` event over slower X11 root-tree detection when both are available. Use X11 tree timing only as fallback evidence.
 - For terminal session-switch bugs, capture both the source and destination terminal surfaces on a second X11 display and verify the destination screenshot text matches the destination `active_session_path`, not stale text from the previous session.
 - When a proof bundle uses `server app screenshot` on Linux X11, state whether the branch includes the real-window screenshot path. Older WebKit-only captures could miss embedded xterm content and produce false blank-terminal evidence.
@@ -62,6 +64,7 @@ Use this workflow when a `yggui` app feature or fix should ship with proof, scre
 - Include `terminal_hosts[].host_content_width`, `host_content_height`, `host_padding_left_px`, `host_padding_right_px`, `host_padding_top_px`, and `host_padding_bottom_px` when the fix uses xterm gutter compensation or any host-content-box adjustment.
 - For typing/cursor visibility bugs, also include `terminal_hosts[].viewport_y` and `terminal_hosts[].base_y` so the proof shows whether the live cursor fell below the visible viewport.
 - For xterm input-hitbox or overtyping bugs, also include `terminal_hosts[].helpers_rect` and `terminal_hosts[].helper_textarea_rect`. A drifted helper textarea is now a classified geometry failure, not a cosmetic quirk.
+- For terminal input bugs, also prove focus ownership. The good state is an active `xterm-helper-textarea` inside the active host plus `helper_textarea_focused: true` and `host_has_active_element: true`.
 - Treat any non-null `active_terminal_surface.geometry_problem` as a failed terminal proof, even if the surface otherwise looks rendered.
 - For startup latency claims, include whether the daemon emitted `daemon/startup_prewarm begin|end|error` for the active terminal. Startup restore should now be prewarmed after the control socket binds instead of waiting for the first UI mount to pay the whole cost.
 - For remote terminal startup restore, also capture whether the initial attach stream included `__YGGTERM_ATTACH_READY__`. That server marker now means the PTY attach itself is live even when Codex is sitting on low-signal idle/footer chrome.
