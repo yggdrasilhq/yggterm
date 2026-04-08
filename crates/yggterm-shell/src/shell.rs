@@ -5235,6 +5235,8 @@ fn app_control_command_defers_background_refresh(command: &AppControlCommand) ->
             | AppControlCommand::CreateTerminal { .. }
             | AppControlCommand::OpenPath { .. }
             | AppControlCommand::SendTerminalInput { .. }
+            | AppControlCommand::ProbeTerminalViewportInput { .. }
+            | AppControlCommand::ProbeTerminalViewportScroll { .. }
             | AppControlCommand::RemoveSession { .. }
             | AppControlCommand::SetRowExpanded { .. }
             | AppControlCommand::Drag { .. }
@@ -12591,6 +12593,281 @@ async fn scroll_preview_viewport_for(
     }
 }
 
+async fn probe_terminal_viewport_input_for(session_path: &str, data: &str, press_enter: bool, press_tab: bool) -> Value {
+    let session_path_literal =
+        serde_json::to_string(session_path).unwrap_or_else(|_| "null".to_string());
+    let data_literal = serde_json::to_string(data).unwrap_or_else(|_| "\"\"".to_string());
+    let script = format!(
+        r#"
+        (async () => {{
+            try {{
+                const sessionPath = {session_path_literal};
+                const text = {data_literal};
+                const pressEnter = {press_enter};
+                const pressTab = {press_tab};
+                const registry = window.__yggtermXtermHosts || {{}};
+                const entries = Object.values(registry)
+                    .filter((entry) => entry && entry.term && entry.sessionPath === sessionPath)
+                    .sort((a, b) => (b.mountedAt || 0) - (a.mountedAt || 0));
+                const visibleEntries = entries.filter((entry) => {{
+                    const host = document.getElementById(entry.hostId);
+                    if (!host) {{
+                        return false;
+                    }}
+                    const rect = host.getBoundingClientRect();
+                    const style = window.getComputedStyle(host);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                }});
+                const entry = visibleEntries[0] || entries[0] || null;
+                if (!entry) {{
+                    dioxus.send({{
+                        accepted: false,
+                        reason: "terminal_host_missing",
+                        session_path: sessionPath,
+                    }});
+                    return;
+                }}
+                const host = document.getElementById(entry.hostId);
+                const helperTextarea = host ? host.querySelector('.xterm-helper-textarea') : null;
+                const target = helperTextarea || host;
+                if (!host || !target) {{
+                    dioxus.send({{
+                        accepted: false,
+                        reason: "terminal_target_missing",
+                        session_path: sessionPath,
+                    }});
+                    return;
+                }}
+                const settle = async (delayMs = 35) => {{
+                    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+                    if (delayMs > 0) {{
+                        await new Promise((resolve) => setTimeout(resolve, delayMs));
+                    }}
+                }};
+                const snapshot = () => {{
+                    const active = entry.term && entry.term.buffer ? entry.term.buffer.active : null;
+                    return {{
+                        viewport_y: active ? Number(active.viewportY || 0) : null,
+                        base_y: active ? Number(active.baseY || 0) : null,
+                        cols: entry.term ? Number(entry.term.cols || 0) : null,
+                        rows: entry.term ? Number(entry.term.rows || 0) : null,
+                        helper_textarea_focused: Boolean(helperTextarea && document.activeElement === helperTextarea),
+                        host_has_active_element: Boolean(host && document.activeElement && host.contains(document.activeElement)),
+                        input_enabled: Boolean(entry.inputEnabled),
+                        text_tail: String(host.innerText || "").trim().slice(-240),
+                    }};
+                }};
+                const focusTarget = () => {{
+                    try {{
+                        if (entry.term && entry.term.focus) {{
+                            entry.term.focus();
+                        }}
+                    }} catch (_error) {{}}
+                    try {{
+                        if (helperTextarea && helperTextarea.focus) {{
+                            helperTextarea.focus({{ preventScroll: true }});
+                        }} else if (host.focus) {{
+                            host.focus({{ preventScroll: true }});
+                        }}
+                    }} catch (_error) {{
+                        try {{
+                            host.focus();
+                        }} catch (_error2) {{}}
+                    }}
+                }};
+                const keySpecForChar = (char) => {{
+                    if (/^[a-z]$/i.test(char)) {{
+                        const upper = char.toUpperCase();
+                        const shift = char === upper && char !== char.toLowerCase();
+                        return {{ key: char, code: `Key${{upper}}`, keyCode: upper.charCodeAt(0), shiftKey: shift }};
+                    }}
+                    if (/^[0-9]$/.test(char)) {{
+                        return {{ key: char, code: `Digit${{char}}`, keyCode: char.charCodeAt(0), shiftKey: false }};
+                    }}
+                    if (char === ' ') {{
+                        return {{ key: ' ', code: 'Space', keyCode: 32, shiftKey: false }};
+                    }}
+                    if (char === '/') {{
+                        return {{ key: '/', code: 'Slash', keyCode: 191, shiftKey: false }};
+                    }}
+                    if (char === '-') {{
+                        return {{ key: '-', code: 'Minus', keyCode: 189, shiftKey: false }};
+                    }}
+                    if (char === '_') {{
+                        return {{ key: '_', code: 'Minus', keyCode: 189, shiftKey: true }};
+                    }}
+                    if (char === '.') {{
+                        return {{ key: '.', code: 'Period', keyCode: 190, shiftKey: false }};
+                    }}
+                    return {{ key: char, code: '', keyCode: char.length === 1 ? char.charCodeAt(0) : 0, shiftKey: false }};
+                }};
+                const dispatchKey = async (spec) => {{
+                    const keyInit = {{
+                        key: spec.key,
+                        code: spec.code || '',
+                        keyCode: spec.keyCode || 0,
+                        which: spec.keyCode || 0,
+                        charCode: spec.keyCode || 0,
+                        bubbles: true,
+                        cancelable: true,
+                        composed: true,
+                        shiftKey: Boolean(spec.shiftKey),
+                        altKey: Boolean(spec.altKey),
+                        ctrlKey: Boolean(spec.ctrlKey),
+                        metaKey: Boolean(spec.metaKey),
+                    }};
+                    target.dispatchEvent(new KeyboardEvent('keydown', keyInit));
+                    if ((spec.key || '').length === 1) {{
+                        target.dispatchEvent(new KeyboardEvent('keypress', keyInit));
+                    }}
+                    target.dispatchEvent(new KeyboardEvent('keyup', keyInit));
+                    await settle(18);
+                }};
+                focusTarget();
+                await settle(35);
+                const before = snapshot();
+                for (const char of Array.from(text || '')) {{
+                    await dispatchKey(keySpecForChar(char));
+                }}
+                if (pressTab) {{
+                    await dispatchKey({{ key: 'Tab', code: 'Tab', keyCode: 9 }});
+                }}
+                if (pressEnter) {{
+                    await dispatchKey({{ key: 'Enter', code: 'Enter', keyCode: 13 }});
+                }}
+                await settle(140);
+                dioxus.send({{
+                    accepted: true,
+                    session_path: sessionPath,
+                    host_id: entry.hostId,
+                    before,
+                    after: snapshot(),
+                    typed_text: text,
+                    press_enter: pressEnter,
+                    press_tab: pressTab,
+                }});
+            }} catch (error) {{
+                dioxus.send({{
+                    accepted: false,
+                    reason: error && error.message ? error.message : String(error),
+                    session_path: {session_path_literal},
+                }});
+            }}
+        }})();
+    "#,
+        session_path_literal = session_path_literal,
+        data_literal = data_literal,
+        press_enter = if press_enter { "true" } else { "false" },
+        press_tab = if press_tab { "true" } else { "false" },
+    );
+    let mut eval = document::eval(&script);
+    match eval.recv::<Value>().await {
+        Ok(value) => value,
+        Err(error) => json!({
+            "accepted": false,
+            "reason": error.to_string(),
+            "session_path": session_path,
+        }),
+    }
+}
+
+async fn probe_terminal_viewport_scroll_for(session_path: &str, lines: i32) -> Value {
+    let session_path_literal =
+        serde_json::to_string(session_path).unwrap_or_else(|_| "null".to_string());
+    let script = format!(
+        r#"
+        (async () => {{
+            try {{
+                const sessionPath = {session_path_literal};
+                const lines = {lines};
+                const registry = window.__yggtermXtermHosts || {{}};
+                const entries = Object.values(registry)
+                    .filter((entry) => entry && entry.term && entry.sessionPath === sessionPath)
+                    .sort((a, b) => (b.mountedAt || 0) - (a.mountedAt || 0));
+                const visibleEntries = entries.filter((entry) => {{
+                    const host = document.getElementById(entry.hostId);
+                    if (!host) {{
+                        return false;
+                    }}
+                    const rect = host.getBoundingClientRect();
+                    const style = window.getComputedStyle(host);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                }});
+                const entry = visibleEntries[0] || entries[0] || null;
+                if (!entry) {{
+                    dioxus.send({{
+                        accepted: false,
+                        reason: "terminal_host_missing",
+                        session_path: sessionPath,
+                    }});
+                    return;
+                }}
+                const host = document.getElementById(entry.hostId);
+                const helperTextarea = host ? host.querySelector('.xterm-helper-textarea') : null;
+                const target = helperTextarea || host;
+                if (!host || !target) {{
+                    dioxus.send({{
+                        accepted: false,
+                        reason: "terminal_target_missing",
+                        session_path: sessionPath,
+                    }});
+                    return;
+                }}
+                const settle = async (delayMs = 45) => {{
+                    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+                    if (delayMs > 0) {{
+                        await new Promise((resolve) => setTimeout(resolve, delayMs));
+                    }}
+                }};
+                const snapshot = () => {{
+                    const active = entry.term && entry.term.buffer ? entry.term.buffer.active : null;
+                    return {{
+                        viewport_y: active ? Number(active.viewportY || 0) : null,
+                        base_y: active ? Number(active.baseY || 0) : null,
+                        input_enabled: Boolean(entry.inputEnabled),
+                        text_tail: String(host.innerText || "").trim().slice(-240),
+                    }};
+                }};
+                const before = snapshot();
+                const deltaY = Number(lines || 0) * 40;
+                target.dispatchEvent(new WheelEvent('wheel', {{
+                    deltaY,
+                    bubbles: true,
+                    cancelable: true,
+                    composed: true,
+                }}));
+                await settle(120);
+                dioxus.send({{
+                    accepted: true,
+                    session_path: sessionPath,
+                    host_id: entry.hostId,
+                    lines,
+                    before,
+                    after: snapshot(),
+                }});
+            }} catch (error) {{
+                dioxus.send({{
+                    accepted: false,
+                    reason: error && error.message ? error.message : String(error),
+                    session_path: {session_path_literal},
+                }});
+            }}
+        }})();
+    "#,
+        session_path_literal = session_path_literal,
+        lines = lines,
+    );
+    let mut eval = document::eval(&script);
+    match eval.recv::<Value>().await {
+        Ok(value) => value,
+        Err(error) => json!({
+            "accepted": false,
+            "reason": error.to_string(),
+            "session_path": session_path,
+        }),
+    }
+}
+
 async fn process_pending_app_control_requests(
     settings_path: &std::path::Path,
     desktop: dioxus::desktop::DesktopContext,
@@ -13155,6 +13432,50 @@ async fn process_pending_app_control_requests(
                     })),
                     error: Some(error.to_string()),
                 },
+            }
+        }
+        AppControlCommand::ProbeTerminalViewportInput {
+            session_path,
+            data,
+            press_enter,
+            press_tab,
+        } => {
+            let result =
+                probe_terminal_viewport_input_for(&session_path, &data, press_enter, press_tab)
+                    .await;
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                error: result
+                    .get("accepted")
+                    .and_then(Value::as_bool)
+                    .filter(|accepted| !accepted)
+                    .and_then(|_| result.get("reason"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                data: Some(result),
+            }
+        }
+        AppControlCommand::ProbeTerminalViewportScroll {
+            session_path,
+            lines,
+        } => {
+            let result = probe_terminal_viewport_scroll_for(&session_path, lines).await;
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                error: result
+                    .get("accepted")
+                    .and_then(Value::as_bool)
+                    .filter(|accepted| !accepted)
+                    .and_then(|_| result.get("reason"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                data: Some(result),
             }
         }
         AppControlCommand::RemoveSession { session_path } => {
@@ -20372,6 +20693,45 @@ fn TerminalCanvas(
                                         !saw_transcript_browser_output
                                             && saw_prompt_only_surface,
                                     );
+                                }
+                                if is_remote_resume_session
+                                    && traced_attach_ready
+                                    && !terminal_overlay_dismissed()
+                                    && terminal_live_host_connected()
+                                    && terminal_paint_seen
+                                    && terminal_geometry_ready
+                                    && resume_visual_reveal_after_ms
+                                        .is_some_and(|deadline_ms| current_millis() >= deadline_ms)
+                                {
+                                    if !deferred_resume_output.is_empty() {
+                                        let replay = std::mem::take(&mut deferred_resume_output);
+                                        let _ = eval.send(TerminalJsCommand::Write { data: replay });
+                                        terminal_resume_surface_staged.set(true);
+                                    }
+                                    let _ = eval.send(TerminalJsCommand::Refit);
+                                    let _ = eval.send(TerminalJsCommand::SetInputEnabled {
+                                        enabled: true,
+                                        focus: true,
+                                    });
+                                    clear_terminal_resume_notification(state, &session_path);
+                                    let _ = safe_shell_mut(
+                                        state,
+                                        "terminal_attach_visual_reveal_from_read",
+                                        |shell| {
+                                            shell.retain_terminal_session_path(&session_path);
+                                            shell.terminal_resume_ready_paths
+                                                .insert(session_path.clone());
+                                            shell.terminal_attach_in_flight
+                                                .remove(&session_path);
+                                            shell.maybe_finish_terminal_surface_request_for_session(
+                                                &session_path,
+                                            );
+                                        },
+                                    );
+                                    maybe_spawn_missing_remote_machine_refreshes(state);
+                                    maybe_spawn_missing_managed_cli_refreshes(state);
+                                    terminal_overlay_dismissed.set(true);
+                                    resume_visual_reveal_after_ms = None;
                                 }
                                 let stalled_remote_resume = is_remote_resume_session
                                     && !traced_attach_ready

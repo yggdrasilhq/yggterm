@@ -8391,6 +8391,46 @@ pub fn run_app_control_send_terminal_input(
     Ok(())
 }
 
+pub fn run_app_control_probe_terminal_viewport_input(
+    session_path: &str,
+    data: &str,
+    press_enter: bool,
+    press_tab: bool,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::ProbeTerminalViewportInput {
+            session_path: session_path.to_string(),
+            data: data.to_string(),
+            press_enter,
+            press_tab,
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_probe_terminal_viewport_scroll(
+    session_path: &str,
+    lines: i32,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::ProbeTerminalViewportScroll {
+            session_path: session_path.to_string(),
+            lines,
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 pub fn run_app_control_remove_session(session_path: &str, timeout_ms: u64) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
     let response = request_app_control(
