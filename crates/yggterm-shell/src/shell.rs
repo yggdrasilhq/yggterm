@@ -2116,11 +2116,21 @@ impl ShellState {
             })
     }
 
+    fn terminal_session_has_visual_resume_reveal(&self, session_path: &str) -> bool {
+        self.terminal_resume_ready_paths.contains(session_path)
+    }
+
+    fn terminal_session_resume_notification_should_stay_visible(&self, session_path: &str) -> bool {
+        terminal_resume_notification_should_stay_visible_for_session(
+            self.terminal_attach_in_flight.contains(session_path),
+            self.terminal_session_has_visual_resume_reveal(session_path),
+        )
+    }
+
     fn clear_terminal_resume_notifications_except(&mut self, keep_session_path: Option<&str>) {
         let keep_path = keep_session_path.map(str::to_string);
         let keep_is_still_recovering = keep_path.as_deref().is_some_and(|session_path| {
-            self.terminal_attach_in_flight.contains(session_path)
-                || !self.terminal_session_has_ready_attempt(session_path)
+            self.terminal_session_resume_notification_should_stay_visible(session_path)
         });
         self.notifications.retain(|notification| {
             let Some(job_key) = notification.job_key.as_deref() else {
@@ -3528,6 +3538,13 @@ fn terminal_resume_notification_should_be_visible(
 ) -> bool {
     active_view_mode == WorkspaceViewMode::Terminal
         && active_session_path.is_some_and(|active_path| active_path == session_path)
+}
+
+fn terminal_resume_notification_should_stay_visible_for_session(
+    attach_in_flight: bool,
+    visual_reveal_complete: bool,
+) -> bool {
+    attach_in_flight || !visual_reveal_complete
 }
 
 fn upsert_terminal_resume_notification(
@@ -21116,22 +21133,18 @@ fn TerminalCanvas(
                                             "attempt": post_attach_read_recovery_attempts + 1,
                                         }),
                                     );
-                                    let _ = safe_shell_mut(
-                                        state,
-                                        "terminal_attach_read_error_after_attach",
-                                        |shell| {
-                                            shell.retain_terminal_session_path(&session_path);
-                                            shell.terminal_attach_in_flight.remove(&session_path);
-                                            shell.terminal_resume_ready_paths
-                                                .insert(session_path.clone());
-                                            shell.maybe_finish_terminal_surface_request_for_session(
-                                                &session_path,
-                                            );
-                                        },
-                                    );
-                                    maybe_spawn_missing_remote_machine_refreshes(state);
-                                    maybe_spawn_missing_managed_cli_refreshes(state);
                                     if post_attach_read_recovery_attempts < 2 {
+                                        let _ = safe_shell_mut(
+                                            state,
+                                            "terminal_attach_retry_after_read_error",
+                                            |shell| {
+                                                shell.retain_terminal_session_path(&session_path);
+                                                shell.terminal_attach_in_flight
+                                                    .insert(session_path.clone());
+                                                shell.terminal_resume_ready_paths
+                                                    .remove(&session_path);
+                                            },
+                                        );
                                         terminal_overlay_dismissed.set(false);
                                         terminal_live_host_connected.set(false);
                                         let _ = eval.send(TerminalJsCommand::SetInputEnabled {
@@ -21174,6 +21187,21 @@ fn TerminalCanvas(
                                         read_poll_ms = 60;
                                         continue;
                                     }
+                                    let _ = safe_shell_mut(
+                                        state,
+                                        "terminal_attach_read_error_after_attach",
+                                        |shell| {
+                                            shell.retain_terminal_session_path(&session_path);
+                                            shell.terminal_attach_in_flight.remove(&session_path);
+                                            shell.terminal_resume_ready_paths
+                                                .insert(session_path.clone());
+                                            shell.maybe_finish_terminal_surface_request_for_session(
+                                                &session_path,
+                                            );
+                                        },
+                                    );
+                                    maybe_spawn_missing_remote_machine_refreshes(state);
+                                    maybe_spawn_missing_managed_cli_refreshes(state);
                                     warn!(session=%session_path, error=%error, "terminal read failed after attach");
                                     break;
                                 }
@@ -28282,6 +28310,88 @@ Waiting for the remote terminal to paint...\n";
     }
 
     #[test]
+    fn describe_viewport_snapshot_treats_resume_toast_without_input_as_recovering() {
+        let snapshot = json!({
+            "active_session_path": "remote-session://jojo/test",
+            "active_view_mode": "Terminal",
+            "active_title": "Yes Yggdrasil Server Use Case",
+            "active_summary": "Saved context",
+            "shell": {
+                "terminal_attach_in_flight": [],
+                "notifications": [{
+                    "title": "Retrying Remote Terminal",
+                    "message": "Yggterm hit a bad intermediate terminal surface on jojo and is retrying the restore.",
+                    "job_key": "terminal-resume:remote-session://jojo/test"
+                }]
+            },
+            "active_surface_requests": []
+        });
+        let dom = json!({
+            "titlebar_title_text": "Yes Yggdrasil Server Use Case",
+            "titlebar_summary_text": "",
+            "titlebar_button_tooltip": "",
+            "titlebar_menu_open": false,
+            "preview_text_sample": "",
+            "preview_viewport_rect": null,
+            "preview_visible_block_ids": [],
+            "preview_font_family": "Inter",
+            "preview_visible_entries": [],
+            "preview_rendered_sections": [],
+            "preview_fallback_context_visible": true,
+            "preview_fallback_context_text": "",
+            "preview_timestamp_labels": [],
+            "preview_window": null,
+            "shell_text_sample": "",
+            "document_editor_count": 0,
+            "document_body_sample": "",
+            "terminal_hosts": [{
+                "session_path": "remote-session://jojo/test",
+                "child_count": 1,
+                "xterm_present": true,
+                "screen_present": true,
+                "viewport_present": true,
+                "rows_present": true,
+                "canvas_count": 0,
+                "text_sample": "Saved context still visible",
+                "input_enabled": false,
+                "resume_overlay_visible": false,
+                "resume_overlay_text": "",
+                "resume_overlay_excerpt": "",
+                "resume_overlay_kind": "hidden",
+                "resume_overlay_phase": "hidden",
+                "resume_overlay_effective_failed": false
+            }],
+            "terminal_resume_overlay": {
+                "visible": false,
+                "text_sample": "",
+                "excerpt": "",
+                "kind": "",
+                "phase": "hidden",
+                "effective_failed": false
+            },
+            "preview_visible_block_count": 0,
+            "preview_scroll_count": 1
+        });
+
+        let viewport = describe_viewport_snapshot(&snapshot, &dom);
+        assert_eq!(viewport.get("ready").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            viewport.get("interactive").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            viewport
+                .get("terminal_settled_kind")
+                .and_then(Value::as_str),
+            Some("recovering")
+        );
+        assert_eq!(
+            viewport.get("reason").and_then(Value::as_str),
+            Some("terminal resume notification is still visible")
+        );
+    }
+
+    #[test]
     fn describe_viewport_snapshot_prefers_interactive_terminal_over_saved_context() {
         let snapshot = json!({
             "active_session_path": "remote-session://oc/test",
@@ -28895,6 +29005,13 @@ Updated at   Branch  Conversation\n\
             terminal_resume_notification_session_path("loading:123"),
             None
         );
+    }
+
+    #[test]
+    fn terminal_resume_notification_stays_visible_until_visual_reveal_completes() {
+        assert!(terminal_resume_notification_should_stay_visible_for_session(true, false));
+        assert!(terminal_resume_notification_should_stay_visible_for_session(false, false));
+        assert!(!terminal_resume_notification_should_stay_visible_for_session(false, true));
     }
 }
 
