@@ -251,6 +251,14 @@ pub(crate) fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value
         .get("problem")
         .and_then(Value::as_str)
         .map(str::to_string);
+    let terminal_input_enabled = active_terminal_hosts.iter().any(|host| {
+        host.get("input_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    });
+    let active_resume_notification_visible = active_session_path
+        .as_deref()
+        .is_some_and(|path| active_terminal_resume_notification_visible(&notifications, path));
     let terminal_attach_pending = active_session_path.as_deref().is_some_and(|path| {
         terminal_attach_in_flight.iter().any(|candidate| {
             candidate
@@ -375,6 +383,13 @@ pub(crate) fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value
                     Some("terminal resume overlay is still visible".to_string()),
                 )
             }
+        } else if active_resume_notification_visible && !terminal_input_enabled {
+            (
+                false,
+                false,
+                Some("recovering".to_string()),
+                Some("terminal resume notification is still visible".to_string()),
+            )
         } else if let Some(problem) = terminal_surface_problem.clone() {
             (false, false, None::<String>, Some(problem))
         } else if terminal_rendered {
@@ -448,6 +463,19 @@ pub(crate) fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value
         "interactive": interactive,
         "terminal_settled_kind": settled_kind,
         "reason": reason,
+    })
+}
+
+fn active_terminal_resume_notification_visible(
+    notifications: &[Value],
+    session_path: &str,
+) -> bool {
+    notifications.iter().any(|notification| {
+        notification
+            .get("job_key")
+            .and_then(Value::as_str)
+            .and_then(|job_key| job_key.strip_prefix("terminal-resume:"))
+            .is_some_and(|candidate| candidate == session_path)
     })
 }
 
