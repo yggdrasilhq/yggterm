@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use vt100::Parser as Vt100Parser;
 use yggterm_core::{append_trace_event, resolve_yggterm_home};
 
 const DEFAULT_COLS: u16 = 120;
@@ -277,8 +278,37 @@ struct PtySessionRuntime {
     last_activity_ms: Arc<AtomicU64>,
     runtime_output_seen: Arc<std::sync::atomic::AtomicBool>,
     eof_without_output: Arc<std::sync::atomic::AtomicBool>,
+    screen_state: Arc<Mutex<TerminalScreenState>>,
     launch_command: String,
     cwd: Option<String>,
+}
+
+struct TerminalScreenState {
+    parser: Vt100Parser,
+    formatted: String,
+}
+
+impl TerminalScreenState {
+    fn new(rows: u16, cols: u16) -> Self {
+        Self {
+            parser: Vt100Parser::new(rows, cols, 0),
+            formatted: String::new(),
+        }
+    }
+
+    fn process(&mut self, bytes: &[u8]) {
+        self.parser.process(bytes);
+        self.refresh_formatted();
+    }
+
+    fn resize(&mut self, rows: u16, cols: u16) {
+        self.parser.screen_mut().set_size(rows, cols);
+        self.refresh_formatted();
+    }
+
+    fn refresh_formatted(&mut self) {
+        self.formatted = String::from_utf8_lossy(&self.parser.screen().state_formatted()).into();
+    }
 }
 
 impl PtySessionRuntime {
@@ -319,12 +349,17 @@ impl PtySessionRuntime {
         let last_activity_ms = Arc::new(AtomicU64::new(started_at_ms));
         let runtime_output_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let eof_without_output = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let screen_state = Arc::new(Mutex::new(TerminalScreenState::new(
+            DEFAULT_ROWS,
+            DEFAULT_COLS,
+        )));
         let reader_chunks = Arc::clone(&chunks);
         let reader_retained_bytes = Arc::clone(&retained_bytes);
         let reader_seq = Arc::clone(&seq);
         let reader_activity = Arc::clone(&last_activity_ms);
         let reader_runtime_output_seen = Arc::clone(&runtime_output_seen);
         let reader_eof_without_output = Arc::clone(&eof_without_output);
+        let reader_screen_state = Arc::clone(&screen_state);
         let key_label = key.to_string();
         let launch_command_label = launch_command.to_string();
 
@@ -340,6 +375,9 @@ impl PtySessionRuntime {
                             let data = String::from_utf8_lossy(&buffer[..bytes]).to_string();
                             if data.is_empty() {
                                 continue;
+                            }
+                            if let Ok(mut screen_state) = reader_screen_state.lock() {
+                                screen_state.process(&buffer[..bytes]);
                             }
                             if !saw_any_output {
                                 saw_any_output = true;
@@ -418,6 +456,7 @@ impl PtySessionRuntime {
             last_activity_ms,
             runtime_output_seen,
             eof_without_output,
+            screen_state,
             launch_command: launch_command.to_string(),
             cwd: cwd.map(|value| value.to_string()),
         })
@@ -471,18 +510,43 @@ impl PtySessionRuntime {
             .collect::<String>()
     }
 
+    fn screen_snapshot_chunk(&self, next_cursor: u64) -> Option<TerminalChunk> {
+        let screen_state = self
+            .screen_state
+            .lock()
+            .expect("pty screen state lock poisoned");
+        let formatted = screen_state.formatted.trim_matches('\0').to_string();
+        if !terminal_chunk_has_visible_text(&formatted) {
+            return None;
+        }
+        Some(TerminalChunk {
+            seq: next_cursor.saturating_add(1),
+            data: formatted,
+        })
+    }
+
     fn read(&self, cursor: u64) -> TerminalReadResult {
-        let chunks = self.chunks.lock().expect("pty chunk lock poisoned");
+        let retained_chunks = self.chunks.lock().expect("pty chunk lock poisoned");
         let next_cursor = self.seq.load(Ordering::SeqCst);
         let mut chunks = if cursor == 0 {
-            select_initial_attach_chunks_for_launch(&chunks, &self.launch_command)
+            if launch_command_looks_like_remote_resume_attach(&self.launch_command) {
+                self.screen_snapshot_chunk(next_cursor)
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            } else {
+                select_initial_attach_chunks_for_launch(&retained_chunks, &self.launch_command)
+            }
         } else {
-            chunks
+            retained_chunks
                 .iter()
                 .filter(|chunk| chunk.seq > cursor)
                 .cloned()
                 .collect()
         };
+        if cursor == 0 && chunks.is_empty() {
+            chunks =
+                select_initial_attach_chunks_for_launch(&retained_chunks, &self.launch_command);
+        }
         if cursor == 0
             && !chunks.is_empty()
             && self.is_running()
@@ -521,6 +585,9 @@ impl PtySessionRuntime {
         if data.is_empty() {
             return;
         }
+        if let Ok(mut screen_state) = self.screen_state.lock() {
+            screen_state.process(data.as_bytes());
+        }
         self.runtime_output_seen.store(true, Ordering::SeqCst);
         self.last_activity_ms.store(now_millis(), Ordering::SeqCst);
         let seq_value = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
@@ -542,7 +609,9 @@ impl PtySessionRuntime {
     }
 
     fn trim_idle_buffer(&self, within: Duration) -> usize {
-        if self.recent_activity(within) {
+        if self.recent_activity(within)
+            || launch_command_looks_like_remote_resume_attach(&self.launch_command)
+        {
             return 0;
         }
         let mut chunks = self.chunks.lock().expect("pty chunk lock poisoned");
@@ -571,6 +640,9 @@ impl PtySessionRuntime {
                 pixel_height: 0,
             })
             .context("resizing pty")?;
+        if let Ok(mut screen_state) = self.screen_state.lock() {
+            screen_state.resize(rows, cols);
+        }
         Ok(())
     }
 
@@ -642,7 +714,12 @@ fn shell_command(launch_command: &str, cwd: Option<&str>) -> CommandBuilder {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
     let mut command = CommandBuilder::new(shell);
     command.arg("-c");
-    command.arg(launch_command);
+    let wrapped_launch_command = if launch_command_looks_like_remote_resume_attach(launch_command) {
+        format!("stty raw -echo </dev/tty >/dev/tty 2>/dev/null || true; exec {launch_command}")
+    } else {
+        launch_command.to_string()
+    };
+    command.arg(wrapped_launch_command);
     for (key, value) in terminal_identity_env_pairs() {
         command.env(key, value);
     }
@@ -742,7 +819,7 @@ fn select_initial_attach_chunks_for_launch(
     launch_command: &str,
 ) -> Vec<TerminalChunk> {
     if launch_command_looks_like_remote_resume_attach(launch_command) {
-        return chunks.iter().cloned().collect();
+        return select_initial_attach_chunks(chunks);
     }
     select_initial_attach_chunks(chunks)
 }
@@ -852,6 +929,14 @@ fn terminal_chunk_is_disposable_initial_attach_suffix(data: &str) -> bool {
 
 fn terminal_chunk_is_low_signal_attach_fragment(data: &str) -> bool {
     let stripped = strip_terminal_control_sequences(data);
+    let normalized = stripped.trim().to_ascii_lowercase();
+    if normalized.contains("^[[?")
+        || normalized.contains("^[]10;")
+        || normalized.contains("^[[1;1r")
+        || (normalized.contains("rgb:") && normalized.contains("cccc/cccc/cccc"))
+    {
+        return true;
+    }
     let lines = stripped
         .lines()
         .map(str::trim)
@@ -887,7 +972,12 @@ fn terminal_chunk_has_generic_attach_idle_footer(data: &str) -> bool {
             && (lower.contains("implement {feature}")
                 || lower.contains("explain this codebase")
                 || lower.contains("find and fix a bug")
-                || lower.contains("resume a previous session"))
+                || lower.contains("resume a previous session")
+                || lower.contains("write tests for")
+                || lower.contains("@filename")
+                || lower.contains("review my changes")
+                || lower.contains("summarize recent commits")
+                || lower.contains("create a pr"))
     });
     let mentions_model_footer = (normalized.contains("gpt-5")
         || normalized.contains("gpt-4")
@@ -1002,6 +1092,25 @@ mod tests {
     }
 
     #[test]
+    fn idle_trim_skips_remote_resume_attach_sessions() {
+        let runtime = PtySessionRuntime::spawn(
+            "remote-session://oc/test",
+            "ssh -tt oc 'exec $HOME/.yggterm/bin/yggterm '\\''server'\\'' '\\''remote'\\'' '\\''resume-codex'\\'' '\\''test-session'\\'' '\\''/home/pi'\\'''",
+            None,
+        )
+        .expect("spawn test runtime");
+        for seq in 0..96 {
+            runtime.seed_snapshot(&format!("chunk-{seq}\n"));
+        }
+        let before = runtime.buffer_usage().1;
+        let reclaimed = runtime.trim_idle_buffer(Duration::from_millis(0));
+        let after = runtime.buffer_usage().1;
+        assert_eq!(reclaimed, 0);
+        assert_eq!(before, after);
+        runtime.shutdown(None).expect("shutdown test runtime");
+    }
+
+    #[test]
     fn initial_attach_selection_keeps_last_meaningful_surface_ahead_of_trailing_noise() {
         let mut chunks = VecDeque::new();
         chunks.push_back(TerminalChunk {
@@ -1069,6 +1178,32 @@ mod tests {
     }
 
     #[test]
+    fn initial_attach_selection_trims_write_tests_footer_suffix() {
+        let mut chunks = VecDeque::new();
+        chunks.push_back(TerminalChunk {
+            seq: 1,
+            data: "  - Push: origin/main updated successfully (2f6b4ac..f49ab56)\n".to_string(),
+        });
+        chunks.push_back(TerminalChunk {
+            seq: 2,
+            data: "› Write tests for @filename\n".to_string(),
+        });
+        chunks.push_back(TerminalChunk {
+            seq: 3,
+            data: "  gpt-5.4 high fast · 100% left · ~/git\n".to_string(),
+        });
+
+        let selected = select_initial_attach_chunks(&chunks);
+        let combined = selected
+            .iter()
+            .map(|chunk| chunk.data.as_str())
+            .collect::<String>();
+
+        assert!(combined.contains("origin/main updated successfully"));
+        assert!(!combined.contains("Write tests for @filename"));
+    }
+
+    #[test]
     fn initial_attach_selection_keeps_prompt_only_surface_when_no_meaningful_history_exists() {
         let mut chunks = VecDeque::new();
         chunks.push_back(TerminalChunk {
@@ -1109,7 +1244,7 @@ mod tests {
     }
 
     #[test]
-    fn initial_remote_resume_attach_keeps_full_retained_stream() {
+    fn initial_remote_resume_attach_trims_to_tail_budget() {
         let mut chunks = VecDeque::new();
         for seq in 1..=260 {
             chunks.push_back(TerminalChunk {
@@ -1123,8 +1258,8 @@ mod tests {
             "ssh -tt oc 'exec $HOME/.yggterm/bin/yggterm '\\''server'\\'' '\\''remote'\\'' '\\''resume-codex'\\'' '\\''test-session'\\'' '\\''/home/pi'\\'''",
         );
 
-        assert_eq!(selected.len(), chunks.len());
-        assert_eq!(selected.first().map(|chunk| chunk.seq), Some(1));
+        assert!(selected.len() < chunks.len());
+        assert_eq!(selected.first().map(|chunk| chunk.seq), Some(69));
         assert_eq!(selected.last().map(|chunk| chunk.seq), Some(260));
     }
 
@@ -1152,6 +1287,28 @@ mod tests {
     }
 
     #[test]
+    fn initial_remote_resume_attach_prefers_screen_snapshot_state() {
+        let runtime = PtySessionRuntime::spawn(
+            "remote-session://oc/test",
+            "ssh -tt oc 'exec $HOME/.yggterm/bin/yggterm '\\''server'\\'' '\\''remote'\\'' '\\''resume-codex'\\'' '\\''test-session'\\'' '\\''/home/pi'\\'''",
+            None,
+        )
+        .expect("spawn test runtime");
+        runtime.seed_snapshot("abcdef\rXYZ");
+
+        let result = runtime.read(0);
+        let combined = result
+            .chunks
+            .iter()
+            .map(|chunk| chunk.data.as_str())
+            .collect::<String>();
+
+        assert!(combined.contains("XYZdef"));
+        assert!(!combined.contains("abcdef\rXYZ"));
+        runtime.shutdown(None).expect("shutdown test runtime");
+    }
+
+    #[test]
     fn initial_local_attach_does_not_append_attach_ready_marker() {
         let runtime = PtySessionRuntime::spawn("local://test", "bash -lc 'printf hello'", None)
             .expect("spawn local test runtime");
@@ -1166,5 +1323,31 @@ mod tests {
 
         assert!(!combined.contains("__YGGTERM_ATTACH_READY__"));
         runtime.shutdown(None).expect("shutdown test runtime");
+    }
+
+    #[test]
+    fn remote_resume_initial_attach_drops_terminal_negotiation_suffix() {
+        let mut chunks = VecDeque::new();
+        chunks.push_back(TerminalChunk {
+            seq: 1,
+            data: "Done. Added these in the ThinkBook x layer.\n".to_string(),
+        });
+        chunks.push_back(TerminalChunk {
+            seq: 2,
+            data: "› ^[[?1;2c^[]10;rgb:cccc/cccc/cccc^[\\^[[1;1R\n".to_string(),
+        });
+
+        let selected = select_initial_attach_chunks_for_launch(
+            &chunks,
+            "ssh -tt oc 'exec $HOME/.yggterm/bin/yggterm '\\''server'\\'' '\\''remote'\\'' '\\''resume-codex'\\'' '\\''test-session'\\'' '\\''/home/pi'\\'''",
+        );
+        let combined = selected
+            .iter()
+            .map(|chunk| chunk.data.as_str())
+            .collect::<String>();
+
+        assert!(combined.contains("Done. Added these in the ThinkBook x layer."));
+        assert!(!combined.contains("^[[?1;2c"));
+        assert!(!combined.contains("^[]10;rgb:cccc/cccc/cccc"));
     }
 }
