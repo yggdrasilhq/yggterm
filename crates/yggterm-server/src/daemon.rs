@@ -23,9 +23,10 @@ use std::sync::{
 use time::OffsetDateTime;
 use tracing::{info, warn};
 use yggterm_core::{
-    AppSettings, PerfSpan, SessionNode, SessionNodeKind, SessionStore, UiTheme, append_trace_event,
+    AppSettings, PerfSpan, SessionNode, SessionNodeKind, SessionStore, append_trace_event,
     looks_like_generated_fallback_title,
 };
+use yggui_contract::UiTheme;
 
 pub const SERVER_PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BACKGROUND_COPY_CHORE_MS: u64 = 12_000;
