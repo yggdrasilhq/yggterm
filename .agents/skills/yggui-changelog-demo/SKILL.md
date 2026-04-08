@@ -33,6 +33,7 @@ Use this workflow when a `yggui` app feature or fix should ship with proof, scre
    - when terminal open/restore is involved, the exact `terminal_open_attempt` object, `active_terminal_surface`, `interactive`, and `terminal_settled_kind`
    - for terminal geometry bugs, include whether `active_terminal_surface.geometry_problem` was set
    - for input/focus bugs, include `dom.active_element`, `terminal_hosts[].helper_textarea_focused`, and `terminal_hosts[].host_has_active_element`
+   - for startup input-contract bugs, also include `terminal_hosts[].input_enabled`
 4. Create or update the proof bundle:
    - `manifest.json`
    - `summary.md`
@@ -65,6 +66,7 @@ Use this workflow when a `yggui` app feature or fix should ship with proof, scre
 - For typing/cursor visibility bugs, also include `terminal_hosts[].viewport_y` and `terminal_hosts[].base_y` so the proof shows whether the live cursor fell below the visible viewport.
 - For xterm input-hitbox or overtyping bugs, also include `terminal_hosts[].helpers_rect` and `terminal_hosts[].helper_textarea_rect`. A drifted helper textarea is now a classified geometry failure, not a cosmetic quirk.
 - For terminal input bugs, also prove focus ownership. The good state is an active `xterm-helper-textarea` inside the active host plus `helper_textarea_focused: true` and `host_has_active_element: true`.
+- For startup restore, the healthy recovery state is a visible toast plus `input_enabled == false` until the live terminal actually settles interactive.
 - Treat any non-null `active_terminal_surface.geometry_problem` as a failed terminal proof, even if the surface otherwise looks rendered.
 - For startup latency claims, include whether the daemon emitted `daemon/startup_prewarm begin|end|error` for the active terminal. Startup restore should now be prewarmed after the control socket binds instead of waiting for the first UI mount to pay the whole cost.
 - For remote terminal startup restore, also capture whether the initial attach stream included `__YGGTERM_ATTACH_READY__`. That server marker now means the PTY attach itself is live even when Codex is sitting on low-signal idle/footer chrome.

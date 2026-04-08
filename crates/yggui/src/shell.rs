@@ -684,6 +684,10 @@ enum TerminalJsCommand {
     Write {
         data: String,
     },
+    SetInputEnabled {
+        enabled: bool,
+        focus: bool,
+    },
     Refit,
 }
 
@@ -13018,6 +13022,7 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     helper_textarea_present: Boolean(helperTextarea),
                     helper_textarea_focused: Boolean(helperTextarea && activeElement === helperTextarea),
                     host_has_active_element: Boolean(activeElement && host.contains(activeElement)),
+                    input_enabled: mountedHost ? Boolean(mountedHost.inputEnabled) : null,
                     screen_present: Boolean(screen),
                     viewport_present: Boolean(viewport),
                     rows_present: Boolean(rowsLayer),
@@ -19963,13 +19968,11 @@ fn TerminalCanvas(
         .or_else(|| initial_resume_overlay_excerpt.clone())
         .or(snapshot_resume_overlay_excerpt);
     let terminal_resume_prefill = terminal_placeholder.clone();
-    let resume_ready_from_shell = state
-        .read()
-        .terminal_resume_ready_paths
-        .contains(&session_path);
-    if is_remote_resume_session && resume_ready_from_shell {
-        clear_terminal_resume_notification(state, &session_path);
-    }
+    let resume_ready_from_shell = !is_remote_resume_session
+        && state
+            .read()
+            .terminal_resume_ready_paths
+            .contains(&session_path);
     append_trace_event(
         &trace_home,
         "ui",
@@ -20322,7 +20325,11 @@ fn TerminalCanvas(
                 );
                 return;
             }
-            let mut eval = document::eval(&terminal_eval_script(&host_id, &theme));
+            let mut eval = document::eval(&terminal_eval_script(
+                &host_id,
+                &theme,
+                !is_remote_resume_session,
+            ));
             let mut js_ready = false;
             let mut resize_seen = false;
             let mut terminal_geometry_ready = false;
@@ -20495,18 +20502,28 @@ fn TerminalCanvas(
                                     }
                                     terminal_paint_seen = true;
                                     if is_remote_resume_session
-                                        && !traced_attach_ready
+                                        && traced_attach_ready
+                                        && !terminal_overlay_dismissed()
                                         && terminal_live_host_connected()
                                         && terminal_geometry_ready
-                                        && terminal_overlay_dismissed()
+                                        && resume_visual_reveal_after_ms.is_some_and(|deadline_ms| {
+                                            current_millis() >= deadline_ms
+                                        })
                                     {
-                                        traced_attach_ready = true;
-                                        post_attach_read_recovery_attempts = 0;
-                                        resume_overlay_failed.set(false);
-                                        resume_overlay_timed_out.set(false);
+                                        if !deferred_resume_output.is_empty() {
+                                            let replay = std::mem::take(&mut deferred_resume_output);
+                                            let _ = eval.send(TerminalJsCommand::Write { data: replay });
+                                            terminal_resume_surface_staged.set(true);
+                                        }
+                                        let _ = eval.send(TerminalJsCommand::Refit);
+                                        let _ = eval.send(TerminalJsCommand::SetInputEnabled {
+                                            enabled: true,
+                                            focus: true,
+                                        });
+                                        clear_terminal_resume_notification(state, &session_path);
                                         let _ = safe_shell_mut(
                                             state,
-                                            "terminal_attach_ready_after_paint",
+                                            "terminal_attach_visual_reveal",
                                             |shell| {
                                                 shell.terminal_resume_ready_paths
                                                     .insert(session_path.clone());
@@ -20517,24 +20534,8 @@ fn TerminalCanvas(
                                                 );
                                             },
                                         );
-                                        resume_visual_reveal_after_ms = Some(
-                                            current_millis()
-                                                .saturating_add(
-                                                    REMOTE_TERMINAL_RESUME_VISUAL_REVEAL_MS,
-                                                ),
-                                        );
                                         maybe_spawn_missing_remote_machine_refreshes(state);
                                         maybe_spawn_missing_managed_cli_refreshes(state);
-                                    }
-                                    if is_remote_resume_session
-                                        && traced_attach_ready
-                                        && !terminal_overlay_dismissed()
-                                        && terminal_live_host_connected()
-                                        && terminal_geometry_ready
-                                        && resume_visual_reveal_after_ms.is_some_and(|deadline_ms| {
-                                            current_millis() >= deadline_ms
-                                        })
-                                    {
                                         terminal_overlay_dismissed.set(true);
                                         resume_visual_reveal_after_ms = None;
                                     }
@@ -20800,7 +20801,12 @@ fn TerminalCanvas(
                                 if has_transport_error {
                                     resume_overlay_failed.set(true);
                                     resume_overlay_timed_out.set(false);
+                                    terminal_overlay_dismissed.set(false);
                                     terminal_live_host_connected.set(false);
+                                    let _ = eval.send(TerminalJsCommand::SetInputEnabled {
+                                        enabled: false,
+                                        focus: false,
+                                    });
                                     upsert_terminal_resume_notification(
                                         state,
                                         &session_path,
@@ -20909,7 +20915,7 @@ fn TerminalCanvas(
                                                 }),
                                             );
                                         }
-                                        if is_remote_resume_session && !traced_attach_ready {
+                                        if is_remote_resume_session && !terminal_overlay_dismissed() {
                                             append_terminal_resume_replay_buffer(
                                                 &mut deferred_resume_output,
                                                 &data,
@@ -21011,31 +21017,12 @@ fn TerminalCanvas(
                                         post_attach_read_recovery_attempts = 0;
                                         resume_overlay_failed.set(false);
                                         resume_overlay_timed_out.set(false);
-                                        clear_terminal_resume_notification(state, &session_path);
-                                        let _ = safe_shell_mut(state, "terminal_attach_ready", |shell| {
-                                            shell.terminal_resume_ready_paths
-                                                .insert(session_path.clone());
-                                            shell.terminal_attach_in_flight.remove(
-                                                &session_path,
-                                            );
-                                            shell.maybe_finish_terminal_surface_request_for_session(
-                                                &session_path,
-                                            );
-                                        });
-                                        if !deferred_resume_output.is_empty() {
-                                            let replay = std::mem::take(&mut deferred_resume_output);
-                                            let _ = eval.send(TerminalJsCommand::Write { data: replay });
-                                            terminal_resume_surface_staged.set(true);
-                                        }
-                                        let _ = eval.send(TerminalJsCommand::Refit);
                                         resume_visual_reveal_after_ms = Some(
                                             current_millis()
                                                 .saturating_add(
                                                     REMOTE_TERMINAL_RESUME_VISUAL_REVEAL_MS,
                                                 ),
                                         );
-                                        maybe_spawn_missing_remote_machine_refreshes(state);
-                                        maybe_spawn_missing_managed_cli_refreshes(state);
                                     }
                                 }
                                 let connected_for_resume = if is_remote_resume_session {
@@ -21183,6 +21170,10 @@ fn TerminalCanvas(
                                     terminal_live_host_connected.set(false);
                                     resume_overlay_failed.set(false);
                                     resume_overlay_timed_out.set(false);
+                                    let _ = eval.send(TerminalJsCommand::SetInputEnabled {
+                                        enabled: false,
+                                        focus: false,
+                                    });
                                     let reason = if invalid_remote_resume_surface {
                                         if saw_transcript_browser_output {
                                             "transcript_browser_surface"
@@ -21271,6 +21262,10 @@ fn TerminalCanvas(
                                     resume_overlay_timed_out.set(false);
                                     terminal_overlay_dismissed.set(false);
                                     terminal_live_host_connected.set(false);
+                                    let _ = eval.send(TerminalJsCommand::SetInputEnabled {
+                                        enabled: false,
+                                        focus: false,
+                                    });
                                     upsert_terminal_resume_notification(
                                         state,
                                         &session_path,
@@ -21377,6 +21372,12 @@ fn TerminalCanvas(
                                     maybe_spawn_missing_remote_machine_refreshes(state);
                                     maybe_spawn_missing_managed_cli_refreshes(state);
                                     if post_attach_read_recovery_attempts < 2 {
+                                        terminal_overlay_dismissed.set(false);
+                                        terminal_live_host_connected.set(false);
+                                        let _ = eval.send(TerminalJsCommand::SetInputEnabled {
+                                            enabled: false,
+                                            focus: false,
+                                        });
                                         upsert_terminal_resume_notification(
                                             state,
                                             &session_path,
@@ -22700,7 +22701,11 @@ fn apply_active_terminal_zoom(state: Signal<ShellState>) {
     ));
 }
 
-fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
+fn terminal_eval_script(
+    host_id: &str,
+    theme: &TerminalTheme,
+    initial_input_enabled: bool,
+) -> String {
     let css = serde_json::to_string(XTERM_CSS).expect("serialize xterm css");
     let xterm = serde_json::to_string(XTERM_JS).expect("serialize xterm js");
     let fit_bundle = serde_json::to_string(XTERM_FIT_JS).expect("serialize xterm fit addon");
@@ -22734,6 +22739,8 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
         serde_json::to_string(&theme.bright_cyan).expect("serialize terminal bright cyan");
     let bright_white =
         serde_json::to_string(&theme.bright_white).expect("serialize terminal bright white");
+    let initial_input_enabled =
+        serde_json::to_string(&initial_input_enabled).expect("serialize initial input enabled");
     let constructed_debug = if cfg!(debug_assertions) {
         "dioxus.send({ kind: \"debug\", message: `constructed host=${hostId} fontSize=${term.options.fontSize} cols=${term.cols} rows=${term.rows}` });"
     } else {
@@ -22923,7 +22930,8 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
         term.loadAddon(fitAddon);
         term.open(host);
         host.tabIndex = 0;
-        host.style.cursor = 'text';
+        let inputEnabled = Boolean({initial_input_enabled});
+        host.style.cursor = inputEnabled ? 'text' : 'default';
         const runtimeStyleId = `yggterm-xterm-runtime-style-${{hostId}}`;
         if (!document.getElementById(runtimeStyleId)) {{
             const runtimeStyle = document.createElement("style");
@@ -23103,6 +23111,9 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
             requestVisiblePaint();
         }};
         const focusTerminal = () => {{
+            if (!inputEnabled) {{
+                return;
+            }}
             try {{
                 term.focus();
             }} catch (_error) {{}}
@@ -23119,8 +23130,35 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
                 }} catch (_error2) {{}}
             }}
         }};
+        const setInputEnabled = (enabled, focus) => {{
+            inputEnabled = Boolean(enabled);
+            try {{
+                term.options.disableStdin = !inputEnabled;
+            }} catch (_error) {{}}
+            host.style.cursor = inputEnabled ? 'text' : 'default';
+            if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
+                window.__yggtermXtermHosts[hostId].inputEnabled = inputEnabled;
+            }}
+            if (!inputEnabled) {{
+                try {{
+                    const helperTextarea = host.querySelector('.xterm-helper-textarea');
+                    if (helperTextarea && helperTextarea.blur) {{
+                        helperTextarea.blur();
+                    }}
+                }} catch (_error) {{}}
+                try {{
+                    if (document.activeElement === host && host.blur) {{
+                        host.blur();
+                    }}
+                }} catch (_error) {{}}
+                return;
+            }}
+            if (focus) {{
+                focusTerminal();
+            }}
+        }};
         const shouldHandleWheel = (event) => {{
-            if (!event) {{
+            if (!event || !inputEnabled) {{
                 return false;
             }}
             const target = event.target;
@@ -23177,6 +23215,15 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
         host.addEventListener("mousedown", handleHostPointerFocus, true);
         host.addEventListener("click", handleHostPointerFocus, true);
         term.attachCustomKeyEventHandler((event) => {{
+            if (!inputEnabled) {{
+                if (event.preventDefault) {{
+                    event.preventDefault();
+                }}
+                if (event.stopPropagation) {{
+                    event.stopPropagation();
+                }}
+                return false;
+            }}
             const accel = event.ctrlKey || event.metaKey;
             const key = (event.key || '').toLowerCase();
             if (!accel) {{
@@ -23236,6 +23283,8 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
             term,
             fitAddon,
             emitResize,
+            setInputEnabled,
+            inputEnabled,
             hostId,
             sessionPath: host.getAttribute("data-terminal-session-path") || "",
             mountedAt: Date.now(),
@@ -23244,13 +23293,15 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
             kind: "debug",
             message: `constructed host=${{hostId}} cols=${{term.cols}} rows=${{term.rows}}`
         }});
-        focusTerminal();
+        setInputEnabled(inputEnabled, inputEnabled);
         const scheduleResizeNudges = () => {{
             [140, 420, 900, 1600].forEach((delayMs) => {{
                 window.setTimeout(() => {{
                     emitResize();
                     requestVisiblePaint();
-                    focusTerminal();
+                    if (inputEnabled) {{
+                        focusTerminal();
+                    }}
                     if (delayMs >= 420) {{
                         ensureVisibleHost(`resize_nudge_${{delayMs}}`);
                     }}
@@ -23263,6 +23314,9 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
             emitPaint();
         }});
         term.onData((data) => {{
+            if (!inputEnabled) {{
+                return;
+            }}
             scrollLiveCursorIntoView();
             dioxus.send({{ kind: "input", data }});
         }});
@@ -23357,6 +23411,8 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
                     }}
                     requestVisiblePaint();
                 }});
+            }} else if (message.kind === "set_input_enabled") {{
+                setInputEnabled(Boolean(message.enabled), Boolean(message.focus));
             }}
         }}
         "#,
@@ -23381,6 +23437,7 @@ fn terminal_eval_script(host_id: &str, theme: &TerminalTheme) -> String {
         bright_magenta = bright_magenta,
         bright_cyan = bright_cyan,
         bright_white = bright_white,
+        initial_input_enabled = initial_input_enabled,
         constructed_debug = constructed_debug,
         reset_debug = reset_debug
     )
@@ -25652,7 +25709,7 @@ mod tests {
     #[test]
     fn terminal_eval_script_bakes_font_size_into_xterm_constructor() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
-        let script = terminal_eval_script("yggterm-terminal-test", &theme);
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
         assert!(script.contains("fontSize: 13"));
         assert!(script.contains("brightWhite"));
     }
@@ -25660,18 +25717,19 @@ mod tests {
     #[test]
     fn terminal_eval_script_focuses_host_and_scopes_wheel_capture() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
-        let script = terminal_eval_script("yggterm-terminal-test", &theme);
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
         assert!(script.contains("host.tabIndex = 0;"));
         assert!(script.contains("const focusTerminal = () => {"));
+        assert!(script.contains("const setInputEnabled = (enabled, focus) => {"));
         assert!(script.contains("host.addEventListener(\"wheel\", handleWheel"));
         assert!(script.contains("host.addEventListener(\"pointerdown\", handleHostPointerFocus"));
-        assert!(script.contains("focusTerminal();"));
+        assert!(script.contains("setInputEnabled(inputEnabled, inputEnabled);"));
     }
 
     #[test]
     fn terminal_eval_script_waits_for_host_mount_before_giving_up() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
-        let script = terminal_eval_script("yggterm-terminal-test", &theme);
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, false);
         assert!(script.contains("mounted on retry"));
         assert!(script.contains("after retries"));
         assert!(script.contains("await sleep(25)"));
@@ -29311,7 +29369,6 @@ Updated at   Branch  Conversation\n\
             "Shared connection to 192.168.0.133 closed.\n"
         ));
     }
-
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
