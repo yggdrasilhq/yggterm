@@ -95,7 +95,11 @@ pub fn ToastViewport(
                     key: "{notification.id}",
                     style: "pointer-events:auto; animation:yggterm-toast-stack-in 220ms ease both;",
                     div {
-                        style: "animation:yggterm-toast-fade 7s ease forwards;",
+                        style: if notification.persistent {
+                            "animation:none;"
+                        } else {
+                            "animation:yggterm-toast-fade 7s ease forwards;"
+                        },
                         ToastCard {
                             item: notification.clone(),
                             palette: palette,
