@@ -49,7 +49,7 @@ Use this workflow when a `yggui` app feature or fix should ship with proof, scre
 - Prefer exact screenshots and traces over vague prose.
 - For terminal restore claims, bind the proof to one attempt id and fail the claim if that attempt latched any failure, even if a later state looks healthy.
 - For startup restore work, prove the app did not issue a second reopen of the already-active terminal. One startup mount sequence is correct. A duplicate reopen is a bug, even if a later attempt recovers.
-- When a startup restore fails before PTY attach, include the daemon `remote_saved_session_preflight_*` trace events and the UI overlay excerpt. Missing-session truth should be proven from the preflight path, not inferred later from a blank terminal timeout.
+- For remote startup restore, the hot path no longer blocks on a separate saved-session existence probe. Expect `remote_saved_session_preflight_elided_runtime_launch` in the daemon trace, then prove missing-session truth from the runtime launch itself, the attempt ledger, and the overlay excerpt.
 - For fresh remote full-screen attaches, also capture whether `ui/terminal_mount` emitted `resize_nudge_begin` / `resize_nudge_end`. The nudge is part of the product contract now: it forces a repaint before Yggterm concludes that a live TUI attach is still blank.
 - Do not treat a visible terminal failure overlay as final proof if `shell.terminal_attach_in_flight` still contains the active session path. That is an in-flight recovery state, not a finished verdict.
 - In `Terminal` mode, saved preview context is no longer accepted as a terminal-ready settle. Expect `terminal_settled_kind == "recovering"` until the resume chip clears and the live terminal is visually revealed.
