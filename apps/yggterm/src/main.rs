@@ -18,6 +18,8 @@ use yggterm_server::{
     run_app_control_create_terminal, run_app_control_describe_rows, run_app_control_describe_state,
     run_app_control_drag, run_app_control_dump_state, run_app_control_focus_window,
     run_app_control_list_clients, run_app_control_open_path, run_app_control_remove_session,
+    run_app_control_probe_terminal_viewport_input,
+    run_app_control_probe_terminal_viewport_scroll,
     run_app_control_scroll_preview, run_app_control_send_terminal_input,
     run_app_control_set_fullscreen, run_app_control_set_main_zoom,
     run_app_control_set_maximized, run_app_control_set_preview_layout,
@@ -448,6 +450,54 @@ fn main() -> Result<()> {
                             })
                             .context("missing --data for server app terminal send")?;
                         run_app_control_send_terminal_input(session_path, data, timeout_ms)
+                    }
+                    "probe-type" => {
+                        let session_path = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
+                            .context("missing session path for server app terminal probe-type")?;
+                        let data = args
+                            .windows(2)
+                            .find_map(|window| {
+                                if window[0] == "--data" {
+                                    Some(window[1].as_str())
+                                } else {
+                                    None
+                                }
+                            })
+                            .context("missing --data for server app terminal probe-type")?;
+                        let press_enter = args.iter().any(|arg| arg == "--enter");
+                        let press_tab = args.iter().any(|arg| arg == "--tab");
+                        run_app_control_probe_terminal_viewport_input(
+                            session_path,
+                            data,
+                            press_enter,
+                            press_tab,
+                            timeout_ms,
+                        )
+                    }
+                    "probe-scroll" => {
+                        let session_path = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
+                            .context(
+                                "missing session path for server app terminal probe-scroll",
+                            )?;
+                        let lines = args
+                            .windows(2)
+                            .find_map(|window| {
+                                if window[0] == "--lines" {
+                                    window[1].parse::<i32>().ok()
+                                } else {
+                                    None
+                                }
+                            })
+                            .context("missing --lines for server app terminal probe-scroll")?;
+                        run_app_control_probe_terminal_viewport_scroll(
+                            session_path,
+                            lines,
+                            timeout_ms,
+                        )
                     }
                     other => anyhow::bail!("unsupported app terminal action: {other}"),
                 }

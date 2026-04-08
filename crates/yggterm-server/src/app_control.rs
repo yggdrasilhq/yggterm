@@ -105,6 +105,18 @@ pub enum AppControlCommand {
         session_path: String,
         data: String,
     },
+    ProbeTerminalViewportInput {
+        session_path: String,
+        data: String,
+        #[serde(default)]
+        press_enter: bool,
+        #[serde(default)]
+        press_tab: bool,
+    },
+    ProbeTerminalViewportScroll {
+        session_path: String,
+        lines: i32,
+    },
     RemoveSession {
         session_path: String,
     },
@@ -136,6 +148,8 @@ impl AppControlCommand {
             Self::Drag { .. } => "drag",
             Self::CreateTerminal { .. } => "create_terminal",
             Self::SendTerminalInput { .. } => "send_terminal_input",
+            Self::ProbeTerminalViewportInput { .. } => "probe_terminal_viewport_input",
+            Self::ProbeTerminalViewportScroll { .. } => "probe_terminal_viewport_scroll",
             Self::RemoveSession { .. } => "remove_session",
             Self::SetRowExpanded { .. } => "set_row_expanded",
             Self::DescribeRows => "describe_rows",
