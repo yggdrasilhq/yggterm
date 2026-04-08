@@ -7,6 +7,7 @@ pub mod drag_visuals;
 pub mod notifications;
 pub mod rails;
 mod shell;
+mod terminal_protocol;
 mod terminal_themes;
 pub mod theme;
 mod window_icon;
