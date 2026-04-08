@@ -112,6 +112,8 @@ pub enum AppControlCommand {
         press_enter: bool,
         #[serde(default)]
         press_tab: bool,
+        #[serde(default)]
+        press_ctrl_c: bool,
     },
     ProbeTerminalViewportScroll {
         session_path: String,

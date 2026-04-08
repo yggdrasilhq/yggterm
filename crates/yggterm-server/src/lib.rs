@@ -8396,6 +8396,7 @@ pub fn run_app_control_probe_terminal_viewport_input(
     data: &str,
     press_enter: bool,
     press_tab: bool,
+    press_ctrl_c: bool,
     timeout_ms: u64,
 ) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
@@ -8406,6 +8407,7 @@ pub fn run_app_control_probe_terminal_viewport_input(
             data: data.to_string(),
             press_enter,
             press_tab,
+            press_ctrl_c,
         },
         timeout_ms,
     )?;
@@ -10459,21 +10461,21 @@ fn short_session_id(session_id: &str) -> String {
 mod tests {
     use super::app_control_open_path_ready;
     use super::{
-        ClientInstanceRecord,
-        GhosttyHostSupport, GhosttyTerminalHostMode, ManagedSessionView, PersistedDaemonState,
-        PersistedLiveSession, PersistedStoredSession, PreviewTone, REMOTE_OUTPUT_SENTINEL,
-        RemoteCommandCacheEntry, RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot,
-        RemotePreviewPayload, RemoteScannedSession, SessionKind, SessionMetadataEntry, SessionNode,
-        SessionNodeKind, SessionPreview, SessionPreviewBlock, SessionSource, SnapshotPreview,
-        SnapshotPreviewBlock, SnapshotRenderedSection, SnapshotSessionView, SshConnectTarget,
-        StoredPreviewHydrationMode, TerminalBackend, TerminalLaunchPhase, UiTheme,
-        WorkspaceViewMode, YggtermServer, apply_remote_preview_payload,
-        apply_remote_scanned_session_preview, build_session, canonical_static_label,
-        clear_session_preview_for_loading, current_millis_u64, dedupe_remote_scanned_sessions,
-        legacy_agent_launch_command, legacy_remote_tmux_session_name,
-        load_remote_machine_sessions_from_mirror, managed_session_from_snapshot,
-        mirror_remote_machine_sessions, parse_recent_context_sections, parse_screen_session_ref,
-        parse_stored_transcript, push_preview_block, remote_cache_key, remote_command_cache,
+        ClientInstanceRecord, GhosttyHostSupport, GhosttyTerminalHostMode, ManagedSessionView,
+        PersistedDaemonState, PersistedLiveSession, PersistedStoredSession, PreviewTone,
+        REMOTE_OUTPUT_SENTINEL, RemoteCommandCacheEntry, RemoteDeployState, RemoteMachineHealth,
+        RemoteMachineSnapshot, RemotePreviewPayload, RemoteScannedSession, SessionKind,
+        SessionMetadataEntry, SessionNode, SessionNodeKind, SessionPreview, SessionPreviewBlock,
+        SessionSource, SnapshotPreview, SnapshotPreviewBlock, SnapshotRenderedSection,
+        SnapshotSessionView, SshConnectTarget, StoredPreviewHydrationMode, TerminalBackend,
+        TerminalLaunchPhase, UiTheme, WorkspaceViewMode, YggtermServer,
+        apply_remote_preview_payload, apply_remote_scanned_session_preview, build_session,
+        canonical_static_label, choose_app_control_pid, clear_session_preview_for_loading,
+        current_millis_u64, dedupe_remote_scanned_sessions, legacy_agent_launch_command,
+        legacy_remote_tmux_session_name, load_remote_machine_sessions_from_mirror,
+        managed_session_from_snapshot, mirror_remote_machine_sessions,
+        parse_recent_context_sections, parse_screen_session_ref, parse_stored_transcript,
+        push_preview_block, remote_cache_key, remote_command_cache,
         remote_direct_attach_launch_command, remote_resume_requires_missing_saved_session_failure,
         remote_resume_runtime_output_mismatches_managed_session,
         remote_resume_runtime_output_requires_restart, remote_resume_shell_command,
@@ -10483,7 +10485,7 @@ mod tests {
         remote_snapshot_looks_like_shell_prompt, remote_ssh_launch_command,
         remote_tmux_session_name, sanitize_recent_context_payload, screen_attach_shell_command,
         screen_resume_or_spawn_shell_command, session_metadata_value, should_fallback_to_python,
-        stored_session_launch_command, strip_remote_payload_noise, choose_app_control_pid,
+        stored_session_launch_command, strip_remote_payload_noise,
         synthesize_remote_scanned_session_view, upsert_session_metadata,
     };
     use crate::SessionRenderedSection;
