@@ -16764,20 +16764,7 @@ fn SidebarRow(
                             "display:inline-flex; align-items:center; justify-content:center; width:20px; min-width:20px; height:20px; color:{};",
                             icon_color
                         ),
-                        if row.kind == BrowserRowKind::Group {
-                            DisclosureIcon { expanded: row.expanded }
-                        } else {
-                            TreeIcon { row: row.clone() }
-                        }
-                    }
-                    if row.kind == BrowserRowKind::Group {
-                        div {
-                            style: format!(
-                                "display:inline-flex; align-items:center; justify-content:center; width:20px; min-width:20px; height:20px; color:{};",
-                                icon_color
-                            ),
-                            TreeIcon { row: row.clone() }
-                        }
+                        TreeIcon { row: row.clone() }
                     }
                     if renaming {
                         input {
@@ -17076,20 +17063,6 @@ fn TreeIcon(row: BrowserRow) -> Element {
                     stroke_opacity: "0.42",
                 }
             }
-        }
-    }
-}
-
-#[component]
-fn DisclosureIcon(expanded: bool) -> Element {
-    let rotation = if expanded { "90deg" } else { "0deg" };
-    rsx! {
-        span {
-            style: format!(
-                "display:inline-flex; align-items:center; justify-content:center; width:14px; height:14px; \
-                 font-size:10px; font-weight:800; line-height:1; transform:rotate({rotation}); transition:transform 120ms ease;"
-            ),
-            "▸"
         }
     }
 }
