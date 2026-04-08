@@ -809,7 +809,9 @@ fn terminal_host_geometry_problem_for_app_control(host: &Value) -> Option<&'stat
         && width_delta <= 18.0
         && (screen_width - helpers_width).abs() <= 4.0
         && (host_width - viewport_width).abs() <= 4.0;
-    if host_width >= 240.0 && screen_width >= 200.0 && width_delta > 12.0
+    if host_width >= 240.0
+        && screen_width >= 200.0
+        && width_delta > 12.0
         && !compensated_screen_width_gap
     {
         return Some("active terminal host geometry does not match the xterm screen width");

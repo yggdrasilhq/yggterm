@@ -2129,7 +2129,9 @@ impl ShellState {
             let Some(session_path) = terminal_resume_notification_session_path(job_key) else {
                 return true;
             };
-            keep_path.as_deref().is_some_and(|keep_path| keep_path == session_path)
+            keep_path
+                .as_deref()
+                .is_some_and(|keep_path| keep_path == session_path)
                 && keep_is_still_recovering
         });
     }
@@ -12593,7 +12595,13 @@ async fn scroll_preview_viewport_for(
     }
 }
 
-async fn probe_terminal_viewport_input_for(session_path: &str, data: &str, press_enter: bool, press_tab: bool) -> Value {
+async fn probe_terminal_viewport_input_for(
+    session_path: &str,
+    data: &str,
+    press_enter: bool,
+    press_tab: bool,
+    press_ctrl_c: bool,
+) -> Value {
     let session_path_literal =
         serde_json::to_string(session_path).unwrap_or_else(|_| "null".to_string());
     let data_literal = serde_json::to_string(data).unwrap_or_else(|_| "\"\"".to_string());
@@ -12605,6 +12613,7 @@ async fn probe_terminal_viewport_input_for(session_path: &str, data: &str, press
                 const text = {data_literal};
                 const pressEnter = {press_enter};
                 const pressTab = {press_tab};
+                const pressCtrlC = {press_ctrl_c};
                 const registry = window.__yggtermXtermHosts || {{}};
                 const entries = Object.values(registry)
                     .filter((entry) => entry && entry.term && entry.sessionPath === sessionPath)
@@ -12701,6 +12710,8 @@ async fn probe_terminal_viewport_input_for(session_path: &str, data: &str, press
                     }}
                     return {{ key: char, code: '', keyCode: char.length === 1 ? char.charCodeAt(0) : 0, shiftKey: false }};
                 }};
+                let usedCoreTrigger = false;
+                let usedTermInput = false;
                 const dispatchKey = async (spec) => {{
                     const keyInit = {{
                         key: spec.key,
@@ -12723,17 +12734,93 @@ async fn probe_terminal_viewport_input_for(session_path: &str, data: &str, press
                     target.dispatchEvent(new KeyboardEvent('keyup', keyInit));
                     await settle(18);
                 }};
+                const sendViaCoreTrigger = async (payload, wasUserInput = true) => {{
+                    const trigger = entry.term
+                        && entry.term._core
+                        && entry.term._core.coreService
+                        && typeof entry.term._core.coreService.triggerDataEvent === 'function'
+                        ? entry.term._core.coreService.triggerDataEvent.bind(entry.term._core.coreService)
+                        : null;
+                    if (!trigger) {{
+                        return false;
+                    }}
+                    try {{
+                        trigger(String(payload || ''), Boolean(wasUserInput));
+                        usedCoreTrigger = true;
+                        await settle(28);
+                        return true;
+                    }} catch (_error) {{
+                        return false;
+                    }}
+                }};
+                const sendViaTermInput = async (payload, wasUserInput = true) => {{
+                    if (!entry.term || typeof entry.term.input !== 'function') {{
+                        return false;
+                    }}
+                    try {{
+                        entry.term.input(String(payload || ''), Boolean(wasUserInput));
+                        usedTermInput = true;
+                        await settle(28);
+                        return true;
+                    }} catch (_error) {{
+                        return false;
+                    }}
+                }};
+                const dispatchTextInput = async (chunk) => {{
+                    const textChunk = String(chunk || '');
+                    if (!textChunk) {{
+                        return;
+                    }}
+                    if ((await sendViaCoreTrigger(textChunk, true))
+                        || (await sendViaTermInput(textChunk, true))) {{
+                        return;
+                    }}
+                    if (!helperTextarea) {{
+                        for (const char of Array.from(textChunk)) {{
+                            await dispatchKey(keySpecForChar(char));
+                        }}
+                        return;
+                    }}
+                    helperTextarea.value = textChunk;
+                    helperTextarea.dispatchEvent(new InputEvent('beforeinput', {{
+                        bubbles: true,
+                        cancelable: true,
+                        composed: true,
+                        data: textChunk,
+                        inputType: 'insertText',
+                    }}));
+                    helperTextarea.dispatchEvent(new InputEvent('input', {{
+                        bubbles: true,
+                        cancelable: false,
+                        composed: true,
+                        data: textChunk,
+                        inputType: 'insertText',
+                    }}));
+                    await settle(24);
+                }};
                 focusTarget();
                 await settle(35);
                 const before = snapshot();
-                for (const char of Array.from(text || '')) {{
-                    await dispatchKey(keySpecForChar(char));
+                if (pressCtrlC) {{
+                    if (!(await sendViaCoreTrigger('\u0003', true))
+                        && !(await sendViaTermInput('\u0003', true))) {{
+                        await dispatchKey({{ key: 'c', code: 'KeyC', keyCode: 67, ctrlKey: true }});
+                    }}
+                }}
+                if (text) {{
+                    await dispatchTextInput(text);
                 }}
                 if (pressTab) {{
-                    await dispatchKey({{ key: 'Tab', code: 'Tab', keyCode: 9 }});
+                    if (!(await sendViaCoreTrigger('\t', true))
+                        && !(await sendViaTermInput('\t', true))) {{
+                        await dispatchKey({{ key: 'Tab', code: 'Tab', keyCode: 9 }});
+                    }}
                 }}
                 if (pressEnter) {{
-                    await dispatchKey({{ key: 'Enter', code: 'Enter', keyCode: 13 }});
+                    if (!(await sendViaCoreTrigger('\r', true))
+                        && !(await sendViaTermInput('\r', true))) {{
+                        await dispatchKey({{ key: 'Enter', code: 'Enter', keyCode: 13 }});
+                    }}
                 }}
                 await settle(140);
                 dioxus.send({{
@@ -12745,6 +12832,9 @@ async fn probe_terminal_viewport_input_for(session_path: &str, data: &str, press
                     typed_text: text,
                     press_enter: pressEnter,
                     press_tab: pressTab,
+                    press_ctrl_c: pressCtrlC,
+                    used_core_trigger: usedCoreTrigger,
+                    used_term_input: usedTermInput,
                 }});
             }} catch (error) {{
                 dioxus.send({{
@@ -12759,6 +12849,7 @@ async fn probe_terminal_viewport_input_for(session_path: &str, data: &str, press
         data_literal = data_literal,
         press_enter = if press_enter { "true" } else { "false" },
         press_tab = if press_tab { "true" } else { "false" },
+        press_ctrl_c = if press_ctrl_c { "true" } else { "false" },
     );
     let mut eval = document::eval(&script);
     match eval.recv::<Value>().await {
@@ -13439,10 +13530,16 @@ async fn process_pending_app_control_requests(
             data,
             press_enter,
             press_tab,
+            press_ctrl_c,
         } => {
-            let result =
-                probe_terminal_viewport_input_for(&session_path, &data, press_enter, press_tab)
-                    .await;
+            let result = probe_terminal_viewport_input_for(
+                &session_path,
+                &data,
+                press_enter,
+                press_tab,
+                press_ctrl_c,
+            )
+            .await;
             AppControlResponse {
                 request_id: request.request_id.clone(),
                 handled_by_pid: std::process::id(),
