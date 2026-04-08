@@ -1,9 +1,11 @@
 [workspace]
 members = [
   "apps/yggterm",
+  "crates/yggui-contract",
   "crates/yggterm-core",
   "crates/yggterm-server",
   "crates/yggui",
+  "crates/yggterm-shell",
   "crates/yggterm-gtk-glue",
   "crates/yggterm-platform",
   "crates/yggterm-ghostty-bridge",
