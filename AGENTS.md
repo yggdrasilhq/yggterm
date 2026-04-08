@@ -76,6 +76,7 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 - For incremental development releases, always bump the patch version (e.g. `0.1.0` -> `0.1.1`) before packaging.
 - For GUI fixes, do not mark the issue as solved until it has been self-tested live on a different X11 display. Use `x11automation` when helpful for reliable interaction/click targeting. If only build/test validation was done, state that explicitly instead of claiming the GUI issue is fixed.
 - When touching terminal UX, resume behavior, or app-control truth, update and run the local checklist at `.todos/terminal-ux-smoketests.md` before handover. Keep the checklist untracked, but keep this reference in sync.
+- Screenshot review must be explicit, not impressionistic. When validating a GUI screenshot, classify each region separately: viewport content, floating toasts/overlays, title/session chip, sidebar affordances, and cursor/input position. Do not infer "no toast", "no arrows", or similar UI absence from memory, nearby state, or prior runs; confirm it from the exact image being discussed and cross-check with app-control state when possible.
 
 ## Licensing
 
