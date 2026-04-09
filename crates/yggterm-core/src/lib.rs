@@ -102,7 +102,8 @@ pub struct AppSettings {
     pub tree_width: f32,
     pub rendered_font_size: f32,
     pub terminal_font_size: f32,
-    pub terminal_theme_name: String,
+    pub terminal_light_theme_name: String,
+    pub terminal_dark_theme_name: String,
     pub ui_font_size: f32,
     pub prefer_ghostty_backend: bool,
     pub litellm_endpoint: String,
@@ -126,7 +127,8 @@ impl Default for AppSettings {
             tree_width: 300.0,
             rendered_font_size: 10.0,
             terminal_font_size: 13.0,
-            terminal_theme_name: String::new(),
+            terminal_light_theme_name: "VS Code Light+".to_string(),
+            terminal_dark_theme_name: "Dark+".to_string(),
             ui_font_size: 14.0,
             prefer_ghostty_backend: true,
             litellm_endpoint: String::new(),
@@ -526,9 +528,22 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
         settings.terminal_font_size =
             serde_json::from_value(value.clone()).context("failed to parse terminal_font_size")?;
     }
-    if let Some(value) = object.get("terminal_theme_name") {
-        settings.terminal_theme_name =
-            serde_json::from_value(value.clone()).context("failed to parse terminal_theme_name")?;
+    if let Some(value) = object.get("terminal_light_theme_name") {
+        settings.terminal_light_theme_name = serde_json::from_value(value.clone())
+            .context("failed to parse terminal_light_theme_name")?;
+    }
+    if let Some(value) = object.get("terminal_dark_theme_name") {
+        settings.terminal_dark_theme_name = serde_json::from_value(value.clone())
+            .context("failed to parse terminal_dark_theme_name")?;
+    }
+    if let Some(value) = object.get("terminal_theme_name")
+        && !object.contains_key("terminal_light_theme_name")
+        && !object.contains_key("terminal_dark_theme_name")
+    {
+        let shared_theme = serde_json::from_value::<String>(value.clone())
+            .context("failed to parse terminal_theme_name")?;
+        settings.terminal_light_theme_name = shared_theme.clone();
+        settings.terminal_dark_theme_name = shared_theme;
     }
     if let Some(value) = object.get("ui_font_size") {
         settings.ui_font_size =
@@ -586,7 +601,8 @@ fn serialize_settings_value(settings: &AppSettings) -> Value {
         "tree_width": settings.tree_width,
         "rendered_font_size": settings.rendered_font_size,
         "terminal_font_size": settings.terminal_font_size,
-        "terminal_theme_name": settings.terminal_theme_name,
+        "terminal_light_theme_name": settings.terminal_light_theme_name,
+        "terminal_dark_theme_name": settings.terminal_dark_theme_name,
         "ui_font_size": settings.ui_font_size,
         "prefer_ghostty_backend": settings.prefer_ghostty_backend,
         "litellm_endpoint": settings.litellm_endpoint,
@@ -1379,5 +1395,15 @@ mod tests {
                 .iter()
                 .any(|row| row.full_path == "/workspace/machine-a/nested/session-1")
         );
+    }
+
+    #[test]
+    fn settings_upgrade_legacy_terminal_theme_into_both_modes() {
+        let parsed = parse_settings_value(&serde_json::json!({
+            "terminal_theme_name": "Aardvark Blue"
+        }))
+        .expect("legacy settings should parse");
+        assert_eq!(parsed.terminal_light_theme_name, "Aardvark Blue");
+        assert_eq!(parsed.terminal_dark_theme_name, "Aardvark Blue");
     }
 }
