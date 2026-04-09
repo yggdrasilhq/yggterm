@@ -81,6 +81,7 @@ Observability note: the terminal attempt ledger, viewport classifier, and app-co
 - Exception: the stable retained-xterm layout may present `screen_rect/helpers_rect` about `16px` narrower than `host_rect` while `viewport_rect` still matches the host. That compensated gap is now accepted and should not be treated as a failed proof by itself.
 - For startup latency claims, include whether the daemon emitted `daemon/startup_prewarm begin|end|error` for the active terminal. Startup restore should now be prewarmed after the control socket binds instead of waiting for the first UI mount to pay the whole cost.
 - For remote terminal startup restore, also capture whether the initial attach stream included `__YGGTERM_ATTACH_READY__`. That server marker now means the PTY attach itself is live even when Codex is sitting on low-signal idle/footer chrome.
+- Once `__YGGTERM_ATTACH_READY__` has arrived, a quiet attached terminal is allowed to settle after the reveal grace deadline even if no fresh meaningful text appears. The same applies to normal idle/prompt/footer terminal surfaces that are not transport errors or transcript placeholders. Do not keep waiting forever just because the remote session stayed silent.
 - For loading-truth bugs, capture one state while `active_surface_requests` still contains the terminal request and one after settle so the bundle shows that the UI did not silently drop the request before attach finished.
 - Keep changelog language user-visible and concise.
 - Treat demo assets as release material, not disposable debugging leftovers.
