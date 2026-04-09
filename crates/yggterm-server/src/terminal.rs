@@ -548,7 +548,6 @@ impl PtySessionRuntime {
                 select_initial_attach_chunks_for_launch(&retained_chunks, &self.launch_command);
         }
         if cursor == 0
-            && !chunks.is_empty()
             && self.is_running()
             && launch_command_looks_like_remote_resume_attach(&self.launch_command)
         {
