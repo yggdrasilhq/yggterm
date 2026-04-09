@@ -8,6 +8,8 @@ pub(crate) enum TerminalJsCommand {
         background: String,
         foreground: String,
         cursor: String,
+        cursor_text: String,
+        dim_foreground: String,
         selection: String,
         black: String,
         red: String,
