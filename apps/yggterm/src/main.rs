@@ -19,7 +19,8 @@ use yggterm_server::{
     run_app_control_describe_rows, run_app_control_describe_state, run_app_control_drag,
     run_app_control_dump_state, run_app_control_focus_window, run_app_control_list_clients,
     run_app_control_open_path, run_app_control_probe_terminal_viewport_input,
-    run_app_control_probe_terminal_viewport_scroll, run_app_control_remove_session,
+    run_app_control_probe_terminal_viewport_scroll, run_app_control_probe_terminal_viewport_select,
+    run_app_control_remove_session,
     run_app_control_scroll_preview, run_app_control_send_terminal_input,
     run_app_control_set_fullscreen, run_app_control_set_main_zoom, run_app_control_set_maximized,
     run_app_control_set_preview_layout, run_app_control_set_row_expanded,
@@ -534,6 +535,13 @@ fn main() -> Result<()> {
                             lines,
                             timeout_ms,
                         )
+                    }
+                    "probe-select" => {
+                        let session_path = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
+                            .context("missing session path for server app terminal probe-select")?;
+                        run_app_control_probe_terminal_viewport_select(session_path, timeout_ms)
                     }
                     other => anyhow::bail!("unsupported app terminal action: {other}"),
                 }
