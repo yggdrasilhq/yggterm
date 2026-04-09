@@ -2504,14 +2504,22 @@ impl ShellState {
     }
 
     fn set_terminal_theme_name(&mut self, value: String) {
-        self.settings.terminal_theme_name = value;
+        self.settings.terminal_theme_name = if value == FOLLOW_UI_TERMINAL_THEME_LABEL {
+            String::new()
+        } else {
+            value
+        };
         self.persist_settings();
         let selected = self.effective_terminal_theme_name();
         self.last_action = format!("terminal theme {selected}");
     }
 
     fn set_ui_theme(&mut self, theme: UiTheme) {
+        if self.settings.theme == theme {
+            return;
+        }
         self.settings.theme = theme;
+        self.server.sync_theme(theme);
         self.persist_settings();
         self.last_action = match theme {
             UiTheme::ZedLight => "light theme".to_string(),
@@ -5297,6 +5305,7 @@ fn app_control_command_defers_background_refresh(command: &AppControlCommand) ->
     matches!(
         command,
         AppControlCommand::SetSearch { .. }
+            | AppControlCommand::SetUiTheme { .. }
             | AppControlCommand::CreateTerminal { .. }
             | AppControlCommand::OpenPath { .. }
             | AppControlCommand::SendTerminalInput { .. }
@@ -11917,6 +11926,10 @@ fn describe_app_state_snapshot(
         .collect::<Vec<_>>();
     selected_tree_paths.sort();
     let settings_snapshot = json!({
+        "theme": match shell.settings.theme {
+            UiTheme::ZedLight => "light",
+            UiTheme::ZedDark => "dark",
+        },
         "interface_font_size": shell.settings.ui_font_size,
         "interface_zoom_percent": zoom_percent_f32(shell.settings.ui_font_size, 14.0),
         "rendered_font_size": shell.settings.rendered_font_size,
@@ -11924,6 +11937,7 @@ fn describe_app_state_snapshot(
         "terminal_font_size": shell.settings.terminal_font_size,
         "terminal_zoom_percent": zoom_percent_f32(shell.settings.terminal_font_size, 10.0),
         "terminal_theme_name": shell.settings.terminal_theme_name,
+        "effective_terminal_theme_name": shell.effective_terminal_theme_name(),
     });
     json!({
         "window": describe_window(desktop),
@@ -12358,6 +12372,11 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     background_color: style.backgroundColor,
                     foreground_color: style.color,
                     font_family: style.fontFamily,
+                    xterm_font_family: term ? String(term.options.fontFamily || '') : null,
+                    xterm_font_weight: term ? String(term.options.fontWeight || '') : null,
+                    xterm_font_weight_bold: term ? String(term.options.fontWeightBold || '') : null,
+                    xterm_theme_background: term && term.options.theme ? String(term.options.theme.background || '') : null,
+                    xterm_theme_foreground: term && term.options.theme ? String(term.options.theme.foreground || '') : null,
                     xterm_present: Boolean(xtermRoot),
                     helpers_present: Boolean(helpers),
                     helper_textarea_present: Boolean(helperTextarea),
@@ -13163,6 +13182,38 @@ async fn process_pending_app_control_requests(
                     "query": query,
                     "query_trimmed": query_trimmed,
                     "focused": focused,
+                    "window": describe_window(&desktop),
+                    "active_view_mode": format!("{:?}", state.read().server.active_view_mode()),
+                    "active_session_path": state.read().server.active_session_path(),
+                    "dom": dom_snapshot,
+                    "state": state_snapshot,
+                })),
+                error: None,
+            }
+        }
+        AppControlCommand::SetUiTheme { theme } => {
+            let _ = safe_shell_mut(state, "app_control_set_ui_theme", |shell| {
+                shell.set_ui_theme(theme);
+            });
+            sleep(Duration::from_millis(60)).await;
+            let dom_snapshot = capture_dom_debug_snapshot_for(active_session_path.as_deref()).await;
+            let mut state_snapshot = describe_app_state_snapshot(&state, &desktop);
+            let viewport = describe_viewport_snapshot(&state_snapshot, &dom_snapshot);
+            if let Some(map) = state_snapshot.as_object_mut() {
+                map.insert("dom".to_string(), dom_snapshot.clone());
+                map.insert("viewport".to_string(), viewport);
+            }
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(json!({
+                    "command": "set_ui_theme",
+                    "theme": match theme {
+                        UiTheme::ZedLight => "light",
+                        UiTheme::ZedDark => "dark",
+                    },
                     "window": describe_window(&desktop),
                     "active_view_mode": format!("{:?}", state.read().server.active_view_mode()),
                     "active_session_path": state.read().server.active_session_path(),
@@ -19741,6 +19792,7 @@ fn TerminalCanvas(
         terminal_frame.host_radius, theme.background,
     );
     let future_theme = theme.clone();
+    let theme_signature = terminal_theme_signature(&theme);
     let trace_home = perf_home_dir(&state.read().bootstrap.settings_path);
     let snapshot_resume_overlay_excerpt = snapshot
         .active_summary
@@ -19923,7 +19975,7 @@ fn TerminalCanvas(
             }
         });
     }
-    let apply_host_key = format!("apply-host:{host_id}:{bootstrap_identity}");
+    let apply_host_key = format!("apply-host:{host_id}:{bootstrap_identity}:{theme_signature}");
     if *apply_host_theme_identity.read() != apply_host_key {
         apply_host_theme_identity.set(apply_host_key);
         let host_id = host_id.clone();
@@ -19933,7 +19985,8 @@ fn TerminalCanvas(
         });
     }
     if snapshot.active_view_mode == WorkspaceViewMode::Terminal {
-        let apply_session_key = format!("apply-session:{session_path}:{bootstrap_identity}");
+        let apply_session_key =
+            format!("apply-session:{session_path}:{bootstrap_identity}:{theme_signature}");
         if *apply_session_theme_identity.read() != apply_session_key {
             apply_session_theme_identity.set(apply_session_key);
             let session_path = session_path.clone();
@@ -22245,6 +22298,13 @@ fn terminal_theme(
     }
 }
 
+fn terminal_theme_signature(theme: &TerminalTheme) -> String {
+    format!(
+        "{}|{}|{}|{}|{}",
+        theme.background, theme.foreground, theme.cursor, theme.selection, theme.font_size
+    )
+}
+
 fn terminal_loading_notice_text(session: &ManagedSessionView) -> Option<String> {
     if !session.session_path.starts_with("remote-session://") {
         return None;
@@ -22265,6 +22325,49 @@ fn terminal_loading_notice_text(session: &ManagedSessionView) -> Option<String> 
     }
     lines.push("Waiting for the remote terminal to paint...".to_string());
     Some(format!("{}\r\n", lines.join("\r\n")))
+}
+
+const FOLLOW_UI_TERMINAL_THEME_LABEL: &str = "Follow UI Theme";
+const TERMINAL_FONT_FAMILY: &str = "'JetBrains Mono', 'Iosevka Term', 'Fira Code', monospace";
+
+fn terminal_hex_channel(value: &str) -> Option<u8> {
+    u8::from_str_radix(value, 16).ok()
+}
+
+fn terminal_theme_is_dark(theme: &TerminalTheme) -> bool {
+    let background = theme.background.trim().trim_start_matches('#');
+    if background.len() != 6 {
+        return false;
+    }
+    let red = terminal_hex_channel(&background[0..2]).unwrap_or(255) as f32 / 255.0;
+    let green = terminal_hex_channel(&background[2..4]).unwrap_or(255) as f32 / 255.0;
+    let blue = terminal_hex_channel(&background[4..6]).unwrap_or(255) as f32 / 255.0;
+    let luminance = (0.2126 * red) + (0.7152 * green) + (0.0722 * blue);
+    luminance < 0.5
+}
+
+fn terminal_font_weight(theme: &TerminalTheme) -> u16 {
+    if terminal_theme_is_dark(theme) {
+        500
+    } else {
+        540
+    }
+}
+
+fn terminal_font_weight_bold(theme: &TerminalTheme) -> u16 {
+    if terminal_theme_is_dark(theme) {
+        700
+    } else {
+        740
+    }
+}
+
+fn terminal_font_smoothing(theme: &TerminalTheme) -> &'static str {
+    if terminal_theme_is_dark(theme) {
+        "antialiased"
+    } else {
+        "subpixel-antialiased"
+    }
 }
 
 fn xterm_assets_bootstrap_script() -> String {
@@ -22464,6 +22567,20 @@ fn terminal_eval_script(
         serde_json::to_string(&theme.bright_white).expect("serialize terminal bright white");
     let initial_input_enabled =
         serde_json::to_string(&initial_input_enabled).expect("serialize initial input enabled");
+    let font_family =
+        serde_json::to_string(TERMINAL_FONT_FAMILY).expect("serialize terminal font family");
+    let font_weight = serde_json::to_string(&terminal_font_weight(theme))
+        .expect("serialize terminal font weight");
+    let font_weight_bold = serde_json::to_string(&terminal_font_weight_bold(theme))
+        .expect("serialize terminal bold font weight");
+    let font_smoothing = serde_json::to_string(terminal_font_smoothing(theme))
+        .expect("serialize terminal font smoothing");
+    let moz_font_smoothing = serde_json::to_string(if terminal_theme_is_dark(theme) {
+        "grayscale"
+    } else {
+        "auto"
+    })
+    .expect("serialize terminal moz font smoothing");
     let constructed_debug = if cfg!(debug_assertions) {
         "dioxus.send({ kind: \"debug\", message: `constructed host=${hostId} fontSize=${term.options.fontSize} cols=${term.cols} rows=${term.rows}` });"
     } else {
@@ -22620,10 +22737,10 @@ fn terminal_eval_script(
             allowTransparency: false,
             convertEol: true,
             cursorBlink: true,
-            fontFamily: "'JetBrains Mono', 'Iosevka Term', 'Fira Code', monospace",
+            fontFamily: {font_family},
             fontSize: {font_size},
-            fontWeight: "500",
-            fontWeightBold: "700",
+            fontWeight: {font_weight},
+            fontWeightBold: {font_weight_bold},
             minimumContrastRatio: 6,
             scrollback: 5000,
             theme: {{
@@ -22662,11 +22779,19 @@ fn terminal_eval_script(
             runtimeStyle.textContent = `
                 #${{hostId}} .xterm,
                 #${{hostId}} .xterm-helpers,
-                #${{hostId}} .xterm-rows {{
+                #${{hostId}} .xterm-rows,
+                #${{hostId}} .xterm .xterm-rows span,
+                #${{hostId}} .xterm-helper-textarea {{
                     margin: 0 !important;
                     padding: 0 !important;
                     width: 100% !important;
                     box-sizing: border-box !important;
+                    font-family: {font_family} !important;
+                    font-weight: {font_weight} !important;
+                    font-feature-settings: "calt" 0, "liga" 0 !important;
+                    text-rendering: geometricPrecision !important;
+                    -webkit-font-smoothing: {font_smoothing} !important;
+                    -moz-osx-font-smoothing: {moz_font_smoothing} !important;
                 }}
                 #${{hostId}} .xterm {{
                     height: 100% !important;
@@ -23175,7 +23300,10 @@ fn terminal_eval_script(
         bright_white = bright_white,
         initial_input_enabled = initial_input_enabled,
         constructed_debug = constructed_debug,
-        reset_debug = reset_debug
+        reset_debug = reset_debug,
+        font_family = font_family,
+        font_weight = font_weight,
+        font_weight_bold = font_weight_bold
     )
 }
 
@@ -23210,6 +23338,20 @@ fn terminal_apply_script(host_id: &str, theme: &TerminalTheme) -> String {
         serde_json::to_string(&theme.bright_cyan).expect("serialize terminal bright cyan");
     let bright_white =
         serde_json::to_string(&theme.bright_white).expect("serialize terminal bright white");
+    let font_family =
+        serde_json::to_string(TERMINAL_FONT_FAMILY).expect("serialize terminal font family");
+    let font_weight = serde_json::to_string(&terminal_font_weight(theme))
+        .expect("serialize terminal font weight");
+    let font_weight_bold = serde_json::to_string(&terminal_font_weight_bold(theme))
+        .expect("serialize terminal bold font weight");
+    let font_smoothing = serde_json::to_string(terminal_font_smoothing(theme))
+        .expect("serialize terminal font smoothing");
+    let moz_font_smoothing = serde_json::to_string(if terminal_theme_is_dark(theme) {
+        "grayscale"
+    } else {
+        "auto"
+    })
+    .expect("serialize terminal moz font smoothing");
     format!(
         r#"
         (() => {{
@@ -23219,7 +23361,14 @@ fn terminal_apply_script(host_id: &str, theme: &TerminalTheme) -> String {
           if (!entry || !entry.term) {{
             return;
           }}
+          entry.term.options.fontFamily = {font_family};
           entry.term.options.fontSize = {font_size};
+          entry.term.options.fontWeight = {font_weight};
+          entry.term.options.fontWeightBold = {font_weight_bold};
+          if (entry.host) {{
+            entry.host.style.webkitFontSmoothing = {font_smoothing};
+            entry.host.style.MozOsxFontSmoothing = {moz_font_smoothing};
+          }}
           entry.term.options.theme = {{
             background: {background},
             foreground: {foreground},
@@ -23278,6 +23427,11 @@ fn terminal_apply_script(host_id: &str, theme: &TerminalTheme) -> String {
         bright_magenta = bright_magenta,
         bright_cyan = bright_cyan,
         bright_white = bright_white,
+        font_family = font_family,
+        font_weight = font_weight,
+        font_weight_bold = font_weight_bold,
+        font_smoothing = font_smoothing,
+        moz_font_smoothing = moz_font_smoothing,
     )
 }
 
@@ -23335,6 +23489,20 @@ fn terminal_apply_script_for_session(session_path: &str, theme: &TerminalTheme) 
         serde_json::to_string(&theme.bright_cyan).expect("serialize terminal bright cyan");
     let bright_white =
         serde_json::to_string(&theme.bright_white).expect("serialize terminal bright white");
+    let font_family =
+        serde_json::to_string(TERMINAL_FONT_FAMILY).expect("serialize terminal font family");
+    let font_weight = serde_json::to_string(&terminal_font_weight(theme))
+        .expect("serialize terminal font weight");
+    let font_weight_bold = serde_json::to_string(&terminal_font_weight_bold(theme))
+        .expect("serialize terminal bold font weight");
+    let font_smoothing = serde_json::to_string(terminal_font_smoothing(theme))
+        .expect("serialize terminal font smoothing");
+    let moz_font_smoothing = serde_json::to_string(if terminal_theme_is_dark(theme) {
+        "grayscale"
+    } else {
+        "auto"
+    })
+    .expect("serialize terminal moz font smoothing");
     format!(
         r#"
         (() => {{
@@ -23347,7 +23515,14 @@ fn terminal_apply_script_for_session(session_path: &str, theme: &TerminalTheme) 
           if (!entry || !entry.term) {{
             return;
           }}
+          entry.term.options.fontFamily = {font_family};
           entry.term.options.fontSize = {font_size};
+          entry.term.options.fontWeight = {font_weight};
+          entry.term.options.fontWeightBold = {font_weight_bold};
+          if (entry.host) {{
+            entry.host.style.webkitFontSmoothing = {font_smoothing};
+            entry.host.style.MozOsxFontSmoothing = {moz_font_smoothing};
+          }}
           entry.term.options.theme = {{
             background: {background},
             foreground: {foreground},
@@ -23407,6 +23582,11 @@ fn terminal_apply_script_for_session(session_path: &str, theme: &TerminalTheme) 
         bright_magenta = bright_magenta,
         bright_cyan = bright_cyan,
         bright_white = bright_white,
+        font_family = font_family,
+        font_weight = font_weight,
+        font_weight_bold = font_weight_bold,
+        font_smoothing = font_smoothing,
+        moz_font_smoothing = moz_font_smoothing,
     )
 }
 
@@ -23621,12 +23801,10 @@ fn SettingsRailBody(
     on_adjust_main_zoom: EventHandler<i32>,
     on_set_terminal_theme_name: EventHandler<String>,
 ) -> Element {
-    let terminal_theme_options = terminal_theme_names();
+    let mut terminal_theme_options = vec![FOLLOW_UI_TERMINAL_THEME_LABEL.to_string()];
+    terminal_theme_options.extend(terminal_theme_names());
     let selected_terminal_theme = if snapshot.settings.terminal_theme_name.trim().is_empty() {
-        match snapshot.settings.theme {
-            UiTheme::ZedLight => "VS Code Light+".to_string(),
-            UiTheme::ZedDark => "Dark+".to_string(),
-        }
+        FOLLOW_UI_TERMINAL_THEME_LABEL.to_string()
     } else {
         snapshot.settings.terminal_theme_name.clone()
     };
@@ -24734,12 +24912,32 @@ fn ThemeSettingsSection(
             div {
                 style: format!(
                     "display:flex; flex-direction:column; gap:8px; padding:9px; border-radius:14px; \
-                     background:rgba(255,255,255,0.56); box-shadow: inset 0 0 0 1px rgba(196,214,228,0.42);"
+                     background:{}; box-shadow: inset 0 0 0 1px {};",
+                    if palette_is_dark(palette) {
+                        "rgba(15,21,27,0.88)"
+                    } else {
+                        "rgba(255,255,255,0.56)"
+                    },
+                    if palette_is_dark(palette) {
+                        "rgba(93,116,134,0.42)"
+                    } else {
+                        "rgba(196,214,228,0.42)"
+                    }
                 ),
                 div {
                     style: format!(
                         "display:flex; align-items:center; gap:5px; height:34px; padding:4px; border-radius:999px; \
-                         background:rgba(236,242,247,0.94); box-shadow: inset 0 0 0 1px rgba(210,221,232,0.92);"
+                         background:{}; box-shadow: inset 0 0 0 1px {};",
+                        if palette_is_dark(palette) {
+                            "rgba(11,16,21,0.92)"
+                        } else {
+                            "rgba(236,242,247,0.94)"
+                        },
+                        if palette_is_dark(palette) {
+                            "rgba(93,116,134,0.42)"
+                        } else {
+                            "rgba(210,221,232,0.92)"
+                        }
                     ),
                     button {
                         style: segmented_pill_button_style(palette, selected_theme == UiTheme::ZedLight),
@@ -24755,9 +24953,19 @@ fn ThemeSettingsSection(
                 button {
                     style: format!(
                         "display:flex; align-items:center; justify-content:space-between; height:34px; padding:0 12px; \
-                         border:none; border-radius:11px; background:rgba(255,255,255,0.86); color:{}; \
-                         box-shadow: inset 0 0 0 1px rgba(208,219,229,0.85); font-size:12px; font-weight:700;",
-                        palette.text
+                         border:none; border-radius:11px; background:{}; color:{}; \
+                         box-shadow: inset 0 0 0 1px {}; font-size:12px; font-weight:700;",
+                        if palette_is_dark(palette) {
+                            "rgba(21,28,35,0.94)"
+                        } else {
+                            "rgba(255,255,255,0.86)"
+                        },
+                        palette.text,
+                        if palette_is_dark(palette) {
+                            "rgba(93,116,134,0.56)"
+                        } else {
+                            "rgba(208,219,229,0.85)"
+                        }
                     ),
                     onclick: move |evt| on_open_editor.call(evt),
                     span { "Edit Theme" }
@@ -24793,12 +25001,32 @@ fn NotificationSettingsSection(
             div {
                 style: format!(
                     "display:flex; flex-direction:column; gap:8px; padding:9px; border-radius:14px; \
-                     background:rgba(255,255,255,0.56); box-shadow: inset 0 0 0 1px rgba(196,214,228,0.42);"
+                     background:{}; box-shadow: inset 0 0 0 1px {};",
+                    if palette_is_dark(palette) {
+                        "rgba(15,21,27,0.88)"
+                    } else {
+                        "rgba(255,255,255,0.56)"
+                    },
+                    if palette_is_dark(palette) {
+                        "rgba(93,116,134,0.42)"
+                    } else {
+                        "rgba(196,214,228,0.42)"
+                    }
                 ),
                 div {
                     style: format!(
                         "display:flex; align-items:center; gap:5px; height:34px; padding:4px; border-radius:999px; \
-                         background:rgba(236,242,247,0.94); box-shadow: inset 0 0 0 1px rgba(210,221,232,0.92);"
+                         background:{}; box-shadow: inset 0 0 0 1px {};",
+                        if palette_is_dark(palette) {
+                            "rgba(11,16,21,0.92)"
+                        } else {
+                            "rgba(236,242,247,0.94)"
+                        },
+                        if palette_is_dark(palette) {
+                            "rgba(93,116,134,0.42)"
+                        } else {
+                            "rgba(210,221,232,0.92)"
+                        }
                     ),
                     button {
                         style: segmented_pill_button_style(palette, selected == NotificationDeliveryMode::InApp),
@@ -24893,6 +25121,7 @@ fn TerminalThemeSettingRow(
     on_change: EventHandler<String>,
 ) -> Element {
     let mut open = use_signal(|| false);
+    let follow_ui_mode = value == FOLLOW_UI_TERMINAL_THEME_LABEL;
     rsx! {
         div {
             style: "display:flex; flex-direction:column; gap:4px; position:relative;",
@@ -24903,14 +25132,34 @@ fn TerminalThemeSettingRow(
             button {
                 style: format!(
                     "width:100%; height:32px; border:none; border-radius:10px; padding:0 10px; \
-                     background:rgba(255,255,255,0.72); color:{}; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.34); \
+                     background:{}; color:{}; box-shadow: inset 0 0 0 1px {}; \
                      font-size:12px; font-weight:600; display:flex; align-items:center; justify-content:space-between; gap:10px;",
+                    if palette_is_dark(palette) {
+                        "rgba(18,24,31,0.9)"
+                    } else {
+                        "rgba(255,255,255,0.72)"
+                    },
                     palette.text
+                    ,
+                    if palette_is_dark(palette) {
+                        "rgba(93,116,134,0.56)"
+                    } else {
+                        "rgba(255,255,255,0.34)"
+                    }
                 ),
                 onclick: move |_| open.set(!open()),
-                span {
-                    style: "min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
-                    "{value}"
+                div {
+                    style: "display:flex; flex-direction:column; align-items:flex-start; gap:1px; min-width:0;",
+                    span {
+                        style: "min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                        "{value}"
+                    }
+                    if follow_ui_mode {
+                        span {
+                            style: format!("font-size:10px; font-weight:600; color:{};", palette.muted),
+                            "Light -> VS Code Light+ · Dark -> Dark+"
+                        }
+                    }
                 }
                 span {
                     style: format!("font-size:11px; color:{};", palette.muted),
@@ -24922,8 +25171,17 @@ fn TerminalThemeSettingRow(
                     style: format!(
                         "position:absolute; left:0; right:0; top:58px; z-index:35; display:flex; flex-direction:column; \
                          max-height:220px; overflow:auto; padding:6px; border-radius:12px; background:{}; \
-                         box-shadow:0 18px 44px rgba(55,72,92,0.18), inset 0 0 0 1px rgba(211,223,233,0.92);",
-                        palette.panel
+                         box-shadow:{};",
+                        if palette_is_dark(palette) {
+                            "rgba(16,22,28,0.98)"
+                        } else {
+                            palette.panel
+                        },
+                        if palette_is_dark(palette) {
+                            "0 18px 44px rgba(0,0,0,0.34), inset 0 0 0 1px rgba(93,116,134,0.56)"
+                        } else {
+                            "0 18px 44px rgba(55,72,92,0.18), inset 0 0 0 1px rgba(211,223,233,0.92)"
+                        }
                     ),
                     for option in options {
                         button {
@@ -24994,8 +25252,8 @@ fn palette(theme: UiTheme) -> Palette {
     match theme {
         UiTheme::ZedLight => Palette {
             shell: "rgba(244,248,250,0.92)",
-            titlebar: "transparent",
-            sidebar: "transparent",
+            titlebar: "rgba(249,252,253,0.74)",
+            sidebar: "rgba(248,251,252,0.72)",
             sidebar_hover: "rgba(134,186,202,0.14)",
             panel: "#ffffff",
             panel_alt: "rgba(255,255,255,0.68)",
@@ -25012,14 +25270,14 @@ fn palette(theme: UiTheme) -> Palette {
         },
         UiTheme::ZedDark => Palette {
             shell: "rgba(39,46,52,0.92)",
-            titlebar: "transparent",
-            sidebar: "transparent",
+            titlebar: "rgba(12,17,22,0.74)",
+            sidebar: "rgba(15,20,26,0.76)",
             sidebar_hover: "rgba(124,200,255,0.12)",
             panel: "#161c22",
-            panel_alt: "rgba(22,28,34,0.76)",
+            panel_alt: "rgba(18,24,31,0.84)",
             border: "#2d3946",
             text: "#dde8f3",
-            muted: "#a2b4c4",
+            muted: "#bcc9d6",
             accent: "#7cc8ff",
             accent_soft: "rgba(124,200,255,0.16)",
             gradient: "linear-gradient(180deg, rgba(56,79,91,0.94) 0%, rgba(55,88,79,0.90) 54%, rgba(39,46,52,0.96) 100%)",
@@ -25143,11 +25401,15 @@ fn chip_style(palette: Palette, selected: bool) -> String {
          color:{}; font-size:11px; font-weight:600;",
         if selected {
             palette.accent
+        } else if palette_is_dark(palette) {
+            "rgba(138,170,197,0.18)"
         } else {
             "rgba(255,255,255,0.10)"
         },
         if selected {
             palette.accent_soft
+        } else if palette_is_dark(palette) {
+            "rgba(12,18,24,0.84)"
         } else {
             "rgba(255,255,255,0.28)"
         },
@@ -25178,11 +25440,23 @@ fn theme_editor_action_button_style(
         "display:flex; align-items:center; gap:7px; height:30px; padding:0 11px; border:none; border-radius:11px; \
          background:{}; color:{}; font-size:11px; font-weight:700; box-shadow:{}; opacity:{};",
         if primary {
-            "rgba(255,255,255,0.98)"
+            if palette_is_dark(palette) {
+                "rgba(24,31,38,0.96)"
+            } else {
+                "rgba(255,255,255,0.98)"
+            }
         } else if enabled {
-            "rgba(235,242,248,0.96)"
+            if palette_is_dark(palette) {
+                "rgba(21,28,35,0.92)"
+            } else {
+                "rgba(235,242,248,0.96)"
+            }
         } else {
-            "rgba(244,247,250,0.84)"
+            if palette_is_dark(palette) {
+                "rgba(21,28,35,0.72)"
+            } else {
+                "rgba(244,247,250,0.84)"
+            }
         },
         if primary {
             accent
@@ -25192,11 +25466,24 @@ fn theme_editor_action_button_style(
             palette.muted
         },
         if primary {
-            format!("inset 0 0 0 1px rgba(214,223,232,0.92), 0 8px 18px rgba(81,113,138,0.08)")
+            if palette_is_dark(palette) {
+                "inset 0 0 0 1px rgba(110,138,162,0.38), 0 10px 24px rgba(0,0,0,0.22)".to_string()
+            } else {
+                "inset 0 0 0 1px rgba(214,223,232,0.92), 0 8px 18px rgba(81,113,138,0.08)"
+                    .to_string()
+            }
         } else if enabled {
-            format!("inset 0 0 0 1px rgba(214,223,232,0.92)")
+            if palette_is_dark(palette) {
+                "inset 0 0 0 1px rgba(93,116,134,0.56)".to_string()
+            } else {
+                "inset 0 0 0 1px rgba(214,223,232,0.92)".to_string()
+            }
         } else {
-            "inset 0 0 0 1px rgba(224,231,238,0.9)".to_string()
+            if palette_is_dark(palette) {
+                "inset 0 0 0 1px rgba(74,91,106,0.42)".to_string()
+            } else {
+                "inset 0 0 0 1px rgba(224,231,238,0.9)".to_string()
+            }
         },
         if enabled || primary { "1" } else { "0.72" },
     )
@@ -25211,9 +25498,19 @@ fn primary_action_style(palette: Palette) -> String {
     )
 }
 
-fn toggle_slider_style(_palette: Palette) -> String {
+fn toggle_slider_style(palette: Palette) -> String {
     format!(
-        "display:flex; align-items:center; gap:4px; padding:3px; border:none; border-radius:999px; background:rgba(255,255,255,0.34); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.28); user-select:none; -webkit-user-select:none;"
+        "display:flex; align-items:center; gap:4px; padding:3px; border:none; border-radius:999px; background:{}; box-shadow: inset 0 0 0 1px {}; user-select:none; -webkit-user-select:none;",
+        if palette_is_dark(palette) {
+            "rgba(17,23,29,0.84)"
+        } else {
+            "rgba(255,255,255,0.34)"
+        },
+        if palette_is_dark(palette) {
+            "rgba(96,118,136,0.4)"
+        } else {
+            "rgba(255,255,255,0.28)"
+        }
     )
 }
 
@@ -25223,6 +25520,8 @@ fn toggle_slider_end_style(palette: Palette, selected: bool) -> String {
          user-select:none; -webkit-user-select:none;",
         if selected {
             palette.panel
+        } else if palette_is_dark(palette) {
+            "rgba(15,21,28,0.18)"
         } else {
             "transparent"
         },
@@ -25236,16 +25535,31 @@ fn toggle_slider_end_style(palette: Palette, selected: bool) -> String {
 
 fn settings_input_style(palette: Palette) -> String {
     format!(
-        "height:30px; padding:0 10px; border:none; border-radius:8px; background:rgba(255,255,255,0.58); \
-         color:{}; outline:none; font-size:11px; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.34);",
-        palette.text
+        "height:30px; padding:0 10px; border:none; border-radius:8px; background:{}; \
+         color:{}; outline:none; font-size:11px; box-shadow: inset 0 0 0 1px {};",
+        if palette_is_dark(palette) {
+            "rgba(18,24,31,0.88)"
+        } else {
+            "rgba(255,255,255,0.58)"
+        },
+        palette.text,
+        if palette_is_dark(palette) {
+            "rgba(93,116,134,0.56)"
+        } else {
+            "rgba(255,255,255,0.34)"
+        }
     )
 }
 
 fn zoom_button_style(palette: Palette) -> String {
     format!(
-        "width:22px; height:22px; border:none; border-radius:8px; background:rgba(255,255,255,0.36); \
+        "width:22px; height:22px; border:none; border-radius:8px; background:{}; \
          color:{}; font-size:13px; font-weight:700; display:inline-flex; align-items:center; justify-content:center;",
+        if palette_is_dark(palette) {
+            "rgba(21,28,35,0.92)"
+        } else {
+            "rgba(255,255,255,0.36)"
+        },
         palette.text
     )
 }
@@ -25255,7 +25569,11 @@ fn segmented_pill_button_style(palette: Palette, selected: bool) -> String {
         "flex:1; height:26px; border:none; border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:{}; \
          display:inline-flex; align-items:center; justify-content:center; box-shadow:{};",
         if selected {
-            "rgba(255,255,255,0.98)"
+            if palette_is_dark(palette) {
+                "rgba(23,30,37,0.98)"
+            } else {
+                "rgba(255,255,255,0.98)"
+            }
         } else {
             "transparent"
         },
@@ -25266,7 +25584,11 @@ fn segmented_pill_button_style(palette: Palette, selected: bool) -> String {
         },
         if selected { 700 } else { 600 },
         if selected {
-            "0 3px 10px rgba(89,111,132,0.12), inset 0 0 0 1px rgba(216,227,236,0.96)"
+            if palette_is_dark(palette) {
+                "0 6px 18px rgba(0,0,0,0.18), inset 0 0 0 1px rgba(96,118,136,0.56)"
+            } else {
+                "0 3px 10px rgba(89,111,132,0.12), inset 0 0 0 1px rgba(216,227,236,0.96)"
+            }
         } else {
             "none"
         }
@@ -25497,6 +25819,7 @@ mod tests {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 5.0, "");
         let script = terminal_apply_script("yggterm-terminal-test", &theme);
         assert!(script.contains("entry.term.options.fontSize = 5"));
+        assert!(script.contains("entry.term.options.fontFamily"));
         assert!(script.contains("brightBlack"));
     }
 
@@ -25511,9 +25834,11 @@ mod tests {
     #[test]
     fn terminal_theme_uses_vscode_light_by_default() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
-        assert_eq!(theme.background, "#ffffff");
-        assert_eq!(theme.foreground, "#1f2328");
-        assert_eq!(theme.blue, "#0451a5");
+        assert_eq!(theme.background, "#fbfbfd");
+        assert_eq!(theme.foreground, "#151b23");
+        assert_eq!(theme.white, "#364152");
+        assert_eq!(theme.bright_white, "#2d3642");
+        assert_eq!(theme.blue, "#0969da");
     }
 
     #[test]
