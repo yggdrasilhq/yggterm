@@ -23,9 +23,9 @@ use yggterm_server::{
     run_app_control_scroll_preview, run_app_control_send_terminal_input,
     run_app_control_set_fullscreen, run_app_control_set_main_zoom, run_app_control_set_maximized,
     run_app_control_set_preview_layout, run_app_control_set_row_expanded,
-    run_app_control_set_search, run_attach, run_daemon, run_screenrecord_capture,
-    run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown,
-    start_local_session, status, try_run_remote_server_command,
+    run_app_control_set_search, run_app_control_set_ui_theme, run_attach, run_daemon,
+    run_screenrecord_capture, run_screenshot_capture, run_trace_bundle, run_trace_follow,
+    run_trace_tail, shutdown, start_local_session, status, try_run_remote_server_command,
 };
 use yggterm_shell::{ShellBootstrap, launch_shell, warm_daemon_start};
 use yggui_contract::UiTheme;
@@ -326,6 +326,18 @@ fn main() -> Result<()> {
                     "clear" => run_app_control_set_search("", Some(false), timeout_ms),
                     other => anyhow::bail!("unsupported app search action: {other}"),
                 }
+            }
+            "theme" => {
+                let theme = cli_positional_args(&args, 3)
+                    .into_iter()
+                    .next()
+                    .unwrap_or("light");
+                let theme = match theme {
+                    "light" => UiTheme::ZedLight,
+                    "dark" => UiTheme::ZedDark,
+                    other => anyhow::bail!("unsupported app theme: {other}"),
+                };
+                run_app_control_set_ui_theme(theme, timeout_ms)
             }
             "fullscreen" => {
                 let action = cli_positional_args(&args, 3)
