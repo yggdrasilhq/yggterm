@@ -3614,6 +3614,31 @@ fn remote_resume_visual_reveal_has_post_attach_content(deferred_resume_output: &
         && !terminal_chunk_tail_has_generic_codex_idle_footer(deferred_resume_output)
 }
 
+fn remote_resume_visual_reveal_output_is_acceptable(deferred_resume_output: &str) -> bool {
+    let trimmed = deferred_resume_output.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    !terminal_chunk_is_transport_error(deferred_resume_output)
+        && !terminal_chunk_is_loading_placeholder(deferred_resume_output)
+        && !terminal_chunk_is_transcript_browser(deferred_resume_output)
+        && !terminal_chunk_is_low_signal_terminal_noise(deferred_resume_output)
+}
+
+fn remote_resume_visual_reveal_can_complete(
+    attach_ready: bool,
+    geometry_ready: bool,
+    replay_may_complete: bool,
+    reveal_deadline_reached: bool,
+    deferred_resume_output: &str,
+) -> bool {
+    attach_ready
+        && geometry_ready
+        && replay_may_complete
+        && reveal_deadline_reached
+        && remote_resume_visual_reveal_output_is_acceptable(deferred_resume_output)
+}
+
 fn upsert_terminal_resume_notification(
     state: Signal<ShellState>,
     session_path: &str,
@@ -20861,21 +20886,21 @@ fn TerminalCanvas(
                                     }
                                     terminal_paint_seen = true;
                                     if is_remote_resume_session
-                                        && traced_attach_ready
                                         && !terminal_overlay_dismissed()
                                         && terminal_live_host_connected()
-                                        && remote_resume_visual_reveal_has_post_attach_content(
+                                        && remote_resume_visual_reveal_can_complete(
+                                            traced_attach_ready,
+                                            terminal_geometry_ready,
+                                            remote_resume_visual_reveal_may_complete(
+                                                resume_post_attach_redraw_nudged,
+                                                resume_post_attach_replay_rebased,
+                                                resume_post_attach_replay_deadline_ms,
+                                            ),
+                                            resume_visual_reveal_after_ms.is_some_and(|deadline_ms| {
+                                                current_millis() >= deadline_ms
+                                            }),
                                             &deferred_resume_output,
                                         )
-                                        && terminal_geometry_ready
-                                        && remote_resume_visual_reveal_may_complete(
-                                            resume_post_attach_redraw_nudged,
-                                            resume_post_attach_replay_rebased,
-                                            resume_post_attach_replay_deadline_ms,
-                                        )
-                                        && resume_visual_reveal_after_ms.is_some_and(|deadline_ms| {
-                                            current_millis() >= deadline_ms
-                                        })
                                     {
                                         if !deferred_resume_output.is_empty() {
                                             let replay = std::mem::take(&mut deferred_resume_output);
@@ -21541,21 +21566,21 @@ fn TerminalCanvas(
                                     );
                                 }
                                 if is_remote_resume_session
-                                    && traced_attach_ready
                                     && !terminal_overlay_dismissed()
                                     && terminal_live_host_connected()
-                                    && remote_resume_visual_reveal_has_post_attach_content(
+                                    && terminal_paint_seen
+                                    && remote_resume_visual_reveal_can_complete(
+                                        traced_attach_ready,
+                                        terminal_geometry_ready,
+                                        remote_resume_visual_reveal_may_complete(
+                                            resume_post_attach_redraw_nudged,
+                                            resume_post_attach_replay_rebased,
+                                            resume_post_attach_replay_deadline_ms,
+                                        ),
+                                        resume_visual_reveal_after_ms
+                                            .is_some_and(|deadline_ms| current_millis() >= deadline_ms),
                                         &deferred_resume_output,
                                     )
-                                    && terminal_paint_seen
-                                    && terminal_geometry_ready
-                                    && remote_resume_visual_reveal_may_complete(
-                                        resume_post_attach_redraw_nudged,
-                                        resume_post_attach_replay_rebased,
-                                        resume_post_attach_replay_deadline_ms,
-                                    )
-                                    && resume_visual_reveal_after_ms
-                                        .is_some_and(|deadline_ms| current_millis() >= deadline_ms)
                                 {
                                     if !deferred_resume_output.is_empty() {
                                         let replay = std::mem::take(&mut deferred_resume_output);
@@ -26230,17 +26255,32 @@ fn utility_icon_style_sized(palette: Palette, selected: bool, font_size_px: u8) 
 }
 
 fn connect_button_style(palette: Palette, selected: bool) -> String {
+    let fill = if selected {
+        palette.accent_soft.to_string()
+    } else if palette_is_dark(palette) {
+        "rgba(46, 128, 224, 0.22)".to_string()
+    } else {
+        "rgba(9, 105, 218, 0.12)".to_string()
+    };
+    let text = if selected {
+        palette.accent.to_string()
+    } else if palette_is_dark(palette) {
+        "#7fc0ff".to_string()
+    } else {
+        "#0969da".to_string()
+    };
+    let border = if selected {
+        palette.accent.to_string()
+    } else if palette_is_dark(palette) {
+        "rgba(95, 168, 255, 0.40)".to_string()
+    } else {
+        "rgba(9, 105, 218, 0.32)".to_string()
+    };
     format!(
         "height:28px; padding:0 11px; border:none; border-radius:10px; background:{}; color:{}; \
          font-size:11px; font-weight:700; white-space:nowrap; user-select:none; -webkit-user-select:none; pointer-events:auto; \
          box-shadow: inset 0 0 0 1px {};",
-        chrome_chip_fill(palette, selected),
-        if selected {
-            palette.accent
-        } else {
-            chrome_chip_text_color(palette, selected, false)
-        },
-        chrome_chip_border(palette)
+        fill, text, border
     )
 }
 
@@ -29445,6 +29485,42 @@ Waiting for the remote terminal to paint...\n";
   gpt-5.4 high fast \u{00b7} 100% left \u{00b7} ~/git\n";
 
         assert!(!remote_resume_visual_reveal_has_post_attach_content(data));
+    }
+
+    #[test]
+    fn remote_resume_visual_reveal_accepts_quiet_attached_terminal_after_deadline() {
+        assert!(remote_resume_visual_reveal_can_complete(
+            true, true, true, true, "",
+        ));
+        assert!(remote_resume_visual_reveal_can_complete(
+            true, true, true, true, "   \n",
+        ));
+        assert!(!remote_resume_visual_reveal_can_complete(
+            true, false, true, true, "",
+        ));
+        assert!(!remote_resume_visual_reveal_can_complete(
+            true, true, false, true, "",
+        ));
+    }
+
+    #[test]
+    fn remote_resume_visual_reveal_accepts_idle_footer_after_deadline() {
+        let data = "\
+\u{203a} Write tests for @filename\n\
+  gpt-5.4 high fast \u{00b7} 100% left \u{00b7} ~/git\n";
+        assert!(remote_resume_visual_reveal_output_is_acceptable(data));
+        assert!(remote_resume_visual_reveal_can_complete(
+            true, true, true, true, data,
+        ));
+    }
+
+    #[test]
+    fn remote_resume_visual_reveal_rejects_transport_error_after_deadline() {
+        let data = "Shared connection to 192.168.0.133 closed.\r\n";
+        assert!(!remote_resume_visual_reveal_output_is_acceptable(data));
+        assert!(!remote_resume_visual_reveal_can_complete(
+            true, true, true, true, data,
+        ));
     }
 
     #[test]
