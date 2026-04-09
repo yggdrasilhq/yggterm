@@ -7925,6 +7925,13 @@ pub fn run_app_control_set_search(
     Ok(())
 }
 
+pub fn run_app_control_set_ui_theme(theme: UiTheme, timeout_ms: u64) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(&home, AppControlCommand::SetUiTheme { theme }, timeout_ms)?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 pub fn run_app_control_set_preview_layout(
     layout: AppControlPreviewLayout,
     timeout_ms: u64,
