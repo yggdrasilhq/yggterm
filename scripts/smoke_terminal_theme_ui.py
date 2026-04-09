@@ -27,6 +27,19 @@ def run(*args: str, check: bool = True) -> dict:
 def app_state(pid: int) -> dict:
     return run("server", "app", "state", "--pid", str(pid), "--timeout-ms", "8000")["data"]
 
+def probe_select(pid: int, session: str) -> dict:
+    return run(
+        "server",
+        "app",
+        "terminal",
+        "probe-select",
+        "--pid",
+        str(pid),
+        session,
+        "--timeout-ms",
+        "8000",
+    )["data"]
+
 
 def wait_for_terminal_settled(pid: int, timeout_seconds: float = 15.0) -> dict:
     deadline = time.time() + timeout_seconds
@@ -100,6 +113,8 @@ def assert_terminal_font_contract(state: dict, expect_bg: str) -> None:
     rows_line_height = host.get("rows_sample_line_height") or host.get("rows_line_height") or ""
     rows_color = host.get("rows_sample_color") or host.get("rows_color") or ""
     dim_color = host.get("dim_sample_color") or ""
+    low_contrast_count = int(host.get("low_contrast_span_count") or 0)
+    low_contrast_samples = host.get("low_contrast_span_samples") or []
     dim_opacity = host.get("dim_sample_opacity") or ""
     cursor_class = host.get("cursor_sample_class_name") or ""
     cursor_background = host.get("cursor_sample_background") or ""
@@ -149,6 +164,10 @@ def assert_terminal_font_contract(state: dict, expect_bg: str) -> None:
             )
     if dim_opacity not in ("", "1", "1.0"):
         raise AssertionError(f"dim text opacity drifted: {dim_opacity!r}")
+    if low_contrast_count > 0:
+        raise AssertionError(
+            f"low-contrast visible spans detected: count={low_contrast_count} samples={low_contrast_samples!r}"
+        )
     if cursor_class and "xterm-cursor" not in cursor_class:
         raise AssertionError(f"cursor class drifted: {cursor_class!r}")
     if cursor_class and not any(
@@ -202,6 +221,11 @@ def main() -> int:
     time.sleep(args.settle_seconds)
     light_state = app_state(args.pid)
     assert_terminal_font_contract(light_state, "#fbfbfd")
+    selection = probe_select(args.pid, args.session)
+    if not selection.get("selected_text_length"):
+        raise AssertionError(f"selection probe failed to capture text: {selection!r}")
+    refreshed_light_state = app_state(args.pid)
+    assert_terminal_font_contract(refreshed_light_state, "#fbfbfd")
 
     print(
         json.dumps(
@@ -211,8 +235,10 @@ def main() -> int:
                 "session": args.session,
                 "dark_theme": dark_state["settings"]["effective_terminal_theme_name"],
                 "light_theme": light_state["settings"]["effective_terminal_theme_name"],
-                "rows_font_family": light_state["viewport"]["terminal_hosts"][0]["rows_font_family"],
-                "rows_font_weight": light_state["viewport"]["terminal_hosts"][0]["rows_font_weight"],
+                "rows_font_family": refreshed_light_state["viewport"]["terminal_hosts"][0]["rows_font_family"],
+                "rows_font_weight": refreshed_light_state["viewport"]["terminal_hosts"][0]["rows_font_weight"],
+                "selected_text_length": selection["selected_text_length"],
+                "selected_contrast": selection.get("selected_contrast"),
             },
             indent=2,
         )
