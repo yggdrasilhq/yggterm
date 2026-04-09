@@ -25,6 +25,10 @@ pub(crate) enum TerminalJsCommand {
         bright_magenta: String,
         bright_cyan: String,
         bright_white: String,
+        font_family: String,
+        font_weight: u16,
+        font_weight_bold: u16,
+        line_height: f32,
         font_size: f32,
     },
     Write {

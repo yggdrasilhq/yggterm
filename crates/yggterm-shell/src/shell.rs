@@ -12328,6 +12328,17 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                 const viewportStyle = viewport ? window.getComputedStyle(viewport) : null;
                 const rowsLayer = host.querySelector('.xterm-rows');
                 const rowsStyle = rowsLayer ? window.getComputedStyle(rowsLayer) : null;
+                const rowBlocks = rowsLayer ? Array.from(rowsLayer.querySelectorAll('div')) : [];
+                const rowSample =
+                    rowBlocks.find((node) => String(node.textContent || '').trim().length > 0)
+                    || rowBlocks[0]
+                    || null;
+                const rowSampleSpan = rowSample ? rowSample.querySelector('span') : null;
+                const rowSampleStyle = rowSampleSpan
+                    ? window.getComputedStyle(rowSampleSpan)
+                    : rowSample
+                        ? window.getComputedStyle(rowSample)
+                        : null;
                 const xtermRoot = host.querySelector('.xterm');
                 const mountedHost = window.__yggtermXtermHosts ? window.__yggtermXtermHosts[host.id] : null;
                 const term = mountedHost ? mountedHost.term : null;
@@ -12387,13 +12398,34 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     background_color: style.backgroundColor,
                     foreground_color: style.color,
                     font_family: style.fontFamily,
+                    host_css_font_family: String(style.getPropertyValue('--yggterm-term-font-family') || '').trim(),
+                    host_css_foreground: String(style.getPropertyValue('--yggterm-term-foreground') || '').trim(),
                     xterm_font_family: term ? String(term.options.fontFamily || '') : null,
                     xterm_font_weight: term ? String(term.options.fontWeight || '') : null,
                     xterm_font_weight_bold: term ? String(term.options.fontWeightBold || '') : null,
+                    xterm_line_height: term ? String(term.options.lineHeight || '') : null,
                     rows_font_family: rowsStyle ? rowsStyle.fontFamily : null,
                     rows_font_weight: rowsStyle ? String(rowsStyle.fontWeight || '') : null,
                     rows_font_feature_settings: rowsStyle ? String(rowsStyle.fontFeatureSettings || '') : null,
                     rows_letter_spacing: rowsStyle ? String(rowsStyle.letterSpacing || '') : null,
+                    rows_line_height: rowsStyle ? String(rowsStyle.lineHeight || '') : null,
+                    rows_color: rowsStyle ? String(rowsStyle.color || '') : null,
+                    rows_sample_font_family: rowSampleStyle ? String(rowSampleStyle.fontFamily || '') : null,
+                    rows_sample_font_weight: rowSampleStyle ? String(rowSampleStyle.fontWeight || '') : null,
+                    rows_sample_font_feature_settings: rowSampleStyle ? String(rowSampleStyle.fontFeatureSettings || '') : null,
+                    rows_sample_letter_spacing: rowSampleStyle ? String(rowSampleStyle.letterSpacing || '') : null,
+                    rows_sample_line_height: rowSampleStyle ? String(rowSampleStyle.lineHeight || '') : null,
+                    rows_sample_color: rowSampleStyle ? String(rowSampleStyle.color || '') : null,
+                    rows_sample_class_name: rowSampleSpan
+                        ? String(rowSampleSpan.className || '')
+                        : rowSample
+                            ? String(rowSample.className || '')
+                            : null,
+                    rows_sample_style_attr: rowSampleSpan
+                        ? String(rowSampleSpan.getAttribute('style') || '')
+                        : rowSample
+                            ? String(rowSample.getAttribute('style') || '')
+                            : null,
                     xterm_theme_background: term && term.options.theme ? String(term.options.theme.background || '') : null,
                     xterm_theme_foreground: term && term.options.theme ? String(term.options.theme.foreground || '') : null,
                     xterm_present: Boolean(xtermRoot),
@@ -13214,6 +13246,7 @@ async fn process_pending_app_control_requests(
             let _ = safe_shell_mut(state, "app_control_set_ui_theme", |shell| {
                 shell.set_ui_theme(theme);
             });
+            apply_active_terminal_zoom(state);
             sleep(Duration::from_millis(60)).await;
             let dom_snapshot = capture_dom_debug_snapshot_for(active_session_path.as_deref()).await;
             let mut state_snapshot = describe_app_state_snapshot(&state, &desktop);
@@ -16126,7 +16159,10 @@ fn app() -> Element {
                             on_endpoint_change: move |value: String| state.with_mut(|shell| shell.update_litellm_endpoint(value)),
                             on_api_key_change: move |value: String| state.with_mut(|shell| shell.update_litellm_api_key(value)),
                             on_model_change: move |value: String| state.with_mut(|shell| shell.update_interface_llm_model(value)),
-                            on_set_ui_theme: move |theme: UiTheme| state.with_mut(|shell| shell.set_ui_theme(theme)),
+                            on_set_ui_theme: move |theme: UiTheme| {
+                                state.with_mut(|shell| shell.set_ui_theme(theme));
+                                apply_active_terminal_zoom(state);
+                            },
                             on_open_theme_editor: move |_| state.with_mut(|shell| shell.open_theme_editor()),
                             on_set_notification_delivery: move |mode: NotificationDeliveryMode| {
                                 state.with_mut(|shell| shell.update_notification_delivery(mode))
@@ -16141,6 +16177,9 @@ fn app() -> Element {
                             },
                             on_set_terminal_theme_name: move |(theme, value): (UiTheme, String)| {
                                 state.with_mut(|shell| shell.set_terminal_theme_name_for(theme, value));
+                                if state.read().snapshot().settings.theme == theme {
+                                    apply_active_terminal_zoom(state);
+                                }
                             },
                             on_connect_ssh_custom: move |_| spawn_connect_ssh_custom(state),
                             on_ssh_target_change: move |value: String| state.with_mut(|shell| shell.update_ssh_connect_target(value)),
@@ -20385,6 +20424,10 @@ fn TerminalCanvas(
                                     bright_magenta: theme.bright_magenta.clone(),
                                     bright_cyan: theme.bright_cyan.clone(),
                                     bright_white: theme.bright_white.clone(),
+                                    font_family: TERMINAL_FONT_FAMILY.to_string(),
+                                    font_weight: terminal_font_weight(&theme),
+                                    font_weight_bold: terminal_font_weight_bold(&theme),
+                                    line_height: terminal_font_line_height(&theme),
                                     font_size: theme.font_size,
                                 });
                                 if !placeholder_rendered
@@ -20846,6 +20889,10 @@ fn TerminalCanvas(
                                         bright_magenta: theme.bright_magenta.clone(),
                                         bright_cyan: theme.bright_cyan.clone(),
                                         bright_white: theme.bright_white.clone(),
+                                        font_family: TERMINAL_FONT_FAMILY.to_string(),
+                                        font_weight: terminal_font_weight(&theme),
+                                        font_weight_bold: terminal_font_weight_bold(&theme),
+                                        line_height: terminal_font_line_height(&theme),
                                         font_size: theme.font_size,
                                     });
                                     placeholder_rendered = false;
@@ -21592,6 +21639,11 @@ fn TerminalCanvas(
     let _ = resume_overlay_effective_failed;
     let _ = resume_overlay_excerpt;
     let terminal_host_visibility = "opacity:1; visibility:visible;";
+    let terminal_host_font_weight = terminal_font_weight(&theme);
+    let terminal_host_font_weight_bold = terminal_font_weight_bold(&theme);
+    let terminal_host_line_height = terminal_font_line_height(&theme);
+    let terminal_host_font_smoothing = terminal_font_smoothing(&theme);
+    let terminal_host_moz_font_smoothing = terminal_moz_font_smoothing(&theme);
     rsx! {
         div {
             key: "{instance_key}",
@@ -21616,11 +21668,21 @@ fn TerminalCanvas(
                     "data-terminal-resume-overlay-phase": "hidden",
                     "data-terminal-resume-overlay-effective-failed": "false",
                     style: format!(
-                        "display:flex; flex:1 1 auto; min-width:0; min-height:0; margin:{}; background:{}; overflow:hidden; transition:opacity 140ms ease; box-sizing:border-box; {}; {};",
+                        "display:flex; flex:1 1 auto; min-width:0; min-height:0; margin:{}; background:{}; overflow:hidden; transition:opacity 140ms ease; box-sizing:border-box; {}; {}; \
+                         --yggterm-term-font-family:{}; --yggterm-term-font-weight:{}; --yggterm-term-font-weight-bold:{}; \
+                         --yggterm-term-line-height:{}; --yggterm-term-letter-spacing:0px; --yggterm-term-foreground:{}; \
+                         --yggterm-term-font-smoothing:{}; --yggterm-term-moz-font-smoothing:{};",
                         terminal_shell_padding,
                         theme.background,
                         terminal_host_visibility,
                         terminal_host_chrome,
+                        TERMINAL_FONT_FAMILY,
+                        terminal_host_font_weight,
+                        terminal_host_font_weight_bold,
+                        terminal_host_line_height,
+                        theme.foreground,
+                        terminal_host_font_smoothing,
+                        terminal_host_moz_font_smoothing,
                     ),
                 }
             }
@@ -22468,6 +22530,11 @@ fn terminal_font_weight(theme: &TerminalTheme) -> u16 {
     500
 }
 
+fn terminal_font_line_height(theme: &TerminalTheme) -> f32 {
+    let _ = theme;
+    1.12
+}
+
 fn terminal_font_weight_bold(theme: &TerminalTheme) -> u16 {
     let _ = theme;
     700
@@ -22616,6 +22683,7 @@ fn emit_system_notification(title: &str, message: &str) {
 }
 
 fn apply_active_terminal_zoom(state: Signal<ShellState>) {
+    let active_host_id = state.read().active_terminal_host_id.clone();
     let snapshot = state.read().snapshot();
     if snapshot.active_view_mode != WorkspaceViewMode::Terminal {
         return;
@@ -22637,9 +22705,13 @@ fn apply_active_terminal_zoom(state: Signal<ShellState>) {
     );
     info!(
         session=%session.session_path,
+        host_id=?active_host_id,
         font_size=theme.font_size,
         "applying live terminal zoom"
     );
+    if let Some(host_id) = active_host_id {
+        let _ = document::eval(&terminal_apply_script(&host_id, &theme));
+    }
     let _ = document::eval(&terminal_apply_script_for_session(
         &session.session_path,
         &theme,
@@ -22692,6 +22764,7 @@ fn terminal_eval_script(
         .expect("serialize terminal font weight");
     let font_weight_bold = serde_json::to_string(&terminal_font_weight_bold(theme))
         .expect("serialize terminal bold font weight");
+    let line_height = terminal_font_line_height(theme);
     let font_smoothing = serde_json::to_string(terminal_font_smoothing(theme))
         .expect("serialize terminal font smoothing");
     let moz_font_smoothing = serde_json::to_string(terminal_moz_font_smoothing(theme))
@@ -22856,6 +22929,8 @@ fn terminal_eval_script(
             fontSize: {font_size},
             fontWeight: {font_weight},
             fontWeightBold: {font_weight_bold},
+            lineHeight: {line_height},
+            letterSpacing: 0,
             minimumContrastRatio: 6,
             scrollback: 5000,
             theme: {{
@@ -22885,6 +22960,14 @@ fn terminal_eval_script(
         term.loadAddon(fitAddon);
         term.open(host);
         host.tabIndex = 0;
+        host.style.setProperty('--yggterm-term-font-family', {font_family});
+        host.style.setProperty('--yggterm-term-font-weight', String({font_weight}));
+        host.style.setProperty('--yggterm-term-font-weight-bold', String({font_weight_bold}));
+        host.style.setProperty('--yggterm-term-line-height', String({line_height}));
+        host.style.setProperty('--yggterm-term-letter-spacing', '0px');
+        host.style.setProperty('--yggterm-term-foreground', {foreground});
+        host.style.setProperty('--yggterm-term-font-smoothing', {font_smoothing});
+        host.style.setProperty('--yggterm-term-moz-font-smoothing', {moz_font_smoothing});
         let inputEnabled = Boolean({initial_input_enabled});
         host.style.cursor = inputEnabled ? 'text' : 'default';
         const runtimeStyleId = `yggterm-xterm-runtime-style-${{hostId}}`;
@@ -22901,16 +22984,16 @@ fn terminal_eval_script(
                     padding: 0 !important;
                     width: 100% !important;
                     box-sizing: border-box !important;
-                    font-family: {font_family} !important;
-                    font-weight: {font_weight} !important;
+                    font-family: var(--yggterm-term-font-family) !important;
+                    font-weight: var(--yggterm-term-font-weight) !important;
                     font-feature-settings: "calt" 0, "liga" 0 !important;
                     font-variant-ligatures: none !important;
                     font-synthesis: none !important;
                     text-rendering: auto !important;
                     font-kerning: none !important;
-                    letter-spacing: 0 !important;
-                    -webkit-font-smoothing: {font_smoothing} !important;
-                    -moz-osx-font-smoothing: {moz_font_smoothing} !important;
+                    letter-spacing: var(--yggterm-term-letter-spacing) !important;
+                    -webkit-font-smoothing: var(--yggterm-term-font-smoothing) !important;
+                    -moz-osx-font-smoothing: var(--yggterm-term-moz-font-smoothing) !important;
                 }}
                 #${{hostId}} .xterm {{
                     height: 100% !important;
@@ -22943,6 +23026,11 @@ fn terminal_eval_script(
                 }}
                 #${{hostId}} .xterm-rows {{
                     height: 100% !important;
+                    color: var(--yggterm-term-foreground) !important;
+                }}
+                #${{hostId}} .xterm-rows > div {{
+                    color: var(--yggterm-term-foreground) !important;
+                    line-height: var(--yggterm-term-line-height) !important;
                 }}
                 #${{hostId}} .xterm-viewport::-webkit-scrollbar {{
                     width: 0 !important;
@@ -23348,8 +23436,7 @@ fn terminal_eval_script(
             }}
             if (message.kind === "reset") {{
                 term.clear();
-                term.options.fontSize = message.font_size;
-                term.options.theme = {{
+                const nextTheme = {{
                     background: message.background,
                     foreground: message.foreground,
                     cursor: message.cursor,
@@ -23371,6 +23458,34 @@ fn terminal_eval_script(
                     brightCyan: message.bright_cyan,
                     brightWhite: message.bright_white,
                 }};
+                host.style.setProperty('--yggterm-term-font-family', message.font_family);
+                host.style.setProperty('--yggterm-term-font-weight', String(message.font_weight));
+                host.style.setProperty('--yggterm-term-font-weight-bold', String(message.font_weight_bold));
+                host.style.setProperty('--yggterm-term-line-height', String(message.line_height));
+                host.style.setProperty('--yggterm-term-letter-spacing', '0px');
+                host.style.setProperty('--yggterm-term-foreground', message.foreground);
+                host.style.setProperty('--yggterm-term-font-smoothing', {font_smoothing});
+                host.style.setProperty('--yggterm-term-moz-font-smoothing', {moz_font_smoothing});
+                try {{
+                    term.options = {{
+                        ...term.options,
+                        fontFamily: message.font_family,
+                        fontSize: message.font_size,
+                        fontWeight: message.font_weight,
+                        fontWeightBold: message.font_weight_bold,
+                        lineHeight: message.line_height,
+                        letterSpacing: 0,
+                        theme: nextTheme,
+                    }};
+                }} catch (_error) {{
+                    term.options.fontFamily = message.font_family;
+                    term.options.fontSize = message.font_size;
+                    term.options.fontWeight = message.font_weight;
+                    term.options.fontWeightBold = message.font_weight_bold;
+                    term.options.lineHeight = message.line_height;
+                    term.options.letterSpacing = 0;
+                    term.options.theme = nextTheme;
+                }}
                 {reset_debug}
                 requestAnimationFrame(() => {{
                     emitResize();
@@ -23463,6 +23578,7 @@ fn terminal_apply_script(host_id: &str, theme: &TerminalTheme) -> String {
         .expect("serialize terminal font weight");
     let font_weight_bold = serde_json::to_string(&terminal_font_weight_bold(theme))
         .expect("serialize terminal bold font weight");
+    let line_height = terminal_font_line_height(theme);
     let font_smoothing = serde_json::to_string(terminal_font_smoothing(theme))
         .expect("serialize terminal font smoothing");
     let moz_font_smoothing = serde_json::to_string(terminal_moz_font_smoothing(theme))
@@ -23476,15 +23592,7 @@ fn terminal_apply_script(host_id: &str, theme: &TerminalTheme) -> String {
           if (!entry || !entry.term) {{
             return;
           }}
-          entry.term.options.fontFamily = {font_family};
-          entry.term.options.fontSize = {font_size};
-          entry.term.options.fontWeight = {font_weight};
-          entry.term.options.fontWeightBold = {font_weight_bold};
-          if (entry.host) {{
-            entry.host.style.webkitFontSmoothing = {font_smoothing};
-            entry.host.style.MozOsxFontSmoothing = {moz_font_smoothing};
-          }}
-          entry.term.options.theme = {{
+          const nextTheme = {{
             background: {background},
             foreground: {foreground},
             cursor: {cursor},
@@ -23507,10 +23615,47 @@ fn terminal_apply_script(host_id: &str, theme: &TerminalTheme) -> String {
             brightWhite: {bright_white},
           }};
           try {{
+            entry.term.options = {{
+              ...entry.term.options,
+              fontFamily: {font_family},
+              fontSize: {font_size},
+              fontWeight: {font_weight},
+              fontWeightBold: {font_weight_bold},
+              lineHeight: {line_height},
+              letterSpacing: 0,
+              theme: nextTheme,
+            }};
+          }} catch (_error) {{
+            entry.term.options.fontFamily = {font_family};
+            entry.term.options.fontSize = {font_size};
+            entry.term.options.fontWeight = {font_weight};
+            entry.term.options.fontWeightBold = {font_weight_bold};
+            entry.term.options.lineHeight = {line_height};
+            entry.term.options.letterSpacing = 0;
+            entry.term.options.theme = nextTheme;
+          }}
+          if (entry.host) {{
+            entry.host.style.setProperty('--yggterm-term-font-family', {font_family});
+            entry.host.style.setProperty('--yggterm-term-font-weight', String({font_weight}));
+            entry.host.style.setProperty('--yggterm-term-font-weight-bold', String({font_weight_bold}));
+            entry.host.style.setProperty('--yggterm-term-line-height', String({line_height}));
+            entry.host.style.setProperty('--yggterm-term-letter-spacing', '0px');
+            entry.host.style.setProperty('--yggterm-term-foreground', {foreground});
+            entry.host.style.setProperty('--yggterm-term-font-smoothing', {font_smoothing});
+            entry.host.style.setProperty('--yggterm-term-moz-font-smoothing', {moz_font_smoothing});
+            entry.host.style.webkitFontSmoothing = {font_smoothing};
+            entry.host.style.MozOsxFontSmoothing = {moz_font_smoothing};
+          }}
+          try {{
             if (entry.emitResize) {{
               entry.emitResize();
             }} else if (entry.fitAddon) {{
               entry.fitAddon.fit();
+            }}
+          }} catch (_error) {{}}
+          try {{
+            if (typeof entry.term.clearTextureAtlas === 'function') {{
+              entry.term.clearTextureAtlas();
             }}
           }} catch (_error) {{}}
           try {{
@@ -23550,6 +23695,7 @@ fn terminal_apply_script(host_id: &str, theme: &TerminalTheme) -> String {
         font_family = font_family,
         font_weight = font_weight,
         font_weight_bold = font_weight_bold,
+        line_height = line_height,
         font_smoothing = font_smoothing,
         moz_font_smoothing = moz_font_smoothing,
     )
@@ -23615,6 +23761,7 @@ fn terminal_apply_script_for_session(session_path: &str, theme: &TerminalTheme) 
         .expect("serialize terminal font weight");
     let font_weight_bold = serde_json::to_string(&terminal_font_weight_bold(theme))
         .expect("serialize terminal bold font weight");
+    let line_height = terminal_font_line_height(theme);
     let font_smoothing = serde_json::to_string(terminal_font_smoothing(theme))
         .expect("serialize terminal font smoothing");
     let moz_font_smoothing = serde_json::to_string(terminal_moz_font_smoothing(theme))
@@ -23631,15 +23778,7 @@ fn terminal_apply_script_for_session(session_path: &str, theme: &TerminalTheme) 
           if (!entry || !entry.term) {{
             return;
           }}
-          entry.term.options.fontFamily = {font_family};
-          entry.term.options.fontSize = {font_size};
-          entry.term.options.fontWeight = {font_weight};
-          entry.term.options.fontWeightBold = {font_weight_bold};
-          if (entry.host) {{
-            entry.host.style.webkitFontSmoothing = {font_smoothing};
-            entry.host.style.MozOsxFontSmoothing = {moz_font_smoothing};
-          }}
-          entry.term.options.theme = {{
+          const nextTheme = {{
             background: {background},
             foreground: {foreground},
             cursor: {cursor},
@@ -23662,10 +23801,47 @@ fn terminal_apply_script_for_session(session_path: &str, theme: &TerminalTheme) 
             brightWhite: {bright_white},
           }};
           try {{
+            entry.term.options = {{
+              ...entry.term.options,
+              fontFamily: {font_family},
+              fontSize: {font_size},
+              fontWeight: {font_weight},
+              fontWeightBold: {font_weight_bold},
+              lineHeight: {line_height},
+              letterSpacing: 0,
+              theme: nextTheme,
+            }};
+          }} catch (_error) {{
+            entry.term.options.fontFamily = {font_family};
+            entry.term.options.fontSize = {font_size};
+            entry.term.options.fontWeight = {font_weight};
+            entry.term.options.fontWeightBold = {font_weight_bold};
+            entry.term.options.lineHeight = {line_height};
+            entry.term.options.letterSpacing = 0;
+            entry.term.options.theme = nextTheme;
+          }}
+          if (entry.host) {{
+            entry.host.style.setProperty('--yggterm-term-font-family', {font_family});
+            entry.host.style.setProperty('--yggterm-term-font-weight', String({font_weight}));
+            entry.host.style.setProperty('--yggterm-term-font-weight-bold', String({font_weight_bold}));
+            entry.host.style.setProperty('--yggterm-term-line-height', String({line_height}));
+            entry.host.style.setProperty('--yggterm-term-letter-spacing', '0px');
+            entry.host.style.setProperty('--yggterm-term-foreground', {foreground});
+            entry.host.style.setProperty('--yggterm-term-font-smoothing', {font_smoothing});
+            entry.host.style.setProperty('--yggterm-term-moz-font-smoothing', {moz_font_smoothing});
+            entry.host.style.webkitFontSmoothing = {font_smoothing};
+            entry.host.style.MozOsxFontSmoothing = {moz_font_smoothing};
+          }}
+          try {{
             if (entry.emitResize) {{
               entry.emitResize();
             }} else if (entry.fitAddon) {{
               entry.fitAddon.fit();
+            }}
+          }} catch (_error) {{}}
+          try {{
+            if (typeof entry.term.clearTextureAtlas === 'function') {{
+              entry.term.clearTextureAtlas();
             }}
           }} catch (_error) {{}}
           try {{
@@ -23706,6 +23882,7 @@ fn terminal_apply_script_for_session(session_path: &str, theme: &TerminalTheme) 
         font_family = font_family,
         font_weight = font_weight,
         font_weight_bold = font_weight_bold,
+        line_height = line_height,
         font_smoothing = font_smoothing,
         moz_font_smoothing = moz_font_smoothing,
     )
@@ -26009,6 +26186,7 @@ mod tests {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
         assert!(script.contains("fontSize: 13"));
+        assert!(script.contains("lineHeight: 1.12"));
         assert!(script.contains("brightWhite"));
     }
 
@@ -26046,10 +26224,12 @@ mod tests {
     fn terminal_apply_script_enforces_monospace_rendering_contract() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
-        assert!(script.contains("font-feature-settings:"));
+        assert!(script.contains("host.style.setProperty('--yggterm-term-font-family'"));
+        assert!(script.contains("font-family: var(--yggterm-term-font-family)"));
         assert!(script.contains("font-variant-ligatures: none"));
         assert!(script.contains("font-synthesis: none"));
-        assert!(script.contains("letter-spacing: 0"));
+        assert!(script.contains("line-height: var(--yggterm-term-line-height)"));
+        assert!(script.contains("letter-spacing: var(--yggterm-term-letter-spacing)"));
     }
 
     #[test]
