@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+use yggterm_core::UiTheme;
 
 const APP_CONTROL_REQUESTS_DIR: &str = "app-control-requests";
 const APP_CONTROL_RESPONSES_DIR: &str = "app-control-responses";
@@ -75,6 +76,9 @@ pub enum AppControlCommand {
         query: String,
         #[serde(default)]
         focused: Option<bool>,
+    },
+    SetUiTheme {
+        theme: UiTheme,
     },
     CaptureScreenshot {
         target: ScreenshotTarget,
@@ -152,6 +156,7 @@ impl AppControlCommand {
         match self {
             Self::SetMainZoom { .. } => "set_main_zoom",
             Self::SetSearch { .. } => "set_search",
+            Self::SetUiTheme { .. } => "set_ui_theme",
             Self::CaptureScreenshot { .. } => "capture_screenshot",
             Self::ScrollPreview { .. } => "scroll_preview",
             Self::SetPreviewLayout { .. } => "set_preview_layout",
