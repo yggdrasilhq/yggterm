@@ -1,8 +1,11 @@
 use include_dir::{Dir, include_dir};
 use once_cell::sync::Lazy;
+use yggui_contract::UiTheme;
 
 static GHOSTTY_THEMES_DIR: Dir<'_> =
     include_dir!("$CARGO_MANIFEST_DIR/../../assets/terminal-themes/ghostty");
+pub const DEFAULT_LIGHT_TERMINAL_THEME: &str = "VS Code Light+";
+pub const DEFAULT_DARK_TERMINAL_THEME: &str = "Dark+";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalPaletteSpec {
@@ -36,7 +39,7 @@ pub struct NamedTerminalTheme {
 
 static TERMINAL_THEME_CATALOG: Lazy<Vec<NamedTerminalTheme>> = Lazy::new(|| {
     let mut themes = vec![NamedTerminalTheme {
-        name: "VS Code Light+".to_string(),
+        name: DEFAULT_LIGHT_TERMINAL_THEME.to_string(),
         palette: TerminalPaletteSpec {
             background: "#fbfbfd".to_string(),
             foreground: "#151b23".to_string(),
@@ -91,10 +94,51 @@ pub fn terminal_theme_names() -> Vec<String> {
         .collect()
 }
 
+pub fn terminal_theme_names_for_mode(theme: UiTheme) -> Vec<String> {
+    let mut names = terminal_theme_catalog()
+        .iter()
+        .filter(|candidate| terminal_theme_matches_mode(candidate, theme))
+        .map(|candidate| candidate.name.clone())
+        .collect::<Vec<_>>();
+    let default_name = default_terminal_theme_name(theme);
+    if !names.iter().any(|name| name == default_name) {
+        names.insert(0, default_name.to_string());
+    }
+    names
+}
+
+pub fn default_terminal_theme_name(theme: UiTheme) -> &'static str {
+    match theme {
+        UiTheme::ZedLight => DEFAULT_LIGHT_TERMINAL_THEME,
+        UiTheme::ZedDark => DEFAULT_DARK_TERMINAL_THEME,
+    }
+}
+
 pub fn terminal_theme_by_name(name: &str) -> Option<&'static NamedTerminalTheme> {
     terminal_theme_catalog()
         .iter()
         .find(|theme| theme.name == name)
+}
+
+fn terminal_theme_matches_mode(theme: &NamedTerminalTheme, mode: UiTheme) -> bool {
+    let is_light = terminal_theme_background_luminance(&theme.palette.background)
+        .map(|luminance| luminance >= 0.58)
+        .unwrap_or_else(|| theme.name == DEFAULT_LIGHT_TERMINAL_THEME);
+    match mode {
+        UiTheme::ZedLight => is_light,
+        UiTheme::ZedDark => !is_light,
+    }
+}
+
+fn terminal_theme_background_luminance(color: &str) -> Option<f32> {
+    let hex = color.strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+    let red = u8::from_str_radix(&hex[0..2], 16).ok()? as f32 / 255.0;
+    let green = u8::from_str_radix(&hex[2..4], 16).ok()? as f32 / 255.0;
+    let blue = u8::from_str_radix(&hex[4..6], 16).ok()? as f32 / 255.0;
+    Some(0.2126 * red + 0.7152 * green + 0.0722 * blue)
 }
 
 fn parse_ghostty_theme(contents: &str) -> Option<TerminalPaletteSpec> {
@@ -188,5 +232,26 @@ mod tests {
         assert_eq!(theme.background, "#101010");
         assert_eq!(theme.foreground, "#f0f0f0");
         assert_eq!(theme.bright_white, "#ffffff");
+    }
+
+    #[test]
+    fn splits_theme_names_by_mode() {
+        let light_names = terminal_theme_names_for_mode(UiTheme::ZedLight);
+        let dark_names = terminal_theme_names_for_mode(UiTheme::ZedDark);
+        assert!(
+            light_names
+                .iter()
+                .any(|name| name == DEFAULT_LIGHT_TERMINAL_THEME)
+        );
+        assert!(
+            dark_names
+                .iter()
+                .any(|name| name == DEFAULT_DARK_TERMINAL_THEME)
+        );
+        assert!(
+            !light_names
+                .iter()
+                .any(|name| name == DEFAULT_DARK_TERMINAL_THEME)
+        );
     }
 }
