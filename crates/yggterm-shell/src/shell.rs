@@ -12327,6 +12327,7 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                 const screenStyle = screen ? window.getComputedStyle(screen) : null;
                 const viewportStyle = viewport ? window.getComputedStyle(viewport) : null;
                 const rowsLayer = host.querySelector('.xterm-rows');
+                const rowsStyle = rowsLayer ? window.getComputedStyle(rowsLayer) : null;
                 const xtermRoot = host.querySelector('.xterm');
                 const mountedHost = window.__yggtermXtermHosts ? window.__yggtermXtermHosts[host.id] : null;
                 const term = mountedHost ? mountedHost.term : null;
@@ -12389,6 +12390,10 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     xterm_font_family: term ? String(term.options.fontFamily || '') : null,
                     xterm_font_weight: term ? String(term.options.fontWeight || '') : null,
                     xterm_font_weight_bold: term ? String(term.options.fontWeightBold || '') : null,
+                    rows_font_family: rowsStyle ? rowsStyle.fontFamily : null,
+                    rows_font_weight: rowsStyle ? String(rowsStyle.fontWeight || '') : null,
+                    rows_font_feature_settings: rowsStyle ? String(rowsStyle.fontFeatureSettings || '') : null,
+                    rows_letter_spacing: rowsStyle ? String(rowsStyle.letterSpacing || '') : null,
                     xterm_theme_background: term && term.options.theme ? String(term.options.theme.background || '') : null,
                     xterm_theme_foreground: term && term.options.theme ? String(term.options.theme.foreground || '') : null,
                     xterm_present: Boolean(xtermRoot),
@@ -22899,6 +22904,8 @@ fn terminal_eval_script(
                     font-family: {font_family} !important;
                     font-weight: {font_weight} !important;
                     font-feature-settings: "calt" 0, "liga" 0 !important;
+                    font-variant-ligatures: none !important;
+                    font-synthesis: none !important;
                     text-rendering: auto !important;
                     font-kerning: none !important;
                     letter-spacing: 0 !important;
@@ -25252,7 +25259,6 @@ fn TerminalThemeSettingRow(
     dark_options: Vec<String>,
     on_change: EventHandler<(UiTheme, String)>,
 ) -> Element {
-    let mut open = use_signal(|| false);
     rsx! {
         div {
             style: "display:flex; flex-direction:column; gap:4px; position:relative;",
@@ -25260,80 +25266,25 @@ fn TerminalThemeSettingRow(
                 style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", palette.muted),
                 "Terminal Theme"
             }
-            button {
-                style: format!(
-                    "width:100%; min-height:44px; border:none; border-radius:12px; padding:8px 10px; \
-                     background:{}; color:{}; box-shadow: inset 0 0 0 1px {}; \
-                     font-size:12px; font-weight:600; display:flex; align-items:center; justify-content:space-between; gap:10px;",
-                    if palette_is_dark(palette) {
-                        "rgba(255,255,255,0.05)"
-                    } else {
-                        "rgba(255,255,255,0.34)"
-                    },
-                    palette.text
-                    ,
-                    if palette_is_dark(palette) {
-                        "rgba(141,160,178,0.24)"
-                    } else {
-                        "rgba(181,197,210,0.42)"
-                    }
-                ),
-                onclick: move |_| open.set(!open()),
-                div {
-                    style: "display:flex; flex-direction:column; align-items:flex-start; gap:1px; min-width:0;",
-                    span {
-                        style: "min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
-                        "Light {light_value} · Dark {dark_value}"
-                    }
-                    span {
-                        style: format!("font-size:10px; font-weight:600; color:{};", palette.muted),
-                        "Choose separate terminal palettes for light and dark UI."
-                    }
+            div {
+                style: "display:flex; flex-direction:column; gap:8px;",
+                TerminalThemeSelectRow {
+                    palette: palette,
+                    icon: "☀".to_string(),
+                    label: "Light".to_string(),
+                    value: light_value,
+                    options: light_options,
+                    mode: UiTheme::ZedLight,
+                    on_change: on_change,
                 }
-                span {
-                    style: format!("font-size:11px; color:{};", palette.muted),
-                    if open() { "▴" } else { "▾" }
-                }
-            }
-            if open() {
-                div {
-                    style: format!(
-                        "position:absolute; left:0; right:0; top:70px; z-index:35; display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); \
-                         gap:10px; padding:10px; border-radius:14px; background:{}; \
-                         box-shadow:{};",
-                        if palette_is_dark(palette) {
-                            "rgba(17,22,28,0.98)"
-                        } else {
-                            "rgba(250,252,254,0.98)"
-                        },
-                        if palette_is_dark(palette) {
-                            "0 18px 44px rgba(0,0,0,0.34), inset 0 0 0 1px rgba(93,116,134,0.56)"
-                        } else {
-                            "0 18px 44px rgba(55,72,92,0.18), inset 0 0 0 1px rgba(211,223,233,0.92)"
-                        }
-                    ),
-                    TerminalThemePane {
-                        palette: palette,
-                        label: "Light Mode".to_string(),
-                        value: light_value,
-                        options: light_options,
-                        mode: UiTheme::ZedLight,
-                        on_change: move |payload| {
-                            on_change.call(payload);
-                            open.set(false);
-                        },
-                    }
-                    TerminalThemePane {
-                        palette: palette,
-                        label: "Dark Mode".to_string(),
-                        value: dark_value,
-                        options: dark_options,
-                        mode: UiTheme::ZedDark,
-                        on_change: move |payload| {
-                            on_change.call(payload);
-                            open.set(false);
-                        },
-                    }
+                TerminalThemeSelectRow {
+                    palette: palette,
+                    icon: "☾".to_string(),
+                    label: "Dark".to_string(),
+                    value: dark_value,
+                    options: dark_options,
+                    mode: UiTheme::ZedDark,
+                    on_change: on_change,
                 }
             }
         }
@@ -25341,8 +25292,9 @@ fn TerminalThemeSettingRow(
 }
 
 #[component]
-fn TerminalThemePane(
+fn TerminalThemeSelectRow(
     palette: Palette,
+    icon: String,
     label: String,
     value: String,
     options: Vec<String>,
@@ -25352,48 +25304,68 @@ fn TerminalThemePane(
     rsx! {
         div {
             style: format!(
-                "display:flex; flex-direction:column; gap:7px; min-width:0; max-height:240px; padding:8px; border-radius:12px; \
-                 background:{}; box-shadow: inset 0 0 0 1px {};",
-                if palette_is_dark(palette) {
-                    "rgba(255,255,255,0.04)"
-                } else {
-                    "rgba(255,255,255,0.56)"
-                },
-                if palette_is_dark(palette) {
-                    "rgba(141,160,178,0.16)"
-                } else {
-                    "rgba(201,214,226,0.72)"
-                }
+                "display:grid; grid-template-columns:auto minmax(0,1fr); align-items:center; gap:10px; \
+                 min-width:0; min-height:34px; padding:0;",
             ),
             div {
-                style: format!("font-size:11px; font-weight:800; letter-spacing:0.02em; color:{};", palette.text),
-                "{label}"
-            }
-            div {
-                style: "display:flex; flex-direction:column; gap:4px; min-height:0; overflow:auto;",
-                for option in options {
-                    button {
-                        key: "{label}:{option}",
-                        style: format!(
-                            "display:flex; align-items:center; justify-content:space-between; min-height:30px; border:none; \
-                             border-radius:8px; padding:0 10px; background:{}; color:{}; font-size:12px; font-weight:600;",
-                            if option == value { palette.accent_soft } else { "transparent" },
-                            if option == value { palette.accent } else { palette.text }
-                        ),
-                        onclick: {
-                            let option = option.clone();
-                            move |_| on_change.call((mode, option.clone()))
+                style: format!(
+                    "display:inline-flex; align-items:center; gap:6px; min-width:58px; font-size:11px; font-weight:700; color:{};",
+                    palette.text
+                ),
+                span {
+                    style: format!(
+                        "display:inline-flex; width:18px; height:18px; align-items:center; justify-content:center; \
+                         border-radius:999px; background:{}; color:{}; font-size:11px; box-shadow: inset 0 0 0 1px {};",
+                        if palette_is_dark(palette) {
+                            "rgba(255,255,255,0.08)"
+                        } else {
+                            "rgba(255,255,255,0.72)"
                         },
-                        span {
-                            style: "min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
-                            "{option}"
+                        if palette_is_dark(palette) {
+                            "#f3f8fd"
+                        } else {
+                            "#1f2b35"
+                        },
+                        if palette_is_dark(palette) {
+                            "rgba(214,229,242,0.18)"
+                        } else {
+                            "rgba(201,214,226,0.56)"
                         }
-                        if option == value {
-                            span {
-                                style: format!("font-size:11px; color:{};", palette.accent),
-                                "✓"
-                            }
-                        }
+                    ),
+                    "{icon}"
+                }
+                span {
+                    "{label}"
+                }
+            }
+            select {
+                value: "{value}",
+                style: format!(
+                    "width:100%; height:34px; border:none; border-radius:10px; padding:0 12px; background:{}; color:{}; \
+                     box-shadow: inset 0 0 0 1px {}; font-size:12px; font-weight:600;",
+                    if palette_is_dark(palette) {
+                        "rgba(8,12,16,0.82)"
+                    } else {
+                        "rgba(255,255,255,0.72)"
+                    },
+                    if palette_is_dark(palette) {
+                        "#f1f7fd"
+                    } else {
+                        "#1f2b35"
+                    },
+                    if palette_is_dark(palette) {
+                        "rgba(214,229,242,0.24)"
+                    } else {
+                        "rgba(201,214,226,0.56)"
+                    }
+                ),
+                oninput: move |evt| on_change.call((mode, evt.value())),
+                for option in options {
+                    option {
+                        key: "{label}:{option}",
+                        value: "{option}",
+                        selected: option == value,
+                        "{option}"
                     }
                 }
             }
@@ -26068,6 +26040,16 @@ mod tests {
         assert!(script.contains("entry.term.options.fontSize = 5"));
         assert!(script.contains("entry.term.options.fontFamily"));
         assert!(script.contains("brightBlack"));
+    }
+
+    #[test]
+    fn terminal_apply_script_enforces_monospace_rendering_contract() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(script.contains("font-feature-settings:"));
+        assert!(script.contains("font-variant-ligatures: none"));
+        assert!(script.contains("font-synthesis: none"));
+        assert!(script.contains("letter-spacing: 0"));
     }
 
     #[test]

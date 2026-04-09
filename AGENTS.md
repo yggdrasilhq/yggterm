@@ -117,3 +117,4 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 - GUI singleton and focus behavior are part of observability too. If client-instance registration, app-control window metadata, or display/session matching changes, update the relevant skill files in the same commit.
 - Terminal input gating is part of observability too. If `terminal_hosts[].input_enabled` or the startup recovery input/focus contract changes, update the relevant skill files in the same commit.
 - Visual changelog assets should be deterministic, reusable, and cleanly composited, with restrained motion and annotation rather than flashy effects.
+- Once a UI/UX bug is fixed to the desired behavior, add or extend a concrete smoke test for it instead of relying on visual judgment alone. For terminal UI work, prefer app-control assertions against the mounted xterm row styles, theme state, input state, and screenshots on a second X11 display before calling it fixed.
