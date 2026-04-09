@@ -12318,6 +12318,140 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     })(),
                 }
                 : null;
+            const parseCssColor = (value) => {
+                const text = String(value || '').trim();
+                if (!text) {
+                    return null;
+                }
+                if (text.startsWith('#') && text.length === 7) {
+                    return {
+                        r: parseInt(text.slice(1, 3), 16),
+                        g: parseInt(text.slice(3, 5), 16),
+                        b: parseInt(text.slice(5, 7), 16),
+                    };
+                }
+                const rgb = text.match(/^rgba?\(([^)]+)\)$/i);
+                if (!rgb) {
+                    return null;
+                }
+                const parts = rgb[1].split(',').map((part) => part.trim());
+                if (parts.length < 3) {
+                    return null;
+                }
+                return {
+                    r: Number(parts[0]),
+                    g: Number(parts[1]),
+                    b: Number(parts[2]),
+                };
+            };
+            const relativeLuminance = (color) => {
+                if (!color) {
+                    return null;
+                }
+                const channel = (value) => {
+                    const normalized = Math.max(0, Math.min(255, Number(value || 0))) / 255;
+                    return normalized <= 0.03928
+                        ? normalized / 12.92
+                        : Math.pow((normalized + 0.055) / 1.055, 2.4);
+                };
+                return (
+                    (0.2126 * channel(color.r))
+                    + (0.7152 * channel(color.g))
+                    + (0.0722 * channel(color.b))
+                );
+            };
+            const contrastRatio = (foreground, background) => {
+                const fg = parseCssColor(foreground);
+                const bg = parseCssColor(background);
+                if (!fg || !bg) {
+                    return null;
+                }
+                const fgL = relativeLuminance(fg);
+                const bgL = relativeLuminance(bg);
+                if (fgL == null || bgL == null) {
+                    return null;
+                }
+                const lighter = Math.max(fgL, bgL);
+                const darker = Math.min(fgL, bgL);
+                return Number((((lighter + 0.05) / (darker + 0.05))).toFixed(2));
+            };
+            const collectVisibleSpanDiagnostics = (rowsLayer, backgroundColor) => {
+                if (!rowsLayer) {
+                    return {
+                        low_contrast_count: 0,
+                        min_contrast: null,
+                        low_contrast_samples: [],
+                    };
+                }
+                let minContrast = null;
+                const lowContrastSamples = [];
+                for (const span of Array.from(rowsLayer.querySelectorAll('span'))) {
+                    const text = String(span.textContent || '').replace(/\s+/g, ' ').trim();
+                    const className = String(span.className || '');
+                    if (className.includes('xterm-cursor')) {
+                        continue;
+                    }
+                    if (!text) {
+                        continue;
+                    }
+                    const rect = span.getBoundingClientRect();
+                    if (rect.width <= 0 || rect.height <= 0) {
+                        continue;
+                    }
+                    const style = window.getComputedStyle(span);
+                    const contrast = contrastRatio(style.color, backgroundColor);
+                    if (contrast == null) {
+                        continue;
+                    }
+                    if (minContrast == null || contrast < minContrast) {
+                        minContrast = contrast;
+                    }
+                    if (contrast >= 4.5) {
+                        continue;
+                    }
+                    lowContrastSamples.push({
+                        text: text.slice(0, 120),
+                        color: String(style.color || ''),
+                        opacity: String(style.opacity || ''),
+                        font_weight: String(style.fontWeight || ''),
+                        contrast,
+                        class_name: className,
+                        style_attr: String(span.getAttribute('style') || ''),
+                    });
+                    if (lowContrastSamples.length >= 8) {
+                        break;
+                    }
+                }
+                return {
+                    low_contrast_count: lowContrastSamples.length,
+                    min_contrast: minContrast,
+                    low_contrast_samples: lowContrastSamples,
+                };
+            };
+            const selectionSummaryForHost = (host) => {
+                const selection = window.getSelection ? window.getSelection() : null;
+                if (!selection || selection.rangeCount === 0) {
+                    return {
+                        text: '',
+                        range_count: 0,
+                        within_host: false,
+                    };
+                }
+                const anchorNode = selection.anchorNode;
+                const focusNode = selection.focusNode;
+                const withinHost = Boolean(
+                    host
+                    && anchorNode
+                    && focusNode
+                    && host.contains(anchorNode)
+                    && host.contains(focusNode)
+                );
+                return {
+                    text: String(selection.toString() || '').slice(0, 480),
+                    range_count: Number(selection.rangeCount || 0),
+                    within_host: withinHost,
+                };
+            };
             const hostDetails = terminalHosts.map((host) => {
                 const style = window.getComputedStyle(host);
                 const helpers = host.querySelector('.xterm-helpers');
@@ -12345,6 +12479,14 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                 const dimSampleStyle = dimSample ? window.getComputedStyle(dimSample) : null;
                 const cursorSample = rowsLayer ? rowsLayer.querySelector('.xterm-cursor') : null;
                 const cursorSampleStyle = cursorSample ? window.getComputedStyle(cursorSample) : null;
+                const effectiveBackgroundColor = (
+                    viewportStyle && viewportStyle.backgroundColor
+                    || screenStyle && screenStyle.backgroundColor
+                    || style.backgroundColor
+                    || ''
+                );
+                const spanDiagnostics = collectVisibleSpanDiagnostics(rowsLayer, effectiveBackgroundColor);
+                const selectionSummary = selectionSummaryForHost(host);
                 const xtermRoot = host.querySelector('.xterm');
                 const mountedHost = window.__yggtermXtermHosts ? window.__yggtermXtermHosts[host.id] : null;
                 const term = mountedHost ? mountedHost.term : null;
@@ -12432,6 +12574,12 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                         : rowSample
                             ? String(rowSample.getAttribute('style') || '')
                             : null,
+                    low_contrast_span_count: spanDiagnostics.low_contrast_count,
+                    low_contrast_min_contrast: spanDiagnostics.min_contrast,
+                    low_contrast_span_samples: spanDiagnostics.low_contrast_samples,
+                    selection_text: selectionSummary.text,
+                    selection_range_count: selectionSummary.range_count,
+                    selection_within_host: selectionSummary.within_host,
                     dim_sample_text: dimSample ? String(dimSample.textContent || '') : null,
                     dim_sample_color: dimSampleStyle ? String(dimSampleStyle.color || '') : null,
                     dim_sample_opacity: dimSampleStyle ? String(dimSampleStyle.opacity || '') : null,
@@ -13152,6 +13300,179 @@ async fn probe_terminal_viewport_scroll_for(session_path: &str, lines: i32) -> V
     }
 }
 
+async fn probe_terminal_viewport_select_for(session_path: &str) -> Value {
+    let session_path_literal =
+        serde_json::to_string(session_path).unwrap_or_else(|_| "null".to_string());
+    let script = format!(
+        r#"
+        (async () => {{
+            try {{
+                const sessionPath = {session_path_literal};
+                const registry = window.__yggtermXtermHosts || {{}};
+                const entries = Object.values(registry)
+                    .filter((entry) => entry && entry.term && entry.sessionPath === sessionPath)
+                    .sort((a, b) => (b.mountedAt || 0) - (a.mountedAt || 0));
+                const visibleEntries = entries.filter((entry) => {{
+                    const host = document.getElementById(entry.hostId);
+                    if (!host) {{
+                        return false;
+                    }}
+                    const rect = host.getBoundingClientRect();
+                    const style = window.getComputedStyle(host);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                }});
+                const entry = visibleEntries[0] || entries[0] || null;
+                if (!entry) {{
+                    dioxus.send({{
+                        accepted: false,
+                        reason: "terminal_host_missing",
+                        session_path: sessionPath,
+                    }});
+                    return;
+                }}
+                const host = document.getElementById(entry.hostId);
+                const rowsLayer = host ? host.querySelector('.xterm-rows') : null;
+                if (!host || !rowsLayer) {{
+                    dioxus.send({{
+                        accepted: false,
+                        reason: "terminal_rows_missing",
+                        session_path: sessionPath,
+                    }});
+                    return;
+                }}
+                const parseCssColor = (value) => {{
+                    const text = String(value || '').trim();
+                    if (!text) {{
+                        return null;
+                    }}
+                    if (text.startsWith('#') && text.length === 7) {{
+                        return {{
+                            r: parseInt(text.slice(1, 3), 16),
+                            g: parseInt(text.slice(3, 5), 16),
+                            b: parseInt(text.slice(5, 7), 16),
+                        }};
+                    }}
+                    const rgb = text.match(/^rgba?\(([^)]+)\)$/i);
+                    if (!rgb) {{
+                        return null;
+                    }}
+                    const parts = rgb[1].split(',').map((part) => part.trim());
+                    if (parts.length < 3) {{
+                        return null;
+                    }}
+                    return {{
+                        r: Number(parts[0]),
+                        g: Number(parts[1]),
+                        b: Number(parts[2]),
+                    }};
+                }};
+                const relativeLuminance = (color) => {{
+                    if (!color) {{
+                        return null;
+                    }}
+                    const channel = (value) => {{
+                        const normalized = Math.max(0, Math.min(255, Number(value || 0))) / 255;
+                        return normalized <= 0.03928
+                            ? normalized / 12.92
+                            : Math.pow((normalized + 0.055) / 1.055, 2.4);
+                    }};
+                    return (
+                        (0.2126 * channel(color.r))
+                        + (0.7152 * channel(color.g))
+                        + (0.0722 * channel(color.b))
+                    );
+                }};
+                const contrastRatio = (foreground, background) => {{
+                    const fg = parseCssColor(foreground);
+                    const bg = parseCssColor(background);
+                    if (!fg || !bg) {{
+                        return null;
+                    }}
+                    const fgL = relativeLuminance(fg);
+                    const bgL = relativeLuminance(bg);
+                    if (fgL == null || bgL == null) {{
+                        return null;
+                    }}
+                    const lighter = Math.max(fgL, bgL);
+                    const darker = Math.min(fgL, bgL);
+                    return Number((((lighter + 0.05) / (darker + 0.05))).toFixed(2));
+                }};
+                const viewport = host.querySelector('.xterm-viewport');
+                const screen = host.querySelector('.xterm-screen');
+                const backgroundColor = String(
+                    (viewport && window.getComputedStyle(viewport).backgroundColor)
+                    || (screen && window.getComputedStyle(screen).backgroundColor)
+                    || window.getComputedStyle(host).backgroundColor
+                    || ''
+                );
+                const spans = Array.from(rowsLayer.querySelectorAll('span'))
+                    .map((span) => {{
+                        const text = String(span.textContent || '').replace(/\s+/g, ' ').trim();
+                        const className = String(span.className || '');
+                        const rect = span.getBoundingClientRect();
+                        const style = window.getComputedStyle(span);
+                        return {{
+                            node: span,
+                            text,
+                            class_name: className,
+                            width: rect.width,
+                            height: rect.height,
+                            contrast: contrastRatio(style.color, backgroundColor),
+                        }};
+                    }})
+                    .filter((entry) => entry.text && entry.width > 0 && entry.height > 0 && !entry.class_name.includes('xterm-cursor'));
+                const meaningfulSpans = spans.filter((entry) => /[A-Za-z0-9]/.test(entry.text) && entry.text.length >= 3);
+                const target = (meaningfulSpans.length ? meaningfulSpans : spans)
+                    .filter((entry) => entry.contrast != null)
+                    .sort((a, b) => Number(a.contrast) - Number(b.contrast))[0]
+                    || meaningfulSpans[0]
+                    || spans[0]
+                    || Array.from(rowsLayer.querySelectorAll('div')).find((node) => String(node.textContent || '').trim())
+                    || rowsLayer;
+                const selection = window.getSelection ? window.getSelection() : null;
+                let rangeText = '';
+                if (selection) {{
+                    selection.removeAllRanges();
+                    const range = document.createRange();
+                    range.selectNodeContents(target.node || target);
+                    selection.addRange(range);
+                    rangeText = String(range.toString() || '');
+                }}
+                await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+                const selectedText = selection ? String(selection.toString() || '') : '';
+                const effectiveSelectedText = selectedText || rangeText || String(target.text || '');
+                dioxus.send({{
+                    accepted: true,
+                    session_path: sessionPath,
+                    host_id: entry.hostId,
+                    selected_text: effectiveSelectedText.slice(0, 480),
+                    selected_text_length: effectiveSelectedText.length,
+                    selected_contrast: target.contrast != null ? Number(target.contrast) : null,
+                    selected_excerpt: String((target.text || effectiveSelectedText || '')).slice(0, 240),
+                    background_color: backgroundColor,
+                }});
+            }} catch (error) {{
+                dioxus.send({{
+                    accepted: false,
+                    reason: error && error.message ? error.message : String(error),
+                    session_path: {session_path_literal},
+                }});
+            }}
+        }})();
+    "#,
+        session_path_literal = session_path_literal,
+    );
+    let mut eval = document::eval(&script);
+    match eval.recv::<Value>().await {
+        Ok(value) => value,
+        Err(error) => json!({
+            "accepted": false,
+            "reason": error.to_string(),
+            "session_path": session_path,
+        }),
+    }
+}
+
 async fn process_pending_app_control_requests(
     settings_path: &std::path::Path,
     desktop: dioxus::desktop::DesktopContext,
@@ -13788,6 +14109,23 @@ async fn process_pending_app_control_requests(
             lines,
         } => {
             let result = probe_terminal_viewport_scroll_for(&session_path, lines).await;
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                error: result
+                    .get("accepted")
+                    .and_then(Value::as_bool)
+                    .filter(|accepted| !accepted)
+                    .and_then(|_| result.get("reason"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                data: Some(result),
+            }
+        }
+        AppControlCommand::ProbeTerminalViewportSelect { session_path } => {
+            let result = probe_terminal_viewport_select_for(&session_path).await;
             AppControlResponse {
                 request_id: request.request_id.clone(),
                 handled_by_pid: std::process::id(),
