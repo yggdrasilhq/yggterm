@@ -94,17 +94,8 @@ pub fn terminal_theme_names() -> Vec<String> {
         .collect()
 }
 
-pub fn terminal_theme_names_for_mode(theme: UiTheme) -> Vec<String> {
-    let mut names = terminal_theme_catalog()
-        .iter()
-        .filter(|candidate| terminal_theme_matches_mode(candidate, theme))
-        .map(|candidate| candidate.name.clone())
-        .collect::<Vec<_>>();
-    let default_name = default_terminal_theme_name(theme);
-    if !names.iter().any(|name| name == default_name) {
-        names.insert(0, default_name.to_string());
-    }
-    names
+pub fn terminal_theme_names_for_mode(_theme: UiTheme) -> Vec<String> {
+    terminal_theme_names()
 }
 
 pub fn default_terminal_theme_name(theme: UiTheme) -> &'static str {
@@ -118,27 +109,6 @@ pub fn terminal_theme_by_name(name: &str) -> Option<&'static NamedTerminalTheme>
     terminal_theme_catalog()
         .iter()
         .find(|theme| theme.name == name)
-}
-
-fn terminal_theme_matches_mode(theme: &NamedTerminalTheme, mode: UiTheme) -> bool {
-    let is_light = terminal_theme_background_luminance(&theme.palette.background)
-        .map(|luminance| luminance >= 0.58)
-        .unwrap_or_else(|| theme.name == DEFAULT_LIGHT_TERMINAL_THEME);
-    match mode {
-        UiTheme::ZedLight => is_light,
-        UiTheme::ZedDark => !is_light,
-    }
-}
-
-fn terminal_theme_background_luminance(color: &str) -> Option<f32> {
-    let hex = color.strip_prefix('#')?;
-    if hex.len() != 6 {
-        return None;
-    }
-    let red = u8::from_str_radix(&hex[0..2], 16).ok()? as f32 / 255.0;
-    let green = u8::from_str_radix(&hex[2..4], 16).ok()? as f32 / 255.0;
-    let blue = u8::from_str_radix(&hex[4..6], 16).ok()? as f32 / 255.0;
-    Some(0.2126 * red + 0.7152 * green + 0.0722 * blue)
 }
 
 fn parse_ghostty_theme(contents: &str) -> Option<TerminalPaletteSpec> {
@@ -235,21 +205,13 @@ mod tests {
     }
 
     #[test]
-    fn splits_theme_names_by_mode() {
+    fn theme_picker_offers_full_catalog_for_both_modes() {
         let light_names = terminal_theme_names_for_mode(UiTheme::ZedLight);
         let dark_names = terminal_theme_names_for_mode(UiTheme::ZedDark);
+        assert_eq!(light_names, terminal_theme_names());
+        assert_eq!(dark_names, terminal_theme_names());
         assert!(
             light_names
-                .iter()
-                .any(|name| name == DEFAULT_LIGHT_TERMINAL_THEME)
-        );
-        assert!(
-            dark_names
-                .iter()
-                .any(|name| name == DEFAULT_DARK_TERMINAL_THEME)
-        );
-        assert!(
-            !light_names
                 .iter()
                 .any(|name| name == DEFAULT_DARK_TERMINAL_THEME)
         );
