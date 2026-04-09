@@ -86,6 +86,8 @@ def assert_terminal_font_contract(state: dict, expect_bg: str) -> None:
     if not hosts:
         raise AssertionError("no terminal host found")
     host = hosts[0]
+    host_width = ((host.get("host_rect") or {}).get("width")) or ((host.get("viewport_rect") or {}).get("width"))
+    screen_width = (host.get("screen_rect") or {}).get("width")
     xterm_family = host.get("xterm_font_family") or ""
     rows_family = host.get("rows_sample_font_family") or host.get("rows_font_family") or ""
     rows_weight = host.get("rows_sample_font_weight") or host.get("rows_font_weight") or ""
@@ -97,6 +99,15 @@ def assert_terminal_font_contract(state: dict, expect_bg: str) -> None:
     rows_spacing = host.get("rows_sample_letter_spacing") or host.get("rows_letter_spacing") or ""
     rows_line_height = host.get("rows_sample_line_height") or host.get("rows_line_height") or ""
     rows_color = host.get("rows_sample_color") or host.get("rows_color") or ""
+    dim_color = host.get("dim_sample_color") or ""
+    dim_opacity = host.get("dim_sample_opacity") or ""
+    cursor_class = host.get("cursor_sample_class_name") or ""
+    cursor_background = host.get("cursor_sample_background") or ""
+    cursor_border_left = host.get("cursor_sample_border_left") or ""
+    cursor_border_bottom = host.get("cursor_sample_border_bottom") or ""
+    cursor_outline = host.get("cursor_sample_outline") or ""
+    if not xterm_family:
+        raise AssertionError("xterm font family missing; terminal runtime likely did not fully mount")
     if "JetBrains Mono" not in xterm_family:
         raise AssertionError(f"xterm font family drifted: {xterm_family!r}")
     if "JetBrains Mono" not in rows_family:
@@ -130,6 +141,30 @@ def assert_terminal_font_contract(state: dict, expect_bg: str) -> None:
         raise AssertionError(
             f"rows sample contrast drifted: color={rows_color!r} background={expect_bg!r} contrast={sample_contrast!r}"
         )
+    if dim_color:
+        dim_contrast = contrast_ratio(dim_color, expect_bg)
+        if dim_contrast is None or dim_contrast < 3.0:
+            raise AssertionError(
+                f"dim text contrast drifted: color={dim_color!r} background={expect_bg!r} contrast={dim_contrast!r}"
+            )
+    if dim_opacity not in ("", "1", "1.0"):
+        raise AssertionError(f"dim text opacity drifted: {dim_opacity!r}")
+    if cursor_class and "xterm-cursor" not in cursor_class:
+        raise AssertionError(f"cursor class drifted: {cursor_class!r}")
+    if cursor_class and not any(
+        value and value not in ("rgba(0, 0, 0, 0)", "transparent")
+        for value in (cursor_background, cursor_border_left, cursor_border_bottom, cursor_outline)
+    ):
+        raise AssertionError(
+            "cursor styling drifted: "
+            f"background={cursor_background!r} border_left={cursor_border_left!r} "
+            f"border_bottom={cursor_border_bottom!r} outline={cursor_outline!r}"
+        )
+    if host_width and screen_width:
+        if abs(float(host_width) - float(screen_width)) > 18.0:
+            raise AssertionError(
+                f"xterm screen width drifted: host={host_width!r} screen={screen_width!r}"
+            )
     if host.get("xterm_theme_background") != expect_bg:
         raise AssertionError(
             f"xterm background drifted: expected {expect_bg}, got {host.get('xterm_theme_background')}"
