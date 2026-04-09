@@ -15939,6 +15939,7 @@ fn app() -> Element {
                                 accent: snapshot.palette.accent,
                                 close_hover: snapshot.palette.close_hover,
                                 control_hover: snapshot.palette.control_hover,
+                                is_dark: palette_is_dark(snapshot.palette),
                             },
                             hovered: hovered(),
                             on_hover_control: move |control: Option<HoveredControl>| hovered.set(control),
@@ -16273,13 +16274,14 @@ fn app() -> Element {
                     }
                 }
                 if !snapshot.notifications.is_empty() {
-                    ToastViewport {
-                        items: snapshot.notifications.clone(),
-                        palette: ToastPalette {
-                            text: snapshot.palette.text,
-                            muted: snapshot.palette.muted,
-                            accent: snapshot.palette.accent,
-                        },
+                        ToastViewport {
+                            items: snapshot.notifications.clone(),
+                            palette: ToastPalette {
+                                text: snapshot.palette.text,
+                                muted: snapshot.palette.muted,
+                                accent: snapshot.palette.accent,
+                                is_dark: palette_is_dark(snapshot.palette),
+                            },
                         center_offset: toast_center_offset(snapshot.right_panel_mode),
                         max_age_ms: 7000,
                         max_visible: 3,
@@ -16424,12 +16426,22 @@ fn Titlebar(
                         onmousedown: |evt| evt.stop_propagation(),
                         onclick: |evt| evt.stop_propagation(),
                         ondoubleclick: |evt| evt.stop_propagation(),
-                        button {
-                            style: format!(
+                            button {
+                                style: format!(
                                 "display:inline-flex; align-items:center; gap:6px; height:30px; padding:0 11px; border:none; border-radius:10px; \
-                                 background:rgba(255,255,255,0.78); color:{}; font-size:11px; font-weight:800; cursor:pointer; \
-                                 box-shadow: inset 0 0 0 1px rgba(190,206,222,0.52); white-space:nowrap;",
-                                if snapshot.titlebar_new_menu_open { snapshot.palette.accent } else { snapshot.palette.text }
+                                 background:{}; color:{}; font-size:11px; font-weight:800; cursor:pointer; \
+                                 box-shadow: inset 0 0 0 1px {}; white-space:nowrap;",
+                                chrome_chip_fill(snapshot.palette, snapshot.titlebar_new_menu_open),
+                                if snapshot.titlebar_new_menu_open {
+                                    snapshot.palette.accent
+                                } else {
+                                    chrome_chip_text_color(
+                                        snapshot.palette,
+                                        snapshot.titlebar_new_menu_open,
+                                        true,
+                                    )
+                                },
+                                chrome_chip_border(snapshot.palette)
                             ),
                             onclick: move |_| on_toggle_new_menu.call(()),
                             if alt_overlay_badge_visible(&snapshot, "") {
@@ -16451,8 +16463,18 @@ fn Titlebar(
                             div {
                                 style: format!(
                                     "position:absolute; left:0; top:38px; z-index:210; min-width:176px; padding:8px; border-radius:14px; \
-                                     background:rgba(255,255,255,0.96); box-shadow:0 18px 46px rgba(74,93,122,0.22), \
-                                     inset 0 0 0 1px rgba(198,212,226,0.82); display:flex; flex-direction:column; gap:6px;",
+                                     background:{}; box-shadow:{}; \
+                                     display:flex; flex-direction:column; gap:6px;",
+                                    if palette_is_dark(snapshot.palette) {
+                                        "rgba(14,19,24,0.98)"
+                                    } else {
+                                        "rgba(255,255,255,0.98)"
+                                    },
+                                    if palette_is_dark(snapshot.palette) {
+                                        "0 18px 46px rgba(0,0,0,0.28), inset 0 0 0 1px rgba(187,204,219,0.16)"
+                                    } else {
+                                        "0 18px 46px rgba(74,93,122,0.22), inset 0 0 0 1px rgba(198,212,226,0.82)"
+                                    },
                                 ),
                                 onmousedown: |evt| evt.stop_propagation(),
                                 button {
@@ -16506,9 +16528,15 @@ fn Titlebar(
                                     .unwrap_or_else(|| "Summary not generated yet.".to_string()),
                                 style: format!(
                                     "display:flex; align-items:center; gap:8px; width:100%; height:32px; padding:0 12px; border:none; border-radius:10px; \
-                                     background:rgba(255,255,255,0.74); color:{}; box-shadow: inset 0 0 0 1px rgba(190,206,222,0.5); \
+                                     background:{}; color:{}; box-shadow: inset 0 0 0 1px {}; \
                                      font-size:12px; font-weight:700; cursor:pointer; min-width:0;",
-                                    snapshot.palette.text
+                                    chrome_chip_fill(snapshot.palette, snapshot.titlebar_session_menu_open),
+                                    chrome_chip_text_color(
+                                        snapshot.palette,
+                                        snapshot.titlebar_session_menu_open,
+                                        true,
+                                    ),
+                                    chrome_chip_border(snapshot.palette)
                                 ),
                                 onclick: move |_| on_toggle_session_menu.call(()),
                                 span {
@@ -16552,8 +16580,17 @@ fn Titlebar(
                                     "data-titlebar-summary-menu": "1",
                                     style: format!(
                                         "position:absolute; left:0; top:38px; z-index:210; width:min(420px, 70vw); padding:12px 14px; border-radius:16px; \
-                                         background:rgba(255,255,255,0.97); box-shadow:0 20px 48px rgba(74,93,122,0.18), \
-                                         inset 0 0 0 1px rgba(198,212,226,0.86); display:flex; flex-direction:column; gap:10px;",
+                                         background:{}; box-shadow:{}; display:flex; flex-direction:column; gap:10px;",
+                                        if palette_is_dark(snapshot.palette) {
+                                            "rgba(14,19,24,0.98)"
+                                        } else {
+                                            "rgba(255,255,255,0.98)"
+                                        },
+                                        if palette_is_dark(snapshot.palette) {
+                                            "0 20px 48px rgba(0,0,0,0.28), inset 0 0 0 1px rgba(187,204,219,0.16)"
+                                        } else {
+                                            "0 20px 48px rgba(74,93,122,0.18), inset 0 0 0 1px rgba(198,212,226,0.86)"
+                                        },
                                     ),
                                     onmousedown: |evt| evt.stop_propagation(),
                                     div {
@@ -16597,7 +16634,7 @@ fn Titlebar(
                             r#type: "text",
                             value: "{snapshot.search_query}",
                             placeholder: "Search sessions…",
-                            style: search_input_style(snapshot.palette.text),
+                            style: search_input_style(snapshot.palette.text, palette_is_dark(snapshot.palette)),
                             onmousedown: |evt| evt.stop_propagation(),
                             ondoubleclick: |evt| evt.stop_propagation(),
                             onfocus: move |_| on_set_search_focus.call(true),
@@ -16650,8 +16687,10 @@ fn Titlebar(
                                     style: format!(
                                         "display:flex; align-items:center; justify-content:space-between; gap:12px; \
                                          height:28px; border:none; border-radius:10px; padding:0 10px; cursor:pointer; \
-                                         background:rgba(255,255,255,0.72); color:{}; box-shadow: inset 0 0 0 1px rgba(196,210,224,0.45);",
-                                        snapshot.palette.text
+                                         background:{}; color:{}; box-shadow: inset 0 0 0 1px {};",
+                                        chrome_chip_fill(snapshot.palette, false),
+                                        chrome_chip_text_color(snapshot.palette, false, true),
+                                        chrome_chip_border(snapshot.palette)
                                     ),
                                     onclick: {
                                         let command = suggestion.command.clone();
@@ -16683,9 +16722,12 @@ fn Titlebar(
                         button {
                             style: format!(
                                 "display:inline-flex; align-items:center; gap:7px; height:28px; padding:0 11px; border:none; border-radius:10px; \
-                                 background:rgba(255,255,255,0.82); color:{}; font-size:11px; font-weight:700; cursor:pointer; \
-                                 box-shadow: inset 0 0 0 1px rgba(170,190,212,0.24); white-space:nowrap;",
+                                 background:{}; color:{}; font-size:11px; font-weight:700; cursor:pointer; \
+                                 box-shadow: inset 0 0 0 1px {}; white-space:nowrap;",
+                                chrome_chip_fill(snapshot.palette, true),
                                 snapshot.palette.accent
+                                ,
+                                chrome_chip_border(snapshot.palette)
                             ),
                             onmousedown: |evt| evt.stop_propagation(),
                             ondoubleclick: |evt| evt.stop_propagation(),
@@ -16768,6 +16810,7 @@ fn Titlebar(
                                 accent: snapshot.palette.accent,
                                 close_hover: snapshot.palette.close_hover,
                                 control_hover: snapshot.palette.control_hover,
+                                is_dark: palette_is_dark(snapshot.palette),
                             },
                             hovered: hovered(),
                             on_hover_control: on_hover_control,
@@ -16792,6 +16835,7 @@ fn Titlebar(
                                 accent: snapshot.palette.accent,
                                 close_hover: snapshot.palette.close_hover,
                                 control_hover: snapshot.palette.control_hover,
+                                is_dark: palette_is_dark(snapshot.palette),
                             },
                             hovered: hovered(),
                             on_hover_control: on_hover_control,
@@ -22365,28 +22409,73 @@ fn terminal_theme_is_dark(theme: &TerminalTheme) -> bool {
     luminance < 0.5
 }
 
-fn terminal_font_weight(theme: &TerminalTheme) -> u16 {
-    if terminal_theme_is_dark(theme) {
-        500
-    } else {
-        540
+fn chrome_parse_css_color(input: &str) -> Option<(f32, f32, f32, f32)> {
+    let trimmed = input.trim();
+    if trimmed.eq_ignore_ascii_case("transparent") {
+        return Some((0.0, 0.0, 0.0, 0.0));
     }
+    if let Some(hex) = trimmed.strip_prefix('#') {
+        let expanded = match hex.len() {
+            3 => hex.chars().flat_map(|ch| [ch, ch]).collect::<String>(),
+            6 => hex.to_string(),
+            _ => return None,
+        };
+        let red = u8::from_str_radix(&expanded[0..2], 16).ok()? as f32 / 255.0;
+        let green = u8::from_str_radix(&expanded[2..4], 16).ok()? as f32 / 255.0;
+        let blue = u8::from_str_radix(&expanded[4..6], 16).ok()? as f32 / 255.0;
+        return Some((red, green, blue, 1.0));
+    }
+    let open = trimmed.find('(')?;
+    let close = trimmed.rfind(')')?;
+    let kind = trimmed[..open].trim();
+    let values = trimmed[open + 1..close]
+        .split(',')
+        .map(|part| part.trim())
+        .collect::<Vec<_>>();
+    match (kind, values.as_slice()) {
+        ("rgb", [red, green, blue]) => Some((
+            red.parse::<f32>().ok()? / 255.0,
+            green.parse::<f32>().ok()? / 255.0,
+            blue.parse::<f32>().ok()? / 255.0,
+            1.0,
+        )),
+        ("rgba", [red, green, blue, alpha]) => Some((
+            red.parse::<f32>().ok()? / 255.0,
+            green.parse::<f32>().ok()? / 255.0,
+            blue.parse::<f32>().ok()? / 255.0,
+            alpha.parse::<f32>().ok()?,
+        )),
+        _ => None,
+    }
+}
+
+fn chrome_blended_luminance(foreground: &str, background: &str) -> Option<f32> {
+    let (fr, fg, fb, fa) = chrome_parse_css_color(foreground)?;
+    let (br, bg, bb, _ba) = chrome_parse_css_color(background)?;
+    let red = (fr * fa) + (br * (1.0 - fa));
+    let green = (fg * fa) + (bg * (1.0 - fa));
+    let blue = (fb * fa) + (bb * (1.0 - fa));
+    Some((0.2126 * red) + (0.7152 * green) + (0.0722 * blue))
+}
+
+fn terminal_font_weight(theme: &TerminalTheme) -> u16 {
+    let _ = theme;
+    500
 }
 
 fn terminal_font_weight_bold(theme: &TerminalTheme) -> u16 {
-    if terminal_theme_is_dark(theme) {
-        700
-    } else {
-        740
-    }
+    let _ = theme;
+    700
 }
 
 fn terminal_font_smoothing(theme: &TerminalTheme) -> &'static str {
-    if terminal_theme_is_dark(theme) {
-        "antialiased"
-    } else {
-        "subpixel-antialiased"
-    }
+    let _ = theme;
+    "antialiased"
+}
+
+fn terminal_moz_font_smoothing(theme: &TerminalTheme) -> &'static str {
+    let _ = theme;
+    "grayscale"
 }
 
 fn xterm_assets_bootstrap_script() -> String {
@@ -22600,12 +22689,8 @@ fn terminal_eval_script(
         .expect("serialize terminal bold font weight");
     let font_smoothing = serde_json::to_string(terminal_font_smoothing(theme))
         .expect("serialize terminal font smoothing");
-    let moz_font_smoothing = serde_json::to_string(if terminal_theme_is_dark(theme) {
-        "grayscale"
-    } else {
-        "auto"
-    })
-    .expect("serialize terminal moz font smoothing");
+    let moz_font_smoothing = serde_json::to_string(terminal_moz_font_smoothing(theme))
+        .expect("serialize terminal moz font smoothing");
     let constructed_debug = if cfg!(debug_assertions) {
         "dioxus.send({ kind: \"debug\", message: `constructed host=${hostId} fontSize=${term.options.fontSize} cols=${term.cols} rows=${term.rows}` });"
     } else {
@@ -22814,7 +22899,9 @@ fn terminal_eval_script(
                     font-family: {font_family} !important;
                     font-weight: {font_weight} !important;
                     font-feature-settings: "calt" 0, "liga" 0 !important;
-                    text-rendering: geometricPrecision !important;
+                    text-rendering: auto !important;
+                    font-kerning: none !important;
+                    letter-spacing: 0 !important;
                     -webkit-font-smoothing: {font_smoothing} !important;
                     -moz-osx-font-smoothing: {moz_font_smoothing} !important;
                 }}
@@ -23371,12 +23458,8 @@ fn terminal_apply_script(host_id: &str, theme: &TerminalTheme) -> String {
         .expect("serialize terminal bold font weight");
     let font_smoothing = serde_json::to_string(terminal_font_smoothing(theme))
         .expect("serialize terminal font smoothing");
-    let moz_font_smoothing = serde_json::to_string(if terminal_theme_is_dark(theme) {
-        "grayscale"
-    } else {
-        "auto"
-    })
-    .expect("serialize terminal moz font smoothing");
+    let moz_font_smoothing = serde_json::to_string(terminal_moz_font_smoothing(theme))
+        .expect("serialize terminal moz font smoothing");
     format!(
         r#"
         (() => {{
@@ -23421,6 +23504,11 @@ fn terminal_apply_script(host_id: &str, theme: &TerminalTheme) -> String {
               entry.emitResize();
             }} else if (entry.fitAddon) {{
               entry.fitAddon.fit();
+            }}
+          }} catch (_error) {{}}
+          try {{
+            if (entry.term.refresh) {{
+              entry.term.refresh(0, Math.max(0, entry.term.rows - 1));
             }}
           }} catch (_error) {{}}
           window.__yggtermLastApply = {{
@@ -23522,12 +23610,8 @@ fn terminal_apply_script_for_session(session_path: &str, theme: &TerminalTheme) 
         .expect("serialize terminal bold font weight");
     let font_smoothing = serde_json::to_string(terminal_font_smoothing(theme))
         .expect("serialize terminal font smoothing");
-    let moz_font_smoothing = serde_json::to_string(if terminal_theme_is_dark(theme) {
-        "grayscale"
-    } else {
-        "auto"
-    })
-    .expect("serialize terminal moz font smoothing");
+    let moz_font_smoothing = serde_json::to_string(terminal_moz_font_smoothing(theme))
+        .expect("serialize terminal moz font smoothing");
     format!(
         r#"
         (() => {{
@@ -23575,6 +23659,11 @@ fn terminal_apply_script_for_session(session_path: &str, theme: &TerminalTheme) 
               entry.emitResize();
             }} else if (entry.fitAddon) {{
               entry.fitAddon.fit();
+            }}
+          }} catch (_error) {{}}
+          try {{
+            if (entry.term.refresh) {{
+              entry.term.refresh(0, Math.max(0, entry.term.rows - 1));
             }}
           }} catch (_error) {{}}
           window.__yggtermLastApply = {{
@@ -24030,6 +24119,7 @@ fn NotificationsRailBody(
                             text: snapshot.palette.text,
                             muted: snapshot.palette.muted,
                             accent: snapshot.palette.accent,
+                            is_dark: palette_is_dark(snapshot.palette),
                         },
                         on_clear: move |_| on_clear_notification.call(notification.id),
                     }
@@ -25462,9 +25552,11 @@ fn sync_window_frame_state(shell: &mut ShellState) {
 
 fn icon_button_style(palette: Palette) -> String {
     format!(
-        "width:28px; height:28px; border:none; border-radius:8px; background:transparent; color:{}; font-size:13px; \
-         user-select:none; -webkit-user-select:none; pointer-events:auto;",
-        palette.muted
+        "width:28px; height:28px; border:none; border-radius:8px; background:{}; color:{}; font-size:13px; \
+         box-shadow: inset 0 0 0 1px {}; user-select:none; -webkit-user-select:none; pointer-events:auto;",
+        chrome_chip_fill(palette, false),
+        chrome_chip_text_color(palette, false, false),
+        chrome_chip_border(palette)
     )
 }
 
@@ -25474,27 +25566,32 @@ fn utility_icon_style(palette: Palette, selected: bool) -> String {
 
 fn utility_icon_style_sized(palette: Palette, selected: bool, font_size_px: u8) -> String {
     format!(
-        "width:28px; height:28px; border:none; border-radius:10px; background:transparent; color:{}; font-size:{}px; font-weight:{}; \
-         user-select:none; -webkit-user-select:none; pointer-events:auto;",
+        "width:28px; height:28px; border:none; border-radius:10px; background:{}; color:{}; font-size:{}px; font-weight:{}; \
+         box-shadow: inset 0 0 0 1px {}; user-select:none; -webkit-user-select:none; pointer-events:auto;",
+        chrome_chip_fill(palette, selected),
         if selected {
             palette.accent
         } else {
-            palette.muted
+            chrome_chip_text_color(palette, selected, false)
         },
         font_size_px,
-        if selected { 800 } else { 700 }
+        if selected { 800 } else { 700 },
+        chrome_chip_border(palette)
     )
 }
 
 fn connect_button_style(palette: Palette, selected: bool) -> String {
     format!(
-        "height:28px; padding:0 11px; border:none; border-radius:10px; background:transparent; color:{}; \
-         font-size:11px; font-weight:700; white-space:nowrap; user-select:none; -webkit-user-select:none; pointer-events:auto;",
+        "height:28px; padding:0 11px; border:none; border-radius:10px; background:{}; color:{}; \
+         font-size:11px; font-weight:700; white-space:nowrap; user-select:none; -webkit-user-select:none; pointer-events:auto; \
+         box-shadow: inset 0 0 0 1px {};",
+        chrome_chip_fill(palette, selected),
         if selected {
             palette.accent
         } else {
-            palette.muted
-        }
+            chrome_chip_text_color(palette, selected, false)
+        },
+        chrome_chip_border(palette)
     )
 }
 
@@ -25605,14 +25702,14 @@ fn toggle_slider_style(palette: Palette) -> String {
     format!(
         "display:flex; align-items:center; gap:4px; padding:3px; border:none; border-radius:999px; background:{}; box-shadow: inset 0 0 0 1px {}; user-select:none; -webkit-user-select:none;",
         if palette_is_dark(palette) {
-            "rgba(17,23,29,0.84)"
+            "rgba(10,14,18,0.74)"
         } else {
-            "rgba(255,255,255,0.34)"
+            "rgba(255,255,255,0.46)"
         },
         if palette_is_dark(palette) {
-            "rgba(96,118,136,0.4)"
+            "rgba(187,204,219,0.16)"
         } else {
-            "rgba(255,255,255,0.28)"
+            "rgba(201,214,226,0.42)"
         }
     )
 }
@@ -25622,18 +25719,65 @@ fn toggle_slider_end_style(palette: Palette, selected: bool) -> String {
         "height:26px; min-width:82px; padding:0 12px; border:none; border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:700; \
          user-select:none; -webkit-user-select:none;",
         if selected {
-            palette.panel
+            if palette_is_dark(palette) {
+                "rgba(255,255,255,0.10)"
+            } else {
+                "rgba(255,255,255,0.92)"
+            }
         } else if palette_is_dark(palette) {
-            "rgba(15,21,28,0.18)"
+            "rgba(255,255,255,0.03)"
         } else {
             "transparent"
         },
         if selected {
-            palette.text
+            chrome_chip_text_color(palette, true, true)
         } else {
-            palette.muted
+            chrome_chip_text_color(palette, false, false)
         }
     )
+}
+
+fn chrome_chip_fill(palette: Palette, selected: bool) -> &'static str {
+    if selected {
+        palette.accent_soft
+    } else if palette_is_dark(palette) {
+        "rgba(8,12,16,0.82)"
+    } else {
+        "rgba(255,255,255,0.72)"
+    }
+}
+
+fn chrome_chip_border(palette: Palette) -> &'static str {
+    if palette_is_dark(palette) {
+        "rgba(214,229,242,0.24)"
+    } else {
+        "rgba(201,214,226,0.56)"
+    }
+}
+
+fn chrome_chip_text_color(palette: Palette, selected: bool, emphasized: bool) -> &'static str {
+    let fill = chrome_chip_fill(palette, selected);
+    let base = if palette.titlebar == "transparent" {
+        palette.shell
+    } else {
+        palette.titlebar
+    };
+    match chrome_blended_luminance(fill, base) {
+        Some(luminance) if luminance < 0.46 => {
+            if emphasized {
+                "#f6fbff"
+            } else {
+                "#e6f0f9"
+            }
+        }
+        _ => {
+            if emphasized {
+                "#18222d"
+            } else {
+                "#33414d"
+            }
+        }
+    }
 }
 
 fn settings_input_style(palette: Palette) -> String {

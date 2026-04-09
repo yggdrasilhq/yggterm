@@ -29,6 +29,7 @@ pub struct ChromePalette {
     pub accent: &'static str,
     pub close_hover: &'static str,
     pub control_hover: &'static str,
+    pub is_dark: bool,
 }
 
 #[component]
@@ -198,6 +199,8 @@ fn WindowControlButton(
         "#ffffff"
     } else if active {
         palette.accent
+    } else if palette.is_dark {
+        "#d7e3ee"
     } else {
         palette.text
     };
@@ -279,11 +282,23 @@ fn WindowControlGlyph(icon: ChromeControlIcon) -> Element {
     }
 }
 
-pub fn search_input_style(text_color: &str) -> String {
+pub fn search_input_style(text_color: &str, dark_surface: bool) -> String {
     format!(
         "width:min(560px, 100%); height:32px; padding:0 12px; border-radius:8px; \
-         border:none; background:rgba(255,255,255,0.66); color:{}; outline:none; font-size:12px; \
-         box-shadow: inset 0 0 0 1px rgba(255,255,255,0.36); user-select:text; -webkit-user-select:text;",
+         border:none; background:{}; color:{}; outline:none; font-size:12px; \
+         box-shadow: inset 0 0 0 1px {}; user-select:text; -webkit-user-select:text; \
+         caret-color:{};",
+        if dark_surface {
+            "rgba(8,12,16,0.84)"
+        } else {
+            "rgba(255,255,255,0.72)"
+        },
+        text_color,
+        if dark_surface {
+            "rgba(214,229,242,0.22)"
+        } else {
+            "rgba(201,214,226,0.56)"
+        },
         text_color
     )
 }
