@@ -43,6 +43,75 @@ pub struct ToastPalette {
     pub text: &'static str,
     pub muted: &'static str,
     pub accent: &'static str,
+    pub is_dark: bool,
+}
+
+fn parse_css_color(input: &str) -> Option<(f32, f32, f32, f32)> {
+    let trimmed = input.trim();
+    if trimmed.eq_ignore_ascii_case("transparent") {
+        return Some((0.0, 0.0, 0.0, 0.0));
+    }
+    if let Some(hex) = trimmed.strip_prefix('#') {
+        let expanded = match hex.len() {
+            3 => hex.chars().flat_map(|ch| [ch, ch]).collect::<String>(),
+            6 => hex.to_string(),
+            _ => return None,
+        };
+        let red = u8::from_str_radix(&expanded[0..2], 16).ok()? as f32 / 255.0;
+        let green = u8::from_str_radix(&expanded[2..4], 16).ok()? as f32 / 255.0;
+        let blue = u8::from_str_radix(&expanded[4..6], 16).ok()? as f32 / 255.0;
+        return Some((red, green, blue, 1.0));
+    }
+    let open = trimmed.find('(')?;
+    let close = trimmed.rfind(')')?;
+    let kind = trimmed[..open].trim();
+    let values = trimmed[open + 1..close]
+        .split(',')
+        .map(|part| part.trim())
+        .collect::<Vec<_>>();
+    match (kind, values.as_slice()) {
+        ("rgb", [red, green, blue]) => Some((
+            red.parse::<f32>().ok()? / 255.0,
+            green.parse::<f32>().ok()? / 255.0,
+            blue.parse::<f32>().ok()? / 255.0,
+            1.0,
+        )),
+        ("rgba", [red, green, blue, alpha]) => Some((
+            red.parse::<f32>().ok()? / 255.0,
+            green.parse::<f32>().ok()? / 255.0,
+            blue.parse::<f32>().ok()? / 255.0,
+            alpha.parse::<f32>().ok()?,
+        )),
+        _ => None,
+    }
+}
+
+fn blended_luminance(foreground: &str, background: &str) -> Option<f32> {
+    let (fr, fg, fb, fa) = parse_css_color(foreground)?;
+    let (br, bg, bb, _ba) = parse_css_color(background)?;
+    let red = (fr * fa) + (br * (1.0 - fa));
+    let green = (fg * fa) + (bg * (1.0 - fa));
+    let blue = (fb * fa) + (bb * (1.0 - fa));
+    Some((0.2126 * red) + (0.7152 * green) + (0.0722 * blue))
+}
+
+fn contrast_text_for_layer(foreground: &str, background: &str, emphasized: bool) -> &'static str {
+    match blended_luminance(foreground, background) {
+        Some(luminance) if luminance < 0.46 => {
+            if emphasized {
+                "#f6fbff"
+            } else {
+                "#e7f1fb"
+            }
+        }
+        _ => {
+            if emphasized {
+                "#18222d"
+            } else {
+                "#31404d"
+            }
+        }
+    }
 }
 
 fn linux_kde_wayland_safe_mode() -> bool {
@@ -132,7 +201,20 @@ pub fn ToastCard(
     palette: ToastPalette,
     on_clear: EventHandler<MouseEvent>,
 ) -> Element {
-    let (tone_accent, tone_fg) = toast_tone_colors(item.tone, palette);
+    let background = if palette.is_dark {
+        "rgba(8,12,16,0.97)"
+    } else {
+        "rgba(252,253,255,0.96)"
+    };
+    let shell_background = if palette.is_dark {
+        "rgba(24,31,38,0.96)"
+    } else {
+        "rgba(243,247,250,0.94)"
+    };
+    let title_fg = contrast_text_for_layer(background, shell_background, true);
+    let body_fg = contrast_text_for_layer(background, shell_background, false);
+    let (tone_accent, close_fg) =
+        toast_tone_colors(item.tone, palette, background, shell_background);
     let blur_style = if linux_kde_wayland_safe_mode() || linux_x11_safe_mode() {
         "backdrop-filter:none; -webkit-backdrop-filter:none;"
     } else {
@@ -142,8 +224,15 @@ pub fn ToastCard(
         div {
             style: format!(
                 "display:flex; flex-direction:column; gap:7px; padding:12px 12px 11px 12px; border-radius:14px; \
-                 background:rgba(249,250,252,0.86); {} box-shadow: 0 18px 38px rgba(49,67,82,0.14), inset 0 0 0 1px rgba(255,255,255,0.72);",
+                 background:{}; {} box-shadow:{};",
+                background,
                 blur_style
+                ,
+                if palette.is_dark {
+                    "0 22px 44px rgba(0,0,0,0.32), inset 0 0 0 1px rgba(214,229,242,0.18)"
+                } else {
+                    "0 18px 38px rgba(49,67,82,0.12), inset 0 0 0 1px rgba(255,255,255,0.88)"
+                }
             ),
             div {
                 style: "display:flex; align-items:center; justify-content:space-between; gap:8px;",
@@ -159,15 +248,20 @@ pub fn ToastCard(
                         style: format!(
                             "font-size:12px; font-weight:700; color:{}; text-rendering:optimizeLegibility; \
                              -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
-                            tone_fg
+                            title_fg
                         ),
                         "{item.title}"
                     }
                 }
                 button {
                     style: format!(
-                        "width:22px; height:22px; border:none; border-radius:8px; background:rgba(241,244,247,0.92); color:{}; font-size:12px; font-weight:700;",
-                        tone_fg
+                        "width:22px; height:22px; border:none; border-radius:8px; background:{}; color:{}; font-size:12px; font-weight:700;",
+                        if palette.is_dark {
+                            "rgba(255,255,255,0.12)"
+                        } else {
+                            "rgba(241,244,247,0.96)"
+                        },
+                        close_fg
                     ),
                     onclick: move |evt| on_clear.call(evt),
                     "×"
@@ -177,7 +271,7 @@ pub fn ToastCard(
                 style: format!(
                     "font-size:11px; line-height:1.45; color:{}; text-rendering:optimizeLegibility; \
                      -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
-                    palette.text
+                    body_fg
                 ),
                 "{item.message}"
             }
@@ -225,11 +319,17 @@ fn ToastProgressBar(progress: Option<f32>, tone: ToastTone) -> Element {
     }
 }
 
-pub fn toast_tone_colors(tone: ToastTone, palette: ToastPalette) -> (&'static str, &'static str) {
+pub fn toast_tone_colors(
+    tone: ToastTone,
+    palette: ToastPalette,
+    background: &str,
+    shell_background: &str,
+) -> (&'static str, &'static str) {
+    let foreground = contrast_text_for_layer(background, shell_background, true);
     match tone {
-        ToastTone::Info => (palette.accent, "#315066"),
-        ToastTone::Success => ("#2f9e62", "#315066"),
-        ToastTone::Warning => ("#d79b24", "#315066"),
-        ToastTone::Error => ("#d95c5c", "#315066"),
+        ToastTone::Info => (palette.accent, foreground),
+        ToastTone::Success => ("#2f9e62", foreground),
+        ToastTone::Warning => ("#d79b24", foreground),
+        ToastTone::Error => ("#d95c5c", foreground),
     }
 }
