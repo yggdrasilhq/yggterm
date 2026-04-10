@@ -49,6 +49,11 @@ pub(crate) enum TerminalJsCommand {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum TerminalJsEvent {
     Ready,
+    HostHealth {
+        cursor_line_text: String,
+        text_tail: String,
+        has_transport_error: bool,
+    },
     Paint {
         child_count: usize,
         xterm_present: bool,
