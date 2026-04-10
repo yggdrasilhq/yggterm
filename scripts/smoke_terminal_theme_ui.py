@@ -112,6 +112,7 @@ def assert_terminal_font_contract(state: dict, expect_bg: str) -> None:
     rows_spacing = host.get("rows_sample_letter_spacing") or host.get("rows_letter_spacing") or ""
     rows_line_height = host.get("rows_sample_line_height") or host.get("rows_line_height") or ""
     rows_color = host.get("rows_sample_color") or host.get("rows_color") or ""
+    xterm_minimum_contrast_ratio = host.get("xterm_minimum_contrast_ratio") or ""
     dim_color = host.get("dim_sample_color") or ""
     low_contrast_count = int(host.get("low_contrast_span_count") or 0)
     low_contrast_samples = host.get("low_contrast_span_samples") or []
@@ -121,6 +122,9 @@ def assert_terminal_font_contract(state: dict, expect_bg: str) -> None:
     cursor_border_left = host.get("cursor_sample_border_left") or ""
     cursor_border_bottom = host.get("cursor_sample_border_bottom") or ""
     cursor_outline = host.get("cursor_sample_outline") or ""
+    cursor_overlay_present = bool(host.get("cursor_overlay_present"))
+    cursor_overlay_display = host.get("cursor_overlay_display") or ""
+    cursor_overlay_rect = host.get("cursor_overlay_rect") or {}
     if not xterm_family:
         raise AssertionError("xterm font family missing; terminal runtime likely did not fully mount")
     if "JetBrains Mono" not in xterm_family:
@@ -141,6 +145,21 @@ def assert_terminal_font_contract(state: dict, expect_bg: str) -> None:
         raise AssertionError(f"xterm line height drifted: {host.get('xterm_line_height')!r}")
     if abs(xterm_line_height - 1.12) > 0.01:
         raise AssertionError(f"xterm line height drifted: {host.get('xterm_line_height')!r}")
+    try:
+        min_ratio_value = float(str(xterm_minimum_contrast_ratio))
+    except (TypeError, ValueError):
+        raise AssertionError(
+            f"xterm minimum contrast ratio drifted: {xterm_minimum_contrast_ratio!r}"
+        )
+    if expect_bg == "#fbfbfd":
+        if min_ratio_value < 8.0:
+            raise AssertionError(
+                f"xterm minimum contrast ratio too low for light mode: {min_ratio_value!r}"
+            )
+    elif min_ratio_value < 6.0:
+        raise AssertionError(
+            f"xterm minimum contrast ratio drifted for dark mode: {min_ratio_value!r}"
+        )
     if rows_weight != "500":
         raise AssertionError(f"rows font weight drifted: {rows_weight!r}")
     if '"liga" 0' not in rows_features and '"calt" 0' not in rows_features:
@@ -158,7 +177,8 @@ def assert_terminal_font_contract(state: dict, expect_bg: str) -> None:
         )
     if dim_color:
         dim_contrast = contrast_ratio(dim_color, expect_bg)
-        if dim_contrast is None or dim_contrast < 3.0:
+        min_dim_contrast = 10.0 if expect_bg == "#fbfbfd" else 3.0
+        if dim_contrast is None or dim_contrast < min_dim_contrast:
             raise AssertionError(
                 f"dim text contrast drifted: color={dim_color!r} background={expect_bg!r} contrast={dim_contrast!r}"
             )
@@ -179,6 +199,12 @@ def assert_terminal_font_contract(state: dict, expect_bg: str) -> None:
             f"background={cursor_background!r} border_left={cursor_border_left!r} "
             f"border_bottom={cursor_border_bottom!r} outline={cursor_outline!r}"
         )
+    if not cursor_overlay_present:
+        raise AssertionError("cursor overlay is missing from the mounted terminal host")
+    if cursor_overlay_display in ("", "none"):
+        raise AssertionError(f"cursor overlay is not visible: {cursor_overlay_display!r}")
+    if float(cursor_overlay_rect.get("width") or 0.0) < 2.0 or float(cursor_overlay_rect.get("height") or 0.0) < 8.0:
+        raise AssertionError(f"cursor overlay rect drifted: {cursor_overlay_rect!r}")
     if host_width and screen_width:
         if abs(float(host_width) - float(screen_width)) > 18.0:
             raise AssertionError(

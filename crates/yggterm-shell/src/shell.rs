@@ -12408,22 +12408,27 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                         low_contrast_samples: [],
                     };
                 }
+                const background = parseCssColor(backgroundColor);
+                const backgroundLuminance = background ? relativeLuminance(background) : null;
+                const minimumVisibleContrast = backgroundLuminance != null && backgroundLuminance > 0.72
+                    ? 6.5
+                    : 4.5;
                 let minContrast = null;
                 const lowContrastSamples = [];
-                for (const span of Array.from(rowsLayer.querySelectorAll('span'))) {
-                    const text = String(span.textContent || '').replace(/\s+/g, ' ').trim();
-                    const className = String(span.className || '');
+                for (const node of Array.from(rowsLayer.querySelectorAll('div, span'))) {
+                    const text = String(node.textContent || '').replace(/\s+/g, ' ').trim();
+                    const className = String(node.className || '');
                     if (className.includes('xterm-cursor')) {
                         continue;
                     }
                     if (!text) {
                         continue;
                     }
-                    const rect = span.getBoundingClientRect();
+                    const rect = node.getBoundingClientRect();
                     if (rect.width <= 0 || rect.height <= 0) {
                         continue;
                     }
-                    const style = window.getComputedStyle(span);
+                    const style = window.getComputedStyle(node);
                     const contrast = contrastRatio(style.color, backgroundColor);
                     if (contrast == null) {
                         continue;
@@ -12431,7 +12436,7 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     if (minContrast == null || contrast < minContrast) {
                         minContrast = contrast;
                     }
-                    if (contrast >= 4.5) {
+                    if (contrast >= minimumVisibleContrast) {
                         continue;
                     }
                     lowContrastSamples.push({
@@ -12441,7 +12446,7 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                         font_weight: String(style.fontWeight || ''),
                         contrast,
                         class_name: className,
-                        style_attr: String(span.getAttribute('style') || ''),
+                        style_attr: String(node.getAttribute('style') || ''),
                     });
                     if (lowContrastSamples.length >= 8) {
                         break;
@@ -12504,6 +12509,8 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                 const dimSampleStyle = dimSample ? window.getComputedStyle(dimSample) : null;
                 const cursorSample = rowsLayer ? rowsLayer.querySelector('.xterm-cursor') : null;
                 const cursorSampleStyle = cursorSample ? window.getComputedStyle(cursorSample) : null;
+                const cursorOverlay = host.querySelector('.yggterm-cursor-overlay');
+                const cursorOverlayStyle = cursorOverlay ? window.getComputedStyle(cursorOverlay) : null;
                 const effectiveBackgroundColor = (
                     viewportStyle && viewportStyle.backgroundColor
                     || screenStyle && screenStyle.backgroundColor
@@ -12536,6 +12543,7 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                 const helperTextareaRect = helperTextarea ? helperTextarea.getBoundingClientRect() : null;
                 const screenRect = screen ? screen.getBoundingClientRect() : null;
                 const viewportRect = viewport ? viewport.getBoundingClientRect() : null;
+                const cursorOverlayRect = cursorOverlay ? cursorOverlay.getBoundingClientRect() : null;
                 const paddingLeftPx = Number.parseFloat(style.paddingLeft || '0') || 0;
                 const paddingRightPx = Number.parseFloat(style.paddingRight || '0') || 0;
                 const paddingTopPx = Number.parseFloat(style.paddingTop || '0') || 0;
@@ -12577,6 +12585,7 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     xterm_font_weight: term ? String(term.options.fontWeight || '') : null,
                     xterm_font_weight_bold: term ? String(term.options.fontWeightBold || '') : null,
                     xterm_line_height: term ? String(term.options.lineHeight || '') : null,
+                    xterm_minimum_contrast_ratio: term ? String(term.options.minimumContrastRatio || '') : null,
                     rows_font_family: rowsStyle ? rowsStyle.fontFamily : null,
                     rows_font_weight: rowsStyle ? String(rowsStyle.fontWeight || '') : null,
                     rows_font_feature_settings: rowsStyle ? String(rowsStyle.fontFeatureSettings || '') : null,
@@ -12617,6 +12626,16 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     cursor_sample_border_bottom: cursorSampleStyle ? String(cursorSampleStyle.borderBottomColor || '') : null,
                     cursor_sample_outline: cursorSampleStyle ? String(cursorSampleStyle.outlineColor || '') : null,
                     cursor_sample_class_name: cursorSample ? String(cursorSample.className || '') : null,
+                    cursor_overlay_present: Boolean(cursorOverlay),
+                    cursor_overlay_display: cursorOverlayStyle ? String(cursorOverlayStyle.display || '') : null,
+                    cursor_overlay_background: cursorOverlayStyle ? String(cursorOverlayStyle.backgroundColor || '') : null,
+                    cursor_overlay_border_left: cursorOverlayStyle ? String(cursorOverlayStyle.borderLeftColor || '') : null,
+                    cursor_overlay_rect: cursorOverlayRect ? {
+                        left: Number(cursorOverlayRect.left.toFixed(2)),
+                        top: Number(cursorOverlayRect.top.toFixed(2)),
+                        width: Number(cursorOverlayRect.width.toFixed(2)),
+                        height: Number(cursorOverlayRect.height.toFixed(2)),
+                    } : null,
                     xterm_theme_background: term && term.options.theme ? String(term.options.theme.background || '') : null,
                     xterm_theme_foreground: term && term.options.theme ? String(term.options.theme.foreground || '') : null,
                     xterm_present: Boolean(xtermRoot),
@@ -16039,6 +16058,66 @@ fn app() -> Element {
                                 input.focus();
                                 if (input.select) input.select();
                             }}
+                        }})();"
+                    ));
+                    return;
+                }
+                let preview_navigation_enabled = {
+                    let shell = state.read();
+                    shell.server.active_view_mode() == WorkspaceViewMode::Rendered && !shell.search_focused
+                };
+                if preview_navigation_enabled && matches!(evt.key(), Key::PageUp | Key::PageDown) {
+                    evt.prevent_default();
+                    let active_session_path = state
+                        .read()
+                        .server
+                        .active_session_path()
+                        .map(str::to_string);
+                    let session_path_literal = serde_json::to_string(&active_session_path)
+                        .unwrap_or_else(|_| "null".to_string());
+                    let scroll_direction = if evt.key() == Key::PageUp { -1.0 } else { 1.0 };
+                    let jump_to_edge = is_accel;
+                    let _ = document::eval(&format!(
+                        "(function() {{
+                            const activeSessionPath = {session_path_literal};
+                            const pickLast = (nodes) => nodes.length ? nodes[nodes.length - 1] : null;
+                            const visibleNodes = (nodes) => nodes.filter((node) => node.getClientRects().length > 0);
+                            const previewScrolls = Array.from(document.querySelectorAll('[data-preview-scroll=\"1\"]'))
+                              .filter((node) => node.isConnected);
+                            const matchingPreviewScrolls = previewScrolls.filter((node) => {{
+                                const path = node.getAttribute('data-preview-session-path');
+                                return activeSessionPath && path === activeSessionPath;
+                            }});
+                            const activePreviewScrolls = previewScrolls.filter(
+                                (node) => node.getAttribute('data-preview-scroll-active') === 'true'
+                            );
+                            const activeMatchingPreviewScrolls = matchingPreviewScrolls.filter(
+                                (node) => node.getAttribute('data-preview-scroll-active') === 'true'
+                            );
+                            const scroller =
+                                pickLast(visibleNodes(activeMatchingPreviewScrolls))
+                                || pickLast(activeMatchingPreviewScrolls)
+                                || pickLast(visibleNodes(matchingPreviewScrolls))
+                                || pickLast(matchingPreviewScrolls)
+                                || pickLast(visibleNodes(activePreviewScrolls))
+                                || pickLast(activePreviewScrolls)
+                                || pickLast(visibleNodes(previewScrolls))
+                                || pickLast(previewScrolls)
+                                || null;
+                            if (!scroller) {{
+                                return;
+                            }}
+                            if ({jump_to_edge}) {{
+                                scroller.scrollTo({{
+                                    top: {scroll_direction} < 0 ? 0 : scroller.scrollHeight,
+                                    behavior: 'smooth',
+                                }});
+                                return;
+                            }}
+                            scroller.scrollBy({{
+                                top: Math.round(scroller.clientHeight * 0.9 * {scroll_direction}),
+                                behavior: 'smooth',
+                            }});
                         }})();"
                     ));
                     return;
@@ -20788,6 +20867,7 @@ fn TerminalCanvas(
                                     background: theme.background.clone(),
                                     foreground: theme.foreground.clone(),
                                     cursor: theme.cursor.clone(),
+                                    cursor_muted: terminal_cursor_muted(&theme),
                                     cursor_text: terminal_cursor_text(&theme),
                                     dim_foreground: terminal_dim_foreground(&theme),
                                     selection: theme.selection.clone(),
@@ -20811,6 +20891,7 @@ fn TerminalCanvas(
                                     font_weight: terminal_font_weight(&theme),
                                     font_weight_bold: terminal_font_weight_bold(&theme),
                                     line_height: terminal_font_line_height(&theme),
+                                    minimum_contrast_ratio: terminal_minimum_contrast_ratio(&theme),
                                     font_size: theme.font_size,
                                 });
                                 if !placeholder_rendered
@@ -20905,6 +20986,14 @@ fn TerminalCanvas(
                                         if !deferred_resume_output.is_empty() {
                                             let replay = std::mem::take(&mut deferred_resume_output);
                                             let _ = eval.send(TerminalJsCommand::Write { data: replay });
+                                            terminal_resume_surface_staged.set(true);
+                                        } else if !terminal_has_visible_output
+                                            && let Some(prefill) = placeholder.clone()
+                                            && terminal_prefill_should_render_to_host(&prefill)
+                                        {
+                                            let _ = eval.send(TerminalJsCommand::Write {
+                                                data: prefill,
+                                            });
                                             terminal_resume_surface_staged.set(true);
                                         }
                                         let _ = eval.send(TerminalJsCommand::Refit);
@@ -21255,6 +21344,7 @@ fn TerminalCanvas(
                                         background: theme.background.clone(),
                                         foreground: theme.foreground.clone(),
                                         cursor: theme.cursor.clone(),
+                                        cursor_muted: terminal_cursor_muted(&theme),
                                         cursor_text: terminal_cursor_text(&theme),
                                         dim_foreground: terminal_dim_foreground(&theme),
                                         selection: theme.selection.clone(),
@@ -21278,6 +21368,7 @@ fn TerminalCanvas(
                                         font_weight: terminal_font_weight(&theme),
                                         font_weight_bold: terminal_font_weight_bold(&theme),
                                         line_height: terminal_font_line_height(&theme),
+                                        minimum_contrast_ratio: terminal_minimum_contrast_ratio(&theme),
                                         font_size: theme.font_size,
                                     });
                                     placeholder_rendered = false;
@@ -21585,6 +21676,12 @@ fn TerminalCanvas(
                                     if !deferred_resume_output.is_empty() {
                                         let replay = std::mem::take(&mut deferred_resume_output);
                                         let _ = eval.send(TerminalJsCommand::Write { data: replay });
+                                        terminal_resume_surface_staged.set(true);
+                                    } else if !terminal_has_visible_output
+                                        && let Some(prefill) = placeholder.clone()
+                                        && terminal_prefill_should_render_to_host(&prefill)
+                                    {
+                                        let _ = eval.send(TerminalJsCommand::Write { data: prefill });
                                         terminal_resume_surface_staged.set(true);
                                     }
                                     let _ = eval.send(TerminalJsCommand::Refit);
@@ -22028,6 +22125,7 @@ fn TerminalCanvas(
     let terminal_host_font_weight_bold = terminal_font_weight_bold(&theme);
     let terminal_host_line_height = terminal_font_line_height(&theme);
     let terminal_host_dim_foreground = terminal_dim_foreground(&theme);
+    let terminal_host_cursor_muted = terminal_cursor_muted(&theme);
     let terminal_host_cursor_text = terminal_cursor_text(&theme);
     let terminal_host_font_smoothing = terminal_font_smoothing(&theme);
     let terminal_host_moz_font_smoothing = terminal_moz_font_smoothing(&theme);
@@ -22058,7 +22156,7 @@ fn TerminalCanvas(
                         "display:flex; flex:1 1 auto; min-width:0; min-height:0; margin:{}; background:{}; overflow:hidden; transition:opacity 140ms ease; box-sizing:border-box; {}; {}; \
                          --yggterm-term-font-family:{}; --yggterm-term-font-weight:{}; --yggterm-term-font-weight-bold:{}; \
                          --yggterm-term-line-height:{}; --yggterm-term-letter-spacing:0px; --yggterm-term-foreground:{}; \
-                         --yggterm-term-dim-foreground:{}; --yggterm-term-cursor:{}; --yggterm-term-cursor-text:{}; \
+                         --yggterm-term-dim-foreground:{}; --yggterm-term-cursor:{}; --yggterm-term-cursor-muted:{}; --yggterm-term-cursor-text:{}; \
                          --yggterm-term-font-smoothing:{}; --yggterm-term-moz-font-smoothing:{};",
                         terminal_shell_padding,
                         theme.background,
@@ -22071,6 +22169,7 @@ fn TerminalCanvas(
                         theme.foreground,
                         terminal_host_dim_foreground,
                         theme.cursor,
+                        terminal_host_cursor_muted,
                         terminal_host_cursor_text,
                         terminal_host_font_smoothing,
                         terminal_host_moz_font_smoothing,
@@ -22326,6 +22425,18 @@ fn remote_resume_attach_confirmation_satisfied(
         saw_prompt_only_surface,
     ) && (remote_resume_meaningful_observations >= 2
         || now_ms.saturating_sub(mount_started_ms) >= REMOTE_TERMINAL_ATTACH_CONFIRMATION_MIN_MS)
+    {
+        return true;
+    }
+    if terminal_live_host_connected
+        && runtime_running
+        && !saw_transcript_browser_output
+        && !saw_generic_idle_output
+        && !saw_generic_idle_footer_output
+        && !saw_prompt_only_surface
+        && first_resume_connected_output_ms.is_some_and(|started_ms| {
+            now_ms.saturating_sub(started_ms) >= REMOTE_TERMINAL_ATTACH_CONNECTED_GRACE_MS
+        })
     {
         return true;
     }
@@ -22922,7 +23033,12 @@ fn terminal_font_weight(theme: &TerminalTheme) -> u16 {
 }
 
 fn terminal_dim_foreground(theme: &TerminalTheme) -> String {
-    blend_terminal_colors(&theme.foreground, &theme.background, 0.76)
+    let alpha = if relative_terminal_luminance_from_hex(&theme.background).unwrap_or(0.0) > 0.72 {
+        0.985
+    } else {
+        0.78
+    };
+    blend_terminal_colors(&theme.foreground, &theme.background, alpha)
         .unwrap_or_else(|| theme.foreground.clone())
 }
 
@@ -22946,6 +23062,28 @@ fn terminal_cursor_text(theme: &TerminalTheme) -> String {
     } else {
         "#fbfbfd".to_string()
     }
+}
+
+fn terminal_cursor_muted(theme: &TerminalTheme) -> String {
+    let alpha = if relative_terminal_luminance_from_hex(&theme.background).unwrap_or(0.0) > 0.72 {
+        0.24
+    } else {
+        0.30
+    };
+    rgba_terminal_color(&theme.cursor, alpha).unwrap_or_else(|| theme.cursor.clone())
+}
+
+fn terminal_minimum_contrast_ratio(theme: &TerminalTheme) -> f32 {
+    if relative_terminal_luminance_from_hex(&theme.background).unwrap_or(0.0) > 0.72 {
+        8.5
+    } else {
+        6.5
+    }
+}
+
+fn relative_terminal_luminance_from_hex(color: &str) -> Option<f32> {
+    let (red, green, blue) = parse_terminal_hex_rgb(color)?;
+    Some(relative_terminal_luminance(red, green, blue))
 }
 
 fn parse_terminal_hex_rgb(color: &str) -> Option<(u8, u8, u8)> {
@@ -22986,6 +23124,11 @@ fn blend_terminal_colors(foreground: &str, background: &str, alpha: f32) -> Opti
         mix(fg_green, bg_green),
         mix(fg_blue, bg_blue)
     ))
+}
+
+fn rgba_terminal_color(color: &str, alpha: f32) -> Option<String> {
+    let (red, green, blue) = parse_terminal_hex_rgb(color)?;
+    Some(format!("rgba({red}, {green}, {blue}, {alpha:.3})"))
 }
 
 fn terminal_font_smoothing(theme: &TerminalTheme) -> &'static str {
@@ -23215,8 +23358,11 @@ fn terminal_eval_script(
     let line_height = terminal_font_line_height(theme);
     let dim_foreground = serde_json::to_string(&terminal_dim_foreground(theme))
         .expect("serialize terminal dim foreground");
+    let cursor_muted = serde_json::to_string(&terminal_cursor_muted(theme))
+        .expect("serialize terminal muted cursor");
     let cursor_text = serde_json::to_string(&terminal_cursor_text(theme))
         .expect("serialize terminal cursor text");
+    let minimum_contrast_ratio = terminal_minimum_contrast_ratio(theme);
     let font_smoothing = serde_json::to_string(terminal_font_smoothing(theme))
         .expect("serialize terminal font smoothing");
     let moz_font_smoothing = serde_json::to_string(terminal_moz_font_smoothing(theme))
@@ -23376,14 +23522,14 @@ fn terminal_eval_script(
         const term = new window.Terminal({{
             allowTransparency: false,
             convertEol: true,
-            cursorBlink: true,
+            cursorBlink: false,
             fontFamily: {font_family},
             fontSize: {font_size},
             fontWeight: {font_weight},
             fontWeightBold: {font_weight_bold},
             lineHeight: {line_height},
             letterSpacing: 0,
-            minimumContrastRatio: 6,
+            minimumContrastRatio: {minimum_contrast_ratio},
             scrollback: 5000,
             theme: {{
                 background: {background},
@@ -23411,6 +23557,22 @@ fn terminal_eval_script(
         const fitAddon = new window.FitAddon.FitAddon();
         term.loadAddon(fitAddon);
         term.open(host);
+        let cursorOverlay = null;
+        const ensureCursorOverlayMounted = () => {{
+            if (cursorOverlay && cursorOverlay.isConnected) {{
+                return cursorOverlay;
+            }}
+            const existingOverlay = host.querySelector('.yggterm-cursor-overlay');
+            if (existingOverlay) {{
+                cursorOverlay = existingOverlay;
+                return cursorOverlay;
+            }}
+            cursorOverlay = document.createElement('div');
+            cursorOverlay.className = 'yggterm-cursor-overlay';
+            host.appendChild(cursorOverlay);
+            return cursorOverlay;
+        }};
+        ensureCursorOverlayMounted();
         host.tabIndex = 0;
         host.style.setProperty('--yggterm-term-font-family', {font_family});
         host.style.setProperty('--yggterm-term-font-weight', String({font_weight}));
@@ -23420,6 +23582,7 @@ fn terminal_eval_script(
         host.style.setProperty('--yggterm-term-foreground', {foreground});
         host.style.setProperty('--yggterm-term-dim-foreground', {dim_foreground});
         host.style.setProperty('--yggterm-term-cursor', {cursor});
+        host.style.setProperty('--yggterm-term-cursor-muted', {cursor_muted});
         host.style.setProperty('--yggterm-term-cursor-text', {cursor_text});
         host.style.setProperty('--yggterm-term-font-smoothing', {font_smoothing});
         host.style.setProperty('--yggterm-term-moz-font-smoothing', {moz_font_smoothing});
@@ -23469,6 +23632,22 @@ fn terminal_eval_script(
                     height: 1px !important;
                     opacity: 0 !important;
                 }}
+                #${{hostId}} .yggterm-cursor-overlay {{
+                    position: absolute !important;
+                    display: none;
+                    pointer-events: none !important;
+                    z-index: 7 !important;
+                    background: var(--yggterm-term-cursor) !important;
+                    border-left: 2px solid var(--yggterm-term-cursor) !important;
+                    box-shadow: 0 0 0 1px var(--yggterm-term-cursor) !important;
+                    border-radius: 1px !important;
+                    opacity: 0.96 !important;
+                }}
+                #${{hostId}}:not(.yggterm-term-focused) .yggterm-cursor-overlay {{
+                    background: var(--yggterm-term-cursor-muted) !important;
+                    border-left-color: var(--yggterm-term-cursor) !important;
+                    box-shadow: 0 0 0 1px var(--yggterm-term-cursor-muted) !important;
+                }}
                 #${{hostId}} .xterm-screen {{
                     overflow: hidden !important;
                     height: 100% !important;
@@ -23488,13 +23667,19 @@ fn terminal_eval_script(
                     color: var(--yggterm-term-foreground) !important;
                     line-height: var(--yggterm-term-line-height) !important;
                 }}
-                #${{hostId}} .xterm-rows span {{
+                #${{hostId}} .xterm-rows span,
+                #${{hostId}} .xterm-rows div {{
                     line-height: var(--yggterm-term-line-height) !important;
                 }}
                 #${{hostId}} .xterm-rows .xterm-dim,
+                #${{hostId}} .xterm-rows [style*="opacity: 0."],
+                #${{hostId}} .xterm-rows [style*="opacity:0."],
                 #${{hostId}} .xterm-rows span[style*="opacity: 0."],
                 #${{hostId}} .xterm-rows span[style*="opacity:0."] {{
                     color: var(--yggterm-term-dim-foreground) !important;
+                    opacity: 1 !important;
+                }}
+                #${{hostId}} .xterm .xterm-cursor {{
                     opacity: 1 !important;
                 }}
                 #${{hostId}}.yggterm-term-focused .xterm .xterm-cursor.xterm-cursor-block {{
@@ -23504,9 +23689,10 @@ fn terminal_eval_script(
                     box-shadow: 0 0 0 1px var(--yggterm-term-cursor) !important;
                 }}
                 #${{hostId}}:not(.yggterm-term-focused) .xterm .xterm-cursor.xterm-cursor-block {{
-                    background: transparent !important;
+                    background: var(--yggterm-term-cursor-muted) !important;
                     outline: 1px solid var(--yggterm-term-cursor) !important;
-                    color: inherit !important;
+                    box-shadow: 0 0 0 1px var(--yggterm-term-cursor-muted) !important;
+                    color: var(--yggterm-term-cursor-text) !important;
                 }}
                 #${{hostId}} .xterm .xterm-cursor.xterm-cursor-bar {{
                     box-shadow: inset 2px 0 0 var(--yggterm-term-cursor) !important;
@@ -23593,6 +23779,44 @@ fn terminal_eval_script(
                 rowsLayer.style.height = '100%';
             }}
         }};
+        const updateCursorOverlay = () => {{
+            try {{
+                const overlay = ensureCursorOverlayMounted();
+                if (!overlay || !inputEnabled || !term || !term.buffer || !term.buffer.active) {{
+                    if (overlay) {{
+                        overlay.style.display = 'none';
+                    }}
+                    return;
+                }}
+                const rowsLayer = host.querySelector('.xterm-rows');
+                const rowSample = rowsLayer ? rowsLayer.querySelector('div') : null;
+                if (!rowsLayer || !rowSample || !term.cols) {{
+                    overlay.style.display = 'none';
+                    return;
+                }}
+                const hostRect = host.getBoundingClientRect();
+                const rowsRect = rowsLayer.getBoundingClientRect();
+                const rowRect = rowSample.getBoundingClientRect();
+                if (rowsRect.width <= 0 || rowRect.height <= 0) {{
+                    overlay.style.display = 'none';
+                    return;
+                }}
+                const active = term.buffer.active;
+                const cellWidth = Math.max(2, rowsRect.width / Math.max(1, Number(term.cols || 1)));
+                const cellHeight = Math.max(10, rowRect.height);
+                const cursorX = Math.max(0, Number(active.cursorX || 0));
+                const cursorY = Math.max(0, Number(active.cursorY || 0));
+                overlay.style.display = 'block';
+                overlay.style.left = `${{Math.round((rowsRect.left - hostRect.left) + (cursorX * cellWidth))}}px`;
+                overlay.style.top = `${{Math.round((rowsRect.top - hostRect.top) + (cursorY * cellHeight))}}px`;
+                overlay.style.width = `${{Math.max(4, Math.round(cellWidth))}}px`;
+                overlay.style.height = `${{Math.max(12, Math.round(cellHeight))}}px`;
+            }} catch (_error) {{
+                if (cursorOverlay) {{
+                    cursorOverlay.style.display = 'none';
+                }}
+            }}
+        }};
         stretchXtermRoot();
         let paintCount = 0;
         let rebuildAttempts = 0;
@@ -23611,6 +23835,7 @@ fn terminal_eval_script(
                 window.__yggtermXtermHosts[hostId].paintCount = paintCount + 1;
                 window.__yggtermXtermHosts[hostId].lastVisiblePaint = visible;
             }}
+            updateCursorOverlay();
             dioxus.send({{
                 kind: "paint",
                 child_count: host.childElementCount,
@@ -23629,6 +23854,7 @@ fn terminal_eval_script(
                 try {{
                     stretchXtermRoot();
                     fitAddon.fit();
+                    updateCursorOverlay();
                 }} catch (_error) {{}}
                 const metrics = hostMetrics();
                 if (hostLooksUsable() && term.rows <= 1) {{
@@ -23665,6 +23891,7 @@ fn terminal_eval_script(
             host.innerHTML = "";
             try {{
                 term.open(host);
+                ensureCursorOverlayMounted();
             }} catch (_error) {{}}
             requestVisiblePaint();
         }};
@@ -23700,6 +23927,7 @@ fn terminal_eval_script(
             }}
             if (!inputEnabled) {{
                 host.classList.remove('yggterm-term-focused');
+                updateCursorOverlay();
                 try {{
                     const helperTextarea = host.querySelector('.xterm-helper-textarea');
                     if (helperTextarea && helperTextarea.blur) {{
@@ -23715,6 +23943,7 @@ fn terminal_eval_script(
             }}
             scrollLiveCursorIntoView();
             requestVisiblePaint();
+            updateCursorOverlay();
             if (focus) {{
                 focusTerminal();
             }}
@@ -23767,9 +23996,20 @@ fn terminal_eval_script(
         }};
         const scrollLiveCursorIntoView = () => {{
             try {{
-                if (term && typeof term.scrollToBottom === 'function') {{
+                if (!term || !term.buffer || !term.buffer.active) {{
+                    return;
+                }}
+                const active = term.buffer.active;
+                const baseY = Math.max(0, Number(active.baseY || 0));
+                const rows = Math.max(1, Number(term.rows || 0));
+                const keepVisibleMargin = Math.max(4, Math.ceil(rows * 0.18));
+                const targetLine = Math.max(0, baseY - keepVisibleMargin);
+                if (typeof term.scrollToLine === 'function') {{
+                    term.scrollToLine(targetLine);
+                }} else if (typeof term.scrollToBottom === 'function') {{
                     term.scrollToBottom();
                 }}
+                updateCursorOverlay();
             }} catch (_error) {{}}
         }};
         host.addEventListener("wheel", handleWheel, {{ passive: false, capture: true }});
@@ -23967,6 +24207,7 @@ fn terminal_eval_script(
                 host.style.setProperty('--yggterm-term-foreground', message.foreground);
                 host.style.setProperty('--yggterm-term-dim-foreground', message.dim_foreground);
                 host.style.setProperty('--yggterm-term-cursor', message.cursor);
+                host.style.setProperty('--yggterm-term-cursor-muted', message.cursor_muted);
                 host.style.setProperty('--yggterm-term-cursor-text', message.cursor_text);
                 host.style.setProperty('--yggterm-term-font-smoothing', {font_smoothing});
                 host.style.setProperty('--yggterm-term-moz-font-smoothing', {moz_font_smoothing});
@@ -23979,6 +24220,7 @@ fn terminal_eval_script(
                         fontWeightBold: message.font_weight_bold,
                         lineHeight: message.line_height,
                         letterSpacing: 0,
+                        minimumContrastRatio: message.minimum_contrast_ratio,
                         theme: nextTheme,
                     }};
                 }} catch (_error) {{
@@ -23988,6 +24230,7 @@ fn terminal_eval_script(
                     term.options.fontWeightBold = message.font_weight_bold;
                     term.options.lineHeight = message.line_height;
                     term.options.letterSpacing = 0;
+                    term.options.minimumContrastRatio = message.minimum_contrast_ratio;
                     term.options.theme = nextTheme;
                 }}
                 {reset_debug}
@@ -24044,6 +24287,8 @@ fn terminal_eval_script(
         font_weight_bold = font_weight_bold,
         line_height = line_height,
         dim_foreground = dim_foreground,
+        cursor_muted = cursor_muted,
+        minimum_contrast_ratio = minimum_contrast_ratio,
         cursor_text = cursor_text
     )
 }
@@ -24088,8 +24333,11 @@ fn terminal_apply_script(host_id: &str, theme: &TerminalTheme) -> String {
     let line_height = terminal_font_line_height(theme);
     let dim_foreground = serde_json::to_string(&terminal_dim_foreground(theme))
         .expect("serialize terminal dim foreground");
+    let cursor_muted = serde_json::to_string(&terminal_cursor_muted(theme))
+        .expect("serialize terminal muted cursor");
     let cursor_text = serde_json::to_string(&terminal_cursor_text(theme))
         .expect("serialize terminal cursor text");
+    let minimum_contrast_ratio = terminal_minimum_contrast_ratio(theme);
     let font_smoothing = serde_json::to_string(terminal_font_smoothing(theme))
         .expect("serialize terminal font smoothing");
     let moz_font_smoothing = serde_json::to_string(terminal_moz_font_smoothing(theme))
@@ -24134,6 +24382,7 @@ fn terminal_apply_script(host_id: &str, theme: &TerminalTheme) -> String {
               fontWeightBold: {font_weight_bold},
               lineHeight: {line_height},
               letterSpacing: 0,
+              minimumContrastRatio: {minimum_contrast_ratio},
               theme: nextTheme,
             }};
           }} catch (_error) {{
@@ -24143,6 +24392,7 @@ fn terminal_apply_script(host_id: &str, theme: &TerminalTheme) -> String {
             entry.term.options.fontWeightBold = {font_weight_bold};
             entry.term.options.lineHeight = {line_height};
             entry.term.options.letterSpacing = 0;
+            entry.term.options.minimumContrastRatio = {minimum_contrast_ratio};
             entry.term.options.theme = nextTheme;
           }}
           if (entry.host) {{
@@ -24154,6 +24404,7 @@ fn terminal_apply_script(host_id: &str, theme: &TerminalTheme) -> String {
             entry.host.style.setProperty('--yggterm-term-foreground', {foreground});
             entry.host.style.setProperty('--yggterm-term-dim-foreground', {dim_foreground});
             entry.host.style.setProperty('--yggterm-term-cursor', {cursor});
+            entry.host.style.setProperty('--yggterm-term-cursor-muted', {cursor_muted});
             entry.host.style.setProperty('--yggterm-term-cursor-text', {cursor_text});
             entry.host.style.setProperty('--yggterm-term-font-smoothing', {font_smoothing});
             entry.host.style.setProperty('--yggterm-term-moz-font-smoothing', {moz_font_smoothing});
@@ -24211,6 +24462,8 @@ fn terminal_apply_script(host_id: &str, theme: &TerminalTheme) -> String {
         font_weight_bold = font_weight_bold,
         line_height = line_height,
         dim_foreground = dim_foreground,
+        cursor_muted = cursor_muted,
+        minimum_contrast_ratio = minimum_contrast_ratio,
         cursor_text = cursor_text,
         font_smoothing = font_smoothing,
         moz_font_smoothing = moz_font_smoothing,
@@ -24280,8 +24533,11 @@ fn terminal_apply_script_for_session(session_path: &str, theme: &TerminalTheme) 
     let line_height = terminal_font_line_height(theme);
     let dim_foreground = serde_json::to_string(&terminal_dim_foreground(theme))
         .expect("serialize terminal dim foreground");
+    let cursor_muted = serde_json::to_string(&terminal_cursor_muted(theme))
+        .expect("serialize terminal muted cursor");
     let cursor_text = serde_json::to_string(&terminal_cursor_text(theme))
         .expect("serialize terminal cursor text");
+    let minimum_contrast_ratio = terminal_minimum_contrast_ratio(theme);
     let font_smoothing = serde_json::to_string(terminal_font_smoothing(theme))
         .expect("serialize terminal font smoothing");
     let moz_font_smoothing = serde_json::to_string(terminal_moz_font_smoothing(theme))
@@ -24329,6 +24585,7 @@ fn terminal_apply_script_for_session(session_path: &str, theme: &TerminalTheme) 
               fontWeightBold: {font_weight_bold},
               lineHeight: {line_height},
               letterSpacing: 0,
+              minimumContrastRatio: {minimum_contrast_ratio},
               theme: nextTheme,
             }};
           }} catch (_error) {{
@@ -24338,6 +24595,7 @@ fn terminal_apply_script_for_session(session_path: &str, theme: &TerminalTheme) 
             entry.term.options.fontWeightBold = {font_weight_bold};
             entry.term.options.lineHeight = {line_height};
             entry.term.options.letterSpacing = 0;
+            entry.term.options.minimumContrastRatio = {minimum_contrast_ratio};
             entry.term.options.theme = nextTheme;
           }}
           if (entry.host) {{
@@ -24349,6 +24607,7 @@ fn terminal_apply_script_for_session(session_path: &str, theme: &TerminalTheme) 
             entry.host.style.setProperty('--yggterm-term-foreground', {foreground});
             entry.host.style.setProperty('--yggterm-term-dim-foreground', {dim_foreground});
             entry.host.style.setProperty('--yggterm-term-cursor', {cursor});
+            entry.host.style.setProperty('--yggterm-term-cursor-muted', {cursor_muted});
             entry.host.style.setProperty('--yggterm-term-cursor-text', {cursor_text});
             entry.host.style.setProperty('--yggterm-term-font-smoothing', {font_smoothing});
             entry.host.style.setProperty('--yggterm-term-moz-font-smoothing', {moz_font_smoothing});
@@ -24407,6 +24666,8 @@ fn terminal_apply_script_for_session(session_path: &str, theme: &TerminalTheme) 
         font_weight_bold = font_weight_bold,
         line_height = line_height,
         dim_foreground = dim_foreground,
+        cursor_muted = cursor_muted,
+        minimum_contrast_ratio = minimum_contrast_ratio,
         cursor_text = cursor_text,
         font_smoothing = font_smoothing,
         moz_font_smoothing = moz_font_smoothing,
@@ -26043,20 +26304,20 @@ fn TerminalThemeSelectRow(
             select {
                 value: "{value}",
                 style: format!(
-                    "width:100%; height:34px; border:none; border-radius:10px; padding:0 12px; background:{}; color:{}; \
-                     box-shadow: inset 0 0 0 1px {}; font-size:12px; font-weight:600;",
+                    "width:100%; height:34px; border:none; border-radius:10px; padding:0 28px 0 12px; appearance:none; -webkit-appearance:none; -moz-appearance:none; \
+                     background:{}; color:{}; box-shadow: inset 0 0 0 1px {}; font-size:12px; font-weight:700;",
                     if palette_is_dark(palette) {
-                        "rgba(8,12,16,0.82)"
+                        "rgba(12,17,23,0.96)"
                     } else {
-                        "rgba(255,255,255,0.72)"
+                        "rgba(255,255,255,0.86)"
                     },
                     if palette_is_dark(palette) {
-                        "#f1f7fd"
+                        "#f5fbff"
                     } else {
                         "#1f2b35"
                     },
                     if palette_is_dark(palette) {
-                        "rgba(214,229,242,0.24)"
+                        "rgba(214,229,242,0.34)"
                     } else {
                         "rgba(201,214,226,0.56)"
                     }
