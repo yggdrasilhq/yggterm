@@ -15990,7 +15990,12 @@ fn app() -> Element {
     let preferred_agent_kind = preferred_agent_session_kind(&snapshot.settings);
     let maximized = snapshot.maximized;
     let fullscreen = snapshot.fullscreen;
-    let shell_radius = if maximized { 0 } else { 11 };
+    let shell_radius = if maximized { 0 } else { 10 };
+    let shell_document_css = format!(
+        "html, body, #main {{ margin:0; width:100%; height:100%; background:transparent !important; overflow:hidden; border-radius:{}px; }} \
+         body {{ overscroll-behavior:none; }}",
+        shell_radius
+    );
     let context_menu_overlay = snapshot.context_menu_row.clone().map(|row| {
         let context_row = resolve_creation_context_row(&snapshot.rows, &row);
         (row, context_row)
@@ -16002,7 +16007,8 @@ fn app() -> Element {
             tabindex: "0",
             style: format!(
                 "position: fixed; inset: 0; overflow: hidden; border-radius:{}px; \
-                 background:transparent; box-shadow:none; box-sizing:border-box;",
+                 clip-path: inset(0 round {}px); background:transparent; box-shadow:none; box-sizing:border-box;",
+                shell_radius,
                 shell_radius
             ),
             onclick: move |_| {
@@ -16066,7 +16072,9 @@ fn app() -> Element {
                     let shell = state.read();
                     shell.server.active_view_mode() == WorkspaceViewMode::Rendered && !shell.search_focused
                 };
-                if preview_navigation_enabled && matches!(evt.key(), Key::PageUp | Key::PageDown) {
+                if preview_navigation_enabled
+                    && matches!(evt.key(), Key::PageUp | Key::PageDown | Key::Home | Key::End)
+                {
                     evt.prevent_default();
                     let active_session_path = state
                         .read()
@@ -16075,8 +16083,15 @@ fn app() -> Element {
                         .map(str::to_string);
                     let session_path_literal = serde_json::to_string(&active_session_path)
                         .unwrap_or_else(|_| "null".to_string());
-                    let scroll_direction = if evt.key() == Key::PageUp { -1.0 } else { 1.0 };
-                    let jump_to_edge = is_accel;
+                    let scroll_direction = if matches!(evt.key(), Key::PageUp) {
+                        -1.0
+                    } else {
+                        1.0
+                    };
+                    let jump_to_edge =
+                        is_accel || matches!(evt.key(), Key::Home | Key::End);
+                    let jump_to_top = matches!(evt.key(), Key::Home)
+                        || (is_accel && matches!(evt.key(), Key::PageUp));
                     let _ = document::eval(&format!(
                         "(function() {{
                             const activeSessionPath = {session_path_literal};
@@ -16109,7 +16124,7 @@ fn app() -> Element {
                             }}
                             if ({jump_to_edge}) {{
                                 scroller.scrollTo({{
-                                    top: {scroll_direction} < 0 ? 0 : scroller.scrollHeight,
+                                    top: {jump_to_top} ? 0 : scroller.scrollHeight,
                                     behavior: 'smooth',
                                 }});
                                 return;
@@ -16191,7 +16206,7 @@ fn app() -> Element {
                 evt.stop_propagation();
             },
             style { "{TOAST_CSS}" }
-            style { "html, body, #main {{ margin:0; width:100%; height:100%; background:transparent !important; overflow:hidden; }} body {{ overscroll-behavior:none; }}" }
+            style { "{shell_document_css}" }
             div {
                 style: shell_style(
                     snapshot.palette,
