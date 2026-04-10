@@ -5893,7 +5893,7 @@ fn spawn_focus_live_session_row_retry(
         WorkspaceViewMode::Terminal => "terminal",
         WorkspaceViewMode::Rendered => row_surface_noun(&row, false),
     };
-    if !retained_live_terminal {
+    if should_show_remote_loading_notice(&row, retained_live_terminal) {
         spawn_loading_notice(
             state,
             request_meta.clone(),
@@ -6094,7 +6094,7 @@ fn spawn_open_session_row_with_mode_retry(
         );
     });
     let surface_noun = row_surface_noun(&row, prefer_terminal);
-    if !retained_live_terminal {
+    if should_show_remote_loading_notice(&row, retained_live_terminal) {
         spawn_loading_notice(
             state,
             request_meta.clone(),
@@ -6642,6 +6642,14 @@ fn is_live_sidebar_row(row: &BrowserRow) -> bool {
 
 fn is_remote_scanned_sidebar_row(row: &BrowserRow) -> bool {
     row.full_path.starts_with("remote-session://")
+}
+
+fn should_show_remote_loading_notice(row: &BrowserRow, retained_live_terminal: bool) -> bool {
+    !retained_live_terminal
+        && (is_remote_scanned_sidebar_row(row)
+            || row.full_path.starts_with("ssh://")
+            || row.full_path.starts_with("codex://")
+            || row.full_path.starts_with("codex-litellm://"))
 }
 
 fn is_remote_machine_group_row(row: &BrowserRow) -> bool {
@@ -12669,6 +12677,8 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     cursor_sample_border_left: cursorSampleStyle ? String(cursorSampleStyle.borderLeftColor || '') : null,
                     cursor_sample_border_bottom: cursorSampleStyle ? String(cursorSampleStyle.borderBottomColor || '') : null,
                     cursor_sample_outline: cursorSampleStyle ? String(cursorSampleStyle.outlineColor || '') : null,
+                    cursor_sample_outline_style: cursorSampleStyle ? String(cursorSampleStyle.outlineStyle || '') : null,
+                    cursor_sample_box_shadow: cursorSampleStyle ? String(cursorSampleStyle.boxShadow || '') : null,
                     cursor_sample_class_name: cursorSample ? String(cursorSample.className || '') : null,
                     cursor_sample_rect: cursorSampleRect ? {
                         left: Number(cursorSampleRect.left.toFixed(2)),
@@ -13319,6 +13329,33 @@ async fn probe_terminal_viewport_input_for(
     }
 }
 
+async fn receive_probe_eval_value(script: &str, session_path: &str) -> Value {
+    for attempt in 0..2 {
+        let mut eval = document::eval(script);
+        match eval.recv::<Value>().await {
+            Ok(value) => return value,
+            Err(error) => {
+                let reason = error.to_string();
+                let should_retry = attempt == 0
+                    && (reason.contains("eval has already ran") || reason.contains("EvalError::Finished"));
+                if should_retry {
+                    continue;
+                }
+                return json!({
+                    "accepted": false,
+                    "reason": reason,
+                    "session_path": session_path,
+                });
+            }
+        }
+    }
+    json!({
+        "accepted": false,
+        "reason": "probe_eval_retry_exhausted",
+        "session_path": session_path,
+    })
+}
+
 async fn probe_terminal_viewport_scroll_for(session_path: &str, lines: i32) -> Value {
     let session_path_literal =
         serde_json::to_string(session_path).unwrap_or_else(|_| "null".to_string());
@@ -13405,15 +13442,7 @@ async fn probe_terminal_viewport_scroll_for(session_path: &str, lines: i32) -> V
         session_path_literal = session_path_literal,
         lines = lines,
     );
-    let mut eval = document::eval(&script);
-    match eval.recv::<Value>().await {
-        Ok(value) => value,
-        Err(error) => json!({
-            "accepted": false,
-            "reason": error.to_string(),
-            "session_path": session_path,
-        }),
-    }
+    receive_probe_eval_value(&script, session_path).await
 }
 
 async fn probe_terminal_viewport_select_for(session_path: &str) -> Value {
@@ -13578,15 +13607,7 @@ async fn probe_terminal_viewport_select_for(session_path: &str) -> Value {
     "#,
         session_path_literal = session_path_literal,
     );
-    let mut eval = document::eval(&script);
-    match eval.recv::<Value>().await {
-        Ok(value) => value,
-        Err(error) => json!({
-            "accepted": false,
-            "reason": error.to_string(),
-            "session_path": session_path,
-        }),
-    }
+    receive_probe_eval_value(&script, session_path).await
 }
 
 async fn process_pending_app_control_requests(
@@ -24166,8 +24187,23 @@ fn terminal_eval_script(
                     return;
                 }}
                 const active = term.buffer.active;
-                const cellWidth = Math.max(2, rowsRect.width / Math.max(1, Number(term.cols || 1)));
-                const cellHeight = Math.max(10, rowRect.height);
+                const xtermDimensions = term._core && term._core._renderService && term._core._renderService.dimensions
+                    ? term._core._renderService.dimensions
+                    : null;
+                const xtermCssDimensions = xtermDimensions && xtermDimensions.css ? xtermDimensions.css : null;
+                const measuredCellWidth = xtermCssDimensions && xtermCssDimensions.cell
+                    ? Number(xtermCssDimensions.cell.width || 0)
+                    : 0;
+                const measuredCellHeight = xtermCssDimensions && xtermCssDimensions.cell
+                    ? Number(xtermCssDimensions.cell.height || 0)
+                    : 0;
+                const cellWidth = Math.max(
+                    2,
+                    measuredCellWidth > 0
+                        ? measuredCellWidth
+                        : rowsRect.width / Math.max(1, Number(term.cols || 1))
+                );
+                const cellHeight = Math.max(10, measuredCellHeight > 0 ? measuredCellHeight : rowRect.height);
                 const cursorX = Math.max(0, Number(active.cursorX || 0));
                 const cursorY = Math.max(0, Number(active.cursorY || 0));
                 overlay.style.display = 'block';
@@ -29589,6 +29625,56 @@ mod tests {
             search_sidebar_matches(&rows, "Excel Shortcut Design").len(),
             1
         );
+    }
+
+    fn test_sidebar_row(path: &str) -> BrowserRow {
+        BrowserRow {
+            kind: BrowserRowKind::Session,
+            full_path: path.to_string(),
+            label: "Test Row".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: Some("Test Row".to_string()),
+            depth: 1,
+            host_label: String::new(),
+            descendant_sessions: 0,
+            expanded: true,
+            session_id: Some("test".to_string()),
+            session_cwd: Some("/tmp".to_string()),
+        }
+    }
+
+    #[test]
+    fn remote_loading_notice_only_shows_for_remote_like_rows() {
+        assert!(should_show_remote_loading_notice(
+            &test_sidebar_row("remote-session://oc/1"),
+            false
+        ));
+        assert!(should_show_remote_loading_notice(
+            &test_sidebar_row("ssh://oc"),
+            false
+        ));
+        assert!(should_show_remote_loading_notice(
+            &test_sidebar_row("codex://oc/1"),
+            false
+        ));
+        assert!(should_show_remote_loading_notice(
+            &test_sidebar_row("codex-litellm://oc/1"),
+            false
+        ));
+        assert!(!should_show_remote_loading_notice(
+            &test_sidebar_row("local://abc"),
+            false
+        ));
+        assert!(!should_show_remote_loading_notice(
+            &test_sidebar_row("/home/pi/.codex/sessions/example.jsonl"),
+            false
+        ));
+        assert!(!should_show_remote_loading_notice(
+            &test_sidebar_row("remote-session://oc/1"),
+            true
+        ));
     }
 
     #[test]
