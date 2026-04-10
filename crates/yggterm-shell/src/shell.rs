@@ -12507,9 +12507,16 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     : rowSample
                         ? window.getComputedStyle(rowSample)
                         : null;
-                const dimSample = rowsLayer
-                    ? rowsLayer.querySelector('.xterm-dim, span[style*="opacity: 0."], span[style*="opacity:0."]')
-                    : null;
+                const rowsRect = rowsLayer ? rowsLayer.getBoundingClientRect() : null;
+                const rowSampleRect = rowSample ? rowSample.getBoundingClientRect() : null;
+                const dimSampleCandidates = rowsLayer
+                    ? Array.from(rowsLayer.querySelectorAll('.xterm-dim, span[style*="opacity: 0."], span[style*="opacity:0."]'))
+                        .filter((node) => !String(node.className || '').includes('xterm-cursor'))
+                    : [];
+                const dimSample = dimSampleCandidates.find((node) => {
+                    const text = String(node.textContent || '').replace(/\s+/g, ' ').trim();
+                    return text.length > 0;
+                }) || dimSampleCandidates[0] || null;
                 const dimSampleStyle = dimSample ? window.getComputedStyle(dimSample) : null;
                 const cursorSample = rowsLayer ? rowsLayer.querySelector('.xterm-cursor') : null;
                 const cursorSampleStyle = cursorSample ? window.getComputedStyle(cursorSample) : null;
@@ -12547,7 +12554,40 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                 const helperTextareaRect = helperTextarea ? helperTextarea.getBoundingClientRect() : null;
                 const screenRect = screen ? screen.getBoundingClientRect() : null;
                 const viewportRect = viewport ? viewport.getBoundingClientRect() : null;
+                const cursorSampleRect = cursorSample ? cursorSample.getBoundingClientRect() : null;
                 const cursorOverlayRect = cursorOverlay ? cursorOverlay.getBoundingClientRect() : null;
+                const xtermDimensions = term && term._core && term._core._renderService && term._core._renderService.dimensions
+                    ? term._core._renderService.dimensions
+                    : null;
+                const xtermCssDimensions = xtermDimensions && xtermDimensions.css ? xtermDimensions.css : null;
+                const xtermCellWidth = xtermCssDimensions && xtermCssDimensions.cell
+                    ? Number(xtermCssDimensions.cell.width || 0)
+                    : 0;
+                const xtermCellHeight = xtermCssDimensions && xtermCssDimensions.cell
+                    ? Number(xtermCssDimensions.cell.height || 0)
+                    : 0;
+                const expectedCursorRect = (
+                    rowsLayer
+                    && hostRect
+                    && rowsRect
+                    && cursorX != null
+                    && cursorY != null
+                    && (xtermCellWidth > 0 || rowsRect.width > 0)
+                    && (xtermCellHeight > 0 || rowSampleRect)
+                ) ? (() => {
+                    const computedCellWidth = xtermCellWidth > 0
+                        ? xtermCellWidth
+                        : rowsRect.width / Math.max(1, Number(term && term.cols ? term.cols : 1));
+                    const computedCellHeight = xtermCellHeight > 0
+                        ? xtermCellHeight
+                        : Math.max(10, Number((rowSampleRect && rowSampleRect.height) || 0));
+                    return {
+                        left: Number((rowsRect.left + (cursorX * computedCellWidth)).toFixed(2)),
+                        top: Number((rowsRect.top + (cursorY * computedCellHeight)).toFixed(2)),
+                        width: Number(Math.max(2, computedCellWidth).toFixed(2)),
+                        height: Number(Math.max(8, computedCellHeight).toFixed(2)),
+                    };
+                })() : null;
                 const paddingLeftPx = Number.parseFloat(style.paddingLeft || '0') || 0;
                 const paddingRightPx = Number.parseFloat(style.paddingRight || '0') || 0;
                 const paddingTopPx = Number.parseFloat(style.paddingTop || '0') || 0;
@@ -12630,6 +12670,13 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     cursor_sample_border_bottom: cursorSampleStyle ? String(cursorSampleStyle.borderBottomColor || '') : null,
                     cursor_sample_outline: cursorSampleStyle ? String(cursorSampleStyle.outlineColor || '') : null,
                     cursor_sample_class_name: cursorSample ? String(cursorSample.className || '') : null,
+                    cursor_sample_rect: cursorSampleRect ? {
+                        left: Number(cursorSampleRect.left.toFixed(2)),
+                        top: Number(cursorSampleRect.top.toFixed(2)),
+                        width: Number(cursorSampleRect.width.toFixed(2)),
+                        height: Number(cursorSampleRect.height.toFixed(2)),
+                    } : null,
+                    cursor_expected_rect: expectedCursorRect,
                     cursor_overlay_present: Boolean(cursorOverlay),
                     cursor_overlay_display: cursorOverlayStyle ? String(cursorOverlayStyle.display || '') : null,
                     cursor_overlay_background: cursorOverlayStyle ? String(cursorOverlayStyle.backgroundColor || '') : null,
@@ -22464,7 +22511,7 @@ fn TerminalCanvas(
                     "data-terminal-resume-overlay-phase": "hidden",
                     "data-terminal-resume-overlay-effective-failed": "false",
                     style: format!(
-                        "display:flex; flex:1 1 auto; min-width:0; min-height:0; margin:{}; background:{}; overflow:hidden; transition:opacity 140ms ease; box-sizing:border-box; {}; {}; \
+                        "display:flex; flex:1 1 auto; min-width:0; min-height:0; margin:{}; background:{}; overflow:hidden; transition:opacity 140ms ease; box-sizing:border-box; position:relative; {}; {}; \
                          --yggterm-term-font-family:{}; --yggterm-term-font-weight:{}; --yggterm-term-font-weight-bold:{}; \
                          --yggterm-term-line-height:{}; --yggterm-term-letter-spacing:0px; --yggterm-term-foreground:{}; \
                          --yggterm-term-dim-foreground:{}; --yggterm-term-cursor:{}; --yggterm-term-cursor-muted:{}; --yggterm-term-cursor-text:{}; \
@@ -23992,24 +24039,30 @@ fn terminal_eval_script(
                 }}
                 #${{hostId}} .xterm .xterm-cursor {{
                     opacity: 1 !important;
+                    background: transparent !important;
+                    color: inherit !important;
+                    outline: none !important;
+                    box-shadow: none !important;
+                    border-left-color: transparent !important;
+                    border-bottom-color: transparent !important;
                 }}
                 #${{hostId}}.yggterm-term-focused .xterm .xterm-cursor.xterm-cursor-block {{
-                    background: var(--yggterm-term-cursor) !important;
-                    color: var(--yggterm-term-cursor-text) !important;
-                    outline: 1px solid var(--yggterm-term-cursor) !important;
-                    box-shadow: 0 0 0 1px var(--yggterm-term-cursor) !important;
+                    background: transparent !important;
+                    color: inherit !important;
+                    outline: none !important;
+                    box-shadow: none !important;
                 }}
                 #${{hostId}}:not(.yggterm-term-focused) .xterm .xterm-cursor.xterm-cursor-block {{
-                    background: var(--yggterm-term-cursor-muted) !important;
-                    outline: 1px solid var(--yggterm-term-cursor) !important;
-                    box-shadow: 0 0 0 1px var(--yggterm-term-cursor-muted) !important;
-                    color: var(--yggterm-term-cursor-text) !important;
+                    background: transparent !important;
+                    outline: none !important;
+                    box-shadow: none !important;
+                    color: inherit !important;
                 }}
                 #${{hostId}} .xterm .xterm-cursor.xterm-cursor-bar {{
-                    box-shadow: inset 2px 0 0 var(--yggterm-term-cursor) !important;
+                    box-shadow: none !important;
                 }}
                 #${{hostId}} .xterm .xterm-cursor.xterm-cursor-underline {{
-                    box-shadow: inset 0 -2px 0 var(--yggterm-term-cursor) !important;
+                    box-shadow: none !important;
                 }}
                 #${{hostId}} .xterm-viewport::-webkit-scrollbar {{
                     width: 0 !important;
@@ -27430,6 +27483,31 @@ mod tests {
         assert!(script.contains("font-synthesis: none"));
         assert!(script.contains("line-height: var(--yggterm-term-line-height)"));
         assert!(script.contains("letter-spacing: var(--yggterm-term-letter-spacing)"));
+    }
+
+    #[test]
+    fn terminal_eval_script_enforces_cursor_overlay_runtime_contract() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(script.contains("cursorOverlay = document.createElement('div');"));
+        assert!(script.contains("cursorOverlay.className = 'yggterm-cursor-overlay';"));
+        assert!(script.contains(".yggterm-cursor-overlay"));
+        assert!(script.contains("const updateCursorOverlay = () => {"));
+        assert!(script.contains("overlay.style.left ="));
+        assert!(script.contains("overlay.style.top ="));
+        assert!(script.contains(".xterm .xterm-cursor.xterm-cursor-block"));
+        assert!(script.contains("background: transparent !important;"));
+        assert!(script.contains("box-shadow: none !important;"));
+    }
+
+    #[test]
+    fn terminal_eval_script_keeps_dim_rows_explicitly_visible() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(script.contains("host.style.setProperty('--yggterm-term-dim-foreground'"));
+        assert!(script.contains(".xterm-rows .xterm-dim"));
+        assert!(script.contains("color: var(--yggterm-term-dim-foreground) !important;"));
+        assert!(script.contains("opacity: 1 !important;"));
     }
 
     #[test]
