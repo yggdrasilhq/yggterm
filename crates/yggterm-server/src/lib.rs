@@ -8526,6 +8526,55 @@ fn xdotool_command(display: &str, xauthority: Option<&str>) -> Command {
     command
 }
 
+fn xdotool_key_for_char(ch: char) -> Option<&'static str> {
+    match ch {
+        'a' | 'A' => Some("a"),
+        'b' | 'B' => Some("b"),
+        'c' | 'C' => Some("c"),
+        'd' | 'D' => Some("d"),
+        'e' | 'E' => Some("e"),
+        'f' | 'F' => Some("f"),
+        'g' | 'G' => Some("g"),
+        'h' | 'H' => Some("h"),
+        'i' | 'I' => Some("i"),
+        'j' | 'J' => Some("j"),
+        'k' | 'K' => Some("k"),
+        'l' | 'L' => Some("l"),
+        'm' | 'M' => Some("m"),
+        'n' | 'N' => Some("n"),
+        'o' | 'O' => Some("o"),
+        'p' | 'P' => Some("p"),
+        'q' | 'Q' => Some("q"),
+        'r' | 'R' => Some("r"),
+        's' | 'S' => Some("s"),
+        't' | 'T' => Some("t"),
+        'u' | 'U' => Some("u"),
+        'v' | 'V' => Some("v"),
+        'w' | 'W' => Some("w"),
+        'x' | 'X' => Some("x"),
+        'y' | 'Y' => Some("y"),
+        'z' | 'Z' => Some("z"),
+        '0' => Some("0"),
+        '1' => Some("1"),
+        '2' => Some("2"),
+        '3' => Some("3"),
+        '4' => Some("4"),
+        '5' => Some("5"),
+        '6' => Some("6"),
+        '7' => Some("7"),
+        '8' => Some("8"),
+        '9' => Some("9"),
+        ' ' => Some("space"),
+        '/' => Some("slash"),
+        '-' => Some("minus"),
+        '_' => Some("underscore"),
+        '.' => Some("period"),
+        ':' => Some("colon"),
+        ',' => Some("comma"),
+        _ => None,
+    }
+}
+
 fn run_xdotool_checked(
     display: &str,
     xauthority: Option<&str>,
@@ -8596,6 +8645,15 @@ fn focus_terminal_viewport_via_x11(context: &X11TerminalProbeContext) -> anyhow:
         &context.display,
         context.xauthority.as_deref(),
         &[
+            "windowactivate".to_string(),
+            "--sync".to_string(),
+            window_id.clone(),
+        ],
+    );
+    let _ = run_xdotool_checked_owned(
+        &context.display,
+        context.xauthority.as_deref(),
+        &[
             "windowfocus".to_string(),
             "--sync".to_string(),
             window_id.clone(),
@@ -8615,7 +8673,7 @@ fn focus_terminal_viewport_via_x11(context: &X11TerminalProbeContext) -> anyhow:
             "1".to_string(),
         ],
     )?;
-    std::thread::sleep(Duration::from_millis(80));
+    std::thread::sleep(Duration::from_millis(120));
     Ok(window_id)
 }
 
@@ -8645,20 +8703,37 @@ fn x11_keyboard_probe_input(
         std::thread::sleep(Duration::from_millis(40));
     }
     if !data.is_empty() {
-        run_xdotool_checked_owned(
-            &before_context.display,
-            before_context.xauthority.as_deref(),
-            &[
-                "type".to_string(),
-                "--window".to_string(),
-                window_id.clone(),
-                "--clearmodifiers".to_string(),
-                "--delay".to_string(),
-                "1".to_string(),
-                "--".to_string(),
-                data.to_string(),
-            ],
-        )?;
+        for ch in data.chars() {
+            if let Some(key) = xdotool_key_for_char(ch) {
+                run_xdotool_checked_owned(
+                    &before_context.display,
+                    before_context.xauthority.as_deref(),
+                    &[
+                        "key".to_string(),
+                        "--window".to_string(),
+                        window_id.clone(),
+                        "--clearmodifiers".to_string(),
+                        key.to_string(),
+                    ],
+                )?;
+            } else {
+                run_xdotool_checked_owned(
+                    &before_context.display,
+                    before_context.xauthority.as_deref(),
+                    &[
+                        "type".to_string(),
+                        "--window".to_string(),
+                        window_id.clone(),
+                        "--clearmodifiers".to_string(),
+                        "--delay".to_string(),
+                        "1".to_string(),
+                        "--".to_string(),
+                        ch.to_string(),
+                    ],
+                )?;
+            }
+            std::thread::sleep(Duration::from_millis(18));
+        }
         std::thread::sleep(Duration::from_millis(40));
     }
     if press_tab {
@@ -10887,6 +10962,17 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use yggterm_core::TranscriptRole;
+
+    #[test]
+    fn xdotool_key_for_char_maps_status_chars() {
+        assert_eq!(super::xdotool_key_for_char('/'), Some("slash"));
+        assert_eq!(super::xdotool_key_for_char('s'), Some("s"));
+        assert_eq!(super::xdotool_key_for_char('t'), Some("t"));
+        assert_eq!(super::xdotool_key_for_char('a'), Some("a"));
+        assert_eq!(super::xdotool_key_for_char('u'), Some("u"));
+        assert_eq!(super::xdotool_key_for_char('s'), Some("s"));
+        assert_eq!(super::xdotool_key_for_char('\n'), None);
+    }
 
     #[test]
     fn app_control_open_path_ready_rejects_loading_placeholder_preview() {

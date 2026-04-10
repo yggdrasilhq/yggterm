@@ -702,6 +702,14 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         .and_then(Value::as_str)
         .map(str::trim)
         .unwrap_or("");
+    let cursor_line_text = host
+        .get("cursor_line_text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if !cursor_line_text.is_empty() && terminal_chunk_is_transport_error(cursor_line_text) {
+        return Some("active terminal host is showing transport/error output");
+    }
     if text_sample.is_empty() {
         return None;
     }
@@ -1120,6 +1128,23 @@ pub(crate) fn terminal_chunk_is_low_signal_terminal_noise(data: &str) -> bool {
 
 pub(crate) fn terminal_chunk_is_transport_error(data: &str) -> bool {
     let stripped = strip_terminal_control_sequences(data);
+    let normalized = stripped.to_ascii_lowercase();
+    if (normalized.contains("shared connection to ")
+        && (normalized.contains(" closed")
+            || normalized.contains("refused")
+            || normalized.contains("timed out")))
+        || (normalized.contains("connection to ")
+            && (normalized.contains(" closed")
+                || normalized.contains("refused")
+                || normalized.contains("timed out")))
+        || normalized.contains("terminal session not found")
+        || normalized.contains("permission denied")
+        || normalized.contains("no route to host")
+        || normalized.contains("broken pipe")
+        || normalized.contains("connection reset by peer")
+    {
+        return true;
+    }
     let lines = stripped
         .lines()
         .map(str::trim)
