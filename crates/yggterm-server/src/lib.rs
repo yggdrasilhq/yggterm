@@ -8630,60 +8630,64 @@ fn x11_keyboard_probe_input(
     let home = resolve_yggterm_home()?;
     let before_context = active_terminal_probe_context(&home, session_path, timeout_ms)?;
     let window_id = focus_terminal_viewport_via_x11(&before_context)?;
-    let mut command = vec![
-        "mousemove".to_string(),
-        "--sync".to_string(),
-        "--window".to_string(),
-        window_id.clone(),
-        before_context.x.to_string(),
-        before_context.y.to_string(),
-        "click".to_string(),
-        "1".to_string(),
-    ];
     if press_ctrl_c {
-        command.extend([
-            "key".to_string(),
-            "--window".to_string(),
-            window_id.clone(),
-            "--clearmodifiers".to_string(),
-            "ctrl+c".to_string(),
-        ]);
+        run_xdotool_checked_owned(
+            &before_context.display,
+            before_context.xauthority.as_deref(),
+            &[
+                "key".to_string(),
+                "--window".to_string(),
+                window_id.clone(),
+                "--clearmodifiers".to_string(),
+                "ctrl+c".to_string(),
+            ],
+        )?;
+        std::thread::sleep(Duration::from_millis(40));
     }
     if !data.is_empty() {
-        command.extend([
-            "type".to_string(),
-            "--window".to_string(),
-            window_id.clone(),
-            "--clearmodifiers".to_string(),
-            "--delay".to_string(),
-            "1".to_string(),
-            "--".to_string(),
-            data.to_string(),
-        ]);
+        run_xdotool_checked_owned(
+            &before_context.display,
+            before_context.xauthority.as_deref(),
+            &[
+                "type".to_string(),
+                "--window".to_string(),
+                window_id.clone(),
+                "--clearmodifiers".to_string(),
+                "--delay".to_string(),
+                "1".to_string(),
+                "--".to_string(),
+                data.to_string(),
+            ],
+        )?;
+        std::thread::sleep(Duration::from_millis(40));
     }
     if press_tab {
-        command.extend([
-            "key".to_string(),
-            "--window".to_string(),
-            window_id.clone(),
-            "--clearmodifiers".to_string(),
-            "Tab".to_string(),
-        ]);
+        run_xdotool_checked_owned(
+            &before_context.display,
+            before_context.xauthority.as_deref(),
+            &[
+                "key".to_string(),
+                "--window".to_string(),
+                window_id.clone(),
+                "--clearmodifiers".to_string(),
+                "Tab".to_string(),
+            ],
+        )?;
+        std::thread::sleep(Duration::from_millis(40));
     }
     if press_enter {
-        command.extend([
-            "key".to_string(),
-            "--window".to_string(),
-            window_id.clone(),
-            "--clearmodifiers".to_string(),
-            "Return".to_string(),
-        ]);
+        run_xdotool_checked_owned(
+            &before_context.display,
+            before_context.xauthority.as_deref(),
+            &[
+                "key".to_string(),
+                "--window".to_string(),
+                window_id.clone(),
+                "--clearmodifiers".to_string(),
+                "Return".to_string(),
+            ],
+        )?;
     }
-    run_xdotool_checked_owned(
-        &before_context.display,
-        before_context.xauthority.as_deref(),
-        &command,
-    )?;
     std::thread::sleep(Duration::from_millis(if press_enter { 220 } else { 120 }));
     let after_context = active_terminal_probe_context(&home, session_path, timeout_ms)?;
     Ok(json!({
