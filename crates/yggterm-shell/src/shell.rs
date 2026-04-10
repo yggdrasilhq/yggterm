@@ -26264,6 +26264,31 @@ fn TerminalThemeSelectRow(
     mode: UiTheme,
     on_change: EventHandler<(UiTheme, String)>,
 ) -> Element {
+    let select_background = if palette_is_dark(palette) {
+        "rgba(10,14,20,0.98)"
+    } else {
+        "rgba(255,255,255,0.94)"
+    };
+    let select_text = if palette_is_dark(palette) {
+        "#f6fbff"
+    } else {
+        "#1f2b35"
+    };
+    let select_border = if palette_is_dark(palette) {
+        "rgba(214,229,242,0.38)"
+    } else {
+        "rgba(201,214,226,0.56)"
+    };
+    let option_background = if palette_is_dark(palette) {
+        "#101720"
+    } else {
+        "#ffffff"
+    };
+    let option_text = if palette_is_dark(palette) {
+        "#f6fbff"
+    } else {
+        "#1f2b35"
+    };
     rsx! {
         div {
             style: format!(
@@ -26305,22 +26330,11 @@ fn TerminalThemeSelectRow(
                 value: "{value}",
                 style: format!(
                     "width:100%; height:34px; border:none; border-radius:10px; padding:0 28px 0 12px; appearance:none; -webkit-appearance:none; -moz-appearance:none; \
-                     background:{}; color:{}; box-shadow: inset 0 0 0 1px {}; font-size:12px; font-weight:700;",
-                    if palette_is_dark(palette) {
-                        "rgba(12,17,23,0.96)"
-                    } else {
-                        "rgba(255,255,255,0.86)"
-                    },
-                    if palette_is_dark(palette) {
-                        "#f5fbff"
-                    } else {
-                        "#1f2b35"
-                    },
-                    if palette_is_dark(palette) {
-                        "rgba(214,229,242,0.34)"
-                    } else {
-                        "rgba(201,214,226,0.56)"
-                    }
+                     background:{}; color:{}; box-shadow: inset 0 0 0 1px {}; font-size:12px; font-weight:700; color-scheme:{};",
+                    select_background,
+                    select_text,
+                    select_border,
+                    if palette_is_dark(palette) { "dark" } else { "light" }
                 ),
                 oninput: move |evt| on_change.call((mode, evt.value())),
                 for option in options {
@@ -26328,6 +26342,11 @@ fn TerminalThemeSelectRow(
                         key: "{label}:{option}",
                         value: "{option}",
                         selected: option == value,
+                        style: format!(
+                            "background:{}; color:{}; font-size:12px; font-weight:700;",
+                            option_background,
+                            option_text
+                        ),
                         "{option}"
                     }
                 }
