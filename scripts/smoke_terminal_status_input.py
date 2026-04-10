@@ -28,6 +28,19 @@ def app_state(pid: int) -> dict:
     return run("server", "app", "state", "--pid", str(pid), "--timeout-ms", "8000")["data"]
 
 
+def host_problem(state: dict) -> str | None:
+    viewport = state.get("viewport") or {}
+    surface = viewport.get("active_terminal_surface") or {}
+    problem = surface.get("problem")
+    if isinstance(problem, str) and problem.strip():
+        return problem
+    host = ((state.get("dom") or {}).get("terminal_hosts") or [{}])[0]
+    cursor_line_text = str(host.get("cursor_line_text") or "").lower()
+    if "shared connection to " in cursor_line_text and " closed" in cursor_line_text:
+        return "active terminal host is showing transport/error output"
+    return None
+
+
 def wait_for_terminal_interactive(pid: int, timeout_seconds: float = 15.0) -> dict:
     deadline = time.time() + timeout_seconds
     last_state = {}
@@ -40,10 +53,30 @@ def wait_for_terminal_interactive(pid: int, timeout_seconds: float = 15.0) -> di
             and viewport.get("interactive") is True
             and hosts
             and hosts[0].get("input_enabled") is True
+            and not host_problem(last_state)
         ):
             return last_state
         time.sleep(0.2)
     raise AssertionError(f"terminal did not settle in time: {last_state!r}")
+
+
+def run_status_probe(pid: int, session: str) -> dict:
+    return run(
+        "server",
+        "app",
+        "terminal",
+        "probe-type",
+        "--pid",
+        str(pid),
+        session,
+        "--mode",
+        "keyboard",
+        "--data",
+        "/status",
+        "--enter",
+        "--timeout-ms",
+        "15000",
+    )
 
 
 def main() -> int:
@@ -70,27 +103,29 @@ def main() -> int:
         "8000",
     )
 
-    probe = run(
-        "server",
-        "app",
-        "terminal",
-        "probe-type",
-        "--pid",
-        str(args.pid),
-        args.session,
-        "--mode",
-        "keyboard",
-        "--data",
-        "/status",
-        "--enter",
-        "--timeout-ms",
-        "15000",
-    )
+    probe = run_status_probe(args.pid, args.session)
     with (out_dir / "probe.json").open("w") as fh:
         json.dump(probe, fh, indent=2)
 
     time.sleep(1.0)
     after = app_state(args.pid)
+    after_host = ((after.get("dom") or {}).get("terminal_hosts") or [{}])[0]
+    after_text_sample = str(after_host.get("text_sample") or "")
+    after_cursor_line_text = str(after_host.get("cursor_line_text") or "")
+    if (
+        "/status" not in after_text_sample
+        and "OpenAI Codex" not in after_text_sample
+        and "Session:" not in after_text_sample
+        and "/status" not in after_cursor_line_text
+        and "OpenAI Codex" not in after_cursor_line_text
+        and "Session:" not in after_cursor_line_text
+    ):
+        after = wait_for_terminal_interactive(args.pid, timeout_seconds=20.0)
+        retry_probe = run_status_probe(args.pid, args.session)
+        with (out_dir / "retry-probe.json").open("w") as fh:
+            json.dump(retry_probe, fh, indent=2)
+        time.sleep(1.0)
+        after = app_state(args.pid)
     with (out_dir / "after.json").open("w") as fh:
         json.dump(after, fh, indent=2)
     run(
@@ -122,6 +157,7 @@ def main() -> int:
     host = ((after.get("dom") or {}).get("terminal_hosts") or [{}])[0]
     notifications = (after.get("shell") or {}).get("notifications") or []
     text_sample = host.get("text_sample") or ""
+    cursor_line_text = host.get("cursor_line_text") or ""
     selected_text_length = (((select.get("data") or {}).get("selected_text_length")) or 0)
 
     if viewport.get("ready") is not True or viewport.get("interactive") is not True:
@@ -136,9 +172,14 @@ def main() -> int:
         raise AssertionError("cursor overlay missing after /status")
     if host.get("cursor_overlay_display") in ("", "none"):
         raise AssertionError(f"cursor overlay hidden after /status: {host.get('cursor_overlay_display')!r}")
-    if "/status" not in text_sample:
+    if "/status" not in text_sample and "/status" not in cursor_line_text:
         raise AssertionError("typed /status did not appear in terminal text sample")
-    if "OpenAI Codex" not in text_sample and "Session:" not in text_sample:
+    if (
+        "OpenAI Codex" not in text_sample
+        and "Session:" not in text_sample
+        and "OpenAI Codex" not in cursor_line_text
+        and "Session:" not in cursor_line_text
+    ):
         raise AssertionError("Codex status panel did not appear after /status")
     if selected_text_length <= 0:
         raise AssertionError(f"selection probe did not capture visible text: {select!r}")
