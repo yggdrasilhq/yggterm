@@ -304,6 +304,7 @@ def assert_text_readability(state: dict) -> dict:
     rows_color = str(host.get("rows_sample_color") or host.get("rows_color") or "")
     dim_color = str(host.get("dim_sample_color") or "")
     low_contrast_count = int(host.get("low_contrast_span_count") or 0)
+    low_contrast_row_count = int(host.get("low_contrast_row_count") or 0)
     row_contrast = contrast_ratio(rows_color, bg)
     dim_contrast = contrast_ratio(dim_color, bg) if dim_color else None
     if "JetBrains Mono" not in str(host.get("rows_sample_font_family") or host.get("rows_font_family") or ""):
@@ -317,6 +318,10 @@ def assert_text_readability(state: dict) -> dict:
     if low_contrast_count != 0:
         raise AssertionError(
             f"visible low-contrast spans remain: count={low_contrast_count} samples={host.get('low_contrast_span_samples')!r}"
+        )
+    if low_contrast_row_count != 0:
+        raise AssertionError(
+            f"visible low-contrast rows remain: count={low_contrast_row_count} samples={host.get('low_contrast_row_samples')!r}"
         )
     if row_contrast is None or row_contrast < 7.0:
         raise AssertionError(
@@ -337,6 +342,7 @@ def assert_text_readability(state: dict) -> dict:
         "dim_sample_color": dim_color,
         "dim_contrast": round(dim_contrast, 2) if dim_contrast is not None else None,
         "low_contrast_span_count": low_contrast_count,
+        "low_contrast_row_count": low_contrast_row_count,
     }
 
 
@@ -427,10 +433,18 @@ def assert_scroll(pid: int, session: str, before_state: dict) -> dict:
     first = probe_scroll(pid, session, lines)
     before = first.get("before") or {}
     after = first.get("after") or {}
+    if after.get("input_enabled") is not True or after.get("helper_textarea_focused") is not True:
+        raise AssertionError(
+            f"scroll probe lost terminal input/focus: first={first!r}"
+        )
     if before.get("viewport_y") == after.get("viewport_y"):
         second = probe_scroll(pid, session, -lines)
         before = second.get("before") or {}
         after = second.get("after") or {}
+        if after.get("input_enabled") is not True or after.get("helper_textarea_focused") is not True:
+            raise AssertionError(
+                f"scroll probe lost terminal input/focus on reverse attempt: second={second!r}"
+            )
         if before.get("viewport_y") == after.get("viewport_y"):
             raise AssertionError(
                 f"scroll probe did not move viewport in either direction: first={first!r} second={second!r}"
@@ -444,6 +458,82 @@ def assert_scroll(pid: int, session: str, before_state: dict) -> dict:
         "lines": lines,
         "before": before,
         "after": after,
+    }
+
+
+def assert_cursor_on_prompt_band(state: dict, *, context: str) -> dict:
+    host = active_host(state)
+    viewport_rect = host.get("viewport_rect") or {}
+    overlay_rect = host.get("cursor_overlay_rect") or {}
+    cursor_row_rect = host.get("cursor_row_rect") or {}
+    cursor_line_text = str(host.get("cursor_line_text") or host.get("cursor_row_text") or "")
+    if not rect_is_visible(viewport_rect):
+        raise AssertionError(f"{context}: viewport rect missing: {viewport_rect!r}")
+    if not rect_is_visible(overlay_rect):
+        raise AssertionError(f"{context}: cursor overlay rect missing: {overlay_rect!r}")
+    prompt_band_top = float(viewport_rect["top"]) + (float(viewport_rect["height"]) * 0.72)
+    if float(overlay_rect["top"]) < prompt_band_top:
+        raise AssertionError(
+            f"{context}: cursor overlay drifted above prompt band: overlay={overlay_rect!r} viewport={viewport_rect!r}"
+        )
+    if rect_is_visible(cursor_row_rect) and float(cursor_row_rect["top"]) < prompt_band_top:
+        raise AssertionError(
+            f"{context}: cursor row drifted above prompt band: row={cursor_row_rect!r} viewport={viewport_rect!r}"
+        )
+    if not cursor_line_text.strip():
+        raise AssertionError(f"{context}: cursor line text is empty")
+    row_color = str(host.get("cursor_row_color") or host.get("rows_color") or "")
+    row_background = str(
+        host.get("cursor_row_background")
+        or host.get("viewport_background_color")
+        or host.get("xterm_theme_background")
+        or ""
+    )
+    row_contrast = contrast_ratio(row_color, row_background)
+    if row_contrast is None or row_contrast < 7.0:
+        raise AssertionError(
+            f"{context}: cursor row contrast too low: color={row_color!r} background={row_background!r} contrast={row_contrast!r}"
+        )
+    return {
+        "cursor_line_text": cursor_line_text,
+        "cursor_overlay_rect": overlay_rect,
+        "cursor_row_rect": cursor_row_rect,
+        "cursor_row_contrast": round(row_contrast, 2),
+    }
+
+
+def assert_partial_input_flow(pid: int, session: str, out_dir: Path) -> dict:
+    typed = probe_type(pid, session, "/sta", mode="keyboard")
+    time.sleep(0.4)
+    typed_state = app_state(pid)
+    typed_host = active_host(typed_state)
+    typed_shot = out_dir / "after-partial-type.png"
+    app_screenshot(pid, typed_shot)
+    cursor_line_text = str(typed_host.get("cursor_line_text") or typed_host.get("cursor_row_text") or "")
+    if "/sta" not in cursor_line_text and "/sta" not in str(typed_host.get("text_sample") or ""):
+        raise AssertionError(
+            f"partial typed text is not visible on the prompt line: cursor_line={cursor_line_text!r}"
+        )
+    typed_anchor = assert_cursor_on_prompt_band(typed_state, context="after partial typing")
+
+    scroll_probe = probe_scroll(pid, session, -5)
+    time.sleep(0.4)
+    scroll_state = app_state(pid)
+    scroll_host = active_host(scroll_state)
+    scroll_shot = out_dir / "after-partial-scroll.png"
+    app_screenshot(pid, scroll_shot)
+    if scroll_host.get("input_enabled") is not True or scroll_host.get("helper_textarea_focused") is not True:
+        raise AssertionError("after partial scroll the terminal lost focused input")
+    scroll_anchor = assert_cursor_on_prompt_band(scroll_state, context="after partial scroll")
+
+    return {
+        "typed_probe": typed,
+        "typed_screenshot": str(typed_shot),
+        "typed_cursor_line_text": cursor_line_text,
+        "typed_anchor": typed_anchor,
+        "scroll_probe": scroll_probe,
+        "scroll_screenshot": str(scroll_shot),
+        "scroll_anchor": scroll_anchor,
     }
 
 
@@ -524,6 +614,7 @@ def main() -> int:
     summary["checks"]["geometry"] = assert_geometry(state)
     summary["checks"]["readability"] = assert_text_readability(state)
     summary["checks"]["cursor"] = assert_cursor_alignment(state)
+    summary["checks"]["partial_input"] = assert_partial_input_flow(args.pid, args.session, out_dir)
     summary["checks"]["selection"] = assert_selection(args.pid, args.session)
     summary["checks"]["scroll"] = assert_scroll(args.pid, args.session, state)
     if args.session_kind == "codex":
