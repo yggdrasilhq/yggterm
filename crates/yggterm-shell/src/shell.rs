@@ -2121,6 +2121,7 @@ impl ShellState {
 
     fn terminal_session_has_visual_resume_reveal(&self, session_path: &str) -> bool {
         self.terminal_resume_ready_paths.contains(session_path)
+            || self.terminal_session_has_ready_attempt(session_path)
     }
 
     fn active_terminal_prefers_text_input(&self) -> bool {
@@ -2146,6 +2147,9 @@ impl ShellState {
     }
 
     fn terminal_session_resume_notification_should_stay_visible(&self, session_path: &str) -> bool {
+        if self.terminal_session_has_ready_attempt(session_path) {
+            return false;
+        }
         terminal_resume_notification_should_stay_visible_for_session(
             self.terminal_attach_in_flight.contains(session_path),
             self.terminal_session_has_visual_resume_reveal(session_path),
@@ -12980,6 +12984,7 @@ async fn probe_terminal_viewport_input_for(
                 const pressCtrlC = {press_ctrl_c};
                 const keyboardOnly = inputMode === 'keyboard';
                 const xtermOnly = inputMode === 'xterm';
+                const domKeyboardOnly = keyboardOnly || xtermOnly;
                 const registry = window.__yggtermXtermHosts || {{}};
                 const entries = Object.values(registry)
                     .filter((entry) => entry && entry.term && entry.sessionPath === sessionPath)
@@ -13097,25 +13102,40 @@ async fn probe_terminal_viewport_input_for(
                     if ((spec.key || '').length === 1) {{
                         target.dispatchEvent(new KeyboardEvent('keypress', keyInit));
                     }}
-                    if (helperTextarea && spec.inputText) {{
-                        helperTextarea.value = spec.inputText;
-                        helperTextarea.dispatchEvent(new InputEvent('beforeinput', {{
-                            bubbles: true,
-                            cancelable: true,
-                            composed: true,
-                            data: spec.inputText,
-                            inputType: 'insertText',
-                        }}));
-                        helperTextarea.dispatchEvent(new InputEvent('input', {{
-                            bubbles: true,
-                            cancelable: false,
-                            composed: true,
-                            data: spec.inputText,
-                            inputType: 'insertText',
-                        }}));
-                    }}
                     target.dispatchEvent(new KeyboardEvent('keyup', keyInit));
                     await settle(18);
+                }};
+                const dispatchPrintableText = async (textChunk) => {{
+                    if (!textChunk) {{
+                        return;
+                    }}
+                    if (!helperTextarea) {{
+                        for (const char of Array.from(textChunk)) {{
+                            const spec = keySpecForChar(char);
+                            await dispatchKey(spec);
+                        }}
+                        return;
+                    }}
+                    helperTextarea.value = textChunk;
+                    try {{
+                        helperTextarea.setSelectionRange(textChunk.length, textChunk.length);
+                    }} catch (_error) {{}}
+                    helperTextarea.dispatchEvent(new InputEvent('beforeinput', {{
+                        bubbles: true,
+                        cancelable: true,
+                        composed: true,
+                        data: textChunk,
+                        inputType: 'insertText',
+                    }}));
+                    helperTextarea.dispatchEvent(new InputEvent('input', {{
+                        bubbles: true,
+                        cancelable: false,
+                        composed: true,
+                        data: textChunk,
+                        inputType: 'insertText',
+                    }}));
+                    helperTextarea.value = '';
+                    await settle(24);
                 }};
                 const sendViaCoreTrigger = async (payload, wasUserInput = true) => {{
                     const trigger = entry.term
@@ -13154,33 +13174,37 @@ async fn probe_terminal_viewport_input_for(
                     if (!textChunk) {{
                         return;
                     }}
-                    if (!keyboardOnly && ((await sendViaCoreTrigger(textChunk, true))
+                    if (!domKeyboardOnly && ((await sendViaCoreTrigger(textChunk, true))
                         || (await sendViaTermInput(textChunk, true)))) {{
                         return;
                     }}
-                    if (xtermOnly) {{
-                        return;
-                    }}
-                    if (!helperTextarea) {{
+                    if (domKeyboardOnly) {{
                         for (const char of Array.from(textChunk)) {{
                             const spec = keySpecForChar(char);
-                            spec.inputText = char;
                             await dispatchKey(spec);
                         }}
                         return;
                     }}
-                    for (const char of Array.from(textChunk)) {{
-                        const spec = keySpecForChar(char);
-                        spec.inputText = char;
-                        await dispatchKey(spec);
-                    }}
+                    await dispatchPrintableText(textChunk);
+                }};
+                const terminalChunkIsTransportError = (textValue) => {{
+                    const normalized = String(textValue || '').toLowerCase();
+                    return (
+                        (normalized.includes('shared connection to ') && (normalized.includes(' closed') || normalized.includes('refused') || normalized.includes('timed out')))
+                        || (normalized.includes('connection to ') && (normalized.includes(' closed') || normalized.includes('refused') || normalized.includes('timed out')))
+                        || normalized.includes('terminal session not found')
+                        || normalized.includes('permission denied')
+                        || normalized.includes('no route to host')
+                        || normalized.includes('broken pipe')
+                        || normalized.includes('connection reset by peer')
+                    );
                 }};
                 focusTarget();
                 await settle(35);
                 const before = snapshot();
                 if (pressCtrlC) {{
-                    if ((keyboardOnly || xtermOnly)
-                        ? !keyboardOnly
+                    if (domKeyboardOnly
+                        ? true
                         : (!(await sendViaCoreTrigger('\u0003', true))
                             && !(await sendViaTermInput('\u0003', true)))) {{
                         await dispatchKey({{ key: 'c', code: 'KeyC', keyCode: 67, ctrlKey: true }});
@@ -13190,16 +13214,16 @@ async fn probe_terminal_viewport_input_for(
                     await dispatchTextInput(text);
                 }}
                 if (pressTab) {{
-                    if ((keyboardOnly || xtermOnly)
-                        ? keyboardOnly
+                    if (domKeyboardOnly
+                        ? true
                         : (!(await sendViaCoreTrigger('\t', true))
                             && !(await sendViaTermInput('\t', true)))) {{
                         await dispatchKey({{ key: 'Tab', code: 'Tab', keyCode: 9 }});
                     }}
                 }}
                 if (pressEnter) {{
-                    if ((keyboardOnly || xtermOnly)
-                        ? keyboardOnly
+                    if (domKeyboardOnly
+                        ? true
                         : (!(await sendViaCoreTrigger('\r', true))
                             && !(await sendViaTermInput('\r', true)))) {{
                         await dispatchKey({{ key: 'Enter', code: 'Enter', keyCode: 13 }});
@@ -13219,6 +13243,7 @@ async fn probe_terminal_viewport_input_for(
                     mode: inputMode,
                     used_core_trigger: usedCoreTrigger,
                     used_term_input: usedTermInput,
+                    has_transport_error: terminalChunkIsTransportError(String(host.innerText || '')),
                 }});
             }} catch (error) {{
                 dioxus.send({{
@@ -20406,11 +20431,12 @@ fn TerminalCanvas(
         .or_else(|| initial_resume_overlay_excerpt.clone())
         .or(snapshot_resume_overlay_excerpt);
     let terminal_resume_prefill = terminal_placeholder.clone();
-    let resume_ready_from_shell = !is_remote_resume_session
-        && state
-            .read()
-            .terminal_resume_ready_paths
-            .contains(&session_path);
+    let resume_ready_from_shell = {
+        let shell = state.read();
+        !is_remote_resume_session
+            || shell.terminal_resume_ready_paths.contains(&session_path)
+            || shell.terminal_session_has_ready_attempt(&session_path)
+    };
     append_trace_event(
         &trace_home,
         "ui",
@@ -20581,13 +20607,14 @@ fn TerminalCanvas(
     }
     let host_should_accept_input = {
         let shell = state.read();
+        let ready_attempt = shell.terminal_session_has_ready_attempt(&session_path);
         let remote_resume_ready = !is_remote_resume_session
             || shell.terminal_resume_ready_paths.contains(&session_path)
-            || shell.terminal_session_has_ready_attempt(&session_path);
+            || ready_attempt;
         snapshot.active_view_mode == WorkspaceViewMode::Terminal
             && snapshot.active_session_path.as_deref() == Some(session_path.as_str())
             && remote_resume_ready
-            && !shell.terminal_attach_in_flight.contains(&session_path)
+            && (ready_attempt || !shell.terminal_attach_in_flight.contains(&session_path))
     };
     let input_enable_key = format!("input:{host_id}:{host_should_accept_input}");
     if *input_enable_identity.read() != input_enable_key {
@@ -20827,6 +20854,9 @@ fn TerminalCanvas(
             let mut resume_visual_reveal_after_ms = None::<u64>;
             let mut first_resume_connected_output_ms = None::<u64>;
             let mut deferred_resume_output = String::new();
+            let mut last_host_health_has_transport_error = false;
+            let mut last_host_health_cursor_line_text = String::new();
+            let mut last_host_health_text_tail = String::new();
             loop {
                 let still_active = {
                     let shell = state.read();
@@ -21041,7 +21071,163 @@ fn TerminalCanvas(
                             Ok(TerminalJsEvent::Input { data }) => {
                                 terminal_has_meaningful_output.set(true);
                                 terminal_prompt_only.set(false);
-                                let _ = terminal_write_async(endpoint.clone(), session_path.clone(), data).await;
+                                if let Err(write_error) = terminal_write_async(
+                                    endpoint.clone(),
+                                    session_path.clone(),
+                                    data.clone(),
+                                )
+                                .await
+                                {
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "terminal_write_error",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "error": write_error.to_string(),
+                                            "input_sample": data.chars().take(80).collect::<String>(),
+                                        }),
+                                    );
+                                    if is_remote_resume_session && post_attach_read_recovery_attempts < 2 {
+                                        let _ = safe_shell_mut(
+                                            state,
+                                            "terminal_attach_retry_after_write_error",
+                                            |shell| {
+                                                shell.retain_terminal_session_path(&session_path);
+                                                shell.terminal_attach_in_flight
+                                                    .insert(session_path.clone());
+                                                shell.terminal_resume_ready_paths
+                                                    .remove(&session_path);
+                                            },
+                                        );
+                                        terminal_overlay_dismissed.set(false);
+                                        terminal_live_host_connected.set(false);
+                                        resume_overlay_failed.set(false);
+                                        resume_overlay_timed_out.set(false);
+                                        let _ = eval.send(TerminalJsCommand::SetInputEnabled {
+                                            enabled: false,
+                                            focus: false,
+                                        });
+                                        upsert_terminal_resume_notification(
+                                            state,
+                                            &session_path,
+                                            NotificationTone::Warning,
+                                            "Retrying Remote Terminal",
+                                            format!(
+                                                "Yggterm hit a live terminal write error on {} and is retrying the restore.",
+                                                session_host_label
+                                            ),
+                                        );
+                                        post_attach_read_recovery_attempts += 1;
+                                        deferred_resume_output.clear();
+                                        first_resume_connected_output_ms = None;
+                                        if let Err(recovery_error) = terminal_attempt_resume_recovery_async(
+                                            endpoint.clone(),
+                                            session_path.clone(),
+                                            &trace_home,
+                                            "terminal_write_error",
+                                            post_attach_read_recovery_attempts,
+                                        )
+                                        .await
+                                        {
+                                            append_trace_event(
+                                                &trace_home,
+                                                "ui",
+                                                "terminal_mount",
+                                                "terminal_write_recovery_error",
+                                                json!({
+                                                    "session_path": session_path.clone(),
+                                                    "error": recovery_error.to_string(),
+                                                    "attempt": post_attach_read_recovery_attempts,
+                                                }),
+                                            );
+                                        }
+                                        cursor = 0;
+                                        read_poll_ms = 60;
+                                    } else {
+                                        safe_push_notification(
+                                            state,
+                                            NotificationTone::Error,
+                                            "Terminal Input Failed",
+                                            write_error.to_string(),
+                                        );
+                                    }
+                                }
+                            }
+                            Ok(TerminalJsEvent::HostHealth { cursor_line_text, text_tail, has_transport_error }) => {
+                                last_host_health_has_transport_error = has_transport_error;
+                                last_host_health_cursor_line_text = cursor_line_text.clone();
+                                last_host_health_text_tail = text_tail.clone();
+                                if has_transport_error && is_remote_resume_session && post_attach_read_recovery_attempts < 2 {
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "transport_error_visible_in_host_retry",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "cursor_line_text": cursor_line_text,
+                                            "text_tail": text_tail,
+                                            "attempt": post_attach_read_recovery_attempts + 1,
+                                        }),
+                                    );
+                                    let _ = safe_shell_mut(
+                                        state,
+                                        "terminal_attach_retry_after_host_health_transport_error",
+                                        |shell| {
+                                            shell.retain_terminal_session_path(&session_path);
+                                            shell.terminal_attach_in_flight
+                                                .insert(session_path.clone());
+                                            shell.terminal_resume_ready_paths
+                                                .remove(&session_path);
+                                        },
+                                    );
+                                    terminal_overlay_dismissed.set(false);
+                                    terminal_live_host_connected.set(false);
+                                    resume_overlay_failed.set(false);
+                                    resume_overlay_timed_out.set(false);
+                                    let _ = eval.send(TerminalJsCommand::SetInputEnabled {
+                                        enabled: false,
+                                        focus: false,
+                                    });
+                                    upsert_terminal_resume_notification(
+                                        state,
+                                        &session_path,
+                                        NotificationTone::Warning,
+                                        "Retrying Remote Terminal",
+                                        format!(
+                                            "Yggterm detected a disconnected terminal surface on {} and is retrying the restore.",
+                                            session_host_label
+                                        ),
+                                    );
+                                    post_attach_read_recovery_attempts += 1;
+                                    deferred_resume_output.clear();
+                                    first_resume_connected_output_ms = None;
+                                    if let Err(recovery_error) = terminal_attempt_resume_recovery_async(
+                                        endpoint.clone(),
+                                        session_path.clone(),
+                                        &trace_home,
+                                        "transport_error_visible_in_host",
+                                        post_attach_read_recovery_attempts,
+                                    )
+                                    .await
+                                    {
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "transport_error_visible_in_host_recovery_error",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "error": recovery_error.to_string(),
+                                                "attempt": post_attach_read_recovery_attempts,
+                                            }),
+                                        );
+                                    }
+                                    cursor = 0;
+                                    read_poll_ms = 60;
+                                }
                             }
                             Ok(TerminalJsEvent::Resize { cols, rows }) => {
                                 current_terminal_cols = cols;
@@ -21272,6 +21458,13 @@ fn TerminalCanvas(
                                     terminal_has_visible_output = true;
                                     terminal_resume_surface_staged.set(true);
                                 }
+                                let transport_error_after_attach = is_remote_resume_session
+                                    && has_transport_error
+                                    && (traced_attach_ready
+                                        || terminal_overlay_dismissed()
+                                        || terminal_live_host_connected()
+                                        || terminal_has_meaningful_output()
+                                        || terminal_has_visible_output);
                                 if is_remote_resume_session {
                                     if saw_meaningful_output
                                         && !saw_transcript_browser_output
@@ -21284,7 +21477,8 @@ fn TerminalCanvas(
                                         remote_resume_meaningful_observations =
                                             remote_resume_meaningful_observations
                                                 .saturating_add(1);
-                                    } else if has_transport_error
+                                    } else if (has_transport_error
+                                        && !transport_error_after_attach)
                                         || saw_transcript_browser_output
                                         || saw_generic_idle_output
                                         || tail_generic_idle_output
@@ -21295,7 +21489,75 @@ fn TerminalCanvas(
                                         remote_resume_meaningful_observations = 0;
                                     }
                                 }
-                                if has_transport_error {
+                                if transport_error_after_attach && post_attach_read_recovery_attempts < 2 {
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "transport_error_after_attach_retry",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "cursor": cursor,
+                                            "attempt": post_attach_read_recovery_attempts + 1,
+                                        }),
+                                    );
+                                    let _ = safe_shell_mut(
+                                        state,
+                                        "terminal_attach_retry_after_transport_error",
+                                        |shell| {
+                                            shell.retain_terminal_session_path(&session_path);
+                                            shell.terminal_attach_in_flight
+                                                .insert(session_path.clone());
+                                            shell.terminal_resume_ready_paths
+                                                .remove(&session_path);
+                                        },
+                                    );
+                                    terminal_overlay_dismissed.set(false);
+                                    terminal_live_host_connected.set(false);
+                                    resume_overlay_failed.set(false);
+                                    resume_overlay_timed_out.set(false);
+                                    let _ = eval.send(TerminalJsCommand::SetInputEnabled {
+                                        enabled: false,
+                                        focus: false,
+                                    });
+                                    upsert_terminal_resume_notification(
+                                        state,
+                                        &session_path,
+                                        NotificationTone::Warning,
+                                        "Retrying Remote Terminal",
+                                        format!(
+                                            "Yggterm saw the live terminal on {} disconnect after attach and is retrying the restore.",
+                                            session_host_label
+                                        ),
+                                    );
+                                    post_attach_read_recovery_attempts += 1;
+                                    deferred_resume_output.clear();
+                                    first_resume_connected_output_ms = None;
+                                    if let Err(recovery_error) = terminal_attempt_resume_recovery_async(
+                                        endpoint.clone(),
+                                        session_path.clone(),
+                                        &trace_home,
+                                        "transport_error_after_attach",
+                                        post_attach_read_recovery_attempts,
+                                    )
+                                    .await
+                                    {
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "transport_error_after_attach_recovery_error",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "error": recovery_error.to_string(),
+                                                "attempt": post_attach_read_recovery_attempts,
+                                            }),
+                                        );
+                                    }
+                                    cursor = 0;
+                                    read_poll_ms = 60;
+                                    continue;
+                                } else if has_transport_error {
                                     resume_overlay_failed.set(true);
                                     resume_overlay_timed_out.set(false);
                                     terminal_overlay_dismissed.set(false);
@@ -21641,6 +21903,40 @@ fn TerminalCanvas(
                                         || tail_prompt_only_output
                                         || saw_attach_ready_marker
                                 };
+                                let quiet_retained_surface_ready = is_remote_resume_session
+                                    && !terminal_live_host_connected()
+                                    && terminal_paint_seen
+                                    && terminal_geometry_ready
+                                    && !last_host_health_has_transport_error
+                                    && (runtime_running
+                                        || !last_host_health_cursor_line_text.trim().is_empty())
+                                    && resume_visual_reveal_after_ms
+                                        .is_some_and(|deadline_ms| current_millis() >= deadline_ms)
+                                    && !saw_transcript_browser_output
+                                    && !saw_generic_idle_output
+                                    && !tail_generic_idle_output
+                                    && !saw_generic_idle_footer_output
+                                    && !tail_generic_idle_footer_output
+                                    && !saw_prompt_only_surface
+                                    && (!last_host_health_cursor_line_text.trim().is_empty()
+                                        || !last_host_health_text_tail.trim().is_empty());
+                                if quiet_retained_surface_ready {
+                                    terminal_live_host_connected.set(true);
+                                    first_resume_connected_output_ms
+                                        .get_or_insert_with(current_millis);
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "quiet_retained_surface_accepted",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "cursor_line_text": last_host_health_cursor_line_text,
+                                            "text_tail": last_host_health_text_tail,
+                                            "runtime_running": runtime_running,
+                                        }),
+                                    );
+                                }
                                 if connected_for_resume || saw_transcript_browser_output {
                                     if connected_for_resume {
                                         terminal_live_host_connected.set(true);
@@ -24130,6 +24426,54 @@ fn terminal_eval_script(
         const renderDisposable = term.onRender(() => {{
             emitPaint();
         }});
+        let lastHostHealthKey = '';
+        const terminalChunkIsTransportError = (textValue) => {{
+            const normalized = String(textValue || '').toLowerCase();
+            return (
+                (normalized.includes('shared connection to ') && (normalized.includes(' closed') || normalized.includes('refused') || normalized.includes('timed out')))
+                || (normalized.includes('connection to ') && (normalized.includes(' closed') || normalized.includes('refused') || normalized.includes('timed out')))
+                || normalized.includes('terminal session not found')
+                || normalized.includes('permission denied')
+                || normalized.includes('no route to host')
+                || normalized.includes('broken pipe')
+                || normalized.includes('connection reset by peer')
+            );
+        }};
+        const emitHostHealth = () => {{
+            try {{
+                const active = term && term.buffer ? term.buffer.active : null;
+                const cursorLineIndex = active ? Number((active.baseY || 0) + (active.cursorY || 0)) : null;
+                const cursorLine = (
+                    active
+                    && Number.isFinite(cursorLineIndex)
+                    && cursorLineIndex >= 0
+                    && active.getLine
+                )
+                    ? active.getLine(cursorLineIndex)
+                    : null;
+                const cursorLineText = cursorLine && cursorLine.translateToString
+                    ? String(cursorLine.translateToString(true) || '')
+                    : '';
+                const textTail = readTerminalBufferSample(term).slice(-240);
+                const hasTransportError = terminalChunkIsTransportError(cursorLineText)
+                    || terminalChunkIsTransportError(textTail);
+                const nextKey = JSON.stringify([
+                    hasTransportError,
+                    cursorLineText.slice(-160),
+                    textTail.slice(-160),
+                ]);
+                if (nextKey === lastHostHealthKey) {{
+                    return;
+                }}
+                lastHostHealthKey = nextKey;
+                dioxus.send({{
+                    kind: "host_health",
+                    cursor_line_text: cursorLineText,
+                    text_tail: textTail,
+                    has_transport_error: hasTransportError,
+                }});
+            }} catch (_error) {{}}
+        }};
         term.onData((data) => {{
             if (!inputEnabled) {{
                 return;
@@ -24182,6 +24526,7 @@ fn terminal_eval_script(
         }};
         emitResize();
         requestVisiblePaint();
+        emitHostHealth();
         scheduleResizeNudges();
         {constructed_debug}
         dioxus.send({{ kind: "ready" }});
@@ -24258,6 +24603,7 @@ fn terminal_eval_script(
                 requestAnimationFrame(() => {{
                     emitResize();
                     requestVisiblePaint();
+                    emitHostHealth();
                 }});
                 scheduleResizeNudges();
             }} else if (message.kind === "write") {{
@@ -24267,9 +24613,11 @@ fn terminal_eval_script(
                         scrollLiveCursorIntoView();
                     }}
                     requestVisiblePaint();
+                    emitHostHealth();
                 }});
             }} else if (message.kind === "set_input_enabled") {{
                 setInputEnabled(Boolean(message.enabled), Boolean(message.focus));
+                emitHostHealth();
             }}
         }}
         "#,
