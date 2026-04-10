@@ -182,6 +182,11 @@ def rect_is_visible(rect: dict | None) -> bool:
     return float(rect.get("width") or 0) > 0 and float(rect.get("height") or 0) > 0
 
 
+def is_transparent_css_color(value: str | None) -> bool:
+    text = str(value or "").strip().lower()
+    return text in ("", "transparent", "rgba(0, 0, 0, 0)", "rgba(0,0,0,0)")
+
+
 def active_host(state: dict) -> dict:
     viewport = state.get("viewport") or {}
     hosts = viewport.get("terminal_hosts") or []
@@ -360,9 +365,23 @@ def assert_cursor_alignment(state: dict) -> dict:
             f"overlay={overlay_rect!r} expected={expected_rect!r} dx={dx:.2f} dy={dy:.2f} dw={dw:.2f} dh={dh:.2f}"
         )
     if rect_is_visible(cursor_rect) and float(cursor_rect["width"]) > float(overlay_rect["width"]) * 4.0:
-        raise AssertionError(
-            f"rendered xterm cursor span is implausibly wide and would wash out whole runs: {cursor_rect!r}"
-        )
+        background = host.get("cursor_sample_background")
+        border_left = host.get("cursor_sample_border_left")
+        border_bottom = host.get("cursor_sample_border_bottom")
+        outline_style = str(host.get("cursor_sample_outline_style") or "").strip().lower()
+        box_shadow = str(host.get("cursor_sample_box_shadow") or "").strip().lower()
+        if (
+            not is_transparent_css_color(background)
+            or not is_transparent_css_color(border_left)
+            or not is_transparent_css_color(border_bottom)
+            or (outline_style not in ("", "none"))
+            or box_shadow not in ("", "none")
+        ):
+            raise AssertionError(
+                "rendered xterm cursor span is wide and still visually active: "
+                f"rect={cursor_rect!r} background={background!r} border_left={border_left!r} "
+                f"border_bottom={border_bottom!r} outline_style={outline_style!r} box_shadow={box_shadow!r}"
+            )
     return {
         "cursor_overlay_rect": overlay_rect,
         "cursor_expected_rect": expected_rect,
@@ -391,6 +410,19 @@ def assert_scroll(pid: int, session: str, before_state: dict) -> dict:
     host = active_host(before_state)
     before_viewport_y = int(host.get("viewport_y") or 0)
     base_y = int(host.get("base_y") or 0)
+    if base_y <= before_viewport_y <= 0:
+        return {
+            "lines": 0,
+            "before": {
+                "base_y": base_y,
+                "viewport_y": before_viewport_y,
+            },
+            "after": {
+                "base_y": base_y,
+                "viewport_y": before_viewport_y,
+            },
+            "reason": "no_scrollback_available",
+        }
     lines = -5 if before_viewport_y > 0 else 5 if base_y > before_viewport_y else -5
     first = probe_scroll(pid, session, lines)
     before = first.get("before") or {}
