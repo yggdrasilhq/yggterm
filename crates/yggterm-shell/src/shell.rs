@@ -12412,6 +12412,13 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                 const darker = Math.min(fgL, bgL);
                 return Number((((lighter + 0.05) / (darker + 0.05))).toFixed(2));
             };
+            const isTransparentCssColor = (value) => {
+                const text = String(value || '').trim().toLowerCase();
+                return text === ''
+                    || text === 'transparent'
+                    || text === 'rgba(0, 0, 0, 0)'
+                    || text === 'rgba(0,0,0,0)';
+            };
             const collectVisibleSpanDiagnostics = (rowsLayer, backgroundColor) => {
                 if (!rowsLayer) {
                     return {
@@ -12459,6 +12466,64 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                         contrast,
                         class_name: className,
                         style_attr: String(node.getAttribute('style') || ''),
+                    });
+                    if (lowContrastSamples.length >= 8) {
+                        break;
+                    }
+                }
+                return {
+                    low_contrast_count: lowContrastSamples.length,
+                    min_contrast: minContrast,
+                    low_contrast_samples: lowContrastSamples,
+                };
+            };
+            const collectVisibleRowDiagnostics = (rowBlocks, backgroundColor) => {
+                if (!rowBlocks || rowBlocks.length === 0) {
+                    return {
+                        low_contrast_count: 0,
+                        min_contrast: null,
+                        low_contrast_samples: [],
+                    };
+                }
+                const background = parseCssColor(backgroundColor);
+                const backgroundLuminance = background ? relativeLuminance(background) : null;
+                const minimumVisibleContrast = backgroundLuminance != null && backgroundLuminance > 0.72
+                    ? 6.5
+                    : 4.5;
+                let minContrast = null;
+                const lowContrastSamples = [];
+                for (const node of rowBlocks) {
+                    const text = String(node.textContent || '').replace(/\s+/g, ' ').trim();
+                    if (!text) {
+                        continue;
+                    }
+                    const rect = node.getBoundingClientRect();
+                    if (rect.width <= 0 || rect.height <= 0) {
+                        continue;
+                    }
+                    const probeNode = node.querySelector('span:not(.xterm-cursor)') || node;
+                    const style = window.getComputedStyle(probeNode);
+                    const rowBackground = !isTransparentCssColor(style.backgroundColor)
+                        ? String(style.backgroundColor || '')
+                        : backgroundColor;
+                    const contrast = contrastRatio(style.color, rowBackground);
+                    if (contrast == null) {
+                        continue;
+                    }
+                    if (minContrast == null || contrast < minContrast) {
+                        minContrast = contrast;
+                    }
+                    if (contrast >= minimumVisibleContrast) {
+                        continue;
+                    }
+                    lowContrastSamples.push({
+                        text: text.slice(0, 120),
+                        color: String(style.color || ''),
+                        background: rowBackground,
+                        font_weight: String(style.fontWeight || ''),
+                        contrast,
+                        class_name: String(probeNode.className || ''),
+                        style_attr: String(probeNode.getAttribute('style') || ''),
                     });
                     if (lowContrastSamples.length >= 8) {
                         break;
@@ -12537,6 +12602,7 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     || ''
                 );
                 const spanDiagnostics = collectVisibleSpanDiagnostics(rowsLayer, effectiveBackgroundColor);
+                const rowDiagnostics = collectVisibleRowDiagnostics(rowBlocks, effectiveBackgroundColor);
                 const selectionSummary = selectionSummaryForHost(host);
                 const xtermRoot = host.querySelector('.xterm');
                 const mountedHost = window.__yggtermXtermHosts ? window.__yggtermXtermHosts[host.id] : null;
@@ -12556,6 +12622,19 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                 const cursorLineText = cursorLine && cursorLine.translateToString
                     ? String(cursorLine.translateToString(true) || "")
                     : "";
+                const cursorRowNode = (
+                    rowBlocks.length > 0
+                    && cursorY != null
+                    && Number.isFinite(cursorY)
+                ) ? rowBlocks[Math.max(0, Math.min(rowBlocks.length - 1, Number(cursorY)))] : null;
+                const cursorRowProbeNode = cursorRowNode
+                    ? (cursorRowNode.querySelector('span:not(.xterm-cursor)') || cursorRowNode)
+                    : null;
+                const cursorRowStyle = cursorRowProbeNode ? window.getComputedStyle(cursorRowProbeNode) : null;
+                const cursorRowRect = cursorRowNode ? cursorRowNode.getBoundingClientRect() : null;
+                const cursorRowBackground = cursorRowStyle && !isTransparentCssColor(cursorRowStyle.backgroundColor)
+                    ? String(cursorRowStyle.backgroundColor || '')
+                    : effectiveBackgroundColor;
                 const bufferTextSample = readTerminalBufferSample(term);
                 const hostRect = host.getBoundingClientRect();
                 const helpersRect = helpers ? helpers.getBoundingClientRect() : null;
@@ -12663,6 +12742,9 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     low_contrast_span_count: spanDiagnostics.low_contrast_count,
                     low_contrast_min_contrast: spanDiagnostics.min_contrast,
                     low_contrast_span_samples: spanDiagnostics.low_contrast_samples,
+                    low_contrast_row_count: rowDiagnostics.low_contrast_count,
+                    low_contrast_row_min_contrast: rowDiagnostics.min_contrast,
+                    low_contrast_row_samples: rowDiagnostics.low_contrast_samples,
                     selection_text: selectionSummary.text,
                     selection_range_count: selectionSummary.range_count,
                     selection_within_host: selectionSummary.within_host,
@@ -12685,6 +12767,15 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                         top: Number(cursorSampleRect.top.toFixed(2)),
                         width: Number(cursorSampleRect.width.toFixed(2)),
                         height: Number(cursorSampleRect.height.toFixed(2)),
+                    } : null,
+                    cursor_row_text: cursorLineText,
+                    cursor_row_color: cursorRowStyle ? String(cursorRowStyle.color || '') : null,
+                    cursor_row_background: cursorRowBackground,
+                    cursor_row_rect: cursorRowRect ? {
+                        left: Number(cursorRowRect.left.toFixed(2)),
+                        top: Number(cursorRowRect.top.toFixed(2)),
+                        width: Number(cursorRowRect.width.toFixed(2)),
+                        height: Number(cursorRowRect.height.toFixed(2)),
                     } : null,
                     cursor_expected_rect: expectedCursorRect,
                     cursor_overlay_present: Boolean(cursorOverlay),
