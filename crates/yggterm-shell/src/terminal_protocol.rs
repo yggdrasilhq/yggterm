@@ -8,6 +8,7 @@ pub(crate) enum TerminalJsCommand {
         background: String,
         foreground: String,
         cursor: String,
+        cursor_muted: String,
         cursor_text: String,
         dim_foreground: String,
         selection: String,
@@ -31,6 +32,7 @@ pub(crate) enum TerminalJsCommand {
         font_weight: u16,
         font_weight_bold: u16,
         line_height: f32,
+        minimum_contrast_ratio: f32,
         font_size: f32,
     },
     Write {
