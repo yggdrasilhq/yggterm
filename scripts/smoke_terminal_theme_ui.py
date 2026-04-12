@@ -122,9 +122,6 @@ def assert_terminal_font_contract(state: dict, expect_bg: str) -> None:
     cursor_border_left = host.get("cursor_sample_border_left") or ""
     cursor_border_bottom = host.get("cursor_sample_border_bottom") or ""
     cursor_outline = host.get("cursor_sample_outline") or ""
-    cursor_overlay_present = bool(host.get("cursor_overlay_present"))
-    cursor_overlay_display = host.get("cursor_overlay_display") or ""
-    cursor_overlay_rect = host.get("cursor_overlay_rect") or {}
     if not xterm_family:
         raise AssertionError("xterm font family missing; terminal runtime likely did not fully mount")
     if "JetBrains Mono" not in xterm_family:
@@ -199,12 +196,11 @@ def assert_terminal_font_contract(state: dict, expect_bg: str) -> None:
             f"background={cursor_background!r} border_left={cursor_border_left!r} "
             f"border_bottom={cursor_border_bottom!r} outline={cursor_outline!r}"
         )
-    if not cursor_overlay_present:
-        raise AssertionError("cursor overlay is missing from the mounted terminal host")
-    if cursor_overlay_display in ("", "none"):
-        raise AssertionError(f"cursor overlay is not visible: {cursor_overlay_display!r}")
-    if float(cursor_overlay_rect.get("width") or 0.0) < 2.0 or float(cursor_overlay_rect.get("height") or 0.0) < 8.0:
-        raise AssertionError(f"cursor overlay rect drifted: {cursor_overlay_rect!r}")
+    if host.get("xterm_cursor_hidden") is True:
+        raise AssertionError("native xterm cursor unexpectedly reports hidden while input is enabled")
+    cursor_rect = host.get("cursor_sample_rect") or {}
+    if float(cursor_rect.get("width") or 0.0) < 2.0 or float(cursor_rect.get("height") or 0.0) < 8.0:
+        raise AssertionError(f"native cursor rect drifted: {cursor_rect!r}")
     if host_width and screen_width:
         if abs(float(host_width) - float(screen_width)) > 18.0:
             raise AssertionError(

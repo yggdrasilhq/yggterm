@@ -53,6 +53,9 @@ pub(crate) enum TerminalJsEvent {
         cursor_line_text: String,
         text_tail: String,
         has_transport_error: bool,
+        cursor_y: u16,
+        rows: u16,
+        blank_rows_below_cursor: u16,
     },
     Paint {
         child_count: usize,
