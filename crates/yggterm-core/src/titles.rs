@@ -277,7 +277,7 @@ impl SessionTitleResolver {
         );
         if !force {
             if let Some(title) = self.store.get_title(session_id)? {
-                if !looks_like_generated_fallback_title(&title) {
+                if !title_is_low_signal_for_cwd(&title, cwd) {
                     return Ok(Some(title));
                 }
                 let _ = self.store.delete_title(session_id);
@@ -306,6 +306,20 @@ impl SessionTitleResolver {
             warn!(session_id, "model response sanitized to empty title");
             return Ok(None);
         };
+        let title = if title_is_low_signal_for_cwd(&title, cwd) {
+            if let Some(heuristic) = heuristic_title_from_context(context) {
+                if title_is_low_signal_for_cwd(&heuristic, cwd) {
+                    warn!(session_id, generated_title=%title, "discarding low-signal generated title");
+                    return Ok(None);
+                }
+                heuristic
+            } else {
+                warn!(session_id, generated_title=%title, "discarding low-signal generated title");
+                return Ok(None);
+            }
+        } else {
+            title
+        };
         self.store.put_title(
             session_id,
             cwd,
@@ -327,7 +341,7 @@ impl SessionTitleResolver {
         info!(session_id, force, file_path=%file_path.display(), "resolving session title");
         if !force {
             if let Some(title) = self.store.get_title(session_id)? {
-                if !looks_like_generated_fallback_title(&title) {
+                if !title_is_low_signal_for_cwd(&title, cwd) {
                     info!(session_id, "using cached session title");
                     return Ok(Some(title));
                 }
@@ -338,7 +352,7 @@ impl SessionTitleResolver {
         }
 
         if let Some(title) = self.store.get_title(session_id)? {
-            if !looks_like_generated_fallback_title(&title) {
+            if !title_is_low_signal_for_cwd(&title, cwd) {
                 return Ok(Some(title));
             }
             let _ = self.store.delete_title(session_id);
@@ -368,6 +382,20 @@ impl SessionTitleResolver {
         let Some(title) = sanitize_generated_title(&title) else {
             warn!(session_id, "model response sanitized to empty title");
             return Ok(None);
+        };
+        let title = if looks_like_generated_fallback_title(&title) {
+            if let Some(heuristic) = heuristic_title_from_context(&context) {
+                if looks_like_generated_fallback_title(&heuristic) {
+                    warn!(session_id, generated_title=%title, "discarding low-signal generated title");
+                    return Ok(None);
+                }
+                heuristic
+            } else {
+                warn!(session_id, generated_title=%title, "discarding low-signal generated title");
+                return Ok(None);
+            }
+        } else {
+            title
         };
 
         self.store.put_title(
@@ -415,6 +443,18 @@ impl SessionTitleResolver {
         let Some(precis) = sanitize_generated_precis(&precis) else {
             return Ok(None);
         };
+        let precis = if looks_like_low_signal_generated_copy(&precis) {
+            if let Some(heuristic) = heuristic_precis_from_context(&context) {
+                if looks_like_low_signal_generated_copy(&heuristic) {
+                    return Ok(None);
+                }
+                heuristic
+            } else {
+                return Ok(None);
+            }
+        } else {
+            precis
+        };
         self.store.put_precis(
             session_id,
             cwd,
@@ -459,6 +499,18 @@ impl SessionTitleResolver {
         let precis = request_litellm_precis(settings, context)?;
         let Some(precis) = sanitize_generated_precis(&precis) else {
             return Ok(None);
+        };
+        let precis = if looks_like_low_signal_generated_copy(&precis) {
+            if let Some(heuristic) = heuristic_precis_from_context(context) {
+                if looks_like_low_signal_generated_copy(&heuristic) {
+                    return Ok(None);
+                }
+                heuristic
+            } else {
+                return Ok(None);
+            }
+        } else {
+            precis
         };
         self.store.put_precis(
             session_id,
@@ -505,6 +557,18 @@ impl SessionTitleResolver {
         let Some(summary) = sanitize_generated_summary(&summary) else {
             return Ok(None);
         };
+        let summary = if looks_like_low_signal_generated_copy(&summary) {
+            if let Some(heuristic) = heuristic_summary_from_context(&context) {
+                if looks_like_low_signal_generated_copy(&heuristic) {
+                    return Ok(None);
+                }
+                heuristic
+            } else {
+                return Ok(None);
+            }
+        } else {
+            summary
+        };
         self.store.put_summary(
             session_id,
             cwd,
@@ -549,6 +613,18 @@ impl SessionTitleResolver {
         let summary = request_litellm_summary(settings, context)?;
         let Some(summary) = sanitize_generated_summary(&summary) else {
             return Ok(None);
+        };
+        let summary = if looks_like_low_signal_generated_copy(&summary) {
+            if let Some(heuristic) = heuristic_summary_from_context(context) {
+                if looks_like_low_signal_generated_copy(&heuristic) {
+                    return Ok(None);
+                }
+                heuristic
+            } else {
+                return Ok(None);
+            }
+        } else {
+            summary
         };
         self.store.put_summary(
             session_id,
@@ -884,7 +960,8 @@ fn strip_auxiliary_image_sentences(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_tail_context, looks_like_generated_fallback_title, sanitize_generated_summary,
+        extract_tail_context, heuristic_title_from_context, looks_like_generated_fallback_title,
+        sanitize_generated_summary,
     };
     use anyhow::Result;
     use std::fs;
@@ -931,7 +1008,25 @@ mod tests {
         assert!(looks_like_generated_fallback_title(
             "document::ddf8f1ee-8e64-4201-ab3a-2b07424f9b77"
         ));
+        assert!(looks_like_generated_fallback_title("local [ok] shell"));
+        assert!(looks_like_generated_fallback_title(
+            "Local Shell Stay Alive Daemon"
+        ));
         assert!(!looks_like_generated_fallback_title("Remove Them Entirely"));
+    }
+
+    #[test]
+    fn heuristic_title_uses_shell_prompt_command_context() {
+        let context = [
+            "pi@dev:~$ echo 'Live local shell title generation proof'",
+            "Live local shell title generation proof",
+            "pi@dev:~$",
+        ]
+        .join("\n");
+        assert_eq!(
+            heuristic_title_from_context(&context).as_deref(),
+            Some("Live Title Generation")
+        );
     }
 }
 
@@ -1016,7 +1111,19 @@ fn extract_quoted_candidate(text: &str) -> Option<String> {
     None
 }
 
+fn title_is_low_signal_for_cwd(title: &str, cwd: &str) -> bool {
+    let trimmed = title.trim();
+    let cwd_trimmed = cwd.trim();
+    trimmed.is_empty()
+        || looks_like_generated_fallback_title(trimmed)
+        || (!cwd_trimmed.is_empty() && trimmed == cwd_trimmed)
+}
+
 fn heuristic_title_from_context(context: &str) -> Option<String> {
+    if let Some(title) = heuristic_title_from_shell_context(context) {
+        return Some(title);
+    }
+
     let line = context
         .lines()
         .rev()
@@ -1097,8 +1204,137 @@ fn heuristic_title_from_context(context: &str) -> Option<String> {
     plausible_title(&title).then_some(title)
 }
 
+fn heuristic_title_from_shell_context(context: &str) -> Option<String> {
+    for line in context
+        .lines()
+        .rev()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if let Some(command) = extract_prompt_command(line)
+            && let Some(title) = heuristic_title_from_shell_command(command)
+        {
+            return Some(title);
+        }
+        if line.starts_with("$ ") || line.starts_with("# ") || line.starts_with("> ") {
+            let command = line[2..].trim();
+            if let Some(title) = heuristic_title_from_shell_command(command) {
+                return Some(title);
+            }
+        }
+    }
+    None
+}
+
+fn extract_prompt_command(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    ["$ ", "# ", "% ", "> "]
+        .iter()
+        .filter_map(|marker| {
+            trimmed
+                .rfind(marker)
+                .map(|idx| &trimmed[idx + marker.len()..])
+        })
+        .map(str::trim)
+        .find(|command| !command.is_empty())
+}
+
+fn heuristic_title_from_shell_command(command: &str) -> Option<String> {
+    let command = command.trim();
+    if command.is_empty() {
+        return None;
+    }
+
+    if let Some(quoted) = extract_quoted_candidate(command)
+        && let Some(title) = title_from_phrase(&quoted)
+    {
+        return Some(title);
+    }
+
+    let mut tokens = command
+        .split_whitespace()
+        .map(|token| token.trim_matches(|ch: char| ch == '"' || ch == '\'' || ch == '`'))
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    while matches!(tokens.first(), Some(token) if *token == "sudo" || token.contains('=')) {
+        tokens.remove(0);
+    }
+    let primary = tokens.first()?.to_ascii_lowercase();
+
+    if matches!(primary.as_str(), "apt" | "apt-get" | "dnf" | "yum" | "brew")
+        && tokens.get(1).is_some_and(|token| *token == "install")
+        && let Some(package) = tokens.get(2)
+    {
+        let package = package
+            .trim_matches(|ch: char| !ch.is_ascii_alphanumeric())
+            .trim();
+        if !package.is_empty() {
+            return Some(format!("Install {}", title_case_word(package)));
+        }
+    }
+
+    if primary == "cargo" {
+        match tokens.get(1).copied() {
+            Some("test") => return Some(String::from("Run Cargo Tests")),
+            Some("build") => return Some(String::from("Build Rust Project")),
+            Some("run") => return Some(String::from("Run Rust App")),
+            Some("fmt") => return Some(String::from("Format Rust Code")),
+            Some("check") => return Some(String::from("Check Rust Build")),
+            _ => {}
+        }
+    }
+
+    if primary == "git" {
+        match tokens.get(1).copied() {
+            Some("status") => return Some(String::from("Review Git Status")),
+            Some("diff") => return Some(String::from("Review Git Diff")),
+            Some("commit") => return Some(String::from("Commit Git Changes")),
+            Some("push") => return Some(String::from("Push Git Changes")),
+            Some("pull") => return Some(String::from("Pull Git Changes")),
+            _ => {}
+        }
+    }
+
+    title_from_phrase(command)
+}
+
+fn title_from_phrase(phrase: &str) -> Option<String> {
+    let words = phrase
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .filter(|word| word.len() > 2)
+        .filter(|word| {
+            !matches!(
+                word.to_ascii_lowercase().as_str(),
+                "echo"
+                    | "sudo"
+                    | "bash"
+                    | "sh"
+                    | "zsh"
+                    | "fish"
+                    | "then"
+                    | "else"
+                    | "done"
+                    | "true"
+                    | "false"
+                    | "local"
+                    | "shell"
+                    | "proof"
+            )
+        })
+        .take(5)
+        .map(title_case_word)
+        .collect::<Vec<_>>();
+    if words.len() < 2 {
+        return None;
+    }
+    let title = words.join(" ");
+    plausible_title(&title).then_some(title)
+}
+
 pub fn looks_like_generated_fallback_title(title: &str) -> bool {
     let compact = title.trim();
+    let lower = compact.to_ascii_lowercase();
     let prefixed_session_uuid = [
         "local::",
         "live::",
@@ -1116,7 +1352,19 @@ pub fn looks_like_generated_fallback_title(title: &str) -> bool {
         && compact.chars().skip(1).all(|ch| ch.is_ascii_hexdigit());
     let bare_hash = (compact.len() == 7 || compact.len() == 8)
         && compact.chars().all(|ch| ch.is_ascii_hexdigit());
-    prefixed_session_uuid || prefixed_hash || bare_hash
+    let generic_runtime_title = matches!(
+        lower.as_str(),
+        "local shell"
+            | "local [ok] shell"
+            | "local codex"
+            | "local [ok] codex"
+            | "local codex litellm"
+            | "local [ok] codex litellm"
+            | "local shell stay alive daemon"
+            | "command bin bash"
+            | "daemon pty request main viewport"
+    );
+    prefixed_session_uuid || prefixed_hash || bare_hash || generic_runtime_title
 }
 
 pub fn looks_like_low_signal_generated_copy(text: &str) -> bool {
@@ -1129,6 +1377,22 @@ pub fn looks_like_low_signal_generated_copy(text: &str) -> bool {
         "filesystem sandboxing",
         "request_user_input",
         "environment_context",
+        "this local shell should stay alive in the daemon while you browse elsewhere.",
+        "this local shell uses the same pty/runtime path as other embedded terminals.",
+        "daemon pty managed directly by yggterm",
+        "local pty managed directly by yggterm",
+        "queue live shell session",
+        "launching live shell session",
+        "launching live codex session",
+        "launching live ssh session",
+        "workspace: localhost",
+        "deploy state:",
+        "launch phase:",
+        "terminal surface: embedded xterm.js",
+        "daemon runtime:",
+        "daemon pty:",
+        "request main viewport terminal stream",
+        "$ exec ",
         "local codex terminal rooted at ",
         "ssh terminal on ",
         "open live terminal",

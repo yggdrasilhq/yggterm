@@ -392,8 +392,15 @@ pub(crate) fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value
             )
         } else if let Some(problem) = terminal_surface_problem.clone() {
             (false, false, None::<String>, Some(problem))
-        } else if terminal_rendered {
+        } else if terminal_rendered && terminal_input_enabled {
             (true, true, Some("interactive".to_string()), None)
+        } else if terminal_rendered && !terminal_input_enabled {
+            (
+                false,
+                false,
+                Some("recovering".to_string()),
+                Some("terminal rendered but input is still disabled".to_string()),
+            )
         } else if terminal_attach_pending {
             (
                 false,
@@ -707,6 +714,20 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         .and_then(Value::as_str)
         .map(str::trim)
         .unwrap_or("");
+    let input_enabled = host
+        .get("input_enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let helper_textarea_focused = host
+        .get("helper_textarea_focused")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let prompt_visible = terminal_chunk_has_prompt_output(text_sample)
+        || terminal_chunk_has_codex_prompt_output(text_sample)
+        || (!cursor_line_text.is_empty()
+            && (terminal_chunk_has_prompt_output(cursor_line_text)
+                || terminal_chunk_has_codex_prompt_output(cursor_line_text)));
+    let prompt_ready_surface = prompt_visible && (input_enabled || helper_textarea_focused);
     if !cursor_line_text.is_empty() && terminal_chunk_is_transport_error(cursor_line_text) {
         return Some("active terminal host is showing transport/error output");
     }
@@ -719,15 +740,19 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     if terminal_chunk_is_loading_placeholder(text_sample) {
         return Some("active terminal host is still showing resume placeholder content");
     }
-    if terminal_chunk_is_generic_codex_idle(text_sample) {
+    if terminal_chunk_is_generic_codex_idle(text_sample) && !prompt_ready_surface {
         return Some("active terminal host is still showing generic Codex idle chrome");
     }
     if terminal_chunk_has_generic_codex_idle_footer(text_sample)
         && !terminal_chunk_has_meaningful_output(text_sample)
+        && !prompt_ready_surface
     {
         return Some("active terminal host is still showing generic Codex idle footer");
     }
-    if terminal_chunk_has_prompt_output(text_sample) {
+    if (terminal_chunk_has_prompt_output(text_sample)
+        || terminal_chunk_has_codex_prompt_output(text_sample))
+        && !prompt_ready_surface
+    {
         return Some("active terminal host is only showing a plain shell prompt");
     }
     if terminal_chunk_is_transcript_browser(text_sample) {
@@ -952,6 +977,23 @@ pub(crate) fn terminal_chunk_has_prompt_output(data: &str) -> bool {
         && normalized_lines.iter().all(|line| line.len() <= 48)
         && normalized_lines.iter().any(|line| {
             line.ends_with('$') || line.ends_with('#') || line.ends_with('>') || line.ends_with('%')
+        })
+}
+
+pub(crate) fn terminal_chunk_has_codex_prompt_output(data: &str) -> bool {
+    let stripped = strip_terminal_control_sequences(data);
+    let normalized_lines = stripped
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    !normalized_lines.is_empty()
+        && normalized_lines.len() <= 2
+        && normalized_lines.iter().all(|line| line.len() <= 96)
+        && normalized_lines.iter().any(|line| {
+            let semantic =
+                line.trim_matches(|ch: char| matches!(ch, '╭' | '╮' | '╰' | '╯' | '─' | '│' | ' '));
+            semantic.starts_with('›')
         })
 }
 
@@ -1245,4 +1287,82 @@ pub(crate) fn strip_terminal_control_sequences(data: &str) -> String {
         ix += 1;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{terminal_chunk_has_codex_prompt_output, terminal_host_problem_for_app_control};
+    use serde_json::json;
+
+    #[test]
+    fn terminal_host_problem_accepts_prompt_ready_codex_footer_surface() {
+        let host = json!({
+            "text_sample": "› Explain this codebase
+
+  gpt-5.4 high fast · 100% left · ~/git",
+            "cursor_line_text": "› Explain this codebase",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": 0.0, "top": 0.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(terminal_host_problem_for_app_control(&host), None);
+    }
+
+    #[test]
+    fn terminal_host_problem_accepts_prompt_ready_generic_codex_idle_surface() {
+        let host = json!({
+            "text_sample": "pi@dev:/home/pi$ codex\n╭────────────────────────────────────────────╮\n│ >_ OpenAI Codex (v0.120.0)                 │\n│                                            │\n│ model:     gpt-5.4 high   /model to change │\n│ directory: /home/pi                        │\n╰────────────────────────────────────────────╯\n\n  Tip: New Use /fast to enable our fastest inference at 2X plan usage.\n\n\n› Implement {feature}\n\n  gpt-5.4 high · /home/pi",
+            "cursor_line_text": "› Implement {feature}",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": 0.0, "top": 0.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(terminal_host_problem_for_app_control(&host), None);
+    }
+
+    #[test]
+    fn terminal_chunk_has_codex_prompt_output_accepts_codex_prompt_line() {
+        assert!(terminal_chunk_has_codex_prompt_output(
+            "› Explain this codebase"
+        ));
+        assert!(terminal_chunk_has_codex_prompt_output(
+            "› Write tests for @filename"
+        ));
+        assert!(!terminal_chunk_has_codex_prompt_output("$ echo hi"));
+    }
+
+    #[test]
+    fn terminal_host_problem_rejects_prompt_ready_footer_when_input_disabled() {
+        let host = json!({
+            "text_sample": "› Explain this codebase
+
+  gpt-5.4 high fast · 100% left · ~/git",
+            "cursor_line_text": "› Explain this codebase",
+            "input_enabled": false,
+            "helper_textarea_focused": false,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": 0.0, "top": 0.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(
+            terminal_host_problem_for_app_control(&host),
+            Some("active terminal host is still showing generic Codex idle footer")
+        );
+    }
 }
