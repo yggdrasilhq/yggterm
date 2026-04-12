@@ -8,5 +8,6 @@ mod terminal_themes;
 mod window_icon;
 
 pub use shell::{
-    PendingUpdateRestart, ShellBootstrap, initial_server_sync, launch_shell, warm_daemon_start,
+    PendingUpdateRestart, ShellBootstrap, initial_server_sync, launch_shell, start_daemon_watchdog,
+    warm_daemon_start,
 };

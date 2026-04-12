@@ -29,7 +29,8 @@ pub use daemon::{
     request_terminal_launch, run_daemon, set_all_preview_blocks_folded, set_view_mode, shutdown,
     snapshot, start_command_session, start_local_session, start_local_session_at,
     start_ssh_session_at, status, switch_agent_session_mode, sync_external_window, sync_theme,
-    terminal_ensure, terminal_read, terminal_resize, terminal_write, toggle_preview_block,
+    terminal_ensure, terminal_read, terminal_resize, terminal_snapshot, terminal_write,
+    toggle_preview_block,
 };
 pub use host::{GhosttyHostKind, GhosttyHostSupport, GhosttyTerminalHostMode, detect_ghostty_host};
 pub use protocol::{
@@ -146,6 +147,7 @@ pub struct SessionPreview {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionSource {
     Stored,
+    LiveLocal,
     LiveSsh,
 }
 
@@ -531,6 +533,7 @@ impl YggtermServer {
         };
         match session.source {
             SessionSource::Stored => self.refresh_stored_session_preview(path, &session)?,
+            SessionSource::LiveLocal => {}
             SessionSource::LiveSsh => {
                 if let Some((raw_machine_key, session_id)) = parse_remote_scanned_session_path(path)
                 {
@@ -2654,7 +2657,7 @@ impl YggtermServer {
                     session.bridge_available,
                 );
             }
-            SessionSource::LiveSsh => {
+            SessionSource::LiveLocal | SessionSource::LiveSsh => {
                 let uses_remote_runtime = live_session_uses_remote_runtime(session);
                 if uses_remote_runtime && let Some(ssh_target) = session.ssh_target.clone() {
                     let (cached_ssh_target, cached_ssh_prefix, cached_launch) =
@@ -7528,6 +7531,8 @@ pub struct ClientInstanceRecord {
     pid: u32,
     started_at_ms: u128,
     #[serde(default)]
+    process_start_ticks: Option<u64>,
+    #[serde(default)]
     pub display: Option<String>,
     #[serde(default)]
     pub wayland_display: Option<String>,
@@ -7575,6 +7580,61 @@ fn process_is_alive(pid: u32) -> bool {
 #[cfg(not(unix))]
 fn process_is_alive(pid: u32) -> bool {
     pid != 0
+}
+
+#[cfg(unix)]
+fn process_start_ticks(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_process_start_ticks_from_stat(&stat)
+}
+
+#[cfg(not(unix))]
+fn process_start_ticks(_pid: u32) -> Option<u64> {
+    None
+}
+
+#[cfg(unix)]
+fn parse_process_start_ticks_from_stat(stat: &str) -> Option<u64> {
+    let (_, rest) = stat.rsplit_once(") ")?;
+    rest.split_whitespace().nth(19)?.parse::<u64>().ok()
+}
+
+#[cfg(not(unix))]
+fn parse_process_start_ticks_from_stat(_stat: &str) -> Option<u64> {
+    None
+}
+
+#[cfg(unix)]
+fn process_has_gui_client_argv(pid: u32) -> bool {
+    let payload = match fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(payload) => payload,
+        Err(_) => return false,
+    };
+    let args = payload
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .collect::<Vec<_>>();
+    if args.len() != 1 {
+        return false;
+    }
+    std::str::from_utf8(args[0]).ok().is_some_and(|arg0| {
+        Path::new(arg0).file_name().and_then(|name| name.to_str()) == Some("yggterm")
+    })
+}
+
+#[cfg(not(unix))]
+fn process_has_gui_client_argv(_pid: u32) -> bool {
+    true
+}
+
+fn client_instance_record_matches_live_process(record: &ClientInstanceRecord) -> bool {
+    if !process_is_alive(record.pid) {
+        return false;
+    }
+    if let Some(expected_start_ticks) = record.process_start_ticks {
+        return process_start_ticks(record.pid) == Some(expected_start_ticks);
+    }
+    process_has_gui_client_argv(record.pid)
 }
 
 fn app_control_command_requires_explicit_target(command: &AppControlCommand) -> bool {
@@ -7693,7 +7753,7 @@ pub(crate) fn active_client_instance_records(
             let _ = fs::remove_file(&path);
             continue;
         };
-        if process_is_alive(record.pid) {
+        if client_instance_record_matches_live_process(&record) {
             active.push(record);
         } else {
             let _ = fs::remove_file(&path);
@@ -8428,6 +8488,8 @@ struct X11TerminalProbeContext {
     session_path: String,
     x: i32,
     y: i32,
+    scroll_x: i32,
+    scroll_y: i32,
     before: Value,
 }
 
@@ -8504,8 +8566,18 @@ fn active_terminal_probe_context(
             .and_then(|value| value.get("pid")),
     )
     .unwrap_or(response.handled_by_pid);
-    let x = (left + width.min(120.0) * 0.2).round() as i32;
-    let y = (top + height - 24.0).round() as i32;
+    let prompt_rect = host
+        .get("cursor_expected_rect")
+        .or_else(|| host.get("cursor_row_rect"));
+    let prompt_left = json_f64(prompt_rect.and_then(|value| value.get("left"))).unwrap_or(left);
+    let prompt_top = json_f64(prompt_rect.and_then(|value| value.get("top"))).unwrap_or(top);
+    let prompt_width =
+        json_f64(prompt_rect.and_then(|value| value.get("width"))).unwrap_or(width.max(24.0));
+    let prompt_height = json_f64(prompt_rect.and_then(|value| value.get("height"))).unwrap_or(24.0);
+    let x = (prompt_left + prompt_width.clamp(8.0, 32.0) * 0.5).round() as i32;
+    let y = (prompt_top + prompt_height * 0.5).round() as i32;
+    let scroll_x = (left + (width * 0.5)).round() as i32;
+    let scroll_y = (top + (height * 0.5)).round() as i32;
     Ok(X11TerminalProbeContext {
         pid,
         display,
@@ -8513,6 +8585,8 @@ fn active_terminal_probe_context(
         session_path: session_path.to_string(),
         x,
         y,
+        scroll_x,
+        scroll_y,
         before: terminal_host_probe_snapshot(host),
     })
 }
@@ -8573,6 +8647,48 @@ fn xdotool_key_for_char(ch: char) -> Option<&'static str> {
         ',' => Some("comma"),
         _ => None,
     }
+}
+
+fn xdotool_key_args(window_id: Option<&str>, key: &str) -> Vec<String> {
+    let mut args = vec!["key".to_string()];
+    if let Some(window_id) = window_id {
+        args.push("--window".to_string());
+        args.push(window_id.to_string());
+    }
+    args.push("--clearmodifiers".to_string());
+    args.push(key.to_string());
+    args
+}
+
+fn xdotool_chord_args(window_id: Option<&str>, modifier: &str, key: &str) -> Vec<String> {
+    let mut args = vec!["key".to_string()];
+    if let Some(window_id) = window_id {
+        args.push("--window".to_string());
+        args.push(window_id.to_string());
+    }
+    args.push("--clearmodifiers".to_string());
+    args.push(format!("{modifier}+{key}"));
+    args
+}
+
+fn xdotool_type_args(window_id: Option<&str>, text: &str) -> Vec<String> {
+    let mut args = vec!["type".to_string()];
+    if let Some(window_id) = window_id {
+        args.push("--window".to_string());
+        args.push(window_id.to_string());
+    }
+    args.push("--clearmodifiers".to_string());
+    args.push("--delay".to_string());
+    args.push("8".to_string());
+    args.push("--".to_string());
+    args.push(text.to_string());
+    args
+}
+
+fn xdotool_type_settle_delay_ms(text: &str) -> u64 {
+    let chars = text.chars().count() as u64;
+    let per_char_ms = 10;
+    (120 + chars.saturating_mul(per_char_ms)).min(2_000)
 }
 
 fn run_xdotool_checked(
@@ -8683,6 +8799,8 @@ fn x11_keyboard_probe_input(
     press_enter: bool,
     press_tab: bool,
     press_ctrl_c: bool,
+    press_ctrl_e: bool,
+    press_ctrl_u: bool,
     timeout_ms: u64,
 ) -> anyhow::Result<Value> {
     let home = resolve_yggterm_home()?;
@@ -8692,61 +8810,54 @@ fn x11_keyboard_probe_input(
         run_xdotool_checked_owned(
             &before_context.display,
             before_context.xauthority.as_deref(),
-            &[
-                "key".to_string(),
-                "--window".to_string(),
-                window_id.clone(),
-                "--clearmodifiers".to_string(),
-                "ctrl+c".to_string(),
-            ],
+            &xdotool_chord_args(Some(&window_id), "ctrl", "c"),
+        )?;
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    if press_ctrl_e {
+        run_xdotool_checked_owned(
+            &before_context.display,
+            before_context.xauthority.as_deref(),
+            &xdotool_chord_args(Some(&window_id), "ctrl", "e"),
+        )?;
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    if press_ctrl_u {
+        run_xdotool_checked_owned(
+            &before_context.display,
+            before_context.xauthority.as_deref(),
+            &xdotool_chord_args(Some(&window_id), "ctrl", "u"),
         )?;
         std::thread::sleep(Duration::from_millis(40));
     }
     if !data.is_empty() {
-        for ch in data.chars() {
-            if let Some(key) = xdotool_key_for_char(ch) {
+        let supported_keys = data
+            .chars()
+            .map(xdotool_key_for_char)
+            .collect::<Option<Vec<_>>>();
+        if let Some(keys) = supported_keys {
+            for key in keys {
                 run_xdotool_checked_owned(
                     &before_context.display,
                     before_context.xauthority.as_deref(),
-                    &[
-                        "key".to_string(),
-                        "--window".to_string(),
-                        window_id.clone(),
-                        "--clearmodifiers".to_string(),
-                        key.to_string(),
-                    ],
+                    &xdotool_key_args(Some(&window_id), key),
                 )?;
-            } else {
-                run_xdotool_checked_owned(
-                    &before_context.display,
-                    before_context.xauthority.as_deref(),
-                    &[
-                        "type".to_string(),
-                        "--window".to_string(),
-                        window_id.clone(),
-                        "--clearmodifiers".to_string(),
-                        "--delay".to_string(),
-                        "1".to_string(),
-                        "--".to_string(),
-                        ch.to_string(),
-                    ],
-                )?;
+                std::thread::sleep(Duration::from_millis(18));
             }
-            std::thread::sleep(Duration::from_millis(18));
+        } else {
+            run_xdotool_checked_owned(
+                &before_context.display,
+                before_context.xauthority.as_deref(),
+                &xdotool_type_args(Some(&window_id), data),
+            )?;
+            std::thread::sleep(Duration::from_millis(xdotool_type_settle_delay_ms(data)));
         }
-        std::thread::sleep(Duration::from_millis(40));
     }
     if press_tab {
         run_xdotool_checked_owned(
             &before_context.display,
             before_context.xauthority.as_deref(),
-            &[
-                "key".to_string(),
-                "--window".to_string(),
-                window_id.clone(),
-                "--clearmodifiers".to_string(),
-                "Tab".to_string(),
-            ],
+            &xdotool_key_args(Some(&window_id), "Tab"),
         )?;
         std::thread::sleep(Duration::from_millis(40));
     }
@@ -8754,13 +8865,7 @@ fn x11_keyboard_probe_input(
         run_xdotool_checked_owned(
             &before_context.display,
             before_context.xauthority.as_deref(),
-            &[
-                "key".to_string(),
-                "--window".to_string(),
-                window_id.clone(),
-                "--clearmodifiers".to_string(),
-                "Return".to_string(),
-            ],
+            &xdotool_key_args(Some(&window_id), "Return"),
         )?;
     }
     std::thread::sleep(Duration::from_millis(if press_enter { 220 } else { 120 }));
@@ -8775,6 +8880,8 @@ fn x11_keyboard_probe_input(
         "press_enter": press_enter,
         "press_tab": press_tab,
         "press_ctrl_c": press_ctrl_c,
+        "press_ctrl_e": press_ctrl_e,
+        "press_ctrl_u": press_ctrl_u,
         "mode": "keyboard",
         "used_core_trigger": false,
         "used_term_input": false,
@@ -8806,8 +8913,8 @@ fn x11_scroll_probe_input(
                 "--sync".to_string(),
                 "--window".to_string(),
                 window_id.clone(),
-                before_context.x.to_string(),
-                before_context.y.to_string(),
+                before_context.scroll_x.to_string(),
+                before_context.scroll_y.to_string(),
                 "click".to_string(),
                 "1".to_string(),
                 "click".to_string(),
@@ -8831,8 +8938,8 @@ fn x11_scroll_probe_input(
         "keyboard_backend": "xdotool",
         "window_id": window_id,
         "click_point": {
-            "x": before_context.x,
-            "y": before_context.y,
+            "x": before_context.scroll_x,
+            "y": before_context.scroll_y,
         },
     }))
 }
@@ -8844,19 +8951,27 @@ pub fn run_app_control_probe_terminal_viewport_input(
     press_enter: bool,
     press_tab: bool,
     press_ctrl_c: bool,
+    press_ctrl_e: bool,
+    press_ctrl_u: bool,
     timeout_ms: u64,
 ) -> anyhow::Result<()> {
-    if mode == ProbeTerminalViewportInputMode::Keyboard {
-        let response = x11_keyboard_probe_input(
+    if matches!(
+        mode,
+        ProbeTerminalViewportInputMode::Auto | ProbeTerminalViewportInputMode::Keyboard
+    ) {
+        if let Ok(response) = x11_keyboard_probe_input(
             session_path,
             data,
             press_enter,
             press_tab,
             press_ctrl_c,
+            press_ctrl_e,
+            press_ctrl_u,
             timeout_ms,
-        )?;
-        write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
-        return Ok(());
+        ) {
+            write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+            return Ok(());
+        }
     }
     let home = resolve_yggterm_home()?;
     let response = request_app_control(
@@ -8868,6 +8983,8 @@ pub fn run_app_control_probe_terminal_viewport_input(
             press_enter,
             press_tab,
             press_ctrl_c,
+            press_ctrl_e,
+            press_ctrl_u,
         },
         timeout_ms,
     )?;
@@ -8880,7 +8997,19 @@ pub fn run_app_control_probe_terminal_viewport_scroll(
     lines: i32,
     timeout_ms: u64,
 ) -> anyhow::Result<()> {
-    let response = x11_scroll_probe_input(session_path, lines, timeout_ms)?;
+    if let Ok(response) = x11_scroll_probe_input(session_path, lines, timeout_ms) {
+        write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+        return Ok(());
+    }
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::ProbeTerminalViewportScroll {
+            session_path: session_path.to_string(),
+            lines,
+        },
+        timeout_ms,
+    )?;
     write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
     Ok(())
 }
@@ -9894,6 +10023,16 @@ fn build_live_session(
         SessionKind::Document => "No terminal runtime is required.".to_string(),
     };
     let default_summary = live_session_default_summary(kind, target);
+    let source = if kind == SessionKind::SshShell {
+        SessionSource::LiveSsh
+    } else {
+        SessionSource::LiveLocal
+    };
+    let launch_phase = if kind == SessionKind::SshShell {
+        TerminalLaunchPhase::RemoteBootstrap
+    } else {
+        TerminalLaunchPhase::BridgePending
+    };
 
     ManagedSessionView {
         id: uuid.to_string(),
@@ -9901,17 +10040,17 @@ fn build_live_session(
         title: uuid.to_string(),
         kind,
         host_label: target.label.clone(),
-        source: SessionSource::LiveSsh,
+        source,
         backend,
         bridge_available: ghostty_bridge_enabled,
-        launch_phase: TerminalLaunchPhase::RemoteBootstrap,
+        launch_phase,
         remote_deploy_state: deploy_state,
         launch_command: launch_command.clone(),
         status_line: describe_status_line(
             backend,
             theme,
-            SessionSource::LiveSsh,
-            TerminalLaunchPhase::RemoteBootstrap,
+            source,
+            launch_phase,
             deploy_state,
             ghostty_bridge_enabled,
         ),
@@ -10382,6 +10521,12 @@ fn describe_launch_phase(
         }
         (SessionSource::Stored, TerminalLaunchPhase::Running, _) => {
             format!("embedded terminal attached · {runtime}")
+        }
+        (SessionSource::LiveLocal, TerminalLaunchPhase::Running, _) => {
+            format!("live terminal attached · {runtime}")
+        }
+        (SessionSource::LiveLocal, TerminalLaunchPhase::BridgePending, _) => {
+            format!("waiting for terminal host · {runtime}")
         }
         (SessionSource::LiveSsh, _, RemoteDeployState::Planned) => {
             format!("remote bootstrap planned · {runtime}")
@@ -10972,6 +11117,51 @@ mod tests {
         assert_eq!(super::xdotool_key_for_char('u'), Some("u"));
         assert_eq!(super::xdotool_key_for_char('s'), Some("s"));
         assert_eq!(super::xdotool_key_for_char('\n'), None);
+    }
+
+    #[test]
+    fn xdotool_key_args_target_window_and_clear_modifiers() {
+        assert_eq!(
+            super::xdotool_key_args(Some("123"), "Return"),
+            vec![
+                "key".to_string(),
+                "--window".to_string(),
+                "123".to_string(),
+                "--clearmodifiers".to_string(),
+                "Return".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn xdotool_type_args_target_window_and_clear_modifiers() {
+        assert_eq!(
+            super::xdotool_type_args(Some("123"), "/status"),
+            vec![
+                "type".to_string(),
+                "--window".to_string(),
+                "123".to_string(),
+                "--clearmodifiers".to_string(),
+                "--delay".to_string(),
+                "1".to_string(),
+                "--".to_string(),
+                "/status".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn xdotool_chord_args_target_window() {
+        assert_eq!(
+            super::xdotool_chord_args(Some("123"), "ctrl", "c"),
+            vec![
+                "key".to_string(),
+                "--window".to_string(),
+                "123".to_string(),
+                "--clearmodifiers".to_string(),
+                "ctrl+c".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -13311,6 +13501,7 @@ mod tests {
         ClientInstanceRecord {
             pid,
             started_at_ms,
+            process_start_ticks: None,
             display: Some(display.to_string()),
             wayland_display: None,
             xdg_session_id: Some("test-session".to_string()),

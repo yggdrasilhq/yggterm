@@ -26,9 +26,9 @@ use yggterm_server::{
     run_app_control_set_preview_layout, run_app_control_set_row_expanded,
     run_app_control_set_search, run_app_control_set_ui_theme, run_attach, run_daemon,
     run_screenrecord_capture, run_screenshot_capture, run_trace_bundle, run_trace_follow,
-    run_trace_tail, shutdown, start_local_session, status, try_run_remote_server_command,
+    run_trace_tail, shutdown, snapshot, start_local_session, status, try_run_remote_server_command,
 };
-use yggterm_shell::{ShellBootstrap, launch_shell, warm_daemon_start};
+use yggterm_shell::{ShellBootstrap, launch_shell, start_daemon_watchdog, warm_daemon_start};
 use yggui_contract::UiTheme;
 
 const DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT_ENV: &str =
@@ -56,6 +56,66 @@ fn cli_positional_args(args: &[String], start: usize) -> Vec<&str> {
         index += 1;
     }
     positional
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuiltinCliCommand {
+    MainHelp,
+    ServerHelp,
+    ServerSnapshot,
+}
+
+fn classify_builtin_cli_command(args: &[String]) -> Option<BuiltinCliCommand> {
+    match args {
+        [arg] if matches!(arg.as_str(), "--help" | "-h" | "help") => {
+            Some(BuiltinCliCommand::MainHelp)
+        }
+        [command] if command == "server" => Some(BuiltinCliCommand::ServerHelp),
+        [command, arg]
+            if command == "server" && matches!(arg.as_str(), "--help" | "-h" | "help") =>
+        {
+            Some(BuiltinCliCommand::ServerHelp)
+        }
+        [command, arg] if command == "server" && arg == "snapshot" => {
+            Some(BuiltinCliCommand::ServerSnapshot)
+        }
+        _ => None,
+    }
+}
+
+fn print_main_help() {
+    println!(
+        "usage:
+  yggterm
+  yggterm --help
+  yggterm --version
+  yggterm install
+  yggterm doc <subcommand>
+  yggterm server <subcommand>
+
+common server commands:
+  yggterm server daemon
+  yggterm server status
+  yggterm server snapshot
+  yggterm server app <subcommand>"
+    );
+}
+
+fn print_server_help() {
+    println!(
+        "usage:
+  yggterm server daemon
+  yggterm server attach <session> [cwd]
+  yggterm server ping
+  yggterm server status
+  yggterm server snapshot
+  yggterm server shutdown
+  yggterm server smoke
+  yggterm server trace <tail|follow|bundle>
+  yggterm server screenshot <target> [output]
+  yggterm server screenrecord <target> [output]
+  yggterm server app <subcommand>"
+    );
 }
 
 fn main() -> Result<()> {
@@ -172,6 +232,24 @@ fn main() -> Result<()> {
             .find(|value| !value.starts_with("--"))
             .map(String::as_str);
         return run_screenrecord_capture(&args[2], output_path, timeout_ms, duration_secs);
+    }
+    if let Some(command) = classify_builtin_cli_command(&args) {
+        match command {
+            BuiltinCliCommand::MainHelp => {
+                print_main_help();
+                return Ok(());
+            }
+            BuiltinCliCommand::ServerHelp => {
+                print_server_help();
+                return Ok(());
+            }
+            BuiltinCliCommand::ServerSnapshot => {
+                let endpoint = default_endpoint(store.home_dir());
+                let (snapshot, _) = snapshot(&endpoint)?;
+                println!("{}", serde_json::to_string_pretty(&snapshot)?);
+                return Ok(());
+            }
+        }
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "app" {
         let preferred_pid = args.windows(2).find_map(|window| {
@@ -491,6 +569,8 @@ fn main() -> Result<()> {
                         let press_enter = args.iter().any(|arg| arg == "--enter");
                         let press_tab = args.iter().any(|arg| arg == "--tab");
                         let press_ctrl_c = args.iter().any(|arg| arg == "--ctrl-c");
+                        let press_ctrl_e = args.iter().any(|arg| arg == "--ctrl-e");
+                        let press_ctrl_u = args.iter().any(|arg| arg == "--ctrl-u");
                         let mode = args
                             .windows(2)
                             .find_map(|window| {
@@ -512,6 +592,8 @@ fn main() -> Result<()> {
                             press_enter,
                             press_tab,
                             press_ctrl_c,
+                            press_ctrl_e,
+                            press_ctrl_u,
                             timeout_ms,
                         )
                     }
@@ -587,6 +669,12 @@ fn main() -> Result<()> {
     if args.as_slice() == ["server", "smoke"] {
         return run_server_smoke();
     }
+    if args.first().is_some_and(|arg| arg == "server") {
+        anyhow::bail!(
+            "unsupported server command: {}",
+            args.get(1).map(String::as_str).unwrap_or("<missing>")
+        );
+    }
     if matches!(
         args.first().map(String::as_str),
         Some("--version" | "-V" | "version")
@@ -632,6 +720,7 @@ fn main() -> Result<()> {
     let _ = cleanup_legacy_daemons(&endpoint, &current_exe);
     cleanup_span.finish(serde_json::json!({}));
     warm_daemon_start(endpoint.clone(), Some(startup_home.clone()));
+    start_daemon_watchdog(endpoint.clone(), Some(startup_home.clone()));
     let linux_window_profile = detect_linux_window_profile();
     append_trace_event(
         &startup_home,
@@ -952,6 +1041,64 @@ fn signal_process_is_alive(pid: u32) -> bool {
     pid != 0
 }
 
+#[cfg(unix)]
+fn signal_process_start_ticks(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    signal_parse_process_start_ticks_from_stat(&stat)
+}
+
+#[cfg(not(unix))]
+fn signal_process_start_ticks(_pid: u32) -> Option<u64> {
+    None
+}
+
+#[cfg(unix)]
+fn signal_parse_process_start_ticks_from_stat(stat: &str) -> Option<u64> {
+    let (_, rest) = stat.rsplit_once(") ")?;
+    rest.split_whitespace().nth(19)?.parse::<u64>().ok()
+}
+
+#[cfg(not(unix))]
+fn signal_parse_process_start_ticks_from_stat(_stat: &str) -> Option<u64> {
+    None
+}
+
+#[cfg(unix)]
+fn signal_process_has_gui_client_argv(pid: u32) -> bool {
+    let payload = match fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(payload) => payload,
+        Err(_) => return false,
+    };
+    let args = payload
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .collect::<Vec<_>>();
+    if args.len() != 1 {
+        return false;
+    }
+    std::str::from_utf8(args[0]).ok().is_some_and(|arg0| {
+        std::path::Path::new(arg0)
+            .file_name()
+            .and_then(|name| name.to_str())
+            == Some("yggterm")
+    })
+}
+
+#[cfg(not(unix))]
+fn signal_process_has_gui_client_argv(_pid: u32) -> bool {
+    true
+}
+
+fn signal_record_matches_live_process(pid: u32, path: &std::path::Path) -> bool {
+    if !signal_process_is_alive(pid) {
+        return false;
+    }
+    if let Some(expected_start_ticks) = read_signal_process_start_ticks_from_record(path) {
+        return signal_process_start_ticks(pid) == Some(expected_start_ticks);
+    }
+    signal_process_has_gui_client_argv(pid)
+}
+
 fn unregister_signal_client_instance(
     home_dir: &std::path::Path,
     endpoint: &yggterm_server::ServerEndpoint,
@@ -973,7 +1120,7 @@ fn unregister_signal_client_instance(
             let _ = fs::remove_file(&path);
             continue;
         }
-        if signal_process_is_alive(pid) {
+        if signal_record_matches_live_process(pid, &path) {
             remaining += 1;
         } else {
             let _ = fs::remove_file(&path);
@@ -999,7 +1146,7 @@ fn compatible_signal_client_count(
             let _ = fs::remove_file(&path);
             continue;
         };
-        if !signal_process_is_alive(pid) {
+        if !signal_record_matches_live_process(pid, &path) {
             let _ = fs::remove_file(&path);
             continue;
         }
@@ -1049,6 +1196,14 @@ fn signal_client_scope_matches_pid(
         return signal_client_scope_matches(&scope, current);
     }
     false
+}
+
+fn read_signal_process_start_ticks_from_record(path: &std::path::Path) -> Option<u64> {
+    let payload = fs::read(path).ok()?;
+    let value = serde_json::from_slice::<serde_json::Value>(&payload).ok()?;
+    value
+        .get("process_start_ticks")
+        .and_then(serde_json::Value::as_u64)
 }
 
 fn read_signal_client_scope_from_record(path: &std::path::Path) -> Option<SignalClientScope> {
@@ -1313,7 +1468,40 @@ fn run_server_smoke() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SignalClientScope, signal_client_scope_matches};
+    use super::{
+        BuiltinCliCommand, SignalClientScope, classify_builtin_cli_command,
+        signal_client_scope_matches, signal_parse_process_start_ticks_from_stat,
+    };
+
+    #[test]
+    fn classify_builtin_cli_command_detects_help_and_snapshot() {
+        assert_eq!(
+            classify_builtin_cli_command(&["--help".to_string()]),
+            Some(BuiltinCliCommand::MainHelp)
+        );
+        assert_eq!(
+            classify_builtin_cli_command(&["server".to_string()]),
+            Some(BuiltinCliCommand::ServerHelp)
+        );
+        assert_eq!(
+            classify_builtin_cli_command(&["server".to_string(), "snapshot".to_string()]),
+            Some(BuiltinCliCommand::ServerSnapshot)
+        );
+        assert_eq!(
+            classify_builtin_cli_command(&["server".to_string(), "--help".to_string()]),
+            Some(BuiltinCliCommand::ServerHelp)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_parse_process_start_ticks_from_stat_reads_field_22() {
+        let stat = "1234 (yggterm) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 515151";
+        assert_eq!(
+            signal_parse_process_start_ticks_from_stat(stat),
+            Some(515151)
+        );
+    }
 
     #[test]
     fn signal_client_scope_rejects_different_x11_display() {

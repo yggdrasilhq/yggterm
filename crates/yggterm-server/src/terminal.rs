@@ -124,6 +124,12 @@ impl TerminalManager {
         self.sessions.get(key).map(|session| session.snapshot())
     }
 
+    pub fn session_screen_snapshot(&self, key: &str) -> Option<String> {
+        self.sessions
+            .get(key)
+            .map(|session| session.screen_snapshot())
+    }
+
     pub fn read(&self, key: &str, cursor: u64) -> Result<TerminalReadResult> {
         let session = self
             .sessions
@@ -508,6 +514,15 @@ impl PtySessionRuntime {
             .iter()
             .map(|chunk| chunk.data.as_str())
             .collect::<String>()
+    }
+
+    fn screen_snapshot(&self) -> String {
+        self.screen_state
+            .lock()
+            .expect("pty screen state lock poisoned")
+            .formatted
+            .trim_matches('\0')
+            .to_string()
     }
 
     fn screen_snapshot_chunk(&self, next_cursor: u64) -> Option<TerminalChunk> {
