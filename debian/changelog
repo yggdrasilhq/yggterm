@@ -1,3 +1,13 @@
+yggterm (2.1.5-1) unstable; urgency=medium
+
+  * Stop helper-style CLI commands like server snapshot and --help from spawning stray desktop windows.
+  * Add a GUI daemon watchdog so long-running desktop clients recover if the helper daemon disappears.
+  * Remove the synthetic cursor overlay and rely on the native xterm cursor for prompt and TUI rendering.
+  * Harden the /status and hidden-cursor smoke harnesses so they prove a live Codex runtime and alternate-buffer restore truthfully.
+  * Keep local live shells in the local tree and reject low-signal boilerplate titles.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sun, 12 Apr 2026 17:30:55 +0530
+
 yggterm (2.1.2-1) unstable; urgency=medium
 
   * Prioritize active remote terminal restore over background refresh churn so live SSH and Codex sessions paint first on relaunch.
