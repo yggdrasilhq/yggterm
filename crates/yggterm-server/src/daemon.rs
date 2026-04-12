@@ -222,6 +222,9 @@ pub enum ServerRequest {
         path: String,
         cursor: u64,
     },
+    TerminalSnapshot {
+        path: String,
+    },
     TerminalWrite {
         path: String,
         data: String,
@@ -254,6 +257,11 @@ pub enum ServerResponse {
         running: bool,
         runtime_output_seen: bool,
         eof_without_output: bool,
+    },
+    TerminalSnapshot {
+        text: String,
+        running: bool,
+        runtime_output_seen: bool,
     },
     Ack {
         message: Option<String>,
@@ -460,10 +468,42 @@ impl DaemonRuntime {
                 }),
             );
         }
-        let seed_prefill = if uses_runtime_owned_terminal_path(path) {
-            None
+        let seed_prefill = if path.starts_with("remote-session://") {
+            match self.server.remote_resume_seed_snapshot_for_path(path) {
+                Ok(Some(prefill)) => {
+                    if let Ok(home) = crate::resolve_yggterm_home() {
+                        append_trace_event(
+                            &home,
+                            "daemon",
+                            "terminal_ensure",
+                            "remote_resume_seed_snapshot",
+                            serde_json::json!({
+                                "path": path,
+                                "bytes": prefill.len(),
+                            }),
+                        );
+                    }
+                    Some(prefill)
+                }
+                Ok(None) => self.server.remote_resume_seed_fallback_for_path(path),
+                Err(error) => {
+                    if let Ok(home) = crate::resolve_yggterm_home() {
+                        append_trace_event(
+                            &home,
+                            "daemon",
+                            "terminal_ensure",
+                            "remote_resume_seed_snapshot_error",
+                            serde_json::json!({
+                                "path": path,
+                                "error": error.to_string(),
+                            }),
+                        );
+                    }
+                    self.server.remote_resume_seed_fallback_for_path(path)
+                }
+            }
         } else {
-            self.server.remote_resume_seed_fallback_for_path(path)
+            None
         };
         if self.terminals.has_session(path) {
             let still_running = self.terminals.session_is_running(path);
@@ -527,6 +567,21 @@ impl DaemonRuntime {
                 );
             }
             if !needs_restart {
+                if !has_runtime_output && let Some(prefill) = seed_prefill.as_deref() {
+                    if let Ok(home) = crate::resolve_yggterm_home() {
+                        append_trace_event(
+                            &home,
+                            "daemon",
+                            "terminal_ensure",
+                            "reuse_session_seed_prefill",
+                            serde_json::json!({
+                                "path": path,
+                                "bytes": prefill.len(),
+                            }),
+                        );
+                    }
+                    self.terminals.seed_session(path, prefill)?;
+                }
                 return Ok(prepare_message);
             }
             if needs_restart {
@@ -996,6 +1051,17 @@ impl DaemonRuntime {
                     running: stream.running,
                     runtime_output_seen: stream.runtime_output_seen,
                     eof_without_output: stream.eof_without_output,
+                }
+            }
+            ServerRequest::TerminalSnapshot { path } => {
+                let text = self
+                    .terminals
+                    .session_screen_snapshot(&path)
+                    .unwrap_or_default();
+                ServerResponse::TerminalSnapshot {
+                    text,
+                    running: self.terminals.session_is_running(&path),
+                    runtime_output_seen: self.terminals.session_has_runtime_output(&path),
                 }
             }
             ServerRequest::TerminalWrite { path, data } => {
@@ -1516,6 +1582,7 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::RequestTerminalLaunch => "request_terminal_launch",
         ServerRequest::TerminalEnsure { .. } => "terminal_ensure",
         ServerRequest::TerminalRead { .. } => "terminal_read",
+        ServerRequest::TerminalSnapshot { .. } => "terminal_snapshot",
         ServerRequest::TerminalWrite { .. } => "terminal_write",
         ServerRequest::TerminalResize { .. } => "terminal_resize",
         ServerRequest::SyncExternalWindow => "sync_external_window",
@@ -1928,6 +1995,23 @@ pub fn terminal_read(
         )),
         ServerResponse::Error { message } => bail!(message),
         other => bail!("unexpected terminal stream response: {:?}", other),
+    }
+}
+
+pub fn terminal_snapshot(endpoint: &ServerEndpoint, path: &str) -> Result<(String, bool, bool)> {
+    match send_request(
+        endpoint,
+        &ServerRequest::TerminalSnapshot {
+            path: path.to_string(),
+        },
+    )? {
+        ServerResponse::TerminalSnapshot {
+            text,
+            running,
+            runtime_output_seen,
+        } => Ok((text, running, runtime_output_seen)),
+        ServerResponse::Error { message } => bail!(message),
+        other => bail!("unexpected terminal snapshot response: {:?}", other),
     }
 }
 

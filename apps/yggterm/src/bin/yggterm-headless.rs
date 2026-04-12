@@ -8,8 +8,64 @@ use yggterm_server::{
     run_app_control_send_terminal_input, run_app_control_set_fullscreen,
     run_app_control_set_main_zoom, run_app_control_set_row_expanded, run_app_control_set_search,
     run_attach, run_daemon, run_screenrecord_capture, run_screenshot_capture, run_trace_bundle,
-    run_trace_follow, run_trace_tail, shutdown, status, try_run_remote_server_command,
+    run_trace_follow, run_trace_tail, shutdown, snapshot, status, try_run_remote_server_command,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuiltinCliCommand {
+    MainHelp,
+    ServerHelp,
+    ServerSnapshot,
+}
+
+fn classify_builtin_cli_command(args: &[String]) -> Option<BuiltinCliCommand> {
+    match args {
+        [arg] if matches!(arg.as_str(), "--help" | "-h" | "help") => {
+            Some(BuiltinCliCommand::MainHelp)
+        }
+        [command] if command == "server" => Some(BuiltinCliCommand::ServerHelp),
+        [command, arg]
+            if command == "server" && matches!(arg.as_str(), "--help" | "-h" | "help") =>
+        {
+            Some(BuiltinCliCommand::ServerHelp)
+        }
+        [command, arg] if command == "server" && arg == "snapshot" => {
+            Some(BuiltinCliCommand::ServerSnapshot)
+        }
+        _ => None,
+    }
+}
+
+fn print_main_help() {
+    println!(
+        "usage:
+  yggterm-headless
+  yggterm-headless --help
+  yggterm-headless server <subcommand>
+
+common server commands:
+  yggterm-headless server daemon
+  yggterm-headless server status
+  yggterm-headless server snapshot
+  yggterm-headless server app <subcommand>"
+    );
+}
+
+fn print_server_help() {
+    println!(
+        "usage:
+  yggterm-headless server daemon
+  yggterm-headless server attach <session> [cwd]
+  yggterm-headless server ping
+  yggterm-headless server status
+  yggterm-headless server snapshot
+  yggterm-headless server shutdown
+  yggterm-headless server trace <tail|follow|bundle>
+  yggterm-headless server screenshot <target> [output]
+  yggterm-headless server screenrecord <target> [output]
+  yggterm-headless server app <subcommand>"
+    );
+}
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -112,6 +168,24 @@ fn main() -> Result<()> {
             .find(|value| !value.starts_with("--"))
             .map(String::as_str);
         return run_screenrecord_capture(&args[2], output_path, timeout_ms, duration_secs);
+    }
+    if let Some(command) = classify_builtin_cli_command(&args) {
+        match command {
+            BuiltinCliCommand::MainHelp => {
+                print_main_help();
+                return Ok(());
+            }
+            BuiltinCliCommand::ServerHelp => {
+                print_server_help();
+                return Ok(());
+            }
+            BuiltinCliCommand::ServerSnapshot => {
+                let endpoint = default_endpoint(store.home_dir());
+                let (snapshot, _) = snapshot(&endpoint)?;
+                println!("{}", serde_json::to_string_pretty(&snapshot)?);
+                return Ok(());
+            }
+        }
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "app" {
         let timeout_ms = args
@@ -419,6 +493,12 @@ fn main() -> Result<()> {
         let runtime = status(&endpoint)?;
         println!("{}", serde_json::to_string_pretty(&runtime)?);
         return Ok(());
+    }
+    if args.first().is_some_and(|arg| arg == "server") {
+        anyhow::bail!(
+            "unsupported server command: {}",
+            args.get(1).map(String::as_str).unwrap_or("<missing>")
+        );
     }
 
     anyhow::bail!("yggterm-headless only supports server subcommands");
