@@ -5,13 +5,17 @@ use crate::terminal_observe::{
     TerminalOpenAttempt, TerminalOpenAttemptState, describe_terminal_open_attempt,
     describe_viewport_snapshot, preview_text_looks_like_loading_placeholder,
     strip_terminal_control_sequences, terminal_bootstrap_should_wait_for_mount_epoch_sync,
-    terminal_chunk_has_generic_codex_idle_footer, terminal_chunk_has_meaningful_output,
-    terminal_chunk_has_prompt_output, terminal_chunk_has_visible_output,
-    terminal_chunk_is_generic_codex_idle, terminal_chunk_is_loading_placeholder,
-    terminal_chunk_is_low_signal_terminal_noise, terminal_chunk_is_saved_transcript_prefill,
-    terminal_chunk_is_transcript_browser, terminal_chunk_is_transport_error,
-    terminal_open_attempt_failure_reason_from_viewport, terminal_open_attempt_state_label,
-    terminal_tail_excerpt,
+    terminal_chunk_has_codex_prompt_output, terminal_chunk_has_generic_codex_idle_footer,
+    terminal_chunk_has_meaningful_output, terminal_chunk_has_prompt_output,
+    terminal_chunk_has_visible_output, terminal_chunk_is_generic_codex_idle,
+    terminal_chunk_is_loading_placeholder, terminal_chunk_is_low_signal_terminal_noise,
+    terminal_chunk_is_saved_transcript_prefill, terminal_chunk_is_transcript_browser,
+    terminal_chunk_is_transport_error, terminal_open_attempt_failure_reason_from_viewport,
+    terminal_open_attempt_state_label, terminal_tail_excerpt,
+};
+#[cfg(test)]
+use crate::terminal_observe::{
+    summarize_terminal_surface_for_app_control, terminal_chunk_is_launcher_boilerplate,
 };
 use crate::terminal_protocol::{TerminalJsCommand, TerminalJsEvent};
 use crate::terminal_themes::{
@@ -99,12 +103,6 @@ use yggui::{
     valid_drop_target as valid_tree_drop_target,
 };
 use yggui_contract::{UiTheme, YgguiThemeSpec};
-
-#[cfg(test)]
-use crate::terminal_observe::{
-    summarize_terminal_surface_for_app_control, terminal_chunk_is_launcher_boilerplate,
-};
-
 static BOOTSTRAP: OnceCell<ShellBootstrap> = OnceCell::new();
 static PASSIVE_COPY_SUSPENDED: AtomicBool = AtomicBool::new(false);
 static PREVIEW_BLOCK_CACHE: OnceCell<Mutex<PreviewBlockCache>> = OnceCell::new();
@@ -123,7 +121,6 @@ static APP_INSTANCE_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 static PRIMARY_APP_INSTANCE_ID: AtomicU64 = AtomicU64::new(0);
 static DAEMON_ENSURE_IN_FLIGHT: OnceCell<Mutex<HashSet<String>>> = OnceCell::new();
 static RECENT_DAEMON_STARTS: OnceCell<Mutex<HashMap<String, u64>>> = OnceCell::new();
-
 const PREVIEW_BLOCK_CACHE_LIMIT: usize = 256;
 const PREVIEW_CONTENT_CACHE_LIMIT: usize = 256;
 const PREVIEW_RUN_CACHE_LIMIT: usize = 256;
@@ -154,6 +151,7 @@ const REMOTE_TERMINAL_ATTACH_CONNECTED_GRACE_MS: u64 = 280;
 const RECENT_DAEMON_START_GRACE_MS: u64 = 3_000;
 static XTERM_ASSETS_BOOTSTRAPPED: OnceCell<()> = OnceCell::new();
 const TREE_LOADING_DOT_CSS: &str = "@keyframes yggterm-tree-loading-dot { 0%, 80%, 100% { opacity: 0.28; transform: translateY(0px); } 40% { opacity: 1; transform: translateY(-1px); } }";
+const TREE_SPINNER_CSS: &str = "@keyframes yggterm-tree-spinner { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }";
 const REMOTE_SURFACE_STAGE_CSS: &str = "@keyframes yggterm-remote-stage-float { 0%, 100% { transform: translateY(0px); } 50% { transform: translateY(-4px); } } @keyframes yggterm-remote-stage-beam { 0% { transform: translateX(-110%); opacity: 0.15; } 30% { opacity: 0.92; } 100% { transform: translateX(220%); opacity: 0.15; } } @keyframes yggterm-remote-stage-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(86, 154, 255, 0.14); opacity: 0.86; } 50% { box-shadow: 0 0 0 12px rgba(86, 154, 255, 0.0); opacity: 1; } }";
 const BACKGROUND_COPY_RETRY_MS: u64 = 300_000;
 const BACKGROUND_COPY_CONTINUE_MS: u64 = 15_000;
@@ -163,6 +161,12 @@ const BACKGROUND_REFRESH_NOTICE_MS: u64 = 12_000;
 const BACKGROUND_REFRESH_STARTUP_DEFER_MS: u64 = 20_000;
 const BACKGROUND_REFRESH_INTERACTIVE_DEFER_MS: u64 = 15_000;
 const BACKGROUND_REFRESH_POLL_MS: u64 = 1_000;
+const LIVE_SESSION_SNAPSHOT_TRIGGER_DEBOUNCE_MS: u64 = 360;
+const LIVE_SESSION_SNAPSHOT_BUSY_POLL_MS: u64 = 700;
+const LIVE_SESSION_SNAPSHOT_IDLE_POLL_MS: u64 = 1_500;
+const LIVE_SESSION_SNAPSHOT_NUDGE_INTERVAL_MS: u64 = 250;
+const LIVE_SESSION_SNAPSHOT_NUDGE_POLLS: usize = 24;
+const TERMINAL_BUSY_HINT_MS: u64 = 2_000;
 const REMOTE_PREVIEW_NO_TARGET_RETRY_MS: u64 = 1_500;
 const THEME_EDITOR_PAD_SIZE: f64 = 286.0;
 const SEARCH_INPUT_ID: &str = "yggterm-search-input";
@@ -171,7 +175,6 @@ const DEBUG_REQUEST_DELAY_ENV: &str = "YGGTERM_DEBUG_REQUEST_DELAY_MS";
 const SCREENSHOT_REQUEST_POLL_MS: u64 = 250;
 const APP_CONTROL_DRAIN_STUCK_MS: u64 = 2_500;
 type WorkspaceReorderPlanItem = TreeReorderPlanItem<BrowserRowKind>;
-
 #[derive(Debug, Clone)]
 pub struct ShellBootstrap {
     pub tree: SessionNode,
@@ -193,13 +196,16 @@ pub struct ShellBootstrap {
     pub linux_window_transparent: bool,
     pub linux_window_profile_reason: String,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingUpdateRestart {
     pub version: String,
     pub executable: PathBuf,
 }
-
+#[derive(Debug, Clone, Default)]
+struct LiveTerminalSidebarSample {
+    cursor_line_text: String,
+    text_tail: String,
+}
 #[derive(Clone)]
 struct ShellState {
     bootstrap: ShellBootstrap,
@@ -243,6 +249,8 @@ struct ShellState {
     last_tree_debug: String,
     generated_precis: BTreeMap<String, String>,
     generated_summaries: BTreeMap<String, String>,
+    live_terminal_sidebar_samples: HashMap<String, LiveTerminalSidebarSample>,
+    terminal_busy_hint_until_ms: HashMap<String, u64>,
     title_requests_in_flight: HashSet<String>,
     precis_requests_in_flight: HashSet<String>,
     summary_requests_in_flight: HashSet<String>,
@@ -268,6 +276,8 @@ struct ShellState {
     managed_cli_refresh_requests: HashSet<String>,
     managed_cli_refresh_completed: HashSet<String>,
     managed_cli_refresh_retry_after_ms: HashMap<String, u64>,
+    live_session_snapshot_refresh_in_flight: bool,
+    next_live_session_snapshot_after_ms: u64,
     drag_paths: Vec<String>,
     drag_hover_target: Option<DragDropTarget>,
     optimistic_drag_paths: Vec<String>,
@@ -290,23 +300,19 @@ struct ShellState {
     latest_open_request_id: u64,
     closing_app: bool,
 }
-
 #[derive(Clone, PartialEq, Eq)]
 struct DockSignature {
     pid: Option<u32>,
     host_token: Option<String>,
     rect: DockRect,
 }
-
 #[derive(Debug, Clone)]
 struct ClientInstanceRegistration {
     path: PathBuf,
 }
-
 struct DaemonSpawnLock {
     path: Option<PathBuf>,
 }
-
 impl Drop for DaemonSpawnLock {
     fn drop(&mut self) {
         if let Some(path) = self.path.as_ref() {
@@ -314,7 +320,6 @@ impl Drop for DaemonSpawnLock {
         }
     }
 }
-
 #[derive(Debug, Serialize, Deserialize)]
 struct ClientInstanceRecord {
     pid: u32,
@@ -332,15 +337,12 @@ struct ClientInstanceRecord {
     #[serde(default)]
     xauthority: Option<String>,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CloseAppMode {
     CloseClientOnly { remaining_clients: usize },
     ShutdownDaemon,
 }
-
 const KEEP_DAEMON_RUNNING_AFTER_LAST_CLIENT: bool = true;
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RightPanelMode {
     Hidden,
@@ -349,20 +351,17 @@ enum RightPanelMode {
     Connect,
     Notifications,
 }
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PreviewLayoutMode {
     Chat,
     Graph,
 }
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NotificationDeliveryMode {
     InApp,
     Both,
     System,
 }
-
 #[derive(Clone, PartialEq, Eq)]
 struct PendingDeleteDialog {
     document_paths: Vec<String>,
@@ -371,14 +370,12 @@ struct PendingDeleteDialog {
     labels: Vec<String>,
     hard_delete: bool,
 }
-
 #[derive(Clone, Debug)]
 struct PreviewSyncFailure {
     message: String,
     retry_count: u32,
     first_failed_at_ms: u64,
 }
-
 #[derive(Clone, PartialEq)]
 struct RenderSnapshot {
     palette: Palette,
@@ -408,6 +405,7 @@ struct RenderSnapshot {
     terminal_mount_epochs: HashMap<String, u64>,
     ssh_targets: Vec<SshConnectTarget>,
     live_sessions: Vec<ManagedSessionView>,
+    optimistic_busy_paths: HashSet<String>,
     total_leaf_sessions: usize,
     last_action: String,
     ghostty_embedded_surface_supported: bool,
@@ -452,9 +450,7 @@ struct RenderSnapshot {
     shell_tint: String,
     shell_gradient: String,
 }
-
 type SharedSnapshot = Arc<RenderSnapshot>;
-
 fn active_viewport_zoom_label(snapshot: &RenderSnapshot) -> String {
     match snapshot.active_view_mode {
         WorkspaceViewMode::Terminal => "Terminal Zoom".to_string(),
@@ -469,14 +465,12 @@ fn active_viewport_zoom_label(snapshot: &RenderSnapshot) -> String {
             .unwrap_or_else(|| "Preview Zoom".to_string()),
     }
 }
-
 fn active_viewport_zoom_value(snapshot: &RenderSnapshot) -> f32 {
     match snapshot.active_view_mode {
         WorkspaceViewMode::Terminal => snapshot.settings.terminal_font_size,
         WorkspaceViewMode::Rendered => snapshot.settings.rendered_font_size,
     }
 }
-
 fn adjust_main_zoom_settings_for_view(
     settings: &mut AppSettings,
     view_mode: WorkspaceViewMode,
@@ -497,7 +491,6 @@ fn adjust_main_zoom_settings_for_view(
         }
     }
 }
-
 fn set_main_zoom_settings_for_view(
     settings: &mut AppSettings,
     view_mode: WorkspaceViewMode,
@@ -517,15 +510,12 @@ fn set_main_zoom_settings_for_view(
         }
     }
 }
-
 fn normalize_app_control_main_zoom_value(value: f32) -> f32 {
     if value > 20.0 { value / 10.0 } else { value }
 }
-
 fn terminal_geometry_is_usable(cols: u16, rows: u16) -> bool {
     cols >= 20 && rows >= 4
 }
-
 fn row_supports_terminal(shell: &ShellState, row: &BrowserRow) -> bool {
     match row.kind {
         BrowserRowKind::Session => true,
@@ -536,11 +526,9 @@ fn row_supports_terminal(shell: &ShellState, row: &BrowserRow) -> bool {
         _ => false,
     }
 }
-
 fn active_viewport_shows_terminal_theme(snapshot: &RenderSnapshot) -> bool {
     snapshot.active_view_mode == WorkspaceViewMode::Terminal
 }
-
 fn rendered_surface_noun(session: &ManagedSessionView) -> &'static str {
     if session.kind == SessionKind::Document {
         match metadata_value(session, "Kind").as_str() {
@@ -552,7 +540,6 @@ fn rendered_surface_noun(session: &ManagedSessionView) -> &'static str {
         "preview"
     }
 }
-
 fn rendered_surface_title(session: &ManagedSessionView) -> &'static str {
     if session.kind == SessionKind::Document {
         match metadata_value(session, "Kind").as_str() {
@@ -564,7 +551,6 @@ fn rendered_surface_title(session: &ManagedSessionView) -> &'static str {
         "Preview"
     }
 }
-
 fn row_surface_noun(row: &BrowserRow, prefer_terminal: bool) -> &'static str {
     if prefer_terminal {
         "terminal"
@@ -577,13 +563,11 @@ fn row_surface_noun(row: &BrowserRow, prefer_terminal: bool) -> &'static str {
         "preview"
     }
 }
-
 #[derive(Clone, PartialEq, Eq)]
 struct SearchCommandSuggestion {
     command: String,
     description: String,
 }
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AltOverlayAction {
     ToggleSidebar,
@@ -599,21 +583,18 @@ enum AltOverlayAction {
     StartTerminal,
     CreatePaper,
 }
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AltOverlayResolution {
     Pending(String),
     Action(AltOverlayAction),
     Invalid,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TreeSelectionMode {
     Replace,
     ExtendRange,
     Toggle,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ContextMenuPlacement {
     left: Option<f64>,
@@ -621,7 +602,6 @@ struct ContextMenuPlacement {
     right: Option<f64>,
     bottom: Option<f64>,
 }
-
 #[derive(Clone)]
 struct CopyGenerationTarget {
     session_path: String,
@@ -633,17 +613,14 @@ struct CopyGenerationTarget {
     remote_machine: Option<RemoteMachineSnapshot>,
     storage_path: Option<String>,
 }
-
 #[derive(Clone)]
 enum BackgroundCopyJob {
     Title(CopyGenerationTarget),
     Summary(CopyGenerationTarget),
 }
-
 fn background_copy_retry_key(prefix: &str, session_path: &str) -> String {
     format!("{prefix}:{session_path}")
 }
-
 fn background_copy_retry_ready(shell: &ShellState, prefix: &str, session_path: &str) -> bool {
     let key = background_copy_retry_key(prefix, session_path);
     !PASSIVE_COPY_SUSPENDED.load(Ordering::Relaxed)
@@ -655,7 +632,6 @@ fn background_copy_retry_ready(shell: &ShellState, prefix: &str, session_path: &
             .copied()
             .is_none_or(|retry_after| retry_after <= current_millis())
 }
-
 #[derive(Clone, Copy, PartialEq)]
 struct Palette {
     shell: &'static str,
@@ -675,7 +651,6 @@ struct Palette {
     shadow: &'static str,
     panel_shadow: &'static str,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PreviewContentBlock {
     Heading {
@@ -705,27 +680,23 @@ enum PreviewContentBlock {
         code: String,
     },
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PreviewInlineSegment {
     Text(String),
     Code(String),
     ImageReference(String),
 }
-
 #[derive(Debug, Clone, PartialEq)]
 struct PreviewRun {
     tone: PreviewTone,
     entries: Vec<PreviewRunEntry>,
 }
-
 #[derive(Debug, Clone, PartialEq)]
 struct PreviewRunEntry {
     block_ix: usize,
     block: SessionPreviewBlock,
     display_timestamp: String,
 }
-
 #[derive(Debug, Clone, PartialEq)]
 struct PreviewVirtualWindow {
     start_index: usize,
@@ -738,20 +709,17 @@ struct PreviewVirtualWindow {
     scroll_height_px: f64,
     overscan_px: f64,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SearchContentHit {
     dom_id: String,
     label: String,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveSurfaceRequest {
     request_id: String,
     operation: String,
     target: YggTarget,
 }
-
 fn active_request_session_target_path(
     request: &ActiveSurfaceRequest,
     fallback_active_path: Option<&str>,
@@ -764,7 +732,6 @@ fn active_request_session_target_path(
         _ => None,
     }
 }
-
 fn pending_interactive_session_request<'a>(
     active_surface_requests: &'a HashMap<YggSurface, ActiveSurfaceRequest>,
 ) -> Option<(WorkspaceViewMode, &'a ActiveSurfaceRequest)> {
@@ -775,44 +742,37 @@ fn pending_interactive_session_request<'a>(
         .get(&YggSurface::Preview)
         .map(|request| (WorkspaceViewMode::Rendered, request))
 }
-
 #[derive(Default)]
 struct PreviewBlockCache {
     order: VecDeque<u64>,
     entries: HashMap<u64, Vec<SessionPreviewBlock>>,
 }
-
 #[derive(Default)]
 struct PreviewContentCache {
     order: VecDeque<u64>,
     entries: HashMap<u64, Vec<PreviewContentBlock>>,
 }
-
 #[derive(Default)]
 struct PreviewRunCache {
     order: VecDeque<u64>,
     entries: HashMap<u64, Vec<PreviewRun>>,
 }
-
 #[derive(Default)]
 struct SidebarMergeCache {
     order: VecDeque<u64>,
     entries: HashMap<u64, Vec<BrowserRow>>,
 }
-
 #[derive(Default)]
 struct SidebarSearchCache {
     order: VecDeque<u64>,
     entries: HashMap<u64, Vec<BrowserRow>>,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MachineHealth {
     Healthy,
     Cached,
     Offline,
 }
-
 impl ShellState {
     fn new(bootstrap: ShellBootstrap) -> Self {
         let initial_search_query = std::env::var("YGGTERM_SEARCH_QUERY").unwrap_or_default();
@@ -830,7 +790,6 @@ impl ShellState {
             &settings.expanded_browser_paths,
             settings.selected_browser_path.as_deref(),
         );
-
         let mut server = YggtermServer::new(
             &bootstrap.browser_tree,
             bootstrap.prefer_ghostty_backend,
@@ -844,7 +803,6 @@ impl ShellState {
         if let Some(initial_server_snapshot) = bootstrap.initial_server_snapshot.clone() {
             server.apply_snapshot(initial_server_snapshot);
         }
-
         let has_initial_server_snapshot = bootstrap.initial_server_snapshot.is_some();
         let needs_initial_server_sync =
             bootstrap.refresh_server_after_launch || !has_initial_server_snapshot;
@@ -892,6 +850,8 @@ impl ShellState {
             last_tree_debug: "tree debug idle".to_string(),
             generated_precis: BTreeMap::new(),
             generated_summaries: BTreeMap::new(),
+            live_terminal_sidebar_samples: HashMap::new(),
+            terminal_busy_hint_until_ms: HashMap::new(),
             title_requests_in_flight: HashSet::new(),
             precis_requests_in_flight: HashSet::new(),
             summary_requests_in_flight: HashSet::new(),
@@ -917,6 +877,8 @@ impl ShellState {
             managed_cli_refresh_requests: HashSet::new(),
             managed_cli_refresh_completed: HashSet::new(),
             managed_cli_refresh_retry_after_ms: HashMap::new(),
+            live_session_snapshot_refresh_in_flight: false,
+            next_live_session_snapshot_after_ms: 0,
             drag_paths: Vec::new(),
             drag_hover_target: None,
             optimistic_drag_paths: Vec::new(),
@@ -970,7 +932,28 @@ impl ShellState {
         state.sync_browser_settings();
         state
     }
-
+    fn overlay_live_terminal_sidebar_sample(&self, session: &mut ManagedSessionView) {
+        let Some(sample) = self
+            .live_terminal_sidebar_samples
+            .get(&session.session_path)
+        else {
+            return;
+        };
+        let sample_lines = sample
+            .text_tail
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        if !sample_lines.is_empty() {
+            session.terminal_lines = sample_lines;
+        }
+        let cursor_line = sample.cursor_line_text.trim();
+        if !cursor_line.is_empty() {
+            session.status_line = cursor_line.to_string();
+        }
+    }
     fn snapshot(&self) -> RenderSnapshot {
         let active_theme_spec = if self.theme_editor_open {
             clamp_theme_spec(&self.theme_editor_draft)
@@ -985,7 +968,16 @@ impl ShellState {
             self.search_query.as_str()
         };
         let search_active = !effective_search_query.trim().is_empty();
-        let live_sessions = self.server.live_sessions();
+        let mut live_sessions = self.server.live_sessions();
+        for session in live_sessions.iter_mut() {
+            self.overlay_live_terminal_sidebar_sample(session);
+        }
+        let optimistic_busy_paths = self
+            .terminal_busy_hint_until_ms
+            .iter()
+            .filter(|(_, deadline_ms)| current_millis() <= **deadline_ms)
+            .map(|(session_path, _)| session_path.clone())
+            .collect::<HashSet<_>>();
         let expanded_paths = self.browser.expanded_path_set();
         let stored_rows = if search_active {
             self.browser.search_rows()
@@ -1069,6 +1061,10 @@ impl ShellState {
                         Some(session.session_path.as_str()) == active_session_path.as_deref()
                     })
                     .cloned()
+                    .map(|mut session| {
+                        self.overlay_live_terminal_sidebar_sample(&mut session);
+                        session
+                    })
             });
         let mut retained_terminal_sessions = live_sessions
             .iter()
@@ -1160,7 +1156,6 @@ impl ShellState {
             .is_some_and(|request| {
                 active_surface_request_matches_session(request, active_session_path.as_deref())
             });
-
         RenderSnapshot {
             palette: palette,
             search_query: self.search_query.clone(),
@@ -1193,6 +1188,7 @@ impl ShellState {
             terminal_mount_epochs: self.terminal_mount_epochs.clone(),
             ssh_targets: self.server.ssh_targets().to_vec(),
             live_sessions,
+            optimistic_busy_paths,
             total_leaf_sessions: self.browser.total_sessions(),
             last_action: self.last_action.clone(),
             ghostty_embedded_surface_supported: self.bootstrap.ghostty_embedded_surface_supported,
@@ -1239,7 +1235,6 @@ impl ShellState {
             shell_gradient: gradient_css(self.settings.theme, &active_theme_spec),
         }
     }
-
     fn set_search(&mut self, query: String) {
         self.search_query = query;
         self.search_sidebar_match_index = None;
@@ -1270,7 +1265,6 @@ impl ShellState {
             }),
         );
     }
-
     fn set_search_focus(&mut self, focused: bool) {
         self.search_focused = focused;
         self.record_ui_telemetry(
@@ -1281,7 +1275,6 @@ impl ShellState {
             }),
         );
     }
-
     fn next_search_sidebar_row(&mut self, step: isize) -> Option<BrowserRow> {
         let rows = self.current_search_sidebar_matches();
         if rows.is_empty() {
@@ -1302,7 +1295,6 @@ impl ShellState {
         self.last_action = format!("search result {}/{}", next + 1, rows.len());
         Some(row)
     }
-
     fn next_search_content_dom_id(&mut self, step: isize) -> Option<String> {
         let hits = search_content_hits(
             self.server.active_session(),
@@ -1319,7 +1311,6 @@ impl ShellState {
         self.last_action = format!("content hit {}/{}", next + 1, hits.len());
         Some(hits[next].dom_id.clone())
     }
-
     fn current_search_sidebar_matches(&self) -> Vec<BrowserRow> {
         let expanded_paths = self.browser.expanded_path_set();
         let stored_rows = self.browser.search_rows();
@@ -1347,7 +1338,6 @@ impl ShellState {
         );
         search_sidebar_matches(&rows, &self.search_query)
     }
-
     fn refresh_search_state(&mut self, source: &str) {
         let trimmed = self.search_query.trim();
         if trimmed.is_empty() || trimmed.starts_with('/') {
@@ -1374,7 +1364,6 @@ impl ShellState {
             }),
         );
     }
-
     fn toggle_sidebar(&mut self) {
         self.sidebar_open = !self.sidebar_open;
         self.sync_browser_settings();
@@ -1384,7 +1373,6 @@ impl ShellState {
             "sidebar hidden".to_string()
         };
     }
-
     fn toggle_metadata_panel(&mut self) {
         self.right_panel_mode = if self.right_panel_mode == RightPanelMode::Metadata {
             RightPanelMode::Hidden
@@ -1401,7 +1389,6 @@ impl ShellState {
             RightPanelMode::Notifications => "notifications opened".to_string(),
         };
     }
-
     fn toggle_settings_panel(&mut self) {
         self.right_panel_mode = if self.right_panel_mode == RightPanelMode::Settings {
             RightPanelMode::Hidden
@@ -1418,7 +1405,6 @@ impl ShellState {
             RightPanelMode::Notifications => "notifications opened".to_string(),
         };
     }
-
     fn toggle_connect_panel(&mut self) {
         self.right_panel_mode = if self.right_panel_mode == RightPanelMode::Connect {
             RightPanelMode::Hidden
@@ -1435,17 +1421,14 @@ impl ShellState {
             RightPanelMode::Notifications => "notifications opened".to_string(),
         };
     }
-
     fn update_ssh_connect_target(&mut self, value: String) {
         self.ssh_connect_target = value;
         self.last_action = "editing ssh target".to_string();
     }
-
     fn update_ssh_connect_prefix(&mut self, value: String) {
         self.ssh_connect_prefix = value;
         self.last_action = "editing ssh prefix".to_string();
     }
-
     fn toggle_notifications_panel(&mut self) {
         self.right_panel_mode = if self.right_panel_mode == RightPanelMode::Notifications {
             RightPanelMode::Hidden
@@ -1460,7 +1443,6 @@ impl ShellState {
             RightPanelMode::Connect => "ssh connect opened".to_string(),
         };
     }
-
     fn set_preview_layout(&mut self, mode: PreviewLayoutMode) {
         self.preview_layout = mode;
         self.last_action = match mode {
@@ -1468,7 +1450,6 @@ impl ShellState {
             PreviewLayoutMode::Graph => "graph view".to_string(),
         };
     }
-
     fn begin_surface_request(
         &mut self,
         request_meta: YggRequestMeta,
@@ -1567,11 +1548,9 @@ impl ShellState {
         }
         self.last_action = label;
     }
-
     fn begin_busy_request(&mut self, request_meta: YggRequestMeta, label: String) {
         self.begin_surface_request(request_meta, label, true);
     }
-
     fn clear_surface_request_for(&mut self, request_id: &str) {
         self.clear_job_notification(&format!("loading:{request_id}"));
         self.active_surface_requests
@@ -1580,7 +1559,6 @@ impl ShellState {
             self.server_busy = false;
         }
     }
-
     fn defer_terminal_surface_request_end(&self, request_id: &str) -> bool {
         let Some(request) = self.active_surface_requests.get(&YggSurface::Terminal) else {
             return false;
@@ -1595,7 +1573,6 @@ impl ShellState {
         };
         self.terminal_attach_in_flight.contains(&session_path)
     }
-
     fn maybe_finish_terminal_surface_request_for_session(&mut self, session_path: &str) {
         if self.terminal_attach_in_flight.contains(session_path) {
             return;
@@ -1617,7 +1594,6 @@ impl ShellState {
         }
         self.clear_surface_request_for(&request.request_id);
     }
-
     fn finish_busy_request_for(&mut self, request_id: &str) {
         if let Ok(store) = SessionStore::open_or_init() {
             append_trace_event(
@@ -1636,7 +1612,6 @@ impl ShellState {
         }
         self.clear_surface_request_for(request_id);
     }
-
     fn begin_terminal_open_attempt(
         &mut self,
         session_path: &str,
@@ -1688,7 +1663,6 @@ impl ShellState {
         self.record_terminal_open_attempt_event("begin", &attempt, None);
         attempt_id
     }
-
     fn latest_terminal_open_attempt_for_path(
         &self,
         session_path: &str,
@@ -1696,12 +1670,10 @@ impl ShellState {
         let attempt_id = self.terminal_open_attempt_by_session.get(session_path)?;
         self.terminal_open_attempts.get(attempt_id)
     }
-
     fn latest_terminal_open_attempt_snapshot_for_path(&self, session_path: &str) -> Option<Value> {
         self.latest_terminal_open_attempt_for_path(session_path)
             .map(describe_terminal_open_attempt)
     }
-
     fn observe_terminal_open_attempt_from_viewport(&mut self, viewport: &Value) {
         let active_session_path = viewport
             .get("active_session_path")
@@ -1865,7 +1837,6 @@ impl ShellState {
             );
         }
     }
-
     fn fail_terminal_open_attempt_for_request(&mut self, request_id: &str, reason: String) {
         let Some(attempt) = self
             .terminal_open_attempts
@@ -1887,7 +1858,6 @@ impl ShellState {
             Some(json!({ "reason": reason })),
         );
     }
-
     fn record_terminal_open_attempt_event(
         &mut self,
         name: &str,
@@ -1925,7 +1895,6 @@ impl ShellState {
             );
         }
     }
-
     fn apply_snapshot_result_without_request(
         &mut self,
         result: Result<(ServerUiSnapshot, Option<String>)>,
@@ -1964,6 +1933,9 @@ impl ShellState {
                 self.refresh_search_state(telemetry_label);
                 self.record_restore_issue_telemetry(telemetry_label);
                 self.record_preview_issue_telemetry(telemetry_label);
+                if self.busy_request_id.is_none() && self.active_surface_requests.is_empty() {
+                    self.server_busy = false;
+                }
                 if let Some(message) = message {
                     self.last_action = message;
                 }
@@ -1971,6 +1943,9 @@ impl ShellState {
             Err(error) => {
                 self.needs_initial_server_sync = false;
                 self.next_background_copy_scan_after_ms = current_millis() + 2_000;
+                if self.busy_request_id.is_none() && self.active_surface_requests.is_empty() {
+                    self.server_busy = false;
+                }
                 self.last_action = format!("server sync failed: {error}");
                 if !self.had_cached_startup_snapshot {
                     self.push_notification(
@@ -1982,7 +1957,6 @@ impl ShellState {
             }
         }
     }
-
     fn apply_daemon_snapshot_result(&mut self, result: Result<(ServerUiSnapshot, Option<String>)>) {
         let request_id = self.busy_request_id.clone();
         if let Some(request_id) = request_id.as_deref() {
@@ -1996,7 +1970,6 @@ impl ShellState {
             false,
         );
     }
-
     fn apply_interactive_snapshot_result(
         &mut self,
         result: Result<(ServerUiSnapshot, Option<String>)>,
@@ -2008,7 +1981,6 @@ impl ShellState {
             true,
         );
     }
-
     fn apply_interactive_snapshot_result_for(
         &mut self,
         request_id: &str,
@@ -2057,7 +2029,6 @@ impl ShellState {
             }
         }
     }
-
     fn apply_daemon_snapshot_result_for(
         &mut self,
         request_id: &str,
@@ -2103,7 +2074,6 @@ impl ShellState {
             }
         }
     }
-
     fn restore_active_preview_if_snapshot_regressed(
         &mut self,
         previous_active_session: Option<ManagedSessionView>,
@@ -2129,7 +2099,6 @@ impl ShellState {
             previous_active_session.rendered_sections,
         );
     }
-
     fn mark_active_remote_preview_dirty_if_needed(&mut self) {
         if self.server.active_view_mode() != WorkspaceViewMode::Rendered {
             return;
@@ -2146,7 +2115,6 @@ impl ShellState {
         self.remote_preview_dirty_epoch
             .insert(session.session_path, current_millis());
     }
-
     fn seed_dynamic_top_level_expansions(&mut self) {
         let mut paths = Vec::new();
         if self
@@ -2161,13 +2129,11 @@ impl ShellState {
         self.browser.ensure_expanded_paths(paths);
         self.sync_browser_settings();
     }
-
     fn ensure_active_session_visible(&mut self) {
         self.ensure_active_session_expanded();
         self.sync_active_session_selection();
         self.sync_browser_settings();
     }
-
     fn retain_terminal_session_path(&mut self, session_path: &str) -> u64 {
         self.retained_terminal_session_paths
             .insert(session_path.to_string());
@@ -2177,7 +2143,6 @@ impl ShellState {
             .or_insert(1);
         *epoch
     }
-
     fn bump_terminal_mount_epoch_for_session(&mut self, session_path: &str) -> u64 {
         let epoch = self
             .terminal_mount_epochs
@@ -2186,21 +2151,18 @@ impl ShellState {
         *epoch = epoch.saturating_add(1).max(1);
         *epoch
     }
-
     fn terminal_session_host_id(&self, session_path: &str) -> Option<String> {
         self.terminal_mount_epochs
             .get(session_path)
             .copied()
             .map(|epoch| terminal_mount_host_id(session_path, epoch))
     }
-
     fn terminal_session_is_retained_live(&self, session_path: &str) -> bool {
         self.retained_terminal_session_paths.contains(session_path)
             && (self.terminal_resume_ready_paths.contains(session_path)
                 || self.terminal_session_has_ready_attempt(session_path))
             && !self.terminal_attach_in_flight.contains(session_path)
     }
-
     fn terminal_session_has_ready_attempt(&self, session_path: &str) -> bool {
         self.latest_terminal_open_attempt_for_path(session_path)
             .is_some_and(|attempt| {
@@ -2208,12 +2170,10 @@ impl ShellState {
                     && attempt.latched_failure_reason.is_none()
             })
     }
-
     fn terminal_session_has_visual_resume_reveal(&self, session_path: &str) -> bool {
         self.terminal_resume_ready_paths.contains(session_path)
             || self.terminal_session_has_ready_attempt(session_path)
     }
-
     fn active_terminal_prefers_text_input(&self) -> bool {
         if self.server.active_view_mode() != WorkspaceViewMode::Terminal {
             return false;
@@ -2227,7 +2187,6 @@ impl ShellState {
         self.terminal_session_has_visual_resume_reveal(session_path)
             || self.terminal_session_has_ready_attempt(session_path)
     }
-
     fn terminal_session_has_active_terminal_request(&self, session_path: &str) -> bool {
         let Some(request) = self.active_surface_requests.get(&YggSurface::Terminal) else {
             return false;
@@ -2235,7 +2194,6 @@ impl ShellState {
         active_request_session_target_path(request, self.server.active_session_path()).as_deref()
             == Some(session_path)
     }
-
     fn startup_terminal_restore_should_open(&self, active_session_path: &str) -> bool {
         self.server.active_view_mode() == WorkspaceViewMode::Terminal
             && !self.server_busy
@@ -2246,7 +2204,6 @@ impl ShellState {
             && !self.terminal_session_has_ready_attempt(active_session_path)
             && self.terminal_session_host_id(active_session_path).is_none()
     }
-
     fn terminal_session_resume_notification_should_stay_visible(&self, session_path: &str) -> bool {
         if self.terminal_session_has_ready_attempt(session_path) {
             return false;
@@ -2257,7 +2214,6 @@ impl ShellState {
             self.terminal_session_has_active_terminal_request(session_path),
         )
     }
-
     fn clear_terminal_resume_notifications_except(&mut self, keep_session_path: Option<&str>) {
         let keep_path = keep_session_path.map(str::to_string);
         let keep_is_still_recovering = keep_path.as_deref().is_some_and(|session_path| {
@@ -2276,7 +2232,6 @@ impl ShellState {
                 && keep_is_still_recovering
         });
     }
-
     fn prune_terminal_resume_notifications(&mut self) {
         let keep_session_path = if self.server.active_view_mode() == WorkspaceViewMode::Terminal {
             self.server.active_session_path().map(str::to_string)
@@ -2285,7 +2240,6 @@ impl ShellState {
         };
         self.clear_terminal_resume_notifications_except(keep_session_path.as_deref());
     }
-
     fn prune_terminal_attach_in_flight(&mut self) {
         let mut keep_paths = self.retained_terminal_session_paths.clone();
         if let Some(active_path) = self.server.active_session_path() {
@@ -2301,7 +2255,6 @@ impl ShellState {
             keep_paths.contains(session_path) && !ready_paths.contains(session_path)
         });
     }
-
     fn prune_terminal_resume_ready_paths(&mut self) {
         let mut keep_paths = self.retained_terminal_session_paths.clone();
         if let Some(active_path) = self.server.active_session_path() {
@@ -2313,7 +2266,6 @@ impl ShellState {
             self.active_terminal_host_id = None;
         }
     }
-
     fn ensure_active_session_expanded(&mut self) {
         let remote_paths = self
             .active_session_visibility_paths()
@@ -2326,7 +2278,6 @@ impl ShellState {
             self.browser.ensure_visible_path(&active_path);
         }
     }
-
     fn clear_user_collapsed_synthetic_ancestors_for_path(&mut self, session_path: &str) {
         let Some((machine_key, _session_id)) = parse_remote_scanned_session_path(session_path)
         else {
@@ -2335,7 +2286,6 @@ impl ShellState {
         self.user_collapsed_synthetic_paths
             .retain(|path| !path.starts_with(&format!("__remote_machine__/{machine_key}")));
     }
-
     fn update_synthetic_group_collapse_state(&mut self, path: &str, expanded: bool) {
         if expanded {
             self.user_collapsed_synthetic_paths.remove(path);
@@ -2343,7 +2293,6 @@ impl ShellState {
             self.user_collapsed_synthetic_paths.insert(path.to_string());
         }
     }
-
     fn sync_active_session_selection(&mut self) {
         if let Some(active) = self.server.active_session().cloned() {
             let selected_path = self
@@ -2355,7 +2304,6 @@ impl ShellState {
             self.browser.select_path(selected_path);
         }
     }
-
     fn active_browser_selection_path_for_session(&self) -> Option<String> {
         let active = self.server.active_session()?;
         let active_path = active.session_path.clone();
@@ -2373,11 +2321,10 @@ impl ShellState {
             .then(|| row.full_path.clone())
         })
     }
-
     fn active_session_visibility_paths(&self) -> Vec<String> {
-        let active_path = self
-            .server
-            .active_session()
+        let active_session = self.server.active_session().cloned();
+        let active_path = active_session
+            .as_ref()
             .map(|session| session.session_path.clone())
             .or_else(|| self.server.active_session_path().map(ToOwned::to_owned));
         let Some(active_path) = active_path else {
@@ -2391,48 +2338,72 @@ impl ShellState {
         {
             return vec!["__live_sessions__".to_string()];
         }
-        let Some((machine_key, session_id)) = parse_remote_scanned_session_path(&active_path)
-        else {
+        if let Some((machine_key, session_id)) = parse_remote_scanned_session_path(&active_path) {
+            let mut paths = vec![format!("__remote_machine__/{machine_key}")];
+            let active_cwd = active_session
+                .as_ref()
+                .map(|active| metadata_value(active, "Cwd"));
+            if let Some(machine) = self
+                .server
+                .remote_machines()
+                .iter()
+                .find(|machine| machine.machine_key == machine_key)
+            {
+                let cwd = active_cwd.unwrap_or_else(|| {
+                    machine
+                        .sessions
+                        .iter()
+                        .find(|session| {
+                            session.session_path == active_path || session.session_id == session_id
+                        })
+                        .map(|session| session.cwd.clone())
+                        .unwrap_or_default()
+                });
+                paths.extend(
+                    compressed_remote_folder_paths(&machine.sessions, &cwd)
+                        .into_iter()
+                        .map(|path| format!("__remote_folder__/{machine_key}{path}")),
+                );
+            } else {
+                let cwd = active_cwd.unwrap_or_default();
+                let mut current = String::new();
+                for segment in cwd.split('/').filter(|segment| !segment.is_empty()) {
+                    current.push('/');
+                    current.push_str(segment);
+                    paths.push(format!("__remote_folder__/{machine_key}{current}"));
+                }
+            }
+            return paths;
+        }
+        let Some(active) = active_session else {
             return Vec::new();
         };
-        let mut paths = vec![format!("__remote_machine__/{machine_key}")];
-        let active_cwd = self
-            .server
-            .active_session()
-            .map(|active| metadata_value(active, "Cwd"));
-        if let Some(machine) = self
-            .server
-            .remote_machines()
-            .iter()
-            .find(|machine| machine.machine_key == machine_key)
-        {
-            let cwd = active_cwd.unwrap_or_else(|| {
-                machine
-                    .sessions
-                    .iter()
-                    .find(|session| {
-                        session.session_path == active_path || session.session_id == session_id
-                    })
-                    .map(|session| session.cwd.clone())
-                    .unwrap_or_default()
-            });
-            paths.extend(
-                compressed_remote_folder_paths(&machine.sessions, &cwd)
-                    .into_iter()
-                    .map(|path| format!("__remote_folder__/{machine_key}{path}")),
-            );
-        } else {
-            let cwd = active_cwd.unwrap_or_default();
-            let mut current = String::new();
-            for segment in cwd.split('/').filter(|segment| !segment.is_empty()) {
-                current.push('/');
-                current.push_str(segment);
-                paths.push(format!("__remote_folder__/{machine_key}{current}"));
+        let local_anchor = if active.kind == SessionKind::Document {
+            let document_path = metadata_value(&active, "Path");
+            if document_path.is_empty() {
+                active.session_path.clone()
+            } else {
+                document_path
             }
+        } else {
+            metadata_value(&active, "Cwd")
+        };
+        let mut paths = vec!["local".to_string()];
+        if local_anchor.is_empty() {
+            return paths;
         }
+        let mut ancestors = Vec::<String>::new();
+        let mut cursor = workspace_parent_path(&local_anchor);
+        while let Some(path) = cursor {
+            if path != "/" {
+                ancestors.push(path.clone());
+            }
+            cursor = workspace_parent_path(&path);
+        }
+        ancestors.reverse();
+        paths.extend(ancestors);
         paths
     }
-
     fn hydrate_generated_copy_from_remote_cache(&mut self) {
         let cached = self
             .server
@@ -2466,7 +2437,6 @@ impl ShellState {
             }
         }
     }
-
     fn select_row(&mut self, row: &BrowserRow) {
         self.browser.select_path(row.full_path.clone());
         self.record_ui_telemetry(
@@ -2509,7 +2479,6 @@ impl ShellState {
             }
         }
     }
-
     fn update_litellm_endpoint(&mut self, value: String) {
         self.settings.litellm_endpoint = value;
         PASSIVE_COPY_SUSPENDED.store(false, Ordering::Relaxed);
@@ -2519,7 +2488,6 @@ impl ShellState {
         self.persist_settings();
         self.last_action = "updated LiteLLM endpoint".to_string();
     }
-
     fn update_litellm_api_key(&mut self, value: String) {
         self.settings.litellm_api_key = value;
         PASSIVE_COPY_SUSPENDED.store(false, Ordering::Relaxed);
@@ -2529,7 +2497,6 @@ impl ShellState {
         self.persist_settings();
         self.last_action = "updated LiteLLM API key".to_string();
     }
-
     fn update_interface_llm_model(&mut self, value: String) {
         self.settings.interface_llm_model = value;
         PASSIVE_COPY_SUSPENDED.store(false, Ordering::Relaxed);
@@ -2539,7 +2506,6 @@ impl ShellState {
         self.persist_settings();
         self.last_action = "updated interface llm".to_string();
     }
-
     fn update_notification_delivery(&mut self, mode: NotificationDeliveryMode) {
         apply_notification_delivery_mode(&mut self.settings, mode);
         self.persist_settings();
@@ -2549,7 +2515,6 @@ impl ShellState {
             NotificationDeliveryMode::System => "system notifications enabled".to_string(),
         };
     }
-
     fn update_notification_sound(&mut self, enabled: bool) {
         self.settings.notification_sound = enabled;
         self.persist_settings();
@@ -2559,7 +2524,6 @@ impl ShellState {
             "notification sound disabled".to_string()
         };
     }
-
     fn adjust_ui_zoom(&mut self, delta_steps: i32) {
         self.settings.ui_font_size =
             clamp_zoom_value(self.settings.ui_font_size + delta_steps as f32);
@@ -2569,7 +2533,6 @@ impl ShellState {
             zoom_percent(self.settings.ui_font_size, 14.0)
         );
     }
-
     fn adjust_main_zoom(&mut self, delta_steps: i32) {
         let active_snapshot = self.snapshot();
         let active_view_mode = active_snapshot.active_view_mode;
@@ -2595,7 +2558,6 @@ impl ShellState {
             zoom_percent(after, 10.0)
         );
     }
-
     fn set_main_zoom(&mut self, view_mode: WorkspaceViewMode, value: f32) {
         let label = match view_mode {
             WorkspaceViewMode::Terminal => "terminal zoom",
@@ -2616,7 +2578,6 @@ impl ShellState {
         };
         self.last_action = format!("{label} {}%", zoom_percent(after, 10.0));
     }
-
     fn set_terminal_theme_name_for(&mut self, theme: UiTheme, value: String) {
         match theme {
             UiTheme::ZedLight => self.settings.terminal_light_theme_name = value,
@@ -2632,7 +2593,6 @@ impl ShellState {
             self.terminal_theme_name_for(theme)
         );
     }
-
     fn set_ui_theme(&mut self, theme: UiTheme) {
         if self.settings.theme == theme {
             return;
@@ -2645,7 +2605,6 @@ impl ShellState {
             UiTheme::ZedDark => "dark theme".to_string(),
         };
     }
-
     fn terminal_theme_name_for(&self, theme: UiTheme) -> String {
         let configured = match theme {
             UiTheme::ZedLight => self.settings.terminal_light_theme_name.trim(),
@@ -2657,11 +2616,9 @@ impl ShellState {
             configured.to_string()
         }
     }
-
     fn effective_terminal_theme_name(&self) -> String {
         self.terminal_theme_name_for(self.settings.theme)
     }
-
     fn reconcile_snapshot_for_request(
         &self,
         request_id: &str,
@@ -2746,7 +2703,6 @@ impl ShellState {
         };
         snapshot
     }
-
     fn open_theme_editor(&mut self) {
         self.theme_editor_open = true;
         self.theme_editor_draft = clamp_theme_spec(&self.settings.yggui_theme);
@@ -2754,13 +2710,11 @@ impl ShellState {
         self.theme_editor_drag_stop = None;
         self.last_action = "theme editor opened".to_string();
     }
-
     fn close_theme_editor(&mut self) {
         self.theme_editor_open = false;
         self.theme_editor_drag_stop = None;
         self.last_action = "theme editor closed".to_string();
     }
-
     fn save_theme_editor(&mut self) {
         self.settings.yggui_theme = clamp_theme_spec(&self.theme_editor_draft);
         self.theme_editor_open = false;
@@ -2773,20 +2727,17 @@ impl ShellState {
             "Yggui shell theme applied.".to_string(),
         );
     }
-
     fn reset_theme_editor(&mut self) {
         self.theme_editor_draft = default_theme_editor_spec();
         self.theme_editor_selected_stop = self.theme_editor_draft.colors.first().map(|_| 0);
         self.theme_editor_drag_stop = None;
         self.last_action = "theme reset to base".to_string();
     }
-
     fn seed_theme_editor(&mut self) {
         self.theme_editor_draft = default_theme_editor_spec();
         self.theme_editor_selected_stop = self.theme_editor_draft.colors.first().map(|_| 0);
         self.last_action = "theme starter added".to_string();
     }
-
     fn add_theme_stop(&mut self, color: Option<&str>) {
         let next = append_theme_stop(&self.theme_editor_draft, color);
         if next.colors.len() == self.theme_editor_draft.colors.len() {
@@ -2796,7 +2747,6 @@ impl ShellState {
         self.theme_editor_selected_stop = self.theme_editor_draft.colors.len().checked_sub(1);
         self.last_action = format!("theme color {}", self.theme_editor_draft.colors.len());
     }
-
     fn add_theme_stop_at(&mut self, x: f32, y: f32) {
         self.add_theme_stop(None);
         if let Some(index) = self.theme_editor_selected_stop
@@ -2807,18 +2757,15 @@ impl ShellState {
         }
         self.theme_editor_draft = clamp_theme_spec(&self.theme_editor_draft);
     }
-
     fn select_theme_stop(&mut self, index: usize) {
         if index < self.theme_editor_draft.colors.len() {
             self.theme_editor_selected_stop = Some(index);
         }
     }
-
     fn begin_theme_drag(&mut self, index: usize) {
         self.select_theme_stop(index);
         self.theme_editor_drag_stop = Some(index);
     }
-
     fn move_theme_stop(&mut self, x: f32, y: f32) {
         let Some(index) = self.theme_editor_drag_stop else {
             return;
@@ -2828,11 +2775,9 @@ impl ShellState {
             stop.y = y.clamp(0.0, 1.0);
         }
     }
-
     fn end_theme_drag(&mut self) {
         self.theme_editor_drag_stop = None;
     }
-
     fn remove_selected_theme_stop(&mut self) {
         let Some(index) = self.theme_editor_selected_stop else {
             return;
@@ -2848,7 +2793,6 @@ impl ShellState {
         };
         self.last_action = "theme color removed".to_string();
     }
-
     fn update_selected_theme_color(&mut self, color: String) {
         let Some(index) = self.theme_editor_selected_stop else {
             return;
@@ -2858,21 +2802,17 @@ impl ShellState {
         }
         self.theme_editor_draft = clamp_theme_spec(&self.theme_editor_draft);
     }
-
     fn update_theme_brightness(&mut self, value: f32) {
         self.theme_editor_draft.brightness = value.clamp(0.0, 1.0);
     }
-
     fn update_theme_grain(&mut self, value: f32) {
         self.theme_editor_draft.grain = value.clamp(0.0, 1.0);
     }
-
     fn toggle_maximized(&mut self) {
         let next = !window().is_maximized();
         window().toggle_maximized();
         self.maximized = next;
     }
-
     fn toggle_fullscreen(&mut self) {
         self.fullscreen = !self.fullscreen;
         self.last_action = if self.fullscreen {
@@ -2881,7 +2821,6 @@ impl ShellState {
             "distraction-free mode disabled".to_string()
         };
     }
-
     fn toggle_always_on_top(&mut self) {
         self.always_on_top = !self.always_on_top;
         window().set_always_on_top(self.always_on_top);
@@ -2891,7 +2830,6 @@ impl ShellState {
             "always on top disabled".to_string()
         };
     }
-
     fn open_context_menu(&mut self, row: BrowserRow, position: (f64, f64)) {
         self.context_menu_row = Some(row);
         self.context_menu_position = Some(position);
@@ -2906,27 +2844,22 @@ impl ShellState {
         );
         self.refresh_tree_debug("open_context_menu");
     }
-
     fn close_context_menu(&mut self) {
         self.context_menu_row = None;
         self.context_menu_position = None;
         self.refresh_tree_debug("close_context_menu");
     }
-
     fn clear_notification(&mut self, id: u64) {
         self.notifications
             .retain(|notification| notification.id != id);
     }
-
     fn clear_job_notification(&mut self, job_key: &str) {
         self.notifications
             .retain(|notification| notification.job_key.as_deref() != Some(job_key));
     }
-
     fn clear_notifications(&mut self) {
         self.notifications.clear();
     }
-
     fn select_tree_row(&mut self, row: &BrowserRow, mode: TreeSelectionMode) {
         if mode == TreeSelectionMode::ExtendRange && is_workspace_row(row) {
             self.extend_tree_selection(row);
@@ -2980,7 +2913,6 @@ impl ShellState {
         );
         self.refresh_tree_debug("select_tree_row");
     }
-
     fn extend_tree_selection(&mut self, row: &BrowserRow) {
         let rows = merged_sidebar_rows(
             self.browser.rows(),
@@ -3038,7 +2970,6 @@ impl ShellState {
         );
         self.refresh_tree_debug("extend_tree_selection");
     }
-
     fn selected_workspace_rows(&self) -> Vec<BrowserRow> {
         let rows = merged_sidebar_rows(
             self.browser.rows(),
@@ -3063,7 +2994,6 @@ impl ShellState {
             .cloned()
             .collect()
     }
-
     fn selected_workspace_delete_paths(&self) -> (Vec<String>, Vec<String>, Vec<String>) {
         let rows = self.selected_workspace_rows();
         let mut document_paths = Vec::new();
@@ -3081,7 +3011,6 @@ impl ShellState {
         }
         (document_paths, group_paths, labels)
     }
-
     fn selected_saved_ssh_target_machine_keys(&self) -> (Vec<String>, Vec<String>) {
         let rows = merged_sidebar_rows(
             self.browser.rows(),
@@ -3101,7 +3030,6 @@ impl ShellState {
                 .filter(|row| self.selected_tree_paths.contains(&row.full_path))
                 .collect::<Vec<_>>()
         };
-
         let mut machine_keys = Vec::new();
         let mut labels = Vec::new();
         for row in selected_rows {
@@ -3113,7 +3041,6 @@ impl ShellState {
         }
         (machine_keys, labels)
     }
-
     fn begin_drag(&mut self, row: &BrowserRow, pointer: (f64, f64)) {
         if !is_workspace_row(row) {
             self.drag_paths.clear();
@@ -3149,13 +3076,11 @@ impl ShellState {
         );
         self.refresh_tree_debug("begin_drag");
     }
-
     fn update_drag_pointer(&mut self, pointer: (f64, f64)) {
         if !self.drag_paths.is_empty() {
             self.drag_pointer = Some(pointer);
         }
     }
-
     fn set_drag_hover_target(
         &mut self,
         row: &BrowserRow,
@@ -3188,7 +3113,6 @@ impl ShellState {
         );
         self.refresh_tree_debug("set_drag_hover_target");
     }
-
     fn clear_drag_state(&mut self) {
         let had_drag = !self.drag_paths.is_empty();
         self.drag_paths.clear();
@@ -3201,7 +3125,6 @@ impl ShellState {
         }
         self.refresh_tree_debug("clear_drag_state");
     }
-
     fn consume_suppressed_tree_click(&mut self) -> bool {
         if current_millis() < self.suppress_tree_click_until_ms {
             self.suppress_tree_click_until_ms = 0;
@@ -3210,7 +3133,6 @@ impl ShellState {
             false
         }
     }
-
     fn open_delete_dialog(&mut self, hard_delete: bool) {
         let (document_paths, group_paths, mut labels) = self.selected_workspace_delete_paths();
         let (ssh_machine_keys, ssh_labels) = self.selected_saved_ssh_target_machine_keys();
@@ -3242,12 +3164,10 @@ impl ShellState {
         }
         self.refresh_tree_debug("open_delete_dialog");
     }
-
     fn cancel_delete_dialog(&mut self) {
         self.pending_delete = None;
         self.refresh_tree_debug("cancel_delete_dialog");
     }
-
     fn begin_tree_rename(&mut self, row: &BrowserRow) {
         if !is_workspace_row(row) {
             return;
@@ -3258,18 +3178,15 @@ impl ShellState {
         self.close_context_menu();
         self.refresh_tree_debug("begin_tree_rename");
     }
-
     fn update_tree_rename_value(&mut self, value: String) {
         self.tree_rename_value = value;
         self.refresh_tree_debug("update_tree_rename");
     }
-
     fn cancel_tree_rename(&mut self) {
         self.tree_rename_path = None;
         self.tree_rename_value.clear();
         self.refresh_tree_debug("cancel_tree_rename");
     }
-
     fn refresh_tree_debug(&mut self, source: &str) {
         self.last_tree_debug = format!(
             "{source} | active={} | view={:?} | selected={} [{}] | drag={} [{}] | hover={} | pending_delete={} | rename={}",
@@ -3297,7 +3214,6 @@ impl ShellState {
                 .unwrap_or_else(|| "none".to_string())
         );
     }
-
     fn record_restore_issue_telemetry(&mut self, source: &str) {
         let effective_expanded = self.browser.expanded_path_set();
         let live_sessions = self.server.live_sessions();
@@ -3329,7 +3245,6 @@ impl ShellState {
         self.record_ui_telemetry("restore_debug", payload.clone());
         info!(source, payload=%payload, "restore debug");
     }
-
     fn record_preview_issue_telemetry(&mut self, source: &str) {
         let payload = if let Some(session) = self.server.active_session() {
             json!({
@@ -3358,7 +3273,6 @@ impl ShellState {
         self.record_ui_telemetry("preview_debug", payload.clone());
         info!(source, payload=%payload, "preview debug");
     }
-
     fn record_ui_telemetry(&mut self, event: &str, payload: Value) {
         let payload_text = payload.to_string();
         let now = current_millis();
@@ -3390,52 +3304,42 @@ impl ShellState {
             append_trace_event(store.home_dir(), "ui", "ui_telemetry", event, telemetry);
         }
     }
-
     fn regenerate_title_for_row(&mut self, _row: &BrowserRow) {
         self.context_menu_row = None;
     }
-
     fn persist_settings(&self) {
         let _ = save_settings_file(&self.bootstrap.settings_path, &self.settings);
     }
-
     fn sync_browser_settings(&mut self) {
         self.settings.show_tree = self.sidebar_open;
         self.settings.selected_browser_path = self.browser.selected_path().map(ToOwned::to_owned);
         self.settings.expanded_browser_paths = self.browser.expanded_paths();
         self.persist_settings();
     }
-
     fn toggle_titlebar_new_menu(&mut self) {
         self.titlebar_session_menu_open = false;
         self.titlebar_new_menu_open = !self.titlebar_new_menu_open;
     }
-
     fn close_titlebar_new_menu(&mut self) {
         self.titlebar_new_menu_open = false;
     }
-
     fn toggle_titlebar_session_menu(&mut self) {
         self.titlebar_new_menu_open = false;
         self.titlebar_session_menu_open = !self.titlebar_session_menu_open;
     }
-
     fn close_titlebar_session_menu(&mut self) {
         self.titlebar_session_menu_open = false;
     }
-
     fn activate_alt_overlay(&mut self) {
         self.alt_overlay_active = true;
         self.alt_overlay_sequence.clear();
         self.titlebar_new_menu_open = false;
         self.titlebar_session_menu_open = false;
     }
-
     fn clear_alt_overlay(&mut self) {
         self.alt_overlay_active = false;
         self.alt_overlay_sequence.clear();
     }
-
     fn push_notification(
         &mut self,
         tone: NotificationTone,
@@ -3477,7 +3381,6 @@ impl ShellState {
             self.notifications.drain(0..overflow);
         }
     }
-
     fn upsert_job_notification(
         &mut self,
         job_key: impl Into<String>,
@@ -3535,7 +3438,6 @@ impl ShellState {
             self.notifications.drain(0..overflow);
         }
     }
-
     fn finish_job_notification(
         &mut self,
         job_key: &str,
@@ -3550,7 +3452,6 @@ impl ShellState {
         }
     }
 }
-
 fn safe_push_notification(
     state: Signal<ShellState>,
     tone: NotificationTone,
@@ -3572,7 +3473,6 @@ fn safe_push_notification(
         );
     }
 }
-
 fn spawn_loading_notice(
     state: Signal<ShellState>,
     request_meta: YggRequestMeta,
@@ -3611,7 +3511,6 @@ fn spawn_loading_notice(
         });
     });
 }
-
 fn safe_upsert_job_notification(
     state: Signal<ShellState>,
     job_key: impl Into<String>,
@@ -3646,7 +3545,6 @@ fn safe_upsert_job_notification(
         );
     }
 }
-
 fn safe_finish_job_notification(
     state: Signal<ShellState>,
     job_key: impl Into<String>,
@@ -3679,15 +3577,12 @@ fn safe_finish_job_notification(
         );
     }
 }
-
 fn terminal_resume_notification_job_key(session_path: &str) -> String {
     format!("terminal-resume:{session_path}")
 }
-
 fn terminal_resume_notification_session_path(job_key: &str) -> Option<&str> {
     job_key.strip_prefix("terminal-resume:")
 }
-
 fn terminal_resume_notification_should_be_visible(
     active_view_mode: WorkspaceViewMode,
     active_session_path: Option<&str>,
@@ -3696,7 +3591,6 @@ fn terminal_resume_notification_should_be_visible(
     active_view_mode == WorkspaceViewMode::Terminal
         && active_session_path.is_some_and(|active_path| active_path == session_path)
 }
-
 fn terminal_resume_notification_should_stay_visible_for_session(
     attach_in_flight: bool,
     visual_reveal_complete: bool,
@@ -3704,7 +3598,6 @@ fn terminal_resume_notification_should_stay_visible_for_session(
 ) -> bool {
     attach_in_flight || active_terminal_request_in_flight || !visual_reveal_complete
 }
-
 fn remote_resume_visual_reveal_may_complete(
     post_attach_redraw_nudged: bool,
     post_attach_replay_rebased: bool,
@@ -3714,7 +3607,6 @@ fn remote_resume_visual_reveal_may_complete(
         || post_attach_replay_rebased
         || post_attach_replay_deadline_ms.is_some_and(|deadline_ms| current_millis() >= deadline_ms)
 }
-
 fn remote_resume_visual_reveal_has_post_attach_content(deferred_resume_output: &str) -> bool {
     terminal_chunk_has_visible_output(deferred_resume_output)
         && !terminal_chunk_is_transport_error(deferred_resume_output)
@@ -3725,7 +3617,6 @@ fn remote_resume_visual_reveal_has_post_attach_content(deferred_resume_output: &
         && !terminal_chunk_has_generic_codex_idle_footer(deferred_resume_output)
         && !terminal_chunk_tail_has_generic_codex_idle_footer(deferred_resume_output)
 }
-
 fn remote_resume_visual_reveal_output_is_acceptable(
     deferred_resume_output: &str,
     host_health_cursor_line_text: &str,
@@ -3752,11 +3643,9 @@ fn remote_resume_visual_reveal_output_is_acceptable(
         && !terminal_chunk_is_saved_transcript_prefill(host_surface_text)
         && !terminal_chunk_is_low_signal_terminal_noise(host_surface_text)
 }
-
 fn remote_resume_host_surface_may_prove_live_terminal(placeholder_rendered: bool) -> bool {
     !placeholder_rendered
 }
-
 fn terminal_max_blank_rows_below_live_cursor(rows: u16) -> u16 {
     if rows >= 36 {
         3
@@ -3766,11 +3655,9 @@ fn terminal_max_blank_rows_below_live_cursor(rows: u16) -> u16 {
         1
     }
 }
-
 fn terminal_host_prompt_layout_is_acceptable(rows: u16, blank_rows_below_cursor: u16) -> bool {
     rows == 0 || blank_rows_below_cursor <= terminal_max_blank_rows_below_live_cursor(rows)
 }
-
 fn remote_resume_visual_reveal_can_complete(
     attach_ready: bool,
     geometry_ready: bool,
@@ -3802,7 +3689,6 @@ fn remote_resume_visual_reveal_can_complete(
         && reveal_deadline_reached
         && (deferred_output_ready || host_surface_ready)
 }
-
 fn stale_remote_resume_retry_should_clear(
     is_remote_resume_session: bool,
     attach_ready: bool,
@@ -3834,7 +3720,6 @@ fn stale_remote_resume_retry_should_clear(
             host_health_text_tail,
         )
 }
-
 fn stale_remote_resume_retry_blank_surface_should_recover(
     is_remote_resume_session: bool,
     ready_attempt: bool,
@@ -3861,7 +3746,6 @@ fn stale_remote_resume_retry_blank_surface_should_recover(
             host_health_blank_rows_below_cursor,
         )
 }
-
 fn upsert_terminal_resume_notification(
     state: Signal<ShellState>,
     session_path: &str,
@@ -3895,7 +3779,6 @@ fn upsert_terminal_resume_notification(
         );
     });
 }
-
 fn clear_terminal_resume_notification(state: Signal<ShellState>, session_path: &str) {
     safe_finish_job_notification(
         state,
@@ -3906,7 +3789,6 @@ fn clear_terminal_resume_notification(state: Signal<ShellState>, session_path: &
         false,
     );
 }
-
 fn safe_shell_mut<R>(
     mut state: Signal<ShellState>,
     context: &'static str,
@@ -3919,7 +3801,6 @@ fn safe_shell_mut<R>(
         },
     )
 }
-
 fn safe_shell_read<R>(
     state: Signal<ShellState>,
     context: &'static str,
@@ -3936,7 +3817,6 @@ fn safe_shell_read<R>(
         }
     }
 }
-
 fn queue_title_generation(state: Signal<ShellState>, row: BrowserRow, force: bool) {
     let target = safe_shell_read(state, "queue_title_generation_read", |shell| {
         copy_generation_target_for_browser_row(&shell.server, &row)
@@ -3946,13 +3826,11 @@ fn queue_title_generation(state: Signal<ShellState>, row: BrowserRow, force: boo
         spawn_title_generation_for_target(state, target, force, force, false);
     }
 }
-
 fn spawn_deferred_title_generation(state: Signal<ShellState>, row: BrowserRow, force: bool) {
     spawn(async move {
         queue_title_generation(state, row, force);
     });
 }
-
 fn queue_active_session_title_generation(state: Signal<ShellState>, force: bool) {
     let Some(target) = safe_shell_read(
         state,
@@ -3967,7 +3845,6 @@ fn queue_active_session_title_generation(state: Signal<ShellState>, force: bool)
     };
     spawn_title_generation_for_target(state, target, force, force, false);
 }
-
 fn queue_active_session_title_generation_silent(state: Signal<ShellState>, force: bool) {
     let Some(target) = safe_shell_read(
         state,
@@ -3982,13 +3859,11 @@ fn queue_active_session_title_generation_silent(state: Signal<ShellState>, force
     };
     spawn_title_generation_for_target(state, target, force, false, false);
 }
-
 fn spawn_deferred_active_session_title_generation(state: Signal<ShellState>, force: bool) {
     spawn(async move {
         queue_active_session_title_generation(state, force);
     });
 }
-
 fn spawn_title_generation_for_target(
     mut state: Signal<ShellState>,
     target: CopyGenerationTarget,
@@ -4094,7 +3969,6 @@ fn spawn_title_generation_for_target(
                 Ok((title, Some(browser_tree)))
             }
         }).await;
-
         perf.finish(json!({
             "session_path": session_path.clone(),
             "force": force,
@@ -4218,7 +4092,6 @@ fn spawn_title_generation_for_target(
         maybe_spawn_background_copy_generation(state);
     });
 }
-
 #[allow(dead_code)]
 fn spawn_precis_generation(state: Signal<ShellState>, session: ManagedSessionView, force: bool) {
     let Some(target) = copy_generation_target_for_session(&state.read().server, &session) else {
@@ -4226,7 +4099,6 @@ fn spawn_precis_generation(state: Signal<ShellState>, session: ManagedSessionVie
     };
     spawn_precis_generation_for_target(state, target, force, force, true);
 }
-
 #[allow(dead_code)]
 fn spawn_precis_generation_for_target(
     mut state: Signal<ShellState>,
@@ -4333,7 +4205,6 @@ fn spawn_precis_generation_for_target(
             )
         })
         .await;
-
         perf.finish(json!({
             "session_path": session_path.clone(),
             "force": force,
@@ -4441,7 +4312,6 @@ fn spawn_precis_generation_for_target(
         maybe_spawn_background_copy_generation(state);
     });
 }
-
 fn spawn_summary_generation(
     state: Signal<ShellState>,
     session: ManagedSessionView,
@@ -4457,7 +4327,6 @@ fn spawn_summary_generation(
     };
     spawn_summary_generation_for_target(state, target, force, announce, force);
 }
-
 fn spawn_summary_generation_for_target(
     mut state: Signal<ShellState>,
     target: CopyGenerationTarget,
@@ -4565,7 +4434,6 @@ fn spawn_summary_generation_for_target(
             )
         })
         .await;
-
         perf.finish(json!({
             "session_path": session_path.clone(),
             "force": force,
@@ -4677,7 +4545,6 @@ fn spawn_summary_generation_for_target(
         maybe_spawn_background_copy_generation(state);
     });
 }
-
 fn spawn_initial_server_sync(
     state: Signal<ShellState>,
     schedule_ui: std::sync::Arc<dyn Fn() + Send + Sync>,
@@ -4735,7 +4602,6 @@ fn spawn_initial_server_sync(
         maybe_spawn_missing_managed_cli_refreshes(state);
     });
 }
-
 fn spawn_initial_browser_tree_load(
     state: Signal<ShellState>,
     schedule_ui: std::sync::Arc<dyn Fn() + Send + Sync>,
@@ -4757,7 +4623,9 @@ fn spawn_initial_browser_tree_load(
             shell.browser_tree_loading_in_flight = false;
             match outcome {
                 Ok(Ok(browser_tree)) => {
-                    let selected_hint = shell.browser.selected_path().map(str::to_string);
+                    let selected_hint = shell
+                        .active_browser_selection_path_for_session()
+                        .or_else(|| shell.browser.selected_path().map(str::to_string));
                     restore_browser_tree(shell, browser_tree, selected_hint.as_deref());
                     shell.refresh_search_state("initial_browser_tree_load_complete");
                     shell.last_action = "loaded session tree".to_string();
@@ -4774,7 +4642,6 @@ fn spawn_initial_browser_tree_load(
         schedule_ui();
     });
 }
-
 fn restart_into_pending_update(mut state: Signal<ShellState>) {
     let pending = state.read().pending_update_restart.clone();
     let Some(update) = pending else {
@@ -4824,7 +4691,6 @@ fn restart_into_pending_update(mut state: Signal<ShellState>) {
         }
     });
 }
-
 fn spawn_graceful_shutdown_and_close(mut state: Signal<ShellState>) {
     if state.read().closing_app {
         return;
@@ -4836,7 +4702,6 @@ fn spawn_graceful_shutdown_and_close(mut state: Signal<ShellState>) {
     });
     let _ = window().close();
 }
-
 fn spawn_auto_update_install_check(mut state: Signal<ShellState>) {
     let install_context = state.read().bootstrap.install_context.clone();
     let perf_home = perf_home_dir(&state.read().bootstrap.settings_path);
@@ -4883,7 +4748,6 @@ fn spawn_auto_update_install_check(mut state: Signal<ShellState>) {
         }
     });
 }
-
 fn spawn_notify_only_update_check(mut state: Signal<ShellState>) {
     let install_context = state.read().bootstrap.install_context.clone();
     let perf_home = perf_home_dir(&state.read().bootstrap.settings_path);
@@ -4924,13 +4788,11 @@ fn spawn_notify_only_update_check(mut state: Signal<ShellState>) {
         });
     });
 }
-
 pub fn initial_server_sync(
     endpoint: ServerEndpoint,
 ) -> Result<(ServerUiSnapshot, Option<ServerRuntimeStatus>, String)> {
     let trace_home = resolve_yggterm_home().ok();
     ensure_daemon_running(&endpoint)?;
-
     let mut runtime = status(&endpoint).ok();
     if let Some(home) = trace_home.as_ref() {
         append_trace_event(
@@ -4944,7 +4806,6 @@ pub fn initial_server_sync(
             }),
         );
     }
-
     let (mut snapshot, _) = match daemon_snapshot(&endpoint) {
         Ok(snapshot) => snapshot,
         Err(_) => {
@@ -4986,9 +4847,7 @@ pub fn initial_server_sync(
     };
     Ok((snapshot, runtime, detail))
 }
-
 const DEFAULT_DAEMON_WATCHDOG_POLL_MS: u64 = 15_000;
-
 fn daemon_watchdog_poll_ms() -> u64 {
     std::env::var("YGGTERM_DAEMON_WATCHDOG_POLL_MS")
         .ok()
@@ -4996,7 +4855,6 @@ fn daemon_watchdog_poll_ms() -> u64 {
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_DAEMON_WATCHDOG_POLL_MS)
 }
-
 pub fn start_daemon_watchdog(endpoint: ServerEndpoint, trace_home: Option<PathBuf>) {
     std::thread::Builder::new()
         .name("yggterm-daemon-watchdog".to_string())
@@ -5026,7 +4884,6 @@ pub fn start_daemon_watchdog(endpoint: ServerEndpoint, trace_home: Option<PathBu
         })
         .ok();
 }
-
 pub fn warm_daemon_start(endpoint: ServerEndpoint, trace_home: Option<PathBuf>) {
     std::thread::Builder::new()
         .name("yggterm-daemon-warm".to_string())
@@ -5050,7 +4907,6 @@ pub fn warm_daemon_start(endpoint: ServerEndpoint, trace_home: Option<PathBuf>) 
         })
         .ok();
 }
-
 fn snapshot_needs_remote_restore_restart(snapshot: &ServerUiSnapshot) -> bool {
     snapshot.remote_machines.is_empty()
         && snapshot.ssh_targets.is_empty()
@@ -5059,7 +4915,6 @@ fn snapshot_needs_remote_restore_restart(snapshot: &ServerUiSnapshot) -> bool {
             .iter()
             .any(|session| session.kind == SessionKind::SshShell)
 }
-
 fn current_spawn_executable() -> Result<PathBuf> {
     let current_exe = std::env::current_exe()?;
     if current_exe.exists() {
@@ -5082,7 +4937,6 @@ fn current_spawn_executable() -> Result<PathBuf> {
     }
     Ok(current_exe)
 }
-
 fn trace_daemon_step(endpoint: &ServerEndpoint, name: &str, payload: serde_json::Value) {
     if let Ok(home) = resolve_yggterm_home() {
         append_trace_event(
@@ -5101,7 +4955,6 @@ fn trace_daemon_step(endpoint: &ServerEndpoint, name: &str, payload: serde_json:
         );
     }
 }
-
 fn daemon_endpoint_key(endpoint: &ServerEndpoint) -> String {
     match endpoint {
         #[cfg(unix)]
@@ -5109,7 +4962,80 @@ fn daemon_endpoint_key(endpoint: &ServerEndpoint) -> String {
         ServerEndpoint::Tcp { host, port } => format!("{host}:{port}"),
     }
 }
-
+#[cfg(unix)]
+fn parse_versioned_server_socket_name(path: &Path) -> Option<(u64, u64, u64)> {
+    let file_name = path.file_name()?.to_str()?;
+    let version = file_name
+        .strip_prefix("server-")?
+        .strip_suffix(".sock")?
+        .split('-')
+        .map(|part| part.parse::<u64>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    match version.as_slice() {
+        [major, minor, patch] => Some((*major, *minor, *patch)),
+        [major, minor] => Some((*major, *minor, 0)),
+        [major] => Some((*major, 0, 0)),
+        _ => None,
+    }
+}
+#[cfg(unix)]
+fn reachable_versioned_server_socket_candidates(current: &Path) -> Vec<PathBuf> {
+    let Some(parent) = current.parent() else {
+        return Vec::new();
+    };
+    let mut candidates = fs::read_dir(parent)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path != current)
+        .filter(|path| parse_versioned_server_socket_name(path).is_some())
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        parse_versioned_server_socket_name(right)
+            .cmp(&parse_versioned_server_socket_name(left))
+            .then_with(|| right.cmp(left))
+    });
+    candidates
+}
+#[cfg(unix)]
+fn maybe_alias_current_endpoint_to_reachable_versioned_socket(
+    endpoint: &ServerEndpoint,
+) -> Result<Option<PathBuf>> {
+    let ServerEndpoint::UnixSocket(current_path) = endpoint else {
+        return Ok(None);
+    };
+    for candidate in reachable_versioned_server_socket_candidates(current_path) {
+        let candidate_endpoint = ServerEndpoint::UnixSocket(candidate.clone());
+        if ping(&candidate_endpoint).is_err() {
+            continue;
+        }
+        if current_path.exists() && ping(endpoint).is_err() {
+            let _ = fs::remove_file(current_path);
+        }
+        if !current_path.exists() {
+            std::os::unix::fs::symlink(&candidate, current_path).with_context(|| {
+                format!(
+                    "linking stale daemon socket {} to reachable {}",
+                    current_path.display(),
+                    candidate.display()
+                )
+            })?;
+        }
+        if ping(endpoint).is_ok() {
+            trace_daemon_step(
+                endpoint,
+                "aliased_to_reachable_versioned_socket",
+                json!({
+                    "current_path": current_path.display().to_string(),
+                    "candidate_path": candidate.display().to_string(),
+                }),
+            );
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
 fn note_recent_daemon_start(endpoint: &ServerEndpoint) {
     let endpoint_key = daemon_endpoint_key(endpoint);
     let recent = RECENT_DAEMON_STARTS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -5117,7 +5043,6 @@ fn note_recent_daemon_start(endpoint: &ServerEndpoint) {
         guard.insert(endpoint_key, current_millis());
     }
 }
-
 fn daemon_started_recently(endpoint: &ServerEndpoint) -> bool {
     let endpoint_key = daemon_endpoint_key(endpoint);
     let recent = RECENT_DAEMON_STARTS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -5138,11 +5063,9 @@ fn daemon_started_recently(endpoint: &ServerEndpoint) -> bool {
         None => false,
     }
 }
-
 struct ProcessLocalDaemonEnsureGuard {
     endpoint_key: Option<String>,
 }
-
 impl Drop for ProcessLocalDaemonEnsureGuard {
     fn drop(&mut self) {
         let Some(endpoint_key) = self.endpoint_key.take() else {
@@ -5155,7 +5078,6 @@ impl Drop for ProcessLocalDaemonEnsureGuard {
         }
     }
 }
-
 fn acquire_process_local_daemon_ensure_guard(
     endpoint: &ServerEndpoint,
 ) -> ProcessLocalDaemonEnsureGuard {
@@ -5203,7 +5125,6 @@ fn acquire_process_local_daemon_ensure_guard(
         thread::sleep(Duration::from_millis(50));
     }
 }
-
 fn ensure_daemon_running(endpoint: &ServerEndpoint) -> Result<()> {
     let _process_guard = acquire_process_local_daemon_ensure_guard(endpoint);
     let current_exe = current_spawn_executable()?;
@@ -5226,6 +5147,16 @@ fn ensure_daemon_running(endpoint: &ServerEndpoint) -> Result<()> {
     if ping(endpoint).is_ok() {
         note_recent_daemon_start(endpoint);
         trace_daemon_step(endpoint, "ping_ok_existing", json!({}));
+        return Ok(());
+    }
+    #[cfg(unix)]
+    if let Some(candidate) = maybe_alias_current_endpoint_to_reachable_versioned_socket(endpoint)? {
+        note_recent_daemon_start(endpoint);
+        trace_daemon_step(
+            endpoint,
+            "ping_ok_via_versioned_socket_alias",
+            json!({ "candidate_path": candidate.display().to_string() }),
+        );
         return Ok(());
     }
     if recent_start_grace {
@@ -5304,6 +5235,21 @@ fn ensure_daemon_running(endpoint: &ServerEndpoint) -> Result<()> {
                     "wait_for_daemon_error",
                     json!({ "attempt": attempt + 1, "error": error.to_string() }),
                 );
+                #[cfg(unix)]
+                if let Some(candidate) =
+                    maybe_alias_current_endpoint_to_reachable_versioned_socket(endpoint)?
+                {
+                    note_recent_daemon_start(endpoint);
+                    trace_daemon_step(
+                        endpoint,
+                        "wait_for_daemon_recovered_via_versioned_socket_alias",
+                        json!({
+                            "attempt": attempt + 1,
+                            "candidate_path": candidate.display().to_string(),
+                        }),
+                    );
+                    return Ok(());
+                }
                 last_error = Some(error);
                 let _ = daemon_shutdown(endpoint);
                 drop(spawn_lock);
@@ -5313,7 +5259,6 @@ fn ensure_daemon_running(endpoint: &ServerEndpoint) -> Result<()> {
     }
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("daemon did not become reachable")))
 }
-
 fn restart_daemon(endpoint: &ServerEndpoint) -> Result<()> {
     let _process_guard = acquire_process_local_daemon_ensure_guard(endpoint);
     let current_exe = current_spawn_executable()?;
@@ -5340,7 +5285,6 @@ fn restart_daemon(endpoint: &ServerEndpoint) -> Result<()> {
     }
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("daemon did not become reachable")))
 }
-
 fn prepare_current_endpoint_for_spawn(endpoint: &ServerEndpoint) -> Result<()> {
     #[cfg(unix)]
     if let ServerEndpoint::UnixSocket(path) = endpoint {
@@ -5350,7 +5294,11 @@ fn prepare_current_endpoint_for_spawn(endpoint: &ServerEndpoint) -> Result<()> {
     }
     Ok(())
 }
-
+fn reap_spawned_child_in_background(mut child: std::process::Child) {
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+}
 fn spawn_daemon_process(endpoint: &ServerEndpoint) -> Result<()> {
     let current_exe = current_spawn_executable()?;
     let log_file = daemon_startup_log_file(endpoint)?;
@@ -5373,10 +5321,10 @@ fn spawn_daemon_process(endpoint: &ServerEndpoint) -> Result<()> {
             });
         }
     }
-    command.spawn()?;
+    let child = command.spawn()?;
+    reap_spawned_child_in_background(child);
     Ok(())
 }
-
 fn wait_for_daemon(endpoint: &ServerEndpoint) -> Result<()> {
     for _ in 0..100 {
         thread::sleep(Duration::from_millis(150));
@@ -5387,7 +5335,6 @@ fn wait_for_daemon(endpoint: &ServerEndpoint) -> Result<()> {
     let tail = read_daemon_startup_log_tail(endpoint);
     anyhow::bail!("daemon did not become reachable{tail}")
 }
-
 fn daemon_startup_log_file(endpoint: &ServerEndpoint) -> Result<std::fs::File> {
     let path = daemon_startup_log_path(endpoint);
     if let Some(parent) = path.parent() {
@@ -5398,7 +5345,6 @@ fn daemon_startup_log_file(endpoint: &ServerEndpoint) -> Result<std::fs::File> {
         .append(true)
         .open(path)?)
 }
-
 fn daemon_spawn_lock_path(endpoint: &ServerEndpoint) -> PathBuf {
     match endpoint {
         #[cfg(unix)]
@@ -5409,13 +5355,11 @@ fn daemon_spawn_lock_path(endpoint: &ServerEndpoint) -> PathBuf {
         ServerEndpoint::Tcp { .. } => PathBuf::from("daemon.spawn.lock"),
     }
 }
-
 #[derive(Debug, Serialize, Deserialize)]
 struct DaemonSpawnLockRecord {
     pid: u32,
     created_at_ms: u64,
 }
-
 fn daemon_spawn_lock_is_stale(path: &Path) -> bool {
     let Ok(bytes) = fs::read(path) else {
         return true;
@@ -5435,7 +5379,6 @@ fn daemon_spawn_lock_is_stale(path: &Path) -> bool {
         .map(|elapsed| elapsed.as_millis() as u64);
     modified_age_ms.is_none_or(|age_ms| age_ms > 15_000)
 }
-
 fn acquire_daemon_spawn_lock(endpoint: &ServerEndpoint) -> Result<DaemonSpawnLock> {
     let path = daemon_spawn_lock_path(endpoint);
     if let Some(parent) = path.parent() {
@@ -5467,7 +5410,6 @@ fn acquire_daemon_spawn_lock(endpoint: &ServerEndpoint) -> Result<DaemonSpawnLoc
     }
     anyhow::bail!("timed out waiting for daemon spawn lock {}", path.display())
 }
-
 fn daemon_startup_log_path(endpoint: &ServerEndpoint) -> PathBuf {
     match endpoint {
         #[cfg(unix)]
@@ -5478,7 +5420,6 @@ fn daemon_startup_log_path(endpoint: &ServerEndpoint) -> PathBuf {
         ServerEndpoint::Tcp { .. } => PathBuf::from("daemon.log"),
     }
 }
-
 fn read_daemon_startup_log_tail(endpoint: &ServerEndpoint) -> String {
     let path = daemon_startup_log_path(endpoint);
     let Ok(contents) = std::fs::read_to_string(path) else {
@@ -5498,7 +5439,6 @@ fn read_daemon_startup_log_tail(endpoint: &ServerEndpoint) -> String {
         format!("; daemon log tail: {}", lines.join(" | "))
     }
 }
-
 async fn maybe_debug_request_delay() {
     let Some(raw) = std::env::var(DEBUG_REQUEST_DELAY_ENV).ok() else {
         return;
@@ -5511,7 +5451,6 @@ async fn maybe_debug_request_delay() {
     }
     sleep(Duration::from_millis(delay_ms)).await;
 }
-
 fn maybe_spawn_missing_remote_machine_refreshes(state: Signal<ShellState>) {
     if safe_shell_read(
         state,
@@ -5557,7 +5496,6 @@ fn maybe_spawn_missing_remote_machine_refreshes(state: Signal<ShellState>) {
         spawn_background_remote_machine_refresh(state, machine_key);
     }
 }
-
 fn managed_cli_refresh_scope_keys(
     remote_machines: &[RemoteMachineSnapshot],
     ssh_targets: &[SshConnectTarget],
@@ -5576,7 +5514,6 @@ fn managed_cli_refresh_scope_keys(
     }
     keys
 }
-
 fn maybe_spawn_missing_managed_cli_refreshes(state: Signal<ShellState>) {
     if safe_shell_read(
         state,
@@ -5620,7 +5557,6 @@ fn maybe_spawn_missing_managed_cli_refreshes(state: Signal<ShellState>) {
         spawn_background_managed_cli_refresh(state, scope_key);
     }
 }
-
 fn app_control_command_defers_background_refresh(command: &AppControlCommand) -> bool {
     matches!(
         command,
@@ -5636,7 +5572,6 @@ fn app_control_command_defers_background_refresh(command: &AppControlCommand) ->
             | AppControlCommand::Drag { .. }
     )
 }
-
 fn terminal_attach_blocks_background_work(shell: &ShellState) -> bool {
     if shell.server.active_view_mode() != WorkspaceViewMode::Terminal {
         return false;
@@ -5647,7 +5582,6 @@ fn terminal_attach_blocks_background_work(shell: &ShellState) -> bool {
     active_path.starts_with("remote-session://")
         && shell.terminal_attach_in_flight.contains(active_path)
 }
-
 fn interactive_surface_request_in_flight(shell: &ShellState) -> bool {
     shell.active_surface_requests.values().any(|request| {
         !matches!(
@@ -5656,11 +5590,136 @@ fn interactive_surface_request_in_flight(shell: &ShellState) -> bool {
         )
     })
 }
-
 fn background_refreshes_deferred(shell: &ShellState) -> bool {
     current_millis() < shell.background_refresh_after_ms
 }
+fn shell_has_live_session_snapshot_refresh_target(shell: &ShellState) -> bool {
+    !shell.server.live_sessions().is_empty()
+}
+fn shell_live_session_snapshot_refresh_interval_ms(shell: &ShellState) -> u64 {
+    if shell
+        .server
+        .live_sessions()
+        .iter()
+        .any(|session| session.terminal_foreground_active == Some(true))
+    {
+        LIVE_SESSION_SNAPSHOT_BUSY_POLL_MS
+    } else {
+        LIVE_SESSION_SNAPSHOT_IDLE_POLL_MS
+    }
+}
+fn schedule_live_session_snapshot_refresh(shell: &mut ShellState, debounce_ms: u64) {
+    if !shell_has_live_session_snapshot_refresh_target(shell) {
+        return;
+    }
+    let due_at_ms = current_millis().saturating_add(debounce_ms);
+    if shell.next_live_session_snapshot_after_ms == 0
+        || shell.next_live_session_snapshot_after_ms > due_at_ms
+    {
+        shell.next_live_session_snapshot_after_ms = due_at_ms;
+    }
+}
+fn spawn_live_session_snapshot_nudge(state: Signal<ShellState>) {
+    spawn(async move {
+        for _ in 0..LIVE_SESSION_SNAPSHOT_NUDGE_POLLS {
+            let _ = safe_shell_mut(state, "live_session_snapshot_nudge_schedule", |shell| {
+                if shell_has_live_session_snapshot_refresh_target(shell) {
+                    shell.next_live_session_snapshot_after_ms = current_millis();
+                }
+            });
+            maybe_spawn_background_live_session_snapshot(state);
+            sleep(Duration::from_millis(
+                LIVE_SESSION_SNAPSHOT_NUDGE_INTERVAL_MS,
+            ))
+            .await;
+        }
+    });
+}
 
+fn maybe_spawn_background_live_session_snapshot(state: Signal<ShellState>) {
+    let snapshot_target = safe_shell_read(
+        state,
+        "maybe_spawn_background_live_session_snapshot_read",
+        |shell| {
+            if shell.live_session_snapshot_refresh_in_flight
+                || shell.needs_initial_server_sync
+                || interactive_surface_request_in_flight(shell)
+                || !shell_has_live_session_snapshot_refresh_target(shell)
+                || current_millis() < shell.next_live_session_snapshot_after_ms
+            {
+                return None;
+            }
+            Some((
+                shell.bootstrap.server_endpoint.clone(),
+                perf_home_dir(&shell.bootstrap.settings_path),
+            ))
+        },
+    )
+    .flatten();
+    let Some((endpoint, trace_home)) = snapshot_target else {
+        return;
+    };
+    let already_started = safe_shell_mut(
+        state,
+        "maybe_spawn_background_live_session_snapshot_begin",
+        |shell| {
+            if shell.live_session_snapshot_refresh_in_flight {
+                true
+            } else {
+                shell.live_session_snapshot_refresh_in_flight = true;
+                false
+            }
+        },
+    )
+    .ok()
+    .unwrap_or(true);
+    if already_started {
+        return;
+    }
+    spawn(async move {
+        let outcome = run_dedicated_interactive_request_io(
+            "background_live_session_snapshot",
+            trace_home.as_path(),
+            move || daemon_snapshot(&endpoint),
+        )
+        .await;
+        let _ = safe_shell_mut(
+            state,
+            "background_live_session_snapshot_complete",
+            |shell| {
+                shell.live_session_snapshot_refresh_in_flight = false;
+                match outcome {
+                    Ok(result) => {
+                        shell.apply_snapshot_result_without_request(
+                            Ok(result),
+                            true,
+                            "background_live_session_snapshot",
+                            false,
+                        );
+                        shell.next_live_session_snapshot_after_ms = current_millis()
+                            .saturating_add(shell_live_session_snapshot_refresh_interval_ms(shell));
+                    }
+                    Err(error) => {
+                        shell.next_live_session_snapshot_after_ms =
+                            current_millis().saturating_add(LIVE_SESSION_SNAPSHOT_IDLE_POLL_MS);
+                        if let Ok(store) = SessionStore::open_or_init() {
+                            append_trace_event(
+                                store.home_dir(),
+                                "ui",
+                                "background_live_session_snapshot",
+                                "error",
+                                json!({
+                                    "error": error.to_string(),
+                                }),
+                            );
+                        }
+                        warn!(error=%error, "background live session snapshot failed");
+                    }
+                }
+            },
+        );
+    });
+}
 fn spawn_background_managed_cli_refresh(state: Signal<ShellState>, scope_key: String) {
     let endpoint = state.read().bootstrap.server_endpoint.clone();
     let mut request_meta = if scope_key == "local" {
@@ -5785,7 +5844,6 @@ fn spawn_background_managed_cli_refresh(state: Signal<ShellState>, scope_key: St
         maybe_spawn_missing_managed_cli_refreshes(state);
     });
 }
-
 fn spawn_background_remote_machine_refresh(state: Signal<ShellState>, machine_key: String) {
     let endpoint = state.read().bootstrap.server_endpoint.clone();
     let mut request_meta = YggRequestMeta::background(
@@ -5861,7 +5919,6 @@ fn spawn_background_remote_machine_refresh(state: Signal<ShellState>, machine_ke
         maybe_spawn_missing_managed_cli_refreshes(state);
     });
 }
-
 fn pending_remote_machine_refreshes(
     remote_machines: &[RemoteMachineSnapshot],
     ssh_targets: &[SshConnectTarget],
@@ -5879,7 +5936,6 @@ fn pending_remote_machine_refreshes(
             )
         })
         .collect::<HashMap<_, _>>();
-
     let mut desired_machine_keys = remote_machines
         .iter()
         .map(|machine| machine.machine_key.clone())
@@ -5928,7 +5984,6 @@ fn pending_remote_machine_refreshes(
         })
         .collect::<Vec<_>>()
 }
-
 fn pending_managed_cli_refreshes(
     remote_machines: &[RemoteMachineSnapshot],
     ssh_targets: &[SshConnectTarget],
@@ -5950,14 +6005,12 @@ fn pending_managed_cli_refreshes(
         })
         .collect::<Vec<_>>()
 }
-
 fn spawn_server_snapshot_action<F>(state: Signal<ShellState>, pending_label: String, request: F)
 where
     F: FnOnce(ServerEndpoint) -> Result<(ServerUiSnapshot, Option<String>)> + Send + 'static,
 {
     spawn_targeted_server_snapshot_action(state, pending_label, YggTarget::App, request);
 }
-
 fn spawn_targeted_server_snapshot_action<F>(
     state: Signal<ShellState>,
     pending_label: String,
@@ -5979,7 +6032,6 @@ fn spawn_targeted_server_snapshot_action<F>(
         request,
     );
 }
-
 fn spawn_surface_snapshot_action<F>(
     mut state: Signal<ShellState>,
     pending_label: String,
@@ -6001,7 +6053,6 @@ fn spawn_surface_snapshot_action<F>(
             "{pending_label} is taking longer than expected. Yggterm is keeping the current UI alive while the daemon finishes."
         ),
     );
-
     spawn(async move {
         maybe_debug_request_delay().await;
         let trace_home = resolve_yggterm_home().unwrap_or_else(|_| PathBuf::from("."));
@@ -6031,7 +6082,6 @@ fn spawn_surface_snapshot_action<F>(
         maybe_spawn_missing_remote_machine_refreshes(state);
     });
 }
-
 fn spawn_set_view_mode(mut state: Signal<ShellState>, mode: WorkspaceViewMode) {
     if mode == WorkspaceViewMode::Terminal {
         let supports_terminal = state.with(|shell| {
@@ -6106,10 +6156,24 @@ fn spawn_set_view_mode(mut state: Signal<ShellState>, mode: WorkspaceViewMode) {
         }
     }
 }
-
 fn spawn_open_session_row(state: Signal<ShellState>, row: BrowserRow) {
     let prefer_terminal = state.read().server.active_view_mode() == WorkspaceViewMode::Terminal;
     spawn_open_session_row_with_mode_retry(state, row, prefer_terminal, 2);
+}
+
+fn remote_live_focus_error_should_retry_via_open(row: &BrowserRow, error_text: &str) -> bool {
+    if parse_remote_scanned_session_path(&row.full_path).is_none() {
+        return false;
+    }
+    let normalized = error_text.trim().to_ascii_lowercase();
+    normalized.contains("reading daemon response")
+        || normalized.contains("parsing daemon response: \"\"")
+}
+
+fn restore_tree_selection_to_active_session(shell: &mut ShellState) {
+    shell.sync_active_session_selection();
+    shell.ensure_active_session_visible();
+    shell.sync_browser_settings();
 }
 
 fn spawn_focus_live_session_row(
@@ -6119,7 +6183,6 @@ fn spawn_focus_live_session_row(
 ) {
     spawn_focus_live_session_row_retry(state, row, mode, 2);
 }
-
 fn spawn_focus_live_session_row_retry(
     mut state: Signal<ShellState>,
     row: BrowserRow,
@@ -6211,9 +6274,26 @@ fn spawn_focus_live_session_row_retry(
                 Ok(result) => shell.apply_interactive_snapshot_result_for(&request_id, Ok(result)),
                 Err(error) => {
                     shell.finish_busy_request_for(&request_id);
+                    let error_text = error.to_string();
                     if retry_budget > 0
-                        && is_transient_local_daemon_connect_error(&error.to_string())
+                        && remote_live_focus_error_should_retry_via_open(&row, &error_text)
                     {
+                        shell.last_action = format!(
+                            "{pending_label} lost a stale live handle; reopening the remote session"
+                        );
+                        let row = row.clone();
+                        spawn(async move {
+                            spawn_open_session_row_with_mode_retry_inner(
+                                state,
+                                row,
+                                mode == WorkspaceViewMode::Terminal,
+                                retry_budget.saturating_sub(1),
+                                false,
+                            );
+                        });
+                        return;
+                    }
+                    if retry_budget > 0 && is_transient_local_daemon_connect_error(&error_text) {
                         let retry_delay_ms = 180;
                         shell.last_action = format!(
                             "{pending_label} waiting for local daemon startup; retrying in {retry_delay_ms} ms"
@@ -6238,11 +6318,12 @@ fn spawn_focus_live_session_row_retry(
                         });
                         return;
                     }
-                    shell.last_action = format!("{pending_label} task failed: {error}");
+                    shell.last_action = format!("{pending_label} task failed: {error_text}");
+                    restore_tree_selection_to_active_session(shell);
                     shell.push_notification(
                         NotificationTone::Error,
                         "Open Session Failed",
-                        error.to_string(),
+                        error_text,
                     );
                 }
             }
@@ -6259,7 +6340,6 @@ fn spawn_focus_live_session_row_retry(
         maybe_spawn_missing_managed_cli_refreshes(state);
     });
 }
-
 fn spawn_open_session_row_with_mode(
     state: Signal<ShellState>,
     row: BrowserRow,
@@ -6267,12 +6347,20 @@ fn spawn_open_session_row_with_mode(
 ) {
     spawn_open_session_row_with_mode_retry(state, row, prefer_terminal, 2);
 }
-
 fn spawn_open_session_row_with_mode_retry(
+    state: Signal<ShellState>,
+    row: BrowserRow,
+    prefer_terminal: bool,
+    retry_budget: u8,
+) {
+    spawn_open_session_row_with_mode_retry_inner(state, row, prefer_terminal, retry_budget, true);
+}
+fn spawn_open_session_row_with_mode_retry_inner(
     mut state: Signal<ShellState>,
     row: BrowserRow,
     prefer_terminal: bool,
     retry_budget: u8,
+    allow_live_focus: bool,
 ) {
     let requested_terminal = prefer_terminal;
     let prefer_terminal = prefer_terminal && state.with(|shell| row_supports_terminal(shell, &row));
@@ -6280,7 +6368,7 @@ fn spawn_open_session_row_with_mode_retry(
     let staged_remote_preview_session = (!prefer_terminal)
         .then(|| parse_remote_scanned_session_path(&row.full_path).map(|_| row.full_path.clone()))
         .flatten();
-    if is_live_sidebar_row(&row) {
+    if allow_live_focus && is_live_sidebar_row(&row) {
         let mode = if prefer_terminal {
             WorkspaceViewMode::Terminal
         } else {
@@ -6480,13 +6568,14 @@ fn spawn_open_session_row_with_mode_retry(
                 }
                 Err(error) => {
                     shell.finish_busy_request_for(&request_id);
+                    let error_text = error.to_string();
                     if prefer_terminal {
-                        shell
-                            .fail_terminal_open_attempt_for_request(&request_id, error.to_string());
+                        shell.fail_terminal_open_attempt_for_request(
+                            &request_id,
+                            error_text.clone(),
+                        );
                     }
-                    if retry_budget > 0
-                        && is_transient_local_daemon_connect_error(&error.to_string())
-                    {
+                    if retry_budget > 0 && is_transient_local_daemon_connect_error(&error_text) {
                         let retry_delay_ms = 180;
                         shell.last_action = format!(
                             "{pending_label} waiting for local daemon startup; retrying in {retry_delay_ms} ms"
@@ -6511,11 +6600,12 @@ fn spawn_open_session_row_with_mode_retry(
                         });
                         return;
                     }
-                    shell.last_action = format!("{pending_label} task failed: {error}");
+                    shell.last_action = format!("{pending_label} task failed: {error_text}");
+                    restore_tree_selection_to_active_session(shell);
                     shell.push_notification(
                         NotificationTone::Error,
                         "Open Session Failed",
-                        error.to_string(),
+                        error_text,
                     );
                 }
             }
@@ -6544,7 +6634,6 @@ fn spawn_open_session_row_with_mode_retry(
         maybe_spawn_missing_remote_machine_refreshes(state);
     });
 }
-
 fn resolve_app_control_row(shell: &ShellState, session_path: &str) -> Option<BrowserRow> {
     let snapshot = shell.snapshot();
     if let Some(row) = snapshot
@@ -6554,7 +6643,6 @@ fn resolve_app_control_row(shell: &ShellState, session_path: &str) -> Option<Bro
     {
         return Some(row);
     }
-
     let stored_rows = shell.browser.search_rows();
     let expanded_paths = search_expanded_paths(
         &stored_rows,
@@ -6582,7 +6670,6 @@ fn resolve_app_control_row(shell: &ShellState, session_path: &str) -> Option<Bro
         .find(|row| row.full_path == session_path)
         .or_else(|| synthesize_app_control_row(shell, session_path))
 }
-
 fn synthesize_app_control_row(shell: &ShellState, session_path: &str) -> Option<BrowserRow> {
     if let Some(session) = shell
         .server
@@ -6622,7 +6709,6 @@ fn synthesize_app_control_row(shell: &ShellState, session_path: &str) -> Option<
             session_cwd: session_cwd_for_managed_session(&session),
         });
     }
-
     if let Some((machine_key, session_id)) = parse_remote_scanned_session_path(session_path)
         && let Some(machine) = shell
             .server
@@ -6654,7 +6740,6 @@ fn synthesize_app_control_row(shell: &ShellState, session_path: &str) -> Option<
             session_cwd: Some(scanned.cwd.clone()),
         });
     }
-
     let path = Path::new(session_path);
     let codex_identity = read_codex_session_identity_fields(path).ok().flatten();
     let label = fallback_label_for_session_path(session_path);
@@ -6684,7 +6769,6 @@ fn synthesize_app_control_row(shell: &ShellState, session_path: &str) -> Option<
             .or_else(|| path.parent().map(|parent| parent.display().to_string())),
     })
 }
-
 fn session_cwd_for_managed_session(session: &ManagedSessionView) -> Option<String> {
     let cwd = metadata_value(session, "Cwd");
     if !cwd.trim().is_empty() {
@@ -6697,7 +6781,6 @@ fn session_cwd_for_managed_session(session: &ManagedSessionView) -> Option<Strin
         .map(|entry| entry.value.clone())
         .or_else(|| session.ssh_target.clone())
 }
-
 fn fallback_label_for_session_path(session_path: &str) -> String {
     Path::new(session_path)
         .file_name()
@@ -6706,14 +6789,12 @@ fn fallback_label_for_session_path(session_path: &str) -> String {
         .map(|name| name.trim_end_matches(".jsonl").to_string())
         .unwrap_or_else(|| session_path.to_string())
 }
-
 fn normalize_live_session_path(session_path: &str) -> String {
     session_path
         .strip_prefix("local::")
         .map(|id| format!("local://{id}"))
         .unwrap_or_else(|| session_path.to_string())
 }
-
 fn set_app_control_row_expanded(shell: &mut ShellState, row: &BrowserRow, expanded: bool) {
     if row.kind != BrowserRowKind::Group {
         return;
@@ -6729,7 +6810,6 @@ fn set_app_control_row_expanded(shell: &mut ShellState, row: &BrowserRow, expand
     }
     shell.sync_browser_settings();
 }
-
 fn app_control_drag_pointer(row: &BrowserRow, placement: Option<DragDropPlacement>) -> (f64, f64) {
     let y = 72.0 + (row.depth as f64 * 12.0);
     let x = match placement {
@@ -6739,7 +6819,6 @@ fn app_control_drag_pointer(row: &BrowserRow, placement: Option<DragDropPlacemen
     };
     (x, y)
 }
-
 fn spawn_connect_ssh_custom(mut state: Signal<ShellState>) {
     let target = state.read().ssh_connect_target.trim().to_string();
     let prefix = state.read().ssh_connect_prefix.trim().to_string();
@@ -6828,7 +6907,6 @@ fn spawn_connect_ssh_custom(mut state: Signal<ShellState>) {
         });
     });
 }
-
 fn spawn_start_group_session(mut state: Signal<ShellState>, row: BrowserRow, kind: SessionKind) {
     if row.kind == BrowserRowKind::Separator
         || row.group_kind == Some(WorkspaceGroupKind::Separator)
@@ -6847,7 +6925,6 @@ fn spawn_start_group_session(mut state: Signal<ShellState>, row: BrowserRow, kin
         start_local_session_at(&endpoint, kind, cwd.as_deref(), title_hint.as_deref())
     });
 }
-
 fn current_new_session_context(
     shell: &ShellState,
     kind: SessionKind,
@@ -6885,14 +6962,12 @@ fn current_new_session_context(
     }
     (None, None)
 }
-
 fn preferred_agent_session_kind(settings: &AppSettings) -> SessionKind {
     match settings.default_agent_profile {
         AgentSessionProfile::CodexLiteLlm => SessionKind::CodexLiteLlm,
         AgentSessionProfile::Codex => SessionKind::Codex,
     }
 }
-
 fn session_kind_for_row(kind: BrowserRowKind) -> SessionKind {
     match kind {
         BrowserRowKind::Session => SessionKind::Codex,
@@ -6901,7 +6976,6 @@ fn session_kind_for_row(kind: BrowserRowKind) -> SessionKind {
         BrowserRowKind::Separator => SessionKind::Codex,
     }
 }
-
 fn session_kind_action_label(kind: SessionKind) -> &'static str {
     match kind {
         SessionKind::Codex | SessionKind::CodexLiteLlm => "session",
@@ -6910,18 +6984,15 @@ fn session_kind_action_label(kind: SessionKind) -> &'static str {
         SessionKind::Document => "paper",
     }
 }
-
 fn is_live_sidebar_row(row: &BrowserRow) -> bool {
     row.full_path.starts_with("ssh://")
         || row.full_path.starts_with("local://")
         || row.full_path.starts_with("codex://")
         || row.full_path.starts_with("codex-litellm://")
 }
-
 fn is_remote_scanned_sidebar_row(row: &BrowserRow) -> bool {
     row.full_path.starts_with("remote-session://")
 }
-
 fn should_show_remote_loading_notice(row: &BrowserRow, retained_live_terminal: bool) -> bool {
     !retained_live_terminal
         && (is_remote_scanned_sidebar_row(row)
@@ -6929,17 +7000,14 @@ fn should_show_remote_loading_notice(row: &BrowserRow, retained_live_terminal: b
             || row.full_path.starts_with("codex://")
             || row.full_path.starts_with("codex-litellm://"))
 }
-
 fn is_remote_machine_group_row(row: &BrowserRow) -> bool {
     row.kind == BrowserRowKind::Group && row.full_path.starts_with("__remote_machine__/")
 }
-
 fn is_synthetic_sidebar_row(row: &BrowserRow) -> bool {
     row.full_path.starts_with("__remote_machine__/")
         || row.full_path.starts_with("__remote_folder__/")
         || row.full_path == "__live_sessions__"
 }
-
 fn saved_ssh_target_machine_key(
     row: &BrowserRow,
     ssh_targets: &[SshConnectTarget],
@@ -6950,13 +7018,11 @@ fn saved_ssh_target_machine_key(
         .any(|target| machine_key_from_labelish(&target.ssh_target) == machine_key)
         .then(|| machine_key.to_string())
 }
-
 fn is_local_stored_session_row(row: &BrowserRow) -> bool {
     row.kind == BrowserRowKind::Session
         && !is_live_sidebar_row(row)
         && !is_remote_scanned_sidebar_row(row)
 }
-
 fn is_local_stored_session_path(path: &str) -> bool {
     !path.trim().is_empty()
         && !path.starts_with("__")
@@ -6964,7 +7030,6 @@ fn is_local_stored_session_path(path: &str) -> bool {
         && !path.starts_with("remote-session://")
         && !path.starts_with("ssh://")
 }
-
 fn supports_generated_session_copy(session: &ManagedSessionView) -> bool {
     session.kind.is_agent()
         || session.kind == SessionKind::SshShell
@@ -6973,7 +7038,6 @@ fn supports_generated_session_copy(session: &ManagedSessionView) -> bool {
         || session.session_path.starts_with("remote-session://")
         || session.session_path.starts_with("ssh://")
 }
-
 fn copy_generation_target_for_session(
     server: &YggtermServer,
     session: &ManagedSessionView,
@@ -7024,7 +7088,6 @@ fn copy_generation_target_for_session(
         storage_path: (!storage_path.trim().is_empty()).then_some(storage_path),
     })
 }
-
 fn copy_generation_target_for_browser_row(
     server: &YggtermServer,
     row: &BrowserRow,
@@ -7067,7 +7130,6 @@ fn copy_generation_target_for_browser_row(
         storage_path: Some(row.full_path.clone()),
     })
 }
-
 fn source_updated_at_for_session(
     server: &YggtermServer,
     session: &ManagedSessionView,
@@ -7086,13 +7148,11 @@ fn source_updated_at_for_session(
         local_session_updated_at(&session.session_path)
     }
 }
-
 fn remote_session_updated_at(session: &RemoteScannedSession) -> Option<OffsetDateTime> {
     (session.modified_epoch > 0)
         .then(|| OffsetDateTime::from_unix_timestamp(session.modified_epoch).ok())
         .flatten()
 }
-
 fn local_session_updated_at(path: &str) -> Option<OffsetDateTime> {
     let meta = std::fs::metadata(path).ok()?;
     let modified = meta.modified().ok()?;
@@ -7102,7 +7162,6 @@ fn local_session_updated_at(path: &str) -> Option<OffsetDateTime> {
         .as_secs() as i64;
     OffsetDateTime::from_unix_timestamp(unix).ok()
 }
-
 fn live_terminal_generation_context(
     endpoint: &ServerEndpoint,
     session_path: &str,
@@ -7134,7 +7193,6 @@ fn live_terminal_generation_context(
         None
     }
 }
-
 fn generation_context_for_target(
     endpoint: &ServerEndpoint,
     target: &CopyGenerationTarget,
@@ -7170,7 +7228,6 @@ fn generation_context_for_target(
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
 }
-
 fn target_can_fetch_remote_generation_context(target: &CopyGenerationTarget) -> bool {
     target.remote_machine.is_some()
         && target
@@ -7178,14 +7235,12 @@ fn target_can_fetch_remote_generation_context(target: &CopyGenerationTarget) -> 
             .as_deref()
             .is_some_and(|path| !path.trim().is_empty())
 }
-
 fn remote_preview_fetch_target(
     server: &YggtermServer,
     session: &ManagedSessionView,
 ) -> Option<(SshConnectTarget, String)> {
     remote_preview_fetch_target_for_path(server, &session.session_path)
 }
-
 fn remote_preview_fetch_target_for_path(
     server: &YggtermServer,
     session_path: &str,
@@ -7209,7 +7264,6 @@ fn remote_preview_fetch_target_for_path(
         scanned.storage_path.clone(),
     ))
 }
-
 fn restore_browser_tree(
     shell: &mut ShellState,
     browser_tree: SessionNode,
@@ -7236,7 +7290,6 @@ fn restore_browser_tree(
     shell.record_restore_issue_telemetry("restore_browser_tree");
     shell.sync_browser_settings();
 }
-
 fn remote_preview_needs_refresh(session: &ManagedSessionView) -> bool {
     session.session_path.starts_with("remote-session://")
         && (session.preview.blocks.is_empty()
@@ -7251,7 +7304,6 @@ fn remote_preview_needs_refresh(session: &ManagedSessionView) -> bool {
                 .any(|section| section.title == "Recent Context")
             || preview_text_looks_like_loading_placeholder(&preview_summary_text(session)))
 }
-
 fn schedule_remote_preview_sync(
     shell: &mut ShellState,
     session_path: &str,
@@ -7271,7 +7323,6 @@ fn schedule_remote_preview_sync(
         .insert(session_path.to_string(), now.saturating_add(debounce_ms));
     true
 }
-
 fn remote_preview_retry_backoff_ms(retry_count: u32) -> u64 {
     match retry_count {
         0 | 1 => 3_000,
@@ -7280,7 +7331,6 @@ fn remote_preview_retry_backoff_ms(retry_count: u32) -> u64 {
         _ => 60_000,
     }
 }
-
 fn schedule_remote_preview_retry_tick(
     state: Signal<ShellState>,
     session_path: String,
@@ -7297,7 +7347,6 @@ fn schedule_remote_preview_retry_tick(
         let _ = kick_active_remote_preview_sync(state, "preview_refresh_retry_tick");
     });
 }
-
 fn summarize_preview_refresh_error(error: &str) -> String {
     let trimmed = error.trim();
     if trimmed.contains("Connection refused") || trimmed.contains("No such file or directory") {
@@ -7312,7 +7361,6 @@ fn summarize_preview_refresh_error(error: &str) -> String {
         "Yggterm could not refresh this remote view right now.".to_string()
     }
 }
-
 fn is_transient_local_daemon_connect_error(error: &str) -> bool {
     let trimmed = error.trim();
     trimmed.contains("Connection refused")
@@ -7322,7 +7370,6 @@ fn is_transient_local_daemon_connect_error(error: &str) -> bool {
             && trimmed.contains("server-")
             && trimmed.contains(".sock"))
 }
-
 fn schedule_active_title_retry_after_failure(state: Signal<ShellState>, session_path: &str) {
     let session_path = session_path.to_string();
     let delay_ms = safe_shell_mut(state, "active_title_autogen_retry_after_failure", |shell| {
@@ -7341,7 +7388,6 @@ fn schedule_active_title_retry_after_failure(state: Signal<ShellState>, session_
         schedule_active_title_autogen_retry_tick(state, session_path, delay_ms);
     }
 }
-
 fn schedule_active_title_autogen_retry_tick(
     state: Signal<ShellState>,
     session_path: String,
@@ -7378,7 +7424,6 @@ fn schedule_active_title_autogen_retry_tick(
         }
     });
 }
-
 fn maybe_request_copy_generation_for_session(
     mut state: Signal<ShellState>,
     session: ManagedSessionView,
@@ -7453,11 +7498,9 @@ fn maybe_request_copy_generation_for_session(
     state.with_mut(|shell| shell.next_background_copy_scan_after_ms = current_millis());
     maybe_spawn_background_copy_generation(state);
 }
-
 fn should_surface_preview_failure(failure: &PreviewSyncFailure, now_ms: u64) -> bool {
     failure.retry_count >= 2 || now_ms.saturating_sub(failure.first_failed_at_ms) >= 6_000
 }
-
 fn spawn_remote_preview_payload_sync(
     state: Signal<ShellState>,
     session_path: String,
@@ -7544,7 +7587,6 @@ fn spawn_remote_preview_payload_sync(
         });
     });
 }
-
 fn kick_active_remote_preview_sync(state: Signal<ShellState>, reason: &'static str) -> bool {
     let action = safe_shell_mut(state, "kick_active_remote_preview_sync", |shell| {
         if shell.server.active_view_mode() != WorkspaceViewMode::Rendered || shell.server_busy {
@@ -7597,7 +7639,6 @@ fn kick_active_remote_preview_sync(state: Signal<ShellState>, reason: &'static s
         None => false,
     }
 }
-
 fn background_copy_job_for_target(
     store: &SessionStore,
     target: &CopyGenerationTarget,
@@ -7654,7 +7695,6 @@ fn background_copy_job_for_target(
     }
     None
 }
-
 fn next_background_copy_job(
     _settings: &AppSettings,
     _local_root: &SessionNode,
@@ -7696,7 +7736,6 @@ fn next_background_copy_job(
     }
     None
 }
-
 fn maybe_spawn_background_copy_generation(mut state: Signal<ShellState>) {
     let scan = {
         let shell = state.read();
@@ -7784,7 +7823,6 @@ fn maybe_spawn_background_copy_generation(mut state: Signal<ShellState>) {
         }
     });
 }
-
 fn remote_scanned_session_context(server: &YggtermServer, session_path: &str) -> Option<String> {
     server.remote_machines().iter().find_map(|machine| {
         machine
@@ -7796,14 +7834,12 @@ fn remote_scanned_session_context(server: &YggtermServer, session_path: &str) ->
             })
     })
 }
-
 fn remote_generated_copy(
     server: &YggtermServer,
     session_path: &str,
 ) -> Option<(String, Option<String>, Option<String>)> {
     remote_generated_copy_from_machines(server.remote_machines(), session_path)
 }
-
 fn remote_generated_copy_from_machines(
     remote_machines: &[RemoteMachineSnapshot],
     session_path: &str,
@@ -7820,7 +7856,6 @@ fn remote_generated_copy_from_machines(
         })
     })
 }
-
 fn resolved_session_title(shell: &ShellState, session: &ManagedSessionView) -> Option<String> {
     if !session.title.trim().is_empty() && !looks_like_generated_fallback_title(&session.title) {
         return Some(session.title.clone());
@@ -7843,7 +7878,6 @@ fn resolved_session_title(shell: &ShellState, session: &ManagedSessionView) -> O
     }
     None
 }
-
 fn title_is_low_signal_for_copy(title: &str, cwd: &str) -> bool {
     let trimmed = title.trim();
     let cwd = cwd.trim();
@@ -7851,7 +7885,6 @@ fn title_is_low_signal_for_copy(title: &str, cwd: &str) -> bool {
         || looks_like_generated_fallback_title(trimmed)
         || (!cwd.is_empty() && trimmed == cwd)
 }
-
 fn title_needs_generation_for_copy_target(
     target: &CopyGenerationTarget,
     stored_title: Option<&str>,
@@ -7859,7 +7892,6 @@ fn title_needs_generation_for_copy_target(
     stored_title.is_none_or(|title| title_is_low_signal_for_copy(title, &target.cwd))
         && title_is_low_signal_for_copy(&target.title, &target.cwd)
 }
-
 fn title_needs_generation_from_visible_titles(
     resolved_title: Option<&str>,
     cwd: &str,
@@ -7873,7 +7905,6 @@ fn title_needs_generation_from_visible_titles(
         || looks_like_generated_fallback_title(trimmed_fallback)
         || (!cwd.trim().is_empty() && trimmed_fallback == cwd.trim())
 }
-
 fn active_session_title_needs_generation(shell: &ShellState, session: &ManagedSessionView) -> bool {
     let fallback_row_title = shell
         .active_browser_selection_path_for_session()
@@ -7894,11 +7925,9 @@ fn active_session_title_needs_generation(shell: &ShellState, session: &ManagedSe
         .unwrap_or_default();
     title_needs_generation_from_visible_titles(resolved_title.as_deref(), &cwd, &fallback_row_title)
 }
-
 fn resolved_session_precis(_shell: &ShellState, _session: &ManagedSessionView) -> Option<String> {
     None
 }
-
 fn resolved_session_summary(shell: &ShellState, session: &ManagedSessionView) -> Option<String> {
     shell
         .generated_summaries
@@ -7911,7 +7940,6 @@ fn resolved_session_summary(shell: &ShellState, session: &ManagedSessionView) ->
         .or_else(|| preview_summary_metadata_value(session, "Summary"))
         .filter(|summary| !looks_like_low_signal_generated_copy(summary))
 }
-
 fn fallback_title_from_browser_row(row: &BrowserRow) -> Option<String> {
     row.session_title
         .clone()
@@ -7932,7 +7960,6 @@ fn fallback_title_from_browser_row(row: &BrowserRow) -> Option<String> {
                 .map(ToOwned::to_owned)
         })
 }
-
 fn fallback_summary_for_session_path(shell: &ShellState, session_path: &str) -> Option<String> {
     if let Some(summary) = remote_generated_copy(&shell.server, session_path)
         .and_then(|(_, _, summary)| summary)
@@ -7959,7 +7986,6 @@ fn fallback_summary_for_session_path(shell: &ShellState, session_path: &str) -> 
     }
     None
 }
-
 fn titlebar_summary_text(
     snapshot: &RenderSnapshot,
     session: &ManagedSessionView,
@@ -7971,7 +7997,6 @@ fn titlebar_summary_text(
         .filter(|summary| !summary.trim().is_empty())
         .filter(|summary| !looks_like_low_signal_generated_copy(summary))
 }
-
 fn preview_summary_metadata_value(session: &ManagedSessionView, label: &str) -> Option<String> {
     session
         .preview
@@ -7981,21 +8006,17 @@ fn preview_summary_metadata_value(session: &ManagedSessionView, label: &str) -> 
         .map(|entry| entry.value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
-
 fn is_placeholder_rendered_section_title(title: &str) -> bool {
     title.eq_ignore_ascii_case("Rendered Session")
         || title.eq_ignore_ascii_case("Server Notes")
         || title.eq_ignore_ascii_case("Recent Context")
 }
-
 fn palette_is_dark(palette: Palette) -> bool {
     palette.panel == "#161c22"
 }
-
 fn preview_block_cache() -> &'static Mutex<PreviewBlockCache> {
     PREVIEW_BLOCK_CACHE.get_or_init(|| Mutex::new(PreviewBlockCache::default()))
 }
-
 fn preview_block_cache_key(blocks: &[SessionPreviewBlock]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for block in blocks {
@@ -8013,23 +8034,18 @@ fn preview_block_cache_key(blocks: &[SessionPreviewBlock]) -> u64 {
     }
     hasher.finish()
 }
-
 fn preview_content_cache() -> &'static Mutex<PreviewContentCache> {
     PREVIEW_CONTENT_CACHE.get_or_init(|| Mutex::new(PreviewContentCache::default()))
 }
-
 fn preview_run_cache() -> &'static Mutex<PreviewRunCache> {
     PREVIEW_RUN_CACHE.get_or_init(|| Mutex::new(PreviewRunCache::default()))
 }
-
 fn sidebar_merge_cache() -> &'static Mutex<SidebarMergeCache> {
     SIDEBAR_MERGE_CACHE.get_or_init(|| Mutex::new(SidebarMergeCache::default()))
 }
-
 fn sidebar_search_cache() -> &'static Mutex<SidebarSearchCache> {
     SIDEBAR_SEARCH_CACHE.get_or_init(|| Mutex::new(SidebarSearchCache::default()))
 }
-
 fn preview_content_cache_key(lines: &[String]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for line in lines {
@@ -8038,7 +8054,6 @@ fn preview_content_cache_key(lines: &[String]) -> u64 {
     }
     hasher.finish()
 }
-
 fn preview_run_cache_key(blocks: &[SessionPreviewBlock], start_index: usize) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     start_index.hash(&mut hasher);
@@ -8057,7 +8072,6 @@ fn preview_run_cache_key(blocks: &[SessionPreviewBlock], start_index: usize) -> 
     }
     hasher.finish()
 }
-
 fn sidebar_merge_cache_key(
     stored_rows: &[BrowserRow],
     remote_machines: &[RemoteMachineSnapshot],
@@ -8151,7 +8165,6 @@ fn sidebar_merge_cache_key(
     }
     hasher.finish()
 }
-
 fn sidebar_search_cache_key(rows: &[BrowserRow], query: &str, mode: u8) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     mode.hash(&mut hasher);
@@ -8175,7 +8188,6 @@ fn sidebar_search_cache_key(rows: &[BrowserRow], query: &str, mode: u8) -> u64 {
     }
     hasher.finish()
 }
-
 fn preview_rendered_sections(session: &ManagedSessionView) -> Vec<SessionRenderedSection> {
     if preview_should_hide_stale_placeholder_content(session) {
         return Vec::new();
@@ -8216,11 +8228,9 @@ fn preview_rendered_sections(session: &ManagedSessionView) -> Vec<SessionRendere
         filtered
     }
 }
-
 fn collapse_preview_image_markup(text: &str) -> String {
     let mut remaining = text.trim();
     let mut out = String::new();
-
     loop {
         let Some(start) = remaining.find("<image name=[") else {
             out.push_str(remaining);
@@ -8235,7 +8245,6 @@ fn collapse_preview_image_markup(text: &str) -> String {
         let label_text = after[..label_end].trim();
         let label = format!("[{label_text}]");
         out.push_str(&label);
-
         let mut tail = after[label_end + 2..].trim_start();
         if let Some(stripped) = tail.strip_prefix("</image>") {
             tail = stripped.trim_start();
@@ -8245,14 +8254,11 @@ fn collapse_preview_image_markup(text: &str) -> String {
         }
         remaining = tail;
     }
-
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
-
 fn normalize_preview_semantic_text(text: &str) -> String {
     collapse_preview_image_markup(text).to_ascii_lowercase()
 }
-
 fn preview_block_text(block: &SessionPreviewBlock) -> String {
     block
         .lines
@@ -8262,7 +8268,6 @@ fn preview_block_text(block: &SessionPreviewBlock) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
-
 fn is_preview_scaffold_line(line: &str) -> bool {
     let trimmed = line.trim();
     if matches!(
@@ -8293,7 +8298,6 @@ fn is_preview_scaffold_line(line: &str) -> bool {
         || lower.contains("the user interrupted the previous turn on purpose")
         || lower.contains("any running unified exec processes were terminated")
 }
-
 fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlock> {
     if preview_should_hide_stale_placeholder_content(session) {
         return Vec::new();
@@ -8308,7 +8312,6 @@ fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlo
             return hit;
         }
     }
-
     let visible = session
         .preview
         .blocks
@@ -8358,7 +8361,6 @@ fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlo
             Some(cleaned)
         })
         .collect::<Vec<_>>();
-
     let mut deduped = Vec::with_capacity(visible.len());
     let mut last_signature = None::<(PreviewTone, String)>;
     for block in visible.into_iter() {
@@ -8373,11 +8375,9 @@ fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlo
         deduped.push(block);
     }
     let mut visible = deduped;
-
     if visible.is_empty() {
         visible = session.preview.blocks.clone();
     }
-
     if let Ok(mut cache) = preview_block_cache().lock() {
         cache.entries.insert(key, visible.clone());
         if let Some(ix) = cache.order.iter().position(|existing| *existing == key) {
@@ -8390,10 +8390,8 @@ fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlo
             }
         }
     }
-
     visible
 }
-
 fn preview_should_hide_stale_placeholder_content(session: &ManagedSessionView) -> bool {
     if !session.session_path.starts_with("remote-session://") {
         return false;
@@ -8412,12 +8410,10 @@ fn preview_should_hide_stale_placeholder_content(session: &ManagedSessionView) -
         session.preview.blocks.is_empty() && !session.rendered_sections.is_empty();
     has_only_placeholder_blocks || has_only_placeholder_sections
 }
-
 fn estimate_preview_block_height(block: &SessionPreviewBlock) -> f64 {
     if block.folded {
         return 64.0;
     }
-
     let mut height = 56.0;
     let mut in_code = false;
     for line in &block.lines {
@@ -8453,10 +8449,8 @@ fn estimate_preview_block_height(block: &SessionPreviewBlock) -> f64 {
         };
         height += wrapped_lines * line_height;
     }
-
     height.max(88.0)
 }
-
 fn preview_virtual_window(
     blocks: &[SessionPreviewBlock],
     scroll_top_px: f64,
@@ -8473,7 +8467,6 @@ fn preview_virtual_window(
     let scroll_height_px = scroll_height_px
         .max(total_height_px)
         .max(viewport_height_px);
-
     if search_active
         || blocks.len() <= PREVIEW_BLOCK_WINDOW
         || blocks.len() <= PREVIEW_SAFE_FULL_RENDER_BLOCK_LIMIT
@@ -8490,19 +8483,16 @@ fn preview_virtual_window(
             overscan_px: 0.0,
         };
     }
-
     let overscan_px = (viewport_height_px * PREVIEW_VIRTUAL_OVERSCAN_FACTOR)
         .clamp(320.0, PREVIEW_MAX_OVERSCAN_PX);
     let render_top_px = (scroll_top_px - overscan_px).max(0.0);
     let render_bottom_px =
         (scroll_top_px + viewport_height_px + overscan_px).max(viewport_height_px);
-
     let mut start_index = 0usize;
     let mut end_index = blocks.len();
     let mut cumulative_px = 0.0;
     let mut top_spacer_px = 0.0;
     let mut started = false;
-
     for (ix, block) in blocks.iter().enumerate() {
         let block_height = estimate_preview_block_height(block);
         let next_cumulative_px = cumulative_px + block_height;
@@ -8517,7 +8507,6 @@ fn preview_virtual_window(
         }
         cumulative_px = next_cumulative_px;
     }
-
     if !started {
         start_index = blocks.len().saturating_sub(PREVIEW_BLOCK_WINDOW);
         top_spacer_px = blocks[..start_index]
@@ -8525,16 +8514,13 @@ fn preview_virtual_window(
             .map(estimate_preview_block_height)
             .sum::<f64>();
     }
-
     if end_index <= start_index {
         end_index = (start_index + PREVIEW_BLOCK_WINDOW).min(blocks.len());
     }
-
     let bottom_spacer_px = blocks[end_index..]
         .iter()
         .map(estimate_preview_block_height)
         .sum::<f64>();
-
     PreviewVirtualWindow {
         start_index,
         end_index,
@@ -8547,7 +8533,6 @@ fn preview_virtual_window(
         overscan_px,
     }
 }
-
 fn group_preview_runs(blocks: &[SessionPreviewBlock], start_index: usize) -> Vec<PreviewRun> {
     let key = preview_run_cache_key(blocks, start_index);
     if let Ok(mut cache) = preview_run_cache().lock() {
@@ -8559,7 +8544,6 @@ fn group_preview_runs(blocks: &[SessionPreviewBlock], start_index: usize) -> Vec
             return hit;
         }
     }
-
     let mut runs: Vec<PreviewRun> = Vec::new();
     let mut last_date_key = None::<(i32, u8, u8)>;
     for (offset, block) in blocks.iter().cloned().enumerate() {
@@ -8599,7 +8583,6 @@ fn group_preview_runs(blocks: &[SessionPreviewBlock], start_index: usize) -> Vec
     }
     runs
 }
-
 fn clamp_search_index(index: Option<usize>, len: usize) -> Option<usize> {
     if len == 0 {
         None
@@ -8607,7 +8590,6 @@ fn clamp_search_index(index: Option<usize>, len: usize) -> Option<usize> {
         Some(index.unwrap_or(0).min(len.saturating_sub(1)))
     }
 }
-
 fn search_terms(query: &str) -> Vec<String> {
     let trimmed = query.trim();
     if trimmed.is_empty() || trimmed.starts_with('/') {
@@ -8647,7 +8629,6 @@ fn search_terms(query: &str) -> Vec<String> {
     }
     terms
 }
-
 fn text_matches_search_terms(text: &str, terms: &[String]) -> bool {
     if terms.is_empty() {
         return false;
@@ -8655,7 +8636,6 @@ fn text_matches_search_terms(text: &str, terms: &[String]) -> bool {
     let haystack = text.to_ascii_lowercase();
     terms.iter().all(|term| haystack.contains(term))
 }
-
 fn row_search_blob(row: &BrowserRow) -> String {
     let mut parts = vec![
         row.label.as_str(),
@@ -8674,15 +8654,12 @@ fn row_search_blob(row: &BrowserRow) -> String {
     }
     parts.join("\n")
 }
-
 fn row_matches_search(row: &BrowserRow, terms: &[String]) -> bool {
     text_matches_search_terms(&row_search_blob(row), terms)
 }
-
 fn is_command_query(query: &str) -> bool {
     query.trim_start().starts_with('/')
 }
-
 fn search_command_suggestions(query: &str) -> Vec<SearchCommandSuggestion> {
     const COMMANDS: &[(&str, &str)] = &[
         ("/preview", "Switch to preview mode"),
@@ -8695,7 +8672,6 @@ fn search_command_suggestions(query: &str) -> Vec<SearchCommandSuggestion> {
         ("/notifications", "Open notifications panel"),
         ("/connect", "Open Connect SSH panel"),
     ];
-
     let needle = query.trim();
     if !needle.starts_with('/') {
         return vec![];
@@ -8709,7 +8685,6 @@ fn search_command_suggestions(query: &str) -> Vec<SearchCommandSuggestion> {
         })
         .collect()
 }
-
 fn resolve_alt_overlay_sequence(sequence: &str) -> AltOverlayResolution {
     match sequence {
         "" => AltOverlayResolution::Pending(String::new()),
@@ -8733,11 +8708,9 @@ fn resolve_alt_overlay_sequence(sequence: &str) -> AltOverlayResolution {
         _ => AltOverlayResolution::Invalid,
     }
 }
-
 fn alt_overlay_badge_visible(snapshot: &RenderSnapshot, prefix: &str) -> bool {
     snapshot.alt_overlay_active && snapshot.alt_overlay_sequence == prefix
 }
-
 fn execute_alt_overlay_action(mut state: Signal<ShellState>, action: AltOverlayAction) {
     match action {
         AltOverlayAction::ToggleSidebar => state.with_mut(|shell| {
@@ -8846,22 +8819,18 @@ fn execute_alt_overlay_action(mut state: Signal<ShellState>, action: AltOverlayA
         }
     }
 }
-
 fn handle_alt_overlay_key(mut state: Signal<ShellState>, key: Key) -> bool {
     if key == Key::Alt {
         state.with_mut(|shell| shell.activate_alt_overlay());
         return true;
     }
-
     if !state.read().alt_overlay_active {
         return false;
     }
-
     if key == Key::Escape {
         state.with_mut(|shell| shell.clear_alt_overlay());
         return true;
     }
-
     let Key::Character(chars) = key else {
         return false;
     };
@@ -8891,7 +8860,6 @@ fn handle_alt_overlay_key(mut state: Signal<ShellState>, key: Key) -> bool {
         }
     }
 }
-
 fn execute_search_command(mut state: Signal<ShellState>, query: String) {
     let command = query.trim().to_ascii_lowercase();
     match command.as_str() {
@@ -8931,7 +8899,6 @@ fn execute_search_command(mut state: Signal<ShellState>, query: String) {
         shell.set_search_focus(false);
     });
 }
-
 fn filtered_sidebar_rows(rows: &[BrowserRow], query: &str) -> Vec<BrowserRow> {
     let terms = search_terms(query);
     if terms.is_empty() {
@@ -8984,7 +8951,6 @@ fn filtered_sidebar_rows(rows: &[BrowserRow], query: &str) -> Vec<BrowserRow> {
     }
     filtered
 }
-
 fn search_expanded_paths(
     stored_rows: &[BrowserRow],
     remote_machines: &[RemoteMachineSnapshot],
@@ -9042,7 +9008,6 @@ fn search_expanded_paths(
     }
     expanded
 }
-
 fn search_sidebar_matches(rows: &[BrowserRow], query: &str) -> Vec<BrowserRow> {
     let terms = search_terms(query);
     if terms.is_empty() {
@@ -9082,12 +9047,10 @@ fn search_sidebar_matches(rows: &[BrowserRow], query: &str) -> Vec<BrowserRow> {
     }
     matches
 }
-
 fn content_search_query(query: &str) -> Option<Vec<String>> {
     let terms = search_terms(query);
     if terms.is_empty() { None } else { Some(terms) }
 }
-
 fn search_content_hits(
     session: Option<&ManagedSessionView>,
     view_mode: WorkspaceViewMode,
@@ -9147,7 +9110,6 @@ fn search_content_hits(
             .collect(),
     }
 }
-
 fn resolved_session_title_for_search(session: &ManagedSessionView) -> Option<String> {
     let title = session.title.trim();
     if title.is_empty() {
@@ -9156,7 +9118,6 @@ fn resolved_session_title_for_search(session: &ManagedSessionView) -> Option<Str
         Some(title.to_string())
     }
 }
-
 fn resolved_session_precis_for_search(session: &ManagedSessionView) -> Option<String> {
     let precis = metadata_value(session, "Precis");
     if precis.trim().is_empty() {
@@ -9165,7 +9126,6 @@ fn resolved_session_precis_for_search(session: &ManagedSessionView) -> Option<St
         Some(precis)
     }
 }
-
 fn resolved_session_summary_for_search(session: &ManagedSessionView) -> Option<String> {
     let summary = metadata_value(session, "Summary");
     if summary.trim().is_empty() {
@@ -9174,18 +9134,15 @@ fn resolved_session_summary_for_search(session: &ManagedSessionView) -> Option<S
         Some(summary)
     }
 }
-
 fn preview_block_dom_id(session_id: &str, ix: usize) -> String {
     format!("preview-block-{}-{ix}", sanitize_dom_id(session_id))
 }
-
 fn sanitize_dom_id(value: &str) -> String {
     value
         .chars()
         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
         .collect()
 }
-
 fn format_preview_timestamp_label(raw: &str, last_date_key: &mut Option<(i32, u8, u8)>) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -9212,7 +9169,6 @@ fn format_preview_timestamp_label(raw: &str, last_date_key: &mut Option<(i32, u8
     *last_date_key = Some(date_key);
     full
 }
-
 fn parse_preview_timestamp(raw: &str) -> Option<OffsetDateTime> {
     let iso = time::format_description::well_known::Rfc3339;
     OffsetDateTime::parse(raw, &iso)
@@ -9236,7 +9192,6 @@ fn parse_preview_timestamp(raw: &str) -> Option<OffsetDateTime> {
             .ok()
         })
 }
-
 fn remote_machine_for_session_path(
     server: &YggtermServer,
     session_path: &str,
@@ -9249,7 +9204,6 @@ fn remote_machine_for_session_path(
             .then(|| machine.clone())
     })
 }
-
 fn spawn_active_session_copy_hydration(mut state: Signal<ShellState>, session: ManagedSessionView) {
     let session_path = session.session_path.clone();
     let remote_cached = remote_generated_copy(&state.read().server, &session_path);
@@ -9337,7 +9291,6 @@ fn spawn_active_session_copy_hydration(mut state: Signal<ShellState>, session: M
             },
         )
         .await;
-
         state.with_mut(|shell| {
             let Ok(Ok((title, precis, summary))) = outcome else {
                 return;
@@ -9364,7 +9317,6 @@ fn spawn_active_session_copy_hydration(mut state: Signal<ShellState>, session: M
         });
     });
 }
-
 fn preview_context_from_session(session: &ManagedSessionView) -> Option<String> {
     let lines = session
         .preview
@@ -9421,13 +9373,11 @@ fn preview_context_from_session(session: &ManagedSessionView) -> Option<String> 
         )
     })
 }
-
 fn parse_remote_scanned_session_path(path: &str) -> Option<(&str, &str)> {
     let rest = path.strip_prefix("remote-session://")?;
     let (machine_key, session_id) = rest.split_once('/')?;
     Some((machine_key, session_id))
 }
-
 fn stage_local_clipboard_png(home: &PathBuf, png_bytes: &[u8]) -> Result<String> {
     let clipboard_dir = home.join("clipboard");
     fs::create_dir_all(&clipboard_dir)?;
@@ -9436,7 +9386,6 @@ fn stage_local_clipboard_png(home: &PathBuf, png_bytes: &[u8]) -> Result<String>
     fs::write(&path, png_bytes)?;
     Ok(path.to_string_lossy().to_string())
 }
-
 fn read_native_clipboard_png() -> Result<Vec<u8>> {
     #[cfg(target_os = "linux")]
     {
@@ -9463,13 +9412,11 @@ fn read_native_clipboard_png() -> Result<Vec<u8>> {
         }
         return Ok(png_bytes);
     }
-
     #[allow(unreachable_code)]
     Err(anyhow!(
         "native clipboard image paste is not implemented on this platform yet"
     ))
 }
-
 fn stage_terminal_clipboard_image(
     state: Signal<ShellState>,
     session_path: &str,
@@ -9496,7 +9443,6 @@ fn stage_terminal_clipboard_image(
         .unwrap_or_else(|| PathBuf::from("."));
     stage_local_clipboard_png(&home, png_bytes)
 }
-
 fn merged_sidebar_rows(
     stored_rows: &[BrowserRow],
     remote_machines: &[RemoteMachineSnapshot],
@@ -9544,7 +9490,6 @@ fn merged_sidebar_rows(
         }
     }
     let cache_lookup_ms = cache_lookup_started_at.elapsed().as_secs_f64() * 1000.0;
-
     let uncached_started_at = Instant::now();
     let rows = merged_sidebar_rows_uncached(
         stored_rows,
@@ -9554,7 +9499,6 @@ fn merged_sidebar_rows(
         expanded_paths,
     );
     let uncached_ms = uncached_started_at.elapsed().as_secs_f64() * 1000.0;
-
     if let Ok(mut cache) = sidebar_merge_cache().lock() {
         cache.entries.insert(key, rows.clone());
         if let Some(ix) = cache.order.iter().position(|existing| *existing == key) {
@@ -9567,7 +9511,6 @@ fn merged_sidebar_rows(
             }
         }
     }
-
     maybe_record_sidebar_merge_breakdown(
         remote_session_count,
         json!({
@@ -9583,10 +9526,8 @@ fn merged_sidebar_rows(
             "ssh_target_count": ssh_targets.len(),
         }),
     );
-
     rows
 }
-
 fn maybe_record_sidebar_merge_breakdown(remote_session_count: usize, payload: Value) {
     let total_ms = payload
         .get("total_ms")
@@ -9600,7 +9541,6 @@ fn maybe_record_sidebar_merge_breakdown(remote_session_count: usize, payload: Va
     };
     append_perf_event(&home, "sidebar", "merge_rows_breakdown", payload);
 }
-
 fn merged_sidebar_rows_traced(
     settings_path: &Path,
     source: &str,
@@ -9627,7 +9567,6 @@ fn merged_sidebar_rows_traced(
             expanded_paths,
         );
     }
-
     let perf_home = perf_home_dir(settings_path);
     let started_at = Instant::now();
     let rows = merged_sidebar_rows(
@@ -9660,7 +9599,6 @@ fn merged_sidebar_rows_traced(
     }
     rows
 }
-
 fn merged_sidebar_rows_uncached(
     stored_rows: &[BrowserRow],
     remote_machines: &[RemoteMachineSnapshot],
@@ -9691,7 +9629,6 @@ fn merged_sidebar_rows_uncached(
             .then_with(|| a.session_path.cmp(&b.session_path))
     });
     let promoted_sort_ms = promoted_sort_started_at.elapsed().as_secs_f64() * 1000.0;
-
     if ssh_targets.is_empty()
         && remote_machines.is_empty()
         && promoted_live_sessions.is_empty()
@@ -9699,11 +9636,9 @@ fn merged_sidebar_rows_uncached(
     {
         return stored_rows.to_vec();
     }
-
     let mut rows = Vec::with_capacity(
         stored_rows.len() + local_tree_live_sessions.len() + remote_machines.len() * 6 + 8,
     );
-
     let machine_rows_init_started_at = Instant::now();
     let mut machine_rows = BTreeMap::<String, SidebarRemoteMachine>::new();
     for target in ssh_targets {
@@ -9813,13 +9748,11 @@ fn merged_sidebar_rows_uncached(
     }
     rows
 }
-
 #[derive(Default)]
 struct RemoteSessionIndex {
     modified_epoch_by_path: HashMap<String, i64>,
     generated_title_by_path: HashMap<String, String>,
 }
-
 fn build_remote_session_index(remote_machines: &[RemoteMachineSnapshot]) -> RemoteSessionIndex {
     let mut index = RemoteSessionIndex::default();
     for machine in remote_machines {
@@ -9838,7 +9771,6 @@ fn build_remote_session_index(remote_machines: &[RemoteMachineSnapshot]) -> Remo
     }
     index
 }
-
 fn live_session_recency_key(
     remote_session_index: &RemoteSessionIndex,
     session: &ManagedSessionView,
@@ -9850,7 +9782,6 @@ fn live_session_recency_key(
         .unwrap_or(0);
     (remote_epoch, session.id.clone())
 }
-
 fn push_live_session_rows(
     rows: &mut Vec<BrowserRow>,
     sessions: &[&ManagedSessionView],
@@ -9860,7 +9791,6 @@ fn push_live_session_rows(
     if sessions.is_empty() {
         return;
     }
-
     let group_path = "__live_sessions__".to_string();
     let expanded = expanded_paths.contains(&group_path);
     rows.push(BrowserRow {
@@ -9881,14 +9811,12 @@ fn push_live_session_rows(
     if !expanded {
         return;
     }
-
     let short_ids = unique_session_short_ids_for_pairs(
         &sessions
             .iter()
             .map(|session| (session.session_path.clone(), session.id.clone()))
             .collect::<Vec<_>>(),
     );
-
     for session in sessions {
         let cwd = metadata_value(session, "Cwd");
         let label = live_session_label_with_index(remote_session_index, session, &short_ids);
@@ -9925,7 +9853,98 @@ fn push_live_session_rows(
         });
     }
 }
-
+fn local_live_session_group_paths(cwd: &str) -> Vec<String> {
+    let mut paths = vec!["local".to_string()];
+    let trimmed = cwd.trim();
+    if trimmed.is_empty() {
+        return paths;
+    }
+    let path = Path::new(trimmed);
+    let mut ancestors = path
+        .ancestors()
+        .filter_map(|ancestor| {
+            let value = ancestor.to_string_lossy().trim().to_string();
+            if value.is_empty() || value == "." || value == "/" || value == trimmed {
+                None
+            } else {
+                Some(value)
+            }
+        })
+        .collect::<Vec<_>>();
+    ancestors.reverse();
+    paths.extend(ancestors);
+    paths
+}
+fn synthetic_local_live_session_rows(
+    sessions: &[&ManagedSessionView],
+    remote_session_index: &RemoteSessionIndex,
+) -> Vec<BrowserRow> {
+    if sessions.is_empty() {
+        return Vec::new();
+    }
+    let short_ids = unique_session_short_ids_for_pairs(
+        &sessions
+            .iter()
+            .map(|session| (session.session_path.clone(), session.id.clone()))
+            .collect::<Vec<_>>(),
+    );
+    let mut ordered_sessions = sessions.to_vec();
+    ordered_sessions.sort_by(|a, b| {
+        let a_cwd = metadata_value(a, "Cwd");
+        let b_cwd = metadata_value(b, "Cwd");
+        a_cwd
+            .cmp(&b_cwd)
+            .then_with(|| a.session_path.cmp(&b.session_path))
+    });
+    let mut rows = Vec::new();
+    let mut emitted_groups = HashSet::<String>::new();
+    for session in ordered_sessions {
+        let cwd = metadata_value(session, "Cwd");
+        let group_paths = local_live_session_group_paths(&cwd);
+        for (depth, group_path) in group_paths.iter().enumerate() {
+            if !emitted_groups.insert(group_path.clone()) {
+                continue;
+            }
+            rows.push(BrowserRow {
+                kind: BrowserRowKind::Group,
+                full_path: group_path.clone(),
+                label: group_path.clone(),
+                detail_label: String::new(),
+                document_kind: None,
+                group_kind: None,
+                session_title: None,
+                depth,
+                host_label: "local".to_string(),
+                descendant_sessions: 1,
+                expanded: true,
+                session_id: None,
+                session_cwd: (group_path != "local").then_some(group_path.clone()),
+            });
+        }
+        let label = live_session_label_with_index(remote_session_index, session, &short_ids);
+        rows.push(BrowserRow {
+            kind: if session.kind == SessionKind::Document {
+                BrowserRowKind::Document
+            } else {
+                BrowserRowKind::Session
+            },
+            full_path: session.session_path.clone(),
+            label: label.clone(),
+            detail_label: String::new(),
+            document_kind: (session.kind == SessionKind::Document)
+                .then_some(WorkspaceDocumentKind::Note),
+            group_kind: None,
+            session_title: Some(label),
+            depth: group_paths.len(),
+            host_label: session.host_label.clone(),
+            descendant_sessions: 1,
+            expanded: true,
+            session_id: Some(session.id.clone()),
+            session_cwd: (!cwd.trim().is_empty()).then_some(cwd),
+        });
+    }
+    rows
+}
 fn inject_local_live_session_rows(
     stored_rows: &[BrowserRow],
     sessions: &[&ManagedSessionView],
@@ -9934,7 +9953,6 @@ fn inject_local_live_session_rows(
     if sessions.is_empty() {
         return stored_rows.to_vec();
     }
-
     let existing_paths = stored_rows
         .iter()
         .map(|row| row.full_path.clone())
@@ -9980,9 +9998,14 @@ fn inject_local_live_session_rows(
             });
     }
     if rows_by_anchor.is_empty() {
+        let has_group_rows = stored_rows
+            .iter()
+            .any(|row| row.kind == BrowserRowKind::Group);
+        if !has_group_rows {
+            return synthetic_local_live_session_rows(sessions, remote_session_index);
+        }
         return stored_rows.to_vec();
     }
-
     let mut rows = Vec::with_capacity(
         stored_rows.len() + rows_by_anchor.values().map(Vec::len).sum::<usize>(),
     );
@@ -10002,7 +10025,6 @@ fn inject_local_live_session_rows(
     }
     rows
 }
-
 fn local_live_session_anchor_path(stored_rows: &[BrowserRow], cwd: &str) -> Option<String> {
     let trimmed_cwd = cwd.trim();
     let mut fallback_local = None::<String>;
@@ -10036,7 +10058,6 @@ fn local_live_session_anchor_path(stored_rows: &[BrowserRow], cwd: &str) -> Opti
     }
     best_match.map(|(_, _, path)| path).or(fallback_local)
 }
-
 fn live_session_label_with_index(
     remote_session_index: &RemoteSessionIndex,
     session: &ManagedSessionView,
@@ -10075,7 +10096,6 @@ fn live_session_label_with_index(
         .cloned()
         .unwrap_or_else(|| session.id.clone())
 }
-
 #[cfg(test)]
 fn live_session_label(
     remote_machines: &[RemoteMachineSnapshot],
@@ -10085,18 +10105,14 @@ fn live_session_label(
     let remote_session_index = build_remote_session_index(remote_machines);
     live_session_label_with_index(&remote_session_index, session, short_ids)
 }
-
 fn is_local_tree_live_session(session: &ManagedSessionView) -> bool {
     is_local_live_session_path(&session.session_path) && session.kind != SessionKind::Document
 }
-
 fn is_promoted_live_session(session: &ManagedSessionView) -> bool {
-    session.session_path.starts_with("remote-session://")
-        || session.session_path.starts_with("ssh://")
-        || (session.kind == SessionKind::Document
-            && is_local_live_session_path(&session.session_path))
+    session.source == SessionSource::LiveSsh
+        && (session.session_path.starts_with("remote-session://")
+            || session.session_path.starts_with("ssh://"))
 }
-
 fn enrich_sidebar_rows_with_live_titles(
     rows: &mut [BrowserRow],
     live_sessions: &[ManagedSessionView],
@@ -10125,7 +10141,6 @@ fn enrich_sidebar_rows_with_live_titles(
         }
     }
 }
-
 fn merge_remote_live_sessions(
     machine_rows: &mut BTreeMap<String, SidebarRemoteMachine>,
     ssh_targets: &[SshConnectTarget],
@@ -10187,7 +10202,6 @@ fn merge_remote_live_sessions(
         machine.needs_resort = true;
     }
 }
-
 fn sort_remote_scanned_sessions_by_recency(sessions: &mut [RemoteScannedSession]) {
     sessions.sort_by(|a, b| {
         b.modified_epoch
@@ -10196,14 +10210,12 @@ fn sort_remote_scanned_sessions_by_recency(sessions: &mut [RemoteScannedSession]
             .then_with(|| a.session_path.cmp(&b.session_path))
     });
 }
-
 fn is_local_live_session_path(path: &str) -> bool {
     path.starts_with("local://")
         || path.starts_with("codex://")
         || path.starts_with("codex-litellm://")
         || path.starts_with("document://")
 }
-
 fn remote_scanned_session_from_live(
     _machine_key: &str,
     session_id: &str,
@@ -10241,7 +10253,6 @@ fn remote_scanned_session_from_live(
         storage_path,
     }
 }
-
 #[derive(Debug)]
 struct SidebarRemoteMachine {
     key: String,
@@ -10251,7 +10262,6 @@ struct SidebarRemoteMachine {
     scanned_sessions: Vec<RemoteScannedSession>,
     needs_resort: bool,
 }
-
 #[derive(Debug, Clone)]
 enum TerminalLaunchContext {
     Local {
@@ -10265,13 +10275,11 @@ enum TerminalLaunchContext {
         title_hint: Option<String>,
     },
 }
-
 #[derive(Debug, Default)]
 struct RemoteFolderTree {
     children: BTreeMap<String, RemoteFolderNode>,
     root_session_indices: Vec<usize>,
 }
-
 #[derive(Debug, Default)]
 struct RemoteFolderNodeBuilder {
     name: String,
@@ -10279,7 +10287,6 @@ struct RemoteFolderNodeBuilder {
     child_paths: HashSet<String>,
     session_indices: Vec<usize>,
 }
-
 #[derive(Debug, Clone)]
 struct RemoteFolderNode {
     name: String,
@@ -10288,7 +10295,6 @@ struct RemoteFolderNode {
     session_indices: Vec<usize>,
     descendant_sessions: usize,
 }
-
 fn ssh_target_machine_label(target: &SshConnectTarget) -> String {
     let raw = if !target.label.trim().is_empty() {
         target.label.trim()
@@ -10302,7 +10308,6 @@ fn ssh_target_machine_label(target: &SshConnectTarget) -> String {
     };
     format!("{raw} [ok]")
 }
-
 fn machine_health_attr_value(health: MachineHealth) -> &'static str {
     match health {
         MachineHealth::Healthy => "healthy",
@@ -10310,7 +10315,6 @@ fn machine_health_attr_value(health: MachineHealth) -> &'static str {
         MachineHealth::Offline => "offline",
     }
 }
-
 fn machine_indicator_color_value(health: MachineHealth) -> &'static str {
     match health {
         MachineHealth::Healthy => "#16a34a",
@@ -10318,7 +10322,6 @@ fn machine_indicator_color_value(health: MachineHealth) -> &'static str {
         MachineHealth::Offline => "#ef4444",
     }
 }
-
 fn machine_status_detail(health: MachineHealth, deploy_state: RemoteDeployState) -> String {
     let health_text = match health {
         MachineHealth::Healthy => "reachable",
@@ -10333,7 +10336,6 @@ fn machine_status_detail(health: MachineHealth, deploy_state: RemoteDeployState)
     };
     format!("{health_text} · {deploy_text}")
 }
-
 fn push_remote_machine_rows(
     rows: &mut Vec<BrowserRow>,
     machine: &SidebarRemoteMachine,
@@ -10360,7 +10362,6 @@ fn push_remote_machine_rows(
     if !machine_expanded {
         return;
     }
-
     let remote_short_ids = unique_session_short_ids_for_pairs(
         &machine
             .scanned_sessions
@@ -10379,7 +10380,6 @@ fn push_remote_machine_rows(
         })
         .collect::<HashMap<_, _>>();
     let folder_tree = build_remote_folder_tree(&machine.scanned_sessions);
-
     for child in folder_tree.children.values() {
         append_remote_folder_rows(rows, machine, child, expanded_paths, &session_labels, 1);
     }
@@ -10407,7 +10407,6 @@ fn push_remote_machine_rows(
         }
     }
 }
-
 fn remote_scanned_session_label(
     session: &RemoteScannedSession,
     short_ids: &HashMap<String, String>,
@@ -10421,7 +10420,6 @@ fn remote_scanned_session_label(
         .cloned()
         .unwrap_or_else(|| session.title_hint.clone())
 }
-
 fn build_remote_folder_tree(sessions: &[RemoteScannedSession]) -> RemoteFolderTree {
     let mut tree = RemoteFolderTree::default();
     let mut nodes = HashMap::<String, RemoteFolderNodeBuilder>::new();
@@ -10480,7 +10478,6 @@ fn build_remote_folder_tree(sessions: &[RemoteScannedSession]) -> RemoteFolderTr
     }
     tree
 }
-
 fn finalize_remote_folder_node(
     path: &str,
     nodes: &mut HashMap<String, RemoteFolderNodeBuilder>,
@@ -10502,7 +10499,6 @@ fn finalize_remote_folder_node(
         descendant_sessions: 0,
     })
 }
-
 fn compress_remote_folder_children(children: &mut BTreeMap<String, RemoteFolderNode>) {
     let keys = children.keys().cloned().collect::<Vec<_>>();
     for key in keys {
@@ -10511,7 +10507,6 @@ fn compress_remote_folder_children(children: &mut BTreeMap<String, RemoteFolderN
         }
     }
 }
-
 fn compress_remote_folder_node(node: &mut RemoteFolderNode, can_compress_self: bool) {
     let child_keys = node.children.keys().cloned().collect::<Vec<_>>();
     for key in child_keys {
@@ -10531,7 +10526,6 @@ fn compress_remote_folder_node(node: &mut RemoteFolderNode, can_compress_self: b
         node.children = child.children;
     }
 }
-
 fn remote_folder_join_label(left: &str, right: &str) -> String {
     if left == "/" {
         return format!("/{right}");
@@ -10542,7 +10536,6 @@ fn remote_folder_join_label(left: &str, right: &str) -> String {
         format!("{left}/{right}")
     }
 }
-
 fn populate_remote_folder_descendant_counts(node: &mut RemoteFolderNode) -> usize {
     let mut count = node.session_indices.len();
     for child in node.children.values_mut() {
@@ -10551,7 +10544,6 @@ fn populate_remote_folder_descendant_counts(node: &mut RemoteFolderNode) -> usiz
     node.descendant_sessions = count;
     count
 }
-
 fn compressed_remote_folder_paths(sessions: &[RemoteScannedSession], cwd: &str) -> Vec<String> {
     let tree = build_remote_folder_tree(sessions);
     let mut paths = Vec::new();
@@ -10562,7 +10554,6 @@ fn compressed_remote_folder_paths(sessions: &[RemoteScannedSession], cwd: &str) 
     }
     paths
 }
-
 fn collect_compressed_remote_folder_paths(
     node: &RemoteFolderNode,
     cwd: &str,
@@ -10583,7 +10574,6 @@ fn collect_compressed_remote_folder_paths(
     }
     true
 }
-
 fn append_remote_folder_rows(
     rows: &mut Vec<BrowserRow>,
     machine: &SidebarRemoteMachine,
@@ -10646,7 +10636,6 @@ fn append_remote_folder_rows(
         }
     }
 }
-
 fn machine_key_from_labelish(value: &str) -> String {
     value
         .chars()
@@ -10661,7 +10650,6 @@ fn machine_key_from_labelish(value: &str) -> String {
         .trim_matches('-')
         .to_string()
 }
-
 fn queue_remove_saved_ssh_target(mut state: Signal<ShellState>, row: BrowserRow) {
     let Some(machine_key) = saved_ssh_target_machine_key(&row, state.read().server.ssh_targets())
     else {
@@ -10675,7 +10663,6 @@ fn queue_remove_saved_ssh_target(mut state: Signal<ShellState>, row: BrowserRow)
         });
         return;
     };
-
     state.with_mut(|shell| {
         shell.select_tree_row(&row, TreeSelectionMode::Replace);
         shell.pending_delete = Some(PendingDeleteDialog {
@@ -10690,7 +10677,6 @@ fn queue_remove_saved_ssh_target(mut state: Signal<ShellState>, row: BrowserRow)
         shell.refresh_tree_debug("open_delete_dialog_saved_ssh_target");
     });
 }
-
 fn apply_machine_health_suffix(label: &str, health: MachineHealth) -> String {
     let base = machine_label_text(label).unwrap_or_else(|| label.to_string());
     format!(
@@ -10703,17 +10689,14 @@ fn apply_machine_health_suffix(label: &str, health: MachineHealth) -> String {
         }
     )
 }
-
 fn queue_session_note_creation(mut state: Signal<ShellState>, row: BrowserRow) {
     if row.kind != BrowserRowKind::Session {
         return;
     }
-
     state.with_mut(|shell| {
         shell.last_action = format!("creating note for {}", row.label);
         shell.server_busy = true;
     });
-
     spawn(async move {
         let row_for_task = row.clone();
         let settings = state.read().settings.clone();
@@ -10730,7 +10713,6 @@ fn queue_session_note_creation(mut state: Signal<ShellState>, row: BrowserRow) {
             },
         )
         .await;
-
         state.with_mut(|shell| match outcome {
             Ok(Ok((document, browser_tree))) => {
                 let expanded_paths = shell.browser.expanded_paths();
@@ -10781,17 +10763,14 @@ fn queue_session_note_creation(mut state: Signal<ShellState>, row: BrowserRow) {
         });
     });
 }
-
 fn queue_session_recipe_creation(mut state: Signal<ShellState>, row: BrowserRow) {
     if row.kind != BrowserRowKind::Session {
         return;
     }
-
     state.with_mut(|shell| {
         shell.last_action = format!("creating recipe for {}", row.label);
         shell.server_busy = true;
     });
-
     spawn(async move {
         let row_for_task = row.clone();
         let settings = state.read().settings.clone();
@@ -10817,7 +10796,6 @@ fn queue_session_recipe_creation(mut state: Signal<ShellState>, row: BrowserRow)
             },
         )
         .await;
-
         state.with_mut(|shell| match outcome {
             Ok(Ok((document, browser_tree))) => {
                 let expanded_paths = shell.browser.expanded_paths();
@@ -10863,17 +10841,14 @@ fn queue_session_recipe_creation(mut state: Signal<ShellState>, row: BrowserRow)
         });
     });
 }
-
 fn queue_new_document(mut state: Signal<ShellState>) {
     state.with_mut(|shell| {
         shell.server_busy = true;
         shell.last_action = "creating document".to_string();
     });
-
     let selected_row = state.read().browser.selected_row().cloned();
     let active_session = state.read().server.active_session().cloned();
     let settings = state.read().settings.clone();
-
     spawn(async move {
         let outcome = task::spawn_blocking(
             move || -> Result<(yggterm_core::WorkspaceDocument, yggterm_core::SessionNode)> {
@@ -10890,7 +10865,6 @@ fn queue_new_document(mut state: Signal<ShellState>) {
             },
         )
         .await;
-
         state.with_mut(|shell| match outcome {
             Ok(Ok((document, browser_tree))) => {
                 let expanded_paths = shell.browser.expanded_paths();
@@ -10932,7 +10906,6 @@ fn queue_new_document(mut state: Signal<ShellState>) {
         });
     });
 }
-
 fn queue_new_document_for_row(state: Signal<ShellState>, row: BrowserRow) {
     queue_new_workspace_document_for_row(
         state,
@@ -10943,7 +10916,6 @@ fn queue_new_document_for_row(state: Signal<ShellState>, row: BrowserRow) {
         None,
     );
 }
-
 fn queue_new_workspace_document_for_row(
     mut state: Signal<ShellState>,
     row: BrowserRow,
@@ -10961,7 +10933,6 @@ fn queue_new_workspace_document_for_row(
         shell.last_action = format!("creating {action_label} in {}", row.label);
         shell.close_context_menu();
     });
-
     let settings = state.read().settings.clone();
     let title = title.to_string();
     spawn(async move {
@@ -10985,7 +10956,6 @@ fn queue_new_workspace_document_for_row(
             },
         )
         .await;
-
         state.with_mut(|shell| match outcome {
             Ok(Ok((document, browser_tree))) => {
                 let expanded_paths = shell.browser.expanded_paths();
@@ -11032,14 +11002,12 @@ fn queue_new_workspace_document_for_row(
         });
     });
 }
-
 fn queue_new_group_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
     state.with_mut(|shell| {
         shell.server_busy = true;
         shell.last_action = format!("creating group in {}", row.label);
         shell.close_context_menu();
     });
-
     let settings = state.read().settings.clone();
     spawn(async move {
         let row_for_task = row.clone();
@@ -11055,7 +11023,6 @@ fn queue_new_group_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
                 Ok((virtual_path, store.load_codex_tree(&settings)?))
             })
             .await;
-
         state.with_mut(|shell| match outcome {
             Ok(Ok((selected_path, browser_tree))) => {
                 let expanded_paths = shell.browser.expanded_paths();
@@ -11093,7 +11060,6 @@ fn queue_new_group_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
         });
     });
 }
-
 fn queue_new_separator_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
     state.with_mut(|shell| {
         shell.server_busy = true;
@@ -11108,7 +11074,6 @@ fn queue_new_separator_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
         );
         shell.close_context_menu();
     });
-
     let settings = state.read().settings.clone();
     spawn(async move {
         let row_for_task = row.clone();
@@ -11127,7 +11092,6 @@ fn queue_new_separator_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
                 Ok((virtual_path, store.load_codex_tree(&settings)?))
             })
             .await;
-
         state.with_mut(|shell| match outcome {
             Ok(Ok((selected_path, browser_tree))) => {
                 let expanded_paths = shell.browser.expanded_paths();
@@ -11172,19 +11136,16 @@ fn queue_new_separator_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
         });
     });
 }
-
 fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: String) {
     let trimmed = label.trim().to_string();
     if trimmed.is_empty() {
         state.with_mut(|shell| shell.cancel_tree_rename());
         return;
     }
-
     state.with_mut(|shell| {
         shell.server_busy = true;
         shell.last_action = format!("renaming {}", row.label);
     });
-
     let settings = state.read().settings.clone();
     spawn(async move {
         let row_for_task = row.clone();
@@ -11223,7 +11184,6 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
             store.load_codex_tree(&settings)
         })
         .await;
-
         state.with_mut(|shell| match outcome {
             Ok(Ok(browser_tree)) => {
                 let expanded_paths = shell.browser.expanded_paths();
@@ -11263,7 +11223,6 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
         });
     });
 }
-
 fn queue_move_selected_items_to_group(
     mut state: Signal<ShellState>,
     placement: WorkspaceDropPlacement,
@@ -11344,7 +11303,6 @@ fn queue_move_selected_items_to_group(
             }),
         );
     });
-
     state.with_mut(|shell| {
         shell.server_busy = true;
         shell.last_action = format!("moving {} item(s) to {}", selected_rows.len(), target_label);
@@ -11356,7 +11314,6 @@ fn queue_move_selected_items_to_group(
             .collect();
         shell.optimistic_drag_target = None;
     });
-
     let settings = state.read().settings.clone();
     spawn(async move {
         let reorder_plan_for_task = reorder_plan.clone();
@@ -11369,7 +11326,6 @@ fn queue_move_selected_items_to_group(
             },
         )
         .await;
-
         state.with_mut(|shell| match outcome {
             Ok(Ok((moved_paths, browser_tree))) => {
                 shell.record_ui_telemetry(
@@ -11447,7 +11403,6 @@ fn queue_move_selected_items_to_group(
         });
     });
 }
-
 fn queue_drop_current_drag_target(mut state: Signal<ShellState>) {
     let (placement, target_label) = {
         let shell = state.read();
@@ -11510,7 +11465,6 @@ fn queue_drop_current_drag_target(mut state: Signal<ShellState>) {
     };
     queue_move_selected_items_to_group(state, placement, target_label);
 }
-
 fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool) {
     let pending = if let Some(pending) = state.read().pending_delete.clone() {
         pending
@@ -11538,7 +11492,6 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
         }
         pending
     };
-
     state.with_mut(|shell| {
         shell.server_busy = true;
         shell.pending_delete = None;
@@ -11553,7 +11506,6 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
         shell.close_context_menu();
         shell.refresh_tree_debug("delete_confirmed");
     });
-
     spawn(async move {
         let pending_for_task = pending.clone();
         let endpoint = state.read().bootstrap.server_endpoint.clone();
@@ -11562,7 +11514,6 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
                 let mut deleted = 0usize;
                 let mut browser_tree = None;
                 let mut daemon_result = None;
-
                 if !pending_for_task.document_paths.is_empty()
                     || !pending_for_task.group_paths.is_empty()
                 {
@@ -11582,7 +11533,6 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
             },
         )
         .await;
-
         state.with_mut(|shell| match outcome {
             Ok(Ok((deleted, maybe_browser_tree, maybe_daemon_result))) => {
                 if let Some(browser_tree) = maybe_browser_tree {
@@ -11634,14 +11584,12 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
         });
     });
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AfterSaveAction {
     SaveOnly,
     RunHere,
     RunNewSession,
 }
-
 fn queue_document_save(
     mut state: Signal<ShellState>,
     virtual_path: String,
@@ -11658,7 +11606,6 @@ fn queue_document_save(
                 .unwrap_or_else(|| "document".to_string())
         );
     });
-
     let settings = state.read().settings.clone();
     spawn(async move {
         let outcome = task::spawn_blocking(
@@ -11670,7 +11617,6 @@ fn queue_document_save(
             },
         )
         .await;
-
         let mut should_run_here = false;
         let mut run_new_session: Option<(Option<String>, String, String, String)> = None;
         state.with_mut(|shell| match outcome {
@@ -11731,7 +11677,6 @@ fn queue_document_save(
                 );
             }
         });
-
         if should_run_here {
             spawn_set_view_mode(state, WorkspaceViewMode::Terminal);
         } else if let Some((cwd, title, launch_command, source_title)) = run_new_session {
@@ -11751,7 +11696,6 @@ fn queue_document_save(
         }
     });
 }
-
 fn session_note_virtual_path(row: &BrowserRow) -> String {
     let base = row
         .session_cwd
@@ -11775,7 +11719,6 @@ fn session_note_virtual_path(row: &BrowserRow) -> String {
     };
     format!("{}/notes/{}", base.trim_end_matches('/'), slug)
 }
-
 fn session_note_template(row: &BrowserRow) -> String {
     let location = row
         .session_cwd
@@ -11787,7 +11730,6 @@ fn session_note_template(row: &BrowserRow) -> String {
         location = location,
     )
 }
-
 fn session_recipe_virtual_path(row: &BrowserRow) -> String {
     let base = row
         .session_cwd
@@ -11811,7 +11753,6 @@ fn session_recipe_virtual_path(row: &BrowserRow) -> String {
     };
     format!("{}/recipes/{}", base.trim_end_matches('/'), slug)
 }
-
 fn session_recipe_template(row: &BrowserRow) -> String {
     let location = row
         .session_cwd
@@ -11825,7 +11766,6 @@ fn session_recipe_template(row: &BrowserRow) -> String {
         location = location,
     )
 }
-
 fn inferred_session_kind_name(row: &BrowserRow) -> &'static str {
     if row.full_path.starts_with("codex-litellm://") {
         "codex_litellm"
@@ -11841,7 +11781,6 @@ fn inferred_session_kind_name(row: &BrowserRow) -> &'static str {
         "session"
     }
 }
-
 fn initial_replay_commands_for_row(row: &BrowserRow) -> Vec<String> {
     if row.full_path.starts_with("codex-litellm://") {
         vec!["CODEX_HOME=\"$HOME/.codex-litellm\" codex-litellm".to_string()]
@@ -11853,7 +11792,6 @@ fn initial_replay_commands_for_row(row: &BrowserRow) -> Vec<String> {
         Vec::new()
     }
 }
-
 fn new_document_virtual_path(
     selected_row: Option<&BrowserRow>,
     active_session: Option<&ManagedSessionView>,
@@ -11868,7 +11806,6 @@ fn new_document_virtual_path(
         unique_workspace_leaf_suffix()
     )
 }
-
 fn new_document_virtual_path_for_row(row: &BrowserRow) -> String {
     let base = document_parent_base(row).unwrap_or_else(|| "/papers".to_string());
     format!(
@@ -11877,7 +11814,6 @@ fn new_document_virtual_path_for_row(row: &BrowserRow) -> String {
         unique_workspace_leaf_suffix()
     )
 }
-
 fn new_group_virtual_path_for_row(row: &BrowserRow) -> String {
     let base = match row.kind {
         BrowserRowKind::Group if row.full_path == "local" => "/workspace".to_string(),
@@ -11900,7 +11836,6 @@ fn new_group_virtual_path_for_row(row: &BrowserRow) -> String {
         unique_workspace_leaf_suffix()
     )
 }
-
 fn new_separator_virtual_path_for_row(row: &BrowserRow) -> String {
     let (base, anchor_leaf, top_of_folder) = match row.kind {
         BrowserRowKind::Group if row.full_path == "local" => ("/workspace".to_string(), None, true),
@@ -11940,24 +11875,20 @@ fn new_separator_virtual_path_for_row(row: &BrowserRow) -> String {
         format!("{}/~separator-{}", base.trim_end_matches('/'), suffix)
     }
 }
-
 fn unique_workspace_leaf_suffix() -> String {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos().to_string())
         .unwrap_or_else(|_| "0".to_string())
 }
-
 fn workspace_leaf_name(path: &str) -> Option<String> {
     path.rsplit('/')
         .find(|segment| !segment.is_empty())
         .map(ToOwned::to_owned)
 }
-
 fn workspace_parent_path(path: &str) -> Option<String> {
     tree_parent_path(path)
 }
-
 fn direct_workspace_parent_path(row: &BrowserRow) -> Option<String> {
     match row.kind {
         BrowserRowKind::Group | BrowserRowKind::Document | BrowserRowKind::Separator => {
@@ -11966,7 +11897,6 @@ fn direct_workspace_parent_path(row: &BrowserRow) -> Option<String> {
         BrowserRowKind::Session => row.session_cwd.as_deref().and_then(workspace_parent_path),
     }
 }
-
 fn browser_row_tree_item(row: &BrowserRow) -> Option<TreeReorderItem<BrowserRowKind>> {
     if !is_workspace_row(row) && !is_drop_target_row(row) {
         return None;
@@ -11982,7 +11912,6 @@ fn browser_row_tree_item(row: &BrowserRow) -> Option<TreeReorderItem<BrowserRowK
         droppable: is_drop_target_row(row),
     })
 }
-
 fn resolve_drag_drop_target(
     rows: &[BrowserRow],
     drag_paths: &[String],
@@ -11996,7 +11925,6 @@ fn resolve_drag_drop_target(
     let row_item = browser_row_tree_item(row)?;
     resolve_tree_drag_drop_target(&items, drag_paths, &row_item, placement)
 }
-
 fn resolve_workspace_drop_placement(
     rows: &[BrowserRow],
     target: &DragDropTarget,
@@ -12007,7 +11935,6 @@ fn resolve_workspace_drop_placement(
         .collect::<Vec<_>>();
     resolve_tree_drop_placement(&items, target)
 }
-
 fn context_menu_drop_placement(row: &BrowserRow) -> Option<WorkspaceDropPlacement> {
     match row.kind {
         BrowserRowKind::Group if is_drop_target_row(row) => {
@@ -12019,7 +11946,6 @@ fn context_menu_drop_placement(row: &BrowserRow) -> Option<WorkspaceDropPlacemen
         BrowserRowKind::Group | BrowserRowKind::Session => None,
     }
 }
-
 fn drag_drop_placement_from_pointer(row: &BrowserRow, y: f64) -> DragDropPlacement {
     let y = y.max(0.0);
     let can_drop_inside =
@@ -12038,7 +11964,6 @@ fn drag_drop_placement_from_pointer(row: &BrowserRow, y: f64) -> DragDropPlaceme
         DragDropPlacement::After
     }
 }
-
 fn build_workspace_reorder_plan(
     rows: &[BrowserRow],
     selected_rows: &[BrowserRow],
@@ -12059,7 +11984,6 @@ fn build_workspace_reorder_plan(
         &unique_workspace_leaf_suffix(),
     )
 }
-
 fn apply_workspace_reorder_plan(
     store: &SessionStore,
     plan: &[WorkspaceReorderPlanItem],
@@ -12075,7 +11999,6 @@ fn apply_workspace_reorder_plan(
             BrowserRowKind::Session => {}
         }
     }
-
     let mut moved_paths = Vec::new();
     for item in plan {
         match item.kind {
@@ -12092,7 +12015,6 @@ fn apply_workspace_reorder_plan(
     }
     Ok(moved_paths)
 }
-
 fn is_workspace_row(row: &BrowserRow) -> bool {
     match row.kind {
         BrowserRowKind::Document | BrowserRowKind::Separator => true,
@@ -12105,7 +12027,6 @@ fn is_workspace_row(row: &BrowserRow) -> bool {
         BrowserRowKind::Session => false,
     }
 }
-
 fn is_drop_target_row(row: &BrowserRow) -> bool {
     match row.kind {
         BrowserRowKind::Group => {
@@ -12117,18 +12038,15 @@ fn is_drop_target_row(row: &BrowserRow) -> bool {
         BrowserRowKind::Session => false,
     }
 }
-
 fn workspace_path_contains(parent: &str, child: &str) -> bool {
     tree_path_contains(parent, child)
 }
-
 fn valid_drop_target(drag_paths: &[String], target_row: &BrowserRow) -> bool {
     let Some(item) = browser_row_tree_item(target_row) else {
         return false;
     };
     valid_tree_drop_target(drag_paths, &item)
 }
-
 fn context_menu_placement(
     position: (f64, f64),
     window_size: (f64, f64),
@@ -12163,7 +12081,6 @@ fn context_menu_placement(
         bottom,
     }
 }
-
 fn context_menu_position_style(placement: ContextMenuPlacement) -> String {
     let mut parts = Vec::new();
     if let Some(left) = placement.left {
@@ -12178,7 +12095,6 @@ fn context_menu_position_style(placement: ContextMenuPlacement) -> String {
     }
     parts.join(" ")
 }
-
 fn group_session_cwd(row: &BrowserRow) -> Option<String> {
     if row.full_path.starts_with("__live_") {
         return None;
@@ -12188,7 +12104,6 @@ fn group_session_cwd(row: &BrowserRow) -> Option<String> {
     }
     Some(row.full_path.clone())
 }
-
 fn group_session_title_hint(row: &BrowserRow, kind: SessionKind) -> String {
     let suffix = match kind {
         SessionKind::Codex => "codex",
@@ -12199,7 +12114,6 @@ fn group_session_title_hint(row: &BrowserRow, kind: SessionKind) -> String {
     };
     format!("{} {}", row.label, suffix)
 }
-
 fn document_parent_base(row: &BrowserRow) -> Option<String> {
     let normalize_legacy_parent = |path: String| {
         path.replace("/notes/notes/", "/notes/")
@@ -12223,7 +12137,6 @@ fn document_parent_base(row: &BrowserRow) -> Option<String> {
         }
     }
 }
-
 fn resolve_creation_context_row(rows: &[BrowserRow], row: &BrowserRow) -> BrowserRow {
     match row.kind {
         BrowserRowKind::Group
@@ -12243,7 +12156,6 @@ fn resolve_creation_context_row(rows: &[BrowserRow], row: &BrowserRow) -> Browse
         BrowserRowKind::Group => row.clone(),
     }
 }
-
 fn nearest_workspace_group_row(rows: &[BrowserRow], path: &str) -> Option<BrowserRow> {
     let mut cursor = Some(path.to_string());
     while let Some(candidate) = cursor {
@@ -12259,7 +12171,6 @@ fn nearest_workspace_group_row(rows: &[BrowserRow], path: &str) -> Option<Browse
     }
     None
 }
-
 fn active_session_document_base(session: &ManagedSessionView) -> Option<String> {
     if session.kind == SessionKind::Document {
         parent_virtual_path(&session.session_path)
@@ -12271,7 +12182,6 @@ fn active_session_document_base(session: &ManagedSessionView) -> Option<String> 
             .map(|entry| entry.value.clone())
     }
 }
-
 fn parent_virtual_path(path: &str) -> Option<String> {
     let normalized = path.trim_end_matches('/');
     let parent = normalized.rsplit_once('/')?.0;
@@ -12281,14 +12191,12 @@ fn parent_virtual_path(path: &str) -> Option<String> {
         Some(parent.to_string())
     }
 }
-
 fn perf_home_dir(settings_path: &std::path::Path) -> PathBuf {
     settings_path
         .parent()
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."))
 }
-
 fn client_instance_scope(endpoint: &ServerEndpoint) -> String {
     let raw = match endpoint {
         #[cfg(unix)]
@@ -12305,13 +12213,11 @@ fn client_instance_scope(endpoint: &ServerEndpoint) -> String {
         })
         .collect()
 }
-
 fn client_instances_dir(settings_path: &std::path::Path, endpoint: &ServerEndpoint) -> PathBuf {
     perf_home_dir(settings_path)
         .join("client-instances")
         .join(client_instance_scope(endpoint))
 }
-
 fn right_panel_mode_label(mode: RightPanelMode) -> &'static str {
     match mode {
         RightPanelMode::Hidden => "hidden",
@@ -12321,14 +12227,12 @@ fn right_panel_mode_label(mode: RightPanelMode) -> &'static str {
         RightPanelMode::Notifications => "notifications",
     }
 }
-
 fn preview_layout_mode_label(mode: PreviewLayoutMode) -> &'static str {
     match mode {
         PreviewLayoutMode::Chat => "chat",
         PreviewLayoutMode::Graph => "graph",
     }
 }
-
 fn selected_sidebar_row_from_rows(
     rows: &[BrowserRow],
     selected_tree_paths: &HashSet<String>,
@@ -12345,7 +12249,6 @@ fn selected_sidebar_row_from_rows(
         .or_else(|| selected_path.and_then(|path| rows.iter().find(|row| row.full_path == path)))
         .cloned()
 }
-
 fn current_selected_sidebar_row(shell: &ShellState) -> Option<BrowserRow> {
     let snapshot = shell.snapshot();
     selected_sidebar_row_from_rows(
@@ -12355,7 +12258,6 @@ fn current_selected_sidebar_row(shell: &ShellState) -> Option<BrowserRow> {
         snapshot.selected_path.as_deref(),
     )
 }
-
 fn remote_machine_for_sidebar_row<'a>(
     shell: &'a ShellState,
     row: &BrowserRow,
@@ -12376,7 +12278,6 @@ fn remote_machine_for_sidebar_row<'a>(
         .iter()
         .find(|machine| machine.machine_key == machine_key)
 }
-
 fn terminal_launch_context(shell: &ShellState) -> TerminalLaunchContext {
     if let Some(row) = current_selected_sidebar_row(shell) {
         if let Some(machine) = remote_machine_for_sidebar_row(shell, &row) {
@@ -12434,14 +12335,12 @@ fn terminal_launch_context(shell: &ShellState) -> TerminalLaunchContext {
         title_hint: None,
     }
 }
-
 fn workspace_view_mode_from_app_control(mode: AppControlViewMode) -> WorkspaceViewMode {
     match mode {
         AppControlViewMode::Preview => WorkspaceViewMode::Rendered,
         AppControlViewMode::Terminal => WorkspaceViewMode::Terminal,
     }
 }
-
 fn drag_drop_placement_from_app_control(placement: AppControlDragPlacement) -> DragDropPlacement {
     match placement {
         AppControlDragPlacement::Before => DragDropPlacement::Before,
@@ -12449,7 +12348,6 @@ fn drag_drop_placement_from_app_control(placement: AppControlDragPlacement) -> D
         AppControlDragPlacement::After => DragDropPlacement::After,
     }
 }
-
 fn active_surface_request_matches_session(
     request: &ActiveSurfaceRequest,
     active_session_path: Option<&str>,
@@ -12462,7 +12360,6 @@ fn active_surface_request_matches_session(
         _ => false,
     }
 }
-
 fn resolve_app_control_remote_machine(
     shell: &ShellState,
     machine_key: &str,
@@ -12475,7 +12372,6 @@ fn resolve_app_control_remote_machine(
         .find(|machine| machine.machine_key == normalized)
         .cloned()
 }
-
 fn describe_app_state_snapshot(
     state: &Signal<ShellState>,
     desktop: &dioxus::desktop::DesktopContext,
@@ -12552,6 +12448,21 @@ fn describe_app_state_snapshot(
         "terminal_dark_theme_name": shell.terminal_theme_name_for(UiTheme::ZedDark),
         "effective_terminal_theme_name": shell.effective_terminal_theme_name(),
     });
+    let live_session_snapshot_debug = shell
+        .server
+        .live_sessions()
+        .iter()
+        .map(|session| {
+            json!({
+                "session_path": session.session_path,
+                "title": session.title,
+                "terminal_foreground_active": session.terminal_foreground_active,
+                "source": format!("{:?}", session.source),
+                "launch_phase": format!("{:?}", session.launch_phase),
+                "status_line": session.status_line,
+            })
+        })
+        .collect::<Vec<_>>();
     json!({
         "window": describe_window(desktop),
         "client_instance": {
@@ -12565,9 +12476,11 @@ fn describe_app_state_snapshot(
         "active_view_mode": format!("{:?}", snapshot.active_view_mode),
         "active_session_path": snapshot.active_session_path.clone(),
         "active_session_source": snapshot.active_session.as_ref().map(|session| format!("{:?}", session.source)),
+        "active_session_terminal_foreground_active": snapshot.active_session.as_ref().and_then(|session| session.terminal_foreground_active),
         "active_title": snapshot.active_title.clone(),
         "active_precis": snapshot.active_precis.clone(),
         "active_summary": snapshot.active_summary.clone(),
+        "live_session_snapshot_debug": live_session_snapshot_debug,
         "settings": settings_snapshot,
         "browser": {
             "selected_path": selected_path.clone(),
@@ -12634,6 +12547,10 @@ fn describe_app_state_snapshot(
                 .iter()
                 .cloned()
                 .collect::<Vec<_>>(),
+            "live_session_snapshot_refresh_in_flight": shell.live_session_snapshot_refresh_in_flight,
+            "next_live_session_snapshot_after_ms": shell.next_live_session_snapshot_after_ms,
+            "background_refresh_after_ms": shell.background_refresh_after_ms,
+            "terminal_busy_hint_until_ms": shell.terminal_busy_hint_until_ms,
             "notifications_count": shell.notifications.len(),
             "notifications": shell.notifications.iter().map(|notification| {
                 json!({
@@ -12695,7 +12612,6 @@ fn describe_app_state_snapshot(
         "active_surface_requests": active_requests,
     })
 }
-
 fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
     let shell = state.read();
     let snapshot = shell.snapshot();
@@ -12703,7 +12619,9 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
         "row_count": snapshot.rows.len(),
         "rows": snapshot.rows.iter().map(|row| {
             let machine = remote_machine_for_sidebar_row(&shell, row);
+            let busy = sidebar_row_shows_busy_icon(&snapshot, row);
             json!({
+                "path": row.full_path,
                 "full_path": row.full_path,
                 "label": row.label,
                 "detail_label": row.detail_label,
@@ -12715,6 +12633,10 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
                 "selected": shell.selected_tree_paths.contains(&row.full_path),
                 "session_id": row.session_id,
                 "session_cwd": row.session_cwd,
+                "child_count": row.descendant_sessions,
+                "busy": busy,
+                "icon_kind": if busy { Some("busy") } else { Some(tree_icon_kind(row)) },
+                "icon_text": if busy { None::<&str> } else { tree_icon_glyph(row) },
                 "draggable": is_workspace_row(row),
                 "drop_target_row": is_drop_target_row(row),
                 "machine_key": machine.as_ref().map(|machine| machine.machine_key.clone()),
@@ -12731,7 +12653,6 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
         }).collect::<Vec<_>>(),
     })
 }
-
 async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Value {
     let active_session_path_literal =
         serde_json::to_string(&active_session_path).unwrap_or_else(|_| "null".to_string());
@@ -12832,7 +12753,9 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                         selected: row.getAttribute('data-selected') === 'true',
                         drop_target: row.getAttribute('data-drop-target'),
                         icon_text: String(icon?.textContent || '').trim(),
-                        label: String(row.textContent || '').trim().slice(0, 140),
+                        icon_kind: String(icon?.getAttribute('data-tree-icon-kind') || '').trim(),
+                        text_label: String(row.getAttribute('data-sidebar-row-label') || '').trim(),
+                        label: String(row.getAttribute('data-sidebar-row-label') || row.textContent || '').trim().slice(0, 140),
                         top: Math.round(rect.top),
                         height: Math.round(rect.height),
                     };
@@ -13115,8 +13038,16 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     && host.contains(anchorNode)
                     && host.contains(focusNode)
                 );
+                const selectedText = String(selection.toString() || '').slice(0, 480);
+                if (!selectedText.trim()) {
+                    return {
+                        text: '',
+                        range_count: 0,
+                        within_host: false,
+                    };
+                }
                 return {
-                    text: String(selection.toString() || '').slice(0, 480),
+                    text: selectedText,
                     range_count: Number(selection.rangeCount || 0),
                     within_host: withinHost,
                 };
@@ -13777,7 +13708,6 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
         }),
     }
 }
-
 async fn scroll_preview_viewport_for(
     active_session_path: Option<&str>,
     top_px: Option<f64>,
@@ -13884,7 +13814,6 @@ async fn scroll_preview_viewport_for(
         }),
     }
 }
-
 async fn probe_terminal_viewport_input_for(
     session_path: &str,
     data: &str,
@@ -14228,7 +14157,6 @@ async fn probe_terminal_viewport_input_for(
         }),
     }
 }
-
 async fn receive_probe_eval_value(script: &str, session_path: &str) -> Value {
     for attempt in 0..2 {
         let mut eval = document::eval(script);
@@ -14256,7 +14184,6 @@ async fn receive_probe_eval_value(script: &str, session_path: &str) -> Value {
         "session_path": session_path,
     })
 }
-
 async fn probe_terminal_viewport_scroll_for(session_path: &str, lines: i32) -> Value {
     let session_path_literal =
         serde_json::to_string(session_path).unwrap_or_else(|_| "null".to_string());
@@ -14360,7 +14287,6 @@ async fn probe_terminal_viewport_scroll_for(session_path: &str, lines: i32) -> V
     );
     receive_probe_eval_value(&script, session_path).await
 }
-
 async fn probe_terminal_viewport_select_for(session_path: &str) -> Value {
     let session_path_literal =
         serde_json::to_string(session_path).unwrap_or_else(|_| "null".to_string());
@@ -14525,7 +14451,6 @@ async fn probe_terminal_viewport_select_for(session_path: &str) -> Value {
     );
     receive_probe_eval_value(&script, session_path).await
 }
-
 async fn process_pending_app_control_requests(
     settings_path: &std::path::Path,
     desktop: dioxus::desktop::DesktopContext,
@@ -15106,18 +15031,46 @@ async fn process_pending_app_control_requests(
         AppControlCommand::SendTerminalInput { session_path, data } => {
             let endpoint = state.read().bootstrap.server_endpoint.clone();
             match terminal_write_async(endpoint, session_path.clone(), data.clone()).await {
-                Ok(()) => AppControlResponse {
-                    request_id: request.request_id.clone(),
-                    handled_by_pid: std::process::id(),
-                    completed_at_ms: current_millis() as u128,
-                    output_path: None,
-                    data: Some(json!({
-                        "accepted": true,
-                        "session_path": session_path,
-                        "bytes": data.len(),
-                    })),
-                    error: None,
-                },
+                Ok(()) => {
+                    if data.contains(['\r', '\n']) {
+                        let _ = safe_shell_mut(
+                            state,
+                            "app_control_send_terminal_input_schedule_live_snapshot_refresh",
+                            |shell| {
+                                let now_ms = current_millis();
+                                shell.next_live_session_snapshot_after_ms = now_ms;
+                                shell.terminal_busy_hint_until_ms.insert(
+                                    session_path.clone(),
+                                    now_ms.saturating_add(TERMINAL_BUSY_HINT_MS),
+                                );
+                            },
+                        );
+                        spawn_live_session_snapshot_nudge(state);
+                    } else {
+                        let _ = safe_shell_mut(
+                            state,
+                            "app_control_send_terminal_input_schedule_live_snapshot_refresh",
+                            |shell| {
+                                schedule_live_session_snapshot_refresh(
+                                    shell,
+                                    LIVE_SESSION_SNAPSHOT_TRIGGER_DEBOUNCE_MS,
+                                );
+                            },
+                        );
+                    }
+                    AppControlResponse {
+                        request_id: request.request_id.clone(),
+                        handled_by_pid: std::process::id(),
+                        completed_at_ms: current_millis() as u128,
+                        output_path: None,
+                        data: Some(json!({
+                            "accepted": true,
+                            "session_path": session_path,
+                            "bytes": data.len(),
+                        })),
+                        error: None,
+                    }
+                }
                 Err(error) => AppControlResponse {
                     request_id: request.request_id.clone(),
                     handled_by_pid: std::process::id(),
@@ -15446,13 +15399,11 @@ async fn process_pending_app_control_requests(
     );
     Ok(true)
 }
-
 fn parse_client_instance_pid(path: &Path) -> Option<u32> {
     let file_name = path.file_name()?.to_str()?;
     let pid_prefix = file_name.split('-').next()?;
     pid_prefix.parse::<u32>().ok()
 }
-
 #[cfg(unix)]
 fn process_is_alive(pid: u32) -> bool {
     if pid == 0 {
@@ -15466,34 +15417,28 @@ fn process_is_alive(pid: u32) -> bool {
         .raw_os_error()
         .is_some_and(|code| code == libc::EPERM)
 }
-
 #[cfg(not(unix))]
 fn process_is_alive(pid: u32) -> bool {
     pid != 0
 }
-
 #[cfg(unix)]
 fn process_start_ticks(pid: u32) -> Option<u64> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     parse_process_start_ticks_from_stat(&stat)
 }
-
 #[cfg(not(unix))]
 fn process_start_ticks(_pid: u32) -> Option<u64> {
     None
 }
-
 #[cfg(unix)]
 fn parse_process_start_ticks_from_stat(stat: &str) -> Option<u64> {
     let (_, rest) = stat.rsplit_once(") ")?;
     rest.split_whitespace().nth(19)?.parse::<u64>().ok()
 }
-
 #[cfg(not(unix))]
 fn parse_process_start_ticks_from_stat(_stat: &str) -> Option<u64> {
     None
 }
-
 #[cfg(unix)]
 fn process_has_gui_client_argv(pid: u32) -> bool {
     let payload = match fs::read(format!("/proc/{pid}/cmdline")) {
@@ -15511,12 +15456,10 @@ fn process_has_gui_client_argv(pid: u32) -> bool {
         Path::new(arg0).file_name().and_then(|name| name.to_str()) == Some("yggterm")
     })
 }
-
 #[cfg(not(unix))]
 fn process_has_gui_client_argv(_pid: u32) -> bool {
     true
 }
-
 fn client_instance_record_matches_live_process(record: &ClientInstanceRecord) -> bool {
     if !process_is_alive(record.pid) {
         return false;
@@ -15526,7 +15469,6 @@ fn client_instance_record_matches_live_process(record: &ClientInstanceRecord) ->
     }
     process_has_gui_client_argv(record.pid)
 }
-
 fn cleanup_stale_client_instances(dir: &Path, keep_path: Option<&Path>) -> Result<Vec<PathBuf>> {
     fs::create_dir_all(dir)?;
     let mut active = Vec::new();
@@ -15564,7 +15506,6 @@ fn cleanup_stale_client_instances(dir: &Path, keep_path: Option<&Path>) -> Resul
     active.sort();
     Ok(active)
 }
-
 fn register_client_instance(
     settings_path: &Path,
     endpoint: &ServerEndpoint,
@@ -15610,14 +15551,12 @@ fn register_client_instance(
     );
     Ok(ClientInstanceRegistration { path })
 }
-
 fn env_var(key: &str) -> Option<String> {
     std::env::var(key)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
-
 fn maybe_shutdown_daemon_for_last_client(
     settings_path: &Path,
     endpoint: &ServerEndpoint,
@@ -15667,7 +15606,6 @@ fn maybe_shutdown_daemon_for_last_client(
         })
     }
 }
-
 fn finalize_client_shutdown(
     settings_path: &Path,
     endpoint: &ServerEndpoint,
@@ -15699,7 +15637,6 @@ fn finalize_client_shutdown(
             remaining_clients: active.len(),
         });
     }
-
     if !INTENTIONAL_CLIENT_SHUTDOWN.swap(false, Ordering::SeqCst) {
         let dir = client_instances_dir(settings_path, endpoint);
         let current_path = CLIENT_INSTANCE
@@ -15727,10 +15664,8 @@ fn finalize_client_shutdown(
             remaining_clients: active.len(),
         });
     }
-
     maybe_shutdown_daemon_for_last_client(settings_path, endpoint)
 }
-
 fn preserve_client_focus_for_background_snapshot(
     shell: &ShellState,
     snapshot: &mut ServerUiSnapshot,
@@ -15769,14 +15704,35 @@ fn preserve_client_focus_for_background_snapshot(
     let preserved_terminal_session = (preserved_view_mode == WorkspaceViewMode::Terminal)
         .then(|| {
             preserved_active_path.as_deref().and_then(|path| {
-                fallback_active_session
-                    .as_ref()
-                    .filter(|session| session.session_path == path)
+                snapshot
+                    .live_sessions
+                    .iter()
+                    .find(|session| session.session_path == path)
                     .cloned()
-                    .map(snapshot_session_view_for_ui)
+                    .or_else(|| {
+                        snapshot
+                            .active_session
+                            .as_ref()
+                            .filter(|session| session.session_path == path)
+                            .cloned()
+                    })
+                    .or_else(|| {
+                        fallback_active_session
+                            .as_ref()
+                            .filter(|session| session.session_path == path)
+                            .cloned()
+                            .map(snapshot_session_view_for_ui)
+                    })
             })
         })
         .flatten();
+    let preserved_live_session = preserved_active_path.as_deref().and_then(|path| {
+        snapshot
+            .live_sessions
+            .iter()
+            .find(|session| session.session_path == path)
+            .cloned()
+    });
     snapshot.active_view_mode = preserved_view_mode;
     snapshot.active_session_path = preserved_active_path.clone();
     snapshot.active_session = match preserved_active_path.as_deref() {
@@ -15790,6 +15746,7 @@ fn preserve_client_focus_for_background_snapshot(
         {
             snapshot.active_session.clone()
         }
+        Some(_path) if preserved_live_session.is_some() => preserved_live_session.clone(),
         _ => None,
     };
     if let Some(preserved_session) = preserved_preview_session {
@@ -15802,7 +15759,6 @@ fn preserve_client_focus_for_background_snapshot(
         }
     }
 }
-
 #[derive(Clone)]
 struct GhosttyDockRequest {
     pid: Option<u32>,
@@ -15811,7 +15767,6 @@ struct GhosttyDockRequest {
     rect: DockRect,
     retry_budget: u8,
 }
-
 impl GhosttyDockRequest {
     fn signature(&self) -> DockSignature {
         DockSignature {
@@ -15821,12 +15776,10 @@ impl GhosttyDockRequest {
         }
     }
 }
-
 fn spawn_dock_sync(mut state: Signal<ShellState>, request: GhosttyDockRequest) {
     if state.read().dock_sync_in_flight {
         return;
     }
-
     state.with_mut(|shell| shell.dock_sync_in_flight = true);
     spawn(async move {
         let request_for_task = request.clone();
@@ -15839,7 +15792,6 @@ fn spawn_dock_sync(mut state: Signal<ShellState>, request: GhosttyDockRequest) {
             )
         })
         .await;
-
         let mut retry_request = None;
         state.with_mut(|shell| {
             shell.dock_sync_in_flight = false;
@@ -15871,12 +15823,10 @@ fn spawn_dock_sync(mut state: Signal<ShellState>, request: GhosttyDockRequest) {
         }
     });
 }
-
 fn spawn_dock_retry(state: Signal<ShellState>, request: GhosttyDockRequest) {
     if request.retry_budget == 0 {
         return;
     }
-
     spawn(async move {
         let _ = task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(250))).await;
         let should_retry = {
@@ -15894,7 +15844,6 @@ fn spawn_dock_retry(state: Signal<ShellState>, request: GhosttyDockRequest) {
                     .unwrap_or(false)
             }
         };
-
         if should_retry {
             let mut next = request.clone();
             next.retry_budget = next.retry_budget.saturating_sub(1);
@@ -15902,12 +15851,10 @@ fn spawn_dock_retry(state: Signal<ShellState>, request: GhosttyDockRequest) {
         }
     });
 }
-
 fn spawn_dock_hide(mut state: Signal<ShellState>, pid: Option<u32>, window_id: String) {
     if state.read().dock_sync_in_flight {
         return;
     }
-
     state.with_mut(|shell| shell.dock_sync_in_flight = true);
     spawn(async move {
         let outcome = task::spawn_blocking(move || {
@@ -15926,7 +15873,6 @@ fn spawn_dock_hide(mut state: Signal<ShellState>, pid: Option<u32>, window_id: S
         });
     });
 }
-
 fn is_transient_dock_error(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("not found yet")
@@ -15934,7 +15880,6 @@ fn is_transient_dock_error(message: &str) -> bool {
         || lower.contains("no window id")
         || lower.contains("not installed on path")
 }
-
 fn ghostty_dock_request(
     desktop: &dioxus::desktop::DesktopContext,
     snapshot: &RenderSnapshot,
@@ -15942,7 +15887,6 @@ fn ghostty_dock_request(
     if !cfg!(target_os = "linux") || snapshot.active_view_mode != WorkspaceViewMode::Terminal {
         return None;
     }
-
     let session = snapshot.active_session.as_ref()?;
     if session.backend != TerminalBackend::Ghostty {
         return None;
@@ -15950,7 +15894,6 @@ fn ghostty_dock_request(
     if session.terminal_host_mode != GhosttyTerminalHostMode::ControlledDock {
         return None;
     }
-
     let pid = session.terminal_process_id?;
     let inner = desktop.inner_size();
     let scale = desktop.scale_factor();
@@ -15969,7 +15912,6 @@ fn ghostty_dock_request(
     let right_padding = 12.0;
     let bottom_padding = 10.0;
     let frame_inset = SHELL_FRAME_INSET_PX;
-
     let x = ((left_sidebar + frame_inset) * scale).round() as i32;
     let y = ((titlebar_height + top_padding + frame_inset) * scale).round() as i32;
     let width = inner.width.saturating_sub(
@@ -15979,11 +15921,9 @@ fn ghostty_dock_request(
         ((titlebar_height + top_padding + bottom_padding + frame_inset * 2.0) * scale).round()
             as u32,
     );
-
     if width < 240 || height < 180 {
         return None;
     }
-
     Some(GhosttyDockRequest {
         pid: Some(pid),
         known_window_id: session.terminal_window_id.clone(),
@@ -15997,7 +15937,6 @@ fn ghostty_dock_request(
         retry_budget: 16,
     })
 }
-
 pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
     let trace_home = perf_home_dir(&bootstrap.settings_path);
     let linux_window_transparent = bootstrap.linux_window_transparent;
@@ -16073,7 +16012,6 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
             "pid": std::process::id(),
         }),
     );
-
     #[cfg(target_os = "macos")]
     let window = WindowBuilder::new()
         .with_title("Yggterm")
@@ -16083,10 +16021,8 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
         .with_resizable(true)
         .with_inner_size(LogicalSize::new(1460.0, 920.0))
         .with_min_inner_size(LogicalSize::new(1024.0, 720.0));
-
     #[cfg(not(target_os = "macos"))]
     let linux_transparent_window = linux_window_transparent;
-
     #[cfg(not(target_os = "macos"))]
     let window = WindowBuilder::new()
         .with_title("Yggterm")
@@ -16096,12 +16032,10 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
         .with_resizable(true)
         .with_inner_size(LogicalSize::new(1460.0, 920.0))
         .with_min_inner_size(LogicalSize::new(1024.0, 720.0));
-
     let config = Config::new()
         .with_window(window)
         .with_close_behaviour(WindowCloseBehaviour::WindowCloses)
         .with_exits_when_last_window_closes(true);
-
     append_trace_event(
         &trace_home,
         "ui",
@@ -16113,11 +16047,9 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
             "profile_reason": linux_window_profile_reason,
         }),
     );
-
     dioxus::LaunchBuilder::desktop()
         .with_cfg(config)
         .launch(app);
-
     if CLIENT_INSTANCE.get().is_some() {
         match finalize_client_shutdown(
             &shutdown_bootstrap.settings_path,
@@ -16134,13 +16066,11 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
             }
         }
     }
-
     if let Some(registration) = CLIENT_INSTANCE.get() {
         let _ = fs::remove_file(&registration.path);
     }
     Ok(())
 }
-
 fn app() -> Element {
     let bootstrap = BOOTSTRAP
         .get()
@@ -16792,6 +16722,7 @@ fn app() -> Element {
         background_refresh_defer_started.set(true);
         spawn(async move {
             loop {
+                maybe_spawn_background_live_session_snapshot(state);
                 let defer_ms =
                     safe_shell_read(state, "background_refresh_scheduler_read", |shell| {
                         shell
@@ -16800,7 +16731,7 @@ fn app() -> Element {
                     })
                     .unwrap_or_default();
                 if defer_ms > 0 {
-                    sleep(Duration::from_millis(defer_ms)).await;
+                    sleep(Duration::from_millis(defer_ms.min(250))).await;
                     continue;
                 }
                 if safe_shell_read(state, "background_refresh_scheduler_gate", |shell| {
@@ -17118,7 +17049,6 @@ fn app() -> Element {
         let context_row = resolve_creation_context_row(&snapshot.rows, &row);
         (row, context_row)
     });
-
     rsx! {
         div {
             id: "yggterm-shell-root",
@@ -17935,7 +17865,6 @@ fn app() -> Element {
         }
     }
 }
-
 #[component]
 fn Titlebar(
     snapshot: SharedSnapshot,
@@ -18494,7 +18423,6 @@ fn Titlebar(
         }
     }
 }
-
 #[component]
 fn WindowResizeHandles() -> Element {
     rsx! {
@@ -18532,7 +18460,6 @@ fn WindowResizeHandles() -> Element {
         }
     }
 }
-
 #[component]
 fn ResizeHandle(style: String, direction: ResizeDirection) -> Element {
     rsx! {
@@ -18546,7 +18473,6 @@ fn ResizeHandle(style: String, direction: ResizeDirection) -> Element {
         }
     }
 }
-
 #[component]
 fn Sidebar(
     snapshot: SharedSnapshot,
@@ -18635,6 +18561,7 @@ fn Sidebar(
                     }
                 }
             }
+            style { "{TREE_SPINNER_CSS}" }
             div {
                 "data-sidebar-scroll": "1",
                 style: "flex:1; min-height:0; overflow:auto; padding:12px 12px 12px 12px;",
@@ -18657,9 +18584,15 @@ fn Sidebar(
                     {
                         let select_row = row.clone();
                         let context_row = row.clone();
+                        let visible_label = sidebar_row_visible_label(&row);
+                        let icon_kind = tree_icon_kind(&row).to_string();
+                        let busy_icon = sidebar_row_shows_busy_icon(&snapshot, &row);
                         rsx! {
                             SidebarRow {
                                 row: row.clone(),
+                                visible_label: visible_label.clone(),
+                                icon_kind: icon_kind.clone(),
+                                busy_icon,
                                 selected: snapshot.selected_tree_paths.iter().any(|path| path == &row.full_path)
                                     || (
                                         snapshot.selected_tree_paths.is_empty()
@@ -18727,7 +18660,237 @@ fn Sidebar(
         }
     }
 }
-
+fn sidebar_row_visible_label(row: &BrowserRow) -> String {
+    machine_label_text(&row.label).unwrap_or_else(|| row.label.clone())
+}
+fn sidebar_row_session_for_icon<'a>(
+    snapshot: &'a RenderSnapshot,
+    row: &BrowserRow,
+) -> Option<&'a ManagedSessionView> {
+    let row_path = normalize_live_session_path(&row.full_path);
+    let row_session_id = row.session_id.as_deref();
+    snapshot
+        .active_session
+        .iter()
+        .chain(snapshot.live_sessions.iter())
+        .chain(snapshot.retained_terminal_sessions.iter())
+        .find(|session| {
+            normalize_live_session_path(&session.session_path) == row_path
+                || session.session_path == row.full_path
+                || row_session_id.is_some_and(|session_id| session.id == session_id)
+        })
+}
+fn session_sample_text_for_sidebar_icon(session: &ManagedSessionView) -> String {
+    let terminal_tail = session
+        .terminal_lines
+        .iter()
+        .rev()
+        .take(8)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !terminal_tail.is_empty() {
+        return terminal_tail
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    let rendered_tail = session
+        .rendered_sections
+        .iter()
+        .rev()
+        .flat_map(|section| section.lines.iter().rev())
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .take(6)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if !rendered_tail.is_empty() {
+        return rendered_tail
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    session.status_line.clone()
+}
+fn terminal_chunk_looks_idle_for_sidebar_icon(sample: &str) -> bool {
+    let trimmed = sample.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let tail_line = trimmed
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or(trimmed);
+    let prompt_summary_prefix = tail_line
+        .split(" >")
+        .next()
+        .map(str::trim)
+        .filter(|prefix| !prefix.is_empty())
+        .unwrap_or(tail_line);
+    terminal_chunk_has_prompt_output(trimmed)
+        || terminal_chunk_has_codex_prompt_output(trimmed)
+        || terminal_chunk_is_generic_codex_idle(trimmed)
+        || terminal_chunk_has_prompt_output(tail_line)
+        || terminal_chunk_has_codex_prompt_output(tail_line)
+        || (prompt_summary_prefix != tail_line
+            && (terminal_chunk_has_prompt_output(prompt_summary_prefix)
+                || terminal_chunk_has_codex_prompt_output(prompt_summary_prefix)))
+}
+fn session_is_idle_for_sidebar_icon(session: &ManagedSessionView) -> bool {
+    let sample = session_sample_text_for_sidebar_icon(session);
+    terminal_chunk_looks_idle_for_sidebar_icon(&sample)
+}
+fn sidebar_row_has_optimistic_busy_hint(snapshot: &RenderSnapshot, row: &BrowserRow) -> bool {
+    let row_path = normalize_live_session_path(&row.full_path);
+    snapshot.optimistic_busy_paths.iter().any(|session_path| {
+        normalize_live_session_path(session_path) == row_path || session_path == &row.full_path
+    })
+}
+fn sidebar_row_shows_busy_icon(snapshot: &RenderSnapshot, row: &BrowserRow) -> bool {
+    if matches!(row.kind, BrowserRowKind::Group | BrowserRowKind::Separator) {
+        return false;
+    }
+    if sidebar_row_has_optimistic_busy_hint(snapshot, row) {
+        return true;
+    }
+    let Some(session) = sidebar_row_session_for_icon(snapshot, row) else {
+        return false;
+    };
+    if session.kind == SessionKind::Document {
+        return false;
+    }
+    if matches!(
+        session.launch_phase,
+        yggterm_server::TerminalLaunchPhase::Queued
+            | yggterm_server::TerminalLaunchPhase::BridgePending
+            | yggterm_server::TerminalLaunchPhase::RemoteBootstrap
+    ) {
+        return true;
+    }
+    let is_active_live_session = snapshot.active_session_path.as_deref()
+        == Some(session.session_path.as_str())
+        && matches!(
+            session.source,
+            SessionSource::LiveLocal | SessionSource::LiveSsh
+        );
+    if is_active_live_session && session_is_idle_for_sidebar_icon(session) {
+        return false;
+    }
+    if session.terminal_foreground_active == Some(true) {
+        return true;
+    }
+    if is_active_live_session
+        && snapshot
+            .active_summary
+            .as_deref()
+            .is_some_and(terminal_chunk_looks_idle_for_sidebar_icon)
+    {
+        return false;
+    }
+    if let Some(foreground_active) = session.terminal_foreground_active {
+        return foreground_active;
+    }
+    is_active_live_session && !session_is_idle_for_sidebar_icon(session)
+}
+fn tree_icon_kind(row: &BrowserRow) -> &'static str {
+    match row.kind {
+        BrowserRowKind::Separator => "separator",
+        BrowserRowKind::Document => {
+            if row.document_kind == Some(WorkspaceDocumentKind::TerminalRecipe) {
+                "recipe"
+            } else {
+                "paper"
+            }
+        }
+        BrowserRowKind::Session => {
+            if row.full_path.starts_with("codex-litellm://") {
+                "codex-litellm"
+            } else if row.full_path.starts_with("codex://") {
+                "codex"
+            } else if row.full_path.starts_with("local://") {
+                "plain-terminal"
+            } else if row.full_path.starts_with("ssh://")
+                || row.full_path.starts_with("remote-session://")
+            {
+                "remote-terminal"
+            } else {
+                "plain-terminal"
+            }
+        }
+        BrowserRowKind::Group => {
+            if row.full_path == "__live_sessions__" {
+                "live-group"
+            } else if row.full_path == "local" {
+                "local-group"
+            } else if row.full_path.starts_with("__remote_machine__/") {
+                "remote-machine"
+            } else {
+                "folder"
+            }
+        }
+    }
+}
+fn tree_icon_glyph(row: &BrowserRow) -> Option<&'static str> {
+    match row.kind {
+        BrowserRowKind::Separator => Some("—"),
+        BrowserRowKind::Session => Some(
+            if row.full_path.starts_with("codex-litellm://")
+                || row.full_path.starts_with("codex://")
+            {
+                "✦"
+            } else if row.full_path.starts_with("local://") {
+                "⌘"
+            } else if row.full_path.starts_with("ssh://")
+                || row.full_path.starts_with("remote-session://")
+            {
+                "⇄"
+            } else {
+                "⌘"
+            },
+        ),
+        _ => None,
+    }
+}
+#[component]
+fn BusyTreeIcon() -> Element {
+    rsx! {
+        span {
+            style: "display:inline-flex; align-items:center; justify-content:center; width:15px; height:15px; opacity:0.92; animation:yggterm-tree-spinner 0.9s linear infinite; transform-origin:center;",
+            svg {
+                width: "15",
+                height: "15",
+                view_box: "0 0 16 16",
+                fill: "none",
+                xmlns: "http://www.w3.org/2000/svg",
+                circle {
+                    cx: "8",
+                    cy: "8",
+                    r: "5.4",
+                    stroke: "currentColor",
+                    stroke_opacity: "0.22",
+                    stroke_width: "1.8",
+                }
+                path {
+                    d: "M8 2.6A5.4 5.4 0 0 1 13.4 8",
+                    stroke: "currentColor",
+                    stroke_width: "1.8",
+                    stroke_linecap: "round",
+                }
+                path {
+                    d: "M11.9 4.1A5.35 5.35 0 0 1 13.4 8",
+                    stroke: "currentColor",
+                    stroke_opacity: "0.82",
+                    stroke_width: "1.8",
+                    stroke_linecap: "round",
+                }
+            }
+        }
+    }
+}
 #[component]
 fn SidebarLoadingState(palette: Palette) -> Element {
     rsx! {
@@ -18756,10 +18919,12 @@ fn SidebarLoadingState(palette: Palette) -> Element {
         }
     }
 }
-
 #[component]
 fn SidebarRow(
     row: BrowserRow,
+    visible_label: String,
+    icon_kind: String,
+    busy_icon: bool,
     selected: bool,
     drop_target: Option<DragDropPlacement>,
     dragging: bool,
@@ -18794,6 +18959,7 @@ fn SidebarRow(
                 id: "{sidebar_row_dom_id(&row.full_path)}",
                 "data-sidebar-row-path": "{row.full_path}",
                 "data-sidebar-row-kind": "Separator",
+                "data-sidebar-row-label": "{row.label}",
                 "data-selected": if selected { "true" } else { "false" },
                 "data-drop-target": match drop_target {
                     Some(DragDropPlacement::Before) => "before",
@@ -18930,14 +19096,15 @@ fn SidebarRow(
     } else {
         "transparent"
     };
-    let icon_color = if row.kind == BrowserRowKind::Group && row.depth == 0 && row.expanded {
+    let icon_color = if busy_icon {
+        palette.muted
+    } else if row.kind == BrowserRowKind::Group && row.depth == 0 && row.expanded {
         palette.accent
     } else if selected {
         palette.text
     } else {
         palette.muted
     };
-    let machine_label = machine_label_text(&row.label);
     let machine_health = machine_health_from_label(&row.label);
     let label_color = if row.kind == BrowserRowKind::Group && row.depth == 0 && row.expanded {
         palette.accent
@@ -18950,12 +19117,12 @@ fn SidebarRow(
     };
     let row_for_enter = row.clone();
     let row_for_move = row.clone();
-
     rsx! {
         div {
             id: "{sidebar_row_dom_id(&row.full_path)}",
             "data-sidebar-row-path": "{row.full_path}",
             "data-sidebar-row-kind": "{row_kind_label}",
+            "data-sidebar-row-label": "{visible_label}",
             "data-sidebar-row-detail": "{row.detail_label}",
             "data-machine-health": if let Some(health) = machine_health {
                 machine_health_attr_value(health)
@@ -19036,11 +19203,16 @@ fn SidebarRow(
                     style: "display:flex; align-items:center; gap:8px; min-width:0;",
                     div {
                         "data-tree-icon": "1",
+                        "data-tree-icon-kind": if busy_icon { "busy" } else { icon_kind.as_str() },
                         style: format!(
                             "display:inline-flex; align-items:center; justify-content:center; width:20px; min-width:20px; height:20px; color:{};",
                             icon_color
                         ),
-                        TreeIcon { row: row.clone() }
+                        if busy_icon {
+                            BusyTreeIcon {}
+                        } else {
+                            TreeIcon { row: row.clone() }
+                        }
                     }
                     if renaming {
                         input {
@@ -19076,7 +19248,7 @@ fn SidebarRow(
                                 label_color,
                                 if row.kind == BrowserRowKind::Group && row.depth == 0 { 600 } else { 500 }
                             ),
-                            "{machine_label.clone().unwrap_or_else(|| row.label.clone())}"
+                            "{visible_label}"
                         }
                     }
                     if let Some(health) = machine_health {
@@ -19111,7 +19283,6 @@ fn SidebarRow(
         }
     }
 }
-
 fn machine_health_from_label(label: &str) -> Option<MachineHealth> {
     if label.ends_with("[ok]") {
         Some(MachineHealth::Healthy)
@@ -19123,7 +19294,6 @@ fn machine_health_from_label(label: &str) -> Option<MachineHealth> {
         None
     }
 }
-
 fn machine_label_text(label: &str) -> Option<String> {
     machine_health_from_label(label).map(|_| {
         label
@@ -19132,7 +19302,6 @@ fn machine_label_text(label: &str) -> Option<String> {
             .unwrap_or_else(|| label.to_string())
     })
 }
-
 #[component]
 fn DragGhost(snapshot: SharedSnapshot) -> Element {
     let Some((x, y)) = snapshot.drag_pointer else {
@@ -19182,50 +19351,17 @@ fn DragGhost(snapshot: SharedSnapshot) -> Element {
         }
     }
 }
-
 #[component]
 fn TreeIcon(row: BrowserRow) -> Element {
-    if row.kind == BrowserRowKind::Separator {
-        return rsx! {
-                span {
-                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; line-height:1;",
-                    "—"
-                }
-        };
-    }
-
-    if row.kind == BrowserRowKind::Session {
-        if row.full_path.starts_with("codex-litellm://") {
-            return rsx! {
-                span {
-                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; line-height:1;",
-                    "✦"
-                }
-            };
-        }
-        if row.full_path.starts_with("local://") {
-            return rsx! {
-                span {
-                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; line-height:1;",
-                    "⌘"
-                }
-            };
-        }
-        if row.full_path.starts_with("ssh://") {
-            return rsx! {
-                span {
-                    style: "display:inline-flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; line-height:1;",
-                    "⇄"
-                }
-            };
-        }
+    if let Some(glyph) = tree_icon_glyph(&row) {
         return rsx! {
             span {
                 style: "display:inline-flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; line-height:1;",
-                ">_"
+                "{glyph}"
             }
         };
-    } else if row.kind == BrowserRowKind::Document {
+    }
+    if row.kind == BrowserRowKind::Document {
         if row.document_kind == Some(WorkspaceDocumentKind::TerminalRecipe) {
             return rsx! {
                 svg {
@@ -19254,7 +19390,6 @@ fn TreeIcon(row: BrowserRow) -> Element {
             }
         };
     }
-
     if row.depth == 0 {
         if row.full_path == "__live_sessions__" {
             return rsx! {
@@ -19295,7 +19430,6 @@ fn TreeIcon(row: BrowserRow) -> Element {
             }
         };
     }
-
     if row.expanded {
         rsx! {
             svg {
@@ -19342,7 +19476,6 @@ fn TreeIcon(row: BrowserRow) -> Element {
         }
     }
 }
-
 #[component]
 fn BellIcon() -> Element {
     rsx! {
@@ -19367,7 +19500,6 @@ fn BellIcon() -> Element {
         }
     }
 }
-
 #[component]
 fn MainSurface(
     state: Signal<ShellState>,
@@ -19688,7 +19820,6 @@ fn MainSurface(
             EmptyState { palette: snapshot.palette }
         }
     };
-
     rsx! {
         div {
             key: "{surface_key}",
@@ -19704,7 +19835,6 @@ fn MainSurface(
         }
     }
 }
-
 #[component]
 fn SessionHeaderCopy(
     title: String,
@@ -19768,7 +19898,6 @@ fn SessionHeaderCopy(
         }
     }
 }
-
 #[component]
 fn RefreshInlineButton(
     label: String,
@@ -19802,7 +19931,6 @@ fn RefreshInlineButton(
         }
     }
 }
-
 #[component]
 fn IconToggleButton(
     active: bool,
@@ -19827,7 +19955,6 @@ fn IconToggleButton(
         }
     }
 }
-
 #[component]
 fn PreviewToolbar(
     palette: Palette,
@@ -19878,7 +20005,6 @@ fn PreviewToolbar(
         }
     }
 }
-
 #[component]
 fn LoadingStateChip(label: String, palette: Palette) -> Element {
     rsx! {
@@ -19899,7 +20025,6 @@ fn LoadingStateChip(label: String, palette: Palette) -> Element {
         }
     }
 }
-
 #[component]
 fn PreviewLoadingPlaceholder(session: ManagedSessionView, palette: Palette) -> Element {
     let surface_noun = rendered_surface_noun(&session);
@@ -19990,7 +20115,6 @@ fn PreviewLoadingPlaceholder(session: ManagedSessionView, palette: Palette) -> E
         }
     }
 }
-
 #[component]
 fn PreviewFailurePlaceholder(
     session: ManagedSessionView,
@@ -20045,7 +20169,6 @@ fn PreviewFailurePlaceholder(
         }
     }
 }
-
 #[component]
 fn DocumentEditor(
     session: ManagedSessionView,
@@ -20218,7 +20341,6 @@ fn DocumentEditor(
         }
     }
 }
-
 fn build_document_input(
     document_kind: &str,
     title: String,
@@ -20259,7 +20381,6 @@ fn build_document_input(
             .collect(),
     }
 }
-
 #[component]
 fn PreviewGraph(
     session: ManagedSessionView,
@@ -20416,7 +20537,6 @@ fn PreviewGraph(
         }
     }
 }
-
 #[component]
 fn RenderedSectionsStrip(sections: Vec<SessionRenderedSection>, palette: Palette) -> Element {
     rsx! {
@@ -20431,7 +20551,6 @@ fn RenderedSectionsStrip(sections: Vec<SessionRenderedSection>, palette: Palette
         }
     }
 }
-
 #[component]
 fn RenderedSectionCard(section: SessionRenderedSection, palette: Palette) -> Element {
     let is_commands = section.title.to_ascii_lowercase().contains("command");
@@ -20492,14 +20611,12 @@ fn RenderedSectionCard(section: SessionRenderedSection, palette: Palette) -> Ele
         }
     }
 }
-
 fn preview_summary_text(session: &ManagedSessionView) -> String {
     if let Some(summary) = preview_summary_metadata_value(session, "Summary")
         .filter(|value| !looks_like_low_signal_generated_copy(value))
     {
         return summary;
     }
-
     let mut candidates = session
         .preview
         .summary
@@ -20527,7 +20644,6 @@ fn preview_summary_text(session: &ManagedSessionView) -> String {
             }
         })
         .collect::<Vec<_>>();
-
     if candidates.is_empty() {
         for block in visible_preview_blocks(session).iter() {
             let joined = block
@@ -20555,7 +20671,6 @@ fn preview_summary_text(session: &ManagedSessionView) -> String {
             }
         }
     }
-
     if candidates.is_empty() {
         format!(
             "{} · {} messages · {} blocks",
@@ -20567,7 +20682,6 @@ fn preview_summary_text(session: &ManagedSessionView) -> String {
         candidates.into_iter().take(2).collect::<Vec<_>>().join(" ")
     }
 }
-
 fn terminal_resume_context_fallback(
     snapshot: &RenderSnapshot,
     session: &ManagedSessionView,
@@ -20594,7 +20708,6 @@ fn terminal_resume_context_fallback(
         })?;
     Some((title, summary))
 }
-
 fn terminal_session_still_active(shell: &ShellState, session_path: &str, host_id: &str) -> bool {
     shell.terminal_attach_in_flight.contains(session_path)
         || (shell.terminal_session_is_retained_live(session_path)
@@ -20602,7 +20715,6 @@ fn terminal_session_still_active(shell: &ShellState, session_path: &str, host_id
         || (shell.server.active_session_path() == Some(session_path)
             && shell.active_terminal_host_id.as_deref() == Some(host_id))
 }
-
 fn terminal_precis(session: &ManagedSessionView) -> String {
     if let Some(summary) = preview_summary_metadata_value(session, "Summary")
         .filter(|value| !looks_like_low_signal_generated_copy(value))
@@ -20637,12 +20749,10 @@ fn terminal_precis(session: &ManagedSessionView) -> String {
         })
         .unwrap_or_else(|| session.status_line.clone())
 }
-
 fn is_remote_resume_agent_session(session: &ManagedSessionView) -> bool {
     session.session_path.starts_with("remote-session://")
         && session.source == SessionSource::LiveSsh
 }
-
 #[component]
 fn TerminalResumeContextFallback(
     title: String,
@@ -20705,7 +20815,6 @@ fn TerminalResumeContextFallback(
         }
     }
 }
-
 #[component]
 fn AgentModeSelector(
     selected: SessionKind,
@@ -20731,7 +20840,6 @@ fn AgentModeSelector(
         }
     }
 }
-
 #[component]
 fn PreviewRunBlock(
     session_id: String,
@@ -20783,7 +20891,6 @@ fn PreviewRunBlock(
     } else {
         "none"
     };
-
     rsx! {
         div {
             style: format!("display:flex; justify-content:{}; width:100%; padding:0 8px; box-sizing:border-box;", row_justify),
@@ -20880,7 +20987,6 @@ fn PreviewRunBlock(
         }
     }
 }
-
 #[component]
 fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
     let blocks = preview_content_blocks(&lines);
@@ -21047,7 +21153,6 @@ fn PreviewContent(lines: Vec<String>, palette: Palette) -> Element {
         }
     }
 }
-
 fn preview_content_blocks(lines: &[String]) -> Vec<PreviewContentBlock> {
     let key = preview_content_cache_key(lines);
     if let Ok(cache) = preview_content_cache().lock()
@@ -21069,11 +21174,9 @@ fn preview_content_blocks(lines: &[String]) -> Vec<PreviewContentBlock> {
     }
     parsed
 }
-
 fn preview_inline_segments(text: &str) -> Vec<PreviewInlineSegment> {
     let mut segments = Vec::new();
     let mut index = 0usize;
-
     while index < text.len() {
         let remaining = &text[index..];
         let code_start = remaining.find('`').map(|offset| index + offset);
@@ -21090,11 +21193,9 @@ fn preview_inline_segments(text: &str) -> Vec<PreviewInlineSegment> {
             }
             break;
         };
-
         if start > index {
             segments.push(PreviewInlineSegment::Text(text[index..start].to_string()));
         }
-
         if Some(start) == image_start
             && let Some(end_offset) = text[start..].find(']')
         {
@@ -21105,7 +21206,6 @@ fn preview_inline_segments(text: &str) -> Vec<PreviewInlineSegment> {
             index = end;
             continue;
         }
-
         if Some(start) == code_start
             && let Some(end_offset) = text[start + 1..].find('`')
         {
@@ -21117,13 +21217,11 @@ fn preview_inline_segments(text: &str) -> Vec<PreviewInlineSegment> {
                 continue;
             }
         }
-
         segments.push(PreviewInlineSegment::Text(
             text[start..start + 1].to_string(),
         ));
         index = start + 1;
     }
-
     segments
         .into_iter()
         .filter(|segment| match segment {
@@ -21133,7 +21231,6 @@ fn preview_inline_segments(text: &str) -> Vec<PreviewInlineSegment> {
         })
         .collect()
 }
-
 #[component]
 fn PreviewInlineText(text: String, palette: Palette, muted: bool) -> Element {
     let segments = preview_inline_segments(&text);
@@ -21173,14 +21270,12 @@ fn PreviewInlineText(text: String, palette: Palette, muted: bool) -> Element {
         }
     }
 }
-
 fn build_preview_content_blocks(lines: &[String]) -> Vec<PreviewContentBlock> {
     let mut blocks = Vec::new();
     let mut paragraph = Vec::<String>::new();
     let mut code = Vec::<String>::new();
     let mut code_language = None::<String>;
     let mut in_code = false;
-
     let flush_paragraph = |blocks: &mut Vec<PreviewContentBlock>, paragraph: &mut Vec<String>| {
         if paragraph.is_empty() {
             return;
@@ -21191,7 +21286,6 @@ fn build_preview_content_blocks(lines: &[String]) -> Vec<PreviewContentBlock> {
         }
         paragraph.clear();
     };
-
     for raw in lines {
         let line = raw.trim_end();
         let trimmed = line.trim();
@@ -21306,7 +21400,6 @@ fn build_preview_content_blocks(lines: &[String]) -> Vec<PreviewContentBlock> {
         }
         paragraph.push(line.to_string());
     }
-
     if in_code {
         blocks.push(PreviewContentBlock::Code {
             language: code_language,
@@ -21315,10 +21408,8 @@ fn build_preview_content_blocks(lines: &[String]) -> Vec<PreviewContentBlock> {
     } else {
         flush_paragraph(&mut blocks, &mut paragraph);
     }
-
     merge_adjacent_image_reference_blocks(blocks)
 }
-
 fn parse_numbered_preview_item(line: &str) -> Option<(usize, String)> {
     let (number, text) = line.split_once(". ")?;
     if number.is_empty() || !number.chars().all(|ch| ch.is_ascii_digit()) {
@@ -21326,7 +21417,6 @@ fn parse_numbered_preview_item(line: &str) -> Option<(usize, String)> {
     }
     Some((number.parse().ok()?, text.trim().to_string()))
 }
-
 fn extract_image_path_from_line(line: &str) -> Option<(String, Option<String>)> {
     let mut found_path = None::<String>;
     for token in line.split_whitespace() {
@@ -21344,7 +21434,6 @@ fn extract_image_path_from_line(line: &str) -> Option<(String, Option<String>)> 
     let residue = residue.trim().trim_matches(':').trim().to_string();
     Some((path, (!residue.is_empty()).then_some(residue)))
 }
-
 fn extract_named_image_reference_from_line(line: &str) -> Option<(String, Option<String>)> {
     let trimmed = line.trim();
     if let Some(after) = trimmed.strip_prefix("<image name=[") {
@@ -21370,7 +21459,6 @@ fn extract_named_image_reference_from_line(line: &str) -> Option<(String, Option
     }
     None
 }
-
 fn merge_adjacent_image_reference_blocks(
     blocks: Vec<PreviewContentBlock>,
 ) -> Vec<PreviewContentBlock> {
@@ -21400,7 +21488,6 @@ fn merge_adjacent_image_reference_blocks(
     }
     merged
 }
-
 fn looks_like_image_path(path: &str) -> bool {
     Path::new(path)
         .extension()
@@ -21412,7 +21499,6 @@ fn looks_like_image_path(path: &str) -> bool {
             )
         })
 }
-
 fn preview_block_excerpt(block: &SessionPreviewBlock, max_chars: usize) -> Option<String> {
     let mut parts = Vec::new();
     for line in block
@@ -21435,7 +21521,6 @@ fn preview_block_excerpt(block: &SessionPreviewBlock, max_chars: usize) -> Optio
     }
     (!parts.is_empty()).then(|| truncate_preview_excerpt(&parts.join(" "), max_chars))
 }
-
 fn truncate_preview_excerpt(text: &str, max_chars: usize) -> String {
     let trimmed = text.trim();
     if trimmed.chars().count() <= max_chars {
@@ -21447,7 +21532,6 @@ fn truncate_preview_excerpt(text: &str, max_chars: usize) -> String {
         .collect::<String>();
     format!("{}…", excerpt.trim_end())
 }
-
 #[component]
 fn TerminalCanvas(
     session: ManagedSessionView,
@@ -21518,15 +21602,24 @@ fn TerminalCanvas(
     let session_host_label = session.host_label.clone();
     let mount_identity = format!("{session_path}:{mount_epoch}");
     let mut terminal_resume_overlay_excerpt = use_signal(|| initial_resume_overlay_excerpt.clone());
-    let mut last_bootstrap_identity = use_signal(String::new);
-    let mut mount_bootstrap_generation = use_signal(|| 0_u64);
-    let mut bootstrap_task_identity = use_signal(String::new);
-    let mut slow_timer_identity = use_signal(String::new);
-    let mut timeout_timer_identity = use_signal(String::new);
-    let mut apply_host_theme_identity = use_signal(String::new);
-    let mut apply_session_theme_identity = use_signal(String::new);
-    let mut active_terminal_host_identity = use_signal(String::new);
-    let mut input_enable_identity = use_signal(String::new);
+    let last_bootstrap_identity =
+        use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
+    let mount_bootstrap_generation =
+        use_hook(|| std::rc::Rc::new(std::cell::Cell::new(0_u64))).clone();
+    let bootstrap_task_identity =
+        use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
+    let slow_timer_identity =
+        use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
+    let timeout_timer_identity =
+        use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
+    let apply_host_theme_identity =
+        use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
+    let apply_session_theme_identity =
+        use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
+    let active_terminal_host_identity =
+        use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
+    let input_enable_identity =
+        use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
     let resume_overlay_excerpt = terminal_resume_overlay_excerpt()
         .or_else(|| initial_resume_overlay_excerpt.clone())
         .or(snapshot_resume_overlay_excerpt);
@@ -21580,8 +21673,13 @@ fn TerminalCanvas(
             }),
         );
     }
-    let mut current_bootstrap_generation = mount_bootstrap_generation();
-    if *last_bootstrap_identity.read() != mount_identity {
+    let current_bootstrap_generation = if *last_bootstrap_identity.borrow() != mount_identity {
+        mount_bootstrap_generation.get().saturating_add(1)
+    } else {
+        mount_bootstrap_generation.get()
+    };
+    let bootstrap_identity = format!("{mount_identity}:{current_bootstrap_generation}");
+    if *last_bootstrap_identity.borrow() != mount_identity {
         append_trace_event(
             &trace_home,
             "ui",
@@ -21593,8 +21691,7 @@ fn TerminalCanvas(
                 "mount_identity": mount_identity.clone(),
             }),
         );
-        current_bootstrap_generation = current_bootstrap_generation.saturating_add(1);
-        last_bootstrap_identity.set(mount_identity.clone());
+        *last_bootstrap_identity.borrow_mut() = mount_identity.clone();
         mount_bootstrap_generation.set(current_bootstrap_generation);
         terminal_resume_overlay_excerpt.set(initial_resume_overlay_excerpt.clone());
         terminal_has_meaningful_output.set(!is_remote_resume_session);
@@ -21606,7 +21703,6 @@ fn TerminalCanvas(
         resume_overlay_failed.set(false);
         resume_overlay_timed_out.set(false);
     }
-    let bootstrap_identity = format!("{mount_identity}:{current_bootstrap_generation}");
     if !is_remote_resume_session {
         if resume_overlay_slow() {
             resume_overlay_slow.set(false);
@@ -21616,18 +21712,18 @@ fn TerminalCanvas(
         }
     } else {
         let slow_key = format!("slow:{bootstrap_identity}");
-        if *slow_timer_identity.read() != slow_key {
-            slow_timer_identity.set(slow_key);
+        if *slow_timer_identity.borrow() != slow_key {
+            *slow_timer_identity.borrow_mut() = slow_key.clone();
             let timer_mount_identity = mount_identity.clone();
-            let timer_last_bootstrap_identity = last_bootstrap_identity;
-            let mut timer_resume_overlay_slow = resume_overlay_slow;
+            let timer_last_bootstrap_identity = last_bootstrap_identity.clone();
             let timer_terminal_live_host_connected = terminal_live_host_connected;
+            let mut timer_resume_overlay_slow = resume_overlay_slow;
             let state = state;
             let session_path = session_path.clone();
             let session_host_label = session_host_label.clone();
             spawn(async move {
                 sleep(Duration::from_millis(REMOTE_TERMINAL_RESUME_SLOW_MS)).await;
-                if *timer_last_bootstrap_identity.read() == timer_mount_identity
+                if *timer_last_bootstrap_identity.borrow() == timer_mount_identity
                     && !timer_terminal_live_host_connected()
                 {
                     timer_resume_overlay_slow.set(true);
@@ -21645,10 +21741,10 @@ fn TerminalCanvas(
             });
         }
         let timeout_key = format!("timeout:{bootstrap_identity}");
-        if *timeout_timer_identity.read() != timeout_key {
-            timeout_timer_identity.set(timeout_key);
+        if *timeout_timer_identity.borrow() != timeout_key {
+            *timeout_timer_identity.borrow_mut() = timeout_key.clone();
             let timer_mount_identity = mount_identity.clone();
-            let timer_last_bootstrap_identity = last_bootstrap_identity;
+            let timer_last_bootstrap_identity = last_bootstrap_identity.clone();
             let timer_terminal_live_host_connected = terminal_live_host_connected;
             let mut timer_resume_overlay_timed_out = resume_overlay_timed_out;
             let state = state;
@@ -21656,7 +21752,7 @@ fn TerminalCanvas(
             let session_host_label = session_host_label.clone();
             spawn(async move {
                 sleep(Duration::from_millis(REMOTE_TERMINAL_RESUME_FAIL_MS)).await;
-                if *timer_last_bootstrap_identity.read() == timer_mount_identity
+                if *timer_last_bootstrap_identity.borrow() == timer_mount_identity
                     && !timer_terminal_live_host_connected()
                 {
                     timer_resume_overlay_timed_out.set(true);
@@ -21675,8 +21771,8 @@ fn TerminalCanvas(
         }
     }
     let active_host_key = format!("active-host:{bootstrap_identity}");
-    if *active_terminal_host_identity.read() != active_host_key {
-        active_terminal_host_identity.set(active_host_key);
+    if *active_terminal_host_identity.borrow() != active_host_key {
+        *active_terminal_host_identity.borrow_mut() = active_host_key.clone();
         state.with_mut(|shell| {
             if shell.server.active_view_mode() == WorkspaceViewMode::Terminal
                 && shell.server.active_session_path() == Some(session_path.as_str())
@@ -21686,25 +21782,25 @@ fn TerminalCanvas(
         });
     }
     let apply_host_key = format!("apply-host:{host_id}:{bootstrap_identity}:{theme_signature}");
-    if *apply_host_theme_identity.read() != apply_host_key {
-        apply_host_theme_identity.set(apply_host_key);
+    if *apply_host_theme_identity.borrow() != apply_host_key {
+        *apply_host_theme_identity.borrow_mut() = apply_host_key.clone();
         let host_id = host_id.clone();
         let theme = theme.clone();
         spawn(async move {
             let _ = document::eval(&terminal_apply_script(&host_id, &theme));
         });
     }
-    if snapshot.active_view_mode == WorkspaceViewMode::Terminal {
-        let apply_session_key =
-            format!("apply-session:{session_path}:{bootstrap_identity}:{theme_signature}");
-        if *apply_session_theme_identity.read() != apply_session_key {
-            apply_session_theme_identity.set(apply_session_key);
-            let session_path = session_path.clone();
-            let theme = theme.clone();
-            spawn(async move {
-                let _ = document::eval(&terminal_apply_script_for_session(&session_path, &theme));
-            });
-        }
+    let apply_session_key =
+        format!("apply-session:{session_path}:{bootstrap_identity}:{theme_signature}");
+    if snapshot.active_view_mode == WorkspaceViewMode::Terminal
+        && *apply_session_theme_identity.borrow() != apply_session_key
+    {
+        *apply_session_theme_identity.borrow_mut() = apply_session_key.clone();
+        let session_path = session_path.clone();
+        let theme = theme.clone();
+        spawn(async move {
+            let _ = document::eval(&terminal_apply_script_for_session(&session_path, &theme));
+        });
     }
     let resume_job_key = terminal_resume_notification_job_key(&session_path);
     let render_stale_retry_clear_ready = {
@@ -21769,13 +21865,12 @@ fn TerminalCanvas(
                 || !shell.terminal_attach_in_flight.contains(&session_path))
     };
     let input_enable_key = format!("input:{host_id}:{host_should_accept_input}");
-    if *input_enable_identity.read() != input_enable_key {
-        input_enable_identity.set(input_enable_key);
-        let host_id = host_id.clone();
-        let session_path = session_path.clone();
+    if *input_enable_identity.borrow() != input_enable_key {
+        *input_enable_identity.borrow_mut() = input_enable_key.clone();
         if host_should_accept_input {
             clear_terminal_resume_notification(state, &session_path);
         }
+        let host_id = host_id.clone();
         spawn(async move {
             let _ = document::eval(&terminal_set_input_enabled_script(
                 &host_id,
@@ -21784,8 +21879,8 @@ fn TerminalCanvas(
             ));
         });
     }
-    if !wait_for_mount_epoch_sync && *bootstrap_task_identity.read() != bootstrap_identity {
-        bootstrap_task_identity.set(bootstrap_identity.clone());
+    if !wait_for_mount_epoch_sync && *bootstrap_task_identity.borrow() != bootstrap_identity {
+        *bootstrap_task_identity.borrow_mut() = bootstrap_identity.clone();
         let mount_identity = mount_identity.clone();
         let endpoint = endpoint.clone();
         let session_path = session_path.clone();
@@ -21816,6 +21911,8 @@ fn TerminalCanvas(
                 "bootstrap_generation": current_bootstrap_generation,
             }),
         );
+        // Dioxus does not reliably re-run a non-reactive child use_effect for each keyed
+        // terminal remount here, so schedule the guarded bootstrap directly from render.
         spawn(async move {
             let mount_identity = mount_identity;
             let endpoint = endpoint;
@@ -22009,6 +22106,7 @@ fn TerminalCanvas(
             let mut blank_retry_poison_recovery_attempts = 0_u64;
             let mut resume_visual_reveal_after_ms = None::<u64>;
             let mut first_resume_connected_output_ms = None::<u64>;
+            let mut initial_read_retry_attempts = 0_u64;
             let mut deferred_resume_output = String::new();
             let mut last_host_health_has_transport_error = false;
             let mut last_host_health_cursor_line_text = String::new();
@@ -22324,6 +22422,30 @@ fn TerminalCanvas(
                                             write_error.to_string(),
                                         );
                                     }
+                                } else if data.contains(['\r', '\n']) {
+                                    let _ = safe_shell_mut(
+                                        state,
+                                        "terminal_input_schedule_live_snapshot_refresh_immediate",
+                                        |shell| {
+                                            let now_ms = current_millis();
+                                            shell.next_live_session_snapshot_after_ms = now_ms;
+                                            shell
+                                                .terminal_busy_hint_until_ms
+                                                .insert(session_path.clone(), now_ms.saturating_add(TERMINAL_BUSY_HINT_MS));
+                                        },
+                                    );
+                                    spawn_live_session_snapshot_nudge(state);
+                                } else {
+                                    let _ = safe_shell_mut(
+                                        state,
+                                        "terminal_input_schedule_live_snapshot_refresh",
+                                        |shell| {
+                                            schedule_live_session_snapshot_refresh(
+                                                shell,
+                                                LIVE_SESSION_SNAPSHOT_TRIGGER_DEBOUNCE_MS,
+                                            );
+                                        },
+                                    );
                                 }
                             }
                             Ok(TerminalJsEvent::HostHealth {
@@ -22339,6 +22461,15 @@ fn TerminalCanvas(
                                 last_host_health_text_tail = text_tail.clone();
                                 last_host_health_rows = rows;
                                 last_host_health_blank_rows_below_cursor = blank_rows_below_cursor;
+                                let _ = safe_shell_mut(state, "terminal_attach_host_health_sample", |shell| {
+                                    shell.live_terminal_sidebar_samples.insert(
+                                        session_path.clone(),
+                                        LiveTerminalSidebarSample {
+                                            cursor_line_text: cursor_line_text.clone(),
+                                            text_tail: text_tail.clone(),
+                                        },
+                                    );
+                                });
                                 let prompt_gap_looks_stale = is_remote_resume_session
                                     && terminal_overlay_dismissed()
                                     && terminal_geometry_ready
@@ -23838,6 +23969,48 @@ fn TerminalCanvas(
                                     || terminal_live_host_connected()
                                     || terminal_has_meaningful_output()
                                     || terminal_has_visible_output;
+                                if should_retry_terminal_initial_read_error(
+                                    attached_or_visible,
+                                    initial_read_retry_attempts,
+                                    &error,
+                                ) {
+                                    initial_read_retry_attempts =
+                                        initial_read_retry_attempts.saturating_add(1);
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "read_error_retry_before_attach",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "error": error.to_string(),
+                                            "attempt": initial_read_retry_attempts,
+                                        }),
+                                    );
+                                    if let Err(recovery_error) = terminal_ensure_with_retry_async(
+                                        endpoint.clone(),
+                                        session_path.clone(),
+                                        &trace_home,
+                                    )
+                                    .await
+                                    {
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "read_error_retry_before_attach_recovery_error",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "error": recovery_error.to_string(),
+                                                "attempt": initial_read_retry_attempts,
+                                            }),
+                                        );
+                                    }
+                                    read_poll_ms = 60;
+                                    next_read_deadline = tokio::time::Instant::now()
+                                        + Duration::from_millis(read_poll_ms);
+                                    continue;
+                                }
                                 if is_remote_resume_session && attached_or_visible {
                                     append_trace_event(
                                         &trace_home,
@@ -24034,13 +24207,11 @@ fn TerminalCanvas(
         }
     }
 }
-
 struct TerminalFrameStyle {
     padding: &'static str,
     shell_radius: &'static str,
     host_radius: &'static str,
 }
-
 fn terminal_frame_style(fullscreen: bool) -> TerminalFrameStyle {
     if fullscreen {
         TerminalFrameStyle {
@@ -24056,7 +24227,6 @@ fn terminal_frame_style(fullscreen: bool) -> TerminalFrameStyle {
         }
     }
 }
-
 fn batch_terminal_chunks(
     chunks: Vec<yggterm_server::TerminalStreamChunk>,
 ) -> (Option<String>, bool, bool, bool, bool, bool, bool) {
@@ -24085,7 +24255,6 @@ fn batch_terminal_chunks(
         saw_attach_ready_marker,
     )
 }
-
 fn strip_low_signal_terminal_noise_lines(data: &str) -> String {
     let kept = data
         .lines()
@@ -24098,7 +24267,6 @@ fn strip_low_signal_terminal_noise_lines(data: &str) -> String {
         cleaned
     }
 }
-
 fn sanitize_terminal_resume_runtime_output(data: &str) -> String {
     if !data.contains("OpenAI Codex") || !data.contains("/model to change") {
         return data.to_string();
@@ -24147,7 +24315,6 @@ fn sanitize_terminal_resume_runtime_output(data: &str) -> String {
         sanitized
     }
 }
-
 fn strip_terminal_attach_ready_marker(data: &str) -> (String, bool) {
     const MARKER: &str = "__YGGTERM_ATTACH_READY__";
     if !data.contains(MARKER) {
@@ -24160,7 +24327,6 @@ fn strip_terminal_attach_ready_marker(data: &str) -> (String, bool) {
         .join("\n");
     (cleaned, true)
 }
-
 fn terminal_chunk_tail_is_idle(data: &str) -> bool {
     let tail = terminal_tail_excerpt(data, 1_400);
     terminal_chunk_has_prompt_output(&tail)
@@ -24168,17 +24334,14 @@ fn terminal_chunk_tail_is_idle(data: &str) -> bool {
         || terminal_chunk_is_transcript_browser(&tail)
         || terminal_chunk_is_loading_placeholder(&tail)
 }
-
 fn terminal_chunk_tail_is_generic_codex_idle(data: &str) -> bool {
     let tail = terminal_tail_excerpt(data, 1_400);
     terminal_chunk_is_generic_codex_idle(&tail)
 }
-
 fn terminal_chunk_tail_has_generic_codex_idle_footer(data: &str) -> bool {
     let tail = terminal_tail_excerpt(data, 1_400);
     terminal_chunk_has_generic_codex_idle_footer(&tail)
 }
-
 fn should_suppress_remote_resume_surface_output(
     is_remote_resume_session: bool,
     overlay_dismissed: bool,
@@ -24202,19 +24365,16 @@ fn should_suppress_remote_resume_surface_output(
                     || saw_generic_idle_footer_output
                     || tail_generic_idle_footer_output)))
 }
-
 fn terminal_chunk_requires_terminal_emulator_forward(data: &str) -> bool {
     !terminal_chunk_is_transport_error(data)
         && !terminal_chunk_has_visible_output(data)
         && data.contains('\u{1b}')
 }
-
 fn terminal_prefill_should_render_to_host(data: &str) -> bool {
     let stripped = strip_terminal_control_sequences(data);
     let normalized = stripped.trim();
     terminal_resume_output_excerpt(normalized).is_some()
 }
-
 fn append_terminal_resume_replay_buffer(buffer: &mut String, data: &str, max_chars: usize) {
     if data.is_empty() {
         return;
@@ -24229,7 +24389,6 @@ fn append_terminal_resume_replay_buffer(buffer: &mut String, data: &str, max_cha
     buffer.clear();
     buffer.push_str(&trimmed);
 }
-
 fn remote_resume_surface_connected(
     saw_meaningful_output: bool,
     saw_visible_output: bool,
@@ -24250,7 +24409,6 @@ fn remote_resume_surface_connected(
     }
     saw_meaningful_output
 }
-
 fn remote_resume_attach_confirmation_satisfied(
     saw_meaningful_output: bool,
     saw_visible_output: bool,
@@ -24302,7 +24460,6 @@ fn remote_resume_attach_confirmation_satisfied(
             now_ms.saturating_sub(started_ms) >= REMOTE_TERMINAL_ATTACH_CONNECTED_GRACE_MS
         })
 }
-
 fn terminal_resume_excerpt_is_meaningful(text: &str) -> bool {
     let trimmed = text.trim();
     let normalized = trimmed.to_ascii_lowercase();
@@ -24318,13 +24475,11 @@ fn terminal_resume_excerpt_is_meaningful(text: &str) -> bool {
         && !terminal_chunk_is_transcript_browser(trimmed)
         && !terminal_chunk_has_prompt_output(trimmed)
 }
-
 fn remote_resume_overlay_seed_excerpt(session: &ManagedSessionView) -> Option<String> {
     let precis = terminal_precis(session);
     let precis = precis.trim();
     terminal_resume_excerpt_is_meaningful(precis).then(|| truncate_preview_excerpt(precis, 240))
 }
-
 fn terminal_resume_output_excerpt(data: &str) -> Option<String> {
     let (cleaned, _) = strip_terminal_attach_ready_marker(data);
     let stripped = strip_terminal_control_sequences(&cleaned);
@@ -24357,7 +24512,6 @@ fn terminal_resume_output_excerpt(data: &str) -> Option<String> {
     let excerpt = excerpt.trim();
     terminal_resume_excerpt_is_meaningful(excerpt).then(|| truncate_preview_excerpt(excerpt, 240))
 }
-
 fn remote_resume_overlay_excerpt(session: &ManagedSessionView) -> Option<String> {
     if let Some(text) = session
         .preview
@@ -24381,7 +24535,6 @@ fn remote_resume_overlay_excerpt(session: &ManagedSessionView) -> Option<String>
                 .then(|| truncate_preview_excerpt(summary.trim(), 240))
         })
 }
-
 fn format_terminal_prefill_text(text: &str) -> String {
     let trimmed = text.trim_end();
     if trimmed.ends_with('\n') || trimmed.ends_with('\r') {
@@ -24390,7 +24543,6 @@ fn format_terminal_prefill_text(text: &str) -> String {
         format!("{trimmed}\r\n")
     }
 }
-
 fn remote_terminal_prefill_text(session: &ManagedSessionView) -> Option<String> {
     remote_resume_overlay_excerpt(session)
         .or_else(|| remote_resume_overlay_seed_excerpt(session))
@@ -24404,7 +24556,6 @@ fn remote_terminal_prefill_text(session: &ManagedSessionView) -> Option<String> 
             }
         })
 }
-
 async fn terminal_ensure_async(
     endpoint: ServerEndpoint,
     session_path: String,
@@ -24415,7 +24566,6 @@ async fn terminal_ensure_async(
     })
     .await
 }
-
 fn should_retry_terminal_ensure(error: &anyhow::Error) -> bool {
     let text = error.to_string().to_ascii_lowercase();
     text.contains("no such file or directory")
@@ -24423,7 +24573,13 @@ fn should_retry_terminal_ensure(error: &anyhow::Error) -> bool {
         || text.contains("connecting to")
         || text.contains("timed out")
 }
-
+fn should_retry_terminal_initial_read_error(
+    attached_or_visible: bool,
+    attempts: u64,
+    error: &anyhow::Error,
+) -> bool {
+    !attached_or_visible && attempts < 4 && should_retry_terminal_ensure(error)
+}
 async fn terminal_ensure_with_retry_async(
     endpoint: ServerEndpoint,
     session_path: String,
@@ -24517,7 +24673,6 @@ async fn terminal_ensure_with_retry_async(
         }
     }
 }
-
 async fn terminal_attempt_resume_recovery_async(
     endpoint: ServerEndpoint,
     session_path: String,
@@ -24550,7 +24705,6 @@ async fn terminal_attempt_resume_recovery_async(
     );
     Ok(())
 }
-
 async fn run_dedicated_terminal_io<T, F>(label: &str, trace_home: &Path, work: F) -> Result<T>
 where
     T: Send + 'static,
@@ -24582,7 +24736,6 @@ where
     );
     result
 }
-
 async fn run_dedicated_interactive_request_io<T, F>(
     label: &str,
     trace_home: &Path,
@@ -24657,7 +24810,6 @@ where
     );
     result
 }
-
 async fn terminal_read_async(
     endpoint: ServerEndpoint,
     session_path: String,
@@ -24675,7 +24827,6 @@ async fn terminal_read_async(
     })
     .await
 }
-
 async fn terminal_write_async(
     endpoint: ServerEndpoint,
     session_path: String,
@@ -24686,7 +24837,6 @@ async fn terminal_write_async(
         .map_err(|error| anyhow!("joining terminal write task: {error}"))?
         .map(|_| ())
 }
-
 async fn terminal_resize_async(
     endpoint: ServerEndpoint,
     session_path: String,
@@ -24698,7 +24848,6 @@ async fn terminal_resize_async(
         .map_err(|error| anyhow!("joining terminal resize task: {error}"))?
         .map(|_| ())
 }
-
 async fn terminal_resize_nudge_async(
     endpoint: ServerEndpoint,
     session_path: String,
@@ -24719,7 +24868,6 @@ async fn terminal_resize_nudge_async(
     let _ = terminal_resize_async(endpoint, session_path, cols, rows).await;
     Ok(())
 }
-
 #[derive(Debug, Clone)]
 struct TerminalTheme {
     background: String,
@@ -24744,7 +24892,6 @@ struct TerminalTheme {
     bright_cyan: String,
     bright_white: String,
 }
-
 fn terminal_theme(
     ui_theme: UiTheme,
     _palette: Palette,
@@ -24808,14 +24955,12 @@ fn terminal_theme(
         bright_white: "#8c959f".to_string(),
     }
 }
-
 fn terminal_theme_signature(theme: &TerminalTheme) -> String {
     format!(
         "{}|{}|{}|{}|{}",
         theme.background, theme.foreground, theme.cursor, theme.selection, theme.font_size
     )
 }
-
 fn terminal_reset_command(title: &str, theme: &TerminalTheme) -> TerminalJsCommand {
     TerminalJsCommand::Reset {
         title: title.to_string(),
@@ -24850,7 +24995,6 @@ fn terminal_reset_command(title: &str, theme: &TerminalTheme) -> TerminalJsComma
         font_size: theme.font_size,
     }
 }
-
 fn terminal_loading_notice_text(session: &ManagedSessionView) -> Option<String> {
     if !session.session_path.starts_with("remote-session://") {
         return None;
@@ -24872,13 +25016,10 @@ fn terminal_loading_notice_text(session: &ManagedSessionView) -> Option<String> 
     lines.push("Waiting for the remote terminal to paint...".to_string());
     Some(format!("{}\r\n", lines.join("\r\n")))
 }
-
 const TERMINAL_FONT_FAMILY: &str = "'JetBrains Mono', 'Iosevka Term', 'Fira Code', monospace";
-
 fn terminal_hex_channel(value: &str) -> Option<u8> {
     u8::from_str_radix(value, 16).ok()
 }
-
 fn terminal_theme_is_dark(theme: &TerminalTheme) -> bool {
     let background = theme.background.trim().trim_start_matches('#');
     if background.len() != 6 {
@@ -24890,7 +25031,6 @@ fn terminal_theme_is_dark(theme: &TerminalTheme) -> bool {
     let luminance = (0.2126 * red) + (0.7152 * green) + (0.0722 * blue);
     luminance < 0.5
 }
-
 fn chrome_parse_css_color(input: &str) -> Option<(f32, f32, f32, f32)> {
     let trimmed = input.trim();
     if trimmed.eq_ignore_ascii_case("transparent") {
@@ -24930,7 +25070,6 @@ fn chrome_parse_css_color(input: &str) -> Option<(f32, f32, f32, f32)> {
         _ => None,
     }
 }
-
 fn chrome_blended_luminance(foreground: &str, background: &str) -> Option<f32> {
     let (fr, fg, fb, fa) = chrome_parse_css_color(foreground)?;
     let (br, bg, bb, _ba) = chrome_parse_css_color(background)?;
@@ -24939,12 +25078,10 @@ fn chrome_blended_luminance(foreground: &str, background: &str) -> Option<f32> {
     let blue = (fb * fa) + (bb * (1.0 - fa));
     Some((0.2126 * red) + (0.7152 * green) + (0.0722 * blue))
 }
-
 fn terminal_font_weight(theme: &TerminalTheme) -> u16 {
     let _ = theme;
     500
 }
-
 fn terminal_dim_foreground(theme: &TerminalTheme) -> String {
     let alpha = if relative_terminal_luminance_from_hex(&theme.background).unwrap_or(0.0) > 0.72 {
         0.985
@@ -24954,17 +25091,14 @@ fn terminal_dim_foreground(theme: &TerminalTheme) -> String {
     blend_terminal_colors(&theme.foreground, &theme.background, alpha)
         .unwrap_or_else(|| theme.foreground.clone())
 }
-
 fn terminal_font_line_height(theme: &TerminalTheme) -> f32 {
     let _ = theme;
     1.12
 }
-
 fn terminal_font_weight_bold(theme: &TerminalTheme) -> u16 {
     let _ = theme;
     700
 }
-
 fn terminal_cursor_text(theme: &TerminalTheme) -> String {
     let Some((red, green, blue)) = parse_terminal_hex_rgb(&theme.cursor) else {
         return theme.background.clone();
@@ -24976,7 +25110,6 @@ fn terminal_cursor_text(theme: &TerminalTheme) -> String {
         "#fbfbfd".to_string()
     }
 }
-
 fn terminal_cursor_muted(theme: &TerminalTheme) -> String {
     let alpha = if relative_terminal_luminance_from_hex(&theme.background).unwrap_or(0.0) > 0.72 {
         0.24
@@ -24985,7 +25118,6 @@ fn terminal_cursor_muted(theme: &TerminalTheme) -> String {
     };
     rgba_terminal_color(&theme.cursor, alpha).unwrap_or_else(|| theme.cursor.clone())
 }
-
 fn terminal_minimum_contrast_ratio(theme: &TerminalTheme) -> f32 {
     if relative_terminal_luminance_from_hex(&theme.background).unwrap_or(0.0) > 0.72 {
         8.5
@@ -24993,12 +25125,10 @@ fn terminal_minimum_contrast_ratio(theme: &TerminalTheme) -> f32 {
         6.5
     }
 }
-
 fn relative_terminal_luminance_from_hex(color: &str) -> Option<f32> {
     let (red, green, blue) = parse_terminal_hex_rgb(color)?;
     Some(relative_terminal_luminance(red, green, blue))
 }
-
 fn parse_terminal_hex_rgb(color: &str) -> Option<(u8, u8, u8)> {
     let hex = color.strip_prefix('#')?;
     if hex.len() != 6 {
@@ -25010,7 +25140,6 @@ fn parse_terminal_hex_rgb(color: &str) -> Option<(u8, u8, u8)> {
         u8::from_str_radix(&hex[4..6], 16).ok()?,
     ))
 }
-
 fn relative_terminal_luminance(red: u8, green: u8, blue: u8) -> f32 {
     fn channel(value: u8) -> f32 {
         let normalized = f32::from(value) / 255.0;
@@ -25020,10 +25149,8 @@ fn relative_terminal_luminance(red: u8, green: u8, blue: u8) -> f32 {
             ((normalized + 0.055) / 1.055).powf(2.4)
         }
     }
-
     0.2126 * channel(red) + 0.7152 * channel(green) + 0.0722 * channel(blue)
 }
-
 fn blend_terminal_colors(foreground: &str, background: &str, alpha: f32) -> Option<String> {
     let (fg_red, fg_green, fg_blue) = parse_terminal_hex_rgb(foreground)?;
     let (bg_red, bg_green, bg_blue) = parse_terminal_hex_rgb(background)?;
@@ -25038,27 +25165,22 @@ fn blend_terminal_colors(foreground: &str, background: &str, alpha: f32) -> Opti
         mix(fg_blue, bg_blue)
     ))
 }
-
 fn rgba_terminal_color(color: &str, alpha: f32) -> Option<String> {
     let (red, green, blue) = parse_terminal_hex_rgb(color)?;
     Some(format!("rgba({red}, {green}, {blue}, {alpha:.3})"))
 }
-
 fn terminal_font_smoothing(theme: &TerminalTheme) -> &'static str {
     let _ = theme;
     "antialiased"
 }
-
 fn terminal_moz_font_smoothing(theme: &TerminalTheme) -> &'static str {
     let _ = theme;
     "grayscale"
 }
-
 fn xterm_assets_bootstrap_script() -> String {
     let css = serde_json::to_string(XTERM_CSS).expect("serialize xterm css");
     let xterm = serde_json::to_string(XTERM_JS).expect("serialize xterm js");
     let fit = serde_json::to_string(XTERM_FIT_JS).expect("serialize xterm fit addon");
-    let canvas = serde_json::to_string(XTERM_CANVAS_JS).expect("serialize xterm canvas addon");
     format!(
         r#"
         (() => {{
@@ -25087,9 +25209,6 @@ fn xterm_assets_bootstrap_script() -> String {
             if (!window.FitAddon || !window.FitAddon.FitAddon) {{
               injectScript("yggterm-xterm-fit-script", {fit});
             }}
-            if (!window.CanvasAddon || !window.CanvasAddon.CanvasAddon) {{
-              injectScript("yggterm-xterm-canvas-script", {canvas});
-            }}
           }} catch (error) {{
             window.__yggtermXtermBootstrapError = error && error.message ? error.message : String(error);
           }}
@@ -25097,7 +25216,6 @@ fn xterm_assets_bootstrap_script() -> String {
         "#
     )
 }
-
 fn terminal_host_id(session_path: &str) -> String {
     let mut id = String::from("yggterm-terminal-");
     for ch in session_path.chars() {
@@ -25109,11 +25227,9 @@ fn terminal_host_id(session_path: &str) -> String {
     }
     id
 }
-
 fn terminal_mount_host_id(session_path: &str, mount_epoch: u64) -> String {
     format!("{}-m{}", terminal_host_id(session_path), mount_epoch)
 }
-
 fn sidebar_row_dom_id(path: &str) -> String {
     let mut id = String::from("yggterm-sidebar-row-");
     for ch in path.chars() {
@@ -25125,18 +25241,15 @@ fn sidebar_row_dom_id(path: &str) -> String {
     }
     id
 }
-
 fn terminal_instance_key(session_path: &str, font_size: f32) -> String {
     format!("{session_path}-{font_size:.1}")
 }
-
 fn current_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
 }
-
 fn notification_delivery_mode(settings: &AppSettings) -> NotificationDeliveryMode {
     match (settings.in_app_notifications, settings.system_notifications) {
         (true, true) => NotificationDeliveryMode::Both,
@@ -25144,7 +25257,6 @@ fn notification_delivery_mode(settings: &AppSettings) -> NotificationDeliveryMod
         _ => NotificationDeliveryMode::InApp,
     }
 }
-
 fn apply_notification_delivery_mode(settings: &mut AppSettings, mode: NotificationDeliveryMode) {
     match mode {
         NotificationDeliveryMode::InApp => {
@@ -25161,7 +25273,6 @@ fn apply_notification_delivery_mode(settings: &mut AppSettings, mode: Notificati
         }
     }
 }
-
 fn emit_notification_chime() {
     let _ = document::eval(
         r#"
@@ -25185,11 +25296,9 @@ fn emit_notification_chime() {
         "#,
     );
 }
-
 fn emit_system_notification(title: &str, message: &str) {
     let _ = send_user_notification(title, message);
 }
-
 fn apply_active_terminal_zoom(state: Signal<ShellState>) {
     let active_host_id = state.read().active_terminal_host_id.clone();
     let snapshot = state.read().snapshot();
@@ -25225,7 +25334,6 @@ fn apply_active_terminal_zoom(state: Signal<ShellState>) {
         &theme,
     ));
 }
-
 fn terminal_eval_script(
     host_id: &str,
     theme: &TerminalTheme,
@@ -25234,8 +25342,6 @@ fn terminal_eval_script(
     let css = serde_json::to_string(XTERM_CSS).expect("serialize xterm css");
     let xterm = serde_json::to_string(XTERM_JS).expect("serialize xterm js");
     let fit_bundle = serde_json::to_string(XTERM_FIT_JS).expect("serialize xterm fit addon");
-    let canvas_bundle =
-        serde_json::to_string(XTERM_CANVAS_JS).expect("serialize xterm canvas addon");
     let background =
         serde_json::to_string(&theme.background).expect("serialize terminal background");
     let foreground =
@@ -25346,16 +25452,11 @@ fn terminal_eval_script(
                 if (!window.FitAddon || !window.FitAddon.FitAddon) {{
                     injectScript("yggterm-xterm-fit-script", {fit_bundle});
                 }}
-                if (!window.CanvasAddon || !window.CanvasAddon.CanvasAddon) {{
-                    injectScript("yggterm-xterm-canvas-script", {canvas_bundle});
-                }}
                 for (let attempt = 0; attempt < 80; attempt += 1) {{
                     if (
                         window.Terminal
                         && window.FitAddon
                         && window.FitAddon.FitAddon
-                        && window.CanvasAddon
-                        && window.CanvasAddon.CanvasAddon
                     ) {{
                         return true;
                     }}
@@ -25377,13 +25478,10 @@ fn terminal_eval_script(
             || !window.Terminal
             || !window.FitAddon
             || !window.FitAddon.FitAddon
-            || !window.CanvasAddon
-            || !window.CanvasAddon.CanvasAddon
         ) {{
             const details = [
               window.Terminal ? "Terminal:ok" : "Terminal:missing",
               window.FitAddon && window.FitAddon.FitAddon ? "FitAddon:ok" : "FitAddon:missing",
-              window.CanvasAddon && window.CanvasAddon.CanvasAddon ? "CanvasAddon:ok" : "CanvasAddon:missing",
               window.__yggtermXtermBootstrapError ? `Bootstrap:${{window.__yggtermXtermBootstrapError}}` : "Bootstrap:none",
             ].join(" · ");
             host.innerHTML = `<div style="padding:18px;color:#fca5a5;font:13px system-ui;">xterm.js assets failed to load.<br><span style="opacity:0.75">${{details}}</span></div>`;
@@ -25494,9 +25592,7 @@ fn terminal_eval_script(
             }},
         }});
         const fitAddon = new window.FitAddon.FitAddon();
-        const canvasAddon = new window.CanvasAddon.CanvasAddon();
         term.loadAddon(fitAddon);
-        term.loadAddon(canvasAddon);
         term.open(host);
         host.tabIndex = 0;
         host.style.setProperty('--yggterm-term-font-family', {font_family});
@@ -25551,10 +25647,19 @@ fn terminal_eval_script(
                 #${{hostId}} .xterm-helper-textarea {{
                     position: absolute !important;
                     top: 0 !important;
-                    left: 0 !important;
-                    width: 1px !important;
-                    height: 1px !important;
+                    left: -9999em !important;
+                    width: 0 !important;
+                    height: 0 !important;
                     opacity: 0 !important;
+                    z-index: -5 !important;
+                    overflow: hidden !important;
+                    caret-color: transparent !important;
+                    pointer-events: none !important;
+                }}
+                #${{hostId}} .xterm-accessibility-tree:not(.debug) *::selection,
+                #${{hostId}} .xterm-accessibility-tree:not(.debug) *::-moz-selection {{
+                    color: transparent !important;
+                    background-color: transparent !important;
                 }}
                 #${{hostId}} .xterm-screen {{
                     overflow: hidden !important;
@@ -26540,7 +26645,6 @@ fn terminal_eval_script(
         cursor_text = cursor_text
     )
 }
-
 fn terminal_apply_script(host_id: &str, theme: &TerminalTheme) -> String {
     let background =
         serde_json::to_string(&theme.background).expect("serialize terminal background");
@@ -26717,7 +26821,6 @@ fn terminal_apply_script(host_id: &str, theme: &TerminalTheme) -> String {
         moz_font_smoothing = moz_font_smoothing,
     )
 }
-
 fn terminal_set_input_enabled_script(host_id: &str, enabled: bool, focus: bool) -> String {
     format!(
         r#"
@@ -26738,7 +26841,6 @@ fn terminal_set_input_enabled_script(host_id: &str, enabled: bool, focus: bool) 
         focus = if focus { "true" } else { "false" },
     )
 }
-
 fn terminal_apply_script_for_session(session_path: &str, theme: &TerminalTheme) -> String {
     let session_path =
         serde_json::to_string(session_path).expect("serialize terminal session path");
@@ -26921,7 +27023,6 @@ fn terminal_apply_script_for_session(session_path: &str, theme: &TerminalTheme) 
         moz_font_smoothing = moz_font_smoothing,
     )
 }
-
 fn terminal_scroll_to_line_script(session_path: &str, line_index: usize) -> String {
     format!(
         r#"
@@ -26939,7 +27040,6 @@ fn terminal_scroll_to_line_script(session_path: &str, line_index: usize) -> Stri
         "#
     )
 }
-
 #[component]
 fn StatusPill(label: String, value: String, palette: Palette) -> Element {
     rsx! {
@@ -26959,7 +27059,6 @@ fn StatusPill(label: String, value: String, palette: Palette) -> Element {
         }
     }
 }
-
 #[component]
 fn TerminalCard(title: String, subtitle: String, lines: Vec<String>, palette: Palette) -> Element {
     rsx! {
@@ -26999,7 +27098,6 @@ fn TerminalCard(title: String, subtitle: String, lines: Vec<String>, palette: Pa
         }
     }
 }
-
 #[component]
 fn EmptyState(palette: Palette) -> Element {
     rsx! {
@@ -27023,7 +27121,6 @@ fn EmptyState(palette: Palette) -> Element {
         }
     }
 }
-
 #[component]
 fn RightRail(
     snapshot: SharedSnapshot,
@@ -27084,11 +27181,9 @@ fn RightRail(
         }
     }
 }
-
 #[component]
 fn MetadataRailBody(snapshot: SharedSnapshot) -> Element {
     let session = snapshot.active_session.clone();
-
     rsx! {
         RailHeader { title: "Session Metadata".to_string(), color: snapshot.palette.text.to_string() }
         RailScrollBody {
@@ -27118,7 +27213,6 @@ fn MetadataRailBody(snapshot: SharedSnapshot) -> Element {
         }
     }
 }
-
 #[component]
 fn SettingsRailBody(
     snapshot: SharedSnapshot,
@@ -27305,7 +27399,6 @@ fn SettingsRailBody(
         }
     }
 }
-
 #[component]
 fn NotificationsRailBody(
     snapshot: SharedSnapshot,
@@ -27347,7 +27440,6 @@ fn NotificationsRailBody(
         }
     }
 }
-
 #[component]
 fn ConnectRailBody(
     snapshot: SharedSnapshot,
@@ -27474,7 +27566,6 @@ fn ConnectRailBody(
         }
     }
 }
-
 #[component]
 fn ContextMenuOverlay(
     row: BrowserRow,
@@ -27626,7 +27717,6 @@ fn ContextMenuOverlay(
         }
     }
 }
-
 #[component]
 fn DeleteConfirmOverlay(
     pending: PendingDeleteDialog,
@@ -27719,7 +27809,6 @@ fn DeleteConfirmOverlay(
         }
     }
 }
-
 #[component]
 fn ThemeEditorOverlay(
     snapshot: SharedSnapshot,
@@ -27765,7 +27854,6 @@ fn ThemeEditorOverlay(
             "0 0 0 1px rgba(59,87,112,0.90), 0 0 0 10px rgba(124,200,255,0.16), 0 26px 60px rgba(0,0,0,0.42), inset 0 0 0 1px rgba(68,84,99,0.94)"
         }
     };
-
     rsx! {
         div {
             style: format!(
@@ -28149,7 +28237,6 @@ fn ThemeEditorOverlay(
         }
     }
 }
-
 #[component]
 fn ThemeDialogButton(
     primary: bool,
@@ -28187,16 +28274,13 @@ fn ThemeDialogButton(
         }
     }
 }
-
 fn toast_center_offset(right_panel_mode: RightPanelMode) -> i32 {
     let _ = right_panel_mode;
     0
 }
-
 fn normalize_theme_editor_axis(value: f64) -> f32 {
     ((value / THEME_EDITOR_PAD_SIZE).clamp(0.0, 1.0)) as f32
 }
-
 #[component]
 fn SettingsField(
     label: String,
@@ -28223,7 +28307,6 @@ fn SettingsField(
         }
     }
 }
-
 #[component]
 fn ThemeSettingsSection(
     palette: Palette,
@@ -28313,7 +28396,6 @@ fn ThemeSettingsSection(
         }
     }
 }
-
 #[component]
 fn NotificationSettingsSection(
     palette: Palette,
@@ -28411,7 +28493,6 @@ fn NotificationSettingsSection(
         }
     }
 }
-
 #[component]
 fn ZoomSettingRow(
     label: String,
@@ -28460,7 +28541,6 @@ fn ZoomSettingRow(
         }
     }
 }
-
 #[component]
 fn TerminalThemeSettingRow(
     palette: Palette,
@@ -28501,7 +28581,6 @@ fn TerminalThemeSettingRow(
         }
     }
 }
-
 #[component]
 fn TerminalThemeSelectRow(
     palette: Palette,
@@ -28602,7 +28681,6 @@ fn TerminalThemeSelectRow(
         }
     }
 }
-
 fn terminal_theme_value_for_settings(value: &str, theme: UiTheme) -> String {
     let value = value.trim();
     if value.is_empty() {
@@ -28611,7 +28689,6 @@ fn terminal_theme_value_for_settings(value: &str, theme: UiTheme) -> String {
         value.to_string()
     }
 }
-
 #[component]
 fn MetadataGroup(title: String, entries: Vec<SessionMetadataEntry>, palette: Palette) -> Element {
     rsx! {
@@ -28642,7 +28719,6 @@ fn MetadataGroup(title: String, entries: Vec<SessionMetadataEntry>, palette: Pal
         }
     }
 }
-
 fn palette(theme: UiTheme) -> Palette {
     match theme {
         UiTheme::ZedLight => Palette {
@@ -28683,7 +28759,6 @@ fn palette(theme: UiTheme) -> Palette {
         },
     }
 }
-
 fn shell_backdrop_style(maximized: bool) -> &'static str {
     if maximized || linux_kde_wayland_safe_mode() {
         "none"
@@ -28691,7 +28766,6 @@ fn shell_backdrop_style(maximized: bool) -> &'static str {
         "blur(10px) saturate(135%)"
     }
 }
-
 fn linux_kde_wayland_safe_mode() -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -28705,7 +28779,6 @@ fn linux_kde_wayland_safe_mode() -> bool {
         false
     }
 }
-
 fn overlay_backdrop_style(default_style: &'static str) -> &'static str {
     if linux_kde_wayland_safe_mode() {
         "none"
@@ -28713,7 +28786,6 @@ fn overlay_backdrop_style(default_style: &'static str) -> &'static str {
         default_style
     }
 }
-
 fn shell_style(
     palette: Palette,
     radius: u8,
@@ -28747,11 +28819,9 @@ fn shell_style(
         interface_font_family()
     )
 }
-
 fn sync_window_frame_state(shell: &mut ShellState) {
     shell.maximized = window().is_maximized();
 }
-
 fn icon_button_style(palette: Palette) -> String {
     format!(
         "width:28px; height:28px; border:none; border-radius:8px; background:{}; color:{}; font-size:13px; \
@@ -28761,11 +28831,9 @@ fn icon_button_style(palette: Palette) -> String {
         chrome_chip_border(palette)
     )
 }
-
 fn utility_icon_style(palette: Palette, selected: bool) -> String {
     utility_icon_style_sized(palette, selected, 13)
 }
-
 fn utility_icon_style_sized(palette: Palette, selected: bool, font_size_px: u8) -> String {
     format!(
         "width:28px; height:28px; border:none; border-radius:10px; background:{}; color:{}; font-size:{}px; font-weight:{}; \
@@ -28781,7 +28849,6 @@ fn utility_icon_style_sized(palette: Palette, selected: bool, font_size_px: u8) 
         chrome_chip_border(palette)
     )
 }
-
 fn connect_button_style(palette: Palette, selected: bool) -> String {
     let fill = if selected {
         palette.accent_soft.to_string()
@@ -28811,7 +28878,6 @@ fn connect_button_style(palette: Palette, selected: bool) -> String {
         fill, text, border
     )
 }
-
 fn chip_style(palette: Palette, selected: bool) -> String {
     format!(
         "height:24px; padding:0 10px; border-radius:999px; border:1px solid {}; background:{}; \
@@ -28837,7 +28903,6 @@ fn chip_style(palette: Palette, selected: bool) -> String {
         }
     )
 }
-
 fn titlebar_new_action_style(palette: Palette) -> String {
     format!(
         "display:flex; align-items:center; width:100%; height:30px; border:none; border-radius:10px; padding:0 10px; \
@@ -28846,7 +28911,6 @@ fn titlebar_new_action_style(palette: Palette) -> String {
         palette.text
     )
 }
-
 fn theme_editor_action_button_style(
     palette: Palette,
     accent: &str,
@@ -28905,7 +28969,6 @@ fn theme_editor_action_button_style(
         if enabled || primary { "1" } else { "0.72" },
     )
 }
-
 fn primary_action_style(palette: Palette) -> String {
     format!(
         "width:100%; border:none; border-radius:12px; background:{}; color:white; padding:10px 12px; text-align:left; \
@@ -28914,7 +28977,6 @@ fn primary_action_style(palette: Palette) -> String {
         palette.accent
     )
 }
-
 fn toggle_slider_style(palette: Palette) -> String {
     format!(
         "display:flex; align-items:center; gap:4px; padding:3px; border:none; border-radius:999px; background:{}; box-shadow: inset 0 0 0 1px {}; user-select:none; -webkit-user-select:none;",
@@ -28930,7 +28992,6 @@ fn toggle_slider_style(palette: Palette) -> String {
         }
     )
 }
-
 fn toggle_slider_end_style(palette: Palette, selected: bool) -> String {
     format!(
         "height:26px; min-width:82px; padding:0 12px; border:none; border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:700; \
@@ -28953,7 +29014,6 @@ fn toggle_slider_end_style(palette: Palette, selected: bool) -> String {
         }
     )
 }
-
 fn chrome_chip_fill(palette: Palette, selected: bool) -> &'static str {
     if selected {
         palette.accent_soft
@@ -28963,7 +29023,6 @@ fn chrome_chip_fill(palette: Palette, selected: bool) -> &'static str {
         "rgba(255,255,255,0.72)"
     }
 }
-
 fn chrome_chip_border(palette: Palette) -> &'static str {
     if palette_is_dark(palette) {
         "rgba(214,229,242,0.24)"
@@ -28971,7 +29030,6 @@ fn chrome_chip_border(palette: Palette) -> &'static str {
         "rgba(201,214,226,0.56)"
     }
 }
-
 fn chrome_chip_text_color(palette: Palette, selected: bool, emphasized: bool) -> &'static str {
     let fill = chrome_chip_fill(palette, selected);
     let base = if palette.titlebar == "transparent" {
@@ -28996,7 +29054,6 @@ fn chrome_chip_text_color(palette: Palette, selected: bool, emphasized: bool) ->
         }
     }
 }
-
 fn settings_input_style(palette: Palette) -> String {
     format!(
         "height:30px; padding:0 10px; border:none; border-radius:8px; background:{}; \
@@ -29014,7 +29071,6 @@ fn settings_input_style(palette: Palette) -> String {
         }
     )
 }
-
 fn zoom_button_style(palette: Palette) -> String {
     format!(
         "width:22px; height:22px; border:none; border-radius:8px; background:{}; \
@@ -29027,7 +29083,6 @@ fn zoom_button_style(palette: Palette) -> String {
         palette.text
     )
 }
-
 fn segmented_pill_button_style(palette: Palette, selected: bool) -> String {
     format!(
         "flex:1; height:26px; border:none; border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:{}; \
@@ -29058,7 +29113,6 @@ fn segmented_pill_button_style(palette: Palette, selected: bool) -> String {
         }
     )
 }
-
 fn context_menu_action_style(palette: Palette, emphasized: bool) -> String {
     format!(
         "width:100%; height:32px; border:none; border-radius:8px; background:{}; color:{}; \
@@ -29076,7 +29130,6 @@ fn context_menu_action_style(palette: Palette, emphasized: bool) -> String {
         if emphasized { 700 } else { 600 }
     )
 }
-
 fn context_menu_action_style_destructive(_palette: Palette) -> String {
     format!(
         "width:100%; height:32px; border:none; border-radius:8px; background:transparent; color:{}; \
@@ -29084,13 +29137,11 @@ fn context_menu_action_style_destructive(_palette: Palette) -> String {
         "#c23f4d"
     )
 }
-
 fn cancel_confirm_button_style(_palette: Palette) -> String {
     "height:34px; padding:0 16px; border:none; border-radius:12px; background:#5fa8ff; color:#ffffff; \
      font-size:13px; font-weight:500;"
         .to_string()
 }
-
 fn delete_confirm_button_style(_palette: Palette, hard_delete: bool) -> String {
     format!(
         "height:34px; padding:0 16px; border:none; border-radius:12px; background:{}; color:#ffffff; \
@@ -29098,7 +29149,6 @@ fn delete_confirm_button_style(_palette: Palette, hard_delete: bool) -> String {
         if hard_delete { "#b3263f" } else { "#c23f4d" }
     )
 }
-
 fn join_debug_paths(mut paths: Vec<String>) -> String {
     if paths.is_empty() {
         return "none".to_string();
@@ -29112,7 +29162,6 @@ fn join_debug_paths(mut paths: Vec<String>) -> String {
         paths.join(", ")
     }
 }
-
 fn inline_toggle_style(_palette: Palette, enabled: bool) -> String {
     format!(
         "display:flex; align-items:center; gap:10px; height:28px; padding:0 2px 0 0; border:none; background:transparent; \
@@ -29120,23 +29169,18 @@ fn inline_toggle_style(_palette: Palette, enabled: bool) -> String {
         if enabled { "1" } else { "0.92" }
     )
 }
-
 fn clamp_zoom_value(value: f32) -> f32 {
     value.clamp(7.0, 20.0)
 }
-
 fn clamp_zoom_value_main(value: f32) -> f32 {
     value.clamp(5.0, 20.0)
 }
-
 fn zoom_percent(value: f32, base: f32) -> i32 {
     ((value / base) * 100.0).round() as i32
 }
-
 fn zoom_percent_f32(value: f32, base: f32) -> f32 {
     (value / base) * 100.0
 }
-
 fn metadata_value(session: &ManagedSessionView, label: &str) -> String {
     session
         .metadata
@@ -29145,29 +29189,25 @@ fn metadata_value(session: &ManagedSessionView, label: &str) -> String {
         .map(|entry| entry.value.clone())
         .unwrap_or_default()
 }
-
 #[cfg(target_os = "linux")]
 fn interface_font_family() -> &'static str {
     "\"Inter Variable\", \"Inter\", system-ui, sans-serif"
 }
-
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn interface_font_family() -> &'static str {
     "system-ui, sans-serif"
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use yggterm_core::SessionNodeKind;
-
+    use yggterm_server::SessionPreview;
     #[test]
     fn terminal_zoom_clamps_to_fifty_percent_floor() {
         assert_eq!(clamp_zoom_value_main(0.0), 5.0);
         assert_eq!(clamp_zoom_value_main(4.0), 5.0);
         assert_eq!(zoom_percent(clamp_zoom_value_main(4.0), 10.0), 50);
     }
-
     #[test]
     fn rendered_zoom_updates_only_rendered_font_size() {
         let mut settings = AppSettings::default();
@@ -29180,7 +29220,6 @@ mod tests {
         assert_eq!(settings.rendered_font_size, 10.0);
         assert_eq!(settings.terminal_font_size, 13.0);
     }
-
     #[test]
     fn terminal_zoom_updates_only_terminal_font_size() {
         let mut settings = AppSettings::default();
@@ -29193,7 +29232,6 @@ mod tests {
         assert_eq!(settings.rendered_font_size, 9.0);
         assert_eq!(settings.terminal_font_size, 12.0);
     }
-
     #[test]
     fn set_rendered_zoom_updates_only_rendered_font_size() {
         let mut settings = AppSettings::default();
@@ -29206,7 +29244,6 @@ mod tests {
         assert_eq!(settings.rendered_font_size, 9.0);
         assert_eq!(settings.terminal_font_size, 13.0);
     }
-
     #[test]
     fn set_terminal_zoom_updates_only_terminal_font_size() {
         let mut settings = AppSettings::default();
@@ -29219,37 +29256,31 @@ mod tests {
         assert_eq!(settings.rendered_font_size, 9.0);
         assert_eq!(settings.terminal_font_size, 14.0);
     }
-
     #[test]
     fn app_control_zoom_values_over_twenty_are_treated_as_percent() {
         assert_eq!(normalize_app_control_main_zoom_value(90.0), 9.0);
         assert_eq!(normalize_app_control_main_zoom_value(130.0), 13.0);
         assert_eq!(normalize_app_control_main_zoom_value(200.0), 20.0);
     }
-
     #[test]
     fn app_control_zoom_values_up_to_twenty_stay_as_font_size() {
         assert_eq!(normalize_app_control_main_zoom_value(9.0), 9.0);
         assert_eq!(normalize_app_control_main_zoom_value(13.0), 13.0);
         assert_eq!(normalize_app_control_main_zoom_value(20.0), 20.0);
     }
-
     #[test]
     fn interface_zoom_clamps_to_fifty_percent_floor() {
         assert_eq!(clamp_zoom_value(0.0), 7.0);
         assert_eq!(clamp_zoom_value(6.0), 7.0);
         assert_eq!(zoom_percent(clamp_zoom_value(6.0), 14.0), 50);
     }
-
     #[test]
     fn terminal_theme_uses_requested_font_size_down_to_floor() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 5.0, "");
         assert_eq!(theme.font_size, 5.0);
-
         let clamped = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 2.0, "");
         assert_eq!(clamped.font_size, 5.0);
     }
-
     #[test]
     fn terminal_eval_script_bakes_font_size_into_xterm_constructor() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
@@ -29258,7 +29289,6 @@ mod tests {
         assert!(script.contains("lineHeight: 1.12"));
         assert!(script.contains("brightWhite"));
     }
-
     #[test]
     fn terminal_eval_script_focuses_host_and_scopes_wheel_capture() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
@@ -29270,7 +29300,6 @@ mod tests {
         assert!(script.contains("host.addEventListener(\"pointerdown\", handleHostPointerFocus"));
         assert!(script.contains("setInputEnabled(inputEnabled, inputEnabled);"));
     }
-
     #[test]
     fn terminal_eval_script_waits_for_host_mount_before_giving_up() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
@@ -29279,7 +29308,6 @@ mod tests {
         assert!(script.contains("after retries"));
         assert!(script.contains("await sleep(25)"));
     }
-
     #[test]
     fn terminal_eval_script_declares_sync_focus_before_stretch_root_uses_it() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
@@ -29296,7 +29324,6 @@ mod tests {
         assert!(sync_ix < stretch_ix);
         assert!(stretch_ix < listener_ix);
     }
-
     #[test]
     fn terminal_apply_script_updates_live_xterm_font_size() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 5.0, "");
@@ -29305,7 +29332,6 @@ mod tests {
         assert!(script.contains("entry.term.options.fontFamily"));
         assert!(script.contains("brightBlack"));
     }
-
     #[test]
     fn terminal_apply_script_enforces_monospace_rendering_contract() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
@@ -29321,7 +29347,6 @@ mod tests {
                 .contains(".xterm .xterm-rows span {\n                    width: 100% !important;")
         );
     }
-
     #[test]
     fn terminal_eval_script_preserves_native_xterm_cursor_contract() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
@@ -29344,7 +29369,19 @@ mod tests {
             !script.contains("overlay.style.borderLeft = `2px solid var(--yggterm-term-cursor)`;")
         );
     }
-
+    #[test]
+    fn terminal_eval_script_hides_accessibility_selection_artifacts() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(script.contains(".xterm-helper-textarea"));
+        assert!(script.contains("left: -9999em !important;"));
+        assert!(script.contains("width: 0 !important;"));
+        assert!(script.contains("height: 0 !important;"));
+        assert!(script.contains("pointer-events: none !important;"));
+        assert!(script.contains(".xterm-accessibility-tree:not(.debug) *::selection"));
+        assert!(script.contains("background-color: transparent !important;"));
+        assert!(script.contains("color: transparent !important;"));
+    }
     #[test]
     fn terminal_probe_input_script_declares_keyboard_target_before_dispatch() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
@@ -29352,7 +29389,6 @@ mod tests {
         assert!(script.contains("const target = helperTextarea || host;"));
         assert!(script.contains("target.dispatchEvent(new KeyboardEvent('keydown', keyInit));"));
     }
-
     #[test]
     fn terminal_eval_script_keeps_dim_rows_explicitly_visible() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
@@ -29362,7 +29398,6 @@ mod tests {
         assert!(script.contains("color: var(--yggterm-term-dim-foreground) !important;"));
         assert!(script.contains("opacity: 1 !important;"));
     }
-
     #[test]
     fn terminal_theme_uses_one_dark_palette_for_dark_mode() {
         let theme = terminal_theme(UiTheme::ZedDark, palette(UiTheme::ZedDark), 13.0, "");
@@ -29370,7 +29405,6 @@ mod tests {
         assert_eq!(theme.foreground, "#cccccc");
         assert_eq!(theme.blue, "#2472c8");
     }
-
     #[test]
     fn terminal_theme_uses_vscode_light_by_default() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
@@ -29380,7 +29414,6 @@ mod tests {
         assert_eq!(theme.bright_white, "#2d3642");
         assert_eq!(theme.blue, "#0969da");
     }
-
     #[test]
     fn terminal_instance_key_changes_with_font_size() {
         let small = terminal_instance_key("/tmp/example", 10.0);
@@ -29389,7 +29422,6 @@ mod tests {
         assert!(small.ends_with("-10.0"));
         assert!(large.ends_with("-20.0"));
     }
-
     #[test]
     fn terminal_frame_style_keeps_normal_padding_outside_distraction_free() {
         let style = terminal_frame_style(false);
@@ -29397,7 +29429,6 @@ mod tests {
         assert_eq!(style.shell_radius, "10px");
         assert_eq!(style.host_radius, "8px");
     }
-
     #[test]
     fn terminal_frame_style_goes_edge_to_edge_in_distraction_free_mode() {
         let style = terminal_frame_style(true);
@@ -29405,7 +29436,6 @@ mod tests {
         assert_eq!(style.shell_radius, "0px");
         assert_eq!(style.host_radius, "0px");
     }
-
     #[test]
     fn active_request_session_target_path_prefers_explicit_session_path() {
         let request = ActiveSurfaceRequest {
@@ -29420,7 +29450,6 @@ mod tests {
             Some("remote-session://jojo/preview-target".to_string())
         );
     }
-
     #[test]
     fn active_request_session_target_path_uses_active_fallback_for_active_session_target() {
         let request = ActiveSurfaceRequest {
@@ -29433,7 +29462,6 @@ mod tests {
             Some("remote-session://jojo/current".to_string())
         );
     }
-
     #[test]
     fn summarize_preview_refresh_error_recognizes_local_daemon_outage() {
         assert_eq!(
@@ -29445,7 +29473,6 @@ mod tests {
             "Yggterm could not reach its local helper yet, so this remote view cannot load right now."
         );
     }
-
     #[test]
     fn remote_preview_retry_backoff_grows_and_caps() {
         assert_eq!(remote_preview_retry_backoff_ms(1), 3_000);
@@ -29454,7 +29481,6 @@ mod tests {
         assert_eq!(remote_preview_retry_backoff_ms(4), 60_000);
         assert_eq!(remote_preview_retry_backoff_ms(9), 60_000);
     }
-
     #[test]
     fn preview_failure_surfaces_only_after_real_threshold() {
         let first = PreviewSyncFailure {
@@ -29465,7 +29491,6 @@ mod tests {
         assert!(!should_surface_preview_failure(&first, 1_500));
         assert!(!should_surface_preview_failure(&first, 6_500));
         assert!(should_surface_preview_failure(&first, 7_001));
-
         let repeated = PreviewSyncFailure {
             message: "repeated".to_string(),
             retry_count: 2,
@@ -29473,7 +29498,6 @@ mod tests {
         };
         assert!(should_surface_preview_failure(&repeated, 1_500));
     }
-
     #[test]
     fn workspace_rows_exclude_live_groups() {
         let live_group = BrowserRow {
@@ -29509,7 +29533,6 @@ mod tests {
         assert!(!is_workspace_row(&live_group));
         assert!(is_workspace_row(&folder));
     }
-
     #[test]
     fn pointer_drag_placement_uses_edges_for_separator_and_middle_for_folder() {
         let separator = BrowserRow {
@@ -29542,7 +29565,6 @@ mod tests {
             session_id: None,
             session_cwd: None,
         };
-
         assert_eq!(
             drag_drop_placement_from_pointer(&separator, 4.0),
             DragDropPlacement::Before
@@ -29564,7 +29586,6 @@ mod tests {
             DragDropPlacement::After
         );
     }
-
     #[test]
     fn drop_target_rejects_self_and_descendants() {
         let target = BrowserRow {
@@ -29595,7 +29616,6 @@ mod tests {
             &target
         ));
     }
-
     #[test]
     fn document_rows_are_valid_drop_targets_for_reorder() {
         let target = BrowserRow {
@@ -29618,7 +29638,6 @@ mod tests {
             &target
         ));
     }
-
     #[test]
     fn ordered_workspace_item_path_uses_flat_index_prefix() {
         let item = BrowserRow {
@@ -29637,10 +29656,8 @@ mod tests {
             session_cwd: Some("/home/pi/gh/notes".to_string()),
         };
         let destination = yggui::ordered_tree_child_path("/home/pi/gh/notes", &item.full_path, 0);
-
         assert_eq!(destination, "/home/pi/gh/notes/0000-paper-a");
     }
-
     #[test]
     fn before_target_resolves_after_previous_sibling() {
         let rows = vec![
@@ -29689,7 +29706,6 @@ mod tests {
             ))
         );
     }
-
     #[test]
     fn before_first_target_resolves_to_top_of_parent() {
         let rows = vec![BrowserRow {
@@ -29721,20 +29737,17 @@ mod tests {
             ))
         );
     }
-
     #[test]
     fn parse_client_instance_pid_reads_pid_prefix() {
         let path = PathBuf::from("/tmp/yggterm/client-instances/4242-12345.json");
         assert_eq!(parse_client_instance_pid(&path), Some(4242));
     }
-
     #[cfg(unix)]
     #[test]
     fn parse_process_start_ticks_from_stat_reads_field_22() {
         let stat = "1234 (yggterm) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 424242";
         assert_eq!(parse_process_start_ticks_from_stat(stat), Some(424242));
     }
-
     #[test]
     fn cleanup_stale_client_instances_keeps_live_pid_and_removes_dead_entries() {
         let dir = std::env::temp_dir().join(format!(
@@ -29758,16 +29771,12 @@ mod tests {
         fs::write(&live_path, live_record).expect("write live path");
         let stale_path = dir.join("999999-1.json");
         fs::write(&stale_path, br#"{"pid":999999}"#).expect("write stale path");
-
         let active = cleanup_stale_client_instances(&dir, None).expect("cleanup instances");
-
         assert_eq!(active, vec![live_path.clone()]);
         assert!(live_path.exists());
         assert!(!stale_path.exists());
-
         let _ = fs::remove_dir_all(&dir);
     }
-
     #[test]
     fn client_instances_dir_is_scoped_by_endpoint() {
         let settings_path = PathBuf::from("/tmp/yggterm/settings.json");
@@ -29784,7 +29793,27 @@ mod tests {
             assert_ne!(a, b);
         }
     }
-
+    #[cfg(unix)]
+    #[test]
+    fn reachable_versioned_server_socket_candidates_sort_newest_first() {
+        let dir = std::env::temp_dir().join(format!(
+            "yggterm-versioned-socket-candidates-{}-{}",
+            std::process::id(),
+            current_millis()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let current = dir.join("server-2-1-4.sock");
+        fs::write(&current, b"").expect("write current");
+        let newest = dir.join("server-2-1-6.sock");
+        let middle = dir.join("server-2-1-5.sock");
+        let oldest = dir.join("server-2-0-9.sock");
+        for path in [&newest, &middle, &oldest] {
+            fs::write(path, b"").expect("write candidate");
+        }
+        let sorted = reachable_versioned_server_socket_candidates(&current);
+        assert_eq!(sorted, vec![newest, middle, oldest]);
+        let _ = fs::remove_dir_all(&dir);
+    }
     #[test]
     fn reorder_plan_keeps_position_when_anchor_is_dragged_row_boundary() {
         let gg = BrowserRow {
@@ -29836,7 +29865,6 @@ mod tests {
             gg.clone(),
             separator.clone(),
         ];
-
         let placement = resolve_workspace_drop_placement(
             &rows,
             &DragDropTarget {
@@ -29845,17 +29873,14 @@ mod tests {
             },
         )
         .expect("placement");
-
         let plan = build_workspace_reorder_plan(&rows, std::slice::from_ref(&gg), &placement)
             .expect("plan");
-
         let gg_plan = plan
             .iter()
             .find(|item| item.from_path == gg.full_path)
             .expect("gg plan item");
         assert_eq!(gg_plan.final_path, "/home/pi/gh/notes/0001-untitled-gg");
     }
-
     #[test]
     fn creation_context_for_paper_resolves_to_parent_folder() {
         let folder = BrowserRow {
@@ -29891,7 +29916,6 @@ mod tests {
         let resolved = resolve_creation_context_row(&[folder.clone(), paper.clone()], &paper);
         assert_eq!(resolved.full_path, folder.full_path);
     }
-
     #[test]
     fn creation_context_for_separator_resolves_to_parent_folder() {
         let folder = BrowserRow {
@@ -29928,7 +29952,6 @@ mod tests {
             resolve_creation_context_row(&[folder.clone(), separator.clone()], &separator);
         assert_eq!(resolved.full_path, folder.full_path);
     }
-
     #[test]
     fn new_separator_virtual_path_sorts_after_regular_children() {
         let folder = BrowserRow {
@@ -29946,12 +29969,9 @@ mod tests {
             session_id: None,
             session_cwd: None,
         };
-
         let path = new_separator_virtual_path_for_row(&folder);
-
         assert!(path.starts_with("/home/pi/gh/notes/!separator-"));
     }
-
     #[test]
     fn new_separator_virtual_path_for_document_anchors_after_clicked_row() {
         let document = BrowserRow {
@@ -29969,22 +29989,17 @@ mod tests {
             session_id: Some("paper-id".to_string()),
             session_cwd: Some("/home/pi/gh/notes".to_string()),
         };
-
         let path = new_separator_virtual_path_for_row(&document);
-
         assert!(path.starts_with("/home/pi/gh/notes/untitled-1774153234~separator-"));
     }
-
     #[test]
     fn context_menu_position_clamps_inside_window_bounds() {
         let placement = context_menu_placement((1010.0, 770.0), (1100.0, 820.0), (224.0, 420.0));
-
         assert_eq!(placement.left, None);
         assert_eq!(placement.top, None);
         assert_eq!(placement.right, Some(90.0));
         assert_eq!(placement.bottom, Some(50.0));
     }
-
     #[test]
     fn preview_content_blocks_render_markdown_shapes() {
         let blocks = preview_content_blocks(&[
@@ -29998,7 +30013,6 @@ mod tests {
             "fn main() {}".to_string(),
             "```".to_string(),
         ]);
-
         assert!(matches!(
             blocks.first(),
             Some(PreviewContentBlock::Heading { level: 1, text }) if text == "Heading"
@@ -30017,20 +30031,17 @@ mod tests {
         );
         assert!(blocks.iter().any(|block| matches!(block, PreviewContentBlock::Code { language: Some(language), code } if language == "rust" && code == "fn main() {}")));
     }
-
     #[test]
     fn preview_content_blocks_collapse_named_image_markup() {
         let blocks = preview_content_blocks(&[
             "<image name=[Image #1]> </image> [Image #1] This is how excel looks.".to_string(),
         ]);
-
         assert!(matches!(
             blocks.first(),
             Some(PreviewContentBlock::ImageReference { label, text })
                 if label == "[Image #1]" && text.as_deref() == Some("This is how excel looks.")
         ));
     }
-
     #[test]
     fn preview_content_blocks_collapse_split_named_image_markup() {
         let blocks = preview_content_blocks(&[
@@ -30038,7 +30049,6 @@ mod tests {
             "</image>".to_string(),
             "[Image #1] We need to increase the disk size.".to_string(),
         ]);
-
         assert_eq!(blocks.len(), 1);
         assert!(matches!(
             blocks.first(),
@@ -30046,7 +30056,6 @@ mod tests {
                 if label == "[Image #1]" && text.as_deref() == Some("We need to increase the disk size.")
         ));
     }
-
     #[test]
     fn preview_block_excerpt_ignores_code_fence_markers() {
         let block = SessionPreviewBlock {
@@ -30061,13 +30070,11 @@ mod tests {
                 "Runs the focused regression suite.".to_string(),
             ],
         };
-
         assert_eq!(
             preview_block_excerpt(&block, 120).as_deref(),
             Some("cargo test Runs the focused regression suite.")
         );
     }
-
     #[test]
     fn merged_sidebar_rows_include_saved_ssh_machine_roots() {
         let expanded_paths = HashSet::from(["__remote_machine__/pi-raspberry".to_string()]);
@@ -30084,12 +30091,10 @@ mod tests {
             &[],
             &expanded_paths,
         );
-
         assert!(rows.iter().any(|row| {
             row.kind == BrowserRowKind::Group && row.depth == 0 && row.label == "raspberry [cached]"
         }));
     }
-
     #[test]
     fn merged_sidebar_rows_include_scanned_remote_sessions_under_machine_root() {
         let expanded_paths = HashSet::from([
@@ -30126,7 +30131,6 @@ mod tests {
             &[],
             &expanded_paths,
         );
-
         assert!(
             rows.iter()
                 .any(|row| row.kind == BrowserRowKind::Group && row.label == "raspberry [ok]")
@@ -30139,7 +30143,6 @@ mod tests {
         assert!(rows.iter().any(|row| row.kind == BrowserRowKind::Session
             && row.full_path == "remote-session://pi-raspberry/019caa6f"));
     }
-
     #[test]
     fn merged_sidebar_rows_expand_remote_hash_labels_until_unique() {
         let expanded_paths = HashSet::from([
@@ -30194,7 +30197,6 @@ mod tests {
             &[],
             &expanded_paths,
         );
-
         let labels = rows
             .iter()
             .filter(|row| row.kind == BrowserRowKind::Session)
@@ -30204,7 +30206,6 @@ mod tests {
         assert_ne!(labels[0], labels[1]);
         assert!(labels.iter().all(|label| label.len() > "Qd3189b".len()));
     }
-
     #[test]
     fn merged_sidebar_rows_sort_remote_sessions_by_modified_epoch_desc() {
         let expanded_paths = HashSet::from([
@@ -30258,7 +30259,6 @@ mod tests {
             &[],
             &expanded_paths,
         );
-
         let labels = rows
             .iter()
             .filter(|row| row.kind == BrowserRowKind::Session)
@@ -30266,7 +30266,6 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(labels, vec!["newer".to_string(), "older".to_string()]);
     }
-
     #[test]
     fn merged_sidebar_rows_hide_nested_remote_children_when_folder_collapsed() {
         let expanded_paths = HashSet::from(["__remote_machine__/pi-raspberry".to_string()]);
@@ -30300,7 +30299,6 @@ mod tests {
             &[],
             &expanded_paths,
         );
-
         assert!(
             rows.iter()
                 .any(|row| row.full_path == "__remote_folder__/pi-raspberry/srv/app")
@@ -30311,7 +30309,6 @@ mod tests {
                 .any(|row| row.full_path == "remote-session://pi-raspberry/019caa6f")
         );
     }
-
     #[test]
     fn saved_ssh_target_machine_key_only_matches_persisted_remote_machine_rows() {
         let row = BrowserRow {
@@ -30336,14 +30333,12 @@ mod tests {
             prefix: None,
             cwd: None,
         }];
-
         assert_eq!(
             saved_ssh_target_machine_key(&row, &targets).as_deref(),
             Some("pi-raspberry")
         );
         assert_eq!(saved_ssh_target_machine_key(&row, &[]), None);
     }
-
     #[test]
     fn merged_sidebar_rows_do_not_render_live_ssh_sessions_under_machine_roots() {
         let expanded_paths = HashSet::from(["__remote_machine__/dev".to_string()]);
@@ -30387,6 +30382,7 @@ mod tests {
                 },
                 metadata: Vec::new(),
                 terminal_process_id: None,
+                terminal_foreground_active: None,
                 terminal_window_id: None,
                 terminal_host_token: None,
                 terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
@@ -30400,7 +30396,6 @@ mod tests {
             }],
             &expanded_paths,
         );
-
         assert!(rows.iter().any(|row| row.full_path == "__live_sessions__"));
         assert!(
             !rows
@@ -30421,7 +30416,6 @@ mod tests {
             0
         );
     }
-
     #[test]
     fn remote_folder_rows_show_descendant_session_counts() {
         let expanded_paths = HashSet::from([
@@ -30475,14 +30469,12 @@ mod tests {
             &[],
             &expanded_paths,
         );
-
         let home_row = rows
             .iter()
             .find(|row| row.full_path == "__remote_folder__/jojo/home/pi")
             .expect("home row");
         assert_eq!(home_row.descendant_sessions, 2);
     }
-
     #[test]
     fn merged_sidebar_rows_compress_single_child_remote_folder_chains() {
         let expanded_paths = HashSet::from([
@@ -30519,7 +30511,6 @@ mod tests {
             &[],
             &expanded_paths,
         );
-
         assert!(rows.iter().any(|row| {
             row.kind == BrowserRowKind::Group
                 && row.full_path
@@ -30532,7 +30523,6 @@ mod tests {
                 .any(|row| row.full_path == "__remote_folder__/jojo/run")
         );
     }
-
     #[test]
     fn merged_sidebar_rows_include_live_remote_session_when_scan_snapshot_is_missing_it() {
         let rows = merged_sidebar_rows(
@@ -30583,6 +30573,7 @@ mod tests {
                     },
                 ],
                 terminal_process_id: None,
+                terminal_foreground_active: None,
                 terminal_window_id: None,
                 terminal_host_token: None,
                 terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
@@ -30600,14 +30591,12 @@ mod tests {
                 "__remote_folder__/oc/home/pi".to_string(),
             ]),
         );
-
         assert!(
             rows.iter()
                 .any(|row| row.full_path
                     == "remote-session://oc/019cf672-8d68-70a1-bd8b-68487c4fc63d")
         );
     }
-
     #[test]
     fn merged_sidebar_rows_include_local_live_sessions_group_and_rows() {
         let rows = merged_sidebar_rows(
@@ -30684,6 +30673,7 @@ mod tests {
                     value: "/home/pi/gh/yggterm".to_string(),
                 }],
                 terminal_process_id: None,
+                terminal_foreground_active: None,
                 terminal_window_id: None,
                 terminal_host_token: None,
                 terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
@@ -30701,7 +30691,6 @@ mod tests {
                 "/home/pi/gh".to_string(),
             ]),
         );
-
         assert!(!rows.iter().any(|row| row.full_path == "__live_sessions__"));
         let session_index = rows
             .iter()
@@ -30712,7 +30701,62 @@ mod tests {
         assert_eq!(session_row.depth, 3);
         assert_eq!(rows[session_index - 1].full_path, "/home/pi/gh");
     }
-
+    #[test]
+    fn merged_sidebar_rows_synthesize_local_tree_for_live_sessions_when_stored_tree_is_empty() {
+        let rows = merged_sidebar_rows(
+            &[],
+            &[],
+            &[],
+            &[ManagedSessionView {
+                id: "019cf672-8d68-70a1-bd8b-68487c4fc63d".to_string(),
+                session_path: "local://019cf672-8d68-70a1-bd8b-68487c4fc63d".to_string(),
+                title: "Tree Smoke".to_string(),
+                kind: SessionKind::Shell,
+                host_label: "local".to_string(),
+                source: yggterm_server::SessionSource::LiveLocal,
+                backend: TerminalBackend::Xterm,
+                bridge_available: true,
+                launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+                remote_deploy_state: yggterm_server::RemoteDeployState::NotRequired,
+                launch_command: String::new(),
+                status_line: String::new(),
+                terminal_lines: vec![],
+                rendered_sections: vec![],
+                preview: yggterm_server::SessionPreview {
+                    summary: vec![],
+                    blocks: vec![],
+                },
+                metadata: vec![SessionMetadataEntry {
+                    label: "Cwd",
+                    value: "/home/pi/gh/yggterm".to_string(),
+                }],
+                terminal_process_id: None,
+                terminal_foreground_active: None,
+                terminal_window_id: None,
+                terminal_host_token: None,
+                terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+                embedded_surface_id: None,
+                embedded_surface_detail: None,
+                last_launch_error: None,
+                last_window_error: None,
+                ssh_target: None,
+                ssh_prefix: None,
+                stored_preview_hydrated: true,
+            }],
+            &HashSet::new(),
+        );
+        assert_eq!(rows[0].full_path, "local");
+        assert_eq!(rows[1].full_path, "/home");
+        assert_eq!(rows[2].full_path, "/home/pi");
+        assert_eq!(rows[3].full_path, "/home/pi/gh");
+        let session_row = rows.last().expect("synthetic local live session row");
+        assert_eq!(
+            session_row.full_path,
+            "local://019cf672-8d68-70a1-bd8b-68487c4fc63d"
+        );
+        assert_eq!(session_row.label, "Tree Smoke");
+        assert_eq!(session_row.depth, 4);
+    }
     #[test]
     fn merged_sidebar_rows_promote_remote_live_sessions_into_live_group() {
         let remote_path = "remote-session://oc/019cf672-8d68-70a1-bd8b-68487c4fc63d".to_string();
@@ -30767,6 +30811,7 @@ mod tests {
                     value: "/home/pi".to_string(),
                 }],
                 terminal_process_id: None,
+                terminal_foreground_active: None,
                 terminal_window_id: None,
                 terminal_host_token: None,
                 terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
@@ -30783,7 +30828,6 @@ mod tests {
                 "__remote_machine__/oc".to_string(),
             ]),
         );
-
         let promoted = rows
             .iter()
             .find(|row| row.full_path == remote_path)
@@ -30796,7 +30840,6 @@ mod tests {
             .count();
         assert_eq!(promoted_count, 1);
     }
-
     #[test]
     fn merged_sidebar_rows_refresh_stale_remote_title_from_live_session() {
         let rows = merged_sidebar_rows(
@@ -30868,6 +30911,7 @@ mod tests {
                     },
                 ],
                 terminal_process_id: None,
+                terminal_foreground_active: None,
                 terminal_window_id: None,
                 terminal_host_token: None,
                 terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
@@ -30885,7 +30929,6 @@ mod tests {
                 "__remote_folder__/oc/home/pi".to_string(),
             ]),
         );
-
         let session_row = rows
             .iter()
             .find(|row| row.full_path == "remote-session://oc/019cf672-8d68-70a1-bd8b-68487c4fc63d")
@@ -30893,7 +30936,6 @@ mod tests {
         assert_eq!(session_row.label, "Excel Shortcut Design");
         assert_eq!(search_sidebar_matches(&rows, "excel design").len(), 1);
     }
-
     #[test]
     fn live_session_label_prefers_remote_cached_generated_title() {
         let remote_machines = vec![RemoteMachineSnapshot {
@@ -30945,6 +30987,7 @@ mod tests {
                 value: "/home/pi/gh".to_string(),
             }],
             terminal_process_id: None,
+            terminal_foreground_active: None,
             terminal_window_id: None,
             terminal_host_token: None,
             terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
@@ -30956,11 +30999,9 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
         };
-
         let label = live_session_label(&remote_machines, &session, &HashMap::new());
         assert_eq!(label, "Stabilize daemon resume path");
     }
-
     #[test]
     fn remote_generation_fetch_gate_requires_machine_and_storage() {
         let mut target = CopyGenerationTarget {
@@ -30973,9 +31014,7 @@ mod tests {
             remote_machine: None,
             storage_path: None,
         };
-
         assert!(!target_can_fetch_remote_generation_context(&target));
-
         target.remote_machine = Some(RemoteMachineSnapshot {
             machine_key: "dev".to_string(),
             label: "dev".to_string(),
@@ -30987,11 +31026,9 @@ mod tests {
             sessions: vec![],
         });
         assert!(!target_can_fetch_remote_generation_context(&target));
-
         target.storage_path = Some("/home/pi/.codex/sessions/foo.jsonl".to_string());
         assert!(target_can_fetch_remote_generation_context(&target));
     }
-
     #[test]
     fn explicit_active_title_does_not_need_generation_when_sidebar_row_is_missing() {
         assert!(!title_needs_generation_from_visible_titles(
@@ -31000,7 +31037,6 @@ mod tests {
             "",
         ));
     }
-
     #[test]
     fn cwd_like_active_title_still_needs_generation_when_sidebar_row_is_missing() {
         assert!(title_needs_generation_from_visible_titles(
@@ -31009,7 +31045,6 @@ mod tests {
             "",
         ));
     }
-
     #[test]
     fn explicit_sidebar_row_title_suppresses_generation_when_session_title_is_missing() {
         assert!(!title_needs_generation_from_visible_titles(
@@ -31018,7 +31053,6 @@ mod tests {
             "LabTerm",
         ));
     }
-
     #[test]
     fn supports_generated_session_copy_accepts_local_stored_session_paths() {
         let session = ManagedSessionView {
@@ -31046,6 +31080,7 @@ mod tests {
                 value: "/home/pi".to_string(),
             }],
             terminal_process_id: None,
+            terminal_foreground_active: None,
             terminal_window_id: None,
             terminal_host_token: None,
             terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
@@ -31057,10 +31092,8 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
         };
-
         assert!(supports_generated_session_copy(&session));
     }
-
     #[test]
     fn supports_generated_session_copy_rejects_virtual_sidebar_paths() {
         let session = ManagedSessionView {
@@ -31084,6 +31117,7 @@ mod tests {
             },
             metadata: vec![],
             terminal_process_id: None,
+            terminal_foreground_active: None,
             terminal_window_id: None,
             terminal_host_token: None,
             terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
@@ -31095,10 +31129,8 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: false,
         };
-
         assert!(!supports_generated_session_copy(&session));
     }
-
     #[test]
     fn enrich_sidebar_rows_with_live_titles_updates_document_rows() {
         let live_sessions = vec![ManagedSessionView {
@@ -31122,6 +31154,7 @@ mod tests {
             },
             metadata: vec![],
             terminal_process_id: None,
+            terminal_foreground_active: None,
             terminal_window_id: None,
             terminal_host_token: None,
             terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
@@ -31148,7 +31181,6 @@ mod tests {
             session_id: Some("ddf8f1ee-8e64-4201-ab3a-2b07424f9b77".to_string()),
             session_cwd: Some("/home/pi".to_string()),
         }];
-
         enrich_sidebar_rows_with_live_titles(&mut rows, &live_sessions, &[]);
         assert_eq!(rows[0].label, "Remove Them Entirely");
         assert_eq!(
@@ -31156,7 +31188,180 @@ mod tests {
             Some("Remove Them Entirely")
         );
     }
-
+    #[test]
+    fn merged_sidebar_rows_do_not_promote_live_documents_into_live_sessions() {
+        let rows = merged_sidebar_rows(
+            &[],
+            &[],
+            &[],
+            &[ManagedSessionView {
+                id: "ddf8f1ee-8e64-4201-ab3a-2b07424f9b77".to_string(),
+                session_path: "document://ddf8f1ee-8e64-4201-ab3a-2b07424f9b77".to_string(),
+                title: "/home/pi".to_string(),
+                kind: SessionKind::Document,
+                host_label: "localhost".to_string(),
+                source: yggterm_server::SessionSource::LiveLocal,
+                backend: TerminalBackend::Xterm,
+                bridge_available: true,
+                launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+                remote_deploy_state: RemoteDeployState::NotRequired,
+                launch_command: String::new(),
+                status_line: String::new(),
+                terminal_lines: vec![],
+                rendered_sections: vec![],
+                preview: yggterm_server::SessionPreview {
+                    summary: vec![],
+                    blocks: vec![],
+                },
+                metadata: vec![],
+                terminal_process_id: None,
+                terminal_foreground_active: None,
+                terminal_window_id: None,
+                terminal_host_token: None,
+                terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+                embedded_surface_id: None,
+                embedded_surface_detail: None,
+                last_launch_error: None,
+                last_window_error: None,
+                ssh_target: None,
+                ssh_prefix: None,
+                stored_preview_hydrated: true,
+            }],
+            &HashSet::from(["__live_sessions__".to_string()]),
+        );
+        assert!(
+            rows.is_empty(),
+            "live documents should not be promoted into Live Sessions: {rows:?}"
+        );
+    }
+    #[test]
+    fn merged_sidebar_rows_do_not_promote_remote_cached_rows_as_live_sessions() {
+        let rows = merged_sidebar_rows(
+            &[],
+            &[RemoteMachineSnapshot {
+                machine_key: "jojo".to_string(),
+                label: "jojo".to_string(),
+                ssh_target: "jojo".to_string(),
+                prefix: None,
+                remote_binary_expr: None,
+                remote_deploy_state: RemoteDeployState::Planned,
+                health: RemoteMachineHealth::Cached,
+                sessions: vec![RemoteScannedSession {
+                    session_path: "remote-session://jojo/abc".to_string(),
+                    session_id: "abc".to_string(),
+                    cwd: "/home/pi".to_string(),
+                    started_at: "2026-03-24T10:00:00Z".to_string(),
+                    modified_epoch: 1,
+                    event_count: 1,
+                    user_message_count: 1,
+                    assistant_message_count: 1,
+                    title_hint: "Cached Remote Session".to_string(),
+                    recent_context: "USER: one".to_string(),
+                    cached_precis: None,
+                    cached_summary: None,
+                    storage_path: "a".to_string(),
+                }],
+            }],
+            &[],
+            &[ManagedSessionView {
+                id: "abc".to_string(),
+                session_path: "remote-session://jojo/abc".to_string(),
+                title: "Cached Remote Session".to_string(),
+                kind: SessionKind::Codex,
+                host_label: "jojo".to_string(),
+                source: yggterm_server::SessionSource::LiveLocal,
+                backend: TerminalBackend::Xterm,
+                bridge_available: true,
+                launch_phase: yggterm_server::TerminalLaunchPhase::BridgePending,
+                remote_deploy_state: RemoteDeployState::Planned,
+                launch_command: String::new(),
+                status_line: String::new(),
+                terminal_lines: vec![],
+                rendered_sections: vec![],
+                preview: yggterm_server::SessionPreview {
+                    summary: vec![],
+                    blocks: vec![],
+                },
+                metadata: vec![],
+                terminal_process_id: None,
+                terminal_foreground_active: None,
+                terminal_window_id: None,
+                terminal_host_token: None,
+                terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+                embedded_surface_id: None,
+                embedded_surface_detail: None,
+                last_launch_error: None,
+                last_window_error: None,
+                ssh_target: Some("jojo".to_string()),
+                ssh_prefix: None,
+                stored_preview_hydrated: true,
+            }],
+            &HashSet::from([
+                "__live_sessions__".to_string(),
+                "__remote_machine__/jojo".to_string(),
+            ]),
+        );
+        assert!(
+            !rows.iter().any(|row| row.full_path == "__live_sessions__"),
+            "cached remote rows should not show up under Live Sessions: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.full_path == "__remote_machine__/jojo"),
+            "cached remote machine should still stay in the machine tree: {rows:?}"
+        );
+    }
+    #[test]
+    fn merged_sidebar_rows_still_promote_real_remote_live_sessions() {
+        let rows = merged_sidebar_rows(
+            &[],
+            &[],
+            &[],
+            &[ManagedSessionView {
+                id: "abc".to_string(),
+                session_path: "remote-session://jojo/abc".to_string(),
+                title: "Remote Live Session".to_string(),
+                kind: SessionKind::Codex,
+                host_label: "jojo".to_string(),
+                source: yggterm_server::SessionSource::LiveSsh,
+                backend: TerminalBackend::Xterm,
+                bridge_available: true,
+                launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+                remote_deploy_state: RemoteDeployState::Ready,
+                launch_command: String::new(),
+                status_line: String::new(),
+                terminal_lines: vec![],
+                rendered_sections: vec![],
+                preview: yggterm_server::SessionPreview {
+                    summary: vec![],
+                    blocks: vec![],
+                },
+                metadata: vec![],
+                terminal_process_id: None,
+                terminal_foreground_active: None,
+                terminal_window_id: None,
+                terminal_host_token: Some("host-token".to_string()),
+                terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+                embedded_surface_id: None,
+                embedded_surface_detail: None,
+                last_launch_error: None,
+                last_window_error: None,
+                ssh_target: Some("jojo".to_string()),
+                ssh_prefix: None,
+                stored_preview_hydrated: true,
+            }],
+            &HashSet::from(["__live_sessions__".to_string()]),
+        );
+        assert!(
+            rows.iter().any(|row| row.full_path == "__live_sessions__"),
+            "real remote live sessions should still be promoted: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.full_path == "remote-session://jojo/abc" && row.depth == 1),
+            "real remote live session row should remain in Live Sessions: {rows:?}"
+        );
+    }
     #[test]
     fn merged_sidebar_rows_break_compression_when_middle_folder_has_sessions() {
         let expanded_paths = HashSet::from([
@@ -31211,7 +31416,6 @@ mod tests {
             &[],
             &expanded_paths,
         );
-
         assert!(rows.iter().any(|row| {
             row.kind == BrowserRowKind::Group
                 && row.full_path == "__remote_folder__/jojo/home/pi"
@@ -31228,7 +31432,6 @@ mod tests {
                 .any(|row| row.full_path == "__remote_folder__/jojo/home")
         );
     }
-
     #[test]
     fn compressed_remote_folder_paths_follow_rendered_chain() {
         let machine = SidebarRemoteMachine {
@@ -31253,7 +31456,6 @@ mod tests {
                 storage_path: "a".to_string(),
             }],
         };
-
         assert_eq!(
             compressed_remote_folder_paths(
                 &machine.scanned_sessions,
@@ -31262,7 +31464,6 @@ mod tests {
             vec!["/run/smb4k/data/smbfs/dada/obsidian/codex".to_string()]
         );
     }
-
     #[test]
     fn merged_sidebar_rows_expose_machine_status_detail() {
         let rows = merged_sidebar_rows(
@@ -31281,7 +31482,6 @@ mod tests {
             &[],
             &HashSet::new(),
         );
-
         let machine_row = rows
             .iter()
             .find(|row| row.full_path == "__remote_machine__/jojo")
@@ -31292,7 +31492,6 @@ mod tests {
             "cached snapshot · remote bootstrap planned"
         );
     }
-
     #[test]
     fn search_terms_support_quoted_phrases() {
         assert_eq!(
@@ -31304,7 +31503,6 @@ mod tests {
             ]
         );
     }
-
     #[test]
     fn alt_overlay_sequence_supports_insert_submenu() {
         assert_eq!(
@@ -31328,7 +31526,6 @@ mod tests {
             AltOverlayResolution::Invalid
         );
     }
-
     #[test]
     fn filtered_sidebar_rows_keep_matching_ancestors() {
         let rows = vec![
@@ -31393,7 +31590,6 @@ mod tests {
                 session_cwd: Some("/home/pi/gh/yggterm".to_string()),
             },
         ];
-
         let filtered = filtered_sidebar_rows(&rows, "excel design");
         let filtered_paths = filtered
             .iter()
@@ -31408,7 +31604,6 @@ mod tests {
             ]
         );
     }
-
     #[test]
     fn search_sidebar_matches_hash_and_path_terms() {
         let rows = vec![BrowserRow {
@@ -31426,7 +31621,6 @@ mod tests {
             session_id: Some("019cf672-8d68-70a1-bd8b-68487c4fc63d".to_string()),
             session_cwd: Some("/home/pi/gh/excel-inspired".to_string()),
         }];
-
         assert_eq!(search_sidebar_matches(&rows, "q4fc63d").len(), 1);
         assert_eq!(
             search_sidebar_matches(&rows, "\"excel shortcut\" gh/excel").len(),
@@ -31434,7 +31628,6 @@ mod tests {
         );
         assert!(search_sidebar_matches(&rows, "timezone").is_empty());
     }
-
     #[test]
     fn search_sidebar_matches_include_group_rows() {
         let rows = vec![
@@ -31484,7 +31677,6 @@ mod tests {
                 session_cwd: Some("/home/pi/gh/excel-inspired".to_string()),
             },
         ];
-
         let matches = search_sidebar_matches(&rows, "home/pi/gh");
         assert!(
             matches
@@ -31492,7 +31684,6 @@ mod tests {
                 .any(|row| row.full_path == "__remote_folder__/oc/home/pi/gh")
         );
     }
-
     #[test]
     fn search_expanded_paths_include_collapsed_remote_sessions() {
         let stored_rows = Vec::<BrowserRow>::new();
@@ -31520,11 +31711,9 @@ mod tests {
                 storage_path: "a".to_string(),
             }],
         }];
-
         let expanded =
             search_expanded_paths(&stored_rows, &remote_machines, &[], &[], &HashSet::new());
         let rows = merged_sidebar_rows(&stored_rows, &remote_machines, &[], &[], &expanded);
-
         assert!(
             rows.iter()
                 .any(|row| row.full_path == "__remote_machine__/oc")
@@ -31542,7 +31731,6 @@ mod tests {
             1
         );
     }
-
     fn test_sidebar_row(path: &str) -> BrowserRow {
         BrowserRow {
             kind: BrowserRowKind::Session,
@@ -31560,7 +31748,106 @@ mod tests {
             session_cwd: Some("/tmp".to_string()),
         }
     }
-
+    #[test]
+    fn tree_icon_contract_matches_terminal_session_types() {
+        assert_eq!(
+            tree_icon_kind(&test_sidebar_row("local://abc")),
+            "plain-terminal"
+        );
+        assert_eq!(tree_icon_glyph(&test_sidebar_row("local://abc")), Some("⌘"));
+        assert_eq!(tree_icon_kind(&test_sidebar_row("codex://oc/1")), "codex");
+        assert_eq!(
+            tree_icon_glyph(&test_sidebar_row("codex://oc/1")),
+            Some("✦")
+        );
+        assert_eq!(
+            tree_icon_kind(&test_sidebar_row("/home/pi/.codex/sessions/example.jsonl")),
+            "plain-terminal"
+        );
+        assert_eq!(
+            tree_icon_glyph(&test_sidebar_row("/home/pi/.codex/sessions/example.jsonl")),
+            Some("⌘")
+        );
+    }
+    #[test]
+    fn session_idle_heuristic_treats_multiline_history_with_trailing_prompt_as_idle() {
+        let session = ManagedSessionView {
+            id: "test".to_string(),
+            session_path: "local://abc".to_string(),
+            title: "/home/pi/Downloads".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "local".to_string(),
+            source: SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: true,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: yggterm_server::RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: "pi@dev:~/gh/yggterm$".to_string(),
+            terminal_lines: vec![
+                "printf '\033[?1049h\033[?25lhc'; sleep 1; printf '\033[?25h\033[?1049l'"
+                    .to_string(),
+                "bash: rintf: command not found".to_string(),
+                "pi@dev:~/gh/yggterm$".to_string(),
+            ],
+            rendered_sections: vec![],
+            preview: yggterm_server::SessionPreview {
+                summary: vec![],
+                blocks: vec![],
+            },
+            metadata: vec![],
+            terminal_process_id: Some(123),
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: true,
+        };
+        assert!(session_is_idle_for_sidebar_icon(&session));
+    }
+    #[test]
+    fn session_idle_heuristic_treats_foreground_command_as_busy() {
+        let session = ManagedSessionView {
+            id: "test".to_string(),
+            session_path: "local://abc".to_string(),
+            title: "/home/pi/Downloads".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "local".to_string(),
+            source: SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: true,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: yggterm_server::RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: vec!["sudo apt install wezterm".to_string()],
+            rendered_sections: vec![],
+            preview: yggterm_server::SessionPreview {
+                summary: vec![],
+                blocks: vec![],
+            },
+            metadata: vec![],
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: true,
+        };
+        assert!(!session_is_idle_for_sidebar_icon(&session));
+    }
     #[test]
     fn remote_loading_notice_only_shows_for_remote_like_rows() {
         assert!(should_show_remote_loading_notice(
@@ -31592,7 +31879,6 @@ mod tests {
             true
         ));
     }
-
     #[test]
     fn enrich_sidebar_rows_uses_live_session_titles_for_search() {
         let mut rows = vec![BrowserRow {
@@ -31631,6 +31917,7 @@ mod tests {
             },
             metadata: Vec::new(),
             terminal_process_id: None,
+            terminal_foreground_active: None,
             terminal_window_id: None,
             terminal_host_token: None,
             terminal_host_mode: yggterm_server::GhosttyTerminalHostMode::Unsupported,
@@ -31642,9 +31929,7 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
         }];
-
         enrich_sidebar_rows_with_live_titles(&mut rows, &live_sessions, &[]);
-
         assert_eq!(
             rows[0].session_title.as_deref(),
             Some("Excel Shortcut Design")
@@ -31655,7 +31940,6 @@ mod tests {
             1
         );
     }
-
     #[test]
     fn search_content_hits_preview_header_matches_summary() {
         let session = ManagedSessionView {
@@ -31693,6 +31977,7 @@ mod tests {
                 },
             ],
             terminal_process_id: None,
+            terminal_foreground_active: None,
             terminal_window_id: None,
             terminal_host_token: None,
             terminal_host_mode: yggterm_server::GhosttyTerminalHostMode::Unsupported,
@@ -31704,13 +31989,11 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
         };
-
         let hits = search_content_hits(Some(&session), WorkspaceViewMode::Rendered, "Asia/Kolkata");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].dom_id, PREVIEW_HEADER_SEARCH_HIT_ID);
         assert_eq!(hits[0].label, "Summary");
     }
-
     #[test]
     fn command_query_does_not_search_preview_or_terminal_content() {
         let session = ManagedSessionView {
@@ -31740,6 +32023,7 @@ mod tests {
             },
             metadata: Vec::new(),
             terminal_process_id: None,
+            terminal_foreground_active: None,
             terminal_window_id: None,
             terminal_host_token: None,
             terminal_host_mode: yggterm_server::GhosttyTerminalHostMode::Unsupported,
@@ -31751,7 +32035,6 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
         };
-
         assert!(content_search_query("/preview").is_none());
         assert!(
             search_content_hits(Some(&session), WorkspaceViewMode::Rendered, "/preview").is_empty()
@@ -31760,7 +32043,6 @@ mod tests {
             search_content_hits(Some(&session), WorkspaceViewMode::Terminal, "/preview").is_empty()
         );
     }
-
     #[test]
     fn pending_remote_machine_refreshes_include_stale_offline_machine() {
         let remote_machines = vec![RemoteMachineSnapshot {
@@ -31780,7 +32062,6 @@ mod tests {
             prefix: None,
             cwd: None,
         }];
-
         let pending = pending_remote_machine_refreshes(
             &remote_machines,
             &ssh_targets,
@@ -31789,10 +32070,8 @@ mod tests {
             &HashMap::new(),
             1_000,
         );
-
         assert_eq!(pending, vec!["dev".to_string()]);
     }
-
     #[test]
     fn pending_remote_machine_refreshes_include_restored_machine_without_target() {
         let remote_machines = vec![RemoteMachineSnapshot {
@@ -31819,7 +32098,6 @@ mod tests {
                 storage_path: "/tmp/remote-dev-123.jsonl".to_string(),
             }],
         }];
-
         let pending = pending_remote_machine_refreshes(
             &remote_machines,
             &[],
@@ -31828,10 +32106,8 @@ mod tests {
             &HashMap::new(),
             1_000,
         );
-
         assert_eq!(pending, vec!["dev".to_string()]);
     }
-
     #[test]
     fn pending_remote_machine_refreshes_respect_retry_cooldown() {
         let remote_machines = vec![RemoteMachineSnapshot {
@@ -31852,7 +32128,6 @@ mod tests {
             cwd: None,
         }];
         let retry_after_ms = HashMap::from([(String::from("dev"), 5_000u64)]);
-
         let pending = pending_remote_machine_refreshes(
             &remote_machines,
             &ssh_targets,
@@ -31861,10 +32136,8 @@ mod tests {
             &retry_after_ms,
             1_000,
         );
-
         assert!(pending.is_empty());
     }
-
     #[test]
     fn pending_managed_cli_refreshes_include_local_and_new_machine() {
         let remote_machines = vec![RemoteMachineSnapshot {
@@ -31884,7 +32157,6 @@ mod tests {
             prefix: None,
             cwd: None,
         }];
-
         let pending = pending_managed_cli_refreshes(
             &remote_machines,
             &ssh_targets,
@@ -31893,10 +32165,8 @@ mod tests {
             &HashMap::new(),
             1_000,
         );
-
         assert_eq!(pending, vec!["local".to_string(), "dev".to_string()]);
     }
-
     #[test]
     fn app_control_open_and_expand_defer_background_refreshes() {
         assert!(app_control_command_defers_background_refresh(
@@ -31921,7 +32191,6 @@ mod tests {
             &AppControlCommand::DescribeState
         ));
     }
-
     #[test]
     fn preview_placeholder_text_is_not_treated_as_real_content() {
         assert!(preview_text_looks_like_loading_placeholder(
@@ -31934,7 +32203,6 @@ mod tests {
             "Nov 23, 2025 01:17PM UTC+0530\nWho are you?"
         ));
     }
-
     #[test]
     fn remote_preview_needs_refresh_for_loading_metadata() {
         let session = ManagedSessionView {
@@ -31967,6 +32235,7 @@ mod tests {
                 value: "loading".to_string(),
             }],
             terminal_process_id: None,
+            terminal_foreground_active: None,
             terminal_window_id: None,
             terminal_host_token: None,
             terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
@@ -31978,10 +32247,8 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: false,
         };
-
         assert!(remote_preview_needs_refresh(&session));
     }
-
     #[test]
     fn remote_preview_needs_refresh_for_placeholder_summary_text() {
         let session = ManagedSessionView {
@@ -32023,6 +32290,7 @@ mod tests {
             },
             metadata: Vec::new(),
             terminal_process_id: None,
+            terminal_foreground_active: None,
             terminal_window_id: None,
             terminal_host_token: None,
             terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
@@ -32034,10 +32302,8 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: false,
         };
-
         assert!(remote_preview_needs_refresh(&session));
     }
-
     #[test]
     fn preview_scan_hydration_remains_visible_while_refreshing() {
         let session = ManagedSessionView {
@@ -32082,6 +32348,7 @@ mod tests {
                 value: "scan".to_string(),
             }],
             terminal_process_id: None,
+            terminal_foreground_active: None,
             terminal_window_id: None,
             terminal_host_token: None,
             terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
@@ -32093,11 +32360,9 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: false,
         };
-
         assert!(remote_preview_needs_refresh(&session));
         assert!(!preview_should_hide_stale_placeholder_content(&session));
     }
-
     #[test]
     fn terminal_chunk_has_meaningful_output_rejects_generic_codex_idle() {
         let data = "\
@@ -32107,11 +32372,9 @@ model:     gpt-5.4 high   /model to change\n\
 \n\
  Run /review on my current changes\n\
  gpt-5.4 high · 100% left · ~\n";
-
         assert!(terminal_chunk_is_generic_codex_idle(data));
         assert!(!terminal_chunk_has_meaningful_output(data));
     }
-
     #[test]
     fn terminal_chunk_has_meaningful_output_rejects_remote_loading_placeholder() {
         let data = "\
@@ -32120,11 +32383,9 @@ Host: jojo\n\
 Workspace: /home/pi\n\
 Deploy: ready\n\
 Waiting for the remote terminal to paint...\n";
-
         assert!(terminal_chunk_is_loading_placeholder(data));
         assert!(!terminal_chunk_has_meaningful_output(data));
     }
-
     #[test]
     fn batch_terminal_chunks_rejects_split_generic_codex_idle() {
         let chunks = vec![
@@ -32141,7 +32402,6 @@ Waiting for the remote terminal to paint...\n";
                 data: "╰───────────────────────────────────────────────────╯\n› Summarize recent commits\n  gpt-5.4 high fast · 100% left · ~\n".to_string(),
             },
         ];
-
         let (
             _combined,
             saw_visible_output,
@@ -32151,7 +32411,6 @@ Waiting for the remote terminal to paint...\n";
             saw_transcript_browser_output,
             saw_attach_ready_marker,
         ) = batch_terminal_chunks(chunks);
-
         assert!(saw_visible_output);
         assert!(!saw_meaningful_output);
         assert!(!saw_prompt_output);
@@ -32162,7 +32421,6 @@ Waiting for the remote terminal to paint...\n";
         assert!(!saw_transcript_browser_output);
         assert!(!saw_attach_ready_marker);
     }
-
     #[test]
     fn terminal_chunk_idle_footer_ignores_real_transcript_with_common_prompt_text() {
         let data = "\
@@ -32175,11 +32433,9 @@ Waiting for the remote terminal to paint...\n";
 \n\
 \u{203a} Explain this codebase\n\
   gpt-5.4 high fast \u{00b7} 100% left \u{00b7} ~/git\n";
-
         assert!(!terminal_chunk_has_generic_codex_idle_footer(data));
         assert!(terminal_chunk_has_meaningful_output(data));
     }
-
     #[test]
     fn terminal_chunk_idle_footer_flags_small_generic_prompt_surface() {
         let data = "\
@@ -32188,28 +32444,22 @@ Waiting for the remote terminal to paint...\n";
 \u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}\n\
 \u{203a} Explain this codebase\n\
   gpt-5.4 high fast \u{00b7} 100% left \u{00b7} ~/git\n";
-
         assert!(terminal_chunk_has_generic_codex_idle_footer(data));
     }
-
     #[test]
     fn terminal_chunk_idle_footer_flags_write_tests_footer_surface() {
         let data = "\
 \u{203a} Write tests for @filename\n\
   gpt-5.4 high fast \u{00b7} 100% left \u{00b7} ~/git\n";
-
         assert!(terminal_chunk_has_generic_codex_idle_footer(data));
     }
-
     #[test]
     fn remote_resume_visual_reveal_rejects_generic_codex_idle_footer() {
         let data = "\
 \u{203a} Write tests for @filename\n\
   gpt-5.4 high fast \u{00b7} 100% left \u{00b7} ~/git\n";
-
         assert!(!remote_resume_visual_reveal_has_post_attach_content(data));
     }
-
     #[test]
     fn remote_resume_visual_reveal_accepts_quiet_attached_terminal_after_deadline() {
         assert!(remote_resume_visual_reveal_can_complete(
@@ -32276,7 +32526,6 @@ Waiting for the remote terminal to paint...\n";
             9,
         ));
     }
-
     #[test]
     fn remote_resume_visual_reveal_accepts_idle_footer_after_deadline() {
         let data = "\
@@ -32291,7 +32540,6 @@ Waiting for the remote terminal to paint...\n";
             true, true, true, true, false, data, "", "", 43, 1,
         ));
     }
-
     #[test]
     fn remote_resume_visual_reveal_accepts_deferred_output_even_if_host_is_blank() {
         let data = "OpenAI Codex v0.0.0
@@ -32304,7 +32552,6 @@ Waiting for the remote terminal to paint...\n";
             true, true, true, true, false, data, "", "", 43, 42,
         ));
     }
-
     #[test]
     fn remote_resume_visual_reveal_rejects_placeholder_backed_host_surface() {
         assert!(!remote_resume_visual_reveal_can_complete(
@@ -32320,7 +32567,6 @@ Waiting for the remote terminal to paint...\n";
             1,
         ));
     }
-
     #[test]
     fn stale_remote_resume_retry_clear_rejects_placeholder_backed_host_surface() {
         assert!(!stale_remote_resume_retry_should_clear(
@@ -32338,7 +32584,6 @@ Waiting for the remote terminal to paint...\n";
             true,
         ));
     }
-
     #[test]
     fn remote_resume_visual_reveal_rejects_transport_error_after_deadline() {
         let data = "Shared connection to 192.168.0.133 closed.
@@ -32350,41 +32595,35 @@ Waiting for the remote terminal to paint...\n";
             true, true, true, true, false, data, "", "", 43, 1,
         ));
     }
-
     #[test]
     fn terminal_chunk_marks_exec_export_not_found_as_transport_error() {
         let data = "bash: line 1: exec: export: not found\r\n";
         assert!(terminal_chunk_is_transport_error(data));
         assert!(!terminal_chunk_has_meaningful_output(data));
     }
-
     #[test]
     fn terminal_chunk_marks_shared_connection_closed_as_transport_error() {
         let data = "Shared connection to 192.168.0.133 closed.\r\n";
         assert!(terminal_chunk_is_transport_error(data));
         assert!(!terminal_chunk_has_meaningful_output(data));
     }
-
     #[test]
     fn terminal_chunk_marks_terminal_session_not_found_as_transport_error() {
         let data = "Error: terminal session not found: codex-runtime://019ad8b9\r\n";
         assert!(terminal_chunk_is_transport_error(data));
         assert!(!terminal_chunk_has_meaningful_output(data));
     }
-
     #[test]
     fn terminal_chunk_detects_launcher_boilerplate() {
         let data = "Open live terminal jojo\nLaunch command prepared:\nDaemon PTY: request main viewport terminal stream\n";
         assert!(terminal_chunk_is_launcher_boilerplate(data));
     }
-
     #[test]
     fn transient_local_daemon_error_matches_daemon_not_reachable_copy() {
         assert!(is_transient_local_daemon_connect_error(
             "local yggterm daemon did not become reachable"
         ));
     }
-
     #[test]
     fn app_control_terminal_surface_flags_transport_error_output() {
         let host = json!({
@@ -32403,7 +32642,6 @@ Waiting for the remote terminal to paint...\n";
             Some("active terminal host is showing transport/error output")
         );
     }
-
     #[test]
     fn app_control_terminal_surface_does_not_flag_narrative_no_route_to_host() {
         let host = json!({
@@ -32419,7 +32657,6 @@ Waiting for the remote terminal to paint...\n";
         assert_eq!(surface.get("rendered").and_then(Value::as_bool), Some(true));
         assert_eq!(surface.get("problem"), Some(&Value::Null));
     }
-
     #[test]
     fn app_control_terminal_surface_flags_geometry_mismatch() {
         let host = json!({
@@ -32446,7 +32683,6 @@ Waiting for the remote terminal to paint...\n";
             Some("active terminal host geometry does not match the xterm screen width")
         );
     }
-
     #[test]
     fn app_control_terminal_surface_accepts_compensated_host_content_width() {
         let host = json!({
@@ -32465,7 +32701,6 @@ Waiting for the remote terminal to paint...\n";
         let surface = summarize_terminal_surface_for_app_control(&[host], false);
         assert_eq!(surface.get("geometry_problem"), Some(&Value::Null));
     }
-
     #[test]
     fn app_control_terminal_surface_accepts_compensated_screen_gap_with_full_viewport() {
         let host = json!({
@@ -32487,7 +32722,6 @@ Waiting for the remote terminal to paint...\n";
         assert_eq!(surface.get("geometry_problem"), Some(&Value::Null));
         assert_eq!(surface.get("problem"), Some(&Value::Null));
     }
-
     #[test]
     fn app_control_terminal_surface_flags_vertical_geometry_mismatch() {
         let host = json!({
@@ -32509,7 +32743,6 @@ Waiting for the remote terminal to paint...\n";
             Some("active terminal host geometry does not match the xterm screen height")
         );
     }
-
     #[test]
     fn app_control_terminal_surface_flags_helper_textarea_drift() {
         let host = json!({
@@ -32536,7 +32769,6 @@ Waiting for the remote terminal to paint...\n";
             Some("active terminal host helper textarea drifted outside the visible host")
         );
     }
-
     #[test]
     fn app_control_terminal_surface_flags_launcher_boilerplate() {
         let host = json!({
@@ -32555,7 +32787,6 @@ Waiting for the remote terminal to paint...\n";
             Some("active terminal host is still showing launcher boilerplate")
         );
     }
-
     #[test]
     fn app_control_terminal_surface_masks_live_problem_when_overlay_context_is_visible() {
         let host = json!({
@@ -32575,7 +32806,6 @@ Waiting for the remote terminal to paint...\n";
             Some("active terminal host is still showing generic Codex idle footer")
         );
     }
-
     #[test]
     fn describe_viewport_snapshot_treats_terminal_resume_fallback_context_as_recovering() {
         let snapshot = json!({
@@ -32634,7 +32864,6 @@ Waiting for the remote terminal to paint...\n";
             "preview_visible_block_count": 0,
             "preview_scroll_count": 1
         });
-
         let viewport = describe_viewport_snapshot(&snapshot, &dom);
         assert_eq!(viewport.get("ready").and_then(Value::as_bool), Some(false));
         assert_eq!(
@@ -32659,7 +32888,6 @@ Waiting for the remote terminal to paint...\n";
             Some(true)
         );
     }
-
     #[test]
     fn describe_viewport_snapshot_keeps_terminal_host_prefill_in_recovering_state() {
         let snapshot = json!({
@@ -32718,7 +32946,6 @@ Waiting for the remote terminal to paint...\n";
             "preview_visible_block_count": 0,
             "preview_scroll_count": 1
         });
-
         let viewport = describe_viewport_snapshot(&snapshot, &dom);
         assert_eq!(viewport.get("ready").and_then(Value::as_bool), Some(false));
         assert_eq!(
@@ -32736,7 +32963,6 @@ Waiting for the remote terminal to paint...\n";
             Some("terminal resume overlay is still visible")
         );
     }
-
     #[test]
     fn describe_viewport_snapshot_treats_resume_toast_without_input_as_recovering() {
         let snapshot = json!({
@@ -32800,7 +33026,6 @@ Waiting for the remote terminal to paint...\n";
             "preview_visible_block_count": 0,
             "preview_scroll_count": 1
         });
-
         let viewport = describe_viewport_snapshot(&snapshot, &dom);
         assert_eq!(viewport.get("ready").and_then(Value::as_bool), Some(false));
         assert_eq!(
@@ -32818,7 +33043,6 @@ Waiting for the remote terminal to paint...\n";
             Some("terminal resume notification is still visible")
         );
     }
-
     #[test]
     fn describe_viewport_snapshot_prefers_interactive_terminal_over_saved_context() {
         let snapshot = json!({
@@ -32878,7 +33102,6 @@ Waiting for the remote terminal to paint...\n";
             "preview_visible_block_count": 0,
             "preview_scroll_count": 1
         });
-
         let viewport = describe_viewport_snapshot(&snapshot, &dom);
         assert_eq!(viewport.get("ready").and_then(Value::as_bool), Some(true));
         assert_eq!(
@@ -32899,7 +33122,6 @@ Waiting for the remote terminal to paint...\n";
             Some(false)
         );
     }
-
     #[test]
     fn describe_viewport_snapshot_requires_terminal_input_before_interactive() {
         let snapshot = json!({
@@ -32957,7 +33179,6 @@ Waiting for the remote terminal to paint...\n";
             "preview_visible_block_count": 0,
             "preview_scroll_count": 1
         });
-
         let viewport = describe_viewport_snapshot(&snapshot, &dom);
         assert_eq!(viewport.get("ready").and_then(Value::as_bool), Some(false));
         assert_eq!(
@@ -32975,7 +33196,6 @@ Waiting for the remote terminal to paint...\n";
             Some("terminal rendered but input is still disabled")
         );
     }
-
     #[test]
     fn terminal_open_attempt_failure_reason_uses_surface_problem_first() {
         let viewport = json!({
@@ -32993,7 +33213,6 @@ Waiting for the remote terminal to paint...\n";
             Some("active terminal host is showing transport/error output")
         );
     }
-
     #[test]
     fn terminal_open_attempt_failure_reason_uses_failure_overlay_copy() {
         let viewport = json!({
@@ -33011,7 +33230,6 @@ Waiting for the remote terminal to paint...\n";
             Some("Remote terminal needs attention\nStill not interactive")
         );
     }
-
     #[test]
     fn terminal_open_attempt_failure_reason_ignores_live_problem_when_overlay_context_settles() {
         let viewport = json!({
@@ -33030,7 +33248,6 @@ Waiting for the remote terminal to paint...\n";
             None
         );
     }
-
     #[test]
     fn terminal_open_attempt_failure_reason_ignores_overlay_after_interactive_recovery() {
         let viewport = json!({
@@ -33052,7 +33269,6 @@ Waiting for the remote terminal to paint...\n";
             None
         );
     }
-
     #[test]
     fn terminal_open_attempt_failure_reason_does_not_latch_low_signal_terminal_noise() {
         let viewport = json!({
@@ -33068,7 +33284,6 @@ Waiting for the remote terminal to paint...\n";
             None
         );
     }
-
     #[test]
     fn terminal_open_attempt_failure_reason_ignores_recovering_overlay_phase() {
         let viewport = json!({
@@ -33088,7 +33303,6 @@ Waiting for the remote terminal to paint...\n";
             None
         );
     }
-
     #[test]
     fn startup_terminal_restore_open_is_skipped_once_mount_host_exists() {
         let active_session_path = "remote-session://oc/test";
@@ -33155,7 +33369,915 @@ Waiting for the remote terminal to paint...\n";
         shell.bump_terminal_mount_epoch_for_session(active_session_path);
         assert!(!shell.startup_terminal_restore_should_open(active_session_path));
     }
-
+    fn test_shell_bootstrap_with_active_session(active_session_path: &str) -> ShellBootstrap {
+        let active_tree = SessionNode {
+            kind: SessionNodeKind::CodexSession,
+            name: "test".to_string(),
+            title: Some("test".to_string()),
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from(active_session_path),
+            children: Vec::new(),
+            session_id: Some("test-session".to_string()),
+            cwd: Some("/home/pi".to_string()),
+        };
+        let root = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: vec![active_tree],
+            session_id: None,
+            cwd: None,
+        };
+        ShellBootstrap {
+            tree: root.clone(),
+            browser_tree: root,
+            browser_tree_loaded: true,
+            settings: AppSettings::default(),
+            install_context: InstallContext {
+                channel: yggterm_core::InstallChannel::Unknown,
+                update_policy: yggterm_core::UpdatePolicy::NotifyOnly,
+                repo: "test/repo".to_string(),
+                asset_label: "linux-aarch64".to_string(),
+                current_version: "0.0.0-test".to_string(),
+                executable_path: PathBuf::from("/tmp/yggterm-test"),
+                preferred_executable: None,
+                managed_root: None,
+                manager_hint: Some("test".to_string()),
+            },
+            settings_path: PathBuf::from("/tmp/yggterm-test-settings.json"),
+            server_endpoint: ServerEndpoint::UnixSocket(PathBuf::from("/tmp/yggterm-test.sock")),
+            initial_server_snapshot: None,
+            theme: UiTheme::ZedLight,
+            ghostty_bridge_enabled: false,
+            ghostty_embedded_surface_supported: false,
+            ghostty_bridge_detail: String::new(),
+            server_daemon_detail: String::new(),
+            prefer_ghostty_backend: false,
+            pending_update_restart: None,
+            refresh_server_after_launch: false,
+            linux_window_transparent: false,
+            linux_window_profile_reason: "test".to_string(),
+        }
+    }
+    #[test]
+    fn preserve_background_snapshot_keeps_live_active_session_from_snapshot_rows() {
+        let active_session_path = "local://fresh-shell";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(
+            "/home/pi/.codex/sessions/example.jsonl",
+        ));
+        shell.active_surface_requests.insert(
+            YggSurface::Terminal,
+            ActiveSurfaceRequest {
+                request_id: "req-live-local".to_string(),
+                operation: "describe_state".to_string(),
+                target: YggTarget::Terminal {
+                    session_path: active_session_path.to_string(),
+                },
+            },
+        );
+        let live_session = ManagedSessionView {
+            id: "fresh-shell-id".to_string(),
+            session_path: active_session_path.to_string(),
+            title: "Dev Yggterm".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "local-shell".to_string(),
+            source: SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: vec!["pi@dev:~/gh/yggterm$".to_string()],
+            rendered_sections: Vec::new(),
+            preview: SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: vec![SessionMetadataEntry {
+                label: "Cwd",
+                value: "/home/pi/gh/yggterm".to_string(),
+            }],
+            terminal_process_id: Some(42),
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+        let mut snapshot = ServerUiSnapshot {
+            active_session_path: Some(active_session_path.to_string()),
+            active_session: None,
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+        };
+        preserve_client_focus_for_background_snapshot(&shell, &mut snapshot);
+        assert_eq!(
+            snapshot.active_session_path.as_deref(),
+            Some(active_session_path)
+        );
+        let active = snapshot
+            .active_session
+            .as_ref()
+            .expect("live session should stay active after preserve");
+        assert_eq!(active.session_path, active_session_path);
+        assert_eq!(active.title, "Dev Yggterm");
+    }
+    #[test]
+    fn preserve_background_snapshot_prefers_fresh_live_terminal_session_over_stale_active_session()
+    {
+        let active_session_path = "local://fresh-shell";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(
+            active_session_path,
+        ));
+        let stale_active = ManagedSessionView {
+            id: "stale-shell-id".to_string(),
+            session_path: active_session_path.to_string(),
+            title: "Stale Shell".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "local-shell".to_string(),
+            source: SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: vec!["pi@dev:~/gh/yggterm$".to_string()],
+            rendered_sections: Vec::new(),
+            preview: SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: vec![SessionMetadataEntry {
+                label: "Cwd",
+                value: "/home/pi/gh/yggterm".to_string(),
+            }],
+            terminal_process_id: Some(41),
+            terminal_foreground_active: Some(false),
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(active_session_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(stale_active.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![snapshot_session_view_for_ui(stale_active)],
+        });
+        let fresh_live = ManagedSessionView {
+            id: "fresh-shell-id".to_string(),
+            session_path: active_session_path.to_string(),
+            title: "Fresh Shell".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "local-shell".to_string(),
+            source: SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: vec!["pi@dev:~/gh/yggterm$ sleep 8".to_string()],
+            rendered_sections: Vec::new(),
+            preview: SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: vec![SessionMetadataEntry {
+                label: "Cwd",
+                value: "/home/pi/gh/yggterm".to_string(),
+            }],
+            terminal_process_id: Some(42),
+            terminal_foreground_active: Some(true),
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+        let mut snapshot = ServerUiSnapshot {
+            active_session_path: Some(active_session_path.to_string()),
+            active_session: None,
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![snapshot_session_view_for_ui(fresh_live)],
+        };
+        preserve_client_focus_for_background_snapshot(&shell, &mut snapshot);
+        let active = snapshot
+            .active_session
+            .as_ref()
+            .expect("fresh live session should stay active after preserve");
+        assert_eq!(active.title, "Fresh Shell");
+        assert_eq!(active.terminal_foreground_active, Some(true));
+        assert_eq!(active.terminal_process_id, Some(42));
+    }
+    #[test]
+    fn apply_snapshot_result_without_request_clears_stale_server_busy_without_active_requests() {
+        let active_session_path = "local://test";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(
+            active_session_path,
+        ));
+        shell.server_busy = true;
+        shell.active_surface_requests.clear();
+        shell.busy_request_id = None;
+        shell.apply_daemon_snapshot_result(Ok((
+            ServerUiSnapshot {
+                active_session_path: Some(active_session_path.to_string()),
+                active_session: None,
+                active_view_mode: WorkspaceViewMode::Terminal,
+                remote_machines: Vec::new(),
+                ssh_targets: Vec::new(),
+                live_sessions: Vec::new(),
+            },
+            Some("snapshot applied".to_string()),
+        )));
+        assert!(!shell.server_busy);
+    }
+    #[test]
+    fn sidebar_busy_icon_prefers_live_active_summary_when_prompt_has_returned() {
+        let session_path = "local://test";
+        let session = ManagedSessionView {
+            id: "test".to_string(),
+            session_path: session_path.to_string(),
+            title: "Dev Yggterm".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "local-shell".to_string(),
+            source: SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: vec![
+                "pi@dev:~/gh/yggterm$ sleep 10".to_string(),
+                "working...".to_string(),
+            ],
+            rendered_sections: Vec::new(),
+            preview: SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: Vec::new(),
+            terminal_process_id: Some(123),
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+        let row = test_sidebar_row(session_path);
+        let snapshot = RenderSnapshot {
+            palette: palette(UiTheme::ZedLight),
+            search_query: String::new(),
+            search_active: false,
+            command_mode_active: false,
+            search_focused: false,
+            search_command_suggestions: Vec::new(),
+            search_sidebar_matches: Vec::new(),
+            search_sidebar_match_index: None,
+            search_content_hits: Vec::new(),
+            search_content_hit_index: None,
+            sidebar_loading: false,
+            preview_loading: false,
+            preview_failure: None,
+            terminal_loading: false,
+            metadata_loading: false,
+            sidebar_open: true,
+            right_panel_mode: RightPanelMode::Notifications,
+            rows: vec![row.clone()],
+            selected_path: Some(session_path.to_string()),
+            selected_row: Some(row.clone()),
+            active_session: Some(session.clone()),
+            active_session_path: Some(session_path.to_string()),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            retained_terminal_sessions: vec![session.clone()],
+            terminal_mount_epochs: HashMap::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![session],
+            total_leaf_sessions: 1,
+            last_action: String::new(),
+            ghostty_embedded_surface_supported: false,
+            ghostty_bridge_detail: String::new(),
+            server_daemon_detail: String::new(),
+            settings: AppSettings::default(),
+            install_context: InstallContext {
+                channel: yggterm_core::InstallChannel::Unknown,
+                update_policy: yggterm_core::UpdatePolicy::NotifyOnly,
+                repo: "test/repo".to_string(),
+                asset_label: "linux-aarch64".to_string(),
+                current_version: "0.0.0-test".to_string(),
+                executable_path: PathBuf::from("/tmp/yggterm-test"),
+                preferred_executable: None,
+                managed_root: None,
+                manager_hint: Some("test".to_string()),
+            },
+            maximized: false,
+            fullscreen: false,
+            always_on_top: false,
+            notifications: Vec::new(),
+            titlebar_new_menu_open: false,
+            titlebar_session_menu_open: false,
+            alt_overlay_active: false,
+            alt_overlay_sequence: String::new(),
+            selected_tree_paths: vec![session_path.to_string()],
+            context_menu_row: None,
+            context_menu_position: None,
+            preview_layout: PreviewLayoutMode::Chat,
+            server_busy: false,
+            show_loading_tree: false,
+            ssh_connect_target: String::new(),
+            ssh_connect_prefix: String::new(),
+            pending_update_restart: None,
+            last_terminal_debug: String::new(),
+            last_tree_debug: String::new(),
+            active_title: Some("Dev Yggterm".to_string()),
+            active_precis: None,
+            active_summary: Some("pi@dev:~/gh/yggterm$ >.".to_string()),
+            drag_paths: Vec::new(),
+            drag_hover_target: None,
+            optimistic_drag_paths: Vec::new(),
+            optimistic_drag_target: None,
+            drag_pointer: None,
+            pending_delete: None,
+            tree_rename_path: None,
+            tree_rename_value: String::new(),
+            theme_editor_open: false,
+            theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
+            theme_editor_selected_stop: None,
+            theme_accent: String::new(),
+            shell_tint: String::new(),
+            shell_gradient: String::new(),
+            optimistic_busy_paths: HashSet::new(),
+        };
+        assert!(!sidebar_row_shows_busy_icon(&snapshot, &row));
+    }
+    #[test]
+    fn sidebar_busy_icon_ignores_stale_inactive_live_sample_without_foreground_activity() {
+        let stale_session = ManagedSessionView {
+            id: "stale".to_string(),
+            session_path: "local://stale".to_string(),
+            title: "Stale Busy".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "local-shell".to_string(),
+            source: SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: vec!["pi@dev:~/gh/yggterm$ sleep 10".to_string()],
+            rendered_sections: Vec::new(),
+            preview: SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: Vec::new(),
+            terminal_process_id: Some(123),
+            terminal_foreground_active: Some(false),
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+        let active_session = ManagedSessionView {
+            id: "active".to_string(),
+            session_path: "local://active".to_string(),
+            title: "Active".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "local-shell".to_string(),
+            source: SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: vec!["pi@dev:~/gh/yggterm$".to_string()],
+            rendered_sections: Vec::new(),
+            preview: SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: Vec::new(),
+            terminal_process_id: Some(456),
+            terminal_foreground_active: Some(false),
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+        let row = test_sidebar_row("local://stale");
+        let snapshot = RenderSnapshot {
+            palette: palette(UiTheme::ZedLight),
+            search_query: String::new(),
+            search_active: false,
+            command_mode_active: false,
+            search_focused: false,
+            search_command_suggestions: Vec::new(),
+            search_sidebar_matches: Vec::new(),
+            search_sidebar_match_index: None,
+            search_content_hits: Vec::new(),
+            search_content_hit_index: None,
+            sidebar_loading: false,
+            preview_loading: false,
+            preview_failure: None,
+            terminal_loading: false,
+            metadata_loading: false,
+            sidebar_open: true,
+            right_panel_mode: RightPanelMode::Notifications,
+            rows: vec![row.clone()],
+            selected_path: Some("local://active".to_string()),
+            selected_row: Some(row.clone()),
+            active_session: Some(active_session.clone()),
+            active_session_path: Some(active_session.session_path.clone()),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            retained_terminal_sessions: vec![stale_session.clone(), active_session.clone()],
+            terminal_mount_epochs: HashMap::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![stale_session, active_session],
+            total_leaf_sessions: 2,
+            last_action: String::new(),
+            ghostty_embedded_surface_supported: false,
+            ghostty_bridge_detail: String::new(),
+            server_daemon_detail: String::new(),
+            settings: AppSettings::default(),
+            install_context: InstallContext {
+                channel: yggterm_core::InstallChannel::Unknown,
+                update_policy: yggterm_core::UpdatePolicy::NotifyOnly,
+                repo: "test/repo".to_string(),
+                asset_label: "linux-aarch64".to_string(),
+                current_version: "0.0.0-test".to_string(),
+                executable_path: PathBuf::from("/tmp/yggterm-test"),
+                preferred_executable: None,
+                managed_root: None,
+                manager_hint: Some("test".to_string()),
+            },
+            maximized: false,
+            fullscreen: false,
+            always_on_top: false,
+            notifications: Vec::new(),
+            titlebar_new_menu_open: false,
+            titlebar_session_menu_open: false,
+            alt_overlay_active: false,
+            alt_overlay_sequence: String::new(),
+            selected_tree_paths: vec!["local://active".to_string()],
+            context_menu_row: None,
+            context_menu_position: None,
+            preview_layout: PreviewLayoutMode::Chat,
+            server_busy: false,
+            show_loading_tree: false,
+            ssh_connect_target: String::new(),
+            ssh_connect_prefix: String::new(),
+            pending_update_restart: None,
+            last_terminal_debug: String::new(),
+            last_tree_debug: String::new(),
+            active_title: Some("Active".to_string()),
+            active_precis: None,
+            active_summary: Some("pi@dev:~/gh/yggterm$ >.".to_string()),
+            drag_paths: Vec::new(),
+            drag_hover_target: None,
+            optimistic_drag_paths: Vec::new(),
+            optimistic_drag_target: None,
+            drag_pointer: None,
+            pending_delete: None,
+            tree_rename_path: None,
+            tree_rename_value: String::new(),
+            theme_editor_open: false,
+            theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
+            theme_editor_selected_stop: None,
+            theme_accent: String::new(),
+            shell_tint: String::new(),
+            shell_gradient: String::new(),
+            optimistic_busy_paths: HashSet::new(),
+        };
+        assert!(!sidebar_row_shows_busy_icon(&snapshot, &row));
+    }
+    #[test]
+    fn sidebar_busy_icon_prefers_foreground_activity_over_stale_idle_summary() {
+        let active_session = ManagedSessionView {
+            id: "active".to_string(),
+            session_path: "local://active".to_string(),
+            title: "Active".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "local-shell".to_string(),
+            source: SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: vec!["pi@dev:~/gh/yggterm$ sleep 10".to_string()],
+            rendered_sections: Vec::new(),
+            preview: SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: Vec::new(),
+            terminal_process_id: Some(456),
+            terminal_foreground_active: Some(true),
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+        let row = test_sidebar_row("local://active");
+        let snapshot = RenderSnapshot {
+            palette: palette(UiTheme::ZedLight),
+            search_query: String::new(),
+            search_active: false,
+            command_mode_active: false,
+            search_focused: false,
+            search_command_suggestions: Vec::new(),
+            search_sidebar_matches: Vec::new(),
+            search_sidebar_match_index: None,
+            search_content_hits: Vec::new(),
+            search_content_hit_index: None,
+            sidebar_loading: false,
+            preview_loading: false,
+            preview_failure: None,
+            terminal_loading: false,
+            metadata_loading: false,
+            sidebar_open: true,
+            right_panel_mode: RightPanelMode::Notifications,
+            rows: vec![row.clone()],
+            selected_path: Some("local://active".to_string()),
+            selected_row: Some(row.clone()),
+            active_session: Some(active_session.clone()),
+            active_session_path: Some(active_session.session_path.clone()),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            retained_terminal_sessions: vec![active_session.clone()],
+            terminal_mount_epochs: HashMap::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![active_session],
+            total_leaf_sessions: 1,
+            last_action: String::new(),
+            ghostty_embedded_surface_supported: false,
+            ghostty_bridge_detail: String::new(),
+            server_daemon_detail: String::new(),
+            settings: AppSettings::default(),
+            install_context: InstallContext {
+                channel: yggterm_core::InstallChannel::Unknown,
+                update_policy: yggterm_core::UpdatePolicy::NotifyOnly,
+                repo: "test/repo".to_string(),
+                asset_label: "linux-aarch64".to_string(),
+                current_version: "0.0.0-test".to_string(),
+                executable_path: PathBuf::from("/tmp/yggterm-test"),
+                preferred_executable: None,
+                managed_root: None,
+                manager_hint: Some("test".to_string()),
+            },
+            maximized: false,
+            fullscreen: false,
+            always_on_top: false,
+            notifications: Vec::new(),
+            titlebar_new_menu_open: false,
+            titlebar_session_menu_open: false,
+            alt_overlay_active: false,
+            alt_overlay_sequence: String::new(),
+            selected_tree_paths: vec!["local://active".to_string()],
+            context_menu_row: None,
+            context_menu_position: None,
+            preview_layout: PreviewLayoutMode::Chat,
+            server_busy: false,
+            show_loading_tree: false,
+            ssh_connect_target: String::new(),
+            ssh_connect_prefix: String::new(),
+            pending_update_restart: None,
+            last_terminal_debug: String::new(),
+            last_tree_debug: String::new(),
+            active_title: Some("Active".to_string()),
+            active_precis: None,
+            active_summary: Some("pi@dev:~/gh/yggterm$ >.".to_string()),
+            drag_paths: Vec::new(),
+            drag_hover_target: None,
+            optimistic_drag_paths: Vec::new(),
+            optimistic_drag_target: None,
+            drag_pointer: None,
+            pending_delete: None,
+            tree_rename_path: None,
+            tree_rename_value: String::new(),
+            theme_editor_open: false,
+            theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
+            theme_editor_selected_stop: None,
+            theme_accent: String::new(),
+            shell_tint: String::new(),
+            shell_gradient: String::new(),
+            optimistic_busy_paths: HashSet::new(),
+        };
+        assert!(sidebar_row_shows_busy_icon(&snapshot, &row));
+    }
+    #[test]
+    fn sidebar_busy_icon_prefers_live_terminal_sample_over_stale_foreground_false() {
+        let active_session = ManagedSessionView {
+            id: "active".to_string(),
+            session_path: "local://active".to_string(),
+            title: "Active".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "local-shell".to_string(),
+            source: SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: vec!["sleep 10".to_string()],
+            rendered_sections: Vec::new(),
+            preview: SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: Vec::new(),
+            terminal_process_id: Some(456),
+            terminal_foreground_active: Some(false),
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+        let row = test_sidebar_row("local://active");
+        let snapshot = RenderSnapshot {
+            palette: palette(UiTheme::ZedLight),
+            search_query: String::new(),
+            search_active: false,
+            command_mode_active: false,
+            search_focused: false,
+            search_command_suggestions: Vec::new(),
+            search_sidebar_matches: Vec::new(),
+            search_sidebar_match_index: None,
+            search_content_hits: Vec::new(),
+            search_content_hit_index: None,
+            sidebar_loading: false,
+            preview_loading: false,
+            preview_failure: None,
+            terminal_loading: false,
+            metadata_loading: false,
+            sidebar_open: true,
+            right_panel_mode: RightPanelMode::Notifications,
+            rows: vec![row.clone()],
+            selected_path: Some("local://active".to_string()),
+            selected_row: Some(row.clone()),
+            active_session: Some(active_session.clone()),
+            active_session_path: Some(active_session.session_path.clone()),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            retained_terminal_sessions: vec![active_session.clone()],
+            terminal_mount_epochs: HashMap::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![active_session],
+            total_leaf_sessions: 1,
+            last_action: String::new(),
+            ghostty_embedded_surface_supported: false,
+            ghostty_bridge_detail: String::new(),
+            server_daemon_detail: String::new(),
+            settings: AppSettings::default(),
+            install_context: InstallContext {
+                channel: yggterm_core::InstallChannel::Unknown,
+                update_policy: yggterm_core::UpdatePolicy::NotifyOnly,
+                repo: "test/repo".to_string(),
+                asset_label: "linux-aarch64".to_string(),
+                current_version: "0.0.0-test".to_string(),
+                executable_path: PathBuf::from("/tmp/yggterm-test"),
+                preferred_executable: None,
+                managed_root: None,
+                manager_hint: Some("test".to_string()),
+            },
+            maximized: false,
+            fullscreen: false,
+            always_on_top: false,
+            notifications: Vec::new(),
+            titlebar_new_menu_open: false,
+            titlebar_session_menu_open: false,
+            alt_overlay_active: false,
+            alt_overlay_sequence: String::new(),
+            selected_tree_paths: vec!["local://active".to_string()],
+            context_menu_row: None,
+            context_menu_position: None,
+            preview_layout: PreviewLayoutMode::Chat,
+            server_busy: false,
+            show_loading_tree: false,
+            ssh_connect_target: String::new(),
+            ssh_connect_prefix: String::new(),
+            pending_update_restart: None,
+            last_terminal_debug: String::new(),
+            last_tree_debug: String::new(),
+            active_title: Some("Active".to_string()),
+            active_precis: None,
+            active_summary: Some("pi@dev:~/gh/yggterm$ >.".to_string()),
+            drag_paths: Vec::new(),
+            drag_hover_target: None,
+            optimistic_drag_paths: Vec::new(),
+            optimistic_drag_target: None,
+            drag_pointer: None,
+            pending_delete: None,
+            tree_rename_path: None,
+            tree_rename_value: String::new(),
+            theme_editor_open: false,
+            theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
+            theme_editor_selected_stop: None,
+            theme_accent: String::new(),
+            shell_tint: String::new(),
+            shell_gradient: String::new(),
+            optimistic_busy_paths: HashSet::new(),
+        };
+        assert!(!sidebar_row_shows_busy_icon(&snapshot, &row));
+    }
+    #[test]
+    fn sidebar_busy_icon_clears_stale_foreground_true_when_live_sample_returns_idle() {
+        let active_session = ManagedSessionView {
+            id: "active".to_string(),
+            session_path: "local://active".to_string(),
+            title: "Active".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "local-shell".to_string(),
+            source: SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: vec![
+                "pi@dev:~/gh/yggterm$ sleep 3".to_string(),
+                "pi@dev:~/gh/yggterm$".to_string(),
+            ],
+            rendered_sections: Vec::new(),
+            preview: SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: Vec::new(),
+            terminal_process_id: Some(456),
+            terminal_foreground_active: Some(true),
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+        let row = test_sidebar_row("local://active");
+        let snapshot = RenderSnapshot {
+            palette: palette(UiTheme::ZedLight),
+            search_query: String::new(),
+            search_active: false,
+            command_mode_active: false,
+            search_focused: false,
+            search_command_suggestions: Vec::new(),
+            search_sidebar_matches: Vec::new(),
+            search_sidebar_match_index: None,
+            search_content_hits: Vec::new(),
+            search_content_hit_index: None,
+            sidebar_loading: false,
+            preview_loading: false,
+            preview_failure: None,
+            terminal_loading: false,
+            metadata_loading: false,
+            sidebar_open: true,
+            right_panel_mode: RightPanelMode::Notifications,
+            rows: vec![row.clone()],
+            selected_path: Some("local://active".to_string()),
+            selected_row: Some(row.clone()),
+            active_session: Some(active_session.clone()),
+            active_session_path: Some(active_session.session_path.clone()),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            retained_terminal_sessions: vec![active_session.clone()],
+            terminal_mount_epochs: HashMap::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![active_session],
+            total_leaf_sessions: 1,
+            last_action: String::new(),
+            ghostty_embedded_surface_supported: false,
+            ghostty_bridge_detail: String::new(),
+            server_daemon_detail: String::new(),
+            settings: AppSettings::default(),
+            install_context: InstallContext {
+                channel: yggterm_core::InstallChannel::Unknown,
+                update_policy: yggterm_core::UpdatePolicy::NotifyOnly,
+                repo: "test/repo".to_string(),
+                asset_label: "linux-aarch64".to_string(),
+                current_version: "0.0.0-test".to_string(),
+                executable_path: PathBuf::from("/tmp/yggterm-test"),
+                preferred_executable: None,
+                managed_root: None,
+                manager_hint: Some("test".to_string()),
+            },
+            maximized: false,
+            fullscreen: false,
+            always_on_top: false,
+            notifications: Vec::new(),
+            titlebar_new_menu_open: false,
+            titlebar_session_menu_open: false,
+            alt_overlay_active: false,
+            alt_overlay_sequence: String::new(),
+            selected_tree_paths: vec!["local://active".to_string()],
+            context_menu_row: None,
+            context_menu_position: None,
+            preview_layout: PreviewLayoutMode::Chat,
+            server_busy: false,
+            show_loading_tree: false,
+            ssh_connect_target: String::new(),
+            ssh_connect_prefix: String::new(),
+            pending_update_restart: None,
+            last_terminal_debug: String::new(),
+            last_tree_debug: String::new(),
+            active_title: Some("Active".to_string()),
+            active_precis: None,
+            active_summary: Some("pi@dev:~/gh/yggterm$ >.".to_string()),
+            drag_paths: Vec::new(),
+            drag_hover_target: None,
+            optimistic_drag_paths: Vec::new(),
+            optimistic_drag_target: None,
+            drag_pointer: None,
+            pending_delete: None,
+            tree_rename_path: None,
+            tree_rename_value: String::new(),
+            theme_editor_open: false,
+            theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
+            theme_editor_selected_stop: None,
+            theme_accent: String::new(),
+            shell_tint: String::new(),
+            shell_gradient: String::new(),
+            optimistic_busy_paths: HashSet::new(),
+        };
+        assert!(!sidebar_row_shows_busy_icon(&snapshot, &row));
+    }
+    #[test]
+    fn terminal_initial_read_error_retries_before_attach_for_socket_connect_errors() {
+        let error = anyhow::anyhow!("connecting to /tmp/yggterm.sock");
+        assert!(should_retry_terminal_initial_read_error(false, 0, &error));
+        assert!(should_retry_terminal_initial_read_error(false, 3, &error));
+        assert!(!should_retry_terminal_initial_read_error(false, 4, &error));
+    }
+    #[test]
+    fn terminal_initial_read_error_does_not_retry_after_attach() {
+        let error = anyhow::anyhow!("connecting to /tmp/yggterm.sock");
+        assert!(!should_retry_terminal_initial_read_error(true, 0, &error));
+    }
     #[test]
     fn terminal_bootstrap_waits_for_initial_active_terminal_epoch_sync() {
         assert!(terminal_bootstrap_should_wait_for_mount_epoch_sync(
@@ -33166,7 +34288,6 @@ Waiting for the remote terminal to paint...\n";
             0,
         ));
     }
-
     #[test]
     fn terminal_bootstrap_does_not_wait_after_epoch_sync() {
         assert!(!terminal_bootstrap_should_wait_for_mount_epoch_sync(
@@ -33184,7 +34305,6 @@ Waiting for the remote terminal to paint...\n";
             1,
         ));
     }
-
     #[test]
     fn terminal_bootstrap_does_not_wait_for_inactive_or_non_terminal_session() {
         assert!(!terminal_bootstrap_should_wait_for_mount_epoch_sync(
@@ -33202,7 +34322,6 @@ Waiting for the remote terminal to paint...\n";
             0,
         ));
     }
-
     #[test]
     fn terminal_chunk_detects_low_signal_terminal_noise() {
         assert!(terminal_chunk_is_low_signal_terminal_noise(
@@ -33215,7 +34334,6 @@ Waiting for the remote terminal to paint...\n";
             "Smoke test passed.\nHTTP 200 OK\n"
         ));
     }
-
     #[test]
     fn terminal_resume_output_excerpt_rejects_low_signal_terminal_noise() {
         assert_eq!(
@@ -33223,7 +34341,6 @@ Waiting for the remote terminal to paint...\n";
             None
         );
     }
-
     #[test]
     fn batch_terminal_chunks_strips_low_signal_terminal_noise_lines() {
         let (combined, saw_visible_output, saw_meaningful_output, _, _, _, _) =
@@ -33246,7 +34363,6 @@ Waiting for the remote terminal to paint...\n";
         assert!(saw_visible_output);
         assert!(!saw_meaningful_output);
     }
-
     #[test]
     fn remote_resume_agent_session_excludes_plain_remote_shells() {
         let mut session = ManagedSessionView {
@@ -33270,6 +34386,7 @@ Waiting for the remote terminal to paint...\n";
             },
             metadata: Vec::new(),
             terminal_process_id: None,
+            terminal_foreground_active: None,
             terminal_window_id: None,
             terminal_host_token: None,
             terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
@@ -33281,12 +34398,10 @@ Waiting for the remote terminal to paint...\n";
             ssh_prefix: None,
             stored_preview_hydrated: false,
         };
-
         assert!(is_remote_resume_agent_session(&session));
         session.source = SessionSource::Stored;
         assert!(!is_remote_resume_agent_session(&session));
     }
-
     #[test]
     fn remote_resume_overlay_excerpt_prefers_preview_context() {
         let session = ManagedSessionView {
@@ -33318,6 +34433,7 @@ Waiting for the remote terminal to paint...\n";
             },
             metadata: Vec::new(),
             terminal_process_id: None,
+            terminal_foreground_active: None,
             terminal_window_id: None,
             terminal_host_token: None,
             terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
@@ -33329,13 +34445,11 @@ Waiting for the remote terminal to paint...\n";
             ssh_prefix: None,
             stored_preview_hydrated: true,
         };
-
         assert_eq!(
             remote_resume_overlay_excerpt(&session).as_deref(),
             Some("I will inspect the wireless logs and hostapd state first.")
         );
     }
-
     #[test]
     fn remote_resume_overlay_excerpt_ignores_rooted_summary_copy() {
         let session = ManagedSessionView {
@@ -33362,6 +34476,7 @@ Waiting for the remote terminal to paint...\n";
             },
             metadata: Vec::new(),
             terminal_process_id: None,
+            terminal_foreground_active: None,
             terminal_window_id: None,
             terminal_host_token: None,
             terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
@@ -33373,10 +34488,8 @@ Waiting for the remote terminal to paint...\n";
             ssh_prefix: None,
             stored_preview_hydrated: false,
         };
-
         assert_eq!(remote_resume_overlay_excerpt(&session), None);
     }
-
     #[test]
     fn remote_resume_overlay_seed_excerpt_uses_terminal_precis_when_preview_is_empty() {
         let session = ManagedSessionView {
@@ -33409,6 +34522,7 @@ Waiting for the remote terminal to paint...\n";
             },
             metadata: Vec::new(),
             terminal_process_id: None,
+            terminal_foreground_active: None,
             terminal_window_id: None,
             terminal_host_token: None,
             terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
@@ -33420,7 +34534,6 @@ Waiting for the remote terminal to paint...\n";
             ssh_prefix: None,
             stored_preview_hydrated: false,
         };
-
         assert_eq!(
             remote_resume_overlay_seed_excerpt(&session).as_deref(),
             Some(
@@ -33434,7 +34547,6 @@ Waiting for the remote terminal to paint...\n";
             )
         );
     }
-
     #[test]
     fn terminal_resume_output_excerpt_strips_saved_transcript_boilerplate() {
         let data = "\
@@ -33445,7 +34557,6 @@ The machine has ip 192.168.0.144 but I can ssh from 192.168.0.138.\r\n\
 \r\n\
 ASSISTANT · Nov 30, 2025\r\n\
 I will inspect the wireless logs next.\r\n";
-
         assert_eq!(
             terminal_resume_output_excerpt(data).as_deref(),
             Some(
@@ -33453,7 +34564,6 @@ I will inspect the wireless logs next.\r\n";
             )
         );
     }
-
     #[test]
     fn terminal_resume_output_excerpt_rejects_generic_codex_idle() {
         let data = "\
@@ -33463,71 +34573,60 @@ directory: ~\n\
 \n\
 Run /review on my current changes\n\
 gpt-5.4 high · 100% left · ~\n";
-
         assert_eq!(terminal_resume_output_excerpt(data), None);
         assert!(!terminal_resume_excerpt_is_meaningful(data));
     }
-
     #[test]
     fn terminal_chunk_is_transcript_browser_for_resume_picker() {
         let data = "\
 Resume a previous session  Sort: Updated at\n\
 Updated at   Branch  Conversation\n\
 1 day ago feature-x Investigate remote preview hydration\n";
-
         assert!(terminal_chunk_is_transcript_browser(data));
         assert!(!terminal_chunk_has_meaningful_output(data));
     }
-
     #[test]
     fn remote_resume_surface_connected_rejects_generic_idle_surface() {
         assert!(!remote_resume_surface_connected(
             false, true, false, false, true, false, false,
         ));
     }
-
     #[test]
     fn remote_resume_surface_connected_accepts_meaningful_codex_surface_with_prompt() {
         assert!(remote_resume_surface_connected(
             true, true, false, false, false, false, false,
         ));
     }
-
     #[test]
     fn remote_resume_surface_connected_rejects_attach_ready_marker_without_visible_surface() {
         assert!(!remote_resume_surface_connected(
             false, false, true, false, false, false, false,
         ));
     }
-
     #[test]
     fn remote_resume_surface_connected_accepts_attach_ready_marker_with_visible_surface() {
         assert!(remote_resume_surface_connected(
             false, true, true, false, false, false, false,
         ));
     }
-
     #[test]
     fn remote_resume_surface_connected_rejects_prompt_only_surface() {
         assert!(!remote_resume_surface_connected(
             false, true, false, false, false, false, true,
         ));
     }
-
     #[test]
     fn stale_remote_resume_retry_blank_surface_recovers_previous_ready_session() {
         assert!(stale_remote_resume_retry_blank_surface_should_recover(
             true, true, true, true, false, "", "", 43, 42, true,
         ));
     }
-
     #[test]
     fn stale_remote_resume_retry_blank_surface_ignores_initial_blank_attach() {
         assert!(!stale_remote_resume_retry_blank_surface_should_recover(
             true, false, true, true, false, "", "", 43, 42, true,
         ));
     }
-
     #[test]
     fn remote_resume_attach_confirmation_accepts_stable_one_shot_meaningful_output() {
         assert!(remote_resume_attach_confirmation_satisfied(
@@ -33547,7 +34646,6 @@ Updated at   Branch  Conversation\n\
             true,
         ));
     }
-
     #[test]
     fn remote_resume_attach_confirmation_rejects_attach_ready_without_post_attach_content() {
         assert!(!remote_resume_attach_confirmation_satisfied(
@@ -33555,7 +34653,6 @@ Updated at   Branch  Conversation\n\
             false,
         ));
     }
-
     #[test]
     fn remote_resume_attach_confirmation_rejects_connected_grace_without_runtime() {
         assert!(!remote_resume_attach_confirmation_satisfied(
@@ -33575,7 +34672,6 @@ Updated at   Branch  Conversation\n\
             true,
         ));
     }
-
     #[test]
     fn append_terminal_resume_replay_buffer_keeps_recent_tail() {
         let mut buffer = String::new();
@@ -33584,7 +34680,6 @@ Updated at   Branch  Conversation\n\
         append_terminal_resume_replay_buffer(&mut buffer, "gh", 4);
         assert_eq!(buffer, "efgh");
     }
-
     #[test]
     fn suppress_resume_output_rejects_prompt_only_or_idle_without_meaningful_context() {
         assert!(should_suppress_remote_resume_surface_output(
@@ -33600,28 +34695,24 @@ Updated at   Branch  Conversation\n\
             true, false, false, false, false, false, false, false, false, true,
         ));
     }
-
     #[test]
     fn suppress_resume_output_allows_meaningful_transcript_with_idle_tail() {
         assert!(!should_suppress_remote_resume_surface_output(
             true, false, false, true, false, false, true, false, false, false,
         ));
     }
-
     #[test]
     fn terminal_chunk_requires_terminal_emulator_forward_for_control_only_handshake() {
         assert!(terminal_chunk_requires_terminal_emulator_forward(
             "\u{1b}[?2004h\u{1b}[>7u\u{1b}[?1004h\u{1b}[6n"
         ));
     }
-
     #[test]
     fn terminal_chunk_requires_terminal_emulator_forward_rejects_visible_error_text() {
         assert!(!terminal_chunk_requires_terminal_emulator_forward(
             "Shared connection to 192.168.0.133 closed.\n"
         ));
     }
-
     #[test]
     fn terminal_resume_notification_visibility_requires_active_terminal_session() {
         assert!(terminal_resume_notification_should_be_visible(
@@ -33640,7 +34731,6 @@ Updated at   Branch  Conversation\n\
             "remote-session://oc/test",
         ));
     }
-
     #[test]
     fn terminal_resume_notification_job_key_round_trips_session_path() {
         let job_key = terminal_resume_notification_job_key("remote-session://oc/test");
@@ -33653,7 +34743,6 @@ Updated at   Branch  Conversation\n\
             None
         );
     }
-
     #[test]
     fn terminal_resume_notification_stays_visible_until_visual_reveal_completes() {
         assert!(terminal_resume_notification_should_stay_visible_for_session(true, false, false));
@@ -33662,7 +34751,6 @@ Updated at   Branch  Conversation\n\
         assert!(!terminal_resume_notification_should_stay_visible_for_session(false, true, false));
     }
 }
-
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn interface_font_family() -> &'static str {
     "system-ui, sans-serif"
