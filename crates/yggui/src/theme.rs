@@ -1,29 +1,40 @@
 use yggui_contract::{UiTheme, YgguiThemeColorStop, YgguiThemeSpec};
 
 pub const MAX_THEME_STOPS: usize = 6;
+const MAX_RENDER_THEME_STOPS: usize = 4;
+const MIN_STOP_INSET: f32 = 0.08;
+const MAX_STOP_INSET: f32 = 0.92;
+const MIN_STOP_ALPHA: f32 = 0.28;
+const MAX_STOP_ALPHA: f32 = 0.86;
+const MIN_THEME_BRIGHTNESS: f32 = 0.38;
+const MAX_THEME_BRIGHTNESS: f32 = 0.72;
+const MAX_THEME_GRAIN: f32 = 0.24;
+const FALLBACK_COLOR: &str = "#7cc8ff";
 pub const THEME_EDITOR_SWATCHES: [&str; 8] = [
-    "#7cc8ff", "#b78dff", "#f5c0d9", "#f38f7e", "#f0c454", "#67d7a3", "#8fa7d4", "#f8f8f8",
+    "#7cc8ff", "#b8a1ff", "#efc6dc", "#e3a08f", "#e8c16d", "#7acfb0", "#9caed8", "#dfe8ef",
 ];
 
 pub fn clamp_theme_spec(spec: &YgguiThemeSpec) -> YgguiThemeSpec {
     let mut next = spec.clone();
-    next.brightness = next.brightness.clamp(0.0, 1.0);
-    next.grain = next.grain.clamp(0.0, 1.0);
+    next.brightness = next
+        .brightness
+        .clamp(MIN_THEME_BRIGHTNESS, MAX_THEME_BRIGHTNESS);
+    next.grain = next.grain.clamp(0.0, MAX_THEME_GRAIN);
     next.colors = next
         .colors
         .iter()
         .take(MAX_THEME_STOPS)
         .cloned()
         .map(|mut stop| {
-            stop.x = stop.x.clamp(0.0, 1.0);
-            stop.y = stop.y.clamp(0.0, 1.0);
-            stop.alpha = stop.alpha.clamp(0.12, 1.0);
-            if !looks_like_hex_color(&stop.color) {
-                stop.color = "#7cc8ff".to_string();
-            }
+            stop.x = stop.x.clamp(MIN_STOP_INSET, MAX_STOP_INSET);
+            stop.y = stop.y.clamp(MIN_STOP_INSET, MAX_STOP_INSET);
+            stop.alpha = stop.alpha.clamp(MIN_STOP_ALPHA, MAX_STOP_ALPHA);
+            stop.color =
+                normalize_hex_color(&stop.color).unwrap_or_else(|| FALLBACK_COLOR.to_string());
             stop
         })
         .collect();
+    rebalance_stop_positions(&mut next.colors);
     next
 }
 
@@ -31,22 +42,22 @@ pub fn default_theme_editor_spec() -> YgguiThemeSpec {
     YgguiThemeSpec {
         colors: vec![
             YgguiThemeColorStop {
-                color: "#7cc8ff".to_string(),
+                color: normalize_hex_color("#7cc8ff").unwrap_or_else(|| FALLBACK_COLOR.to_string()),
                 x: 0.18,
                 y: 0.24,
-                alpha: 0.86,
+                alpha: 0.74,
             },
             YgguiThemeColorStop {
-                color: "#67d7a3".to_string(),
+                color: normalize_hex_color("#67d7a3").unwrap_or_else(|| "#7acfb0".to_string()),
                 x: 0.64,
                 y: 0.34,
-                alpha: 0.78,
+                alpha: 0.66,
             },
             YgguiThemeColorStop {
-                color: "#d7e3ee".to_string(),
+                color: normalize_hex_color("#d7e3ee").unwrap_or_else(|| "#dfe8ef".to_string()),
                 x: 0.82,
                 y: 0.76,
-                alpha: 0.62,
+                alpha: 0.48,
             },
         ],
         brightness: 0.56,
@@ -67,7 +78,7 @@ pub fn append_theme_stop(spec: &YgguiThemeSpec, color: Option<&str>) -> YgguiThe
         color: swatch,
         x: (0.2 + spread * 0.16).clamp(0.12, 0.88),
         y: (0.24 + spread * 0.14).clamp(0.12, 0.88),
-        alpha: 0.82,
+        alpha: 0.68,
     });
     clamp_theme_spec(&next)
 }
@@ -80,10 +91,12 @@ pub fn gradient_css(theme: UiTheme, spec: &YgguiThemeSpec) -> String {
     let mut layers = spec
         .colors
         .iter()
-        .map(|stop| {
-            let rgba = color_with_alpha(&stop.color, stop.alpha * (0.42 + spec.brightness * 0.58));
+        .take(MAX_RENDER_THEME_STOPS)
+        .enumerate()
+        .map(|(index, stop)| {
+            let rgba = rendered_stop_rgba(theme, stop, spec.brightness, index);
             format!(
-                "radial-gradient(circle at {:.0}% {:.0}%, {} 0%, transparent 42%)",
+                "radial-gradient(circle at {:.0}% {:.0}%, {} 0%, transparent 46%)",
                 stop.x * 100.0,
                 stop.y * 100.0,
                 rgba
@@ -119,7 +132,9 @@ pub fn dominant_accent(spec: &YgguiThemeSpec, fallback: &'static str) -> String 
         .colors
         .first()
         .map(|stop| stop.color.clone())
-        .unwrap_or_else(|| fallback.to_string())
+        .unwrap_or_else(|| {
+            normalize_hex_color(fallback).unwrap_or_else(|| FALLBACK_COLOR.to_string())
+        })
 }
 
 fn default_gradient(theme: UiTheme) -> &'static str {
@@ -165,9 +180,125 @@ fn grain_layer(theme: UiTheme, grain: f32) -> String {
     }
 }
 
-fn color_with_alpha(hex: &str, alpha: f32) -> String {
-    let (r, g, b) = hex_to_rgb(hex).unwrap_or((124, 200, 255));
-    format!("rgba({r}, {g}, {b}, {:.3})", alpha.clamp(0.0, 1.0))
+fn rendered_stop_rgba(
+    theme: UiTheme,
+    stop: &YgguiThemeColorStop,
+    brightness: f32,
+    index: usize,
+) -> String {
+    let color = normalize_hex_color(&stop.color).unwrap_or_else(|| FALLBACK_COLOR.to_string());
+    let rgb = hex_to_rgb(&color).unwrap_or((124, 200, 255));
+    let anchor = match theme {
+        UiTheme::ZedLight => (234, 241, 246),
+        UiTheme::ZedDark => (96, 122, 130),
+    };
+    let softened = mix_rgb(
+        rgb,
+        anchor,
+        match theme {
+            UiTheme::ZedLight => 0.28,
+            UiTheme::ZedDark => 0.34,
+        },
+    );
+    let polished = match theme {
+        UiTheme::ZedLight => mix_rgb(softened, (255, 255, 255), 0.10 + brightness * 0.08),
+        UiTheme::ZedDark => mix_rgb(softened, (230, 240, 248), 0.06 + brightness * 0.05),
+    };
+    let layer_alpha =
+        (stop.alpha * (0.30 + brightness * 0.28) + 0.10 - index as f32 * 0.04).clamp(0.16, 0.54);
+    format!(
+        "rgba({}, {}, {}, {:.3})",
+        polished.0, polished.1, polished.2, layer_alpha
+    )
+}
+
+fn rebalance_stop_positions(stops: &mut [YgguiThemeColorStop]) {
+    for index in 0..stops.len() {
+        let (head, tail) = stops.split_at_mut(index + 1);
+        let current = &head[index];
+        for (offset, other) in tail.iter_mut().enumerate() {
+            let dx = other.x - current.x;
+            let dy = other.y - current.y;
+            let distance = (dx * dx + dy * dy).sqrt();
+            if distance >= 0.15 {
+                continue;
+            }
+            let angle = ((index + offset + 1) as f32) * 0.78;
+            let nudge = 0.17 - distance;
+            other.x = (other.x + angle.cos() * nudge).clamp(MIN_STOP_INSET, MAX_STOP_INSET);
+            other.y = (other.y + angle.sin() * nudge).clamp(MIN_STOP_INSET, MAX_STOP_INSET);
+        }
+    }
+}
+
+fn normalize_hex_color(value: &str) -> Option<String> {
+    let rgb = hex_to_rgb(value)?;
+    let (h, s, l) = rgb_to_hsl(rgb);
+    let (safe_s, safe_l) = if s < 0.12 {
+        (s.clamp(0.04, 0.18), l.clamp(0.78, 0.92))
+    } else {
+        (s.clamp(0.26, 0.72), l.clamp(0.60, 0.82))
+    };
+    let (r, g, b) = hsl_to_rgb(h, safe_s, safe_l);
+    Some(rgb_to_hex((r, g, b)))
+}
+
+fn rgb_to_hsl((r, g, b): (u8, u8, u8)) -> (f32, f32, f32) {
+    let r = r as f32 / 255.0;
+    let g = g as f32 / 255.0;
+    let b = b as f32 / 255.0;
+    let max = r.max(g.max(b));
+    let min = r.min(g.min(b));
+    let lightness = (max + min) / 2.0;
+    if (max - min).abs() < f32::EPSILON {
+        return (0.0, 0.0, lightness);
+    }
+    let delta = max - min;
+    let saturation = delta / (1.0 - (2.0 * lightness - 1.0).abs());
+    let hue = if (max - r).abs() < f32::EPSILON {
+        60.0 * (((g - b) / delta).rem_euclid(6.0))
+    } else if (max - g).abs() < f32::EPSILON {
+        60.0 * (((b - r) / delta) + 2.0)
+    } else {
+        60.0 * (((r - g) / delta) + 4.0)
+    };
+    (hue, saturation, lightness)
+}
+
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
+    if s <= f32::EPSILON {
+        let grey = (l * 255.0).round() as u8;
+        return (grey, grey, grey);
+    }
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - (((h / 60.0).rem_euclid(2.0)) - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r1, g1, b1) = match h {
+        h if (0.0..60.0).contains(&h) => (c, x, 0.0),
+        h if (60.0..120.0).contains(&h) => (x, c, 0.0),
+        h if (120.0..180.0).contains(&h) => (0.0, c, x),
+        h if (180.0..240.0).contains(&h) => (0.0, x, c),
+        h if (240.0..300.0).contains(&h) => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    (
+        ((r1 + m) * 255.0).round() as u8,
+        ((g1 + m) * 255.0).round() as u8,
+        ((b1 + m) * 255.0).round() as u8,
+    )
+}
+
+fn rgb_to_hex((r, g, b): (u8, u8, u8)) -> String {
+    format!("#{r:02x}{g:02x}{b:02x}")
+}
+
+fn mix_rgb(left: (u8, u8, u8), right: (u8, u8, u8), right_weight: f32) -> (u8, u8, u8) {
+    let left_weight = 1.0 - right_weight.clamp(0.0, 1.0);
+    (
+        (left.0 as f32 * left_weight + right.0 as f32 * right_weight).round() as u8,
+        (left.1 as f32 * left_weight + right.1 as f32 * right_weight).round() as u8,
+        (left.2 as f32 * left_weight + right.2 as f32 * right_weight).round() as u8,
+    )
 }
 
 fn looks_like_hex_color(value: &str) -> bool {
@@ -186,4 +317,54 @@ fn hex_to_rgb(value: &str) -> Option<(u8, u8, u8)> {
         u8::from_str_radix(&value[3..5], 16).ok()?,
         u8::from_str_radix(&value[5..7], 16).ok()?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_theme_spec_pastelizes_extreme_colors() {
+        let spec = YgguiThemeSpec {
+            colors: vec![YgguiThemeColorStop {
+                color: "#ff0000".to_string(),
+                x: 0.01,
+                y: 1.2,
+                alpha: 1.0,
+            }],
+            brightness: 1.0,
+            grain: 0.8,
+        };
+        let clamped = clamp_theme_spec(&spec);
+        assert_eq!(clamped.brightness, MAX_THEME_BRIGHTNESS);
+        assert_eq!(clamped.grain, MAX_THEME_GRAIN);
+        assert_eq!(clamped.colors[0].color, "#e25050");
+        assert!((MIN_STOP_INSET..=MAX_STOP_INSET).contains(&clamped.colors[0].x));
+        assert!((MIN_STOP_INSET..=MAX_STOP_INSET).contains(&clamped.colors[0].y));
+    }
+
+    #[test]
+    fn gradient_css_uses_limited_render_stops() {
+        let mut spec = default_theme_editor_spec();
+        for _ in 0..4 {
+            spec = append_theme_stop(&spec, Some("#7cc8ff"));
+        }
+        let gradient = gradient_css(UiTheme::ZedDark, &spec);
+        assert_eq!(
+            gradient.matches("radial-gradient(circle at").count(),
+            MAX_RENDER_THEME_STOPS
+        );
+    }
+
+    #[test]
+    fn dominant_accent_uses_normalized_color() {
+        let spec = YgguiThemeSpec {
+            colors: vec![YgguiThemeColorStop {
+                color: "#00ff00".to_string(),
+                ..YgguiThemeColorStop::default()
+            }],
+            ..YgguiThemeSpec::default()
+        };
+        assert_eq!(dominant_accent(&spec, "#ff00ff"), "#50e250");
+    }
 }
