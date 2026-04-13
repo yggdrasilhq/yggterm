@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -8,6 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "target" / "debug" / "yggterm"
+ENV = os.environ.copy()
 
 
 def run(*args: str, check: bool = True) -> dict:
@@ -16,6 +18,7 @@ def run(*args: str, check: bool = True) -> dict:
         cwd=ROOT,
         text=True,
         capture_output=True,
+        env=ENV,
     )
     if check and proc.returncode != 0:
         raise AssertionError(
@@ -27,6 +30,62 @@ def run(*args: str, check: bool = True) -> dict:
 
 def app_state(pid: int) -> dict:
     return run("server", "app", "state", "--pid", str(pid), "--timeout-ms", "8000")["data"]
+
+
+def terminal_send(pid: int, session: str, data: str) -> dict:
+    return run(
+        "server",
+        "app",
+        "terminal",
+        "send",
+        "--pid",
+        str(pid),
+        session,
+        "--data",
+        data,
+        "--timeout-ms",
+        "15000",
+    )
+
+
+def terminal_probe_type(
+    pid: int,
+    session: str,
+    data: str,
+    *,
+    mode: str = "xterm",
+    press_enter: bool = False,
+    press_tab: bool = False,
+    press_ctrl_c: bool = False,
+    press_ctrl_e: bool = False,
+    press_ctrl_u: bool = False,
+) -> dict:
+    args = [
+        "server",
+        "app",
+        "terminal",
+        "probe-type",
+        "--pid",
+        str(pid),
+        session,
+        "--data",
+        data,
+        "--mode",
+        mode,
+        "--timeout-ms",
+        "15000",
+    ]
+    if press_enter:
+        args.append("--enter")
+    if press_tab:
+        args.append("--tab")
+    if press_ctrl_c:
+        args.append("--ctrl-c")
+    if press_ctrl_e:
+        args.append("--ctrl-e")
+    if press_ctrl_u:
+        args.append("--ctrl-u")
+    return run(*args)
 
 
 def app_open(pid: int, session: str, view: str = "terminal") -> dict:
@@ -80,6 +139,47 @@ def unwrap_data(payload: dict) -> dict:
     if isinstance(data, dict):
         return data
     return payload
+
+
+def server_snapshot() -> dict:
+    return unwrap_data(run("server", "snapshot"))
+
+
+def normalize_live_path(path: str) -> str:
+    if "://" in path or "::" not in path:
+        return path
+    prefix, suffix = path.split("::", 1)
+    return f"{prefix}://{suffix}"
+
+
+def find_snapshot_session(snapshot: dict, session: str) -> dict | None:
+    normalized_session = normalize_live_path(session)
+
+    def matches(candidate: dict, key: str | None = None) -> bool:
+        candidates = {
+            normalize_live_path(str(key or "")),
+            normalize_live_path(str(candidate.get("session_path") or "")),
+            normalize_live_path(str(candidate.get("path") or "")),
+        }
+        return normalized_session in candidates
+
+    sessions = snapshot.get("sessions") or {}
+    if isinstance(sessions, dict):
+        for key, value in sessions.items():
+            if isinstance(value, dict) and matches(value, str(key)):
+                return value
+
+    active_session = snapshot.get("active_session") or {}
+    if isinstance(active_session, dict) and matches(active_session, snapshot.get("active_session_path")):
+        return active_session
+
+    live_sessions = snapshot.get("live_sessions") or []
+    if isinstance(live_sessions, list):
+        for entry in live_sessions:
+            if isinstance(entry, dict) and matches(entry):
+                return entry
+
+    return None
 
 
 def probe_select(pid: int, session: str) -> dict:
@@ -266,10 +366,10 @@ def terminal_hosts(state: dict) -> list[dict]:
     return []
 
 
-def active_host(state: dict) -> dict:
+def active_host_or_none(state: dict) -> dict | None:
     hosts = terminal_hosts(state)
     if not hosts:
-        raise AssertionError("no terminal host found in app state")
+        return None
     active_session_path = state.get("active_session_path")
     explicit_matches = [host for host in hosts if host.get("is_active_session_host") is True]
     if explicit_matches:
@@ -295,13 +395,23 @@ def active_host(state: dict) -> dict:
     return hosts[-1]
 
 
+def active_host(state: dict) -> dict:
+    host = active_host_or_none(state)
+    if host is None:
+        raise AssertionError("no terminal host found in app state")
+    return host
+
+
 def wait_for_interactive(pid: int, timeout_seconds: float = 20.0) -> dict:
     deadline = time.time() + timeout_seconds
     last_state = {}
     while time.time() < deadline:
         last_state = app_state(pid)
         viewport = last_state.get("viewport") or {}
-        host = active_host(last_state)
+        host = active_host_or_none(last_state)
+        if host is None:
+            time.sleep(0.25)
+            continue
         if (
             viewport.get("ready") is True
             and viewport.get("interactive") is True
@@ -519,14 +629,29 @@ def assert_text_readability(state: dict) -> dict:
 def assert_renderer_contract(state: dict) -> dict:
     host = active_host(state)
     canvas_count = int(host.get("canvas_count") or 0)
-    renderer_mode = str(host.get("xterm_renderer_mode") or "")
-    if canvas_count <= 0:
+    renderer_mode = str(host.get("xterm_renderer_mode") or "").strip().lower() or "unknown"
+    screen_rect = host.get("screen_rect") or host.get("viewport_rect") or host.get("host_rect") or {}
+    if renderer_mode not in {"canvas", "dom"}:
         raise AssertionError(
-            f"xterm did not mount the canvas renderer: canvas_count={canvas_count} renderer_mode={renderer_mode!r}"
+            f"xterm mounted an unsupported renderer: renderer_mode={renderer_mode!r} canvas_count={canvas_count}"
+        )
+    if renderer_mode == "canvas" and canvas_count <= 0:
+        raise AssertionError(
+            f"xterm reported canvas renderer without canvas nodes: canvas_count={canvas_count}"
+        )
+    if not str(host.get("text_sample") or "").strip():
+        raise AssertionError(
+            f"xterm renderer mounted without visible terminal text: renderer_mode={renderer_mode!r}"
+        )
+    if int(screen_rect.get("width") or 0) < 280 or int(screen_rect.get("height") or 0) < 140:
+        raise AssertionError(
+            f"xterm renderer surface is too small: renderer_mode={renderer_mode!r} screen_rect={screen_rect!r}"
         )
     return {
         "canvas_count": canvas_count,
-        "renderer_mode": renderer_mode or "canvas",
+        "renderer_mode": renderer_mode,
+        "screen_rect": screen_rect,
+        "text_sample": str(host.get("text_sample") or "")[:160],
     }
 
 
@@ -558,6 +683,179 @@ def assert_local_tree_placement(pid: int, session: str) -> dict:
     raise AssertionError(
         f"session only appears under Live Sessions instead of the local tree: {matches!r}"
     )
+
+
+
+def sidebar_dom_row(state: dict, session: str) -> dict | None:
+    dom_rows = ((state.get("dom") or {}).get("sidebar_visible_rows") or [])
+    return next(
+        (
+            row
+            for row in dom_rows
+            if str(row.get("path") or "") == session
+        ),
+        None,
+    )
+
+
+def assert_busy_icon_lifecycle(pid: int, session: str, *, sleep_seconds: int = 3) -> dict:
+    launch = unwrap_data(terminal_send(pid, session, f"sleep {sleep_seconds}\r"))
+    if not bool(launch.get("accepted")):
+        raise AssertionError(f"terminal send rejected busy lifecycle probe: {launch}")
+
+    busy_row = None
+    busy_deadline = time.time() + 4.0
+    while time.time() < busy_deadline:
+        state = app_state(pid)
+        row = sidebar_dom_row(state, session)
+        if row and str(row.get("icon_kind") or "") == "busy":
+            busy_row = row
+            break
+        time.sleep(0.2)
+    if busy_row is None:
+        raise AssertionError("local terminal never entered the busy icon state during a foreground command")
+
+    idle_row = None
+    idle_deadline = time.time() + max(10.0, sleep_seconds + 8.0)
+    while time.time() < idle_deadline:
+        state = app_state(pid)
+        row = sidebar_dom_row(state, session)
+        if row and not bool(row.get("busy")) and str(row.get("icon_kind") or "") == "plain-terminal":
+            idle_row = row
+            break
+        time.sleep(0.25)
+    if idle_row is None:
+        raise AssertionError("local terminal did not recover from busy spinner back to the plain terminal icon")
+
+    return {
+        "busy_icon_kind": str(busy_row.get("icon_kind") or ""),
+        "busy_icon_text": str(busy_row.get("icon_text") or ""),
+        "idle_icon_kind": str(idle_row.get("icon_kind") or ""),
+        "idle_icon_text": str(idle_row.get("icon_text") or ""),
+    }
+
+
+def assert_sidebar_contract(pid: int, session: str) -> dict:
+    state = app_state(pid)
+    dom_rows = ((state.get("dom") or {}).get("sidebar_visible_rows") or [])
+    if not dom_rows:
+        raise AssertionError("sidebar dom rows are missing from app state")
+
+    live_group_index = next(
+        (
+            index
+            for index, row in enumerate(dom_rows)
+            if str(row.get("path") or "") == "__live_sessions__"
+        ),
+        None,
+    )
+    live_group_children = []
+    if live_group_index is not None:
+        for row in dom_rows[live_group_index + 1 :]:
+            path = str(row.get("path") or "")
+            if path.startswith("__remote_machine__/") or path == "local":
+                break
+            live_group_children.append(row)
+    if live_group_index is not None and not live_group_children:
+        raise AssertionError("Live Sessions is visible but empty")
+    live_group_documents = [
+        row
+        for row in live_group_children
+        if str(row.get("kind") or "") == "Document"
+    ]
+    if live_group_documents:
+        raise AssertionError(
+            f"Live Sessions contains document rows instead of only live terminals: {live_group_documents!r}"
+        )
+    cached_live_rows = [
+        row
+        for row in live_group_children
+        if str(row.get("machine_health") or "").strip().lower() == "cached"
+    ]
+    if cached_live_rows:
+        raise AssertionError(
+            f"Live Sessions still contains cached rows instead of only actual live sessions: {cached_live_rows!r}"
+        )
+
+    selected_row = next(
+        (
+            row
+            for row in dom_rows
+            if str(row.get("path") or "") == session
+        ),
+        None,
+    )
+    if selected_row is None:
+        raise AssertionError(f"selected session is missing from sidebar dom rows: {session}")
+    selected_icon_kind = str(selected_row.get("icon_kind") or "")
+    selected_icon_text = str(selected_row.get("icon_text") or "")
+    selected_busy = bool(selected_row.get("busy")) or selected_icon_kind == "busy"
+    if selected_busy:
+        if selected_icon_kind != "busy" or selected_icon_text:
+            raise AssertionError(
+                f"selected busy local terminal row lost the busy spinner contract: {selected_row!r}"
+            )
+    elif selected_icon_kind != "plain-terminal" or selected_icon_text != "⌘":
+        raise AssertionError(
+            f"selected local terminal row lost the plain terminal icon contract: {selected_row!r}"
+        )
+
+    inconsistent_generic_session_icons = [
+        row
+        for row in dom_rows
+        if str(row.get("kind") or "") == "Session"
+        and str(row.get("icon_kind") or "") == "session"
+    ]
+    if inconsistent_generic_session_icons:
+        raise AssertionError(
+            f"terminal sessions still use the inconsistent generic session icon: {inconsistent_generic_session_icons!r}"
+        )
+
+    failed_notifications = [
+        notification
+        for notification in ((state.get("shell") or {}).get("notifications") or [])
+        if str(notification.get("title") or "") == "Remote Terminal Failed"
+    ]
+    if failed_notifications:
+        raise AssertionError(
+            f"stale remote terminal failure notification is still visible: {failed_notifications!r}"
+        )
+
+    return {
+        "live_group_present": live_group_index is not None,
+        "live_group_child_count": len(live_group_children),
+        "live_group_document_count": len(live_group_documents),
+        "selected_busy": selected_busy,
+        "selected_icon_kind": selected_icon_kind,
+        "selected_icon_text": selected_icon_text,
+        "generic_session_icon_count": len(inconsistent_generic_session_icons),
+        "failed_notification_count": len(failed_notifications),
+    }
+
+
+def assert_local_session_runtime_ready(session: str) -> dict:
+    snapshot = server_snapshot()
+    session_entry = find_snapshot_session(snapshot, session)
+    if session_entry is None:
+        raise AssertionError(f"session is missing from server snapshot: {session}")
+    launch_phase = str(session_entry.get("launch_phase") or "")
+    status_line = str(session_entry.get("status_line") or "")
+    lowered_status = status_line.lower()
+    if launch_phase != "Running":
+        raise AssertionError(
+            f"local session is not running yet: session={session!r} launch_phase={launch_phase!r}"
+        )
+    if "planned" in lowered_status or "waiting for terminal host" in lowered_status:
+        raise AssertionError(
+            f"local session runtime is not ready: session={session!r} status_line={status_line!r}"
+        )
+    return {
+        "launch_phase": launch_phase,
+        "status_line": status_line,
+        "source": session_entry.get("source"),
+        "session_id": session_entry.get("id"),
+        "terminal_process_id": session_entry.get("terminal_process_id"),
+    }
 
 
 def cursor_sample_is_visibly_active(host: dict) -> bool:
@@ -808,10 +1106,10 @@ def assert_cursor_prompt_visibility(state: dict, *, context: str) -> dict:
 
 def assert_partial_input_flow(pid: int, session: str, out_dir: Path) -> dict:
     wait_for_terminal_quiescent(pid, timeout_seconds=12.0)
-    clear = probe_type(pid, session, "", mode="keyboard", press_ctrl_c=True, press_ctrl_e=True, press_ctrl_u=True)
+    clear = terminal_send(pid, session, "\u0003\u0005\u0015")
     time.sleep(0.3)
     wait_for_terminal_quiescent(pid, timeout_seconds=8.0)
-    typed = probe_type(pid, session, "/sta", mode="keyboard")
+    typed = terminal_send(pid, session, "/sta")
     time.sleep(0.4)
     typed_state = wait_for_terminal_quiescent(pid, timeout_seconds=8.0)
     typed_host = active_host(typed_state)
@@ -926,17 +1224,9 @@ def ensure_live_codex_runtime(pid: int, session: str) -> dict:
             "action": "noop",
             "state": current,
         }
-    prepare = probe_type(
-        pid,
-        session,
-        "",
-        mode="keyboard",
-        press_ctrl_c=True,
-        press_ctrl_e=True,
-        press_ctrl_u=True,
-    )
+    prepare = terminal_send(pid, session, "\u0003\u0005\u0015")
     time.sleep(0.4)
-    launch = probe_type(pid, session, "codex", mode="keyboard", press_enter=True)
+    launch = terminal_send(pid, session, "codex\r")
     state = wait_for_live_codex_prompt(pid, timeout_seconds=30.0)
     return {
         "action": "launch_codex",
@@ -947,10 +1237,18 @@ def ensure_live_codex_runtime(pid: int, session: str) -> dict:
 
 
 def assert_hidden_cursor_tui(pid: int, session: str, out_dir: Path) -> dict:
-    clear = probe_type(pid, session, "", mode="keyboard", press_ctrl_c=True, press_ctrl_e=True, press_ctrl_u=True)
-    time.sleep(0.2)
-    command = "sh -lc 'tput smcup;tput civis;printf hc;sleep 3;tput cnorm;tput rmcup'"
-    probe = probe_type(pid, session, command, mode="keyboard", press_enter=True)
+    clear = terminal_probe_type(
+        pid,
+        session,
+        "",
+        mode="xterm",
+        press_ctrl_c=True,
+        press_ctrl_e=True,
+        press_ctrl_u=True,
+    )
+    wait_for_terminal_quiescent(pid, timeout_seconds=6.0)
+    command = "printf '\\033[?1049h\\033[?25lhc'; sleep 1; printf '\\033[?25h\\033[?1049l'"
+    probe = terminal_probe_type(pid, session, command, mode="xterm", press_enter=True)
     deadline = time.time() + 6.0
     state = {}
     host = {}
@@ -1008,11 +1306,12 @@ def assert_hidden_cursor_tui(pid: int, session: str, out_dir: Path) -> dict:
         "raw_cursor_hidden_count": restored_host.get("raw_cursor_hidden_count"),
     }
 
+
 def assert_status_command(pid: int, session: str, out_dir: Path) -> dict:
     ensure = ensure_live_codex_runtime(pid, session)
-    clear = probe_type(pid, session, "", mode="keyboard", press_ctrl_e=True, press_ctrl_u=True)
+    clear = terminal_send(pid, session, "\u0005\u0015")
     time.sleep(0.3)
-    probe = probe_type(pid, session, "/status", mode="keyboard", press_enter=True)
+    probe = terminal_send(pid, session, "/status\r")
     state = wait_for_status_panel(pid, timeout_seconds=12.0)
     try:
         state = wait_for_terminal_quiescent(pid, timeout_seconds=6.0)
@@ -1081,7 +1380,11 @@ def main() -> int:
     parser.add_argument("--session-kind", choices=("codex", "plain"), default="codex")
     parser.add_argument("--out", default="/tmp/xterm-embed-faults")
     parser.add_argument("--reopen", action="store_true")
+    parser.add_argument("--home")
     args = parser.parse_args()
+
+    if args.home:
+        ENV["YGGTERM_HOME"] = str(Path(args.home).expanduser())
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1126,6 +1429,8 @@ def main() -> int:
         summary["checks"]["status_command"] = assert_status_command(args.pid, args.session, out_dir)
     if args.session.startswith("local://"):
         summary["checks"]["local_tree"] = assert_local_tree_placement(args.pid, args.session)
+        summary["checks"]["sidebar_contract"] = assert_sidebar_contract(args.pid, args.session)
+        summary["checks"]["local_runtime"] = assert_local_session_runtime_ready(args.session)
     summary["checks"]["themes"] = assert_theme_contract(args.pid, out_dir)
     final_state = app_state(args.pid)
     with (out_dir / "final-state.json").open("w") as fh:
