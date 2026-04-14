@@ -103,7 +103,7 @@ pub fn gradient_css(theme: UiTheme, spec: &YgguiThemeSpec) -> String {
             )
         })
         .collect::<Vec<_>>();
-    layers.push(default_backdrop(theme, spec.brightness));
+    layers.push(default_backdrop(theme, &spec));
     let grain = grain_layer(theme, spec.grain);
     if !grain.is_empty() {
         layers.push(grain);
@@ -113,11 +113,13 @@ pub fn gradient_css(theme: UiTheme, spec: &YgguiThemeSpec) -> String {
 
 pub fn shell_tint(theme: UiTheme, spec: &YgguiThemeSpec) -> String {
     let spec = clamp_theme_spec(spec);
-    let alpha = 0.88 + spec.brightness * 0.08;
-    match theme {
-        UiTheme::ZedLight => format!("rgba(244,248,250,{alpha:.3})"),
-        UiTheme::ZedDark => format!("rgba(39,46,52,{alpha:.3})"),
-    }
+    let rgb = themed_shell_rgb(theme, &spec);
+    let brightness_lift = theme_brightness_lift(spec.brightness);
+    let alpha = match theme {
+        UiTheme::ZedLight => 0.72 + brightness_lift * 0.06,
+        UiTheme::ZedDark => 0.56 + brightness_lift * 0.08,
+    };
+    format!("rgba({}, {}, {}, {:.3})", rgb.0, rgb.1, rgb.2, alpha)
 }
 
 pub fn preview_surface_css(theme: UiTheme, spec: &YgguiThemeSpec) -> String {
@@ -140,29 +142,50 @@ pub fn dominant_accent(spec: &YgguiThemeSpec, fallback: &'static str) -> String 
 fn default_gradient(theme: UiTheme) -> &'static str {
     match theme {
         UiTheme::ZedLight => {
-            "linear-gradient(180deg, rgba(232,243,248,0.94) 0%, rgba(232,244,238,0.90) 48%, rgba(237,240,244,0.94) 100%)"
+            "linear-gradient(180deg, rgba(236,243,248,0.86) 0%, rgba(240,245,249,0.78) 50%, rgba(232,238,244,0.86) 100%)"
         }
         UiTheme::ZedDark => {
-            "linear-gradient(180deg, rgba(68,95,106,0.92) 0%, rgba(75,102,94,0.88) 52%, rgba(58,65,73,0.94) 100%)"
+            "linear-gradient(180deg, rgba(56,74,92,0.76) 0%, rgba(48,60,76,0.70) 50%, rgba(32,38,48,0.82) 100%)"
         }
     }
 }
 
-fn default_backdrop(theme: UiTheme, brightness: f32) -> String {
-    match theme {
-        UiTheme::ZedLight => format!(
-            "linear-gradient(180deg, rgba(242,247,249,{:.3}) 0%, rgba(238,244,241,{:.3}) 55%, rgba(235,239,244,{:.3}) 100%)",
-            0.92 + brightness * 0.05,
-            0.90 + brightness * 0.05,
-            0.92 + brightness * 0.04
+fn default_backdrop(theme: UiTheme, spec: &YgguiThemeSpec) -> String {
+    let base = themed_shell_rgb(theme, spec);
+    let brightness_lift = theme_brightness_lift(spec.brightness);
+    let (top, middle, bottom, top_alpha, middle_alpha, bottom_alpha) = match theme {
+        UiTheme::ZedLight => (
+            mix_rgb(base, (255, 255, 255), 0.34),
+            mix_rgb(base, (243, 247, 250), 0.44),
+            mix_rgb(base, (232, 238, 244), 0.52),
+            0.66 + brightness_lift * 0.08,
+            0.60 + brightness_lift * 0.08,
+            0.72 + brightness_lift * 0.06,
         ),
-        UiTheme::ZedDark => format!(
-            "linear-gradient(180deg, rgba(59,79,88,{:.3}) 0%, rgba(69,89,82,{:.3}) 50%, rgba(49,55,63,{:.3}) 100%)",
-            0.86 + brightness * 0.08,
-            0.84 + brightness * 0.08,
-            0.90 + brightness * 0.06
+        UiTheme::ZedDark => (
+            mix_rgb(base, (92, 110, 128), 0.20),
+            mix_rgb(base, (48, 56, 68), 0.18),
+            mix_rgb(base, (24, 28, 36), 0.26),
+            0.48 + brightness_lift * 0.08,
+            0.42 + brightness_lift * 0.07,
+            0.58 + brightness_lift * 0.06,
         ),
-    }
+    };
+    format!(
+        "linear-gradient(180deg, rgba({}, {}, {}, {:.3}) 0%, rgba({}, {}, {}, {:.3}) 54%, rgba({}, {}, {}, {:.3}) 100%)",
+        top.0,
+        top.1,
+        top.2,
+        top_alpha,
+        middle.0,
+        middle.1,
+        middle.2,
+        middle_alpha,
+        bottom.0,
+        bottom.1,
+        bottom.2,
+        bottom_alpha
+    )
 }
 
 fn grain_layer(theme: UiTheme, grain: f32) -> String {
@@ -210,6 +233,53 @@ fn rendered_stop_rgba(
         "rgba({}, {}, {}, {:.3})",
         polished.0, polished.1, polished.2, layer_alpha
     )
+}
+
+fn themed_shell_rgb(theme: UiTheme, spec: &YgguiThemeSpec) -> (u8, u8, u8) {
+    let spec = clamp_theme_spec(spec);
+    if spec.colors.is_empty() {
+        return match theme {
+            UiTheme::ZedLight => (242, 246, 249),
+            UiTheme::ZedDark => (40, 49, 58),
+        };
+    }
+
+    let mut weighted = (0.0f32, 0.0f32, 0.0f32);
+    let mut total = 0.0f32;
+    for stop in spec.colors.iter().take(MAX_RENDER_THEME_STOPS) {
+        let rgb = hex_to_rgb(&stop.color).unwrap_or((124, 200, 255));
+        let weight = stop.alpha.max(0.1);
+        weighted.0 += rgb.0 as f32 * weight;
+        weighted.1 += rgb.1 as f32 * weight;
+        weighted.2 += rgb.2 as f32 * weight;
+        total += weight;
+    }
+    let averaged = if total <= f32::EPSILON {
+        (124, 200, 255)
+    } else {
+        (
+            (weighted.0 / total).round() as u8,
+            (weighted.1 / total).round() as u8,
+            (weighted.2 / total).round() as u8,
+        )
+    };
+    match theme {
+        UiTheme::ZedLight => mix_rgb(
+            averaged,
+            (245, 248, 250),
+            0.68 - theme_brightness_lift(spec.brightness) * 0.10,
+        ),
+        UiTheme::ZedDark => mix_rgb(
+            averaged,
+            (30, 37, 45),
+            0.72 - theme_brightness_lift(spec.brightness) * 0.12,
+        ),
+    }
+}
+
+fn theme_brightness_lift(brightness: f32) -> f32 {
+    ((brightness - MIN_THEME_BRIGHTNESS) / (MAX_THEME_BRIGHTNESS - MIN_THEME_BRIGHTNESS))
+        .clamp(0.0, 1.0)
 }
 
 fn rebalance_stop_positions(stops: &mut [YgguiThemeColorStop]) {
@@ -366,5 +436,55 @@ mod tests {
             ..YgguiThemeSpec::default()
         };
         assert_eq!(dominant_accent(&spec, "#ff00ff"), "#50e250");
+    }
+
+    #[test]
+    fn shell_tint_tracks_selected_color_family() {
+        let spec = YgguiThemeSpec {
+            colors: vec![
+                YgguiThemeColorStop {
+                    color: "#b8a1ff".to_string(),
+                    x: 0.18,
+                    y: 0.24,
+                    alpha: 0.82,
+                },
+                YgguiThemeColorStop {
+                    color: "#c9b8ff".to_string(),
+                    x: 0.64,
+                    y: 0.32,
+                    alpha: 0.72,
+                },
+            ],
+            brightness: 0.56,
+            grain: 0.12,
+        };
+        let rgb = themed_shell_rgb(UiTheme::ZedDark, &spec);
+        assert!(rgb.2 >= rgb.1);
+        assert!(rgb.0 >= 40);
+    }
+
+    #[test]
+    fn gradient_css_no_longer_uses_old_green_backdrop_signature() {
+        let spec = YgguiThemeSpec {
+            colors: vec![
+                YgguiThemeColorStop {
+                    color: "#b8a1ff".to_string(),
+                    x: 0.18,
+                    y: 0.24,
+                    alpha: 0.82,
+                },
+                YgguiThemeColorStop {
+                    color: "#d9d1ff".to_string(),
+                    x: 0.74,
+                    y: 0.68,
+                    alpha: 0.58,
+                },
+            ],
+            brightness: 0.56,
+            grain: 0.12,
+        };
+        let gradient = gradient_css(UiTheme::ZedDark, &spec);
+        assert!(!gradient.contains("69,89,82"));
+        assert!(!gradient.contains("75,102,94"));
     }
 }
