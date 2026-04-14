@@ -17040,11 +17040,10 @@ fn app() -> Element {
     let maximized = snapshot.maximized;
     let fullscreen = snapshot.fullscreen;
     let shell_radius = if maximized { 0 } else { 10 };
-    let shell_document_css = format!(
-        "html, body, #main {{ margin:0; width:100%; height:100%; background:transparent !important; overflow:hidden; border-radius:{}px; }} \
-         body {{ overscroll-behavior:none; }}",
-        shell_radius
-    );
+    let shell_document_css =
+        "html, body, #main { margin:0; width:100%; height:100%; background:transparent !important; overflow:hidden; } \
+         body { overscroll-behavior:none; }"
+            .to_string();
     let context_menu_overlay = snapshot.context_menu_row.clone().map(|row| {
         let context_row = resolve_creation_context_row(&snapshot.rows, &row);
         (row, context_row)
@@ -17053,12 +17052,7 @@ fn app() -> Element {
         div {
             id: "yggterm-shell-root",
             tabindex: "0",
-            style: format!(
-                "position: fixed; inset: 0; overflow: hidden; border-radius:{}px; \
-                 clip-path: inset(0 round {}px); background:transparent; box-shadow:none; box-sizing:border-box;",
-                shell_radius,
-                shell_radius
-            ),
+            style: "position:relative; width:100vw; height:100vh; overflow:hidden; background:transparent; box-shadow:none; box-sizing:border-box;",
             onclick: move |_| {
                 state.with_mut(|shell| {
                     shell.clear_alt_overlay();
@@ -28759,8 +28753,18 @@ fn palette(theme: UiTheme) -> Palette {
         },
     }
 }
+fn shell_live_blur_supported() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::env::var_os("WAYLAND_DISPLAY").is_some() && !linux_kde_wayland_safe_mode()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
 fn shell_backdrop_style(maximized: bool) -> &'static str {
-    if maximized || linux_kde_wayland_safe_mode() {
+    if maximized || !shell_live_blur_supported() {
         "none"
     } else {
         "blur(10px) saturate(135%)"
@@ -28794,6 +28798,11 @@ fn shell_style(
     maximized: bool,
 ) -> String {
     let backdrop = shell_backdrop_style(maximized);
+    let effective_shell_fill = if shell_live_blur_supported() && !maximized {
+        shell_tint.to_string()
+    } else {
+        palette.shell.to_string()
+    };
     let frame_inset = if maximized { 0.0 } else { SHELL_FRAME_INSET_PX };
     let frame_outline = if maximized {
         "none".to_string()
@@ -28811,7 +28820,7 @@ fn shell_style(
          -webkit-backdrop-filter:{}; font-family:{};",
         frame_inset,
         radius,
-        shell_tint,
+        effective_shell_fill,
         shell_gradient,
         box_shadow,
         backdrop,
