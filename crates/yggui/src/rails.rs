@@ -1,5 +1,41 @@
 use dioxus::prelude::*;
 
+const RAIL_SCROLLBAR_CSS: &str = r#"
+.yggui-rail-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--yggui-scrollbar-thumb, rgba(255,255,255,0.18))
+    var(--yggui-scrollbar-track, transparent);
+  scrollbar-gutter: stable;
+}
+
+.yggui-rail-scroll::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.yggui-rail-scroll::-webkit-scrollbar-track {
+  background: var(--yggui-scrollbar-track, transparent);
+}
+
+.yggui-rail-scroll::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+.yggui-rail-scroll::-webkit-scrollbar-thumb {
+  background: var(--yggui-scrollbar-thumb, rgba(255,255,255,0.18));
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  min-height: 32px;
+}
+
+.yggui-rail-scroll:hover::-webkit-scrollbar-thumb {
+  background: var(--yggui-scrollbar-thumb-hover, rgba(255,255,255,0.28));
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+"#;
+
 #[component]
 pub fn SideRailShell(visible: bool, width_px: usize, zoom_percent: f32, body: Element) -> Element {
     let rail_width = if visible { width_px } else { 0 };
@@ -42,7 +78,9 @@ pub fn RailHeader(title: String, color: String) -> Element {
 #[component]
 pub fn RailScrollBody(content: Element) -> Element {
     rsx! {
+        style { "{RAIL_SCROLLBAR_CSS}" }
         div {
+            class: "yggui-rail-scroll",
             style: "flex:1; overflow:auto; padding:10px 16px 14px 16px; display:flex; flex-direction:column; gap:14px; \
              text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
             {content}
