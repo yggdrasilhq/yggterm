@@ -41,39 +41,45 @@ pub fn TitlebarChrome(
     right: Element,
     on_toggle_maximized: EventHandler<()>,
 ) -> Element {
-    let mut drag_armed = use_signal(|| false);
     rsx! {
         div {
             style: format!(
-                "display:grid; grid-template-columns:minmax(0,1fr) auto minmax(0,1fr); align-items:center; \
-                 gap:12px; height:44px; padding:0 12px; background:{}; zoom:{}%; user-select:none; \
+                "position:relative; display:grid; grid-template-columns:minmax(0,1fr) minmax(260px, 560px) minmax(0,1fr); align-items:center; \
+                 gap:6px; height:32px; padding:0 8px 0 8px; box-sizing:border-box; background:{}; zoom:{}%; user-select:none; overflow:visible; \
                  -webkit-user-select:none;",
                 background, zoom_percent
             ),
-            onmousedown: move |_| drag_armed.set(true),
-            onmouseup: move |_| drag_armed.set(false),
-            onmouseleave: move |_| drag_armed.set(false),
-            onmousemove: move |_| {
-                if drag_armed() {
-                    drag_armed.set(false);
-                    window().drag();
-                }
-            },
+            onmousedown: move |_| window().drag(),
             ondoubleclick: move |_| {
-                drag_armed.set(false);
                 on_toggle_maximized.call(());
             },
             div {
-                style: "min-width:0; display:flex; align-items:center; justify-content:flex-start;",
-                {left}
+                style: "position:absolute; inset:0; z-index:0;",
+                onmousedown: move |_| window().drag(),
+                ondoubleclick: move |_| {
+                    on_toggle_maximized.call(());
+                },
             }
             div {
-                style: "min-width:0; display:flex; align-items:center; justify-content:center;",
-                {center}
+                style: "position:relative; z-index:1; min-width:0; height:100%; display:flex; align-items:center; justify-content:flex-start; box-sizing:border-box; pointer-events:none;",
+                div {
+                    style: "display:flex; align-items:center; justify-content:flex-start; min-width:0; width:100%; height:100%; pointer-events:auto;",
+                    {left}
+                }
             }
             div {
-                style: "min-width:0; display:flex; align-items:center; justify-content:flex-end;",
-                {right}
+                style: "position:relative; z-index:1; min-width:0; height:100%; display:flex; align-items:center; justify-content:center; box-sizing:border-box; pointer-events:none;",
+                div {
+                    style: "display:flex; align-items:center; justify-content:center; min-width:0; width:100%; height:100%; pointer-events:auto;",
+                    {center}
+                }
+            }
+            div {
+                style: "position:relative; z-index:1; min-width:0; height:100%; display:flex; align-items:center; justify-content:flex-end; box-sizing:border-box; pointer-events:none;",
+                div {
+                    style: "display:flex; align-items:center; justify-content:flex-end; min-width:0; width:100%; height:100%; pointer-events:auto;",
+                    {right}
+                }
             }
         }
     }
@@ -284,20 +290,23 @@ fn WindowControlGlyph(icon: ChromeControlIcon) -> Element {
 
 pub fn search_input_style(text_color: &str, dark_surface: bool) -> String {
     format!(
-        "width:min(560px, 100%); height:32px; padding:0 12px; border-radius:8px; \
-         border:none; background:{}; color:{}; outline:none; font-size:12px; \
+        "width:100%; height:26px; padding:0 11px; border-radius:8px; \
+         border:none; background:{}; color:{}; outline:none; box-sizing:border-box; display:block; margin:0; \
+         font-size:13.5px; font-weight:550; letter-spacing:-0.012em; line-height:1; \
+         font-family:'Inter Variable', Inter, system-ui, sans-serif; text-rendering:optimizeLegibility; \
+         -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale; \
          box-shadow: inset 0 0 0 1px {}; user-select:text; -webkit-user-select:text; \
          caret-color:{};",
         if dark_surface {
-            "rgba(8,12,16,0.84)"
+            "rgba(8,12,16,0.88)"
         } else {
-            "rgba(255,255,255,0.72)"
+            "rgba(255,255,255,0.9)"
         },
         text_color,
         if dark_surface {
-            "rgba(214,229,242,0.22)"
+            "rgba(214,229,242,0.24)"
         } else {
-            "rgba(201,214,226,0.56)"
+            "rgba(201,214,226,0.74)"
         },
         text_color
     )
