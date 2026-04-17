@@ -12,20 +12,24 @@ mkdir -p "$DIST_DIR"
 
 BIN_NAME="yggterm"
 HEADLESS_BIN_NAME="yggterm-headless"
+MOCK_CLI_BIN_NAME="yggterm-mock-cli"
 case "$TARGET_LABEL" in
   windows-*)
     BIN_NAME="yggterm.exe"
     HEADLESS_BIN_NAME="yggterm-headless.exe"
+    MOCK_CLI_BIN_NAME="yggterm-mock-cli.exe"
     ;;
 esac
 
-BUILD_CMD=("${CARGO_CMD[@]}" build --release -p yggterm --bin yggterm --bin yggterm-headless --no-default-features)
+BUILD_CMD=("${CARGO_CMD[@]}" build --release -p yggterm --bin yggterm --bin yggterm-headless --bin yggterm-mock-cli --no-default-features)
 BIN_PATH="${ROOT_DIR}/target/release/${BIN_NAME}"
 HEADLESS_BIN_PATH="${ROOT_DIR}/target/release/${HEADLESS_BIN_NAME}"
+MOCK_CLI_BIN_PATH="${ROOT_DIR}/target/release/${MOCK_CLI_BIN_NAME}"
 if [[ -n "$TARGET_TRIPLE" ]]; then
   BUILD_CMD+=(--target "$TARGET_TRIPLE")
   BIN_PATH="${ROOT_DIR}/target/${TARGET_TRIPLE}/release/${BIN_NAME}"
   HEADLESS_BIN_PATH="${ROOT_DIR}/target/${TARGET_TRIPLE}/release/${HEADLESS_BIN_NAME}"
+  MOCK_CLI_BIN_PATH="${ROOT_DIR}/target/${TARGET_TRIPLE}/release/${MOCK_CLI_BIN_NAME}"
 fi
 
 pushd "$ROOT_DIR" >/dev/null
@@ -47,6 +51,13 @@ case "$HEADLESS_BIN_NAME" in
     ;;
 esac
 cp "$HEADLESS_BIN_PATH" "${DIST_DIR}/${HEADLESS_OUT_BASENAME}"
+MOCK_CLI_OUT_BASENAME="yggterm-mock-cli-${TARGET_LABEL}"
+case "$MOCK_CLI_BIN_NAME" in
+  *.exe)
+    MOCK_CLI_OUT_BASENAME="${MOCK_CLI_OUT_BASENAME}.exe"
+    ;;
+esac
+cp "$MOCK_CLI_BIN_PATH" "${DIST_DIR}/${MOCK_CLI_OUT_BASENAME}"
 
 checksum_file() {
   local file="$1"
@@ -60,15 +71,19 @@ checksum_file() {
 
 checksum_file "${DIST_DIR}/${OUT_BASENAME}" "${DIST_DIR}/${OUT_BASENAME}.sha256"
 checksum_file "${DIST_DIR}/${HEADLESS_OUT_BASENAME}" "${DIST_DIR}/${HEADLESS_OUT_BASENAME}.sha256"
+checksum_file "${DIST_DIR}/${MOCK_CLI_OUT_BASENAME}" "${DIST_DIR}/${MOCK_CLI_OUT_BASENAME}.sha256"
 
 tar -C "$DIST_DIR" -czf "${DIST_DIR}/yggterm-${TARGET_LABEL}.tar.gz" \
   "${OUT_BASENAME}" \
   "${OUT_BASENAME}.sha256" \
   "${HEADLESS_OUT_BASENAME}" \
-  "${HEADLESS_OUT_BASENAME}.sha256"
+  "${HEADLESS_OUT_BASENAME}.sha256" \
+  "${MOCK_CLI_OUT_BASENAME}" \
+  "${MOCK_CLI_OUT_BASENAME}.sha256"
 
 checksum_file "${DIST_DIR}/yggterm-${TARGET_LABEL}.tar.gz" "${DIST_DIR}/yggterm-${TARGET_LABEL}.tar.gz.sha256"
 
 echo "Release binary: ${DIST_DIR}/${OUT_BASENAME}"
 echo "Release headless binary: ${DIST_DIR}/${HEADLESS_OUT_BASENAME}"
+echo "Release mock cli: ${DIST_DIR}/${MOCK_CLI_OUT_BASENAME}"
 echo "Release archive: ${DIST_DIR}/yggterm-${TARGET_LABEL}.tar.gz"
