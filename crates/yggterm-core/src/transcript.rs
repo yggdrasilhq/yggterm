@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +103,45 @@ pub fn read_codex_transcript_messages_limited(
     max_messages: usize,
 ) -> Result<Vec<TranscriptMessage>> {
     read_codex_transcript_messages_with_limit(path, Some(max_messages))
+}
+
+pub fn read_codex_transcript_messages_tail_limited(
+    path: &Path,
+    max_messages: usize,
+) -> Result<Vec<TranscriptMessage>> {
+    const INITIAL_WINDOW_BYTES: u64 = 2 * 1024 * 1024;
+    const MAX_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
+
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("failed to read session transcript {}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .with_context(|| format!("failed to stat session transcript {}", path.display()))?
+        .len();
+    let mut window = INITIAL_WINDOW_BYTES.min(file_len.max(1));
+
+    loop {
+        let start = file_len.saturating_sub(window);
+        file.seek(SeekFrom::Start(start))
+            .with_context(|| format!("failed to seek session transcript {}", path.display()))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).with_context(|| {
+            format!("failed to read session transcript tail {}", path.display())
+        })?;
+        let text = String::from_utf8_lossy(&bytes);
+        let lines = if start > 0 {
+            text.lines().skip(1).collect::<Vec<_>>()
+        } else {
+            text.lines().collect::<Vec<_>>()
+        };
+        let messages = parse_transcript_message_lines(lines, max_messages);
+        if messages.len() >= max_messages || start == 0 || window >= MAX_WINDOW_BYTES {
+            return Ok(messages);
+        }
+        window = (window.saturating_mul(2))
+            .min(MAX_WINDOW_BYTES)
+            .min(file_len.max(1));
+    }
 }
 
 fn read_codex_transcript_messages_with_limit(
@@ -205,6 +245,88 @@ fn push_message(messages: &mut Vec<TranscriptMessage>, payload: &Value, timestam
     );
 }
 
+fn push_message_deque(
+    messages: &mut VecDeque<TranscriptMessage>,
+    payload: &Value,
+    timestamp: Option<String>,
+    max_messages: usize,
+) {
+    push_message_lines_deque(
+        messages,
+        normalized_message_role(payload),
+        message_lines_from_payload(payload),
+        timestamp,
+        max_messages,
+    );
+}
+
+fn parse_transcript_message_lines<'a, I>(lines: I, max_messages: usize) -> Vec<TranscriptMessage>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut messages = VecDeque::new();
+    for line in lines {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+
+        match value.get("type").and_then(Value::as_str) {
+            Some("response_item") => {
+                let Some(payload) = value.get("payload") else {
+                    continue;
+                };
+                if payload.get("type").and_then(Value::as_str) != Some("message") {
+                    continue;
+                }
+                push_message_deque(
+                    &mut messages,
+                    payload,
+                    extract_timestamp_raw(payload).or_else(|| extract_timestamp_raw(&value)),
+                    max_messages,
+                );
+            }
+            Some("compacted") => {
+                let Some(history) = value
+                    .get("payload")
+                    .and_then(|payload| payload.get("replacement_history"))
+                    .and_then(Value::as_array)
+                else {
+                    continue;
+                };
+                let fallback_timestamp = extract_timestamp_raw(&value);
+                for item in history {
+                    if item.get("type").and_then(Value::as_str) != Some("message") {
+                        continue;
+                    }
+                    push_message_deque(
+                        &mut messages,
+                        item,
+                        extract_timestamp_raw(item).or_else(|| fallback_timestamp.clone()),
+                        max_messages,
+                    );
+                }
+            }
+            Some("event_msg") => {
+                let Some(payload) = value.get("payload") else {
+                    continue;
+                };
+                let Some((role, text)) = event_message_role_and_text(payload) else {
+                    continue;
+                };
+                push_message_lines_deque(
+                    &mut messages,
+                    role,
+                    normalize_preview_text(text),
+                    extract_timestamp_raw(&value),
+                    max_messages,
+                );
+            }
+            _ => {}
+        }
+    }
+    messages.into_iter().collect()
+}
+
 fn push_message_lines(
     messages: &mut Vec<TranscriptMessage>,
     role: TranscriptRole,
@@ -226,6 +348,33 @@ fn push_message_lines(
         timestamp,
         lines,
     });
+}
+
+fn push_message_lines_deque(
+    messages: &mut VecDeque<TranscriptMessage>,
+    role: TranscriptRole,
+    lines: Vec<String>,
+    timestamp: Option<String>,
+    max_messages: usize,
+) {
+    if lines.is_empty() {
+        return;
+    }
+    let candidate_key = normalized_transcript_message_key(role, &lines);
+    if let Some(last) = messages.back() {
+        let last_key = normalized_transcript_message_key(last.role, &last.lines);
+        if last.role == role && last_key == candidate_key {
+            return;
+        }
+    }
+    messages.push_back(TranscriptMessage {
+        role,
+        timestamp,
+        lines,
+    });
+    while messages.len() > max_messages {
+        messages.pop_front();
+    }
 }
 
 fn normalized_message_role(payload: &Value) -> TranscriptRole {
@@ -379,10 +528,20 @@ fn collapse_named_image_markup(text: &str) -> String {
 
 fn looks_like_generation_noise(text: &str, role: TranscriptRole) -> bool {
     let lower = text.to_ascii_lowercase();
-    if lower.len() < 16 {
+    let min_len = match role {
+        TranscriptRole::User => 8,
+        TranscriptRole::Assistant => 16,
+        TranscriptRole::System => return true,
+    };
+    if lower.len() < min_len {
         return true;
     }
-    if role == TranscriptRole::System {
+    if role == TranscriptRole::User
+        && matches!(
+            lower.as_str(),
+            "ok" | "okay" | "thanks" | "thank you" | "yes" | "no" | "hi" | "hello"
+        )
+    {
         return true;
     }
     [
@@ -424,7 +583,7 @@ fn looks_like_generation_noise(text: &str, role: TranscriptRole) -> bool {
 mod tests {
     use super::{
         TranscriptMessage, TranscriptRole, generation_context_from_messages,
-        read_codex_transcript_messages,
+        read_codex_transcript_messages, read_codex_transcript_messages_tail_limited,
     };
     use anyhow::Result;
     use std::fs;
@@ -561,6 +720,46 @@ mod tests {
         assert_eq!(messages.len(), 1, "{messages:?}");
         assert_eq!(messages[0].role, TranscriptRole::User);
         assert_eq!(messages[0].lines, vec!["real follow-up".to_string()]);
+
+        let _ = fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn generation_context_keeps_short_substantive_user_question() {
+        let messages = vec![TranscriptMessage {
+            role: TranscriptRole::User,
+            timestamp: Some("2026-04-17T10:00:00Z".to_string()),
+            lines: vec!["Who are you?".to_string()],
+        }];
+
+        let context = generation_context_from_messages(&messages);
+
+        assert!(context.contains("USER: Who are you?"));
+    }
+
+    #[test]
+    fn transcript_reader_tail_limit_keeps_latest_messages() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "yggterm-transcript-tail-{}-{}.jsonl",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::write(
+            &path,
+            [
+                r#"{"timestamp":"2026-03-20T10:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"first"}]}}"#,
+                r#"{"timestamp":"2026-03-20T10:00:01Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"second"}]}}"#,
+                r#"{"timestamp":"2026-03-20T10:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"third"}]}}"#,
+                r#"{"timestamp":"2026-03-20T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"fourth"}]}}"#,
+            ]
+            .join("\n"),
+        )?;
+
+        let messages = read_codex_transcript_messages_tail_limited(&path, 2)?;
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].lines, vec!["third".to_string()]);
+        assert_eq!(messages[1].lines, vec!["fourth".to_string()]);
 
         let _ = fs::remove_file(path);
         Ok(())

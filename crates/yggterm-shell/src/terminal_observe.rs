@@ -396,10 +396,10 @@ pub(crate) fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value
             (true, true, Some("interactive".to_string()), None)
         } else if terminal_rendered && !terminal_input_enabled {
             (
+                true,
                 false,
-                false,
-                Some("recovering".to_string()),
-                Some("terminal rendered but input is still disabled".to_string()),
+                Some("visible".to_string()),
+                Some("terminal rendered but focus is outside the terminal".to_string()),
             )
         } else if terminal_attach_pending {
             (
@@ -722,16 +722,76 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         .get("helper_textarea_focused")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let xterm_present = host
+        .get("xterm_present")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let screen_present = host
+        .get("screen_present")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let rows_present = host
+        .get("rows_present")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let canvas_count = host
+        .get("canvas_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let render_event_count = host
+        .get("render_event_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cursor_node_count = host
+        .get("cursor_node_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let data_event_count = host
+        .get("data_event_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let blank_rows_below_cursor = host
+        .get("blank_rows_below_cursor")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let xterm_buffer_kind = host
+        .get("xterm_buffer_kind")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    let xterm_cursor_hidden = host
+        .get("xterm_cursor_hidden")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let cursor_sample_visible = host
+        .get("cursor_sample_rect")
+        .and_then(Value::as_object)
+        .is_some()
+        || cursor_node_count > 0;
     let prompt_visible = terminal_chunk_has_prompt_output(text_sample)
         || terminal_chunk_has_codex_prompt_output(text_sample)
         || (!cursor_line_text.is_empty()
             && (terminal_chunk_has_prompt_output(cursor_line_text)
                 || terminal_chunk_has_codex_prompt_output(cursor_line_text)));
-    let prompt_ready_surface = prompt_visible && (input_enabled || helper_textarea_focused);
+    let prompt_ready_surface =
+        prompt_visible && (input_enabled || helper_textarea_focused || cursor_sample_visible);
     if !cursor_line_text.is_empty() && terminal_chunk_is_transport_error(cursor_line_text) {
         return Some("active terminal host is showing transport/error output");
     }
+    let blank_but_mounted_surface = text_sample.is_empty()
+        && (xterm_present || screen_present || rows_present || canvas_count > 0)
+        && (render_event_count > 0
+            || data_event_count > 0
+            || !cursor_line_text.is_empty()
+            || blank_rows_below_cursor > 0
+            || !xterm_buffer_kind.is_empty()
+            || input_enabled
+            || helper_textarea_focused
+            || xterm_cursor_hidden);
     if text_sample.is_empty() {
+        if blank_but_mounted_surface {
+            return Some("active terminal host exists but xterm surface is empty");
+        }
         return None;
     }
     if terminal_chunk_is_transport_error(text_sample) {
@@ -861,6 +921,61 @@ fn terminal_host_geometry_problem_for_app_control(host: &Value) -> Option<&'stat
         .and_then(|value| value.get("top"))
         .and_then(Value::as_f64)
         .unwrap_or(host_top);
+    let helper_textarea_present = host
+        .get("helper_textarea_present")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let input_enabled = host
+        .get("input_enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let helper_textarea_opacity = host
+        .get("helper_textarea_opacity")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let helper_textarea_background = host
+        .get("helper_textarea_background")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let helper_textarea_outline_style = host
+        .get("helper_textarea_outline_style")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let helper_textarea_outline_color = host
+        .get("helper_textarea_outline_color")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let helper_textarea_box_shadow = host
+        .get("helper_textarea_box_shadow")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let helper_textarea_clip_path = host
+        .get("helper_textarea_clip_path")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let helper_textarea_clip = host
+        .get("helper_textarea_clip")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let helper_textarea_pointer_events = host
+        .get("helper_textarea_pointer_events")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     let width_delta = (host_width - screen_width).abs();
     let compensated_screen_width_gap = host_width >= 240.0
         && screen_width >= 200.0
@@ -920,12 +1035,35 @@ fn terminal_host_geometry_problem_for_app_control(host: &Value) -> Option<&'stat
     {
         return Some("active terminal host helper layer is taller than the visible host");
     }
-    if helper_textarea_width > 8.0
-        || helper_textarea_height > 8.0
-        || (helper_textarea_left - host_left).abs() > 32.0
-        || (helper_textarea_top - host_top).abs() > 32.0
-    {
-        return Some("active terminal host helper textarea drifted outside the visible host");
+    if helper_textarea_present && input_enabled {
+        let tiny_helper = helper_textarea_width >= 1.0
+            && helper_textarea_width <= 2.0
+            && helper_textarea_height >= 1.0
+            && helper_textarea_height <= 2.0;
+        let visually_null = helper_textarea_opacity == "0"
+            && helper_textarea_outline_style == "none"
+            && helper_textarea_pointer_events == "none"
+            && helper_textarea_box_shadow == "none"
+            && (helper_textarea_background == "transparent"
+                || helper_textarea_background == "rgba(0, 0, 0, 0)")
+            && (helper_textarea_outline_color.is_empty()
+                || helper_textarea_outline_color == "transparent"
+                || helper_textarea_outline_color == "rgba(0, 0, 0, 0)")
+            && (helper_textarea_clip_path.contains("inset(50%)")
+                || helper_textarea_clip.contains("rect(0px, 0px, 0px, 0px)")
+                || helper_textarea_clip.contains("rect(0, 0, 0, 0)"));
+        let hidden_offscreen = helper_textarea_left <= (host_left - 1000.0)
+            && (helper_textarea_top - host_top).abs() <= 32.0;
+        if !visually_null {
+            return Some(
+                "active terminal host helper textarea is visibly mounted instead of visually hidden",
+            );
+        }
+        if !tiny_helper || !hidden_offscreen {
+            return Some(
+                "active terminal host helper textarea drifted outside the expected hidden contract",
+            );
+        }
     }
     None
 }
@@ -1344,7 +1482,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_host_problem_rejects_prompt_ready_footer_when_input_disabled() {
+    fn terminal_host_problem_accepts_visible_prompt_surface_without_terminal_focus() {
         let host = json!({
             "text_sample": "› Explain this codebase
 
@@ -1352,6 +1490,35 @@ mod tests {
             "cursor_line_text": "› Explain this codebase",
             "input_enabled": false,
             "helper_textarea_focused": false,
+            "cursor_node_count": 1,
+            "cursor_sample_rect": {"left": 302.0, "top": 214.0, "width": 8.0, "height": 17.0},
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": 0.0, "top": 0.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(terminal_host_problem_for_app_control(&host), None);
+    }
+
+    #[test]
+    fn terminal_host_problem_rejects_blank_normal_buffer_surface() {
+        let host = json!({
+            "text_sample": "",
+            "cursor_line_text": "",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": true,
+            "canvas_count": 1,
+            "render_event_count": 3,
+            "data_event_count": 1,
+            "blank_rows_below_cursor": 28,
+            "xterm_buffer_kind": "normal",
+            "xterm_cursor_hidden": false,
             "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
             "host_content_width": 840.0,
             "host_content_height": 830.0,
@@ -1362,7 +1529,125 @@ mod tests {
         });
         assert_eq!(
             terminal_host_problem_for_app_control(&host),
-            Some("active terminal host is still showing generic Codex idle footer")
+            Some("active terminal host exists but xterm surface is empty")
+        );
+    }
+
+    #[test]
+    fn terminal_host_problem_accepts_visually_hidden_offscreen_helper_textarea() {
+        let host = json!({
+            "text_sample": "pi@dev:~$",
+            "cursor_line_text": "pi@dev:~$",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "helper_textarea_present": true,
+            "helper_textarea_opacity": "0",
+            "helper_textarea_background": "rgba(0, 0, 0, 0)",
+            "helper_textarea_outline_style": "none",
+            "helper_textarea_outline_color": "rgba(0, 0, 0, 0)",
+            "helper_textarea_box_shadow": "none",
+            "helper_textarea_clip_path": "inset(50%)",
+            "helper_textarea_clip": "rect(0px, 0px, 0px, 0px)",
+            "helper_textarea_pointer_events": "none",
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": true,
+            "canvas_count": 1,
+            "render_event_count": 3,
+            "data_event_count": 1,
+            "blank_rows_below_cursor": 28,
+            "xterm_buffer_kind": "normal",
+            "xterm_cursor_hidden": false,
+            "host_rect": {"left": 304.0, "top": 68.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(terminal_host_problem_for_app_control(&host), None);
+    }
+
+    #[test]
+    fn terminal_host_problem_rejects_hidden_helper_textarea_anchored_inside_host() {
+        let host = json!({
+            "text_sample": "pi@dev:~$",
+            "cursor_line_text": "pi@dev:~$",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "helper_textarea_present": true,
+            "helper_textarea_opacity": "0",
+            "helper_textarea_background": "rgba(0, 0, 0, 0)",
+            "helper_textarea_outline_style": "none",
+            "helper_textarea_outline_color": "rgba(0, 0, 0, 0)",
+            "helper_textarea_box_shadow": "none",
+            "helper_textarea_clip_path": "inset(50%)",
+            "helper_textarea_clip": "rect(0px, 0px, 0px, 0px)",
+            "helper_textarea_pointer_events": "none",
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": true,
+            "canvas_count": 1,
+            "render_event_count": 3,
+            "data_event_count": 1,
+            "blank_rows_below_cursor": 28,
+            "xterm_buffer_kind": "normal",
+            "xterm_cursor_hidden": false,
+            "host_rect": {"left": 304.0, "top": 68.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": 304.0, "top": 68.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(
+            terminal_host_problem_for_app_control(&host),
+            Some(
+                "active terminal host helper textarea drifted outside the expected hidden contract"
+            )
+        );
+    }
+
+    #[test]
+    fn terminal_host_problem_rejects_visibly_mounted_helper_textarea() {
+        let host = json!({
+            "text_sample": "pi@dev:~$",
+            "cursor_line_text": "pi@dev:~$",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "helper_textarea_present": true,
+            "helper_textarea_opacity": "1",
+            "helper_textarea_background": "rgb(255, 255, 255)",
+            "helper_textarea_outline_style": "auto",
+            "helper_textarea_outline_color": "rgb(59, 130, 246)",
+            "helper_textarea_box_shadow": "rgb(59, 130, 246) 0px 0px 0px 1px",
+            "helper_textarea_clip_path": "none",
+            "helper_textarea_clip": "auto",
+            "helper_textarea_pointer_events": "auto",
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": true,
+            "canvas_count": 1,
+            "render_event_count": 3,
+            "data_event_count": 1,
+            "blank_rows_below_cursor": 28,
+            "xterm_buffer_kind": "normal",
+            "xterm_cursor_hidden": false,
+            "host_rect": {"left": 304.0, "top": 68.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": 304.0, "top": 68.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(
+            terminal_host_problem_for_app_control(&host),
+            Some(
+                "active terminal host helper textarea is visibly mounted instead of visually hidden"
+            )
         );
     }
 }

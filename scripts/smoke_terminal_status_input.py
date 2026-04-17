@@ -28,6 +28,22 @@ def app_state(pid: int) -> dict:
     return run("server", "app", "state", "--pid", str(pid), "--timeout-ms", "8000")["data"]
 
 
+def terminal_send(pid: int, session: str, data: str) -> dict:
+    return run(
+        "server",
+        "app",
+        "terminal",
+        "send",
+        "--pid",
+        str(pid),
+        session,
+        "--data",
+        data,
+        "--timeout-ms",
+        "15000",
+    )
+
+
 def terminal_hosts(state: dict) -> list[dict]:
     viewport_hosts = ((state.get("viewport") or {}).get("terminal_hosts") or [])
     if isinstance(viewport_hosts, list) and viewport_hosts:
@@ -137,42 +153,6 @@ def wait_for_terminal_interactive(pid: int, timeout_seconds: float = 15.0) -> di
     raise AssertionError(f"terminal did not settle in time: {last_state!r}")
 
 
-def probe_type(
-    pid: int,
-    session: str,
-    data: str,
-    *,
-    press_enter: bool = False,
-    press_ctrl_c: bool = False,
-    press_ctrl_e: bool = False,
-    press_ctrl_u: bool = False,
-) -> dict:
-    args = [
-        "server",
-        "app",
-        "terminal",
-        "probe-type",
-        "--pid",
-        str(pid),
-        session,
-        "--mode",
-        "keyboard",
-        "--data",
-        data,
-        "--timeout-ms",
-        "15000",
-    ]
-    if press_enter:
-        args.append("--enter")
-    if press_ctrl_c:
-        args.append("--ctrl-c")
-    if press_ctrl_e:
-        args.append("--ctrl-e")
-    if press_ctrl_u:
-        args.append("--ctrl-u")
-    return run(*args)
-
-
 def wait_for_live_codex_prompt(pid: int, timeout_seconds: float = 20.0) -> dict:
     deadline = time.time() + timeout_seconds
     last_state = {}
@@ -191,9 +171,9 @@ def ensure_live_codex_runtime(pid: int, session: str) -> dict:
             "action": "noop",
             "state": current,
         }
-    prepare = probe_type(pid, session, "", press_ctrl_c=True, press_ctrl_e=True, press_ctrl_u=True)
+    prepare = terminal_send(pid, session, "\u0003\u0005\u0015")
     time.sleep(0.4)
-    launch = probe_type(pid, session, "codex", press_enter=True)
+    launch = terminal_send(pid, session, "codex\r")
     state = wait_for_live_codex_prompt(pid, timeout_seconds=30.0)
     return {
         "action": "launch_codex",
@@ -204,11 +184,11 @@ def ensure_live_codex_runtime(pid: int, session: str) -> dict:
 
 
 def clear_prompt(pid: int, session: str) -> dict:
-    return probe_type(pid, session, "", press_ctrl_e=True, press_ctrl_u=True)
+    return terminal_send(pid, session, "\u0005\u0015")
 
 
 def run_status_probe(pid: int, session: str) -> dict:
-    return probe_type(pid, session, "/status", press_enter=True)
+    return terminal_send(pid, session, "/status\r")
 
 
 def main() -> int:

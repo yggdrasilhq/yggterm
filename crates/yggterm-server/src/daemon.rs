@@ -1,9 +1,9 @@
 use crate::terminal::TerminalBufferStats;
 use crate::{
     GhosttyHostSupport, ManagedSessionView, PersistedDaemonState, RemoteMachineSnapshot,
-    RemoteRuntimeRegistry, ServerUiSnapshot, SessionKind, SshConnectTarget, TerminalManager,
-    WorkspaceViewMode, YggtermServer, active_client_instance_records, current_millis,
-    fetch_remote_generation_context, persist_remote_generated_copy,
+    RemoteRuntimeRegistry, ServerUiSnapshot, SessionKind, SnapshotSessionView, SshConnectTarget,
+    TerminalManager, WorkspaceViewMode, YggtermServer, active_client_instance_records,
+    current_millis, fetch_remote_generation_context, persist_remote_generated_copy,
     remote_resume_runtime_output_requires_restart, terminate_remote_codex_session,
 };
 use anyhow::{Context, Result, bail};
@@ -40,6 +40,131 @@ const DEFAULT_ORPHAN_DAEMON_REAP_AFTER_MS: u64 = 180_000;
 #[cfg(target_os = "linux")]
 const DUPLICATE_SAME_HOME_GRACE_MS: u64 = 2_000;
 const REMOTE_ATTACH_STARTUP_GRACE_MS: u64 = 900;
+
+#[cfg(target_os = "linux")]
+fn daemon_binary_is_legacy(current_exe: &str, argv0: &str, proc_exe_target: Option<&Path>) -> bool {
+    if argv0 != current_exe {
+        return true;
+    }
+    let Some(proc_exe_target) = proc_exe_target else {
+        return false;
+    };
+    let target = proc_exe_target.to_string_lossy();
+    target.contains(" (deleted)") || target != current_exe
+}
+
+fn terminal_sidebar_snapshot_from_screen(text: &str) -> Option<(String, Vec<String>)> {
+    let lines = text
+        .replace('\r', "")
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return None;
+    }
+    let tail = lines
+        .iter()
+        .rev()
+        .take(8)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
+    let status_line = tail.last().cloned().unwrap_or_default();
+    Some((status_line, tail))
+}
+
+#[cfg(unix)]
+fn parse_versioned_server_socket_name(path: &Path) -> Option<(u64, u64, u64)> {
+    let file_name = path.file_name()?.to_str()?;
+    let version = file_name.strip_prefix("server-")?.strip_suffix(".sock")?;
+    let mut parts = version.split('-');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    let patch = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+#[cfg(unix)]
+fn versioned_server_socket_alias_candidates(current: &Path) -> Vec<PathBuf> {
+    let Some(parent) = current.parent() else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    if let Ok(entries) = fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let candidate = entry.path();
+            if candidate != current
+                && parse_versioned_server_socket_name(&candidate).is_some()
+                && seen.insert(candidate.clone())
+            {
+                candidates.push(candidate);
+            }
+        }
+    }
+    let client_instances_dir = parent.join("client-instances");
+    if let Ok(entries) = fs::read_dir(client_instances_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(socket_name) = name.rsplit("--").next() else {
+                continue;
+            };
+            let Some(socket_name) = socket_name
+                .find("server-")
+                .map(|offset| &socket_name[offset..])
+            else {
+                continue;
+            };
+            let Some(socket_stem) = socket_name.strip_suffix("-sock") else {
+                continue;
+            };
+            let candidate = parent.join(format!("{socket_stem}.sock"));
+            if candidate != current
+                && parse_versioned_server_socket_name(&candidate).is_some()
+                && seen.insert(candidate.clone())
+            {
+                candidates.push(candidate);
+            }
+        }
+    }
+    candidates.sort();
+    candidates
+}
+
+#[cfg(unix)]
+fn refresh_legacy_server_socket_aliases(current: &Path) {
+    let Some(current_version) = parse_versioned_server_socket_name(current) else {
+        return;
+    };
+    for candidate in versioned_server_socket_alias_candidates(current) {
+        let Some(candidate_version) = parse_versioned_server_socket_name(&candidate) else {
+            continue;
+        };
+        if candidate_version == current_version {
+            continue;
+        }
+        if ping(&ServerEndpoint::UnixSocket(candidate.clone())).is_ok() {
+            continue;
+        }
+        let _ = fs::remove_file(&candidate);
+        let _ = std::os::unix::fs::symlink(current, &candidate);
+    }
+}
+
+#[cfg(unix)]
+fn server_socket_path_lexists(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
 
 fn uses_runtime_owned_terminal_path(path: &str) -> bool {
     path.starts_with("remote-session://") || path.starts_with("codex-runtime://")
@@ -330,6 +455,8 @@ impl DaemonRuntime {
             // Do not block daemon boot on active terminal launch. Bind the control socket first,
             // then let explicit terminal-open requests or later recovery drive runtime startup.
             server.restore_persisted_state_with_launch_policy(saved, Some(&store), false);
+            // Rewrite migrated state immediately so stale unrecoverable sessions do not linger on disk.
+            write_persisted_state(&state_path, &server.persisted_state())?;
         }
         let runtime = Self {
             support,
@@ -383,14 +510,41 @@ impl DaemonRuntime {
         }
     }
 
-    fn snapshot_response(&self, message: Option<String>) -> ServerResponse {
-        ServerResponse::Snapshot {
-            snapshot: self.server.snapshot(),
-            message,
+    fn overlay_terminal_runtime_snapshot_session(&self, session: &mut SnapshotSessionView) {
+        let runtime_path = self.terminal_runtime_key_for_path(&session.session_path);
+        session.terminal_process_id = self.terminals.session_process_id(&runtime_path);
+        session.terminal_foreground_active = self
+            .terminals
+            .session_foreground_process_active(&runtime_path);
+        if matches!(
+            session.kind,
+            SessionKind::Shell | SessionKind::Codex | SessionKind::CodexLiteLlm
+        ) && let Some(screen_text) = self.terminals.session_screen_snapshot(&runtime_path)
+            && let Some((status_line, terminal_lines)) =
+                terminal_sidebar_snapshot_from_screen(&screen_text)
+        {
+            session.status_line = status_line;
+            session.terminal_lines = terminal_lines;
         }
     }
 
+    fn snapshot_response(&self, message: Option<String>) -> ServerResponse {
+        let mut snapshot = self.server.snapshot();
+        if let Some(active_session) = snapshot.active_session.as_mut() {
+            self.overlay_terminal_runtime_snapshot_session(active_session);
+        }
+        for session in &mut snapshot.live_sessions {
+            self.overlay_terminal_runtime_snapshot_session(session);
+        }
+        ServerResponse::Snapshot { snapshot, message }
+    }
+
+    fn terminal_runtime_key_for_path(&self, path: &str) -> String {
+        self.server.terminal_runtime_key_for_path(path)
+    }
+
     fn ensure_terminal_for_path(&mut self, path: &str) -> Result<Option<String>> {
+        let runtime_path = self.terminal_runtime_key_for_path(path);
         let prepare_message = self.server.ensure_managed_cli_for_session_path(path)?;
         if path.starts_with("remote-session://")
             && let Ok(home) = crate::resolve_yggterm_home()
@@ -505,12 +659,15 @@ impl DaemonRuntime {
         } else {
             None
         };
-        if self.terminals.has_session(path) {
-            let still_running = self.terminals.session_is_running(path);
-            let has_runtime_output = self.terminals.session_has_runtime_output(path);
-            let runtime_age_ms = self.terminals.session_runtime_age_ms(path).unwrap_or(0);
+        if self.terminals.has_session(&runtime_path) {
+            let still_running = self.terminals.session_is_running(&runtime_path);
+            let has_runtime_output = self.terminals.session_has_runtime_output(&runtime_path);
+            let runtime_age_ms = self
+                .terminals
+                .session_runtime_age_ms(&runtime_path)
+                .unwrap_or(0);
             let runtime_snapshot = if path.starts_with("remote-session://") && has_runtime_output {
-                self.terminals.session_snapshot(path)
+                self.terminals.session_snapshot(&runtime_path)
             } else {
                 None
             };
@@ -526,7 +683,7 @@ impl DaemonRuntime {
             let remote_runtime_output_requires_restart = has_runtime_output
                 && self
                     .terminals
-                    .read(path, 0)
+                    .read(&runtime_path, 0)
                     .map(|stream| {
                         let snapshot = stream
                             .chunks
@@ -542,10 +699,14 @@ impl DaemonRuntime {
                     runtime_age_ms,
                     remote_runtime_output_requires_restart,
                 );
+            let blank_remote_attach = path.starts_with("remote-session://")
+                && !has_runtime_output
+                && runtime_age_ms >= 1_500;
             let spec_matches =
                 self.terminals
-                    .session_matches_spec(path, &launch_command, cwd.as_deref());
-            let needs_restart = !still_running || stale_remote_attach || !spec_matches;
+                    .session_matches_spec(&runtime_path, &launch_command, cwd.as_deref());
+            let needs_restart =
+                !still_running || stale_remote_attach || blank_remote_attach || !spec_matches;
             if let Ok(home) = crate::resolve_yggterm_home() {
                 append_trace_event(
                     &home,
@@ -559,6 +720,7 @@ impl DaemonRuntime {
                         "runtime_age_ms": runtime_age_ms,
                         "remote_runtime_output_requires_restart": remote_runtime_output_requires_restart,
                         "stale_remote_attach": stale_remote_attach,
+                        "blank_remote_attach": blank_remote_attach,
                         "runtime_saved_session_mismatch": runtime_saved_session_mismatch,
                         "spec_matches": spec_matches,
                         "remote_resume_path": path.starts_with("remote-session://"),
@@ -580,7 +742,7 @@ impl DaemonRuntime {
                             }),
                         );
                     }
-                    self.terminals.seed_session(path, prefill)?;
+                    self.terminals.seed_session(&runtime_path, prefill)?;
                 }
                 return Ok(prepare_message);
             }
@@ -601,7 +763,7 @@ impl DaemonRuntime {
                     );
                 }
                 self.terminals.restart_session(
-                    path,
+                    &runtime_path,
                     &launch_command,
                     cwd.as_deref(),
                     stop_command.as_deref(),
@@ -618,7 +780,7 @@ impl DaemonRuntime {
                     );
                 }
                 if let Some(prefill) = seed_prefill.as_deref() {
-                    self.terminals.seed_session(path, prefill)?;
+                    self.terminals.seed_session(&runtime_path, prefill)?;
                 }
             }
             return Ok(prepare_message);
@@ -637,7 +799,7 @@ impl DaemonRuntime {
             );
         }
         self.terminals
-            .ensure_session(path, &launch_command, cwd.as_deref())?;
+            .ensure_session(&runtime_path, &launch_command, cwd.as_deref())?;
         if let Ok(home) = crate::resolve_yggterm_home() {
             append_trace_event(
                 &home,
@@ -650,7 +812,7 @@ impl DaemonRuntime {
             );
         }
         if let Some(prefill) = seed_prefill.as_deref() {
-            self.terminals.seed_session(path, prefill)?;
+            self.terminals.seed_session(&runtime_path, prefill)?;
         }
         Ok(prepare_message)
     }
@@ -664,15 +826,7 @@ impl DaemonRuntime {
     }
 
     fn persist(&self) -> Result<()> {
-        if let Some(parent) = self.state_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating daemon state dir {}", parent.display()))?;
-        }
-        let state = self.server.persisted_state();
-        let json = serde_json::to_string_pretty(&state).context("serializing daemon state")?;
-        fs::write(&self.state_path, json)
-            .with_context(|| format!("writing daemon state {}", self.state_path.display()))?;
-        Ok(())
+        write_persisted_state(&self.state_path, &self.server.persisted_state())
     }
 
     fn handle_request(&mut self, request: ServerRequest) -> Result<ServerResponse> {
@@ -846,6 +1000,15 @@ impl DaemonRuntime {
                 }))
             }
             ServerRequest::RemoveSession { path } => {
+                let remote_target = self.server.remote_shutdown_target_for_path(&path);
+                if let Some((machine, session_id)) = remote_target.as_ref() {
+                    terminate_remote_codex_session(machine, session_id).with_context(|| {
+                        format!(
+                            "failed to terminate remote session {} on {} before removal",
+                            session_id, machine.ssh_target
+                        )
+                    })?;
+                }
                 let stop_command = self.server.terminal_stop_command(&path);
                 let removed_terminal = self
                     .terminals
@@ -872,22 +1035,26 @@ impl DaemonRuntime {
                     cwd.as_deref(),
                     title_hint.as_deref(),
                 );
+                if self.server.active_session_supports_terminal() {
+                    self.ensure_terminal_for_active()?;
+                }
                 self.persist()?;
                 self.snapshot_response(Some(format!("started {key}")))
             }
             ServerRequest::SwitchAgentSessionMode { path, session_kind } => {
+                let runtime_path = self.terminal_runtime_key_for_path(&path);
                 if self
                     .terminals
-                    .recent_activity(&path, std::time::Duration::from_secs(4))
+                    .recent_activity(&runtime_path, std::time::Duration::from_secs(4))
                 {
                     bail!("session is still active; wait for it to settle before switching modes");
                 }
                 let stop_command = self.server.terminal_stop_command(&path);
                 self.server.switch_agent_session_mode(&path, session_kind)?;
                 if let Some((launch_command, cwd)) = self.server.terminal_spec(&path) {
-                    if self.terminals.has_session(&path) {
+                    if self.terminals.has_session(&runtime_path) {
                         self.terminals.restart_session(
-                            &path,
+                            &runtime_path,
                             &launch_command,
                             cwd.as_deref(),
                             stop_command.as_deref(),
@@ -918,6 +1085,9 @@ impl DaemonRuntime {
                     &launch_command,
                     source_label.as_deref(),
                 );
+                if self.server.active_session_supports_terminal() {
+                    self.ensure_terminal_for_active()?;
+                }
                 self.persist()?;
                 self.snapshot_response(Some(format!("started {key}")))
             }
@@ -1008,9 +1178,10 @@ impl DaemonRuntime {
                 ServerResponse::Ack { message }
             }
             ServerRequest::TerminalRead { path, cursor } => {
+                let runtime_path = self.terminal_runtime_key_for_path(&path);
                 if uses_runtime_owned_terminal_path(&path)
-                    && self.terminals.session_hit_eof_without_output(&path)
-                    && !self.terminals.session_has_runtime_output(&path)
+                    && self.terminals.session_hit_eof_without_output(&runtime_path)
+                    && !self.terminals.session_has_runtime_output(&runtime_path)
                     && let Some((stored_launch_command, cwd)) = self.server.terminal_spec(&path)
                 {
                     // Runtime-owned terminals must stay on their stored daemon-owned launch path.
@@ -1026,18 +1197,19 @@ impl DaemonRuntime {
                             "restart_before_read",
                             serde_json::json!({
                                 "path": path,
+                                "runtime_path": runtime_path,
                                 "reason": "eof_without_output",
                             }),
                         );
                     }
                     self.terminals.restart_session(
-                        &path,
+                        &runtime_path,
                         &launch_command,
                         cwd.as_deref(),
                         stop_command.as_deref(),
                     )?;
                 }
-                let stream = self.terminals.read(&path, cursor)?;
+                let stream = self.terminals.read(&runtime_path, cursor)?;
                 ServerResponse::TerminalStream {
                     cursor: stream.cursor,
                     chunks: stream
@@ -1054,22 +1226,25 @@ impl DaemonRuntime {
                 }
             }
             ServerRequest::TerminalSnapshot { path } => {
+                let runtime_path = self.terminal_runtime_key_for_path(&path);
                 let text = self
                     .terminals
-                    .session_screen_snapshot(&path)
+                    .session_screen_snapshot(&runtime_path)
                     .unwrap_or_default();
                 ServerResponse::TerminalSnapshot {
                     text,
-                    running: self.terminals.session_is_running(&path),
-                    runtime_output_seen: self.terminals.session_has_runtime_output(&path),
+                    running: self.terminals.session_is_running(&runtime_path),
+                    runtime_output_seen: self.terminals.session_has_runtime_output(&runtime_path),
                 }
             }
             ServerRequest::TerminalWrite { path, data } => {
-                self.terminals.write(&path, &data)?;
+                let runtime_path = self.terminal_runtime_key_for_path(&path);
+                self.terminals.write(&runtime_path, &data)?;
                 ServerResponse::Ack { message: None }
             }
             ServerRequest::TerminalResize { path, cols, rows } => {
-                self.terminals.resize(&path, cols, rows)?;
+                let runtime_path = self.terminal_runtime_key_for_path(&path);
+                self.terminals.resize(&runtime_path, cols, rows)?;
                 ServerResponse::Ack { message: None }
             }
             ServerRequest::SyncExternalWindow => {
@@ -2220,7 +2395,7 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
 
     #[cfg(unix)]
     if let ServerEndpoint::UnixSocket(path) = endpoint {
-        if path.exists() {
+        if server_socket_path_lexists(path) {
             match fs::remove_file(path) {
                 Ok(()) => {}
                 Err(error) => {
@@ -2234,6 +2409,7 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
         }
         let listener = std::os::unix::net::UnixListener::bind(path)
             .with_context(|| format!("binding server socket {}", path.display()))?;
+        refresh_legacy_server_socket_aliases(path);
         listener
             .set_nonblocking(true)
             .context("setting daemon unix listener nonblocking")?;
@@ -2434,15 +2610,35 @@ fn linux_proc_pid_age_ms(pid: u32) -> Option<u64> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_proc_yggterm_home(proc_path: &Path) -> Option<PathBuf> {
-    let environ = fs::read(proc_path.join("environ")).ok()?;
-    environ
+fn linux_yggterm_home_from_environ_bytes(environ: &[u8]) -> Option<PathBuf> {
+    let mut home = None::<PathBuf>;
+    for part in environ
         .split(|byte| *byte == 0)
         .filter(|part| !part.is_empty())
-        .find_map(|part| {
-            let item = String::from_utf8_lossy(part);
-            item.strip_prefix("YGGTERM_HOME=").map(PathBuf::from)
-        })
+    {
+        let item = String::from_utf8_lossy(part);
+        if let Some(value) = item.strip_prefix("YGGTERM_HOME=") {
+            return Some(PathBuf::from(value));
+        }
+        if let Some(value) = item.strip_prefix("HOME=") {
+            home = Some(PathBuf::from(value));
+        }
+    }
+    home.map(|path| path.join(".yggterm"))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proc_yggterm_home(proc_path: &Path) -> Option<PathBuf> {
+    let environ = fs::read(proc_path.join("environ")).ok()?;
+    linux_yggterm_home_from_environ_bytes(&environ)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proc_state(proc_path: &Path) -> Option<char> {
+    let stat = fs::read_to_string(proc_path.join("stat")).ok()?;
+    stat.split_once(") ")
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .and_then(|state| state.chars().next())
 }
 
 #[cfg(target_os = "linux")]
@@ -2464,20 +2660,6 @@ fn linux_socket_inode(path: &Path) -> Option<u64> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_process_has_socket_inode(pid: u32, inode: u64) -> bool {
-    let fd_dir = PathBuf::from(format!("/proc/{pid}/fd"));
-    let Ok(entries) = fs::read_dir(fd_dir) else {
-        return false;
-    };
-    let target = format!("socket:[{inode}]");
-    entries.flatten().any(|entry| {
-        fs::read_link(entry.path())
-            .ok()
-            .is_some_and(|link| link.to_string_lossy() == target)
-    })
-}
-
-#[cfg(target_os = "linux")]
 fn cleanup_legacy_linux_daemon_processes(
     endpoint: &ServerEndpoint,
     current_exe: &Path,
@@ -2493,6 +2675,63 @@ fn cleanup_legacy_linux_daemon_processes(
         #[cfg(unix)]
         ServerEndpoint::UnixSocket(path) => linux_socket_inode(path),
         ServerEndpoint::Tcp { .. } => None,
+    };
+    let (same_home_daemon_count, oldest_same_home_pid) = if let Some(home) = current_home.as_deref()
+    {
+        let mut count = 0usize;
+        let mut oldest_pid = None::<(u64, u32)>;
+        let entries =
+            fs::read_dir("/proc").context("reading /proc for same-home daemon counting")?;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(pid_str) = name.to_str() else {
+                continue;
+            };
+            if !pid_str.chars().all(|ch| ch.is_ascii_digit()) {
+                continue;
+            }
+            let proc_path = entry.path();
+            if linux_proc_state(&proc_path) == Some('Z') {
+                continue;
+            }
+            let Ok(bytes) = fs::read(proc_path.join("cmdline")) else {
+                continue;
+            };
+            if bytes.is_empty() {
+                continue;
+            }
+            let parts = bytes
+                .split(|byte| *byte == 0)
+                .filter(|part| !part.is_empty())
+                .map(|part| String::from_utf8_lossy(part).to_string())
+                .collect::<Vec<_>>();
+            if parts.is_empty() {
+                continue;
+            }
+            let is_daemon = parts[0].contains("yggterm")
+                && parts.iter().any(|part| part == "server")
+                && parts.iter().any(|part| part == "daemon");
+            if !is_daemon {
+                continue;
+            }
+            if linux_proc_yggterm_home(&proc_path).as_deref() == Some(home) {
+                count += 1;
+                let age_ms =
+                    linux_proc_pid_age_ms(pid_str.parse::<u32>().unwrap_or(0)).unwrap_or_default();
+                let pid = pid_str.parse::<u32>().unwrap_or(0);
+                if pid > 0
+                    && oldest_pid.is_none_or(|(oldest_age_ms, oldest_pid_value)| {
+                        age_ms > oldest_age_ms
+                            || (age_ms == oldest_age_ms && pid < oldest_pid_value)
+                    })
+                {
+                    oldest_pid = Some((age_ms, pid));
+                }
+            }
+        }
+        (count, oldest_pid.map(|(_, pid)| pid))
+    } else {
+        (0, None)
     };
     let mut daemon_candidates = 0usize;
     let mut killed_legacy = 0usize;
@@ -2513,6 +2752,10 @@ fn cleanup_legacy_linux_daemon_processes(
             continue;
         }
         let proc_path = entry.path();
+        if linux_proc_state(&proc_path) == Some('Z') {
+            continue;
+        }
+        let proc_exe_target = fs::read_link(proc_path.join("exe")).ok();
         let cmdline_path = entry.path().join("cmdline");
         let Ok(bytes) = fs::read(&cmdline_path) else {
             continue;
@@ -2542,14 +2785,16 @@ fn cleanup_legacy_linux_daemon_processes(
             .and_then(|home| active_client_instance_records(home, &default_endpoint(home)).ok())
             .is_some_and(|records| !records.is_empty());
         let age_ms = linux_proc_pid_age_ms(pid).unwrap_or_default();
-        let is_legacy_binary = argv0 != &current_exe;
+        let is_legacy_binary =
+            daemon_binary_is_legacy(&current_exe, argv0, proc_exe_target.as_deref());
         let is_orphan_clientless = !has_clients
             && age_ms >= reap_after_ms
             && daemon_home.as_deref() != current_home.as_deref();
-        let is_duplicate_same_home = daemon_home.as_deref() == current_home.as_deref()
+        let is_duplicate_same_home = same_home_daemon_count > 1
+            && daemon_home.as_deref() == current_home.as_deref()
+            && Some(pid) != oldest_same_home_pid
             && age_ms >= DUPLICATE_SAME_HOME_GRACE_MS
-            && current_socket_inode
-                .is_some_and(|inode| !linux_process_has_socket_inode(pid, inode));
+            && !has_clients;
         if is_legacy_binary || is_orphan_clientless || is_duplicate_same_home {
             terminate_linux_process(pid);
             if is_legacy_binary {
@@ -2572,6 +2817,8 @@ fn cleanup_legacy_linux_daemon_processes(
                 "killed_legacy": killed_legacy,
                 "killed_orphan": killed_orphan,
                 "killed_duplicate_same_home": killed_duplicate_same_home,
+                "same_home_daemon_count": same_home_daemon_count,
+                "oldest_same_home_pid": oldest_same_home_pid,
                 "reap_after_ms": reap_after_ms,
                 "current_socket_inode": current_socket_inode,
             }),
@@ -2605,6 +2852,16 @@ fn load_persisted_state(path: &Path) -> Result<Option<PersistedDaemonState>> {
     let state = serde_json::from_str(&json)
         .with_context(|| format!("parsing daemon state {}", path.display()))?;
     Ok(Some(state))
+}
+
+fn write_persisted_state(path: &Path, state: &PersistedDaemonState) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating daemon state dir {}", parent.display()))?;
+    }
+    let json = serde_json::to_string_pretty(state).context("serializing daemon state")?;
+    fs::write(path, json).with_context(|| format!("writing daemon state {}", path.display()))?;
+    Ok(())
 }
 
 fn write_response<W: Write>(writer: &mut W, response: &ServerResponse) -> Result<()> {
@@ -2737,13 +2994,134 @@ fn send_request(endpoint: &ServerEndpoint, request: &ServerRequest) -> Result<Se
 
 #[cfg(test)]
 mod tests {
+    use super::terminal_sidebar_snapshot_from_screen;
+    use std::fs;
+    use std::path::Path;
+
     use super::collect_remote_copy_candidates;
+    #[cfg(target_os = "linux")]
+    use super::linux_yggterm_home_from_environ_bytes;
+    use super::load_persisted_state;
     use super::remote_resume_stale_attach;
     use super::terminal_launch_command_for_path;
-    use crate::{
-        RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession,
-        remote_scanned_session_path,
+    use super::write_persisted_state;
+    #[cfg(unix)]
+    use super::{
+        daemon_binary_is_legacy, parse_versioned_server_socket_name,
+        versioned_server_socket_alias_candidates,
     };
+    use crate::{
+        PersistedDaemonState, PersistedLiveSession, RemoteDeployState, RemoteMachineHealth,
+        RemoteMachineSnapshot, RemoteScannedSession, remote_scanned_session_path,
+    };
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_versioned_server_socket_name_accepts_semver_socket_names() {
+        let parsed = parse_versioned_server_socket_name(Path::new("/tmp/server-2-1-5.sock"));
+        assert_eq!(parsed, Some((2, 1, 5)));
+        assert_eq!(
+            parse_versioned_server_socket_name(Path::new("/tmp/server.sock")),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn versioned_server_socket_alias_candidates_include_client_instance_versions() {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-daemon-alias-test-{}-{}",
+            std::process::id(),
+            super::current_millis()
+        ));
+        let sockets_dir = root.join("home").join(".yggterm");
+        let client_instances = sockets_dir.join("client-instances");
+        fs::create_dir_all(&client_instances).expect("create client instances dir");
+        let current = sockets_dir.join("server-2-1-5.sock");
+        fs::write(&current, b"").expect("write current socket placeholder");
+        fs::create_dir_all(client_instances.join("unix--home-pi--yggterm-server-2-1-4-sock"))
+            .expect("create old instance dir");
+
+        let candidates = versioned_server_socket_alias_candidates(&current);
+
+        assert!(candidates.contains(&sockets_dir.join("server-2-1-4.sock")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn daemon_binary_is_legacy_for_deleted_proc_exe_target() {
+        let current = "/home/pi/.yggterm/bin/yggterm";
+        assert!(daemon_binary_is_legacy(
+            current,
+            current,
+            Some(Path::new("/home/pi/.yggterm/bin/yggterm (deleted)")),
+        ));
+        assert!(!daemon_binary_is_legacy(
+            current,
+            current,
+            Some(Path::new("/home/pi/.yggterm/bin/yggterm")),
+        ));
+        assert!(daemon_binary_is_legacy(
+            current,
+            "/tmp/old-yggterm",
+            Some(Path::new("/tmp/old-yggterm")),
+        ));
+    }
+
+    #[test]
+    fn write_persisted_state_creates_parent_and_round_trips() {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-daemon-state-roundtrip-{}-{}",
+            std::process::id(),
+            super::current_millis()
+        ));
+        let state_path = root.join("nested").join("server-state.json");
+        let expected = PersistedDaemonState {
+            active_session_path: Some("remote-session://jojo/demo".to_string()),
+            active_view_mode: super::WorkspaceViewMode::Terminal,
+            ssh_targets: Vec::new(),
+            remote_machines: Vec::new(),
+            stored_sessions: Vec::new(),
+            live_sessions: vec![PersistedLiveSession {
+                key: "remote-session://jojo/demo".to_string(),
+                id: "demo".to_string(),
+                title: "Demo".to_string(),
+                kind: super::SessionKind::Codex,
+                ssh_target: "jojo".to_string(),
+                prefix: None,
+                cwd: Some("/home/pi".to_string()),
+            }],
+        };
+
+        write_persisted_state(&state_path, &expected).expect("write daemon state");
+        let loaded = load_persisted_state(&state_path)
+            .expect("load daemon state")
+            .expect("persisted daemon state");
+        assert_eq!(loaded.active_session_path, expected.active_session_path);
+        assert_eq!(loaded.live_sessions, expected.live_sessions);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn terminal_sidebar_snapshot_from_screen_prefers_non_empty_tail() {
+        let snapshot = "\npi@dev:~/gh/yggterm$ sleep 3\npi@dev:~/gh/yggterm$ \n";
+        let (status_line, terminal_lines) =
+            terminal_sidebar_snapshot_from_screen(snapshot).expect("screen snapshot");
+        assert_eq!(status_line, "pi@dev:~/gh/yggterm$");
+        assert_eq!(
+            terminal_lines,
+            vec![
+                "pi@dev:~/gh/yggterm$ sleep 3".to_string(),
+                "pi@dev:~/gh/yggterm$".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn terminal_sidebar_snapshot_from_screen_returns_none_for_blank_surface() {
+        assert_eq!(terminal_sidebar_snapshot_from_screen("\n  \n\r\n"), None);
+    }
 
     #[test]
     fn collect_remote_copy_candidates_do_not_clone_machine_session_lists() {
@@ -2907,5 +3285,25 @@ mod tests {
         assert!(!remote_resume_stale_attach(true, 3_500, false));
         assert!(remote_resume_stale_attach(false, 901, false));
         assert!(remote_resume_stale_attach(true, 3_500, true));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_yggterm_home_from_environ_prefers_explicit_override() {
+        let env = b"HOME=/home/pi\0YGGTERM_HOME=/tmp/yggterm-test\0";
+        assert_eq!(
+            linux_yggterm_home_from_environ_bytes(env),
+            Some(std::path::PathBuf::from("/tmp/yggterm-test"))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_yggterm_home_from_environ_falls_back_to_default_home_dir() {
+        let env = b"HOME=/home/pi\0DISPLAY=:10\0";
+        assert_eq!(
+            linux_yggterm_home_from_environ_bytes(env),
+            Some(std::path::PathBuf::from("/home/pi/.yggterm"))
+        );
     }
 }
