@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::io::Read;
 use std::io::Write;
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,20 +15,21 @@ use yggterm_core::{
     install_release_update, refresh_desktop_integration,
 };
 use yggterm_server::{
-    AppControlPreviewLayout, AppControlViewMode, PersistedDaemonState,
+    AppControlPreviewLayout, AppControlRightPanelMode, AppControlViewMode, PersistedDaemonState,
     ProbeTerminalViewportInputMode, SessionKind, YggtermServer, cleanup_legacy_daemons,
-    default_endpoint, detect_ghostty_host, ping, run_app_control_create_terminal,
-    run_app_control_describe_rows, run_app_control_describe_state, run_app_control_drag,
-    run_app_control_dump_state, run_app_control_focus_window, run_app_control_list_clients,
-    run_app_control_open_path, run_app_control_probe_terminal_viewport_input,
-    run_app_control_probe_terminal_viewport_scroll, run_app_control_probe_terminal_viewport_select,
-    run_app_control_remove_session, run_app_control_scroll_preview,
-    run_app_control_send_terminal_input, run_app_control_set_fullscreen,
-    run_app_control_set_main_zoom, run_app_control_set_maximized,
-    run_app_control_set_preview_layout, run_app_control_set_row_expanded,
-    run_app_control_set_search, run_app_control_set_ui_theme, run_attach, run_daemon,
-    run_screenrecord_capture, run_screenshot_capture, run_trace_bundle, run_trace_follow,
-    run_trace_tail, shutdown, snapshot, start_local_session, status, try_run_remote_server_command,
+    default_endpoint, detect_ghostty_host, ensure_local_daemon_running, ping,
+    run_app_control_create_terminal, run_app_control_describe_rows, run_app_control_describe_state,
+    run_app_control_drag, run_app_control_dump_state, run_app_control_focus_window,
+    run_app_control_list_clients, run_app_control_open_path,
+    run_app_control_probe_terminal_viewport_input, run_app_control_probe_terminal_viewport_scroll,
+    run_app_control_probe_terminal_viewport_select, run_app_control_remove_session,
+    run_app_control_scroll_preview, run_app_control_send_terminal_input,
+    run_app_control_set_fullscreen, run_app_control_set_main_zoom, run_app_control_set_maximized,
+    run_app_control_set_preview_layout, run_app_control_set_right_panel_mode,
+    run_app_control_set_row_expanded, run_app_control_set_search, run_app_control_set_ui_theme,
+    run_attach, run_daemon, run_screenrecord_capture, run_screenshot_capture, run_trace_bundle,
+    run_trace_follow, run_trace_tail, shutdown, snapshot, start_local_session, status,
+    try_run_remote_server_command,
 };
 use yggterm_shell::{ShellBootstrap, launch_shell, start_daemon_watchdog, warm_daemon_start};
 use yggui_contract::UiTheme;
@@ -38,6 +41,28 @@ const ENV_YGGTERM_ENABLE_ACCESSIBILITY: &str = "YGGTERM_ENABLE_ACCESSIBILITY";
 const ENV_YGGTERM_ENABLE_WEBKIT_COMPOSITING: &str = "YGGTERM_ENABLE_WEBKIT_COMPOSITING";
 const ENV_YGGTERM_ALLOW_MULTI_WINDOW: &str = "YGGTERM_ALLOW_MULTI_WINDOW";
 const ENV_YGGTERM_ENABLE_TRANSPARENT_WINDOW: &str = "YGGTERM_ENABLE_TRANSPARENT_WINDOW";
+const ENV_MALLOC_ARENA_MAX: &str = "MALLOC_ARENA_MAX";
+
+fn configure_linux_allocator_limits() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        const ARENA_MAX: libc::c_int = 2;
+        if std::env::var_os(ENV_MALLOC_ARENA_MAX).is_none() {
+            let exe =
+                std::env::current_exe().context("locating yggterm binary for allocator re-exec")?;
+            let mut command = Command::new(exe);
+            command
+                .args(std::env::args_os().skip(1))
+                .env(ENV_MALLOC_ARENA_MAX, ARENA_MAX.to_string());
+            let error = command.exec();
+            return Err(anyhow::anyhow!(
+                "re-execing yggterm with allocator limits failed: {error}"
+            ));
+        }
+        let _ = unsafe { libc::mallopt(libc::M_ARENA_MAX, ARENA_MAX) };
+    }
+    Ok(())
+}
 
 fn cli_positional_args(args: &[String], start: usize) -> Vec<&str> {
     let mut positional = Vec::new();
@@ -118,7 +143,13 @@ fn print_server_help() {
     );
 }
 
+fn ensure_local_server_ready_for_cli(store: &SessionStore) -> Result<()> {
+    let endpoint = default_endpoint(store.home_dir());
+    ensure_local_daemon_running(&endpoint)
+}
+
 fn main() -> Result<()> {
+    configure_linux_allocator_limits()?;
     configure_linux_accessibility_bridge();
     configure_linux_webkit_compositing();
     tracing_subscriber::fmt()
@@ -244,6 +275,7 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             BuiltinCliCommand::ServerSnapshot => {
+                ensure_local_server_ready_for_cli(&store)?;
                 let endpoint = default_endpoint(store.home_dir());
                 let (snapshot, _) = snapshot(&endpoint)?;
                 println!("{}", serde_json::to_string_pretty(&snapshot)?);
@@ -405,6 +437,21 @@ fn main() -> Result<()> {
                     "clear" => run_app_control_set_search("", Some(false), timeout_ms),
                     other => anyhow::bail!("unsupported app search action: {other}"),
                 }
+            }
+            "panel" | "right-panel" => {
+                let mode = cli_positional_args(&args, 3)
+                    .into_iter()
+                    .next()
+                    .unwrap_or("hidden");
+                let mode = match mode {
+                    "hidden" | "hide" | "close" | "none" => AppControlRightPanelMode::Hidden,
+                    "connect" => AppControlRightPanelMode::Connect,
+                    "notifications" | "notification" => AppControlRightPanelMode::Notifications,
+                    "settings" => AppControlRightPanelMode::Settings,
+                    "metadata" | "session-metadata" => AppControlRightPanelMode::Metadata,
+                    other => anyhow::bail!("unsupported app right panel mode: {other}"),
+                };
+                run_app_control_set_right_panel_mode(mode, timeout_ms)
             }
             "theme" => {
                 let theme = cli_positional_args(&args, 3)
@@ -655,12 +702,14 @@ fn main() -> Result<()> {
         return Ok(());
     }
     if args.as_slice() == ["server", "ping"] {
+        ensure_local_server_ready_for_cli(&store)?;
         let endpoint = default_endpoint(store.home_dir());
         ping(&endpoint)?;
         println!("pong");
         return Ok(());
     }
     if args.as_slice() == ["server", "status"] {
+        ensure_local_server_ready_for_cli(&store)?;
         let endpoint = default_endpoint(store.home_dir());
         let runtime = status(&endpoint)?;
         println!("{}", serde_json::to_string_pretty(&runtime)?);
@@ -967,6 +1016,24 @@ fn signal_client_instances_dir(
         .join(signal_client_instance_scope(endpoint))
 }
 
+fn signal_client_instance_dirs_for_scan(
+    home_dir: &std::path::Path,
+    endpoint: &yggterm_server::ServerEndpoint,
+) -> Vec<std::path::PathBuf> {
+    let current = signal_client_instances_dir(home_dir, endpoint);
+    let root = home_dir.join("client-instances");
+    let mut dirs = vec![current.clone()];
+    if let Ok(entries) = fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path != current && path.is_dir() {
+                dirs.push(path);
+            }
+        }
+    }
+    dirs
+}
+
 fn maybe_focus_existing_client(home_dir: &std::path::Path, args: &[String]) -> Result<()> {
     if !args.is_empty()
         || std::env::var_os(ENV_YGGTERM_ALLOW_MULTI_WINDOW).is_some()
@@ -1103,58 +1170,60 @@ fn unregister_signal_client_instance(
     home_dir: &std::path::Path,
     endpoint: &yggterm_server::ServerEndpoint,
 ) -> Result<usize> {
-    let dir = signal_client_instances_dir(home_dir, endpoint);
-    fs::create_dir_all(&dir)?;
     let current_pid = std::process::id();
-    let entries = fs::read_dir(&dir)
-        .with_context(|| format!("reading client instances {}", dir.display()))?;
-    let mut remaining = 0_usize;
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        let Some(pid) = signal_parse_client_pid(&path) else {
-            let _ = fs::remove_file(&path);
-            continue;
-        };
-        if pid == current_pid {
-            let _ = fs::remove_file(&path);
-            continue;
-        }
-        if signal_record_matches_live_process(pid, &path) {
-            remaining += 1;
-        } else {
-            let _ = fs::remove_file(&path);
+    let mut remaining_pids = std::collections::BTreeSet::new();
+    for dir in signal_client_instance_dirs_for_scan(home_dir, endpoint) {
+        fs::create_dir_all(&dir)?;
+        let entries = fs::read_dir(&dir)
+            .with_context(|| format!("reading client instances {}", dir.display()))?;
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let Some(pid) = signal_parse_client_pid(&path) else {
+                let _ = fs::remove_file(&path);
+                continue;
+            };
+            if pid == current_pid {
+                let _ = fs::remove_file(&path);
+                continue;
+            }
+            if signal_record_matches_live_process(pid, &path) {
+                remaining_pids.insert(pid);
+            } else {
+                let _ = fs::remove_file(&path);
+            }
         }
     }
-    Ok(remaining)
+    Ok(remaining_pids.len())
 }
 
 fn compatible_signal_client_count(
     home_dir: &std::path::Path,
     endpoint: &yggterm_server::ServerEndpoint,
 ) -> Result<usize> {
-    let dir = signal_client_instances_dir(home_dir, endpoint);
-    fs::create_dir_all(&dir)?;
-    let entries = fs::read_dir(&dir)
-        .with_context(|| format!("reading client instances {}", dir.display()))?;
     let current_scope = current_signal_client_scope();
-    let mut live = 0_usize;
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        let Some(pid) = signal_parse_client_pid(&path) else {
-            let _ = fs::remove_file(&path);
-            continue;
-        };
-        if !signal_record_matches_live_process(pid, &path) {
-            let _ = fs::remove_file(&path);
-            continue;
-        }
-        if signal_client_scope_matches_pid(pid, &path, &current_scope) {
-            live += 1;
+    let mut live = std::collections::BTreeSet::new();
+    for dir in signal_client_instance_dirs_for_scan(home_dir, endpoint) {
+        fs::create_dir_all(&dir)?;
+        let entries = fs::read_dir(&dir)
+            .with_context(|| format!("reading client instances {}", dir.display()))?;
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let Some(pid) = signal_parse_client_pid(&path) else {
+                let _ = fs::remove_file(&path);
+                continue;
+            };
+            if !signal_record_matches_live_process(pid, &path) {
+                let _ = fs::remove_file(&path);
+                continue;
+            }
+            if signal_client_scope_matches_pid(pid, &path, &current_scope) {
+                live.insert(pid);
+            }
         }
     }
-    Ok(live)
+    Ok(live.len())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1209,7 +1278,7 @@ fn read_signal_process_start_ticks_from_record(path: &std::path::Path) -> Option
 fn read_signal_client_scope_from_record(path: &std::path::Path) -> Option<SignalClientScope> {
     let payload = fs::read(path).ok()?;
     let value = serde_json::from_slice::<serde_json::Value>(&payload).ok()?;
-    Some(SignalClientScope {
+    let scope = SignalClientScope {
         display: value
             .get("display")
             .and_then(serde_json::Value::as_str)
@@ -1235,7 +1304,17 @@ fn read_signal_client_scope_from_record(path: &std::path::Path) -> Option<Signal
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
             .filter(|value| !value.is_empty()),
-    })
+    };
+    if scope.display.is_none()
+        && scope.wayland_display.is_none()
+        && scope.xdg_session_id.is_none()
+        && scope.xdg_runtime_dir.is_none()
+        && scope.xauthority.is_none()
+    {
+        None
+    } else {
+        Some(scope)
+    }
 }
 
 #[cfg(unix)]
@@ -1470,8 +1549,11 @@ fn run_server_smoke() -> Result<()> {
 mod tests {
     use super::{
         BuiltinCliCommand, SignalClientScope, classify_builtin_cli_command,
-        signal_client_scope_matches, signal_parse_process_start_ticks_from_stat,
+        compatible_signal_client_count, signal_client_instances_dir, signal_client_scope_matches,
+        signal_parse_process_start_ticks_from_stat, signal_process_start_ticks,
     };
+    use std::fs;
+    use yggterm_server::ServerEndpoint;
 
     #[test]
     fn classify_builtin_cli_command_detects_help_and_snapshot() {
@@ -1533,5 +1615,37 @@ mod tests {
         };
         let same = current.clone();
         assert!(signal_client_scope_matches(&same, &current));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compatible_signal_client_count_scans_legacy_scope_dirs() {
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-signal-client-home-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_millis()
+        ));
+        let current_endpoint = ServerEndpoint::UnixSocket(home.join("server-2-1-5.sock"));
+        let legacy_endpoint = ServerEndpoint::UnixSocket(home.join("server-2-1-4.sock"));
+        let legacy_dir = signal_client_instances_dir(&home, &legacy_endpoint);
+        fs::create_dir_all(&legacy_dir).expect("create legacy dir");
+        fs::write(
+            legacy_dir.join(format!("{}-1.json", std::process::id())),
+            serde_json::json!({
+                "pid": std::process::id(),
+                "process_start_ticks": signal_process_start_ticks(std::process::id()),
+            })
+            .to_string(),
+        )
+        .expect("write live record");
+
+        let live =
+            compatible_signal_client_count(&home, &current_endpoint).expect("count live clients");
+        assert_eq!(live, 1);
+
+        let _ = fs::remove_dir_all(&home);
     }
 }

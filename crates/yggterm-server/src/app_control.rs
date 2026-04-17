@@ -33,6 +33,16 @@ pub enum AppControlPreviewLayout {
     Graph,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppControlRightPanelMode {
+    Hidden,
+    Connect,
+    Notifications,
+    Settings,
+    Metadata,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ProbeTerminalViewportInputMode {
@@ -76,6 +86,9 @@ pub enum AppControlCommand {
         query: String,
         #[serde(default)]
         focused: Option<bool>,
+    },
+    SetRightPanelMode {
+        mode: AppControlRightPanelMode,
     },
     SetUiTheme {
         theme: UiTheme,
@@ -163,6 +176,7 @@ impl AppControlCommand {
         match self {
             Self::SetMainZoom { .. } => "set_main_zoom",
             Self::SetSearch { .. } => "set_search",
+            Self::SetRightPanelMode { .. } => "set_right_panel_mode",
             Self::SetUiTheme { .. } => "set_ui_theme",
             Self::CaptureScreenshot { .. } => "capture_screenshot",
             Self::ScrollPreview { .. } => "scroll_preview",

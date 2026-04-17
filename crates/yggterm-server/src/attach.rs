@@ -6,6 +6,8 @@ use std::process::{Command, Stdio};
 use time::OffsetDateTime;
 use yggterm_core::SessionStore;
 
+const TERMINAL_ENV_REMOVALS: &[&str] = &["NO_COLOR"];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttachMetadata {
     pub uuid: String,
@@ -133,6 +135,9 @@ fn exec_tmux(uuid: &str, cwd: Option<&str>) -> Result<()> {
     {
         use std::os::unix::process::CommandExt;
         let mut command = Command::new("tmux");
+        for key in TERMINAL_ENV_REMOVALS {
+            command.env_remove(key);
+        }
         command
             .arg("new-session")
             .arg("-A")
@@ -151,6 +156,9 @@ fn exec_tmux(uuid: &str, cwd: Option<&str>) -> Result<()> {
     #[cfg(not(unix))]
     {
         let mut command = Command::new("tmux");
+        for key in TERMINAL_ENV_REMOVALS {
+            command.env_remove(key);
+        }
         command
             .arg("new-session")
             .arg("-A")
@@ -177,6 +185,9 @@ fn exec_shell(cwd: Option<&str>) -> Result<()> {
     {
         use std::os::unix::process::CommandExt;
         let mut command = Command::new(&shell);
+        for key in TERMINAL_ENV_REMOVALS {
+            command.env_remove(key);
+        }
         command.arg("-i");
         if let Some(cwd) = cwd.map(str::trim).filter(|value| !value.is_empty()) {
             if uses_bash_shell(&shell) {
@@ -194,6 +205,9 @@ fn exec_shell(cwd: Option<&str>) -> Result<()> {
     #[cfg(not(unix))]
     {
         let mut command = Command::new(&shell);
+        for key in TERMINAL_ENV_REMOVALS {
+            command.env_remove(key);
+        }
         command.arg("-i");
         if let Some(cwd) = cwd.map(str::trim).filter(|value| !value.is_empty()) {
             if uses_bash_shell(&shell) {

@@ -43,7 +43,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use tao::event::ElementState;
@@ -64,18 +64,20 @@ use tracing::{info, warn};
 use yggterm_core::{
     AgentSessionProfile, AppSettings, BrowserRow, BrowserRowKind, InstallContext, PerfSpan,
     SessionBrowserState, SessionNode, SessionStore, WorkspaceDocumentInput, WorkspaceDocumentKind,
-    WorkspaceGroupKind, append_perf_event, append_trace_event, check_for_update,
-    install_release_update, looks_like_generated_fallback_title,
-    looks_like_low_signal_generated_copy, read_codex_session_identity_fields, resolve_yggterm_home,
-    save_settings_file, unique_session_short_ids_for_pairs, update_command_hint,
+    WorkspaceGroupKind, append_bounded_jsonl_record, append_perf_event, append_trace_event,
+    best_effort_precis_from_context, best_effort_summary_from_context,
+    best_effort_title_from_context, check_for_update, install_release_update,
+    looks_like_generated_fallback_title, looks_like_low_signal_generated_copy,
+    read_codex_session_identity_fields, resolve_yggterm_home, save_settings_file,
+    unique_session_short_ids_for_pairs, update_command_hint,
 };
 use yggterm_platform::{DockRect, send_user_notification};
 use yggterm_server::{
     AppControlCommand, AppControlDragCommand, AppControlDragPlacement, AppControlPreviewLayout,
-    AppControlResponse, AppControlViewMode, GhosttyTerminalHostMode, ManagedSessionView,
-    PreviewTone, ProbeTerminalViewportInputMode, RemoteDeployState, RemoteMachineHealth,
-    RemoteMachineSnapshot, RemoteScannedSession, ServerEndpoint, ServerRuntimeStatus,
-    ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionPreviewBlock,
+    AppControlResponse, AppControlRightPanelMode, AppControlViewMode, GhosttyTerminalHostMode,
+    ManagedSessionView, PreviewTone, ProbeTerminalViewportInputMode, RemoteDeployState,
+    RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession, ServerEndpoint,
+    ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionPreviewBlock,
     SessionRenderedSection, SessionSource, SshConnectTarget, TerminalBackend, WorkspaceViewMode,
     YGG_LOADING_NOTIFICATION_AFTER_MS, YggOperationPriority, YggRequestMeta, YggSurface, YggTarget,
     YggtermServer, app_control_requests_pending, cleanup_legacy_daemons,
@@ -108,6 +110,10 @@ static PASSIVE_COPY_SUSPENDED: AtomicBool = AtomicBool::new(false);
 static PREVIEW_BLOCK_CACHE: OnceCell<Mutex<PreviewBlockCache>> = OnceCell::new();
 static PREVIEW_CONTENT_CACHE: OnceCell<Mutex<PreviewContentCache>> = OnceCell::new();
 static PREVIEW_RUN_CACHE: OnceCell<Mutex<PreviewRunCache>> = OnceCell::new();
+
+const UI_TELEMETRY_FILENAME: &str = "ui-telemetry.jsonl";
+const UI_TELEMETRY_ROTATED_FILENAME: &str = "ui-telemetry.previous.jsonl";
+const UI_TELEMETRY_MAX_BYTES: u64 = 8 * 1024 * 1024;
 static SIDEBAR_MERGE_CACHE: OnceCell<Mutex<SidebarMergeCache>> = OnceCell::new();
 static SIDEBAR_SEARCH_CACHE: OnceCell<Mutex<SidebarSearchCache>> = OnceCell::new();
 static CLIENT_INSTANCE: OnceCell<ClientInstanceRegistration> = OnceCell::new();
@@ -116,7 +122,11 @@ static INTENTIONAL_CLIENT_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static APP_ROOT_RENDER_TRACED: AtomicBool = AtomicBool::new(false);
 static APP_ROOT_EFFECT_TRACED: AtomicBool = AtomicBool::new(false);
 static APP_ROOT_MAC_WINDOW_FORCED: AtomicBool = AtomicBool::new(false);
+static APP_ROOT_WINDOW_FOCUS_REQUESTED: AtomicBool = AtomicBool::new(false);
 static APP_ROOT_RENDER_COUNT: AtomicU64 = AtomicU64::new(0);
+static ALLOCATOR_TRIM_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static LAST_ALLOCATOR_TRIM_MS: AtomicU64 = AtomicU64::new(0);
+static RENDER_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
 static APP_INSTANCE_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 static PRIMARY_APP_INSTANCE_ID: AtomicU64 = AtomicU64::new(0);
 static DAEMON_ENSURE_IN_FLIGHT: OnceCell<Mutex<HashSet<String>>> = OnceCell::new();
@@ -127,13 +137,26 @@ const PREVIEW_RUN_CACHE_LIMIT: usize = 256;
 const SIDEBAR_MERGE_CACHE_LIMIT: usize = 128;
 const SIDEBAR_SEARCH_CACHE_LIMIT: usize = 256;
 const SIDE_RAIL_WIDTH: usize = 292;
+const SIDEBAR_MIN_WIDTH: f32 = 220.0;
+const SIDEBAR_MAX_WIDTH: f32 = 420.0;
+const SIDEBAR_RESIZE_HANDLE_WIDTH: f32 = 8.0;
+const SNAPSHOT_LIVE_TERMINAL_LINE_LIMIT: usize = 48;
+const SNAPSHOT_RETAINED_TERMINAL_LINE_LIMIT: usize = 40;
+const SNAPSHOT_LIVE_RENDERED_SECTION_LIMIT: usize = 2;
+const SNAPSHOT_RENDERED_SECTION_LINE_LIMIT: usize = 10;
+const SNAPSHOT_PREVIEW_BLOCK_LIMIT: usize = 2;
+const SNAPSHOT_PREVIEW_BLOCK_LINE_LIMIT: usize = 6;
 const DEFERRED_STARTUP_SYNC_MS: u64 = 8_000;
+const ALLOCATOR_TRIM_MIN_INTERVAL_MS: u64 = 10_000;
+const ALLOCATOR_TRIM_STARTUP_DELAY_MS: u64 = 3_500;
+const ALLOCATOR_TRIM_STARTUP_RETRY_COUNT: usize = 18;
+const ALLOCATOR_TRIM_STARTUP_RETRY_INTERVAL_MS: u64 = 5_000;
+const ALLOCATOR_TRIM_RSS_THRESHOLD_KB: u64 = 384 * 1024;
 const EDGE_RESIZE_HANDLE: usize = 5;
 const CORNER_RESIZE_HANDLE: usize = 10;
 const XTERM_CSS: &str = include_str!("../../../assets/xterm/xterm.css");
 const XTERM_JS: &str = include_str!("../../../assets/xterm/xterm.js");
 const XTERM_FIT_JS: &str = include_str!("../../../assets/xterm/addon-fit.js");
-const XTERM_CANVAS_JS: &str = include_str!("../../../assets/xterm/addon-canvas.js");
 const PREVIEW_BLOCK_WINDOW: usize = 24;
 const PREVIEW_SAFE_FULL_RENDER_BLOCK_LIMIT: usize = 600;
 const PREVIEW_VIRTUAL_OVERSCAN_FACTOR: f64 = 0.85;
@@ -166,7 +189,28 @@ const LIVE_SESSION_SNAPSHOT_BUSY_POLL_MS: u64 = 700;
 const LIVE_SESSION_SNAPSHOT_IDLE_POLL_MS: u64 = 1_500;
 const LIVE_SESSION_SNAPSHOT_NUDGE_INTERVAL_MS: u64 = 250;
 const LIVE_SESSION_SNAPSHOT_NUDGE_POLLS: usize = 24;
+const TREE_RENAME_BLUR_COMMIT_GRACE_MS: u64 = 350;
 const TERMINAL_BUSY_HINT_MS: u64 = 2_000;
+const TITLEBAR_HEIGHT_PX: f64 = 32.0;
+const TITLEBAR_RESPONSIVE_CSS: &str = r#"
+[data-yggterm-titlebar-right] .yggterm-titlebar-overflow-trigger {
+    display: none !important;
+}
+@media (max-width: 1320px) {
+    [data-yggterm-titlebar-right] .yggterm-titlebar-inline-secondary,
+    [data-yggterm-titlebar-right] .yggterm-titlebar-inline-update {
+        display: none !important;
+    }
+    [data-yggterm-titlebar-right] .yggterm-titlebar-overflow-trigger {
+        display: inline-flex !important;
+    }
+}
+@media (max-width: 1120px) {
+    [data-yggterm-titlebar-right] .yggterm-titlebar-connect-primary {
+        display: none !important;
+    }
+}
+"#;
 const REMOTE_PREVIEW_NO_TARGET_RETRY_MS: u64 = 1_500;
 const THEME_EDITOR_PAD_SIZE: f64 = 286.0;
 const SEARCH_INPUT_ID: &str = "yggterm-search-input";
@@ -206,6 +250,11 @@ struct LiveTerminalSidebarSample {
     cursor_line_text: String,
     text_tail: String,
 }
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SidebarResizeDrag {
+    origin_client_x: f64,
+    origin_width: f32,
+}
 #[derive(Clone)]
 struct ShellState {
     bootstrap: ShellBootstrap,
@@ -214,11 +263,14 @@ struct ShellState {
     settings: AppSettings,
     search_query: String,
     search_focused: bool,
+    terminal_input_override_active: bool,
     search_sidebar_match_index: Option<usize>,
     search_content_match_index: Option<usize>,
     busy_request_id: Option<String>,
     active_surface_requests: HashMap<YggSurface, ActiveSurfaceRequest>,
     sidebar_open: bool,
+    sidebar_width: f32,
+    sidebar_resize_drag: Option<SidebarResizeDrag>,
     right_panel_mode: RightPanelMode,
     last_action: String,
     maximized: bool,
@@ -228,6 +280,7 @@ struct ShellState {
     next_notification_id: u64,
     titlebar_new_menu_open: bool,
     titlebar_session_menu_open: bool,
+    titlebar_overflow_menu_open: bool,
     alt_overlay_active: bool,
     alt_overlay_sequence: String,
     selected_tree_paths: HashSet<String>,
@@ -287,6 +340,7 @@ struct ShellState {
     pending_delete: Option<PendingDeleteDialog>,
     tree_rename_path: Option<String>,
     tree_rename_value: String,
+    tree_rename_started_at_ms: u64,
     theme_editor_open: bool,
     theme_editor_draft: YgguiThemeSpec,
     theme_editor_selected_stop: Option<usize>,
@@ -362,6 +416,8 @@ enum NotificationDeliveryMode {
     Both,
     System,
 }
+const TOAST_VIEWPORT_MAX_AGE_MS: u64 = 7_000;
+const TOAST_VIEWPORT_MAX_VISIBLE: usize = 3;
 #[derive(Clone, PartialEq, Eq)]
 struct PendingDeleteDialog {
     document_paths: Vec<String>,
@@ -394,6 +450,8 @@ struct RenderSnapshot {
     terminal_loading: bool,
     metadata_loading: bool,
     sidebar_open: bool,
+    sidebar_width: f32,
+    sidebar_resizing: bool,
     right_panel_mode: RightPanelMode,
     rows: Vec<BrowserRow>,
     selected_path: Option<String>,
@@ -419,6 +477,7 @@ struct RenderSnapshot {
     notifications: Vec<ToastNotification>,
     titlebar_new_menu_open: bool,
     titlebar_session_menu_open: bool,
+    titlebar_overflow_menu_open: bool,
     alt_overlay_active: bool,
     alt_overlay_sequence: String,
     selected_tree_paths: Vec<String>,
@@ -451,6 +510,147 @@ struct RenderSnapshot {
     shell_gradient: String,
 }
 type SharedSnapshot = Arc<RenderSnapshot>;
+
+fn snapshot_terminal_line_tail(lines: &[String], limit: usize) -> Vec<String> {
+    lines
+        .iter()
+        .rev()
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+fn snapshot_rendered_section_tail(
+    sections: &[SessionRenderedSection],
+    section_limit: usize,
+    line_limit: usize,
+) -> Vec<SessionRenderedSection> {
+    sections
+        .iter()
+        .rev()
+        .take(section_limit)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|mut section| {
+            if section.lines.len() > line_limit {
+                let keep_from = section.lines.len().saturating_sub(line_limit);
+                section.lines = section.lines.split_off(keep_from);
+            }
+            section
+        })
+        .collect()
+}
+
+fn snapshot_preview_block_head(
+    blocks: &[SessionPreviewBlock],
+    block_limit: usize,
+    line_limit: usize,
+) -> Vec<SessionPreviewBlock> {
+    blocks
+        .iter()
+        .take(block_limit)
+        .cloned()
+        .map(|mut block| {
+            if block.lines.len() > line_limit {
+                block.lines.truncate(line_limit);
+            }
+            block
+        })
+        .collect()
+}
+
+fn snapshot_live_sidebar_session_view(session: &ManagedSessionView) -> ManagedSessionView {
+    ManagedSessionView {
+        id: session.id.clone(),
+        session_path: session.session_path.clone(),
+        title: session.title.clone(),
+        kind: session.kind,
+        host_label: session.host_label.clone(),
+        source: session.source,
+        backend: session.backend,
+        bridge_available: session.bridge_available,
+        launch_phase: session.launch_phase,
+        remote_deploy_state: session.remote_deploy_state,
+        launch_command: session.launch_command.clone(),
+        status_line: session.status_line.clone(),
+        terminal_lines: snapshot_terminal_line_tail(
+            &session.terminal_lines,
+            SNAPSHOT_LIVE_TERMINAL_LINE_LIMIT,
+        ),
+        rendered_sections: snapshot_rendered_section_tail(
+            &session.rendered_sections,
+            SNAPSHOT_LIVE_RENDERED_SECTION_LIMIT,
+            SNAPSHOT_RENDERED_SECTION_LINE_LIMIT,
+        ),
+        preview: session.preview.clone(),
+        metadata: session.metadata.clone(),
+        terminal_process_id: session.terminal_process_id,
+        terminal_foreground_active: session.terminal_foreground_active,
+        terminal_window_id: session.terminal_window_id.clone(),
+        terminal_host_token: session.terminal_host_token.clone(),
+        terminal_host_mode: session.terminal_host_mode,
+        embedded_surface_id: session.embedded_surface_id.clone(),
+        embedded_surface_detail: session.embedded_surface_detail.clone(),
+        last_launch_error: session.last_launch_error.clone(),
+        last_window_error: session.last_window_error.clone(),
+        ssh_target: session.ssh_target.clone(),
+        ssh_prefix: session.ssh_prefix.clone(),
+        stored_preview_hydrated: session.stored_preview_hydrated,
+    }
+}
+
+fn snapshot_retained_terminal_session_view(session: &ManagedSessionView) -> ManagedSessionView {
+    ManagedSessionView {
+        id: session.id.clone(),
+        session_path: session.session_path.clone(),
+        title: session.title.clone(),
+        kind: session.kind,
+        host_label: session.host_label.clone(),
+        source: session.source,
+        backend: session.backend,
+        bridge_available: session.bridge_available,
+        launch_phase: session.launch_phase,
+        remote_deploy_state: session.remote_deploy_state,
+        launch_command: session.launch_command.clone(),
+        status_line: session.status_line.clone(),
+        terminal_lines: snapshot_terminal_line_tail(
+            &session.terminal_lines,
+            SNAPSHOT_RETAINED_TERMINAL_LINE_LIMIT,
+        ),
+        rendered_sections: snapshot_rendered_section_tail(
+            &session.rendered_sections,
+            SNAPSHOT_LIVE_RENDERED_SECTION_LIMIT,
+            SNAPSHOT_RENDERED_SECTION_LINE_LIMIT,
+        ),
+        preview: yggterm_server::SessionPreview {
+            summary: session.preview.summary.clone(),
+            blocks: snapshot_preview_block_head(
+                &session.preview.blocks,
+                SNAPSHOT_PREVIEW_BLOCK_LIMIT,
+                SNAPSHOT_PREVIEW_BLOCK_LINE_LIMIT,
+            ),
+        },
+        metadata: session.metadata.clone(),
+        terminal_process_id: session.terminal_process_id,
+        terminal_foreground_active: session.terminal_foreground_active,
+        terminal_window_id: session.terminal_window_id.clone(),
+        terminal_host_token: session.terminal_host_token.clone(),
+        terminal_host_mode: session.terminal_host_mode,
+        embedded_surface_id: session.embedded_surface_id.clone(),
+        embedded_surface_detail: session.embedded_surface_detail.clone(),
+        last_launch_error: session.last_launch_error.clone(),
+        last_window_error: session.last_window_error.clone(),
+        ssh_target: session.ssh_target.clone(),
+        ssh_prefix: session.ssh_prefix.clone(),
+        stored_preview_hydrated: session.stored_preview_hydrated,
+    }
+}
+
 fn active_viewport_zoom_label(snapshot: &RenderSnapshot) -> String {
     match snapshot.active_view_mode {
         WorkspaceViewMode::Terminal => "Terminal Zoom".to_string(),
@@ -594,6 +794,12 @@ enum TreeSelectionMode {
     Replace,
     ExtendRange,
     Toggle,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyRegenerationMode {
+    Title,
+    Summary,
+    Copy,
 }
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ContextMenuPlacement {
@@ -742,6 +948,9 @@ fn pending_interactive_session_request<'a>(
         .get(&YggSurface::Preview)
         .map(|request| (WorkspaceViewMode::Rendered, request))
 }
+fn clamp_sidebar_width(width: f32) -> f32 {
+    width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH)
+}
 #[derive(Default)]
 struct PreviewBlockCache {
     order: VecDeque<u64>,
@@ -785,6 +994,7 @@ impl ShellState {
             RightPanelMode::Metadata
         };
         let sidebar_open = settings.show_tree;
+        let sidebar_width = clamp_sidebar_width(settings.tree_width);
         let mut browser = SessionBrowserState::new(bootstrap.browser_tree.clone());
         browser.restore_ui_state(
             &settings.expanded_browser_paths,
@@ -815,11 +1025,14 @@ impl ShellState {
             server,
             search_query: String::new(),
             search_focused: false,
+            terminal_input_override_active: false,
             search_sidebar_match_index: None,
             search_content_match_index: None,
             busy_request_id: None,
             active_surface_requests: HashMap::new(),
             sidebar_open,
+            sidebar_width,
+            sidebar_resize_drag: None,
             right_panel_mode,
             last_action: "ready".to_string(),
             maximized: false,
@@ -829,6 +1042,7 @@ impl ShellState {
             next_notification_id: 1,
             titlebar_new_menu_open: false,
             titlebar_session_menu_open: false,
+            titlebar_overflow_menu_open: false,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             selected_tree_paths: HashSet::new(),
@@ -888,6 +1102,7 @@ impl ShellState {
             pending_delete: None,
             tree_rename_path: None,
             tree_rename_value: String::new(),
+            tree_rename_started_at_ms: 0,
             theme_editor_open: false,
             theme_editor_draft: initial_yggui_theme,
             theme_editor_selected_stop: None,
@@ -968,14 +1183,41 @@ impl ShellState {
             self.search_query.as_str()
         };
         let search_active = !effective_search_query.trim().is_empty();
-        let mut live_sessions = self.server.live_sessions();
+        let live_session_views = self.server.live_session_views();
+        let mut live_sessions = live_session_views
+            .iter()
+            .map(|session| snapshot_live_sidebar_session_view(session))
+            .collect::<Vec<_>>();
         for session in live_sessions.iter_mut() {
             self.overlay_live_terminal_sidebar_sample(session);
         }
+        let session_for_busy_hint = |session_path: &str| {
+            live_sessions
+                .iter()
+                .chain(self.server.active_session().into_iter())
+                .find(|session| {
+                    normalize_live_session_path(&session.session_path)
+                        == normalize_live_session_path(session_path)
+                        || session.session_path == session_path
+                })
+        };
         let optimistic_busy_paths = self
             .terminal_busy_hint_until_ms
             .iter()
-            .filter(|(_, deadline_ms)| current_millis() <= **deadline_ms)
+            .filter(|(session_path, deadline_ms)| {
+                if current_millis() > **deadline_ms {
+                    return false;
+                }
+                let Some(session) = session_for_busy_hint(session_path) else {
+                    return true;
+                };
+                if session.terminal_foreground_active == Some(false)
+                    && session_is_idle_for_sidebar_icon(session)
+                {
+                    return false;
+                }
+                true
+            })
             .map(|(session_path, _)| session_path.clone())
             .collect::<HashSet<_>>();
         let expanded_paths = self.browser.expanded_path_set();
@@ -984,37 +1226,6 @@ impl ShellState {
         } else {
             self.browser.rows().to_vec()
         };
-        let merged_expanded_paths = if search_active {
-            search_expanded_paths(
-                &stored_rows,
-                self.server.remote_machines(),
-                self.server.ssh_targets(),
-                &live_sessions,
-                &expanded_paths,
-            )
-        } else {
-            expanded_paths.clone()
-        };
-        let mut merged_rows = merged_sidebar_rows_traced(
-            &self.bootstrap.settings_path,
-            if search_active {
-                "snapshot_search"
-            } else {
-                "snapshot"
-            },
-            &stored_rows,
-            self.server.remote_machines(),
-            self.server.ssh_targets(),
-            &live_sessions,
-            &merged_expanded_paths,
-        );
-        enrich_sidebar_rows_with_live_titles(
-            &mut merged_rows,
-            &live_sessions,
-            self.server.remote_machines(),
-        );
-        let rows = filtered_sidebar_rows(&merged_rows, effective_search_query);
-        let search_sidebar_matches = search_sidebar_matches(&merged_rows, effective_search_query);
         let selected_path = if let Some(active) = self.server.active_session() {
             if active.source == yggterm_server::SessionSource::LiveSsh
                 || active.session_path.starts_with("remote-session://")
@@ -1049,10 +1260,14 @@ impl ShellState {
         let active_session = active_session_path
             .as_deref()
             .and_then(|path| {
-                live_sessions
+                live_session_views
                     .iter()
                     .find(|session| session.session_path == path)
-                    .cloned()
+                    .map(|session| {
+                        let mut session = (*session).clone();
+                        self.overlay_live_terminal_sidebar_sample(&mut session);
+                        session
+                    })
             })
             .or_else(|| {
                 self.server
@@ -1068,22 +1283,57 @@ impl ShellState {
             });
         let mut retained_terminal_sessions = live_sessions
             .iter()
-            .filter(|session| {
-                self.terminal_session_is_retained_live(&session.session_path)
-                    && self.server.session_supports_terminal(&session.session_path)
-            })
-            .cloned()
+            .filter(|session| self.terminal_session_should_render_retained(&session.session_path))
+            .map(snapshot_retained_terminal_session_view)
             .collect::<Vec<_>>();
-        if let Some(active_session) = active_session.clone()
-            && self
-                .server
-                .session_supports_terminal(&active_session.session_path)
-            && !retained_terminal_sessions
-                .iter()
-                .any(|session| session.session_path == active_session.session_path)
-        {
-            retained_terminal_sessions.push(active_session);
+        if let Some(active_session) = active_session.clone() {
+            let active_terminal_should_render = active_view_mode == WorkspaceViewMode::Terminal
+                || self.terminal_session_is_retained_live(&active_session.session_path);
+            if active_terminal_should_render
+                && self
+                    .server
+                    .session_supports_terminal(&active_session.session_path)
+                && !retained_terminal_sessions
+                    .iter()
+                    .any(|session| session.session_path == active_session.session_path)
+            {
+                retained_terminal_sessions
+                    .push(snapshot_retained_terminal_session_view(&active_session));
+            }
         }
+        let sidebar_hot_sessions =
+            merge_hot_sidebar_sessions(&live_sessions, &retained_terminal_sessions);
+        let merged_expanded_paths = if search_active {
+            search_expanded_paths(
+                &stored_rows,
+                self.server.remote_machines(),
+                self.server.ssh_targets(),
+                &sidebar_hot_sessions,
+                &expanded_paths,
+            )
+        } else {
+            expanded_paths.clone()
+        };
+        let mut merged_rows = merged_sidebar_rows_traced(
+            &self.bootstrap.settings_path,
+            if search_active {
+                "snapshot_search"
+            } else {
+                "snapshot"
+            },
+            &stored_rows,
+            self.server.remote_machines(),
+            self.server.ssh_targets(),
+            &sidebar_hot_sessions,
+            &merged_expanded_paths,
+        );
+        enrich_sidebar_rows_with_live_titles(
+            &mut merged_rows,
+            &sidebar_hot_sessions,
+            self.server.remote_machines(),
+        );
+        let rows = filtered_sidebar_rows(&merged_rows, effective_search_query);
+        let search_sidebar_matches = search_sidebar_matches(&merged_rows, effective_search_query);
         let active_title = active_session
             .as_ref()
             .and_then(|session| resolved_session_title(self, session))
@@ -1177,6 +1427,8 @@ impl ShellState {
                 .active_surface_requests
                 .contains_key(&YggSurface::MetadataRail),
             sidebar_open: self.sidebar_open,
+            sidebar_width: self.sidebar_width,
+            sidebar_resizing: self.sidebar_resize_drag.is_some(),
             right_panel_mode: self.right_panel_mode,
             rows,
             selected_path,
@@ -1202,6 +1454,7 @@ impl ShellState {
             notifications: self.notifications.clone(),
             titlebar_new_menu_open: self.titlebar_new_menu_open,
             titlebar_session_menu_open: self.titlebar_session_menu_open,
+            titlebar_overflow_menu_open: self.titlebar_overflow_menu_open,
             alt_overlay_active: self.alt_overlay_active,
             alt_overlay_sequence: self.alt_overlay_sequence.clone(),
             selected_tree_paths: self.selected_tree_paths.iter().cloned().collect(),
@@ -1267,6 +1520,12 @@ impl ShellState {
     }
     fn set_search_focus(&mut self, focused: bool) {
         self.search_focused = focused;
+        if focused {
+            self.terminal_input_override_active = false;
+            self.titlebar_new_menu_open = false;
+            self.titlebar_session_menu_open = false;
+            self.titlebar_overflow_menu_open = false;
+        }
         self.record_ui_telemetry(
             "search_focus_debug",
             json!({
@@ -1274,6 +1533,12 @@ impl ShellState {
                 "query": self.search_query,
             }),
         );
+    }
+    fn dismiss_titlebar_transients(&mut self) {
+        self.search_focused = false;
+        self.titlebar_new_menu_open = false;
+        self.titlebar_session_menu_open = false;
+        self.titlebar_overflow_menu_open = false;
     }
     fn next_search_sidebar_row(&mut self, step: isize) -> Option<BrowserRow> {
         let rows = self.current_search_sidebar_matches();
@@ -1373,28 +1638,55 @@ impl ShellState {
             "sidebar hidden".to_string()
         };
     }
+    fn start_sidebar_resize(&mut self, client_x: f64) {
+        self.sidebar_open = true;
+        self.sidebar_resize_drag = Some(SidebarResizeDrag {
+            origin_client_x: client_x,
+            origin_width: self.sidebar_width,
+        });
+        self.last_action = "sidebar resize started".to_string();
+    }
+    fn update_sidebar_resize(&mut self, client_x: f64) {
+        let Some(drag) = self.sidebar_resize_drag else {
+            return;
+        };
+        let delta = (client_x - drag.origin_client_x) as f32;
+        let next_width = clamp_sidebar_width(drag.origin_width + delta);
+        if (next_width - self.sidebar_width).abs() < 0.5 {
+            return;
+        }
+        self.sidebar_width = next_width;
+        self.settings.tree_width = next_width;
+        self.persist_settings();
+        self.last_action = format!("sidebar width {}px", next_width.round() as i64);
+    }
+    fn finish_sidebar_resize(&mut self) {
+        if self.sidebar_resize_drag.take().is_some() {
+            self.settings.tree_width = self.sidebar_width;
+            self.persist_settings();
+            self.last_action =
+                format!("sidebar resized to {}px", self.sidebar_width.round() as i64);
+        }
+    }
     fn toggle_metadata_panel(&mut self) {
-        self.right_panel_mode = if self.right_panel_mode == RightPanelMode::Metadata {
+        let next_mode = if self.right_panel_mode == RightPanelMode::Metadata {
             RightPanelMode::Hidden
         } else {
             RightPanelMode::Metadata
         };
-        self.settings.show_settings = false;
-        self.persist_settings();
-        self.last_action = match self.right_panel_mode {
-            RightPanelMode::Metadata => "metadata opened".to_string(),
-            RightPanelMode::Hidden => "right panel hidden".to_string(),
-            RightPanelMode::Settings => "settings opened".to_string(),
-            RightPanelMode::Connect => "ssh connect opened".to_string(),
-            RightPanelMode::Notifications => "notifications opened".to_string(),
-        };
+        self.set_right_panel_mode(next_mode);
     }
     fn toggle_settings_panel(&mut self) {
-        self.right_panel_mode = if self.right_panel_mode == RightPanelMode::Settings {
+        let next_mode = if self.right_panel_mode == RightPanelMode::Settings {
             RightPanelMode::Hidden
         } else {
             RightPanelMode::Settings
         };
+        self.set_right_panel_mode(next_mode);
+    }
+    fn set_right_panel_mode(&mut self, mode: RightPanelMode) {
+        self.terminal_input_override_active = terminal_input_override_for_right_panel_mode(mode);
+        self.right_panel_mode = mode;
         self.settings.show_settings = self.right_panel_mode == RightPanelMode::Settings;
         self.persist_settings();
         self.last_action = match self.right_panel_mode {
@@ -1406,20 +1698,12 @@ impl ShellState {
         };
     }
     fn toggle_connect_panel(&mut self) {
-        self.right_panel_mode = if self.right_panel_mode == RightPanelMode::Connect {
+        let next_mode = if self.right_panel_mode == RightPanelMode::Connect {
             RightPanelMode::Hidden
         } else {
             RightPanelMode::Connect
         };
-        self.settings.show_settings = false;
-        self.persist_settings();
-        self.last_action = match self.right_panel_mode {
-            RightPanelMode::Connect => "ssh connect opened".to_string(),
-            RightPanelMode::Hidden => "right panel hidden".to_string(),
-            RightPanelMode::Metadata => "metadata opened".to_string(),
-            RightPanelMode::Settings => "settings opened".to_string(),
-            RightPanelMode::Notifications => "notifications opened".to_string(),
-        };
+        self.set_right_panel_mode(next_mode);
     }
     fn update_ssh_connect_target(&mut self, value: String) {
         self.ssh_connect_target = value;
@@ -1430,18 +1714,12 @@ impl ShellState {
         self.last_action = "editing ssh prefix".to_string();
     }
     fn toggle_notifications_panel(&mut self) {
-        self.right_panel_mode = if self.right_panel_mode == RightPanelMode::Notifications {
+        let next_mode = if self.right_panel_mode == RightPanelMode::Notifications {
             RightPanelMode::Hidden
         } else {
             RightPanelMode::Notifications
         };
-        self.last_action = match self.right_panel_mode {
-            RightPanelMode::Notifications => "notifications opened".to_string(),
-            RightPanelMode::Hidden => "right panel hidden".to_string(),
-            RightPanelMode::Metadata => "metadata opened".to_string(),
-            RightPanelMode::Settings => "settings opened".to_string(),
-            RightPanelMode::Connect => "ssh connect opened".to_string(),
-        };
+        self.set_right_panel_mode(next_mode);
     }
     fn set_preview_layout(&mut self, mode: PreviewLayoutMode) {
         self.preview_layout = mode;
@@ -1691,10 +1969,10 @@ impl ShellState {
         else {
             return;
         };
-        let Some(attempt) = self.terminal_open_attempts.get_mut(&attempt_id) else {
-            return;
-        };
         let now_ms = current_millis();
+        let mut clear_resume_notification_for = None::<String>;
+        let mut deferred_event = None::<(&'static str, TerminalOpenAttempt, Value)>;
+        let mut should_return_early = false;
         let ready = viewport
             .get("ready")
             .and_then(Value::as_bool)
@@ -1736,105 +2014,116 @@ impl ShellState {
             .and_then(Value::as_str)
             .map(str::to_string);
         let failure_reason = terminal_open_attempt_failure_reason_from_viewport(viewport);
-        attempt.observations = attempt.observations.saturating_add(1);
-        attempt.last_observed_ready = ready;
-        attempt.last_observed_reason = reason.clone();
-        attempt.last_surface_problem = surface_problem.clone();
-        attempt.last_overlay_visible = overlay_visible;
-        attempt.last_overlay_kind = overlay_kind.clone();
-        attempt.last_overlay_text = overlay_text.clone();
-        if ready && interactive && settled_kind == "interactive" && surface_problem.is_none() {
-            let first_ready = attempt.ready_at_ms.is_none();
-            if first_ready {
-                attempt.ready_at_ms = Some(now_ms);
+        {
+            let Some(attempt) = self.terminal_open_attempts.get_mut(&attempt_id) else {
+                return;
+            };
+            attempt.observations = attempt.observations.saturating_add(1);
+            attempt.last_observed_ready = ready;
+            attempt.last_observed_reason = reason.clone();
+            attempt.last_surface_problem = surface_problem.clone();
+            attempt.last_overlay_visible = overlay_visible;
+            attempt.last_overlay_kind = overlay_kind.clone();
+            attempt.last_overlay_text = overlay_text.clone();
+            if ready && interactive && settled_kind == "interactive" && surface_problem.is_none() {
+                let first_ready = attempt.ready_at_ms.is_none();
+                if first_ready {
+                    attempt.ready_at_ms = Some(now_ms);
+                }
+                if attempt.latched_failure_reason.is_none() {
+                    attempt.state = TerminalOpenAttemptState::Ready;
+                }
+                if first_ready {
+                    deferred_event = Some((
+                        "ready",
+                        attempt.clone(),
+                        json!({
+                            "ready": ready,
+                            "interactive": interactive,
+                            "settled_kind": settled_kind,
+                            "viewport_reason": reason,
+                            "surface_problem": surface_problem,
+                            "overlay_visible": overlay_visible,
+                            "overlay_phase": overlay_phase,
+                        }),
+                    ));
+                }
+                clear_resume_notification_for = Some(attempt.session_path.clone());
+                should_return_early = true;
+            } else if let Some(failure_reason) = failure_reason {
+                if attempt.latched_failure_reason.is_none() {
+                    attempt.latched_failure_at_ms = Some(now_ms);
+                    attempt.latched_failure_reason = Some(failure_reason.clone());
+                    attempt.state = TerminalOpenAttemptState::Failed;
+                    deferred_event = Some((
+                        "latched_failure",
+                        attempt.clone(),
+                        json!({
+                            "reason": failure_reason,
+                            "ready": ready,
+                            "viewport_reason": reason,
+                            "surface_problem": surface_problem,
+                            "overlay_visible": overlay_visible,
+                            "overlay_kind": overlay_kind,
+                            "overlay_phase": overlay_phase,
+                            "overlay_text": overlay_text,
+                        }),
+                    ));
+                }
+                should_return_early = true;
+            } else {
+                let recovering = !ready && matches!(overlay_phase, "recovering" | "chip")
+                    || reason.as_deref()
+                        == Some("active terminal host exists but attach is still in flight");
+                if recovering && attempt.latched_failure_reason.is_none() {
+                    if !matches!(attempt.state, TerminalOpenAttemptState::Recovering) {
+                        attempt.state = TerminalOpenAttemptState::Recovering;
+                        deferred_event = Some((
+                            "recovering",
+                            attempt.clone(),
+                            json!({
+                                "ready": ready,
+                                "interactive": interactive,
+                                "settled_kind": settled_kind,
+                                "viewport_reason": reason,
+                                "surface_problem": surface_problem,
+                                "overlay_visible": overlay_visible,
+                                "overlay_kind": overlay_kind,
+                                "overlay_phase": overlay_phase,
+                            }),
+                        ));
+                    }
+                    should_return_early = true;
+                } else if ready && attempt.ready_at_ms.is_none() {
+                    attempt.ready_at_ms = Some(now_ms);
+                    if attempt.latched_failure_reason.is_none() {
+                        attempt.state = TerminalOpenAttemptState::Ready;
+                    }
+                    deferred_event = Some((
+                        "ready",
+                        attempt.clone(),
+                        json!({
+                            "ready": ready,
+                            "interactive": interactive,
+                            "settled_kind": settled_kind,
+                            "viewport_reason": reason,
+                            "surface_problem": surface_problem,
+                            "overlay_visible": overlay_visible,
+                            "overlay_phase": overlay_phase,
+                        }),
+                    ));
+                    clear_resume_notification_for = Some(attempt.session_path.clone());
+                }
             }
-            if attempt.latched_failure_reason.is_none() {
-                attempt.state = TerminalOpenAttemptState::Ready;
-            }
-            if first_ready {
-                let attempt_snapshot = attempt.clone();
-                self.record_terminal_open_attempt_event(
-                    "ready",
-                    &attempt_snapshot,
-                    Some(json!({
-                        "ready": ready,
-                        "interactive": interactive,
-                        "settled_kind": settled_kind,
-                        "viewport_reason": reason,
-                        "surface_problem": surface_problem,
-                        "overlay_visible": overlay_visible,
-                        "overlay_phase": overlay_phase,
-                    })),
-                );
-            }
-            return;
         }
-        if let Some(failure_reason) = failure_reason {
-            if attempt.latched_failure_reason.is_none() {
-                attempt.latched_failure_at_ms = Some(now_ms);
-                attempt.latched_failure_reason = Some(failure_reason.clone());
-                attempt.state = TerminalOpenAttemptState::Failed;
-                let attempt_snapshot = attempt.clone();
-                self.record_terminal_open_attempt_event(
-                    "latched_failure",
-                    &attempt_snapshot,
-                    Some(json!({
-                        "reason": failure_reason,
-                        "ready": ready,
-                        "viewport_reason": reason,
-                        "surface_problem": surface_problem,
-                        "overlay_visible": overlay_visible,
-                        "overlay_kind": overlay_kind,
-                        "overlay_phase": overlay_phase,
-                        "overlay_text": overlay_text,
-                    })),
-                );
-            }
-            return;
+        if let Some((event_name, attempt_snapshot, payload)) = deferred_event {
+            self.record_terminal_open_attempt_event(event_name, &attempt_snapshot, Some(payload));
         }
-        let recovering = !ready && matches!(overlay_phase, "recovering" | "chip")
-            || reason.as_deref()
-                == Some("active terminal host exists but attach is still in flight");
-        if recovering && attempt.latched_failure_reason.is_none() {
-            if !matches!(attempt.state, TerminalOpenAttemptState::Recovering) {
-                attempt.state = TerminalOpenAttemptState::Recovering;
-                let attempt_snapshot = attempt.clone();
-                self.record_terminal_open_attempt_event(
-                    "recovering",
-                    &attempt_snapshot,
-                    Some(json!({
-                        "ready": ready,
-                        "interactive": interactive,
-                        "settled_kind": settled_kind,
-                        "viewport_reason": reason,
-                        "surface_problem": surface_problem,
-                        "overlay_visible": overlay_visible,
-                        "overlay_kind": overlay_kind,
-                        "overlay_phase": overlay_phase,
-                    })),
-                );
-            }
-            return;
+        if let Some(session_path) = clear_resume_notification_for {
+            self.clear_job_notification(&terminal_resume_notification_job_key(&session_path));
         }
-        if ready && attempt.ready_at_ms.is_none() {
-            attempt.ready_at_ms = Some(now_ms);
-            if attempt.latched_failure_reason.is_none() {
-                attempt.state = TerminalOpenAttemptState::Ready;
-            }
-            let attempt_snapshot = attempt.clone();
-            self.record_terminal_open_attempt_event(
-                "ready",
-                &attempt_snapshot,
-                Some(json!({
-                    "ready": ready,
-                    "interactive": interactive,
-                    "settled_kind": settled_kind,
-                    "viewport_reason": reason,
-                    "surface_problem": surface_problem,
-                    "overlay_visible": overlay_visible,
-                    "overlay_phase": overlay_phase,
-                })),
-            );
+        if should_return_early {
+            return;
         }
     }
     fn fail_terminal_open_attempt_for_request(&mut self, request_id: &str, reason: String) {
@@ -1912,6 +2201,7 @@ impl ShellState {
                 self.server.apply_snapshot(snapshot);
                 self.restore_active_preview_if_snapshot_regressed(previous_active_session);
                 self.mark_active_remote_preview_dirty_if_needed();
+                self.sync_live_terminal_retention();
                 self.prune_terminal_attach_in_flight();
                 self.prune_terminal_resume_ready_paths();
                 self.prune_terminal_resume_notifications();
@@ -1922,7 +2212,10 @@ impl ShellState {
                     self.seed_dynamic_top_level_expansions();
                     self.ensure_active_session_expanded();
                 }
-                if always_sync_selection || was_initial_sync || self.selected_tree_paths.is_empty()
+                if always_sync_selection
+                    || was_initial_sync
+                    || self.selected_tree_paths.is_empty()
+                    || !self.active_session_sidebar_selection_is_consistent()
                 {
                     self.sync_active_session_selection();
                 }
@@ -1994,6 +2287,7 @@ impl ShellState {
                 self.server.apply_snapshot(snapshot);
                 self.restore_active_preview_if_snapshot_regressed(previous_active_session);
                 self.mark_active_remote_preview_dirty_if_needed();
+                self.sync_live_terminal_retention();
                 self.prune_terminal_attach_in_flight();
                 self.prune_terminal_resume_ready_paths();
                 self.prune_terminal_resume_notifications();
@@ -2042,6 +2336,7 @@ impl ShellState {
                 self.server.apply_snapshot(snapshot);
                 self.restore_active_preview_if_snapshot_regressed(previous_active_session);
                 self.mark_active_remote_preview_dirty_if_needed();
+                self.sync_live_terminal_retention();
                 self.prune_terminal_attach_in_flight();
                 self.prune_terminal_resume_ready_paths();
                 self.prune_terminal_resume_notifications();
@@ -2051,6 +2346,11 @@ impl ShellState {
                 self.next_background_copy_scan_after_ms = 0;
                 if was_initial_sync {
                     self.seed_dynamic_top_level_expansions();
+                }
+                if self.selected_tree_paths.is_empty()
+                    || !self.active_session_sidebar_selection_is_consistent()
+                {
+                    self.sync_active_session_selection();
                 }
                 self.ensure_active_session_visible();
                 self.record_restore_issue_telemetry("apply_daemon_snapshot_result");
@@ -2117,12 +2417,15 @@ impl ShellState {
     }
     fn seed_dynamic_top_level_expansions(&mut self) {
         let mut paths = Vec::new();
-        if self
+        let has_promoted_live_sessions = self
             .server
             .live_sessions()
             .iter()
-            .any(|session| session.kind != SessionKind::SshShell)
-        {
+            .any(is_promoted_live_session)
+            || self.retained_terminal_session_paths.iter().any(|path| {
+                self.terminal_session_is_retained_live(path) && is_hot_terminal_sidebar_path(path)
+            });
+        if has_promoted_live_sessions {
             paths.push("__live_sessions__".to_string());
         }
         paths.extend(self.active_session_visibility_paths());
@@ -2134,6 +2437,13 @@ impl ShellState {
         self.sync_active_session_selection();
         self.sync_browser_settings();
     }
+    fn ensure_session_path_visible(&mut self, session_path: &str) {
+        if is_hot_terminal_sidebar_path(session_path) {
+            self.browser
+                .ensure_expanded_paths(vec!["__live_sessions__".to_string()]);
+        }
+        self.browser.ensure_visible_path(session_path);
+    }
     fn retain_terminal_session_path(&mut self, session_path: &str) -> u64 {
         self.retained_terminal_session_paths
             .insert(session_path.to_string());
@@ -2142,6 +2452,32 @@ impl ShellState {
             .entry(session_path.to_string())
             .or_insert(1);
         *epoch
+    }
+    fn sync_live_terminal_retention(&mut self) {
+        let mut keep_paths = self
+            .server
+            .live_sessions()
+            .iter()
+            .filter(|session| {
+                is_hot_terminal_sidebar_path(&session.session_path)
+                    && self.server.session_supports_terminal(&session.session_path)
+            })
+            .map(|session| session.session_path.clone())
+            .collect::<HashSet<_>>();
+        if let Some(active_path) = self.server.active_session_path()
+            && self.server.session_supports_terminal(active_path)
+            && (self.server.active_view_mode() == WorkspaceViewMode::Terminal
+                || keep_paths.contains(active_path))
+        {
+            keep_paths.insert(active_path.to_string());
+        }
+        self.retained_terminal_session_paths
+            .retain(|session_path| keep_paths.contains(session_path));
+        self.terminal_mount_epochs
+            .retain(|session_path, _| keep_paths.contains(session_path));
+        for session_path in keep_paths {
+            self.retain_terminal_session_path(&session_path);
+        }
     }
     fn bump_terminal_mount_epoch_for_session(&mut self, session_path: &str) -> u64 {
         let epoch = self
@@ -2163,6 +2499,10 @@ impl ShellState {
                 || self.terminal_session_has_ready_attempt(session_path))
             && !self.terminal_attach_in_flight.contains(session_path)
     }
+    fn terminal_session_should_render_retained(&self, session_path: &str) -> bool {
+        self.retained_terminal_session_paths.contains(session_path)
+            && self.server.session_supports_terminal(session_path)
+    }
     fn terminal_session_has_ready_attempt(&self, session_path: &str) -> bool {
         self.latest_terminal_open_attempt_for_path(session_path)
             .is_some_and(|attempt| {
@@ -2176,6 +2516,12 @@ impl ShellState {
     }
     fn active_terminal_prefers_text_input(&self) -> bool {
         if self.server.active_view_mode() != WorkspaceViewMode::Terminal {
+            return false;
+        }
+        if self.right_panel_mode != RightPanelMode::Hidden
+            || self.search_focused
+            || is_command_query(&self.search_query)
+        {
             return false;
         }
         let Some(session_path) = self.server.active_session_path() else {
@@ -2304,6 +2650,22 @@ impl ShellState {
             self.browser.select_path(selected_path);
         }
     }
+    fn active_session_sidebar_selection_is_consistent(&self) -> bool {
+        let expected_path = self
+            .active_browser_selection_path_for_session()
+            .or_else(|| {
+                self.server
+                    .active_session()
+                    .map(|session| session.session_path.clone())
+            })
+            .or_else(|| self.server.active_session_path().map(str::to_string));
+        match expected_path {
+            Some(expected_path) => {
+                current_selected_sidebar_row(self).is_some_and(|row| row.full_path == expected_path)
+            }
+            None => current_selected_sidebar_row(self).is_none(),
+        }
+    }
     fn active_browser_selection_path_for_session(&self) -> Option<String> {
         let active = self.server.active_session()?;
         let active_path = active.session_path.clone();
@@ -2335,6 +2697,8 @@ impl ShellState {
             .live_sessions()
             .iter()
             .any(|session| session.session_path == active_path && is_promoted_live_session(session))
+            || (self.terminal_session_is_retained_live(&active_path)
+                && is_hot_terminal_sidebar_path(&active_path))
         {
             return vec!["__live_sessions__".to_string()];
         }
@@ -2468,7 +2832,7 @@ impl ShellState {
                 self.clear_user_collapsed_synthetic_ancestors_for_path(&row.full_path);
                 self.apply_daemon_snapshot_result(open_stored_session(
                     &self.bootstrap.server_endpoint,
-                    session_kind_for_row(row.kind),
+                    session_kind_for_row(&row),
                     &row.full_path,
                     row.session_id.as_deref(),
                     row.session_cwd.as_deref(),
@@ -2849,6 +3213,113 @@ impl ShellState {
         self.context_menu_position = None;
         self.refresh_tree_debug("close_context_menu");
     }
+    fn all_sidebar_rows_for_selection(&self) -> Vec<BrowserRow> {
+        let stored_rows = self.browser.search_rows();
+        let live_sessions = self.server.live_sessions();
+        let mut expanded_paths = stored_rows
+            .iter()
+            .filter(|row| row.kind == BrowserRowKind::Group)
+            .map(|row| row.full_path.clone())
+            .collect::<HashSet<_>>();
+        expanded_paths.insert("__live_sessions__".to_string());
+        expanded_paths.insert("local".to_string());
+        for machine in self.server.remote_machines() {
+            expanded_paths.insert(format!("__remote_machine__/{}", machine.machine_key));
+        }
+        let mut previous_group_count = 0;
+        for _ in 0..8 {
+            let rows = merged_sidebar_rows(
+                &stored_rows,
+                self.server.remote_machines(),
+                self.server.ssh_targets(),
+                &live_sessions,
+                &expanded_paths,
+            );
+            let group_paths = rows
+                .iter()
+                .filter(|row| row.kind == BrowserRowKind::Group)
+                .map(|row| row.full_path.clone())
+                .collect::<HashSet<_>>();
+            let next_group_count = group_paths.len();
+            if next_group_count == previous_group_count && group_paths.is_subset(&expanded_paths) {
+                return rows;
+            }
+            previous_group_count = next_group_count;
+            expanded_paths.extend(group_paths);
+        }
+        merged_sidebar_rows(
+            &stored_rows,
+            self.server.remote_machines(),
+            self.server.ssh_targets(),
+            &live_sessions,
+            &expanded_paths,
+        )
+    }
+    fn select_all_tree_rows(&mut self) {
+        let terms = search_terms(&self.search_query);
+        let selected_rows = self
+            .all_sidebar_rows_for_selection()
+            .into_iter()
+            .filter(is_tree_multiselect_row)
+            .filter(|row| terms.is_empty() || row_matches_search(row, &terms))
+            .collect::<Vec<_>>();
+        if selected_rows.is_empty() {
+            return;
+        }
+        self.selected_tree_paths = selected_rows
+            .iter()
+            .map(|row| row.full_path.clone())
+            .collect();
+        if let Some(anchor_row) = selected_rows.first() {
+            self.selection_anchor = Some(anchor_row.full_path.clone());
+            if !is_synthetic_sidebar_row(anchor_row) {
+                self.browser.select_path(anchor_row.full_path.clone());
+            }
+        }
+        self.record_ui_telemetry(
+            "tree_select_all",
+            json!({
+                "selected_paths": self.selected_tree_paths.iter().cloned().collect::<Vec<_>>(),
+                "search_query": self.search_query,
+            }),
+        );
+        self.last_action = format!("selected {} tree item(s)", self.selected_tree_paths.len());
+        self.refresh_tree_debug("select_all_tree_rows");
+    }
+    fn selected_copy_generation_rows(&self, context_row: Option<&BrowserRow>) -> Vec<BrowserRow> {
+        let all_rows = self.all_sidebar_rows_for_selection();
+        let selected_paths = if !self.selected_tree_paths.is_empty()
+            && context_row.is_none_or(|row| self.selected_tree_paths.contains(&row.full_path))
+        {
+            self.selected_tree_paths.clone()
+        } else if let Some(row) = context_row {
+            HashSet::from([row.full_path.clone()])
+        } else if let Some(row) = current_selected_sidebar_row(self) {
+            HashSet::from([row.full_path])
+        } else {
+            HashSet::new()
+        };
+        if selected_paths.is_empty() {
+            return Vec::new();
+        }
+        let live_sessions = self.server.live_sessions();
+        let mut rows = Vec::new();
+        let mut seen_paths = HashSet::<String>::new();
+        for row in &all_rows {
+            if !selected_paths.contains(&row.full_path) {
+                continue;
+            }
+            collect_selected_copy_generation_rows(
+                &all_rows,
+                &self.server,
+                &live_sessions,
+                row,
+                &mut seen_paths,
+                &mut rows,
+            );
+        }
+        rows
+    }
     fn clear_notification(&mut self, id: u64) {
         self.notifications
             .retain(|notification| notification.id != id);
@@ -2861,11 +3332,11 @@ impl ShellState {
         self.notifications.clear();
     }
     fn select_tree_row(&mut self, row: &BrowserRow, mode: TreeSelectionMode) {
-        if mode == TreeSelectionMode::ExtendRange && is_workspace_row(row) {
+        if mode == TreeSelectionMode::ExtendRange && is_tree_multiselect_row(row) {
             self.extend_tree_selection(row);
             return;
         }
-        if mode == TreeSelectionMode::Toggle && is_workspace_row(row) {
+        if mode == TreeSelectionMode::Toggle && is_tree_multiselect_row(row) {
             if self.selected_tree_paths.contains(&row.full_path) {
                 self.selected_tree_paths.remove(&row.full_path);
             } else {
@@ -2914,13 +3385,7 @@ impl ShellState {
         self.refresh_tree_debug("select_tree_row");
     }
     fn extend_tree_selection(&mut self, row: &BrowserRow) {
-        let rows = merged_sidebar_rows(
-            self.browser.rows(),
-            self.server.remote_machines(),
-            self.server.ssh_targets(),
-            &self.server.live_sessions(),
-            &self.browser.expanded_path_set(),
-        );
+        let rows = self.all_sidebar_rows_for_selection();
         let anchor = self
             .selection_anchor
             .clone()
@@ -2947,7 +3412,7 @@ impl ShellState {
         };
         self.selected_tree_paths.clear();
         for candidate in rows.iter().skip(start).take(end - start + 1) {
-            if is_workspace_row(candidate) {
+            if is_tree_multiselect_row(candidate) {
                 self.selected_tree_paths.insert(candidate.full_path.clone());
             }
         }
@@ -3169,12 +3634,13 @@ impl ShellState {
         self.refresh_tree_debug("cancel_delete_dialog");
     }
     fn begin_tree_rename(&mut self, row: &BrowserRow) {
-        if !is_workspace_row(row) {
+        if row.kind != BrowserRowKind::Session && !is_workspace_row(row) {
             return;
         }
         self.select_tree_row(row, TreeSelectionMode::Replace);
         self.tree_rename_path = Some(row.full_path.clone());
         self.tree_rename_value = row.label.clone();
+        self.tree_rename_started_at_ms = current_millis();
         self.close_context_menu();
         self.refresh_tree_debug("begin_tree_rename");
     }
@@ -3185,6 +3651,7 @@ impl ShellState {
     fn cancel_tree_rename(&mut self) {
         self.tree_rename_path = None;
         self.tree_rename_value.clear();
+        self.tree_rename_started_at_ms = 0;
         self.refresh_tree_debug("cancel_tree_rename");
     }
     fn refresh_tree_debug(&mut self, source: &str) {
@@ -3294,13 +3761,13 @@ impl ShellState {
             "payload": payload,
         });
         if let Ok(store) = SessionStore::open_or_init() {
-            let path = store.home_dir().join("ui-telemetry.jsonl");
-            if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-                if let Ok(mut line) = serde_json::to_vec(&telemetry) {
-                    line.push(b'\n');
-                    let _ = file.write_all(&line);
-                }
-            }
+            let path = store.home_dir().join(UI_TELEMETRY_FILENAME);
+            append_bounded_jsonl_record(
+                &path,
+                UI_TELEMETRY_ROTATED_FILENAME,
+                UI_TELEMETRY_MAX_BYTES,
+                &telemetry,
+            );
             append_trace_event(store.home_dir(), "ui", "ui_telemetry", event, telemetry);
         }
     }
@@ -3312,29 +3779,44 @@ impl ShellState {
     }
     fn sync_browser_settings(&mut self) {
         self.settings.show_tree = self.sidebar_open;
+        self.settings.tree_width = self.sidebar_width;
         self.settings.selected_browser_path = self.browser.selected_path().map(ToOwned::to_owned);
         self.settings.expanded_browser_paths = self.browser.expanded_paths();
         self.persist_settings();
     }
     fn toggle_titlebar_new_menu(&mut self) {
+        self.search_focused = false;
         self.titlebar_session_menu_open = false;
+        self.titlebar_overflow_menu_open = false;
         self.titlebar_new_menu_open = !self.titlebar_new_menu_open;
     }
     fn close_titlebar_new_menu(&mut self) {
         self.titlebar_new_menu_open = false;
     }
     fn toggle_titlebar_session_menu(&mut self) {
+        self.search_focused = false;
         self.titlebar_new_menu_open = false;
+        self.titlebar_overflow_menu_open = false;
         self.titlebar_session_menu_open = !self.titlebar_session_menu_open;
     }
     fn close_titlebar_session_menu(&mut self) {
         self.titlebar_session_menu_open = false;
+    }
+    fn toggle_titlebar_overflow_menu(&mut self) {
+        self.search_focused = false;
+        self.titlebar_new_menu_open = false;
+        self.titlebar_session_menu_open = false;
+        self.titlebar_overflow_menu_open = !self.titlebar_overflow_menu_open;
+    }
+    fn close_titlebar_overflow_menu(&mut self) {
+        self.titlebar_overflow_menu_open = false;
     }
     fn activate_alt_overlay(&mut self) {
         self.alt_overlay_active = true;
         self.alt_overlay_sequence.clear();
         self.titlebar_new_menu_open = false;
         self.titlebar_session_menu_open = false;
+        self.titlebar_overflow_menu_open = false;
     }
     fn clear_alt_overlay(&mut self) {
         self.alt_overlay_active = false;
@@ -3471,6 +3953,18 @@ fn safe_push_notification(
             panic_payload=?error,
             "suppressed notification panic"
         );
+    }
+}
+fn set_signal_if_changed<T>(mut signal: Signal<T>, value: T)
+where
+    T: PartialEq + 'static,
+{
+    let should_update = {
+        let current = signal.read();
+        current.ne(&value)
+    };
+    if should_update {
+        signal.set(value);
     }
 }
 fn spawn_loading_notice(
@@ -3817,18 +4311,173 @@ fn safe_shell_read<R>(
         }
     }
 }
-fn queue_title_generation(state: Signal<ShellState>, row: BrowserRow, force: bool) {
+fn queue_title_generation(state: Signal<ShellState>, row: BrowserRow, force: bool, announce: bool) {
     let target = safe_shell_read(state, "queue_title_generation_read", |shell| {
-        copy_generation_target_for_browser_row(&shell.server, &row)
+        let live_sessions = shell.server.live_sessions();
+        copy_generation_target_for_sidebar_row(&shell.server, &live_sessions, &row)
     })
     .flatten();
     if let Some(target) = target {
-        spawn_title_generation_for_target(state, target, force, force, false);
+        spawn_title_generation_for_target(state, target, force, announce, false);
     }
 }
 fn spawn_deferred_title_generation(state: Signal<ShellState>, row: BrowserRow, force: bool) {
     spawn(async move {
-        queue_title_generation(state, row, force);
+        queue_title_generation(state, row, force, force);
+    });
+}
+fn queue_rename_field_ai_title_generation(mut state: Signal<ShellState>, row: BrowserRow) {
+    let row_for_task = row.clone();
+    spawn(async move {
+        let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let store = SessionStore::open_or_init()?;
+            if let Some(session_id) = row_for_task.session_id.as_deref() {
+                store.clear_title_for_session_id(session_id)?;
+            } else if store
+                .clear_title_for_session_path(&row_for_task.full_path)?
+                .is_none()
+            {
+                return Err(anyhow!(
+                    "session AI title refresh needs a stable session identity: {}",
+                    row_for_task.full_path
+                ));
+            }
+            Ok(())
+        })
+        .await;
+
+        match outcome {
+            Ok(Ok(())) => {
+                state.with_mut(|shell| {
+                    if shell.tree_rename_path.as_deref() == Some(row.full_path.as_str()) {
+                        shell.cancel_tree_rename();
+                    }
+                    shell.last_action = "regenerating session title".to_string();
+                });
+                queue_title_generation(state, row, true, true);
+            }
+            Ok(Err(error)) => {
+                state.with_mut(|shell| {
+                    shell.push_notification(
+                        NotificationTone::Warning,
+                        "Title Refresh Failed",
+                        error.to_string(),
+                    );
+                });
+            }
+            Err(error) => {
+                state.with_mut(|shell| {
+                    shell.push_notification(
+                        NotificationTone::Warning,
+                        "Title Refresh Failed",
+                        format!("title refresh task failed: {error}"),
+                    );
+                });
+            }
+        }
+    });
+}
+fn queue_precis_generation_for_row(
+    state: Signal<ShellState>,
+    row: BrowserRow,
+    force: bool,
+    announce: bool,
+) {
+    let target = safe_shell_read(state, "queue_precis_generation_read", |shell| {
+        let live_sessions = shell.server.live_sessions();
+        copy_generation_target_for_sidebar_row(&shell.server, &live_sessions, &row)
+    })
+    .flatten();
+    if let Some(target) = target {
+        spawn_precis_generation_for_target(state, target, force, announce, force);
+    }
+}
+fn queue_summary_generation_for_row(
+    state: Signal<ShellState>,
+    row: BrowserRow,
+    force: bool,
+    announce: bool,
+) {
+    let target = safe_shell_read(state, "queue_summary_generation_read", |shell| {
+        let live_sessions = shell.server.live_sessions();
+        copy_generation_target_for_sidebar_row(&shell.server, &live_sessions, &row)
+    })
+    .flatten();
+    if let Some(target) = target {
+        spawn_summary_generation_for_target(state, target, force, announce, force);
+    }
+}
+fn queue_selected_copy_regeneration(
+    mut state: Signal<ShellState>,
+    context_row: BrowserRow,
+    mode: CopyRegenerationMode,
+) {
+    let selected_rows = safe_shell_read(state, "queue_selected_copy_regeneration_read", |shell| {
+        shell.selected_copy_generation_rows(Some(&context_row))
+    })
+    .unwrap_or_default();
+    if selected_rows.is_empty() {
+        state.with_mut(|shell| {
+            shell.close_context_menu();
+            shell.push_notification(
+                NotificationTone::Warning,
+                "No Sessions Selected",
+                "Select one or more sessions, folders, or machine groups before regenerating copy."
+                    .to_string(),
+            );
+        });
+        return;
+    }
+    let target_count = selected_rows.len();
+    let mode_label = match mode {
+        CopyRegenerationMode::Title => "title",
+        CopyRegenerationMode::Summary => "summary",
+        CopyRegenerationMode::Copy => "copy",
+    };
+    state.with_mut(|shell| {
+        shell.close_context_menu();
+        shell.last_action = format!("queued {mode_label} regeneration for {target_count} session(s)");
+        shell.push_notification(
+            NotificationTone::Info,
+            match mode {
+                CopyRegenerationMode::Title => "Regenerating Titles",
+                CopyRegenerationMode::Summary => "Regenerating Summaries",
+                CopyRegenerationMode::Copy => "Regenerating Session Copy",
+            },
+            match mode {
+                CopyRegenerationMode::Title => {
+                    format!("Queued title regeneration for {target_count} session(s).")
+                }
+                CopyRegenerationMode::Summary => {
+                    format!("Queued summary regeneration for {target_count} session(s).")
+                }
+                CopyRegenerationMode::Copy => {
+                    format!("Queued title, precis, and summary regeneration for {target_count} session(s).")
+                }
+            },
+        );
+    });
+    for row in selected_rows {
+        match mode {
+            CopyRegenerationMode::Title => queue_title_generation(state, row, true, false),
+            CopyRegenerationMode::Summary => {
+                queue_summary_generation_for_row(state, row, true, false)
+            }
+            CopyRegenerationMode::Copy => {
+                queue_title_generation(state, row.clone(), true, false);
+                queue_precis_generation_for_row(state, row.clone(), true, false);
+                queue_summary_generation_for_row(state, row, true, false);
+            }
+        }
+    }
+}
+fn spawn_selected_copy_regeneration(
+    state: Signal<ShellState>,
+    row: BrowserRow,
+    mode: CopyRegenerationMode,
+) {
+    spawn(async move {
+        queue_selected_copy_regeneration(state, row, mode);
     });
 }
 fn queue_active_session_title_generation(state: Signal<ShellState>, force: bool) {
@@ -4558,7 +5207,7 @@ fn spawn_initial_server_sync(
         perf.finish(json!({
             "ok": outcome.as_ref().is_ok_and(|result| result.is_ok()),
         }));
-        let _ = safe_shell_mut(
+        let should_schedule_allocator_trim = safe_shell_mut(
             state,
             "initial_server_sync_complete",
             |shell| match outcome {
@@ -4569,6 +5218,7 @@ fn spawn_initial_server_sync(
                     shell.apply_daemon_snapshot_result(Ok((snapshot, Some(message))));
                     shell.server_daemon_detail = detail;
                     shell.next_background_copy_scan_after_ms = current_millis() + 2_500;
+                    true
                 }
                 Ok(Err(error)) => {
                     shell.server_busy = false;
@@ -4582,6 +5232,7 @@ fn spawn_initial_server_sync(
                             error.to_string(),
                         );
                     }
+                    false
                 }
                 Err(error) => {
                     shell.server_busy = false;
@@ -4593,9 +5244,19 @@ fn spawn_initial_server_sync(
                         "Server Task Failed",
                         error.to_string(),
                     );
+                    false
                 }
             },
-        );
+        )
+        .ok()
+        .unwrap_or(false);
+        if should_schedule_allocator_trim {
+            schedule_allocator_trim_after(
+                state,
+                "initial_server_sync",
+                ALLOCATOR_TRIM_STARTUP_DELAY_MS,
+            );
+        }
         async_render_epoch.with_mut(|epoch| *epoch += 1);
         schedule_ui();
         maybe_spawn_missing_remote_machine_refreshes(state);
@@ -4998,6 +5659,11 @@ fn reachable_versioned_server_socket_candidates(current: &Path) -> Vec<PathBuf> 
     });
     candidates
 }
+
+#[cfg(unix)]
+fn server_socket_path_lexists(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
 #[cfg(unix)]
 fn maybe_alias_current_endpoint_to_reachable_versioned_socket(
     endpoint: &ServerEndpoint,
@@ -5010,10 +5676,10 @@ fn maybe_alias_current_endpoint_to_reachable_versioned_socket(
         if ping(&candidate_endpoint).is_err() {
             continue;
         }
-        if current_path.exists() && ping(endpoint).is_err() {
+        if server_socket_path_lexists(current_path) && ping(endpoint).is_err() {
             let _ = fs::remove_file(current_path);
         }
-        if !current_path.exists() {
+        if !server_socket_path_lexists(current_path) {
             std::os::unix::fs::symlink(&candidate, current_path).with_context(|| {
                 format!(
                     "linking stale daemon socket {} to reachable {}",
@@ -5288,7 +5954,7 @@ fn restart_daemon(endpoint: &ServerEndpoint) -> Result<()> {
 fn prepare_current_endpoint_for_spawn(endpoint: &ServerEndpoint) -> Result<()> {
     #[cfg(unix)]
     if let ServerEndpoint::UnixSocket(path) = endpoint {
-        if path.exists() && ping(endpoint).is_err() {
+        if server_socket_path_lexists(path) && ping(endpoint).is_err() {
             let _ = std::fs::remove_file(path);
         }
     }
@@ -5561,6 +6227,7 @@ fn app_control_command_defers_background_refresh(command: &AppControlCommand) ->
     matches!(
         command,
         AppControlCommand::SetSearch { .. }
+            | AppControlCommand::SetRightPanelMode { .. }
             | AppControlCommand::SetUiTheme { .. }
             | AppControlCommand::CreateTerminal { .. }
             | AppControlCommand::OpenPath { .. }
@@ -5592,6 +6259,107 @@ fn interactive_surface_request_in_flight(shell: &ShellState) -> bool {
 }
 fn background_refreshes_deferred(shell: &ShellState) -> bool {
     current_millis() < shell.background_refresh_after_ms
+}
+fn allocator_trim_can_run(shell: &ShellState) -> bool {
+    !shell.needs_initial_server_sync
+        && !shell.background_copy_scan_in_flight
+        && !interactive_surface_request_in_flight(shell)
+        && !terminal_attach_blocks_background_work(shell)
+        && shell.title_requests_in_flight.is_empty()
+        && shell.summary_requests_in_flight.is_empty()
+}
+#[cfg(target_os = "linux")]
+fn maybe_spawn_process_allocator_trim(perf_home: PathBuf, reason: &'static str) -> bool {
+    let now_ms = current_millis();
+    if now_ms.saturating_sub(LAST_ALLOCATOR_TRIM_MS.load(Ordering::Relaxed))
+        < ALLOCATOR_TRIM_MIN_INTERVAL_MS
+    {
+        return false;
+    }
+    let Some(before) = current_process_memory_sample() else {
+        return false;
+    };
+    if before.rss_kb < ALLOCATOR_TRIM_RSS_THRESHOLD_KB {
+        return false;
+    }
+    if ALLOCATOR_TRIM_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return false;
+    }
+    let worker_name = format!("yggterm-allocator-trim-{}", current_millis());
+    let result = thread::Builder::new().name(worker_name).spawn(move || {
+        let trim_started_at_ms = current_millis();
+        let trimmed = unsafe { libc::malloc_trim(0) };
+        let after = current_process_memory_sample();
+        let finished_at_ms = current_millis();
+        let payload = json!({
+            "reason": reason,
+            "trimmed": trimmed,
+            "started_at_ms": trim_started_at_ms,
+            "finished_at_ms": finished_at_ms,
+            "before": {
+                "rss_kb": before.rss_kb,
+                "pss_kb": before.pss_kb,
+                "anonymous_kb": before.anonymous_kb,
+            },
+            "after": after.map(|sample| json!({
+                "rss_kb": sample.rss_kb,
+                "pss_kb": sample.pss_kb,
+                "anonymous_kb": sample.anonymous_kb,
+            })),
+        });
+        append_perf_event(&perf_home, "memory", "allocator_trim", payload);
+        LAST_ALLOCATOR_TRIM_MS.store(finished_at_ms, Ordering::Relaxed);
+        ALLOCATOR_TRIM_IN_FLIGHT.store(false, Ordering::SeqCst);
+    });
+    if result.is_err() {
+        ALLOCATOR_TRIM_IN_FLIGHT.store(false, Ordering::SeqCst);
+        return false;
+    }
+    true
+}
+#[cfg(target_os = "linux")]
+fn maybe_spawn_background_allocator_trim(state: Signal<ShellState>, reason: &'static str) {
+    let perf_home = safe_shell_read(
+        state,
+        "maybe_spawn_background_allocator_trim_read",
+        |shell| {
+            allocator_trim_can_run(shell).then(|| perf_home_dir(&shell.bootstrap.settings_path))
+        },
+    )
+    .flatten();
+    let Some(perf_home) = perf_home else {
+        return;
+    };
+    let _ = maybe_spawn_process_allocator_trim(perf_home, reason);
+}
+#[cfg(not(target_os = "linux"))]
+fn maybe_spawn_background_allocator_trim(_state: Signal<ShellState>, _reason: &'static str) {}
+fn schedule_allocator_trim_after(state: Signal<ShellState>, reason: &'static str, delay_ms: u64) {
+    let perf_home = safe_shell_read(state, "schedule_allocator_trim_after_read", |shell| {
+        perf_home_dir(&shell.bootstrap.settings_path)
+    });
+    let Some(perf_home) = perf_home else {
+        return;
+    };
+    #[cfg(target_os = "linux")]
+    {
+        let worker_name = format!("yggterm-allocator-trim-schedule-{}", current_millis());
+        let _ = thread::Builder::new().name(worker_name).spawn(move || {
+            thread::sleep(Duration::from_millis(delay_ms));
+            let _ = maybe_spawn_process_allocator_trim(perf_home.clone(), reason);
+            for _ in 1..ALLOCATOR_TRIM_STARTUP_RETRY_COUNT {
+                thread::sleep(Duration::from_millis(
+                    ALLOCATOR_TRIM_STARTUP_RETRY_INTERVAL_MS,
+                ));
+                if maybe_spawn_process_allocator_trim(perf_home.clone(), reason) {
+                    break;
+                }
+            }
+        });
+    }
 }
 fn shell_has_live_session_snapshot_refresh_target(shell: &ShellState) -> bool {
     !shell.server.live_sessions().is_empty()
@@ -6157,8 +6925,17 @@ fn spawn_set_view_mode(mut state: Signal<ShellState>, mode: WorkspaceViewMode) {
     }
 }
 fn spawn_open_session_row(state: Signal<ShellState>, row: BrowserRow) {
-    let prefer_terminal = state.read().server.active_view_mode() == WorkspaceViewMode::Terminal;
+    let prefer_terminal =
+        state.with(|shell| preferred_open_mode_for_row(shell, &row) == WorkspaceViewMode::Terminal);
     spawn_open_session_row_with_mode_retry(state, row, prefer_terminal, 2);
+}
+
+fn preferred_open_mode_for_row(shell: &ShellState, row: &BrowserRow) -> WorkspaceViewMode {
+    if is_live_sidebar_row(row) && row_supports_terminal(shell, row) {
+        WorkspaceViewMode::Terminal
+    } else {
+        shell.server.active_view_mode()
+    }
 }
 
 fn remote_live_focus_error_should_retry_via_open(row: &BrowserRow, error_text: &str) -> bool {
@@ -6214,16 +6991,19 @@ fn spawn_focus_live_session_row_retry(
         open_request_id = shell.latest_open_request_id;
         retained_live_terminal = mode == WorkspaceViewMode::Terminal
             && shell.terminal_session_is_retained_live(&row.full_path);
+        shell.selected_tree_paths.clear();
+        shell.selected_tree_paths.insert(row.full_path.clone());
+        shell.selection_anchor = Some(row.full_path.clone());
         shell.browser.select_path(row.full_path.clone());
+        shell.ensure_session_path_visible(&row.full_path);
         shell.context_menu_row = None;
-        if mode == WorkspaceViewMode::Terminal && retained_live_terminal {
+        if mode == WorkspaceViewMode::Terminal {
             shell.retain_terminal_session_path(&row.full_path);
         }
         shell.clear_terminal_resume_notifications_except(
             (mode == WorkspaceViewMode::Terminal).then_some(row.full_path.as_str()),
         );
         shell.sync_browser_settings();
-        shell.ensure_active_session_visible();
         shell.begin_surface_request(
             request_meta.clone(),
             format!("focusing {}", row.label),
@@ -6368,6 +7148,26 @@ fn spawn_open_session_row_with_mode_retry_inner(
     let staged_remote_preview_session = (!prefer_terminal)
         .then(|| parse_remote_scanned_session_path(&row.full_path).map(|_| row.full_path.clone()))
         .flatten();
+    if prefer_terminal && state.with(|shell| session_is_hot_terminal_row(shell, &row)) {
+        state.with_mut(|shell| {
+            shell.latest_open_request_id = shell.latest_open_request_id.saturating_add(1);
+            shell.selected_tree_paths.clear();
+            shell.selected_tree_paths.insert(row.full_path.clone());
+            shell.selection_anchor = Some(row.full_path.clone());
+            shell.browser.select_path(row.full_path.clone());
+            shell.ensure_session_path_visible(&row.full_path);
+            shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+            shell
+                .server
+                .request_terminal_launch_for_path(&row.full_path);
+            shell.retain_terminal_session_path(&row.full_path);
+            shell.context_menu_row = None;
+            shell.clear_terminal_resume_notifications_except(Some(row.full_path.as_str()));
+            shell.sync_browser_settings();
+            shell.last_action = format!("focused hot {}", row.label);
+        });
+        return;
+    }
     if allow_live_focus && is_live_sidebar_row(&row) {
         let mode = if prefer_terminal {
             WorkspaceViewMode::Terminal
@@ -6503,7 +7303,7 @@ fn spawn_open_session_row_with_mode_retry_inner(
                 } else {
                     open_stored_session_with_view(
                         &request_endpoint,
-                        session_kind_for_row(row_for_request.kind),
+                        session_kind_for_row(&row_for_request),
                         &row_for_request.full_path,
                         row_for_request.session_id.as_deref(),
                         row_for_request.session_cwd.as_deref(),
@@ -6968,9 +7768,65 @@ fn preferred_agent_session_kind(settings: &AppSettings) -> SessionKind {
         AgentSessionProfile::Codex => SessionKind::Codex,
     }
 }
-fn session_kind_for_row(kind: BrowserRowKind) -> SessionKind {
-    match kind {
-        BrowserRowKind::Session => SessionKind::Codex,
+
+fn is_codex_storage_session_path(path: &str) -> bool {
+    path.contains("/.codex/sessions/")
+}
+
+fn is_codex_litellm_storage_session_path(path: &str) -> bool {
+    path.contains("/.codex-litellm/sessions/")
+}
+
+fn row_session_kind(row: &BrowserRow) -> Option<SessionKind> {
+    if row.kind != BrowserRowKind::Session {
+        return None;
+    }
+    if row.full_path.starts_with("codex-litellm://")
+        || is_codex_litellm_storage_session_path(&row.full_path)
+    {
+        Some(SessionKind::CodexLiteLlm)
+    } else if row.full_path.starts_with("codex://") || is_codex_storage_session_path(&row.full_path)
+    {
+        Some(SessionKind::Codex)
+    } else if row.full_path.starts_with("local://") {
+        Some(SessionKind::Shell)
+    } else if row.full_path.starts_with("ssh://") || row.full_path.starts_with("remote-session://")
+    {
+        Some(SessionKind::SshShell)
+    } else {
+        None
+    }
+}
+
+fn is_hot_terminal_sidebar_path(path: &str) -> bool {
+    path.starts_with("local://")
+        || path.starts_with("ssh://")
+        || path.starts_with("remote-session://")
+        || path.starts_with("codex://")
+        || path.starts_with("codex-litellm://")
+        || is_codex_storage_session_path(path)
+        || is_codex_litellm_storage_session_path(path)
+}
+
+fn merge_hot_sidebar_sessions(
+    live_sessions: &[ManagedSessionView],
+    retained_terminal_sessions: &[ManagedSessionView],
+) -> Vec<ManagedSessionView> {
+    let mut sessions_by_path = BTreeMap::<String, ManagedSessionView>::new();
+    for session in live_sessions {
+        sessions_by_path.insert(session.session_path.clone(), session.clone());
+    }
+    for session in retained_terminal_sessions {
+        sessions_by_path
+            .entry(session.session_path.clone())
+            .or_insert_with(|| session.clone());
+    }
+    sessions_by_path.into_values().collect()
+}
+
+fn session_kind_for_row(row: &BrowserRow) -> SessionKind {
+    match row.kind {
+        BrowserRowKind::Session => row_session_kind(row).unwrap_or(SessionKind::Codex),
         BrowserRowKind::Document => SessionKind::Document,
         BrowserRowKind::Group => SessionKind::Codex,
         BrowserRowKind::Separator => SessionKind::Codex,
@@ -6989,6 +7845,16 @@ fn is_live_sidebar_row(row: &BrowserRow) -> bool {
         || row.full_path.starts_with("local://")
         || row.full_path.starts_with("codex://")
         || row.full_path.starts_with("codex-litellm://")
+        || is_codex_storage_session_path(&row.full_path)
+        || is_codex_litellm_storage_session_path(&row.full_path)
+}
+
+fn session_is_hot_terminal_row(shell: &ShellState, row: &BrowserRow) -> bool {
+    shell.terminal_session_is_retained_live(&row.full_path)
+        || shell
+            .server
+            .active_session_path()
+            .is_some_and(|active_path| active_path == row.full_path)
 }
 fn is_remote_scanned_sidebar_row(row: &BrowserRow) -> bool {
     row.full_path.starts_with("remote-session://")
@@ -7035,6 +7901,7 @@ fn supports_generated_session_copy(session: &ManagedSessionView) -> bool {
         || session.kind == SessionKind::SshShell
         || is_local_live_session_path(&session.session_path)
         || is_local_stored_session_path(&session.session_path)
+        || session.session_path.starts_with("codex://")
         || session.session_path.starts_with("remote-session://")
         || session.session_path.starts_with("ssh://")
 }
@@ -7092,6 +7959,9 @@ fn copy_generation_target_for_browser_row(
     server: &YggtermServer,
     row: &BrowserRow,
 ) -> Option<CopyGenerationTarget> {
+    if row.kind != BrowserRowKind::Session {
+        return None;
+    }
     let session_id = row.session_id.clone()?;
     if is_remote_scanned_sidebar_row(row) {
         let machine = remote_machine_for_session_path(server, &row.full_path)?;
@@ -7116,7 +7986,12 @@ fn copy_generation_target_for_browser_row(
                 .then(|| remote.storage_path.clone()),
         });
     }
-    if !is_local_stored_session_row(row) {
+    if row.full_path.starts_with("__")
+        || row.full_path.starts_with("local://")
+        || row.full_path.starts_with("ssh://")
+        || row.full_path.starts_with("codex://")
+        || row.full_path.starts_with("codex-litellm://")
+    {
         return None;
     }
     Some(CopyGenerationTarget {
@@ -7129,6 +8004,87 @@ fn copy_generation_target_for_browser_row(
         remote_machine: None,
         storage_path: Some(row.full_path.clone()),
     })
+}
+fn copy_generation_target_for_sidebar_row(
+    server: &YggtermServer,
+    live_sessions: &[ManagedSessionView],
+    row: &BrowserRow,
+) -> Option<CopyGenerationTarget> {
+    copy_generation_target_for_browser_row(server, row).or_else(|| {
+        let normalized_row_path = normalize_live_session_path(&row.full_path);
+        live_sessions
+            .iter()
+            .find(|session| {
+                normalize_live_session_path(&session.session_path) == normalized_row_path
+                    || session.session_path == row.full_path
+                    || row
+                        .session_id
+                        .as_deref()
+                        .is_some_and(|session_id| session.id == session_id)
+            })
+            .and_then(|session| copy_generation_target_for_session(server, session))
+            .or_else(|| {
+                server
+                    .active_session()
+                    .filter(|session| {
+                        normalize_live_session_path(&session.session_path) == normalized_row_path
+                            || session.session_path == row.full_path
+                            || row
+                                .session_id
+                                .as_deref()
+                                .is_some_and(|session_id| session.id == session_id)
+                    })
+                    .and_then(|session| copy_generation_target_for_session(server, session))
+            })
+    })
+}
+fn collect_selected_copy_generation_rows(
+    all_rows: &[BrowserRow],
+    server: &YggtermServer,
+    live_sessions: &[ManagedSessionView],
+    selected_row: &BrowserRow,
+    seen_paths: &mut HashSet<String>,
+    out: &mut Vec<BrowserRow>,
+) {
+    if copy_generation_target_for_sidebar_row(server, live_sessions, selected_row).is_some()
+        && seen_paths.insert(selected_row.full_path.clone())
+    {
+        out.push(selected_row.clone());
+        return;
+    }
+    let selected_prefix = format!("{}/", selected_row.full_path.trim_end_matches('/'));
+    let remote_machine_prefix = selected_row
+        .full_path
+        .strip_prefix("__remote_machine__/")
+        .map(|machine_key| format!("remote-session://{machine_key}/"));
+    for candidate in all_rows {
+        if candidate.kind != BrowserRowKind::Session {
+            continue;
+        }
+        let in_selected_scope = if let Some(prefix) = remote_machine_prefix.as_deref() {
+            candidate.full_path.starts_with(prefix)
+        } else if selected_row.full_path == "__live_sessions__" {
+            is_live_sidebar_row(candidate)
+        } else if selected_row.full_path == "local" {
+            !is_remote_scanned_sidebar_row(candidate)
+                && !candidate.full_path.starts_with("ssh://")
+                && !candidate.full_path.starts_with("__")
+        } else {
+            candidate.full_path.starts_with(&selected_prefix)
+                || candidate.session_cwd.as_deref().is_some_and(|cwd| {
+                    cwd == selected_row.full_path || cwd.starts_with(&selected_prefix)
+                })
+        };
+        if !in_selected_scope {
+            continue;
+        }
+        if copy_generation_target_for_sidebar_row(server, live_sessions, candidate).is_none() {
+            continue;
+        }
+        if seen_paths.insert(candidate.full_path.clone()) {
+            out.push(candidate.clone());
+        }
+    }
 }
 fn source_updated_at_for_session(
     server: &YggtermServer,
@@ -7144,6 +8100,13 @@ fn source_updated_at_for_session(
                     .find(|candidate| candidate.session_path == session.session_path)
                     .and_then(remote_session_updated_at)
             })
+    } else if session.session_path.starts_with("codex://") {
+        let storage_path = metadata_value(session, "Storage");
+        if storage_path.trim().is_empty() {
+            None
+        } else {
+            local_session_updated_at(&storage_path)
+        }
     } else {
         local_session_updated_at(&session.session_path)
     }
@@ -7216,6 +8179,7 @@ fn generation_context_for_target(
         }
     }
     if (is_local_live_session_path(&target.session_path)
+        || target.session_path.starts_with("codex://")
         || target.session_path.starts_with("ssh://"))
         && let Some(context) = live_terminal_generation_context(endpoint, &target.session_path)
     {
@@ -7227,6 +8191,71 @@ fn generation_context_for_target(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+fn humanized_title_for_copy_target(target: &CopyGenerationTarget) -> Option<String> {
+    if let Some(machine) = target.remote_machine.as_ref() {
+        let label = machine.label.trim();
+        if !label.is_empty() {
+            return Some(format!("{} Shell", shell_title_case_words(label)));
+        }
+    }
+    let cwd = target.cwd.trim().trim_end_matches('/');
+    if cwd.is_empty() {
+        return None;
+    }
+    if let Some(home_user) = cwd.strip_prefix("/home/")
+        && !home_user.is_empty()
+        && !home_user.contains('/')
+    {
+        return Some(format!("{} Home Shell", shell_title_case_words(home_user)));
+    }
+    let leaf = cwd.rsplit('/').find(|segment| !segment.trim().is_empty())?;
+    let leaf = leaf.replace('_', " ").replace('-', " ");
+    let title = format!("{} Shell", shell_title_case_words(&leaf));
+    (!looks_like_generated_fallback_title(&title)).then_some(title)
+}
+fn humanized_summary_for_copy_target(target: &CopyGenerationTarget) -> Option<String> {
+    let cwd = target.cwd.trim();
+    if let Some(machine) = target.remote_machine.as_ref() {
+        let label = machine.label.trim();
+        if !label.is_empty() && !cwd.is_empty() {
+            return Some(format!("Remote shell on {label} rooted at {cwd}."));
+        }
+        if !label.is_empty() {
+            return Some(format!("Remote shell on {label}."));
+        }
+    }
+    if !cwd.is_empty() {
+        return Some(format!("Local shell rooted at {cwd}."));
+    }
+    None
+}
+fn generated_copy_from_context(
+    target: &CopyGenerationTarget,
+    context: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let title =
+        best_effort_title_from_context(context).or_else(|| humanized_title_for_copy_target(target));
+    let precis = best_effort_precis_from_context(context)
+        .or_else(|| humanized_summary_for_copy_target(target));
+    let summary = best_effort_summary_from_context(context)
+        .or_else(|| precis.clone())
+        .or_else(|| humanized_summary_for_copy_target(target));
+    (title, precis, summary)
+}
+fn shell_title_case_words(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(|word| {
+            let mut chars = word.chars();
+            let Some(first) = chars.next() else {
+                return String::new();
+            };
+            first.to_ascii_uppercase().to_string() + &chars.as_str().to_ascii_lowercase()
+        })
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 fn target_can_fetch_remote_generation_context(target: &CopyGenerationTarget) -> bool {
     target.remote_machine.is_some()
@@ -7365,6 +8394,8 @@ fn is_transient_local_daemon_connect_error(error: &str) -> bool {
     let trimmed = error.trim();
     trimmed.contains("Connection refused")
         || trimmed.contains("No such file or directory")
+        || trimmed.contains("reading daemon response")
+        || trimmed.contains("parsing daemon response: \"\"")
         || trimmed.contains("local yggterm daemon did not become reachable")
         || (trimmed.contains("connecting to ")
             && trimmed.contains("server-")
@@ -7470,6 +8501,7 @@ fn maybe_request_copy_generation_for_session(
     {
         schedule_active_title_autogen_retry_tick(state, session.session_path.clone(), delay_ms);
     }
+    let mut requested_background_scan = false;
     if should_request_title_generation || !has_summary || summary_stale {
         spawn_active_session_copy_hydration(state, session.clone());
         if should_request_title_generation {
@@ -7492,11 +8524,20 @@ fn maybe_request_copy_generation_for_session(
         if !has_summary || summary_stale {
             spawn_summary_generation(state, session, false, false);
         }
-        state.with_mut(|shell| shell.next_background_copy_scan_after_ms = current_millis());
+        requested_background_scan =
+            state.with_mut(|shell| schedule_background_copy_scan_now(shell, now_ms));
+    }
+    if requested_background_scan {
         maybe_spawn_background_copy_generation(state);
     }
-    state.with_mut(|shell| shell.next_background_copy_scan_after_ms = current_millis());
-    maybe_spawn_background_copy_generation(state);
+}
+fn schedule_background_copy_scan_now(shell: &mut ShellState, now_ms: u64) -> bool {
+    if shell.next_background_copy_scan_after_ms > now_ms {
+        shell.next_background_copy_scan_after_ms = now_ms;
+        true
+    } else {
+        false
+    }
 }
 fn should_surface_preview_failure(failure: &PreviewSyncFailure, now_ms: u64) -> bool {
     failure.retry_count >= 2 || now_ms.saturating_sub(failure.first_failed_at_ms) >= 6_000
@@ -7857,12 +8898,39 @@ fn remote_generated_copy_from_machines(
     })
 }
 fn resolved_session_title(shell: &ShellState, session: &ManagedSessionView) -> Option<String> {
-    if !session.title.trim().is_empty() && !looks_like_generated_fallback_title(&session.title) {
+    let copy_target = copy_generation_target_for_session(&shell.server, session);
+    let copy_cwd = copy_target
+        .as_ref()
+        .map(|target| target.cwd.trim())
+        .unwrap_or_default();
+    let browser_row_title = shell
+        .browser
+        .rows()
+        .iter()
+        .find(|row| row.full_path == session.session_path)
+        .and_then(|row| {
+            row.session_title
+                .clone()
+                .or_else(|| (!row.label.trim().is_empty()).then(|| row.label.clone()))
+        })
+        .filter(|title| !title_is_low_signal_for_copy(title, copy_cwd));
+    if browser_row_title.is_some() {
+        return browser_row_title;
+    }
+    let local_shell_abbreviated_title =
+        matches!(
+            (session.source, session.kind),
+            (SessionSource::LiveLocal, SessionKind::Shell)
+        ) && title_looks_like_abbreviated_shell_label(&session.title);
+    if !session.title.trim().is_empty()
+        && !title_is_low_signal_for_copy(&session.title, copy_cwd)
+        && !local_shell_abbreviated_title
+    {
         return Some(session.title.clone());
     }
     let remote_title = remote_generated_copy(&shell.server, &session.session_path)
         .map(|(title, _, _)| title)
-        .filter(|title| !title.trim().is_empty() && !looks_like_generated_fallback_title(title));
+        .filter(|title| !title.trim().is_empty() && !title_is_low_signal_for_copy(title, copy_cwd));
     if remote_title.is_some() {
         return remote_title;
     }
@@ -7872,11 +8940,28 @@ fn resolved_session_title(shell: &ShellState, session: &ManagedSessionView) -> O
         .iter()
         .find(|row| row.full_path == session.session_path)
         .map(|row| row.label.clone())
-        .filter(|title| !title.trim().is_empty() && !looks_like_generated_fallback_title(title))
+        .filter(|title| !title.trim().is_empty() && !title_is_low_signal_for_copy(title, copy_cwd))
     {
         return Some(row_title);
     }
-    None
+    copy_target
+        .as_ref()
+        .and_then(humanized_title_for_copy_target)
+}
+fn title_looks_like_abbreviated_shell_label(title: &str) -> bool {
+    let trimmed = title.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > 10 {
+        return false;
+    }
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    !words.is_empty()
+        && words.len() <= 3
+        && words.iter().all(|word| {
+            let compact = word.trim_matches(|ch: char| !ch.is_ascii_alphanumeric());
+            !compact.is_empty()
+                && compact.chars().count() <= 4
+                && compact.chars().all(|ch| ch.is_ascii_alphanumeric())
+        })
 }
 fn title_is_low_signal_for_copy(title: &str, cwd: &str) -> bool {
     let trimmed = title.trim();
@@ -7996,6 +9081,12 @@ fn titlebar_summary_text(
         .or_else(|| preview_summary_metadata_value(session, "Summary"))
         .filter(|summary| !summary.trim().is_empty())
         .filter(|summary| !looks_like_low_signal_generated_copy(summary))
+}
+fn titlebar_search_dropdown_open(snapshot: &RenderSnapshot) -> bool {
+    (snapshot.command_mode_active || snapshot.search_focused)
+        && !snapshot.titlebar_new_menu_open
+        && !snapshot.titlebar_session_menu_open
+        && !snapshot.titlebar_overflow_menu_open
 }
 fn preview_summary_metadata_value(session: &ManagedSessionView, label: &str) -> Option<String> {
     session
@@ -9234,12 +10325,12 @@ fn spawn_active_session_copy_hydration(mut state: Signal<ShellState>, session: M
                     let store_title = store.resolve_title_for_session_id(&session.id)?;
                     let store_precis = store.resolve_precis_for_session_id(&session.id)?;
                     let store_summary = store.resolve_summary_for_session_id(&session.id)?;
-                    let resolved_title = if title.trim().is_empty() {
+                    let mut resolved_title = if title.trim().is_empty() {
                         store_title
                     } else {
                         store_title.or(Some(title))
                     };
-                    let resolved_precis = if precis
+                    let mut resolved_precis = if precis
                         .as_ref()
                         .is_some_and(|value| !value.trim().is_empty())
                     {
@@ -9255,18 +10346,35 @@ fn spawn_active_session_copy_hydration(mut state: Signal<ShellState>, session: M
                     } else {
                         store_summary
                     };
-                    if resolved_summary
-                        .as_deref()
-                        .is_none_or(looks_like_low_signal_generated_copy)
-                    {
-                        if let Some(target) = generation_target.as_ref() {
-                            resolved_summary =
-                                generation_context_for_target(&endpoint_for_task, target);
+                    if let Some(target) = generation_target.as_ref() {
+                        if let Some(context) =
+                            generation_context_for_target(&endpoint_for_task, target)
+                        {
+                            let (generated_title, generated_precis, generated_summary) =
+                                generated_copy_from_context(target, &context);
+                            if resolved_title
+                                .as_deref()
+                                .is_none_or(looks_like_generated_fallback_title)
+                            {
+                                resolved_title = generated_title;
+                            }
+                            if resolved_precis
+                                .as_deref()
+                                .is_none_or(looks_like_low_signal_generated_copy)
+                            {
+                                resolved_precis = generated_precis;
+                            }
+                            if resolved_summary
+                                .as_deref()
+                                .is_none_or(looks_like_low_signal_generated_copy)
+                            {
+                                resolved_summary = generated_summary;
+                            }
                         }
                     }
                     return Ok((resolved_title, resolved_precis, resolved_summary));
                 }
-                let (title, precis, mut summary) = if !needs_local_lookup {
+                let (mut title, mut precis, mut summary) = if !needs_local_lookup {
                     (
                         store.resolve_title_for_session_id(&session.id)?,
                         store.resolve_precis_for_session_id(&session.id)?,
@@ -9279,12 +10387,29 @@ fn spawn_active_session_copy_hydration(mut state: Signal<ShellState>, session: M
                         store.resolve_summary_for_session_path(&path_for_task)?,
                     )
                 };
-                if summary
-                    .as_deref()
-                    .is_none_or(looks_like_low_signal_generated_copy)
-                {
-                    if let Some(target) = generation_target.as_ref() {
-                        summary = generation_context_for_target(&endpoint_for_task, target);
+                if let Some(target) = generation_target.as_ref() {
+                    if let Some(context) = generation_context_for_target(&endpoint_for_task, target)
+                    {
+                        let (generated_title, generated_precis, generated_summary) =
+                            generated_copy_from_context(target, &context);
+                        if title
+                            .as_deref()
+                            .is_none_or(looks_like_generated_fallback_title)
+                        {
+                            title = generated_title;
+                        }
+                        if precis
+                            .as_deref()
+                            .is_none_or(looks_like_low_signal_generated_copy)
+                        {
+                            precis = generated_precis;
+                        }
+                        if summary
+                            .as_deref()
+                            .is_none_or(looks_like_low_signal_generated_copy)
+                        {
+                            summary = generated_summary;
+                        }
                     }
                 }
                 Ok((title, precis, summary))
@@ -10109,9 +11234,7 @@ fn is_local_tree_live_session(session: &ManagedSessionView) -> bool {
     is_local_live_session_path(&session.session_path) && session.kind != SessionKind::Document
 }
 fn is_promoted_live_session(session: &ManagedSessionView) -> bool {
-    session.source == SessionSource::LiveSsh
-        && (session.session_path.starts_with("remote-session://")
-            || session.session_path.starts_with("ssh://"))
+    session.kind != SessionKind::Document && is_hot_terminal_sidebar_path(&session.session_path)
 }
 fn enrich_sidebar_rows_with_live_titles(
     rows: &mut [BrowserRow],
@@ -10121,21 +11244,72 @@ fn enrich_sidebar_rows_with_live_titles(
     let mut title_by_path = HashMap::<String, String>::new();
     let remote_session_index = build_remote_session_index(remote_machines);
     for session in live_sessions {
-        let title = session.title.trim();
-        if !title.is_empty() && !looks_like_generated_fallback_title(title) {
-            title_by_path.insert(session.session_path.clone(), title.to_string());
+        let session_cwd = session_cwd_for_managed_session(session);
+        let cwd = session_cwd.as_deref().unwrap_or_default();
+        let direct_title = session.title.trim();
+        if !direct_title.is_empty()
+            && !title_is_low_signal_for_copy(direct_title, cwd)
+            && !title_looks_like_abbreviated_shell_label(direct_title)
+        {
+            title_by_path.insert(session.session_path.clone(), direct_title.to_string());
+            continue;
+        }
+        if let Some(cwd) = session_cwd
+            && let Some(title) = humanized_title_for_copy_target(&CopyGenerationTarget {
+                session_path: session.session_path.clone(),
+                session_id: session.id.clone(),
+                cwd,
+                title: session.title.clone(),
+                source_updated_at: None,
+                remote_context: None,
+                remote_machine: None,
+                storage_path: None,
+            })
+        {
+            title_by_path.insert(session.session_path.clone(), title);
         }
     }
     for (session_path, title) in remote_session_index.generated_title_by_path {
         title_by_path.entry(session_path).or_insert(title);
     }
     for row in rows {
-        let Some(title) = title_by_path.get(&row.full_path).cloned() else {
+        let row_cwd = row.session_cwd.clone().unwrap_or_default();
+        let preserved_row_title = row
+            .session_title
+            .clone()
+            .or_else(|| (!row.label.trim().is_empty()).then(|| row.label.clone()))
+            .filter(|title| !title_is_low_signal_for_copy(title, &row_cwd));
+        if preserved_row_title.is_some() {
+            continue;
+        }
+        let Some(mut title) = title_by_path.get(&row.full_path).cloned() else {
             continue;
         };
+        if matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document)
+            && title_is_low_signal_for_copy(&title, &row_cwd)
+            && !row_cwd.trim().is_empty()
+        {
+            if let Some(recovered_title) = humanized_title_for_copy_target(&CopyGenerationTarget {
+                session_path: row.full_path.clone(),
+                session_id: row.session_id.clone().unwrap_or_default(),
+                cwd: row_cwd.clone(),
+                title: row.label.clone(),
+                source_updated_at: None,
+                remote_context: None,
+                remote_machine: None,
+                storage_path: None,
+            }) {
+                title = recovered_title;
+            }
+        }
         row.session_title = Some(title.clone());
         if matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document)
-            && (row.label.trim().is_empty() || looks_like_generated_fallback_title(&row.label))
+            && (row.label.trim().is_empty()
+                || looks_like_generated_fallback_title(&row.label)
+                || row
+                    .session_cwd
+                    .as_deref()
+                    .is_some_and(|cwd| cwd.trim() == row.label.trim()))
         {
             row.label = title;
         }
@@ -10315,6 +11489,20 @@ fn machine_health_attr_value(health: MachineHealth) -> &'static str {
         MachineHealth::Offline => "offline",
     }
 }
+fn machine_display_health(
+    health: MachineHealth,
+    deploy_state: RemoteDeployState,
+    session_count: usize,
+) -> MachineHealth {
+    if matches!(health, MachineHealth::Cached)
+        && matches!(deploy_state, RemoteDeployState::Ready)
+        && session_count > 0
+    {
+        MachineHealth::Healthy
+    } else {
+        health
+    }
+}
 fn machine_indicator_color_value(health: MachineHealth) -> &'static str {
     match health {
         MachineHealth::Healthy => "#16a34a",
@@ -10341,7 +11529,12 @@ fn push_remote_machine_rows(
     machine: &SidebarRemoteMachine,
     expanded_paths: &HashSet<String>,
 ) {
-    let machine_label = apply_machine_health_suffix(&machine.label, machine.health);
+    let display_health = machine_display_health(
+        machine.health,
+        machine.remote_deploy_state,
+        machine.scanned_sessions.len(),
+    );
+    let machine_label = apply_machine_health_suffix(&machine.label, display_health);
     let machine_path = format!("__remote_machine__/{}", machine.key);
     let machine_expanded = expanded_paths.contains(&machine_path);
     rows.push(BrowserRow {
@@ -11142,6 +12335,16 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
         state.with_mut(|shell| shell.cancel_tree_rename());
         return;
     }
+    let ignore_unchanged_blur_commit = {
+        let shell = state.read();
+        shell.tree_rename_path.as_deref() == Some(row.full_path.as_str())
+            && trimmed == row.label.trim()
+            && current_millis().saturating_sub(shell.tree_rename_started_at_ms)
+                <= TREE_RENAME_BLUR_COMMIT_GRACE_MS
+    };
+    if ignore_unchanged_blur_commit {
+        return;
+    }
     state.with_mut(|shell| {
         shell.server_busy = true;
         shell.last_action = format!("renaming {}", row.label);
@@ -11179,7 +12382,30 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
                             .unwrap_or(WorkspaceGroupKind::Folder),
                     )?;
                 }
-                BrowserRowKind::Session => {}
+                BrowserRowKind::Session => {
+                    let cwd = row_for_task
+                        .session_cwd
+                        .clone()
+                        .unwrap_or_else(|| row_for_task.full_path.clone());
+                    if let Some(session_id) = row_for_task.session_id.as_deref() {
+                        store.save_manual_title_for_session_id(
+                            session_id,
+                            &cwd,
+                            &trimmed_for_task,
+                        )?;
+                    } else if store
+                        .save_manual_title_for_session_path(
+                            &row_for_task.full_path,
+                            &trimmed_for_task,
+                        )?
+                        .is_none()
+                    {
+                        return Err(anyhow!(
+                            "session rename needs a stable session identity: {}",
+                            row_for_task.full_path
+                        ));
+                    }
+                }
             }
             store.load_codex_tree(&settings)
         })
@@ -11195,8 +12421,14 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
                 shell.selected_tree_paths.clear();
                 shell.selected_tree_paths.insert(row.full_path.clone());
                 shell.selection_anchor = Some(row.full_path.clone());
+                if row.kind == BrowserRowKind::Session {
+                    shell
+                        .server
+                        .set_session_title_hint(&row.full_path, &trimmed);
+                }
                 shell.tree_rename_path = None;
                 shell.tree_rename_value.clear();
+                shell.tree_rename_started_at_ms = 0;
                 shell.sync_browser_settings();
                 shell.server_busy = false;
                 shell.last_action = format!("renamed {}", trimmed);
@@ -12027,6 +13259,12 @@ fn is_workspace_row(row: &BrowserRow) -> bool {
         BrowserRowKind::Session => false,
     }
 }
+fn is_tree_multiselect_row(row: &BrowserRow) -> bool {
+    match row.kind {
+        BrowserRowKind::Session | BrowserRowKind::Document | BrowserRowKind::Separator => true,
+        BrowserRowKind::Group => row.full_path != "/",
+    }
+}
 fn is_drop_target_row(row: &BrowserRow) -> bool {
     match row.kind {
         BrowserRowKind::Group => {
@@ -12197,6 +13435,44 @@ fn perf_home_dir(settings_path: &std::path::Path) -> PathBuf {
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."))
 }
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, Default)]
+struct ProcessMemorySample {
+    rss_kb: u64,
+    pss_kb: u64,
+    anonymous_kb: u64,
+}
+#[cfg(target_os = "linux")]
+fn process_memory_sample_from_smaps_rollup(text: &str) -> ProcessMemorySample {
+    let mut sample = ProcessMemorySample::default();
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(label) = parts.next() else {
+            continue;
+        };
+        let value = parts
+            .next()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or_default();
+        match label {
+            "Rss:" => sample.rss_kb = value,
+            "Pss:" => sample.pss_kb = value,
+            "Anonymous:" => sample.anonymous_kb = value,
+            _ => {}
+        }
+    }
+    sample
+}
+#[cfg(target_os = "linux")]
+fn current_process_memory_sample() -> Option<ProcessMemorySample> {
+    let text = fs::read_to_string("/proc/self/smaps_rollup").ok()?;
+    let sample = process_memory_sample_from_smaps_rollup(&text);
+    (sample.rss_kb > 0).then_some(sample)
+}
+#[cfg(not(target_os = "linux"))]
+fn current_process_memory_sample() -> Option<()> {
+    None
+}
 fn client_instance_scope(endpoint: &ServerEndpoint) -> String {
     let raw = match endpoint {
         #[cfg(unix)]
@@ -12225,6 +13501,65 @@ fn right_panel_mode_label(mode: RightPanelMode) -> &'static str {
         RightPanelMode::Settings => "settings",
         RightPanelMode::Connect => "connect",
         RightPanelMode::Notifications => "notifications",
+    }
+}
+
+fn app_control_right_panel_mode(mode: AppControlRightPanelMode) -> RightPanelMode {
+    match mode {
+        AppControlRightPanelMode::Hidden => RightPanelMode::Hidden,
+        AppControlRightPanelMode::Connect => RightPanelMode::Connect,
+        AppControlRightPanelMode::Notifications => RightPanelMode::Notifications,
+        AppControlRightPanelMode::Settings => RightPanelMode::Settings,
+        AppControlRightPanelMode::Metadata => RightPanelMode::Metadata,
+    }
+}
+
+fn app_control_right_panel_mode_label(mode: AppControlRightPanelMode) -> &'static str {
+    right_panel_mode_label(app_control_right_panel_mode(mode))
+}
+
+fn app_control_dom_rect_visible(dom: &Value, key: &str) -> bool {
+    dom.get(key).and_then(Value::as_object).is_some_and(|rect| {
+        rect.get("width")
+            .and_then(Value::as_f64)
+            .unwrap_or_default()
+            > 0.0
+            && rect
+                .get("height")
+                .and_then(Value::as_f64)
+                .unwrap_or_default()
+                > 0.0
+    })
+}
+
+fn app_control_dom_settings_panel_visible(dom: &Value) -> bool {
+    if dom
+        .get("active_element")
+        .and_then(Value::as_object)
+        .and_then(|active| active.get("data_settings_field_key"))
+        .and_then(Value::as_str)
+        .is_some_and(|field| !field.is_empty())
+    {
+        return true;
+    }
+    [
+        "settings_interface_llm_input_rect",
+        "settings_endpoint_input_rect",
+        "settings_api_key_input_rect",
+    ]
+    .into_iter()
+    .any(|key| app_control_dom_rect_visible(dom, key))
+}
+
+fn coerce_app_control_shell_state_from_dom(snapshot: &mut Value, dom: &Value) {
+    if !app_control_dom_settings_panel_visible(dom) {
+        return;
+    }
+    if let Some(shell) = snapshot.get_mut("shell").and_then(Value::as_object_mut) {
+        shell.insert(
+            "right_panel_mode".to_string(),
+            Value::String("settings".to_string()),
+        );
     }
 }
 fn preview_layout_mode_label(mode: PreviewLayoutMode) -> &'static str {
@@ -12433,11 +13768,31 @@ fn describe_app_state_snapshot(
         .cloned()
         .collect::<Vec<_>>();
     selected_tree_paths.sort();
+    let notification_now_ms = current_millis();
+    let visible_notifications = shell
+        .notifications
+        .iter()
+        .filter(|notification| {
+            notification.persistent
+                || notification_now_ms.saturating_sub(notification.created_at_ms)
+                    <= TOAST_VIEWPORT_MAX_AGE_MS
+        })
+        .rev()
+        .take(TOAST_VIEWPORT_MAX_VISIBLE)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
     let settings_snapshot = json!({
         "theme": match shell.settings.theme {
             UiTheme::ZedLight => "light",
             UiTheme::ZedDark => "dark",
         },
+        "tree_width": shell.settings.tree_width,
+        "litellm_endpoint": shell.settings.litellm_endpoint,
+        "litellm_api_key": shell.settings.litellm_api_key,
+        "interface_llm_model": shell.settings.interface_llm_model,
         "interface_font_size": shell.settings.ui_font_size,
         "interface_zoom_percent": zoom_percent_f32(shell.settings.ui_font_size, 14.0),
         "rendered_font_size": shell.settings.rendered_font_size,
@@ -12499,26 +13854,48 @@ fn describe_app_state_snapshot(
                     "session_title": row.session_title,
                     "kind": format!("{:?}", row.kind),
                     "machine_key": machine.as_ref().map(|machine| machine.machine_key.clone()),
-                    "machine_health": machine.as_ref().map(|machine| format!("{:?}", machine.health).to_ascii_lowercase()),
-                    "machine_indicator_color": machine.as_ref().map(|machine| {
-                        machine_indicator_color_value(match machine.health {
+                "machine_health": machine.as_ref().map(|machine| {
+                    format!(
+                        "{:?}",
+                        machine_display_health(
+                            match machine.health {
+                                RemoteMachineHealth::Healthy => MachineHealth::Healthy,
+                                RemoteMachineHealth::Cached => MachineHealth::Cached,
+                                RemoteMachineHealth::Offline => MachineHealth::Offline,
+                            },
+                            machine.remote_deploy_state,
+                            machine.sessions.len(),
+                        )
+                    )
+                    .to_ascii_lowercase()
+                }),
+                "machine_health_raw": machine.as_ref().map(|machine| format!("{:?}", machine.health).to_ascii_lowercase()),
+                "machine_indicator_color": machine.as_ref().map(|machine| {
+                    machine_indicator_color_value(machine_display_health(
+                        match machine.health {
                             RemoteMachineHealth::Healthy => MachineHealth::Healthy,
                             RemoteMachineHealth::Cached => MachineHealth::Cached,
                             RemoteMachineHealth::Offline => MachineHealth::Offline,
-                        })
-                    }),
-                })
-            }),
+                        },
+                        machine.remote_deploy_state,
+                        machine.sessions.len(),
+                    ))
+                }),
+            })
+        }),
             "expanded_paths": shell.browser.expanded_paths(),
             "metrics": {
                 "row_count": browser_metrics.row_count,
                 "rebuild_count": browser_metrics.rebuild_count,
                 "last_rebuild_ms": browser_metrics.last_rebuild_ms,
+                "root_render_count": APP_ROOT_RENDER_COUNT.load(Ordering::SeqCst),
             },
         },
         "shell": {
             "sidebar_open": shell.sidebar_open,
-            "right_panel_mode": right_panel_mode_label(shell.right_panel_mode),
+            "sidebar_width": shell.sidebar_width,
+            "sidebar_resizing": shell.sidebar_resize_drag.is_some(),
+            "right_panel_mode": right_panel_mode_label(snapshot.right_panel_mode),
             "preview_layout": preview_layout_mode_label(shell.preview_layout),
             "search_query": shell.search_query,
             "search_focused": shell.search_focused,
@@ -12527,6 +13904,16 @@ fn describe_app_state_snapshot(
             "selected_tree_paths": selected_tree_paths,
             "selection_anchor": shell.selection_anchor,
             "tree_rename_path": shell.tree_rename_path,
+            "context_menu_row": shell.context_menu_row.as_ref().map(|row| {
+                json!({
+                    "full_path": row.full_path,
+                    "label": row.label,
+                    "kind": format!("{:?}", row.kind),
+                })
+            }),
+            "context_menu_position": shell
+                .context_menu_position
+                .map(|(x, y)| json!({ "x": x, "y": y })),
             "theme_editor_open": shell.theme_editor_open,
             "titlebar_new_menu_open": shell.titlebar_new_menu_open,
             "fullscreen": shell.fullscreen,
@@ -12552,7 +13939,20 @@ fn describe_app_state_snapshot(
             "background_refresh_after_ms": shell.background_refresh_after_ms,
             "terminal_busy_hint_until_ms": shell.terminal_busy_hint_until_ms,
             "notifications_count": shell.notifications.len(),
+            "visible_notifications_count": visible_notifications.len(),
             "notifications": shell.notifications.iter().map(|notification| {
+                json!({
+                    "id": notification.id,
+                    "tone": format!("{:?}", notification.tone),
+                    "title": notification.title,
+                    "message": notification.message,
+                    "created_at_ms": notification.created_at_ms,
+                    "job_key": notification.job_key,
+                    "progress": notification.progress,
+                    "persistent": notification.persistent,
+                })
+            }).collect::<Vec<_>>(),
+            "visible_notifications": visible_notifications.iter().map(|notification| {
                 json!({
                     "id": notification.id,
                     "tone": format!("{:?}", notification.tone),
@@ -12602,8 +14002,23 @@ fn describe_app_state_snapshot(
                     "machine_key": machine.machine_key,
                     "label": machine.label,
                     "ssh_target": machine.ssh_target,
-                    "health": format!("{:?}", machine.health).to_ascii_lowercase(),
-                    "machine_indicator_color": machine_indicator_color_value(health),
+                    "health": format!(
+                        "{:?}",
+                        machine_display_health(
+                            health,
+                            machine.remote_deploy_state,
+                            machine.sessions.len(),
+                        )
+                    )
+                    .to_ascii_lowercase(),
+                    "health_raw": format!("{:?}", machine.health).to_ascii_lowercase(),
+                    "machine_indicator_color": machine_indicator_color_value(
+                        machine_display_health(
+                            health,
+                            machine.remote_deploy_state,
+                            machine.sessions.len(),
+                        )
+                    ),
                     "remote_deploy_state": format!("{:?}", machine.remote_deploy_state),
                     "session_count": machine.sessions.len(),
                 })
@@ -12640,13 +14055,32 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
                 "draggable": is_workspace_row(row),
                 "drop_target_row": is_drop_target_row(row),
                 "machine_key": machine.as_ref().map(|machine| machine.machine_key.clone()),
-                "machine_health": machine.as_ref().map(|machine| format!("{:?}", machine.health).to_ascii_lowercase()),
+                "machine_health": machine.as_ref().map(|machine| {
+                    format!(
+                        "{:?}",
+                        machine_display_health(
+                            match machine.health {
+                                RemoteMachineHealth::Healthy => MachineHealth::Healthy,
+                                RemoteMachineHealth::Cached => MachineHealth::Cached,
+                                RemoteMachineHealth::Offline => MachineHealth::Offline,
+                            },
+                            machine.remote_deploy_state,
+                            machine.sessions.len(),
+                        )
+                    )
+                    .to_ascii_lowercase()
+                }),
+                "machine_health_raw": machine.as_ref().map(|machine| format!("{:?}", machine.health).to_ascii_lowercase()),
                 "machine_indicator_color": machine.as_ref().map(|machine| {
-                    machine_indicator_color_value(match machine.health {
-                        RemoteMachineHealth::Healthy => MachineHealth::Healthy,
-                        RemoteMachineHealth::Cached => MachineHealth::Cached,
-                        RemoteMachineHealth::Offline => MachineHealth::Offline,
-                    })
+                    machine_indicator_color_value(machine_display_health(
+                        match machine.health {
+                            RemoteMachineHealth::Healthy => MachineHealth::Healthy,
+                            RemoteMachineHealth::Cached => MachineHealth::Cached,
+                            RemoteMachineHealth::Offline => MachineHealth::Offline,
+                        },
+                        machine.remote_deploy_state,
+                        machine.sessions.len(),
+                    ))
                 }),
                 "remote_deploy_state": machine.as_ref().map(|machine| format!("{:?}", machine.remote_deploy_state)),
             })
@@ -12720,13 +14154,79 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
             const titlebar = titlebarSessionContainer?.closest('[data-yggterm-titlebar="1"]')
                 || pickLast(visibleNodes(titlebars))
                 || pickLast(titlebars);
+            const sidebar =
+                pickLast(visibleNodes(sidebars))
+                || pickLast(sidebars)
+                || null;
+            const sidebarResizeHandle = sidebar?.querySelector('[data-sidebar-resize-handle="1"]') || null;
             const titlebarTitle = titlebar?.querySelector('[data-titlebar-title="1"]') || null;
-            const titlebarButton = titlebar?.querySelector('[data-titlebar-session-button="1"]') || null;
+            const titlebarSidebarButton = titlebar?.querySelector('[data-titlebar-sidebar-button="1"]') || null;
+            const titlebarSummaryShell = titlebar?.querySelector('[data-titlebar-summary-shell="1"]') || null;
+            const titlebarButton = titlebarSummaryShell?.querySelector('[data-titlebar-session-button="1"]')
+                || titlebar?.querySelector('[data-titlebar-session-button="1"]')
+                || null;
             const titlebarSummary = titlebar?.querySelector('[data-titlebar-summary-body="1"]') || null;
             const titlebarSummaryMenu = titlebar?.querySelector('[data-titlebar-summary-menu="1"]') || null;
+            const titlebarSummaryRegenerateSummary = titlebarSummaryMenu?.querySelector('[data-titlebar-summary-action="summary"]') || null;
+            const titlebarNewMenuOuter = titlebar?.querySelector('[data-titlebar-new-menu="1"]') || null;
+            const titlebarNewMenu = titlebarNewMenuOuter?.querySelector('[data-titlebar-new-menu-shell="1"]')
+                || titlebarNewMenuOuter
+                || null;
+            const titlebarNewMenuActions = Array.from(titlebarNewMenu?.querySelectorAll('[data-titlebar-new-menu-action="1"]') || []);
+            const titlebarNewButton = titlebarNewMenuOuter?.querySelector('[data-titlebar-new-button="1"]')
+                || titlebarNewMenu?.querySelector('[data-titlebar-new-button="1"]')
+                || titlebar?.querySelector('[data-titlebar-new-button="1"]')
+                || null;
+            const titlebarLeftGroup = titlebar?.querySelector('[data-yggterm-titlebar-left="1"]') || null;
+            const titlebarSearchOuterShell = titlebar?.querySelector('[data-yggterm-titlebar-search="1"]') || null;
+            const titlebarSearchShell = titlebar?.querySelector('[data-titlebar-search-modal="1"]')
+                || titlebar?.querySelector('[data-yggterm-titlebar-search="1"]')
+                || null;
+            const titlebarSearchFieldShell = titlebar?.querySelector('[data-titlebar-search-field-shell="1"]') || null;
+            const titlebarSearchInput = titlebar?.querySelector('#yggterm-search-input') || null;
+            const titlebarSearchDropdown = titlebar?.querySelector('[data-titlebar-search-dropdown="1"]') || null;
+            const titlebarSearchDropdownHeader = titlebarSearchDropdown?.querySelector('[data-titlebar-search-dropdown-header="1"]') || null;
+            const titlebarSearchDropdownEntries = Array.from(titlebarSearchDropdown?.querySelectorAll('[data-titlebar-search-dropdown-entry="1"]') || []);
+            const titlebarRightGroup = titlebar?.querySelector('[data-yggterm-titlebar-right="1"]') || null;
+            const titlebarConnectButton = titlebar?.querySelector('[data-titlebar-connect-button="1"]') || null;
+            const titlebarNotificationsButton = titlebar?.querySelector('[data-titlebar-notifications-button="1"]') || null;
+            const titlebarSettingsButton = titlebar?.querySelector('[data-titlebar-settings-button="1"]') || null;
+            const titlebarMetadataButton = titlebar?.querySelector('[data-titlebar-metadata-button="1"]') || null;
+            const titlebarOverflowButton = titlebar?.querySelector('[data-titlebar-overflow-button="1"]') || null;
+            const titlebarOverflowMenu = titlebar?.querySelector('[data-titlebar-overflow-menu="1"]') || null;
+            const contextMenu = rootNode?.querySelector('[data-context-menu="1"]')
+                || document.querySelector('[data-context-menu="1"]')
+                || null;
+            const contextMenuRenameSession = contextMenu?.querySelector('[data-context-menu-action="rename-session"]') || null;
+            const contextMenuActions = Array.from(contextMenu?.querySelectorAll('[data-context-menu-action]') || []);
+            const treeRenameInputs = rootNode
+                ? Array.from(rootNode.querySelectorAll('[data-tree-rename-input="1"]'))
+                : Array.from(document.querySelectorAll('[data-tree-rename-input="1"]'));
+            const treeRenameInput =
+                pickLast(visibleNodes(treeRenameInputs))
+                || pickLast(treeRenameInputs)
+                || null;
+            const treeRenameAiAction = treeRenameInput?.closest('[data-sidebar-row-path]')?.querySelector('[data-sidebar-rename-ai-action="title"]')
+                || rootNode?.querySelector('[data-sidebar-rename-ai-action="title"]')
+                || document.querySelector('[data-sidebar-rename-ai-action="title"]')
+                || null;
+            const settingsEndpointInput = rootNode?.querySelector('[data-settings-field-key="litellm-endpoint"]') || null;
+            const settingsApiKeyInput = rootNode?.querySelector('[data-settings-field-key="litellm-api-key"]') || null;
+            const settingsInterfaceLlmInput = rootNode?.querySelector('[data-settings-field-key="interface-llm"]') || null;
+            const themeEditorOverlay = rootNode?.querySelector('[data-theme-editor-overlay="1"]') || null;
+            const themeEditorShell = rootNode?.querySelector('[data-theme-editor-shell="1"]') || null;
+            const themeEditorOpenButton = rootNode?.querySelector('[data-theme-editor-open-button="1"]') || null;
+            const themeEditorApplyButton = rootNode?.querySelector('[data-theme-editor-action="apply"]') || null;
+            const themeEditorResetButton = rootNode?.querySelector('[data-theme-editor-action="reset"]') || null;
+            const themeEditorSeedButton = rootNode?.querySelector('[data-theme-editor-action="seed"]') || null;
             const mainSurfaces = rootNode
                 ? Array.from(rootNode.querySelectorAll('[data-yggterm-main-surface="1"]'))
                 : Array.from(document.querySelectorAll('[data-yggterm-main-surface="1"]'));
+            const mainSurface =
+                pickLast(visibleNodes(mainSurfaces))
+                || pickLast(mainSurfaces)
+                || null;
+            const mainSurfaceBody = mainSurface?.querySelector('[data-yggterm-main-surface-body="1"]') || null;
             const terminalResumeOverlay = pickLast(visibleNodes(
                 rootNode
                     ? Array.from(rootNode.querySelectorAll('[data-terminal-resume-overlay="true"]'))
@@ -12831,15 +14331,43 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                         ? activeElement.className
                         : '',
                     role: String(activeElement.getAttribute && activeElement.getAttribute('role') || ''),
+                    data_settings_field_key: String(
+                        activeElement.getAttribute && activeElement.getAttribute('data-settings-field-key') || ''
+                    ),
                     data_terminal_session_path: String(
                         activeElement.getAttribute && activeElement.getAttribute('data-terminal-session-path') || ''
                     ),
+                    value: 'value' in activeElement ? String(activeElement.value || '') : '',
                     within_terminal_host_id: (() => {
                         const matchedHost = activeElement.closest && activeElement.closest('[data-terminal-session-path]');
                         return matchedHost ? String(matchedHost.id || '') : '';
                     })(),
                 }
                 : null;
+            const elementSummaryAtPoint = (rect) => {
+                if (!rect || !Number.isFinite(rect.left) || !Number.isFinite(rect.top) || !Number.isFinite(rect.width) || !Number.isFinite(rect.height) || rect.width <= 0 || rect.height <= 0) {
+                    return null;
+                }
+                const pointX = rect.left + Math.max(1, rect.width / 2);
+                const pointY = rect.top + Math.max(1, rect.height / 2);
+                const node = document.elementFromPoint(pointX, pointY);
+                if (!node) {
+                    return null;
+                }
+                return {
+                    tag: String(node.tagName || '').toLowerCase(),
+                    id: String(node.id || ''),
+                    class_name: typeof node.className === 'string' ? node.className : '',
+                    role: String(node.getAttribute && node.getAttribute('role') || ''),
+                    data_settings_field_key: String(
+                        node.getAttribute && node.getAttribute('data-settings-field-key') || ''
+                    ),
+                    data_terminal_session_path: String(
+                        node.getAttribute && node.getAttribute('data-terminal-session-path') || ''
+                    ),
+                    text: String(node.textContent || '').trim().slice(0, 120),
+                };
+            };
             const parseCssColor = (value) => {
                 const text = String(value || '').trim();
                 if (!text) {
@@ -12933,7 +14461,10 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                         continue;
                     }
                     const style = window.getComputedStyle(node);
-                    const contrast = contrastRatio(style.color, backgroundColor);
+                    const sampleBackground = !isTransparentCssColor(style.backgroundColor)
+                        ? String(style.backgroundColor || '')
+                        : backgroundColor;
+                    const contrast = contrastRatio(style.color, sampleBackground);
                     if (contrast == null) {
                         continue;
                     }
@@ -12946,6 +14477,7 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     lowContrastSamples.push({
                         text: text.slice(0, 120),
                         color: String(style.color || ''),
+                        background: sampleBackground,
                         opacity: String(style.opacity || ''),
                         font_weight: String(style.fontWeight || ''),
                         contrast,
@@ -13139,6 +14671,25 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     .filter(Boolean);
                 const selectionSummary = selectionSummaryForHost(host);
                 const xtermRoot = host.querySelector('.xterm');
+                const xtermRootStyle = xtermRoot ? window.getComputedStyle(xtermRoot) : null;
+                const resolvedUserSelect = (style, node) => {{
+                    const candidates = [
+                        style ? style.userSelect : '',
+                        style && style.getPropertyValue ? style.getPropertyValue('user-select') : '',
+                        style ? style.webkitUserSelect : '',
+                        style && style.getPropertyValue ? style.getPropertyValue('-webkit-user-select') : '',
+                        node && node.style ? node.style.userSelect : '',
+                        node && node.style ? node.style.webkitUserSelect : '',
+                    ];
+                    for (const candidate of candidates) {{
+                        const normalized = String(candidate || '').trim().toLowerCase();
+                        if (normalized) {{
+                            return normalized;
+                        }}
+                    }}
+                    return '';
+                }};
+                const selectionLayerRects = host.querySelectorAll('.xterm-selection div');
                 const mountedHost = window.__yggtermXtermHosts ? window.__yggtermXtermHosts[host.id] : null;
                 const term = mountedHost ? mountedHost.term : null;
                 const activeBuffer = term && term.buffer ? term.buffer.active : null;
@@ -13375,6 +14926,10 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     selection_text: selectionSummary.text,
                     selection_range_count: selectionSummary.range_count,
                     selection_within_host: selectionSummary.within_host,
+                    xterm_root_user_select: resolvedUserSelect(xtermRootStyle, xtermRoot),
+                    rows_user_select: resolvedUserSelect(rowsStyle, rowsLayer),
+                    selection_layer_count: host.querySelectorAll('.xterm-selection').length,
+                    selection_layer_rect_count: selectionLayerRects.length,
                     dim_sample_text: dimSample ? String(dimSample.textContent || '') : null,
                     dim_sample_color: dimSampleStyle ? String(dimSampleStyle.color || '') : null,
                     dim_sample_opacity: dimSampleStyle ? String(dimSampleStyle.opacity || '') : null,
@@ -13513,6 +15068,14 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                         width: Number(helperTextareaRect.width.toFixed(2)),
                         height: Number(helperTextareaRect.height.toFixed(2)),
                     } : null,
+                    helper_textarea_opacity: helperTextarea ? String(window.getComputedStyle(helperTextarea).opacity || '') : null,
+                    helper_textarea_background: helperTextarea ? String(window.getComputedStyle(helperTextarea).backgroundColor || '') : null,
+                    helper_textarea_outline_style: helperTextarea ? String(window.getComputedStyle(helperTextarea).outlineStyle || '') : null,
+                    helper_textarea_outline_color: helperTextarea ? String(window.getComputedStyle(helperTextarea).outlineColor || '') : null,
+                    helper_textarea_box_shadow: helperTextarea ? String(window.getComputedStyle(helperTextarea).boxShadow || '') : null,
+                    helper_textarea_clip_path: helperTextarea ? String(window.getComputedStyle(helperTextarea).clipPath || '') : null,
+                    helper_textarea_clip: helperTextarea ? String(window.getComputedStyle(helperTextarea).clip || '') : null,
+                    helper_textarea_pointer_events: helperTextarea ? String(window.getComputedStyle(helperTextarea).pointerEvents || '') : null,
                     screen_rect: screenRect ? {
                         left: Number(screenRect.left.toFixed(2)),
                         top: Number(screenRect.top.toFixed(2)),
@@ -13554,6 +15117,20 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     };
                 })()
                 : null;
+            const rectSummary = (node) => {
+                if (!node) {
+                    return null;
+                }
+                const rect = node.getBoundingClientRect();
+                return {
+                    left: Number(rect.left.toFixed(2)),
+                    top: Number(rect.top.toFixed(2)),
+                    width: Number(rect.width.toFixed(2)),
+                    height: Number(rect.height.toFixed(2)),
+                    right: Number(rect.right.toFixed(2)),
+                    bottom: Number(rect.bottom.toFixed(2)),
+                };
+            };
             const previewViewportTop = previewViewportRect ? previewViewportRect.top : -120;
             const previewViewportBottom = previewViewportRect
                 ? (previewViewportRect.top + previewViewportRect.height)
@@ -13674,11 +15251,109 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                 shell_root_count: shellRoots.length,
                 shell_roots: shellRootDetails,
                 sidebar_count: sidebars.length,
+                shell_root_rect: rectSummary(rootNode),
+                shell_root_background: rootNode ? String(window.getComputedStyle(rootNode).backgroundColor || '') : null,
+                shell_root_box_shadow: rootNode ? String(window.getComputedStyle(rootNode).boxShadow || '') : null,
+                shell_root_border_radius: rootNode ? String(window.getComputedStyle(rootNode).borderRadius || '') : null,
+                sidebar_rect: rectSummary(sidebar),
+                sidebar_resize_handle_rect: rectSummary(sidebarResizeHandle),
                 titlebar_count: titlebars.length,
                 titlebar_title_text: String(titlebarTitle?.textContent || "").trim().slice(0, 240),
                 titlebar_button_tooltip: String(titlebarButton?.getAttribute('title') || "").trim().slice(0, 240),
                 titlebar_summary_text: String(titlebarSummary?.textContent || "").trim().slice(0, 240),
                 titlebar_menu_open: Boolean(titlebarSummaryMenu),
+                titlebar_rect: rectSummary(titlebar),
+                titlebar_left_rect: rectSummary(titlebarLeftGroup),
+                titlebar_sidebar_button_rect: rectSummary(titlebarSidebarButton),
+                titlebar_search_shell_rect: rectSummary(titlebarSearchShell),
+                titlebar_search_shell_background: titlebarSearchShell ? String(window.getComputedStyle(titlebarSearchShell).backgroundColor || '') : null,
+                titlebar_search_shell_box_shadow: titlebarSearchShell ? String(window.getComputedStyle(titlebarSearchShell).boxShadow || '') : null,
+                titlebar_search_shell_border_radius: titlebarSearchShell ? String(window.getComputedStyle(titlebarSearchShell).borderRadius || '') : null,
+                titlebar_search_outer_shell_rect: rectSummary(titlebarSearchOuterShell),
+                titlebar_search_outer_shell_background: titlebarSearchOuterShell ? String(window.getComputedStyle(titlebarSearchOuterShell).backgroundColor || '') : null,
+                titlebar_search_outer_shell_box_shadow: titlebarSearchOuterShell ? String(window.getComputedStyle(titlebarSearchOuterShell).boxShadow || '') : null,
+                titlebar_search_outer_shell_border_radius: titlebarSearchOuterShell ? String(window.getComputedStyle(titlebarSearchOuterShell).borderRadius || '') : null,
+                titlebar_search_field_shell_rect: rectSummary(titlebarSearchFieldShell),
+                titlebar_search_field_shell_background: titlebarSearchFieldShell ? String(window.getComputedStyle(titlebarSearchFieldShell).backgroundColor || '') : null,
+                titlebar_search_field_shell_box_shadow: titlebarSearchFieldShell ? String(window.getComputedStyle(titlebarSearchFieldShell).boxShadow || '') : null,
+                titlebar_search_field_shell_border_radius: titlebarSearchFieldShell ? String(window.getComputedStyle(titlebarSearchFieldShell).borderRadius || '') : null,
+                titlebar_search_input_rect: rectSummary(titlebarSearchInput),
+                titlebar_search_input_hit_target: elementSummaryAtPoint(rectSummary(titlebarSearchInput)),
+                titlebar_search_input_background: titlebarSearchInput ? String(window.getComputedStyle(titlebarSearchInput).backgroundColor || '') : null,
+                titlebar_search_input_box_shadow: titlebarSearchInput ? String(window.getComputedStyle(titlebarSearchInput).boxShadow || '') : null,
+                titlebar_search_input_border_radius: titlebarSearchInput ? String(window.getComputedStyle(titlebarSearchInput).borderRadius || '') : null,
+                titlebar_search_dropdown_rect: rectSummary(titlebarSearchDropdown),
+                titlebar_search_dropdown_background: titlebarSearchDropdown ? String(window.getComputedStyle(titlebarSearchDropdown).backgroundColor || '') : null,
+                titlebar_search_dropdown_box_shadow: titlebarSearchDropdown ? String(window.getComputedStyle(titlebarSearchDropdown).boxShadow || '') : null,
+                titlebar_search_dropdown_border_top_width: titlebarSearchDropdown ? String(window.getComputedStyle(titlebarSearchDropdown).borderTopWidth || '') : null,
+                titlebar_search_dropdown_header_rect: rectSummary(titlebarSearchDropdownHeader),
+                titlebar_search_dropdown_entry_rects: titlebarSearchDropdownEntries.slice(0, 8).map((node) => rectSummary(node)).filter(Boolean),
+                titlebar_new_button_rect: rectSummary(titlebarNewButton),
+                titlebar_new_button_background: titlebarNewButton ? String(window.getComputedStyle(titlebarNewButton).backgroundColor || '') : null,
+                titlebar_new_button_box_shadow: titlebarNewButton ? String(window.getComputedStyle(titlebarNewButton).boxShadow || '') : null,
+                titlebar_new_button_border_radius: titlebarNewButton ? String(window.getComputedStyle(titlebarNewButton).borderRadius || '') : null,
+                titlebar_new_menu_rect: rectSummary(titlebarNewMenu),
+                titlebar_new_menu_background: titlebarNewMenu ? String(window.getComputedStyle(titlebarNewMenu).backgroundColor || '') : null,
+                titlebar_new_menu_box_shadow: titlebarNewMenu ? String(window.getComputedStyle(titlebarNewMenu).boxShadow || '') : null,
+                titlebar_new_menu_border_radius: titlebarNewMenu ? String(window.getComputedStyle(titlebarNewMenu).borderRadius || '') : null,
+                titlebar_new_menu_action_rects: titlebarNewMenuActions.slice(0, 8).map((node) => rectSummary(node)).filter(Boolean),
+                titlebar_session_button_rect: rectSummary(titlebarButton),
+                titlebar_session_button_hit_target: elementSummaryAtPoint(rectSummary(titlebarButton)),
+                titlebar_session_button_background: titlebarButton ? String(window.getComputedStyle(titlebarButton).backgroundColor || '') : null,
+                titlebar_session_button_box_shadow: titlebarButton ? String(window.getComputedStyle(titlebarButton).boxShadow || '') : null,
+                titlebar_session_button_border_radius: titlebarButton ? String(window.getComputedStyle(titlebarButton).borderRadius || '') : null,
+                titlebar_summary_shell_rect: rectSummary(titlebarSummaryShell),
+                titlebar_summary_menu_rect: rectSummary(titlebarSummaryMenu),
+                titlebar_summary_menu_background: titlebarSummaryMenu ? String(window.getComputedStyle(titlebarSummaryMenu).backgroundColor || '') : null,
+                titlebar_summary_menu_box_shadow: titlebarSummaryMenu ? String(window.getComputedStyle(titlebarSummaryMenu).boxShadow || '') : null,
+                titlebar_summary_menu_border_top_width: titlebarSummaryMenu ? String(window.getComputedStyle(titlebarSummaryMenu).borderTopWidth || '') : null,
+                titlebar_summary_menu_border_top_color: titlebarSummaryMenu ? String(window.getComputedStyle(titlebarSummaryMenu).borderTopColor || '') : null,
+                titlebar_summary_menu_border_radius: titlebarSummaryMenu ? String(window.getComputedStyle(titlebarSummaryMenu).borderRadius || '') : null,
+                titlebar_summary_body_rect: rectSummary(titlebarSummary),
+                titlebar_summary_actions_rect: null,
+                titlebar_summary_regenerate_title_rect: null,
+                titlebar_summary_regenerate_title_background: null,
+                titlebar_summary_regenerate_title_box_shadow: null,
+                titlebar_summary_regenerate_summary_rect: rectSummary(titlebarSummaryRegenerateSummary),
+                titlebar_summary_regenerate_summary_background: titlebarSummaryRegenerateSummary ? String(window.getComputedStyle(titlebarSummaryRegenerateSummary).backgroundColor || '') : null,
+                titlebar_summary_regenerate_summary_box_shadow: titlebarSummaryRegenerateSummary ? String(window.getComputedStyle(titlebarSummaryRegenerateSummary).boxShadow || '') : null,
+                titlebar_right_rect: rectSummary(titlebarRightGroup),
+                titlebar_connect_button_rect: rectSummary(titlebarConnectButton),
+                titlebar_connect_button_hit_target: elementSummaryAtPoint(rectSummary(titlebarConnectButton)),
+                titlebar_notifications_button_rect: rectSummary(titlebarNotificationsButton),
+                titlebar_notifications_button_hit_target: elementSummaryAtPoint(rectSummary(titlebarNotificationsButton)),
+                titlebar_settings_button_rect: rectSummary(titlebarSettingsButton),
+                titlebar_settings_button_hit_target: elementSummaryAtPoint(rectSummary(titlebarSettingsButton)),
+                titlebar_metadata_button_rect: rectSummary(titlebarMetadataButton),
+                titlebar_metadata_button_hit_target: elementSummaryAtPoint(rectSummary(titlebarMetadataButton)),
+                titlebar_overflow_button_rect: rectSummary(titlebarOverflowButton),
+                titlebar_overflow_button_hit_target: elementSummaryAtPoint(rectSummary(titlebarOverflowButton)),
+                titlebar_overflow_menu_rect: rectSummary(titlebarOverflowMenu),
+                context_menu_rect: rectSummary(contextMenu),
+                context_menu_hit_target: elementSummaryAtPoint(rectSummary(contextMenu)),
+                context_menu_action_rects: contextMenuActions.slice(0, 12).map((node) => ({
+                    action: String(node.getAttribute('data-context-menu-action') || ''),
+                    rect: rectSummary(node),
+                })).filter((entry) => Boolean(entry.rect)),
+                context_menu_rename_session_rect: rectSummary(contextMenuRenameSession),
+                tree_rename_input_rect: rectSummary(treeRenameInput),
+                tree_rename_input_hit_target: elementSummaryAtPoint(rectSummary(treeRenameInput)),
+                tree_rename_input_focused: treeRenameInputs.some((node) => node === document.activeElement),
+                tree_rename_input_value: treeRenameInput ? String(treeRenameInput.value || '') : '',
+                tree_rename_ai_action_rect: rectSummary(treeRenameAiAction),
+                settings_endpoint_input_rect: rectSummary(settingsEndpointInput),
+                settings_api_key_input_rect: rectSummary(settingsApiKeyInput),
+                settings_interface_llm_input_rect: rectSummary(settingsInterfaceLlmInput),
+                settings_interface_llm_input_hit_target: elementSummaryAtPoint(rectSummary(settingsInterfaceLlmInput)),
+                theme_editor_overlay_rect: rectSummary(themeEditorOverlay),
+                theme_editor_shell_rect: rectSummary(themeEditorShell),
+                theme_editor_shell_background: themeEditorShell ? String(window.getComputedStyle(themeEditorShell).backgroundColor || '') : null,
+                theme_editor_shell_box_shadow: themeEditorShell ? String(window.getComputedStyle(themeEditorShell).boxShadow || '') : null,
+                theme_editor_shell_border_radius: themeEditorShell ? String(window.getComputedStyle(themeEditorShell).borderRadius || '') : null,
+                theme_editor_open_button_rect: rectSummary(themeEditorOpenButton),
+                theme_editor_apply_button_rect: rectSummary(themeEditorApplyButton),
+                theme_editor_reset_button_rect: rectSummary(themeEditorResetButton),
+                theme_editor_seed_button_rect: rectSummary(themeEditorSeedButton),
                 terminal_resume_overlay: {
                     visible: Boolean(terminalResumeOverlay),
                     text_sample: String(terminalResumeOverlay?.innerText || "").trim().slice(0, 480),
@@ -13688,6 +15363,8 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     effective_failed: terminalResumeOverlay?.getAttribute('data-terminal-resume-overlay-effective-failed') === 'true',
                 },
                 main_surface_count: mainSurfaces.length,
+                main_surface_rect: rectSummary(mainSurface),
+                main_surface_body_rect: rectSummary(mainSurfaceBody),
                 shell_text_sample: String((rootNode || pickLast(shellRoots) || document.getElementById("yggterm-shell-root"))?.innerText || "").slice(0, 240),
                 sidebar_scroll_top: sidebarScroller ? Math.round(sidebarScroller.scrollTop) : null,
                 active_element: activeElementSummary,
@@ -13701,11 +15378,28 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
     "#;
     let script = script.replace("__ACTIVE_SESSION_PATH__", &active_session_path_literal);
     let mut eval = document::eval(&script);
-    match eval.recv::<Value>().await {
-        Ok(value) => value,
-        Err(error) => json!({
+    match tokio::time::timeout(Duration::from_millis(1500), eval.recv::<Value>()).await {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => json!({
             "error": error.to_string(),
         }),
+        Err(_) => json!({
+            "error": "dom_debug_snapshot_timeout",
+        }),
+    }
+}
+async fn capture_dom_debug_snapshot_for_or_empty(active_session_path: Option<&str>) -> Value {
+    let snapshot = capture_dom_debug_snapshot_for(active_session_path).await;
+    if snapshot.get("error").and_then(Value::as_str) == Some("dom_debug_snapshot_timeout") {
+        json!({
+            "error": "dom_debug_snapshot_timeout",
+            "terminal_host_count": 0,
+            "terminal_hosts": [],
+            "sidebar_visible_rows": [],
+            "sidebar_visible_row_count": 0,
+        })
+    } else {
+        snapshot
     }
 }
 async fn scroll_preview_viewport_for(
@@ -14237,6 +15931,7 @@ async fn probe_terminal_viewport_scroll_for(session_path: &str, lines: i32) -> V
                 const snapshot = () => {{
                     const active = entry.term && entry.term.buffer ? entry.term.buffer.active : null;
                     const viewportElement = host.querySelector('.xterm-viewport');
+                    const modes = entry.term && entry.term.modes ? entry.term.modes : null;
                     return {{
                         viewport_y: active ? Number(active.viewportY || 0) : null,
                         base_y: active ? Number(active.baseY || 0) : null,
@@ -14244,26 +15939,41 @@ async fn probe_terminal_viewport_scroll_for(session_path: &str, lines: i32) -> V
                         input_enabled: Boolean(entry.inputEnabled),
                         helper_textarea_focused: Boolean(helperTextarea && document.activeElement === helperTextarea),
                         host_has_active_element: Boolean(host && host.contains(document.activeElement)),
+                        xterm_buffer_kind: entry.term && entry.term.buffer
+                            ? (entry.term.buffer.active === entry.term.buffer.alternate ? 'alternate' : 'normal')
+                            : 'unknown',
+                        xterm_mouse_tracking_mode: modes ? String(modes.mouseTrackingMode || '') : '',
+                        wheel_event_count: Number(entry.wheelEventCount || 0),
+                        scroll_event_count: Number(entry.scrollEventCount || 0),
+                        data_event_count: Number(entry.dataEventCount || 0),
+                        render_event_count: Number(entry.renderEventCount || 0),
+                        text_head: String(host.innerText || "").trim().slice(0, 240),
                         text_tail: String(host.innerText || "").trim().slice(-240),
                     }};
                 }};
                 const before = snapshot();
                 const deltaY = Number(lines || 0) * 40;
-                let scrolled = false;
                 try {{
-                    if (entry.term && typeof entry.term.scrollLines === 'function' && Number.isFinite(lines) && lines !== 0) {{
-                        entry.term.scrollLines(lines);
-                        scrolled = true;
+                    if (helperTextarea && helperTextarea.focus) {{
+                        helperTextarea.focus({{ preventScroll: true }});
+                    }} else if (host.focus) {{
+                        host.focus({{ preventScroll: true }});
                     }}
                 }} catch (_error) {{}}
-                if (!scrolled) {{
-                    wheelTarget.dispatchEvent(new WheelEvent('wheel', {{
-                        deltaY,
-                        bubbles: true,
-                        cancelable: true,
-                        composed: true,
-                    }}));
-                }}
+                const targetRect = wheelTarget.getBoundingClientRect();
+                const clientX = Number((targetRect.left + (targetRect.width / 2)).toFixed(2));
+                const clientY = Number((targetRect.top + (targetRect.height / 2)).toFixed(2));
+                wheelTarget.dispatchEvent(new WheelEvent('wheel', {{
+                    deltaY,
+                    deltaMode: 0,
+                    bubbles: true,
+                    cancelable: true,
+                    composed: true,
+                    clientX,
+                    clientY,
+                    screenX: clientX,
+                    screenY: clientY,
+                }}));
                 await settle(120);
                 dioxus.send({{
                     accepted: true,
@@ -14428,6 +16138,11 @@ async fn probe_terminal_viewport_select_for(session_path: &str) -> Value {
                 await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
                 const selectedText = selection ? String(selection.toString() || '') : '';
                 const effectiveSelectedText = selectedText || rangeText || String(target.text || '');
+                if (selection) {{
+                    try {{
+                        selection.removeAllRanges();
+                    }} catch (_error) {{}}
+                }}
                 dioxus.send({{
                     accepted: true,
                     session_path: sessionPath,
@@ -14499,7 +16214,8 @@ async fn process_pending_app_control_requests(
                 apply_active_terminal_zoom(state);
             }
             sleep(Duration::from_millis(40)).await;
-            let dom_snapshot = capture_dom_debug_snapshot_for(active_session_path.as_deref()).await;
+            let dom_snapshot =
+                capture_dom_debug_snapshot_for_or_empty(active_session_path.as_deref()).await;
             let state_snapshot = describe_app_state_snapshot(&state, &desktop);
             AppControlResponse {
                 request_id: request.request_id.clone(),
@@ -14533,7 +16249,8 @@ async fn process_pending_app_control_requests(
                 shell.refresh_search_state("app_control_set_search");
             });
             sleep(Duration::from_millis(40)).await;
-            let dom_snapshot = capture_dom_debug_snapshot_for(active_session_path.as_deref()).await;
+            let dom_snapshot =
+                capture_dom_debug_snapshot_for_or_empty(active_session_path.as_deref()).await;
             let mut state_snapshot = describe_app_state_snapshot(&state, &desktop);
             let viewport = describe_viewport_snapshot(&state_snapshot, &dom_snapshot);
             if let Some(map) = state_snapshot.as_object_mut() {
@@ -14559,13 +16276,45 @@ async fn process_pending_app_control_requests(
                 error: None,
             }
         }
+        AppControlCommand::SetRightPanelMode { mode } => {
+            let requested_mode = app_control_right_panel_mode(mode);
+            let _ = safe_shell_mut(state, "app_control_set_right_panel_mode", |shell| {
+                shell.set_right_panel_mode(requested_mode);
+            });
+            sleep(Duration::from_millis(40)).await;
+            let dom_snapshot =
+                capture_dom_debug_snapshot_for_or_empty(active_session_path.as_deref()).await;
+            let mut state_snapshot = describe_app_state_snapshot(&state, &desktop);
+            let viewport = describe_viewport_snapshot(&state_snapshot, &dom_snapshot);
+            if let Some(map) = state_snapshot.as_object_mut() {
+                map.insert("dom".to_string(), dom_snapshot.clone());
+                map.insert("viewport".to_string(), viewport);
+            }
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(json!({
+                    "command": "set_right_panel_mode",
+                    "requested_mode": app_control_right_panel_mode_label(mode),
+                    "window": describe_window(&desktop),
+                    "active_view_mode": format!("{:?}", state.read().server.active_view_mode()),
+                    "active_session_path": state.read().server.active_session_path(),
+                    "dom": dom_snapshot,
+                    "state": state_snapshot,
+                })),
+                error: None,
+            }
+        }
         AppControlCommand::SetUiTheme { theme } => {
             let _ = safe_shell_mut(state, "app_control_set_ui_theme", |shell| {
                 shell.set_ui_theme(theme);
             });
             apply_active_terminal_zoom(state);
             sleep(Duration::from_millis(60)).await;
-            let dom_snapshot = capture_dom_debug_snapshot_for(active_session_path.as_deref()).await;
+            let dom_snapshot =
+                capture_dom_debug_snapshot_for_or_empty(active_session_path.as_deref()).await;
             let mut state_snapshot = describe_app_state_snapshot(&state, &desktop);
             let viewport = describe_viewport_snapshot(&state_snapshot, &dom_snapshot);
             if let Some(map) = state_snapshot.as_object_mut() {
@@ -14596,7 +16345,8 @@ async fn process_pending_app_control_requests(
             target,
             output_path,
         } => {
-            let dom_snapshot = capture_dom_debug_snapshot_for(active_session_path.as_deref()).await;
+            let dom_snapshot =
+                capture_dom_debug_snapshot_for_or_empty(active_session_path.as_deref()).await;
             match capture_visible_app_surface(
                 &desktop,
                 Path::new(&output_path),
@@ -14634,7 +16384,8 @@ async fn process_pending_app_control_requests(
             let scroll_result =
                 scroll_preview_viewport_for(active_session_path.as_deref(), top_px, ratio).await;
             sleep(Duration::from_millis(40)).await;
-            let dom_snapshot = capture_dom_debug_snapshot_for(active_session_path.as_deref()).await;
+            let dom_snapshot =
+                capture_dom_debug_snapshot_for_or_empty(active_session_path.as_deref()).await;
             AppControlResponse {
                 request_id: request.request_id.clone(),
                 handled_by_pid: std::process::id(),
@@ -14660,7 +16411,8 @@ async fn process_pending_app_control_requests(
                 shell.set_preview_layout(layout_mode);
             });
             sleep(Duration::from_millis(40)).await;
-            let dom_snapshot = capture_dom_debug_snapshot_for(active_session_path.as_deref()).await;
+            let dom_snapshot =
+                capture_dom_debug_snapshot_for_or_empty(active_session_path.as_deref()).await;
             AppControlResponse {
                 request_id: request.request_id.clone(),
                 handled_by_pid: std::process::id(),
@@ -15355,7 +17107,8 @@ async fn process_pending_app_control_requests(
             output_path: None,
             data: Some({
                 let mut snapshot = describe_app_state_snapshot(&state, &desktop);
-                let dom = capture_dom_debug_snapshot_for(active_session_path.as_deref()).await;
+                let dom =
+                    capture_dom_debug_snapshot_for_or_empty(active_session_path.as_deref()).await;
                 let mut viewport = describe_viewport_snapshot(&snapshot, &dom);
                 let terminal_open_attempt = state.with_mut(|shell| {
                     shell.observe_terminal_open_attempt_from_viewport(&viewport);
@@ -15378,6 +17131,7 @@ async fn process_pending_app_control_requests(
                     );
                     map.insert("viewport".to_string(), viewport);
                 }
+                coerce_app_control_shell_state_from_dom(&mut snapshot, &dom);
                 snapshot
             }),
             error: None,
@@ -15898,7 +17652,7 @@ fn ghostty_dock_request(
     let inner = desktop.inner_size();
     let scale = desktop.scale_factor();
     let left_sidebar = if snapshot.sidebar_open {
-        SIDE_RAIL_WIDTH as f64
+        snapshot.sidebar_width as f64
     } else {
         0.0
     };
@@ -15907,7 +17661,7 @@ fn ghostty_dock_request(
     } else {
         0.0
     };
-    let titlebar_height = 44.0;
+    let titlebar_height = TITLEBAR_HEIGHT_PX;
     let top_padding = 12.0;
     let right_padding = 12.0;
     let bottom_padding = 10.0;
@@ -16071,6 +17825,14 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
     }
     Ok(())
 }
+fn render_trace_enabled() -> bool {
+    *RENDER_TRACE_ENABLED.get_or_init(|| {
+        std::env::var("YGGTERM_TRACE_RENDER")
+            .ok()
+            .as_deref()
+            .is_some_and(|value| matches!(value, "1" | "true" | "TRUE" | "yes" | "YES"))
+    })
+}
 fn app() -> Element {
     let bootstrap = BOOTSTRAP
         .get()
@@ -16103,16 +17865,18 @@ fn app() -> Element {
         }
     });
     let render_count = APP_ROOT_RENDER_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
-    append_trace_event(
-        &trace_home,
-        "ui",
-        "startup",
-        "app_root_render_count",
-        json!({
-            "pid": std::process::id(),
-            "count": render_count,
-        }),
-    );
+    if render_trace_enabled() {
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "startup",
+            "app_root_render_count",
+            json!({
+                "pid": std::process::id(),
+                "count": render_count,
+            }),
+        );
+    }
     if !APP_ROOT_RENDER_TRACED.swap(true, Ordering::SeqCst) {
         append_trace_event(
             &trace_home,
@@ -16155,7 +17919,6 @@ fn app() -> Element {
     let mut last_preview_refresh_marker = use_signal(|| None::<(String, u64, bool)>);
     let mut last_sidebar_autoscroll_path = use_signal(|| None::<String>);
     let schedule_ui_update = schedule_update();
-    #[cfg(target_os = "macos")]
     let desktop_for_root_effect = desktop.clone();
     let trace_home_for_root_effect = trace_home.clone();
     let trace_home_for_mount_epoch = trace_home.clone();
@@ -16187,6 +17950,18 @@ fn app() -> Element {
                     }),
                 );
             }
+        }
+        if !APP_ROOT_WINDOW_FOCUS_REQUESTED.swap(true, Ordering::SeqCst) {
+            desktop_for_root_effect.set_focus();
+            append_trace_event(
+                &trace_home_for_root_effect,
+                "ui",
+                "startup",
+                "window_focus_requested",
+                json!({
+                    "pid": std::process::id(),
+                }),
+            );
         }
         if XTERM_ASSETS_BOOTSTRAPPED.get().is_none() {
             let _ = XTERM_ASSETS_BOOTSTRAPPED.set(());
@@ -16227,6 +18002,10 @@ fn app() -> Element {
                         .and_then(Value::as_u64)
                         .unwrap_or(0);
                     if visible && width > 0 && height > 0 {
+                        let focus_snapshot = focus_app_window(&desktop)
+                            .unwrap_or_else(|error| json!({ "error": error.to_string() }));
+                        sync_active_terminal_input_policy(state);
+                        schedule_ui_update();
                         append_trace_event(
                             &trace_home,
                             "ui",
@@ -16236,6 +18015,16 @@ fn app() -> Element {
                                 "pid": std::process::id(),
                                 "elapsed_ms": current_millis().saturating_sub(started_at_ms),
                                 "window": window,
+                            }),
+                        );
+                        append_trace_event(
+                            &trace_home,
+                            "ui",
+                            "startup",
+                            "window_spawn_focus_requested",
+                            json!({
+                                "pid": std::process::id(),
+                                "window": focus_snapshot,
                             }),
                         );
                         window_spawn_traced.store(true, Ordering::SeqCst);
@@ -16621,11 +18410,11 @@ fn app() -> Element {
             )
         };
         let Some(active_session_path) = active_session_path else {
-            last_terminal_mount_key.set(None);
+            set_signal_if_changed(last_terminal_mount_key, None);
             return;
         };
         if active_view_mode != WorkspaceViewMode::Terminal {
-            last_terminal_mount_key.set(None);
+            set_signal_if_changed(last_terminal_mount_key, None);
             return;
         }
         let mount_key = format!("{active_session_path}:{latest_open_request_id}");
@@ -16676,7 +18465,7 @@ fn app() -> Element {
             let row = resolve_app_control_row(shell, &active_session_path)?;
             Some((active_session_path, row))
         }) else {
-            last_startup_terminal_restore_path.set(None);
+            set_signal_if_changed(last_startup_terminal_restore_path, None);
             return;
         };
         if *last_startup_terminal_restore_path.read() == Some(active_session_path.clone()) {
@@ -16746,6 +18535,7 @@ fn app() -> Element {
                 }
                 maybe_spawn_missing_remote_machine_refreshes(state);
                 maybe_spawn_missing_managed_cli_refreshes(state);
+                maybe_spawn_background_allocator_trim(state, "background_idle");
                 sleep(Duration::from_millis(BACKGROUND_REFRESH_POLL_MS)).await;
             }
         });
@@ -16771,9 +18561,26 @@ fn app() -> Element {
         }
     });
     use_effect(move || {
+        let policy_signature = {
+            let shell = state.read();
+            let snapshot = shell.snapshot();
+            (
+                snapshot.active_view_mode,
+                snapshot.right_panel_mode,
+                snapshot.search_focused,
+                snapshot.command_mode_active,
+                snapshot.active_session_path.clone(),
+                shell.active_terminal_host_id.clone(),
+                shell.terminal_input_override_active,
+            )
+        };
+        let _ = policy_signature;
+        sync_active_terminal_input_policy(state);
+    });
+    use_effect(move || {
         let active = state.read().server.active_session().cloned();
         let Some(session) = active else {
-            last_preview_refresh_marker.set(None);
+            set_signal_if_changed(last_preview_refresh_marker, None);
             return;
         };
         maybe_request_copy_generation_for_session(state, session);
@@ -16797,18 +18604,18 @@ fn app() -> Element {
             )
         };
         let Some(session) = active else {
-            last_preview_refresh_marker.set(None);
+            set_signal_if_changed(last_preview_refresh_marker, None);
             return;
         };
         if view_mode != WorkspaceViewMode::Rendered {
-            last_preview_refresh_marker.set(None);
+            set_signal_if_changed(last_preview_refresh_marker, None);
             return;
         }
         if server_busy {
             return;
         }
         if !session.session_path.starts_with("remote-session://") {
-            last_preview_refresh_marker.set(None);
+            set_signal_if_changed(last_preview_refresh_marker, None);
             return;
         }
         let needs_refresh = remote_preview_needs_refresh(&session);
@@ -16852,7 +18659,7 @@ fn app() -> Element {
                     REMOTE_PREVIEW_NO_TARGET_RETRY_MS,
                 );
             }
-            last_preview_refresh_marker.set(None);
+            set_signal_if_changed(last_preview_refresh_marker, None);
         } else {
             last_preview_refresh_marker.set(Some(refresh_marker));
         }
@@ -16868,11 +18675,11 @@ fn app() -> Element {
             (active_path, active_visible, snapshot.show_loading_tree)
         };
         if show_loading_tree {
-            last_sidebar_autoscroll_path.set(None);
+            set_signal_if_changed(last_sidebar_autoscroll_path, None);
             return;
         }
         let Some(active_path) = active_path else {
-            last_sidebar_autoscroll_path.set(None);
+            set_signal_if_changed(last_sidebar_autoscroll_path, None);
             return;
         };
         if !active_visible {
@@ -16937,15 +18744,15 @@ fn app() -> Element {
             )
         };
         let Some(row) = selected_row else {
-            last_open_recovery_path.set(None);
+            set_signal_if_changed(last_open_recovery_path, None);
             return;
         };
         if active_session_path.is_some() || server_busy {
-            last_open_recovery_path.set(None);
+            set_signal_if_changed(last_open_recovery_path, None);
             return;
         }
         if !matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document) {
-            last_open_recovery_path.set(None);
+            set_signal_if_changed(last_open_recovery_path, None);
             return;
         }
         if *last_open_recovery_path.read() == Some(row.full_path.clone()) {
@@ -17054,16 +18861,65 @@ fn app() -> Element {
             tabindex: "0",
             style: "position:relative; width:100vw; height:100vh; overflow:hidden; background:transparent; box-shadow:none; box-sizing:border-box;",
             onclick: move |_| {
-                state.with_mut(|shell| {
+                let active_terminal_session = state.with_mut(|shell| {
                     shell.clear_alt_overlay();
-                    shell.close_titlebar_new_menu();
-                    shell.close_titlebar_session_menu();
-                })
+                    if shell.server.active_view_mode() == WorkspaceViewMode::Terminal {
+                        shell.server.active_session().map(|session| session.session_path.clone())
+                    } else {
+                        None
+                    }
+                });
+                dismiss_titlebar_transients_and_resync_active_terminal(state);
+                if let Some(session_path) = active_terminal_session {
+                    if let Ok(session_path_literal) = serde_json::to_string(&session_path) {
+                        let _ = document::eval(&format!(
+                            "(function() {{
+                                const sessionPath = {session_path_literal};
+                                const registry = window.__yggtermXtermHosts || {{}};
+                                const entries = Object.values(registry)
+                                    .filter((entry) => entry && entry.sessionPath === sessionPath)
+                                    .sort((a, b) => (b.mountedAt || 0) - (a.mountedAt || 0));
+                                const visible = entries.find((entry) => {{
+                                    const host = entry && entry.hostId ? document.getElementById(entry.hostId) : null;
+                                    if (!host) {{
+                                        return false;
+                                    }}
+                                    const rect = host.getBoundingClientRect();
+                                    const style = window.getComputedStyle(host);
+                                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                                }}) || entries[0] || null;
+                                if (!visible || !visible.hostId) {{
+                                    return;
+                                }}
+                                const host = document.getElementById(visible.hostId);
+                                const helperTextarea = host ? host.querySelector('.xterm-helper-textarea') : null;
+                                try {{
+                                    if (helperTextarea && helperTextarea.focus) {{
+                                        helperTextarea.focus({{ preventScroll: true }});
+                                    }} else if (host && host.focus) {{
+                                        host.focus({{ preventScroll: true }});
+                                    }}
+                                }} catch (_error) {{}}
+                            }})();"
+                        ));
+                    }
+                }
             },
             onmouseup: move |_| {
                 if !state.read().drag_paths.is_empty() {
                     queue_drop_current_drag_target(state);
                     state.with_mut(|shell| shell.clear_drag_state());
+                }
+                state.with_mut(|shell| shell.finish_sidebar_resize());
+            },
+            onmousemove: move |evt| {
+                let pointer = evt.client_coordinates();
+                let drag_active = !state.read().drag_paths.is_empty();
+                if drag_active {
+                    state.with_mut(|shell| shell.update_drag_pointer((pointer.x, pointer.y)));
+                }
+                if state.read().sidebar_resize_drag.is_some() {
+                    state.with_mut(|shell| shell.update_sidebar_resize(pointer.x));
                 }
             },
             onkeydown: move |evt| {
@@ -17270,7 +19126,10 @@ fn app() -> Element {
                             on_toggle_sidebar: move || state.with_mut(|shell| shell.toggle_sidebar()),
                             on_search: move |value: String| state.with_mut(|shell| shell.set_search(value)),
                             on_execute_search_command: move |command: String| execute_search_command(state, command),
-                            on_set_search_focus: move |focused: bool| state.with_mut(|shell| shell.set_search_focus(focused)),
+                            on_set_search_focus: move |focused: bool| {
+                                state.with_mut(|shell| shell.set_search_focus(focused));
+                                sync_active_terminal_input_policy(state);
+                            },
                             on_prev_search_content: move |_| {
                                 if let Some(dom_id) = state.with_mut(|shell| shell.next_search_content_dom_id(-1)) {
                                     if let Some(line_index) = dom_id.strip_prefix("__terminal_line__:") {
@@ -17407,6 +19266,8 @@ fn app() -> Element {
                         on_set_view_mode: move |mode: WorkspaceViewMode| spawn_set_view_mode(state, mode),
                         on_toggle_session_menu: move |_| state.with_mut(|shell| shell.toggle_titlebar_session_menu()),
                         on_toggle_new_menu: move |_| state.with_mut(|shell| shell.toggle_titlebar_new_menu()),
+                        on_toggle_overflow_menu: move |_| state.with_mut(|shell| shell.toggle_titlebar_overflow_menu()),
+                        on_close_overflow_menu: move |_| state.with_mut(|shell| shell.close_titlebar_overflow_menu()),
                         on_start_session: move |_| {
                             let (cwd, title_hint) = state.with_mut(|shell| {
                                 shell.close_titlebar_new_menu();
@@ -17459,18 +19320,27 @@ fn app() -> Element {
                             state.with_mut(|shell| shell.close_titlebar_new_menu());
                             queue_new_document(state)
                         },
-                        on_refresh_title: move |_| {
-                            spawn_deferred_active_session_title_generation(state, true)
-                        },
                         on_refresh_summary: move |_| {
                             if let Some(session) = state.read().server.active_session().cloned() {
                                 spawn_summary_generation(state, session, true, true);
                             }
                         },
-                        on_toggle_meta: move || state.with_mut(|shell| shell.toggle_metadata_panel()),
-                        on_toggle_settings: move || state.with_mut(|shell| shell.toggle_settings_panel()),
-                        on_toggle_connect: move || state.with_mut(|shell| shell.toggle_connect_panel()),
-                        on_toggle_notifications: move || state.with_mut(|shell| shell.toggle_notifications_panel()),
+                        on_toggle_meta: move || {
+                            state.with_mut(|shell| shell.toggle_metadata_panel());
+                            sync_active_terminal_input_policy(state);
+                        },
+                        on_toggle_settings: move || {
+                            state.with_mut(|shell| shell.toggle_settings_panel());
+                            sync_active_terminal_input_policy(state);
+                        },
+                        on_toggle_connect: move || {
+                            state.with_mut(|shell| shell.toggle_connect_panel());
+                            sync_active_terminal_input_policy(state);
+                        },
+                        on_toggle_notifications: move || {
+                            state.with_mut(|shell| shell.toggle_notifications_panel());
+                            sync_active_terminal_input_policy(state);
+                        },
                         on_restart_update: move || restart_into_pending_update(state),
                         on_toggle_maximized: move || state.with_mut(|shell| shell.toggle_maximized()),
                         on_toggle_fullscreen: move || state.with_mut(|shell| shell.toggle_fullscreen()),
@@ -17527,6 +19397,12 @@ fn app() -> Element {
                                 spawn_open_session_row(state, row);
                             }
                         },
+                        on_select_all_rows: move |_| {
+                            state.with_mut(|shell| shell.select_all_tree_rows())
+                        },
+                        on_start_sidebar_resize: move |client_x: f64| {
+                            state.with_mut(|shell| shell.start_sidebar_resize(client_x))
+                        },
                         on_select_row: move |(row, mode): (BrowserRow, TreeSelectionMode)| {
                             let row_for_log = row.clone();
                             if let Err(error) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -17548,17 +19424,6 @@ fn app() -> Element {
                                     return;
                                 }
                                 if mode != TreeSelectionMode::Replace {
-                                    return;
-                                }
-                                if is_live_sidebar_row(&row) {
-                                    let prefer_terminal =
-                                        state.read().server.active_view_mode()
-                                            == WorkspaceViewMode::Terminal;
-                                    spawn_open_session_row_with_mode(
-                                        state,
-                                        row.clone(),
-                                        prefer_terminal,
-                                    );
                                     return;
                                 }
                                 match row.kind {
@@ -17597,6 +19462,9 @@ fn app() -> Element {
                         on_drop_into_row: move |_| queue_drop_current_drag_target(state),
                         on_end_drag: move |_| state.with_mut(|shell| shell.clear_drag_state()),
                         on_begin_rename: move |row: BrowserRow| state.with_mut(|shell| shell.begin_tree_rename(&row)),
+                        on_regenerate_row_title: move |row: BrowserRow| {
+                            queue_rename_field_ai_title_generation(state, row);
+                        },
                         on_update_rename: move |value: String| state.with_mut(|shell| shell.update_tree_rename_value(value)),
                         on_commit_rename: move |row: BrowserRow| {
                             let label = state.read().tree_rename_value.clone();
@@ -17608,6 +19476,9 @@ fn app() -> Element {
                     div {
                         "data-yggterm-main-surface": "1",
                         style: "display:flex; flex:1; min-width:0; min-height:0;",
+                        onmousedown: move |_| {
+                            reclaim_active_terminal_input_from_viewport_click(state);
+                        },
                         MainSurface {
                             state,
                             snapshot: main_snapshot,
@@ -17676,6 +19547,10 @@ fn app() -> Element {
                             on_endpoint_change: move |value: String| state.with_mut(|shell| shell.update_litellm_endpoint(value)),
                             on_api_key_change: move |value: String| state.with_mut(|shell| shell.update_litellm_api_key(value)),
                             on_model_change: move |value: String| state.with_mut(|shell| shell.update_interface_llm_model(value)),
+                            on_focus_input: move |_| {
+                                state.with_mut(|shell| shell.terminal_input_override_active = false);
+                                sync_active_terminal_input_policy(state);
+                            },
                             on_set_ui_theme: move |theme: UiTheme| {
                                 state.with_mut(|shell| shell.set_ui_theme(theme));
                                 apply_active_terminal_zoom(state);
@@ -17765,12 +19640,9 @@ fn app() -> Element {
                                 queue_session_recipe_creation(state, row.clone());
                             }
                         },
-                        on_regenerate: {
+                        on_rename_session: {
                             let row = row.clone();
-                            move |_| {
-                                state.with_mut(|shell| shell.regenerate_title_for_row(&row));
-                                spawn_deferred_title_generation(state, row.clone(), true);
-                            }
+                            move |_| state.with_mut(|shell| shell.begin_tree_rename(&row))
                         },
                         on_refresh_remote_machine: {
                             let row = row.clone();
@@ -17844,8 +19716,8 @@ fn app() -> Element {
                                 is_dark: palette_is_dark(snapshot.palette),
                             },
                         center_offset: toast_center_offset(snapshot.right_panel_mode),
-                        max_age_ms: 7000,
-                        max_visible: 3,
+                        max_age_ms: TOAST_VIEWPORT_MAX_AGE_MS,
+                        max_visible: TOAST_VIEWPORT_MAX_VISIBLE,
                         now_ms: current_millis(),
                         on_clear: move |id: u64| state.with_mut(|shell| shell.clear_notification(id)),
                     }
@@ -17873,10 +19745,11 @@ fn Titlebar(
     on_set_view_mode: EventHandler<WorkspaceViewMode>,
     on_toggle_session_menu: EventHandler<()>,
     on_toggle_new_menu: EventHandler<()>,
+    on_toggle_overflow_menu: EventHandler<()>,
+    on_close_overflow_menu: EventHandler<()>,
     on_start_session: EventHandler<()>,
     on_start_terminal: EventHandler<()>,
     on_create_paper: EventHandler<()>,
-    on_refresh_title: EventHandler<()>,
     on_refresh_summary: EventHandler<()>,
     on_toggle_meta: EventHandler<()>,
     on_toggle_settings: EventHandler<()>,
@@ -17923,6 +19796,96 @@ fn Titlebar(
         active_title.clone().unwrap_or_default(),
         active_summary.clone().unwrap_or_default()
     );
+    let search_dropdown_open = titlebar_search_dropdown_open(&snapshot);
+    let search_placeholder = if snapshot.command_mode_active {
+        "/ Run a yggterm command"
+    } else {
+        "Search live sessions or type '/' for commands"
+    };
+    let search_dropdown_hint = if snapshot.search_active {
+        if snapshot.search_sidebar_matches.is_empty() {
+            "No matching rows yet. Keep typing or prefix '/' for a command."
+        } else {
+            "Jump between matching rows and live terminal content from here."
+        }
+    } else {
+        "Search live sessions, folders, and hot terminals. Prefix '/' to run a yggterm command."
+    };
+    let floating_panel_background = if palette_is_dark(snapshot.palette) {
+        "rgb(14,19,24)"
+    } else {
+        "rgb(248,250,253)"
+    };
+    let floating_panel_shadow = if palette_is_dark(snapshot.palette) {
+        "0 20px 48px rgba(0,0,0,0.28)"
+    } else {
+        "0 20px 48px rgba(74,93,122,0.18)"
+    };
+    let floating_panel_border = chrome_chip_border(snapshot.palette);
+    let floating_panel_box_shadow = format!(
+        "{}, 0 0 0 1px {}",
+        floating_panel_shadow, floating_panel_border
+    );
+    let search_panel_background = floating_panel_background;
+    let search_panel_shadow = floating_panel_box_shadow.as_str();
+    let titlebar_modal_tab_height = 28;
+    let titlebar_modal_width = "min(500px, 76vw)";
+    let search_divider_color = if palette_is_dark(snapshot.palette) {
+        "rgba(187,204,219,0.14)"
+    } else {
+        "rgba(201,214,226,0.9)"
+    };
+    let search_center_style =
+        "position:relative; display:flex; align-items:center; width:100%; height:100%; min-width:0; overflow:visible;"
+            .to_string();
+    let search_open_key = "titlebar-search-open";
+    let search_closed_key = "titlebar-search-closed";
+    let search_shell_style = if search_dropdown_open {
+        format!(
+            "position:absolute; left:0; right:0; top:3px; z-index:221; display:flex; flex-direction:column; gap:6px; \
+             width:min(620px, 100%); min-width:280px; padding:0; border-radius:16px; \
+             background:{}; box-shadow:{}; overflow:hidden; transition:background 120ms ease, box-shadow 120ms ease;",
+            search_panel_background, search_panel_shadow
+        )
+    } else {
+        "position:relative; display:flex; align-items:center; width:min(620px, 100%); min-width:280px; height:26px; overflow:visible;"
+            .to_string()
+    };
+    let search_modal_style = if search_dropdown_open {
+        "display:flex; flex-direction:column; gap:8px; width:100%; min-width:0; padding:8px 10px 10px; box-sizing:border-box; overflow:hidden;"
+            .to_string()
+    } else {
+        "display:flex; flex-direction:column; gap:6px; width:100%; min-width:0;".to_string()
+    };
+    let search_field_shell_style = if search_dropdown_open {
+        "display:flex; align-items:center; gap:8px; width:100%; min-width:0; height:26px; padding:0;"
+            .to_string()
+    } else {
+        "display:flex; align-items:center; gap:8px; width:100%; min-width:0; height:26px;"
+            .to_string()
+    };
+    let search_dropdown_panel_style = if search_dropdown_open {
+        format!(
+            "position:static; display:flex; flex-direction:column; gap:6px; min-width:0; padding:8px 2px 0 2px; \
+             border-top:1px solid {}; background:transparent; box-shadow:none; overflow:hidden;",
+            search_divider_color
+        )
+    } else {
+        format!(
+            "position:absolute; left:0; right:0; top:calc(100% + 4px); z-index:220; display:flex; flex-direction:column; gap:5px; \
+             padding:9px 8px 6px 8px; border-radius:0 0 16px 16px; background:{}; box-shadow:{}; border-top:1px solid {};",
+            search_panel_background, search_panel_shadow, search_divider_color
+        )
+    };
+    let search_field_style = if search_dropdown_open {
+        format!(
+            "{} background:transparent; box-shadow:none; border-radius:0; padding:0 4px;",
+            search_input_style(snapshot.palette.text, palette_is_dark(snapshot.palette)),
+        )
+    } else {
+        search_input_style(snapshot.palette.text, palette_is_dark(snapshot.palette))
+    };
+    let titlebar_session_panel_background = floating_panel_background;
     rsx! {
         TitlebarChrome {
             background: snapshot.palette.titlebar.to_string(),
@@ -17930,13 +19893,18 @@ fn Titlebar(
             on_toggle_maximized: on_toggle_maximized,
             left: rsx! {
                 div {
+                    "data-yggterm-titlebar-left": "1",
                     style: format!(
                         "display:flex; align-items:center; gap:12px; min-width:0; width:100%; padding-left:{}px;",
                         titlebar_leading_inset
                     ),
                     button {
+                        "data-titlebar-sidebar-button": "1",
                         style: icon_button_style(snapshot.palette),
-                        onmousedown: |evt| evt.stop_propagation(),
+                        onmousedown: |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                        },
                         ondoubleclick: |evt| evt.stop_propagation(),
                         onclick: move |_| on_toggle_sidebar.call(()),
                         if alt_overlay_badge_visible(&snapshot, "") {
@@ -17982,15 +19950,20 @@ fn Titlebar(
                         }
                     }
                     div {
-                        style: "position:relative; display:flex; align-items:center;",
-                        onmousedown: |evt| evt.stop_propagation(),
+                        style: "position:relative; display:flex; align-items:flex-start; height:100%; overflow:visible;",
+                        onmousedown: |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                        },
                         onclick: |evt| evt.stop_propagation(),
                         ondoubleclick: |evt| evt.stop_propagation(),
                             button {
+                                "data-titlebar-new-button": "1",
                                 style: format!(
-                                "display:inline-flex; align-items:center; gap:6px; height:30px; padding:0 11px; border:none; border-radius:10px; \
+                                "display:inline-flex; align-items:center; gap:6px; height:{}px; padding:0 11px; border:none; border-radius:11px; \
                                  background:{}; color:{}; font-size:11px; font-weight:800; cursor:pointer; \
                                  box-shadow: inset 0 0 0 1px {}; white-space:nowrap;",
+                                titlebar_modal_tab_height,
                                 chrome_chip_fill(snapshot.palette, snapshot.titlebar_new_menu_open),
                                 if snapshot.titlebar_new_menu_open {
                                     snapshot.palette.accent
@@ -18002,7 +19975,8 @@ fn Titlebar(
                                     )
                                 },
                                 chrome_chip_border(snapshot.palette)
-                            ),
+                                ),
+                            onmousedown: |evt| evt.stop_propagation(),
                             onclick: move |_| on_toggle_new_menu.call(()),
                             if alt_overlay_badge_visible(&snapshot, "") {
                                 span {
@@ -18021,54 +19995,78 @@ fn Titlebar(
                         }
                         if snapshot.titlebar_new_menu_open {
                             div {
+                                "data-titlebar-new-menu": "1",
                                 style: format!(
-                                    "position:absolute; left:0; top:38px; z-index:210; min-width:176px; padding:8px; border-radius:14px; \
-                                     background:{}; box-shadow:{}; \
-                                     display:flex; flex-direction:column; gap:6px;",
-                                    if palette_is_dark(snapshot.palette) {
-                                        "rgba(14,19,24,0.98)"
-                                    } else {
-                                        "rgba(255,255,255,0.98)"
-                                    },
-                                    if palette_is_dark(snapshot.palette) {
-                                        "0 18px 46px rgba(0,0,0,0.28), inset 0 0 0 1px rgba(187,204,219,0.16)"
-                                    } else {
-                                        "0 18px 46px rgba(74,93,122,0.22), inset 0 0 0 1px rgba(198,212,226,0.82)"
-                                    },
+                                    "position:absolute; left:0; top:0; z-index:210; display:flex; flex-direction:column; align-items:flex-start; \
+                                     min-width:184px; background:transparent; overflow:visible; pointer-events:none;",
                                 ),
-                                onmousedown: |evt| evt.stop_propagation(),
-                                button {
-                                    style: titlebar_new_action_style(snapshot.palette),
-                                    onclick: move |_| on_start_session.call(()),
-                                    if alt_overlay_badge_visible(&snapshot, "i") {
-                                        span {
-                                            style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:8px;",
-                                            "S"
-                                        }
+                                div {
+                                    "data-titlebar-new-button": "1",
+                                    style: format!(
+                                    "display:inline-flex; align-items:center; gap:6px; height:{}px; padding:0 12px 1px 12px; border:none; border-radius:11px 11px 0 0; \
+                                         background:{}; color:{}; font-size:11px; font-weight:800; cursor:pointer; box-shadow:none; white-space:nowrap; pointer-events:auto;",
+                                        titlebar_modal_tab_height,
+                                        floating_panel_background,
+                                        snapshot.palette.accent,
+                                    ),
+                                    onmousedown: |evt| evt.stop_propagation(),
+                                    onclick: move |_| on_toggle_new_menu.call(()),
+                                    ondoubleclick: |evt| evt.stop_propagation(),
+                                    "+"
+                                    span {
+                                        style: format!("font-size:10px; color:{};", snapshot.palette.accent),
+                                        "▾"
                                     }
-                                    "New Session"
                                 }
-                                button {
-                                    style: titlebar_new_action_style(snapshot.palette),
-                                    onclick: move |_| on_start_terminal.call(()),
-                                    if alt_overlay_badge_visible(&snapshot, "i") {
-                                        span {
-                                            style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:8px;",
-                                            "T"
+                                div {
+                                    "data-titlebar-new-menu-shell": "1",
+                                    style: format!(
+                                        "display:flex; flex-direction:column; gap:8px; width:min(292px, 72vw); margin-top:-1px; padding:12px; border-radius:0 16px 16px 16px; \
+                                         background:{}; box-shadow:{}; pointer-events:auto; box-sizing:border-box; overflow:hidden;",
+                                        floating_panel_background,
+                                        floating_panel_box_shadow,
+                                    ),
+                                    onclick: |evt| evt.stop_propagation(),
+                                    div {
+                                        style: "display:flex; flex-direction:column; gap:6px;",
+                                        onmousedown: |evt| evt.stop_propagation(),
+                                        button {
+                                            "data-titlebar-new-menu-action": "1",
+                                            style: titlebar_new_action_style(snapshot.palette),
+                                            onclick: move |_| on_start_session.call(()),
+                                            if alt_overlay_badge_visible(&snapshot, "i") {
+                                                span {
+                                                    style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:8px;",
+                                                    "S"
+                                                }
+                                            }
+                                            "New Session"
+                                        }
+                                        button {
+                                            "data-titlebar-new-menu-action": "1",
+                                            style: titlebar_new_action_style(snapshot.palette),
+                                            onclick: move |_| on_start_terminal.call(()),
+                                            if alt_overlay_badge_visible(&snapshot, "i") {
+                                                span {
+                                                    style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:8px;",
+                                                    "T"
+                                                }
+                                            }
+                                            "New Terminal"
+                                        }
+                                        button {
+                                            "data-titlebar-new-menu-action": "1",
+                                            style: titlebar_new_action_style(snapshot.palette),
+                                            onclick: move |_| on_create_paper.call(()),
+                                            if alt_overlay_badge_visible(&snapshot, "i") {
+                                                span {
+                                                    style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:8px;",
+                                                    "P"
+                                                }
+                                            }
+                                            "New Paper"
                                         }
                                     }
-                                    "New Terminal"
-                                }
-                                button {
-                                    style: titlebar_new_action_style(snapshot.palette),
-                                    onclick: move |_| on_create_paper.call(()),
-                                    if alt_overlay_badge_visible(&snapshot, "i") {
-                                        span {
-                                            style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:8px;",
-                                            "P"
-                                        }
-                                    }
-                                    "New Paper"
                                 }
                             }
                         }
@@ -18077,27 +20075,38 @@ fn Titlebar(
                         div {
                             key: "{titlebar_session_key}",
                             "data-titlebar-session-path": "{active_session_path_value}",
-                            style: "position:relative; display:flex; align-items:center; flex:1 1 220px; min-width:0; max-width:360px;",
-                            onmousedown: |evt| evt.stop_propagation(),
+                            style: format!(
+                                "position:relative; display:flex; align-items:flex-start; align-self:center; flex:1 1 220px; min-width:0; max-width:360px; height:{}px; overflow:visible;",
+                                titlebar_modal_tab_height
+                            ),
+                            onmousedown: |evt| {
+                                evt.prevent_default();
+                                evt.stop_propagation();
+                            },
                             onclick: |evt| evt.stop_propagation(),
                             ondoubleclick: |evt| evt.stop_propagation(),
                             button {
                                 "data-titlebar-session-button": "1",
-                                title: active_summary
-                                    .clone()
-                                    .unwrap_or_else(|| "Summary not generated yet.".to_string()),
                                 style: format!(
-                                    "display:flex; align-items:center; gap:8px; width:100%; height:32px; padding:0 12px; border:none; border-radius:10px; \
-                                     background:{}; color:{}; box-shadow: inset 0 0 0 1px {}; \
-                                     font-size:12px; font-weight:700; cursor:pointer; min-width:0;",
-                                    chrome_chip_fill(snapshot.palette, snapshot.titlebar_session_menu_open),
-                                    chrome_chip_text_color(
-                                        snapshot.palette,
-                                        snapshot.titlebar_session_menu_open,
-                                        true,
-                                    ),
-                                    chrome_chip_border(snapshot.palette)
+                                    "display:flex; align-items:center; gap:8px; width:100%; height:{}px; padding:0 12px; border:none; \
+                                     border-radius:{}; background:{}; color:{}; box-shadow:{}; \
+                                     font-size:12px; font-weight:700; cursor:pointer; min-width:0; box-sizing:border-box; position:relative; z-index:{};",
+                                    titlebar_modal_tab_height,
+                                    if snapshot.titlebar_session_menu_open { "11px 11px 0 0" } else { "11px" },
+                                    if snapshot.titlebar_session_menu_open {
+                                        titlebar_session_panel_background
+                                    } else {
+                                        chrome_chip_fill(snapshot.palette, false)
+                                    },
+                                    chrome_chip_text_color(snapshot.palette, snapshot.titlebar_session_menu_open, true),
+                                    if snapshot.titlebar_session_menu_open {
+                                        "none".to_string()
+                                    } else {
+                                        format!("inset 0 0 0 1px {}", chrome_chip_border(snapshot.palette))
+                                    },
+                                    if snapshot.titlebar_session_menu_open { 241 } else { 211 }
                                 ),
+                                onmousedown: |evt| evt.stop_propagation(),
                                 onclick: move |_| on_toggle_session_menu.call(()),
                                 span {
                                     "data-titlebar-title": "1",
@@ -18137,45 +20146,49 @@ fn Titlebar(
                             }
                             if snapshot.titlebar_session_menu_open {
                                 div {
-                                    "data-titlebar-summary-menu": "1",
+                                    "data-titlebar-summary-shell": "1",
                                     style: format!(
-                                        "position:absolute; left:0; top:38px; z-index:210; width:min(420px, 70vw); padding:12px 14px; border-radius:16px; \
-                                         background:{}; box-shadow:{}; display:flex; flex-direction:column; gap:10px;",
-                                        if palette_is_dark(snapshot.palette) {
-                                            "rgba(14,19,24,0.98)"
-                                        } else {
-                                            "rgba(255,255,255,0.98)"
-                                        },
-                                        if palette_is_dark(snapshot.palette) {
-                                            "0 20px 48px rgba(0,0,0,0.28), inset 0 0 0 1px rgba(187,204,219,0.16)"
-                                        } else {
-                                            "0 20px 48px rgba(74,93,122,0.18), inset 0 0 0 1px rgba(198,212,226,0.86)"
-                                        },
+                                        "position:absolute; left:0; top:{}px; z-index:240; width:{}; min-width:max(100%, 352px); height:1px; overflow:visible; pointer-events:none;",
+                                        titlebar_modal_tab_height - 1,
+                                        titlebar_modal_width,
                                     ),
-                                    onmousedown: |evt| evt.stop_propagation(),
                                     div {
-                                        style: format!("font-size:13px; font-weight:800; color:{};", snapshot.palette.text),
-                                        "{active_title}"
-                                    }
-                                    div {
-                                        "data-titlebar-summary-body": "1",
+                                        "data-titlebar-summary-menu": "1",
                                         style: format!(
-                                            "font-size:12px; line-height:1.65; color:{}; max-height:180px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere;",
-                                            snapshot.palette.muted
+                                            "display:flex; flex-direction:column; gap:12px; width:{}; min-width:max(100%, 352px); margin-top:-1px; \
+                                             padding:14px; border:none; border-radius:0 16px 16px 16px; background:{}; \
+                                             box-shadow:{}; pointer-events:auto; box-sizing:border-box; overflow:hidden;",
+                                            titlebar_modal_width,
+                                            titlebar_session_panel_background,
+                                            floating_panel_box_shadow,
                                         ),
-                                        {active_summary.clone().unwrap_or_else(|| "Summary not generated yet.".to_string())}
-                                    }
-                                    div {
-                                        style: "display:flex; align-items:center; gap:8px;",
-                                        button {
-                                            style: titlebar_new_action_style(snapshot.palette),
-                                            onclick: move |_| on_refresh_title.call(()),
-                                            "Regenerate Title"
+                                        onmousedown: |evt| evt.stop_propagation(),
+                                        onclick: |evt| evt.stop_propagation(),
+                                        div {
+                                            style: "display:flex; align-items:flex-start; justify-content:space-between; gap:12px;",
+                                            div {
+                                                style: format!("font-size:13px; font-weight:800; color:{}; min-width:0; flex:1;", snapshot.palette.text),
+                                                "{active_title}"
+                                            }
+                                            button {
+                                                "data-titlebar-summary-action": "summary",
+                                                title: "Regenerate summary",
+                                                style: titlebar_modal_icon_button_style(snapshot.palette),
+                                                onmousedown: |evt| {
+                                                    evt.prevent_default();
+                                                    evt.stop_propagation();
+                                                },
+                                                onclick: move |_| on_refresh_summary.call(()),
+                                                AiSparkleIcon { size: 13 }
+                                            }
                                         }
-                                        button {
-                                            style: titlebar_new_action_style(snapshot.palette),
-                                            onclick: move |_| on_refresh_summary.call(()),
-                                            "Regenerate Summary"
+                                        div {
+                                            "data-titlebar-summary-body": "1",
+                                            style: format!(
+                                                "font-size:12px; line-height:1.65; color:{}; max-height:180px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere;",
+                                                snapshot.palette.muted
+                                            ),
+                                            {active_summary.clone().unwrap_or_else(|| "Summary not generated yet.".to_string())}
                                         }
                                     }
                                 }
@@ -18186,102 +20199,280 @@ fn Titlebar(
             },
             center: rsx! {
                 div {
-                    style: "display:flex; flex-direction:column; align-items:stretch; gap:4px; width:min(560px, 100%); min-width:280px;",
-                    div {
-                        style: "display:flex; align-items:center; gap:8px;",
-                        input {
-                            id: SEARCH_INPUT_ID,
-                            r#type: "text",
-                            value: "{snapshot.search_query}",
-                            placeholder: "Search sessions…",
-                            style: search_input_style(snapshot.palette.text, palette_is_dark(snapshot.palette)),
-                            onmousedown: |evt| evt.stop_propagation(),
-                            ondoubleclick: |evt| evt.stop_propagation(),
-                            onfocus: move |_| on_set_search_focus.call(true),
-                            onblur: move |_| on_set_search_focus.call(false),
-                            oninput: move |evt| on_search.call(evt.value()),
-                            onkeydown: move |evt| {
-                                if evt.key() == Key::Enter && command_mode_active {
-                                    evt.prevent_default();
-                                    on_execute_search_command.call(search_query.clone());
-                                }
-                            },
-                        }
-                        if snapshot.search_active
-                            && matches!(
-                                snapshot.active_view_mode,
-                                WorkspaceViewMode::Rendered | WorkspaceViewMode::Terminal
-                            )
-                        {
-                            button {
-                                title: "Previous search hit",
-                                style: chip_style(snapshot.palette, false),
-                                onclick: move |_| on_prev_search_content.call(()),
-                                "↑"
-                            }
-                            button {
-                                title: "Next search hit",
-                                style: chip_style(snapshot.palette, false),
-                                onclick: move |_| on_next_search_content.call(()),
-                                "↓"
-                            }
-                            div {
-                                style: format!("font-size:11px; color:{}; min-width:62px; text-align:right;", snapshot.palette.muted),
-                                if let Some(ix) = snapshot.search_content_hit_index {
-                                    {format!("{}/{}", ix + 1, snapshot.search_content_hits.len())}
-                                } else {
-                                    "0/0"
-                                }
-                            }
-                        }
-                    }
-                    if snapshot.command_mode_active {
+                    style: "{search_center_style}",
+                    if search_dropdown_open {
                         div {
-                            style: "display:flex; flex-direction:column; gap:4px;",
+                            key: "{search_open_key}",
+                            "data-yggterm-titlebar-search": "1",
+                            style: "{search_shell_style}",
                             div {
-                                style: format!("font-size:10px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", snapshot.palette.muted),
-                                "Press Enter to run a yggterm command"
-                            }
-                            for suggestion in snapshot.search_command_suggestions.iter().take(5) {
-                                button {
-                                    style: format!(
-                                        "display:flex; align-items:center; justify-content:space-between; gap:12px; \
-                                         height:28px; border:none; border-radius:10px; padding:0 10px; cursor:pointer; \
-                                         background:{}; color:{}; box-shadow: inset 0 0 0 1px {};",
-                                        chrome_chip_fill(snapshot.palette, false),
-                                        chrome_chip_text_color(snapshot.palette, false, true),
-                                        chrome_chip_border(snapshot.palette)
-                                    ),
-                                    onclick: {
-                                        let command = suggestion.command.clone();
-                                        move |_| on_execute_search_command.call(command.clone())
+                                "data-titlebar-search-modal": "1",
+                                style: "{search_modal_style}",
+                                div {
+                                    "data-titlebar-search-field-shell": "1",
+                                    style: "{search_field_shell_style}",
+                                    onmousedown: move |evt| {
+                                        evt.stop_propagation();
+                                        on_set_search_focus.call(true);
+                                        let _ = document::eval(&format!(
+                                            "(function() {{
+                                                const input = document.getElementById({SEARCH_INPUT_ID:?});
+                                                if (input && input.focus) {{
+                                                    input.focus({{ preventScroll: true }});
+                                                }}
+                                            }})();"
+                                        ));
                                     },
-                                    span {
-                                        style: "font-size:11px; font-weight:700;",
-                                        "{suggestion.command}"
+                                    onclick: move |evt| {
+                                        evt.stop_propagation();
+                                        on_set_search_focus.call(true);
+                                    },
+                                    div {
+                                        style: "display:flex; align-items:center; gap:8px; width:100%; min-width:0;",
+                                        input {
+                                            id: SEARCH_INPUT_ID,
+                                            r#type: "text",
+                                            value: "{snapshot.search_query}",
+                                            placeholder: "{search_placeholder}",
+                                            style: "{search_field_style}",
+                                            onmounted: move |evt| async move {
+                                                let _ = evt.set_focus(true).await;
+                                            },
+                                            onmousedown: move |evt| {
+                                                evt.stop_propagation();
+                                                on_set_search_focus.call(true);
+                                            },
+                                            onclick: move |evt| {
+                                                evt.stop_propagation();
+                                                on_set_search_focus.call(true);
+                                                let _ = document::eval(&format!(
+                                                    "(function() {{
+                                                        const input = document.getElementById({SEARCH_INPUT_ID:?});
+                                                        if (input && input.focus) {{
+                                                            input.focus({{ preventScroll: true }});
+                                                        }}
+                                                    }})();"
+                                                ));
+                                            },
+                                            ondoubleclick: |evt| evt.stop_propagation(),
+                                            onfocus: move |_| on_set_search_focus.call(true),
+                                            onblur: move |_| on_set_search_focus.call(false),
+                                            oninput: move |evt| on_search.call(evt.value()),
+                                            onkeydown: move |evt| {
+                                                if evt.key() == Key::Enter && command_mode_active {
+                                                    evt.prevent_default();
+                                                    on_execute_search_command.call(search_query.clone());
+                                                }
+                                            },
+                                        }
+                                        if snapshot.search_active
+                                            && matches!(
+                                                snapshot.active_view_mode,
+                                                WorkspaceViewMode::Rendered | WorkspaceViewMode::Terminal
+                                            )
+                                        {
+                                            button {
+                                                title: "Previous search hit",
+                                                style: chip_style(snapshot.palette, false),
+                                                onclick: move |_| on_prev_search_content.call(()),
+                                                "↑"
+                                            }
+                                            button {
+                                                title: "Next search hit",
+                                                style: chip_style(snapshot.palette, false),
+                                                onclick: move |_| on_next_search_content.call(()),
+                                                "↓"
+                                            }
+                                            div {
+                                                style: format!("font-size:11px; color:{}; min-width:62px; text-align:right;", snapshot.palette.muted),
+                                                if let Some(ix) = snapshot.search_content_hit_index {
+                                                    {format!("{}/{}", ix + 1, snapshot.search_content_hits.len())}
+                                                } else {
+                                                    "0/0"
+                                                }
+                                            }
+                                        }
                                     }
-                                    span {
-                                        style: format!("font-size:10px; color:{};", snapshot.palette.muted),
-                                        "{suggestion.description}"
+                                }
+                                div {
+                                    "data-titlebar-search-dropdown": "1",
+                                    style: "{search_dropdown_panel_style}",
+                                    onmousedown: |evt| evt.stop_propagation(),
+                                    onclick: |evt| evt.stop_propagation(),
+                                    div {
+                                        "data-titlebar-search-dropdown-header": "1",
+                                        style: format!(
+                                            "display:flex; align-items:center; justify-content:space-between; gap:10px; padding:0 4px 2px 4px; \
+                                             font-size:11.5px; font-weight:600; letter-spacing:-0.012em; color:{}; \
+                                             text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased;",
+                                            snapshot.palette.muted
+                                        ),
+                                        span { "{search_dropdown_hint}" }
+                                        span { "Ctrl+Shift+P" }
+                                    }
+                                    if snapshot.command_mode_active {
+                                        for suggestion in snapshot.search_command_suggestions.iter().take(5) {
+                                            button {
+                                                "data-titlebar-search-dropdown-entry": "1",
+                                                style: format!(
+                                                    "display:flex; align-items:center; justify-content:space-between; gap:12px; \
+                                                     height:31px; border:none; border-radius:10px; padding:0 10px; cursor:pointer; \
+                                                     background:{}; color:{}; box-shadow: inset 0 0 0 1px {};",
+                                                    chrome_chip_fill(snapshot.palette, false),
+                                                    chrome_chip_text_color(snapshot.palette, false, true),
+                                                    chrome_chip_border(snapshot.palette)
+                                                ),
+                                                onclick: {
+                                                    let command = suggestion.command.clone();
+                                                    move |_| on_execute_search_command.call(command.clone())
+                                                },
+                                                span {
+                                                    style: "font-size:12.5px; font-weight:750; letter-spacing:-0.012em; text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased;",
+                                                    "{suggestion.command}"
+                                                }
+                                                span {
+                                                    style: format!("font-size:11.5px; color:{}; text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased;", snapshot.palette.muted),
+                                                    "{suggestion.description}"
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        div {
+                                            "data-titlebar-search-dropdown-entry": "1",
+                                            style: format!(
+                                                "display:flex; align-items:center; justify-content:space-between; gap:12px; height:31px; \
+                                                 padding:0 10px; border-radius:10px; background:{}; color:{}; \
+                                                 box-shadow: inset 0 0 0 1px {};",
+                                                chrome_chip_fill(snapshot.palette, false),
+                                                chrome_chip_text_color(snapshot.palette, false, true),
+                                                chrome_chip_border(snapshot.palette)
+                                            ),
+                                            span {
+                                                style: "font-size:12.5px; font-weight:750; letter-spacing:-0.012em; text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased;",
+                                                if snapshot.search_active {
+                                                    {format!("{} matching rows", snapshot.search_sidebar_matches.len())}
+                                                } else {
+                                                    "Search sessions and live terminals"
+                                                }
+                                            }
+                                            span {
+                                                style: format!("font-size:11.5px; color:{}; text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased;", snapshot.palette.muted),
+                                                if snapshot.search_active {
+                                                    if let Some(ix) = snapshot.search_content_hit_index {
+                                                        {format!("content {}/{}", ix + 1, snapshot.search_content_hits.len())}
+                                                    } else {
+                                                        {format!("content 0/{}", snapshot.search_content_hits.len())}
+                                                    }
+                                                } else {
+                                                    "Prefix '/' for commands"
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
-                    } else if snapshot.search_focused || snapshot.search_active {
+                    } else {
                         div {
-                            style: format!("font-size:10px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", snapshot.palette.muted),
-                            "Prefix '/' for yggterm commands · Ctrl+Shift+P focuses search"
+                            key: "{search_closed_key}",
+                            "data-yggterm-titlebar-search": "1",
+                            style: "{search_shell_style}",
+                            div {
+                                "data-titlebar-search-field-shell": "1",
+                                style: "{search_field_shell_style}",
+                                onmousedown: move |evt| {
+                                    evt.stop_propagation();
+                                    on_set_search_focus.call(true);
+                                    let _ = document::eval(&format!(
+                                        "(function() {{
+                                            const input = document.getElementById({SEARCH_INPUT_ID:?});
+                                            if (input && input.focus) {{
+                                                input.focus({{ preventScroll: true }});
+                                            }}
+                                        }})();"
+                                    ));
+                                },
+                                onclick: move |evt| {
+                                    evt.stop_propagation();
+                                    on_set_search_focus.call(true);
+                                },
+                                ondoubleclick: |evt| evt.stop_propagation(),
+                                input {
+                                    id: SEARCH_INPUT_ID,
+                                    r#type: "text",
+                                    value: "{snapshot.search_query}",
+                                    placeholder: "{search_placeholder}",
+                                    style: "{search_field_style}",
+                                    onmousedown: move |evt| {
+                                        evt.stop_propagation();
+                                        on_set_search_focus.call(true);
+                                    },
+                                    onclick: move |evt| {
+                                        evt.stop_propagation();
+                                        on_set_search_focus.call(true);
+                                        let _ = document::eval(&format!(
+                                            "(function() {{
+                                                const input = document.getElementById({SEARCH_INPUT_ID:?});
+                                                if (input && input.focus) {{
+                                                    input.focus({{ preventScroll: true }});
+                                                }}
+                                            }})();"
+                                        ));
+                                    },
+                                    ondoubleclick: |evt| evt.stop_propagation(),
+                                    onfocus: move |_| on_set_search_focus.call(true),
+                                    onblur: move |_| on_set_search_focus.call(false),
+                                    oninput: move |evt| on_search.call(evt.value()),
+                                    onkeydown: move |evt| {
+                                        if evt.key() == Key::Enter && command_mode_active {
+                                            evt.prevent_default();
+                                            on_execute_search_command.call(search_query.clone());
+                                        }
+                                    },
+                                }
+                                if snapshot.search_active
+                                    && matches!(
+                                        snapshot.active_view_mode,
+                                        WorkspaceViewMode::Rendered | WorkspaceViewMode::Terminal
+                                    )
+                                {
+                                    button {
+                                        title: "Previous search hit",
+                                        style: chip_style(snapshot.palette, false),
+                                        onclick: move |_| on_prev_search_content.call(()),
+                                        "↑"
+                                    }
+                                    button {
+                                        title: "Next search hit",
+                                        style: chip_style(snapshot.palette, false),
+                                        onclick: move |_| on_next_search_content.call(()),
+                                        "↓"
+                                    }
+                                    div {
+                                        style: format!("font-size:11px; color:{}; min-width:62px; text-align:right;", snapshot.palette.muted),
+                                        if let Some(ix) = snapshot.search_content_hit_index {
+                                            {format!("{}/{}", ix + 1, snapshot.search_content_hits.len())}
+                                        } else {
+                                            "0/0"
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             },
             right: rsx! {
                 div {
-                    style: "display:flex; align-items:center; justify-content:flex-end; gap:10px; min-width:0; width:100%;",
+                    "data-yggterm-titlebar-right": "1",
+                    style: "position:relative; display:flex; align-items:center; justify-content:flex-end; gap:8px; min-width:0; width:100%;",
+                    onclick: |evt| evt.stop_propagation(),
+                    style { "{TITLEBAR_RESPONSIVE_CSS}" }
                     if let Some(update) = snapshot.pending_update_restart.clone() {
                         button {
+                            class: "yggterm-titlebar-inline-update",
                             style: format!(
-                                "display:inline-flex; align-items:center; gap:7px; height:28px; padding:0 11px; border:none; border-radius:10px; \
+                                "display:inline-flex; align-items:center; gap:7px; height:26px; padding:0 11px; border:none; border-radius:10px; \
                                  background:{}; color:{}; font-size:11px; font-weight:700; cursor:pointer; \
                                  box-shadow: inset 0 0 0 1px {}; white-space:nowrap;",
                                 chrome_chip_fill(snapshot.palette, true),
@@ -18296,13 +20487,24 @@ fn Titlebar(
                         }
                     }
                     button {
+                        "data-titlebar-connect-button": "1",
+                        class: "yggterm-titlebar-connect-primary",
                         style: connect_button_style(
                             snapshot.palette,
                             snapshot.right_panel_mode == RightPanelMode::Connect
                         ),
-                        onmousedown: |evt| evt.stop_propagation(),
+                        onmousedown: |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                        },
                         ondoubleclick: |evt| evt.stop_propagation(),
-                        onclick: move |_| on_toggle_connect.call(()),
+                        onclick: {
+                            let on_toggle_connect = on_toggle_connect.clone();
+                            move |evt| {
+                                evt.stop_propagation();
+                                on_toggle_connect.call(());
+                            }
+                        },
                         if alt_overlay_badge_visible(&snapshot, "") {
                             span {
                                 style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:6px;",
@@ -18311,54 +20513,172 @@ fn Titlebar(
                         }
                         "Connect SSH"
                     }
-                    button {
-                        style: utility_icon_style(
-                            snapshot.palette,
-                            snapshot.right_panel_mode == RightPanelMode::Notifications
-                        ),
-                        onmousedown: |evt| evt.stop_propagation(),
-                        ondoubleclick: |evt| evt.stop_propagation(),
-                        onclick: move |_| on_toggle_notifications.call(()),
-                        if alt_overlay_badge_visible(&snapshot, "") {
-                            span {
-                                style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:6px;",
-                                "N"
+                    div {
+                        class: "yggterm-titlebar-inline-secondary",
+                        style: "display:flex; align-items:center; gap:8px;",
+                        button {
+                            "data-titlebar-notifications-button": "1",
+                            style: utility_icon_style(
+                                snapshot.palette,
+                                snapshot.right_panel_mode == RightPanelMode::Notifications
+                            ),
+                            onmousedown: |evt| {
+                                evt.prevent_default();
+                                evt.stop_propagation();
+                            },
+                            onclick: {
+                                let on_toggle_notifications = on_toggle_notifications.clone();
+                                move |evt| {
+                                    evt.stop_propagation();
+                                    on_toggle_notifications.call(());
+                                }
+                            },
+                            ondoubleclick: |evt| evt.stop_propagation(),
+                            if alt_overlay_badge_visible(&snapshot, "") {
+                                span {
+                                    style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:6px;",
+                                    "N"
+                                }
                             }
+                            BellIcon {}
                         }
-                        BellIcon {}
+                        button {
+                            "data-titlebar-settings-button": "1",
+                            style: utility_icon_style_sized(
+                                snapshot.palette,
+                                snapshot.right_panel_mode == RightPanelMode::Settings,
+                                17
+                            ),
+                            onmousedown: |evt| {
+                                evt.prevent_default();
+                                evt.stop_propagation();
+                            },
+                            onclick: {
+                                let on_toggle_settings = on_toggle_settings.clone();
+                                move |evt| {
+                                    evt.stop_propagation();
+                                    on_toggle_settings.call(());
+                                }
+                            },
+                            ondoubleclick: |evt| evt.stop_propagation(),
+                            if alt_overlay_badge_visible(&snapshot, "") {
+                                span {
+                                    style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:6px;",
+                                    "G"
+                                }
+                            }
+                            "⚙"
+                        }
+                        button {
+                            "data-titlebar-metadata-button": "1",
+                            style: utility_icon_style(
+                                snapshot.palette,
+                                snapshot.right_panel_mode == RightPanelMode::Metadata
+                            ),
+                            onmousedown: |evt| {
+                                evt.prevent_default();
+                                evt.stop_propagation();
+                            },
+                            onclick: {
+                                let on_toggle_meta = on_toggle_meta.clone();
+                                move |evt| {
+                                    evt.stop_propagation();
+                                    on_toggle_meta.call(());
+                                }
+                            },
+                            ondoubleclick: |evt| evt.stop_propagation(),
+                            if alt_overlay_badge_visible(&snapshot, "") {
+                                span {
+                                    style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:6px;",
+                                    "M"
+                                }
+                            }
+                            "ⓘ"
+                        }
                     }
                     button {
-                        style: utility_icon_style_sized(
-                            snapshot.palette,
-                            snapshot.right_panel_mode == RightPanelMode::Settings,
-                            17
-                        ),
-                        onmousedown: |evt| evt.stop_propagation(),
-                        ondoubleclick: |evt| evt.stop_propagation(),
-                        onclick: move |_| on_toggle_settings.call(()),
-                        if alt_overlay_badge_visible(&snapshot, "") {
-                            span {
-                                style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:6px;",
-                                "G"
-                            }
-                        }
-                        "⚙"
-                    }
-                    button {
+                        "data-titlebar-overflow-button": "1",
+                        class: "yggterm-titlebar-overflow-trigger",
+                        title: "More actions",
                         style: utility_icon_style(
                             snapshot.palette,
-                            snapshot.right_panel_mode == RightPanelMode::Metadata
+                            snapshot.titlebar_overflow_menu_open
                         ),
-                        onmousedown: |evt| evt.stop_propagation(),
+                        onmousedown: |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                        },
+                        onclick: {
+                            let on_toggle_overflow_menu = on_toggle_overflow_menu.clone();
+                            move |evt| {
+                                evt.stop_propagation();
+                                on_toggle_overflow_menu.call(());
+                            }
+                        },
                         ondoubleclick: |evt| evt.stop_propagation(),
-                        onclick: move |_| on_toggle_meta.call(()),
-                        if alt_overlay_badge_visible(&snapshot, "") {
-                            span {
-                                style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:6px;",
-                                "M"
+                        "⋮"
+                    }
+                    if snapshot.titlebar_overflow_menu_open {
+                        div {
+                            "data-titlebar-overflow-menu": "1",
+                            style: format!(
+                                "position:absolute; right:110px; top:34px; z-index:220; min-width:196px; padding:8px; border-radius:14px; \
+                                 background:{}; box-shadow:{}; display:flex; flex-direction:column; gap:6px;",
+                                if palette_is_dark(snapshot.palette) {
+                                    "rgba(14,19,24,0.98)"
+                                } else {
+                                    "rgba(255,255,255,0.98)"
+                                },
+                                if palette_is_dark(snapshot.palette) {
+                                    "0 16px 34px rgba(0,0,0,0.22), inset 0 0 0 1px rgba(187,204,219,0.14)"
+                                } else {
+                                    "0 16px 34px rgba(74,93,122,0.12), inset 0 0 0 1px rgba(198,212,226,0.84)"
+                                },
+                            ),
+                            onmousedown: |evt| evt.stop_propagation(),
+                            if let Some(update) = snapshot.pending_update_restart.clone() {
+                                button {
+                                    style: titlebar_new_action_style(snapshot.palette),
+                                    onclick: move |_| {
+                                        on_close_overflow_menu.call(());
+                                        on_restart_update.call(());
+                                    },
+                                    "Restart to Use {update.version}"
+                                }
+                            }
+                            button {
+                                style: titlebar_new_action_style(snapshot.palette),
+                                onclick: move |_| {
+                                    on_close_overflow_menu.call(());
+                                    on_toggle_connect.call(());
+                                },
+                                "Connect SSH"
+                            }
+                            button {
+                                style: titlebar_new_action_style(snapshot.palette),
+                                onclick: move |_| {
+                                    on_close_overflow_menu.call(());
+                                    on_toggle_notifications.call(());
+                                },
+                                "Notifications"
+                            }
+                            button {
+                                style: titlebar_new_action_style(snapshot.palette),
+                                onclick: move |_| {
+                                    on_close_overflow_menu.call(());
+                                    on_toggle_settings.call(());
+                                },
+                                "Settings"
+                            }
+                            button {
+                                style: titlebar_new_action_style(snapshot.palette),
+                                onclick: move |_| {
+                                    on_close_overflow_menu.call(());
+                                    on_toggle_meta.call(());
+                                },
+                                "Session Metadata"
                             }
                         }
-                        "ⓘ"
                     }
                     div { style: "flex:1; min-width:24px; max-width:40px; height:100%;" }
                     if native_macos_titlebar {
@@ -18472,6 +20792,8 @@ fn Sidebar(
     snapshot: SharedSnapshot,
     on_prev_search_row: EventHandler<()>,
     on_next_search_row: EventHandler<()>,
+    on_select_all_rows: EventHandler<()>,
+    on_start_sidebar_resize: EventHandler<f64>,
     on_select_row: EventHandler<(BrowserRow, TreeSelectionMode)>,
     on_delete_selected_items: EventHandler<bool>,
     on_open_context_menu: EventHandler<(BrowserRow, (f64, f64))>,
@@ -18482,12 +20804,13 @@ fn Sidebar(
     on_drop_into_row: EventHandler<()>,
     on_end_drag: EventHandler<()>,
     on_begin_rename: EventHandler<BrowserRow>,
+    on_regenerate_row_title: EventHandler<BrowserRow>,
     on_update_rename: EventHandler<String>,
     on_commit_rename: EventHandler<BrowserRow>,
     on_cancel_rename: EventHandler<()>,
 ) -> Element {
     let width = if snapshot.sidebar_open {
-        SIDE_RAIL_WIDTH
+        snapshot.sidebar_width.round().max(0.0) as usize
     } else {
         0
     };
@@ -18502,17 +20825,27 @@ fn Sidebar(
         div {
             id: "yggterm-sidebar",
             "data-sidebar-open": if snapshot.sidebar_open { "true" } else { "false" },
+            "data-sidebar-width": "{snapshot.sidebar_width.round() as i64}",
             style: format!(
                 "width:{}px; min-width:{}px; max-width:{}px; display:flex; flex-direction:column; \
                  background:{}; overflow:hidden; transition: opacity 180ms ease, transform 180ms ease; \
                  opacity:{}; transform:{}; pointer-events:{}; zoom:{}%; user-select:none; \
-                 -webkit-user-select:none;",
+                 -webkit-user-select:none; position:relative;",
                 width, width, width, snapshot.palette.sidebar, opacity, translate,
                 if snapshot.sidebar_open { "auto" } else { "none" },
                 zoom_percent_f32(snapshot.settings.ui_font_size, 14.0)
             ),
             tabindex: "0",
             onkeydown: move |evt| {
+                let is_accel = evt.modifiers().contains(Modifiers::CONTROL)
+                    || evt.modifiers().contains(Modifiers::META);
+                if is_accel
+                    && matches!(evt.key(), Key::Character(ref key) if key.eq_ignore_ascii_case("a"))
+                {
+                    evt.prevent_default();
+                    on_select_all_rows.call(());
+                    return;
+                }
                 if evt.key() == Key::Delete {
                     evt.prevent_default();
                     on_delete_selected_items.call(false);
@@ -18619,6 +20952,10 @@ fn Sidebar(
                                     let row = row.clone();
                                     move |_| on_begin_rename.call(row.clone())
                                 },
+                                on_regenerate_title: {
+                                    let row = row.clone();
+                                    move |_| on_regenerate_row_title.call(row.clone())
+                                },
                                 on_update_rename: move |value: String| on_update_rename.call(value),
                                 on_commit_rename: {
                                     let row = row.clone();
@@ -18650,6 +20987,19 @@ fn Sidebar(
                     }
                 }
                 }
+                div {
+                    "data-sidebar-resize-handle": "1",
+                    style: format!(
+                        "position:absolute; top:0; right:0; width:{}px; height:100%; cursor:ew-resize; z-index:18; \
+                         background:transparent;",
+                        SIDEBAR_RESIZE_HANDLE_WIDTH
+                    ),
+                    onmousedown: move |evt| {
+                        evt.stop_propagation();
+                        on_start_sidebar_resize.call(evt.client_coordinates().x);
+                    },
+                    ondoubleclick: |evt| evt.stop_propagation(),
+                }
             }
         }
     }
@@ -18657,6 +21007,14 @@ fn Sidebar(
 fn sidebar_row_visible_label(row: &BrowserRow) -> String {
     machine_label_text(&row.label).unwrap_or_else(|| row.label.clone())
 }
+fn snapshot_terminal_mount_epoch(snapshot: &RenderSnapshot, session_path: &str) -> u64 {
+    snapshot
+        .terminal_mount_epochs
+        .get(session_path)
+        .copied()
+        .unwrap_or(0)
+}
+
 fn sidebar_row_session_for_icon<'a>(
     snapshot: &'a RenderSnapshot,
     row: &BrowserRow,
@@ -18664,10 +21022,10 @@ fn sidebar_row_session_for_icon<'a>(
     let row_path = normalize_live_session_path(&row.full_path);
     let row_session_id = row.session_id.as_deref();
     snapshot
-        .active_session
+        .live_sessions
         .iter()
-        .chain(snapshot.live_sessions.iter())
         .chain(snapshot.retained_terminal_sessions.iter())
+        .chain(snapshot.active_session.iter())
         .find(|session| {
             normalize_live_session_path(&session.session_path) == row_path
                 || session.session_path == row.full_path
@@ -18734,6 +21092,22 @@ fn terminal_chunk_looks_idle_for_sidebar_icon(sample: &str) -> bool {
             && (terminal_chunk_has_prompt_output(prompt_summary_prefix)
                 || terminal_chunk_has_codex_prompt_output(prompt_summary_prefix)))
 }
+fn terminal_lines_are_bootstrap_scaffold(lines: &[String]) -> bool {
+    let visible = lines
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    !visible.is_empty()
+        && visible.iter().all(|line| {
+            line.starts_with("$ exec ")
+                || line.starts_with("Queue live shell session ")
+                || line.starts_with("Target: ")
+                || line.starts_with("Command: ")
+                || line.starts_with("Daemon runtime: ")
+                || line.starts_with("Daemon PTY: ")
+        })
+}
 fn session_is_idle_for_sidebar_icon(session: &ManagedSessionView) -> bool {
     let sample = session_sample_text_for_sidebar_icon(session);
     terminal_chunk_looks_idle_for_sidebar_icon(&sample)
@@ -18757,21 +21131,29 @@ fn sidebar_row_shows_busy_icon(snapshot: &RenderSnapshot, row: &BrowserRow) -> b
     if session.kind == SessionKind::Document {
         return false;
     }
-    if matches!(
-        session.launch_phase,
-        yggterm_server::TerminalLaunchPhase::Queued
-            | yggterm_server::TerminalLaunchPhase::BridgePending
-            | yggterm_server::TerminalLaunchPhase::RemoteBootstrap
-    ) {
-        return true;
-    }
+    let sidebar_sample = session_sample_text_for_sidebar_icon(session);
+    let has_terminal_line_sample = session
+        .terminal_lines
+        .iter()
+        .any(|line| !line.trim().is_empty())
+        && !terminal_lines_are_bootstrap_scaffold(&session.terminal_lines);
+    let is_idle = terminal_chunk_looks_idle_for_sidebar_icon(&sidebar_sample);
     let is_active_live_session = snapshot.active_session_path.as_deref()
         == Some(session.session_path.as_str())
         && matches!(
             session.source,
             SessionSource::LiveLocal | SessionSource::LiveSsh
         );
-    if is_active_live_session && session_is_idle_for_sidebar_icon(session) {
+    if matches!(
+        session.launch_phase,
+        yggterm_server::TerminalLaunchPhase::Queued
+            | yggterm_server::TerminalLaunchPhase::BridgePending
+            | yggterm_server::TerminalLaunchPhase::RemoteBootstrap
+    ) {
+        return session.terminal_foreground_active == Some(true)
+            || (has_terminal_line_sample && !is_idle && is_active_live_session);
+    }
+    if is_active_live_session && is_idle {
         return false;
     }
     if session.terminal_foreground_active == Some(true) {
@@ -18788,7 +21170,7 @@ fn sidebar_row_shows_busy_icon(snapshot: &RenderSnapshot, row: &BrowserRow) -> b
     if let Some(foreground_active) = session.terminal_foreground_active {
         return foreground_active;
     }
-    is_active_live_session && !session_is_idle_for_sidebar_icon(session)
+    false
 }
 fn tree_icon_kind(row: &BrowserRow) -> &'static str {
     match row.kind {
@@ -18801,9 +21183,13 @@ fn tree_icon_kind(row: &BrowserRow) -> &'static str {
             }
         }
         BrowserRowKind::Session => {
-            if row.full_path.starts_with("codex-litellm://") {
+            if row.full_path.starts_with("codex-litellm://")
+                || is_codex_litellm_storage_session_path(&row.full_path)
+            {
                 "codex-litellm"
-            } else if row.full_path.starts_with("codex://") {
+            } else if row.full_path.starts_with("codex://")
+                || is_codex_storage_session_path(&row.full_path)
+            {
                 "codex"
             } else if row.full_path.starts_with("local://") {
                 "plain-terminal"
@@ -18833,7 +21219,9 @@ fn tree_icon_glyph(row: &BrowserRow) -> Option<&'static str> {
         BrowserRowKind::Separator => Some("—"),
         BrowserRowKind::Session => Some(
             if row.full_path.starts_with("codex-litellm://")
+                || is_codex_litellm_storage_session_path(&row.full_path)
                 || row.full_path.starts_with("codex://")
+                || is_codex_storage_session_path(&row.full_path)
             {
                 "✦"
             } else if row.full_path.starts_with("local://") {
@@ -18929,6 +21317,7 @@ fn SidebarRow(
     on_select: EventHandler<MouseEvent>,
     on_open_context_menu: EventHandler<(f64, f64)>,
     on_begin_rename: EventHandler<MouseEvent>,
+    on_regenerate_title: EventHandler<MouseEvent>,
     on_update_rename: EventHandler<String>,
     on_commit_rename: EventHandler<()>,
     on_cancel_rename: EventHandler<()>,
@@ -19036,6 +21425,8 @@ fn SidebarRow(
                 }
                 if renaming {
                     input {
+                        "data-tree-rename-input": "1",
+                        "data-tree-rename-row-path": "{row.full_path}",
                         style: format!(
                             "width:140px; height:29px; border:none; border-radius:10px; background:rgba(255,255,255,0.92); \
                              color:{}; font-size:12px; font-weight:600; padding:0 10px; box-shadow: inset 0 0 0 1px rgba(204,214,224,0.9);",
@@ -19209,31 +21600,49 @@ fn SidebarRow(
                         }
                     }
                     if renaming {
-                        input {
-                            style: format!(
-                                "flex:1; min-width:0; height:29px; border:none; border-radius:10px; background:rgba(255,255,255,0.92); \
-                                 color:{}; font-size:12px; font-weight:600; padding:0 10px; box-shadow: inset 0 0 0 1px rgba(204,214,224,0.9);",
-                                palette.text
-                            ),
-                            value: rename_value,
-                            onmounted: move |evt| async move {
-                                let _ = evt.set_focus(true).await;
-                            },
-                            oninput: move |evt| on_update_rename.call(evt.value()),
-                            onkeydown: move |evt| {
-                                if evt.key() == Key::Enter {
-                                    on_commit_rename.call(());
-                                } else if evt.key() == Key::Escape {
-                                    on_cancel_rename.call(());
+                        div {
+                            style: "flex:1; min-width:0; display:flex; align-items:center; gap:6px;",
+                            input {
+                                "data-tree-rename-input": "1",
+                                "data-tree-rename-row-path": "{row.full_path}",
+                                style: format!(
+                                    "flex:1; min-width:0; height:29px; border:none; border-radius:10px; background:rgba(255,255,255,0.92); \
+                                     color:{}; font-size:12px; font-weight:600; padding:0 10px; box-shadow: inset 0 0 0 1px rgba(204,214,224,0.9);",
+                                    palette.text
+                                ),
+                                value: rename_value,
+                                onmounted: move |evt| async move {
+                                    let _ = evt.set_focus(true).await;
+                                },
+                                oninput: move |evt| on_update_rename.call(evt.value()),
+                                onkeydown: move |evt| {
+                                    if evt.key() == Key::Enter {
+                                        on_commit_rename.call(());
+                                    } else if evt.key() == Key::Escape {
+                                        on_cancel_rename.call(());
+                                    }
+                                },
+                                onblur: move |_| on_commit_rename.call(()),
+                                onclick: |evt| evt.stop_propagation(),
+                                onmousedown: |evt| evt.stop_propagation(),
+                                oncontextmenu: |evt| {
+                                    evt.prevent_default();
+                                    evt.stop_propagation();
+                                },
+                            }
+                            if row.kind == BrowserRowKind::Session {
+                                button {
+                                    "data-sidebar-rename-ai-action": "title",
+                                    title: "Use an AI-generated title",
+                                    style: rename_ai_action_button_style(palette),
+                                    onmousedown: |evt| {
+                                        evt.prevent_default();
+                                        evt.stop_propagation();
+                                    },
+                                    onclick: move |evt| on_regenerate_title.call(evt),
+                                    AiSparkleIcon { size: 12 }
                                 }
-                            },
-                            onblur: move |_| on_commit_rename.call(()),
-                            onclick: |evt| evt.stop_propagation(),
-                            onmousedown: |evt| evt.stop_propagation(),
-                            oncontextmenu: |evt| {
-                                evt.prevent_default();
-                                evt.stop_propagation();
-                            },
+                            }
                         }
                     } else {
                         span {
@@ -19668,11 +22077,11 @@ fn MainSurface(
                         style: "{terminal_layer_style}",
                         for terminal_session in retained_terminal_sessions.iter().cloned() {
                             {
-                                let session_mount_epoch = snapshot
-                                    .terminal_mount_epochs
-                                    .get(&terminal_session.session_path)
-                                    .copied()
-                                    .unwrap_or(1);
+                                let session_mount_epoch =
+                                    snapshot_terminal_mount_epoch(
+                                        snapshot.as_ref(),
+                                        &terminal_session.session_path,
+                                    );
                                 let terminal_visible = terminal_surface_visible
                                     && snapshot.active_session_path.as_deref()
                                         == Some(terminal_session.session_path.as_str());
@@ -19819,10 +22228,15 @@ fn MainSurface(
             key: "{surface_key}",
             style: format!(
                 "flex:1; min-width:0; min-height:0; display:flex; flex-direction:column; background:transparent; padding:{};",
-                if snapshot.fullscreen { "0" } else { "12px 12px 10px 0" }
+                if snapshot.fullscreen {
+                    "0"
+                } else {
+                    "4px"
+                }
             ),
             div {
                 key: "{surface_key}-body",
+                "data-yggterm-main-surface-body": "1",
                 style: "display:flex; flex-direction:column; flex:1 1 auto; min-width:0; min-height:0; overflow:hidden; position:relative;",
                 {body}
             }
@@ -19921,6 +22335,33 @@ fn RefreshInlineButton(
                 path { d: "M3 12a9 9 0 0 1 15.55-6.36L21 8" }
                 path { d: "M3 22v-6h6" }
                 path { d: "M21 12a9 9 0 0 1-15.55 6.36L3 16" }
+            }
+        }
+    }
+}
+#[component]
+fn AiSparkleIcon(size: usize) -> Element {
+    let size_attr = size.to_string();
+    rsx! {
+        svg {
+            width: "{size_attr}",
+            height: "{size_attr}",
+            view_box: "0 0 24 24",
+            fill: "none",
+            xmlns: "http://www.w3.org/2000/svg",
+            path {
+                d: "M12 3.5L13.79 8.21L18.5 10L13.79 11.79L12 16.5L10.21 11.79L5.5 10L10.21 8.21L12 3.5Z",
+                fill: "currentColor",
+            }
+            path {
+                d: "M18.3 3.8L18.88 5.32L20.4 5.9L18.88 6.48L18.3 8L17.72 6.48L16.2 5.9L17.72 5.32L18.3 3.8Z",
+                fill: "currentColor",
+                fill_opacity: "0.88",
+            }
+            path {
+                d: "M6.1 15.4L6.6 16.7L7.9 17.2L6.6 17.7L6.1 19L5.6 17.7L4.3 17.2L5.6 16.7L6.1 15.4Z",
+                fill: "currentColor",
+                fill_opacity: "0.82",
             }
         }
     }
@@ -21591,7 +24032,7 @@ fn TerminalCanvas(
                 .map(format_terminal_prefill_text)
         })
     } else {
-        terminal_loading_notice_text(&session)
+        local_terminal_prefill_text(&session)
     };
     let session_host_label = session.host_label.clone();
     let mount_identity = format!("{session_path}:{mount_epoch}");
@@ -21624,21 +24065,24 @@ fn TerminalCanvas(
             || shell.terminal_resume_ready_paths.contains(&session_path)
             || shell.terminal_session_has_ready_attempt(&session_path)
     };
-    append_trace_event(
-        &trace_home,
-        "ui",
-        "terminal_mount",
-        "component_render",
-        json!({
-            "session_path": session_path.clone(),
-            "host_id": host_id.clone(),
-            "mount_epoch": mount_epoch,
-            "mount_identity": mount_identity.clone(),
-            "active_view_mode": format!("{:?}", snapshot.active_view_mode),
-        }),
-    );
+    if render_trace_enabled() {
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "terminal_mount",
+            "component_render",
+            json!({
+                "session_path": session_path.clone(),
+                "host_id": host_id.clone(),
+                "mount_epoch": mount_epoch,
+                "mount_identity": mount_identity.clone(),
+                "active_view_mode": format!("{:?}", snapshot.active_view_mode),
+            }),
+        );
+    }
     let mut terminal_has_meaningful_output = use_signal(|| !is_remote_resume_session);
     let mut terminal_prompt_only = use_signal(|| false);
+    let mut terminal_host_painted = use_signal(|| false);
     let mut terminal_overlay_dismissed = use_signal(|| !is_remote_resume_session);
     let mut terminal_live_host_connected = use_signal(|| !is_remote_resume_session);
     let mut terminal_resume_surface_staged = use_signal(|| !is_remote_resume_session);
@@ -21690,6 +24134,7 @@ fn TerminalCanvas(
         terminal_resume_overlay_excerpt.set(initial_resume_overlay_excerpt.clone());
         terminal_has_meaningful_output.set(!is_remote_resume_session);
         terminal_prompt_only.set(false);
+        terminal_host_painted.set(false);
         terminal_overlay_dismissed.set(!is_remote_resume_session);
         terminal_live_host_connected.set(!is_remote_resume_session);
         terminal_resume_surface_staged.set(!is_remote_resume_session);
@@ -21858,7 +24303,10 @@ fn TerminalCanvas(
                 || retained_ready_surface
                 || !shell.terminal_attach_in_flight.contains(&session_path))
     };
-    let input_enable_key = format!("input:{host_id}:{host_should_accept_input}");
+    let input_enable_key = format!(
+        "input:{host_id}:{host_should_accept_input}:painted:{}",
+        terminal_host_painted()
+    );
     if *input_enable_identity.borrow() != input_enable_key {
         *input_enable_identity.borrow_mut() = input_enable_key.clone();
         if host_should_accept_input {
@@ -22065,7 +24513,16 @@ fn TerminalCanvas(
             let mut eval = document::eval(&terminal_eval_script(
                 &host_id,
                 &theme,
-                !is_remote_resume_session,
+                terminal_initial_programmatic_focus(
+                    snapshot.active_view_mode,
+                    snapshot.active_session_path.as_deref(),
+                    &session_path,
+                    is_remote_resume_session,
+                    snapshot.right_panel_mode,
+                    snapshot.search_focused,
+                    snapshot.command_mode_active,
+                    snapshot.tree_rename_path.is_some(),
+                ),
             ));
             let mut js_ready = false;
             let mut resize_seen = false;
@@ -22241,6 +24698,9 @@ fn TerminalCanvas(
                                 current_terminal_rows = rows;
                                 let geometry_usable = terminal_geometry_is_usable(cols, rows);
                                 if painted {
+                                    if !terminal_host_painted() {
+                                        terminal_host_painted.set(true);
+                                    }
                                     resize_seen = resize_seen || geometry_usable;
                                     terminal_geometry_ready =
                                         terminal_geometry_ready || geometry_usable;
@@ -22450,20 +24910,29 @@ fn TerminalCanvas(
                                 rows,
                                 blank_rows_below_cursor,
                             }) => {
+                                let host_health_sample_changed =
+                                    last_host_health_cursor_line_text != cursor_line_text
+                                        || last_host_health_text_tail != text_tail;
                                 last_host_health_has_transport_error = has_transport_error;
                                 last_host_health_cursor_line_text = cursor_line_text.clone();
                                 last_host_health_text_tail = text_tail.clone();
                                 last_host_health_rows = rows;
                                 last_host_health_blank_rows_below_cursor = blank_rows_below_cursor;
-                                let _ = safe_shell_mut(state, "terminal_attach_host_health_sample", |shell| {
-                                    shell.live_terminal_sidebar_samples.insert(
-                                        session_path.clone(),
-                                        LiveTerminalSidebarSample {
-                                            cursor_line_text: cursor_line_text.clone(),
-                                            text_tail: text_tail.clone(),
+                                if host_health_sample_changed {
+                                    let _ = safe_shell_mut(
+                                        state,
+                                        "terminal_attach_host_health_sample",
+                                        |shell| {
+                                            shell.live_terminal_sidebar_samples.insert(
+                                                session_path.clone(),
+                                                LiveTerminalSidebarSample {
+                                                    cursor_line_text: cursor_line_text.clone(),
+                                                    text_tail: text_tail.clone(),
+                                                },
+                                            );
                                         },
                                     );
-                                });
+                                }
                                 let prompt_gap_looks_stale = is_remote_resume_session
                                     && terminal_overlay_dismissed()
                                     && terminal_geometry_ready
@@ -23315,6 +25784,15 @@ fn TerminalCanvas(
                                     }
                                     placeholder_rendered = true;
                                 }
+                                let local_retained_surface_ready =
+                                    local_retained_terminal_surface_ready(
+                                        is_remote_resume_session,
+                                        terminal_paint_seen,
+                                        terminal_geometry_ready,
+                                        placeholder_rendered,
+                                        &last_host_health_cursor_line_text,
+                                        &last_host_health_text_tail,
+                                    );
                                 let attach_ready = if is_remote_resume_session {
                                     let now_ms = current_millis();
                                     terminal_paint_seen
@@ -23345,7 +25823,8 @@ fn TerminalCanvas(
                                         && (saw_meaningful_output
                                         || saw_prompt_output
                                         || tail_prompt_only_output
-                                        || saw_visible_output)
+                                        || saw_visible_output
+                                        || local_retained_surface_ready)
                                 };
                                 if attach_ready {
                                     if !traced_attach_ready {
@@ -23381,6 +25860,35 @@ fn TerminalCanvas(
                                         );
                                     }
                                     if !is_remote_resume_session {
+                                        let (should_accept_input_now, should_focus_now) = safe_shell_read(
+                                            state,
+                                            "terminal_attach_local_ready_input_gate",
+                                            |shell| {
+                                                let command_mode_active =
+                                                    is_command_query(&shell.search_query);
+                                                (
+                                                    terminal_should_accept_input(
+                                                        shell.server.active_view_mode(),
+                                                        shell.server.active_session_path(),
+                                                        &session_path,
+                                                        shell.search_focused,
+                                                        command_mode_active,
+                                                        shell.tree_rename_path.is_some(),
+                                                    ),
+                                                    terminal_initial_programmatic_focus(
+                                                        shell.server.active_view_mode(),
+                                                        shell.server.active_session_path(),
+                                                        &session_path,
+                                                        false,
+                                                        shell.right_panel_mode,
+                                                        shell.search_focused,
+                                                        command_mode_active,
+                                                        shell.tree_rename_path.is_some(),
+                                                    ),
+                                                )
+                                            },
+                                        )
+                                        .unwrap_or((false, false));
                                         let _ = safe_shell_mut(
                                             state,
                                             "terminal_attach_local_ready",
@@ -23393,8 +25901,8 @@ fn TerminalCanvas(
                                             },
                                         );
                                         let _ = eval.send(TerminalJsCommand::SetInputEnabled {
-                                            enabled: true,
-                                            focus: true,
+                                            enabled: should_accept_input_now,
+                                            focus: should_focus_now,
                                         });
                                     }
                                 }
@@ -23966,6 +26474,8 @@ fn TerminalCanvas(
                                 if should_retry_terminal_initial_read_error(
                                     attached_or_visible,
                                     initial_read_retry_attempts,
+                                    current_millis().saturating_sub(mount_started_ms),
+                                    !is_remote_resume_session,
                                     &error,
                                 ) {
                                     initial_read_retry_attempts =
@@ -24005,7 +26515,17 @@ fn TerminalCanvas(
                                         + Duration::from_millis(read_poll_ms);
                                     continue;
                                 }
-                                if is_remote_resume_session && attached_or_visible {
+                                let post_attach_read_retry_limit = if is_remote_resume_session {
+                                    2
+                                } else {
+                                    4
+                                };
+                                if attached_or_visible
+                                    && should_retry_terminal_read_error_after_attach(
+                                        is_remote_resume_session,
+                                        &error,
+                                    )
+                                {
                                     append_trace_event(
                                         &trace_home,
                                         "ui",
@@ -24015,9 +26535,10 @@ fn TerminalCanvas(
                                             "session_path": session_path.clone(),
                                             "error": error.to_string(),
                                             "attempt": post_attach_read_recovery_attempts + 1,
+                                            "remote_resume_session": is_remote_resume_session,
                                         }),
                                     );
-                                    if post_attach_read_recovery_attempts < 2 {
+                                    if post_attach_read_recovery_attempts < post_attach_read_retry_limit {
                                         let _ = safe_shell_mut(
                                             state,
                                             "terminal_attach_retry_after_read_error",
@@ -24035,15 +26556,30 @@ fn TerminalCanvas(
                                             enabled: false,
                                             focus: false,
                                         });
+                                        let (notification_title, notification_message) =
+                                            if is_remote_resume_session {
+                                                (
+                                                    "Retrying Remote Terminal",
+                                                    format!(
+                                                        "Yggterm hit a bad intermediate terminal surface on {} and is retrying the restore.",
+                                                        session_host_label
+                                                    ),
+                                                )
+                                            } else {
+                                                (
+                                                    "Recovering Local Terminal",
+                                                    format!(
+                                                        "Yggterm lost contact with its local helper on {} and is retrying the restore.",
+                                                        session_host_label
+                                                    ),
+                                                )
+                                            };
                                         upsert_terminal_resume_notification(
                                             state,
                                             &session_path,
                                             NotificationTone::Warning,
-                                            "Retrying Remote Terminal",
-                                            format!(
-                                                "Yggterm hit a bad intermediate terminal surface on {} and is retrying the restore.",
-                                                session_host_label
-                                            ),
+                                            notification_title,
+                                            notification_message,
                                         );
                                         post_attach_read_recovery_attempts += 1;
                                         deferred_resume_output.clear();
@@ -24075,6 +26611,21 @@ fn TerminalCanvas(
                                             + Duration::from_millis(read_poll_ms);
                                         continue;
                                     }
+                                    if !is_remote_resume_session {
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "read_error_after_attach_retries_exhausted",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "error": error.to_string(),
+                                                "attempts": post_attach_read_recovery_attempts,
+                                            }),
+                                        );
+                                    }
+                                }
+                                if is_remote_resume_session && attached_or_visible {
                                     let _ = safe_shell_mut(
                                         state,
                                         "terminal_attach_read_error_after_attach",
@@ -24215,9 +26766,9 @@ fn terminal_frame_style(fullscreen: bool) -> TerminalFrameStyle {
         }
     } else {
         TerminalFrameStyle {
-            padding: "6px",
+            padding: "4px",
             shell_radius: "10px",
-            host_radius: "8px",
+            host_radius: "10px",
         }
     }
 }
@@ -24563,16 +27114,35 @@ async fn terminal_ensure_async(
 fn should_retry_terminal_ensure(error: &anyhow::Error) -> bool {
     let text = error.to_string().to_ascii_lowercase();
     text.contains("no such file or directory")
+        || text.contains("no terminal spec for session")
         || text.contains("connection refused")
         || text.contains("connecting to")
+        || text.contains("reading daemon response")
+        || text.contains("parsing daemon response: \"\"")
         || text.contains("timed out")
+}
+
+fn should_retry_terminal_read_error_after_attach(
+    is_remote_resume_session: bool,
+    error: &anyhow::Error,
+) -> bool {
+    is_remote_resume_session || is_transient_local_daemon_connect_error(&error.to_string())
 }
 fn should_retry_terminal_initial_read_error(
     attached_or_visible: bool,
     attempts: u64,
+    elapsed_ms: u64,
+    local_session: bool,
     error: &anyhow::Error,
 ) -> bool {
-    !attached_or_visible && attempts < 4 && should_retry_terminal_ensure(error)
+    if attached_or_visible || !should_retry_terminal_ensure(error) {
+        return false;
+    }
+    if local_session {
+        elapsed_ms < 6_000 && attempts < 24
+    } else {
+        attempts < 4
+    }
 }
 async fn terminal_ensure_with_retry_async(
     endpoint: ServerEndpoint,
@@ -24928,24 +27498,24 @@ fn terminal_theme(
     TerminalTheme {
         background: "#f7f8fa".to_string(),
         foreground: "#1f2328".to_string(),
-        cursor: "#005fb8".to_string(),
+        cursor: "#0451a5".to_string(),
         font_size: font_size.max(5.0),
         selection: "rgba(9, 105, 218, 0.20)".to_string(),
         black: "#24292f".to_string(),
-        red: "#cd3131".to_string(),
-        green: "#00bc00".to_string(),
-        yellow: "#949800".to_string(),
+        red: "#a1260d".to_string(),
+        green: "#0c6428".to_string(),
+        yellow: "#7a4f00".to_string(),
         blue: "#0451a5".to_string(),
-        magenta: "#bc05bc".to_string(),
-        cyan: "#0598bc".to_string(),
+        magenta: "#6936aa".to_string(),
+        cyan: "#0e6570".to_string(),
         white: "#57606a".to_string(),
         bright_black: "#6e7781".to_string(),
-        bright_red: "#cd3131".to_string(),
-        bright_green: "#14ce14".to_string(),
-        bright_yellow: "#b5ba00".to_string(),
+        bright_red: "#a1260d".to_string(),
+        bright_green: "#0c6428".to_string(),
+        bright_yellow: "#744900".to_string(),
         bright_blue: "#0451a5".to_string(),
-        bright_magenta: "#bc05bc".to_string(),
-        bright_cyan: "#0598bc".to_string(),
+        bright_magenta: "#7340b3".to_string(),
+        bright_cyan: "#0e6570".to_string(),
         bright_white: "#8c959f".to_string(),
     }
 }
@@ -25010,7 +27580,47 @@ fn terminal_loading_notice_text(session: &ManagedSessionView) -> Option<String> 
     lines.push("Waiting for the remote terminal to paint...".to_string());
     Some(format!("{}\r\n", lines.join("\r\n")))
 }
-const TERMINAL_FONT_FAMILY: &str = "'JetBrains Mono', 'Iosevka Term', 'Fira Code', monospace";
+fn local_terminal_prefill_text(session: &ManagedSessionView) -> Option<String> {
+    if session.session_path.starts_with("remote-session://")
+        || session.source != SessionSource::LiveLocal
+    {
+        return None;
+    }
+    let mut lines = session
+        .terminal_lines
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let status_line = session.status_line.trim();
+    if !status_line.is_empty() && lines.last().map(String::as_str) != Some(status_line) {
+        lines.push(status_line.to_string());
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    let keep_from = lines.len().saturating_sub(40);
+    Some(format_terminal_prefill_text(
+        &lines[keep_from..].join("\r\n"),
+    ))
+}
+fn local_retained_terminal_surface_ready(
+    is_remote_resume_session: bool,
+    terminal_paint_seen: bool,
+    terminal_geometry_ready: bool,
+    placeholder_rendered: bool,
+    host_health_cursor_line_text: &str,
+    host_health_text_tail: &str,
+) -> bool {
+    !is_remote_resume_session
+        && terminal_paint_seen
+        && terminal_geometry_ready
+        && (placeholder_rendered
+            || !host_health_cursor_line_text.trim().is_empty()
+            || !host_health_text_tail.trim().is_empty())
+}
+const TERMINAL_FONT_FAMILY: &str = "'Iosevka Term', 'JetBrains Mono', 'Fira Code', monospace";
 fn terminal_hex_channel(value: &str) -> Option<u8> {
     u8::from_str_radix(value, 16).ok()
 }
@@ -25074,7 +27684,7 @@ fn chrome_blended_luminance(foreground: &str, background: &str) -> Option<f32> {
 }
 fn terminal_font_weight(theme: &TerminalTheme) -> u16 {
     let _ = theme;
-    500
+    400
 }
 fn terminal_dim_foreground(theme: &TerminalTheme) -> String {
     let alpha = if relative_terminal_luminance_from_hex(&theme.background).unwrap_or(0.0) > 0.72 {
@@ -25087,7 +27697,7 @@ fn terminal_dim_foreground(theme: &TerminalTheme) -> String {
 }
 fn terminal_font_line_height(theme: &TerminalTheme) -> f32 {
     let _ = theme;
-    1.12
+    1.0
 }
 fn terminal_font_weight_bold(theme: &TerminalTheme) -> u16 {
     let _ = theme;
@@ -25113,11 +27723,9 @@ fn terminal_cursor_muted(theme: &TerminalTheme) -> String {
     rgba_terminal_color(&theme.cursor, alpha).unwrap_or_else(|| theme.cursor.clone())
 }
 fn terminal_minimum_contrast_ratio(theme: &TerminalTheme) -> f32 {
-    if relative_terminal_luminance_from_hex(&theme.background).unwrap_or(0.0) > 0.72 {
-        8.5
-    } else {
-        6.5
-    }
+    let _ = theme;
+    // Match VS Code's integrated terminal default. Higher values wash out ANSI palettes.
+    4.5
 }
 fn relative_terminal_luminance_from_hex(color: &str) -> Option<f32> {
     let (red, green, blue) = parse_terminal_hex_rgb(color)?;
@@ -25165,11 +27773,11 @@ fn rgba_terminal_color(color: &str, alpha: f32) -> Option<String> {
 }
 fn terminal_font_smoothing(theme: &TerminalTheme) -> &'static str {
     let _ = theme;
-    "antialiased"
+    "auto"
 }
 fn terminal_moz_font_smoothing(theme: &TerminalTheme) -> &'static str {
     let _ = theme;
-    "grayscale"
+    "auto"
 }
 fn xterm_assets_bootstrap_script() -> String {
     let css = serde_json::to_string(XTERM_CSS).expect("serialize xterm css");
@@ -25328,6 +27936,163 @@ fn apply_active_terminal_zoom(state: Signal<ShellState>) {
         &theme,
     ));
 }
+fn sync_active_terminal_input_policy(state: Signal<ShellState>) {
+    let (active_host_id, terminal_input_override_active, snapshot) = {
+        let shell = state.read();
+        (
+            shell.active_terminal_host_id.clone(),
+            shell.terminal_input_override_active,
+            shell.snapshot(),
+        )
+    };
+    if snapshot.active_view_mode != WorkspaceViewMode::Terminal {
+        return;
+    }
+    let Some(session) = snapshot.active_session.as_ref() else {
+        return;
+    };
+    let (allow_input, focus_input) = terminal_runtime_input_policy(
+        snapshot.active_view_mode,
+        snapshot.active_session_path.as_deref(),
+        &session.session_path,
+        snapshot.right_panel_mode,
+        snapshot.search_focused,
+        snapshot.command_mode_active,
+        snapshot.tree_rename_path.is_some(),
+        terminal_input_override_active,
+    );
+    if let Some(host_id) = active_host_id {
+        let _ = document::eval(&terminal_set_input_enabled_script(
+            &host_id,
+            allow_input,
+            focus_input,
+        ));
+    }
+    let _ = document::eval(&terminal_set_input_enabled_script_for_session(
+        &session.session_path,
+        allow_input,
+        focus_input,
+    ));
+}
+fn dismiss_titlebar_transients_and_resync_active_terminal(mut state: Signal<ShellState>) {
+    state.with_mut(|shell| {
+        shell.dismiss_titlebar_transients();
+        if shell.search_focused {
+            shell.set_search_focus(false);
+        }
+    });
+    let _ = document::eval(&format!(
+        "(function() {{
+            const input = document.getElementById({SEARCH_INPUT_ID:?});
+            if (input && document.activeElement === input && input.blur) {{
+                input.blur();
+            }}
+        }})();"
+    ));
+    sync_active_terminal_input_policy(state);
+}
+fn reclaim_active_terminal_input_from_viewport_click(mut state: Signal<ShellState>) {
+    state.with_mut(|shell| {
+        shell.dismiss_titlebar_transients();
+        shell.terminal_input_override_active = true;
+        if shell.search_focused {
+            shell.set_search_focus(false);
+        }
+    });
+    let _ = document::eval(&format!(
+        "(function() {{
+            const input = document.getElementById({SEARCH_INPUT_ID:?});
+            if (input && document.activeElement === input && input.blur) {{
+                input.blur();
+            }}
+        }})();"
+    ));
+    let active_host_id = state.read().active_terminal_host_id.clone();
+    let snapshot = state.read().snapshot();
+    if snapshot.active_view_mode != WorkspaceViewMode::Terminal {
+        sync_active_terminal_input_policy(state);
+        return;
+    }
+    let Some(session) = snapshot.active_session.as_ref() else {
+        return;
+    };
+    if let Some(host_id) = active_host_id {
+        let _ = document::eval(&terminal_set_input_enabled_script(&host_id, true, true));
+    }
+    let _ = document::eval(&terminal_set_input_enabled_script_for_session(
+        &session.session_path,
+        true,
+        true,
+    ));
+}
+fn terminal_should_accept_input(
+    active_view_mode: WorkspaceViewMode,
+    active_session_path: Option<&str>,
+    session_path: &str,
+    search_focused: bool,
+    command_mode_active: bool,
+    tree_rename_active: bool,
+) -> bool {
+    active_view_mode == WorkspaceViewMode::Terminal
+        && active_session_path == Some(session_path)
+        && !search_focused
+        && !command_mode_active
+        && !tree_rename_active
+}
+fn terminal_initial_programmatic_focus(
+    active_view_mode: WorkspaceViewMode,
+    active_session_path: Option<&str>,
+    session_path: &str,
+    is_remote_resume_session: bool,
+    right_panel_mode: RightPanelMode,
+    search_focused: bool,
+    command_mode_active: bool,
+    tree_rename_active: bool,
+) -> bool {
+    !is_remote_resume_session
+        && terminal_should_accept_input(
+            active_view_mode,
+            active_session_path,
+            session_path,
+            search_focused,
+            command_mode_active,
+            tree_rename_active,
+        )
+        && right_panel_allows_terminal_autofocus(right_panel_mode)
+}
+fn right_panel_allows_terminal_autofocus(right_panel_mode: RightPanelMode) -> bool {
+    !matches!(
+        right_panel_mode,
+        RightPanelMode::Settings | RightPanelMode::Connect
+    )
+}
+fn terminal_runtime_input_policy(
+    active_view_mode: WorkspaceViewMode,
+    active_session_path: Option<&str>,
+    session_path: &str,
+    right_panel_mode: RightPanelMode,
+    search_focused: bool,
+    command_mode_active: bool,
+    tree_rename_active: bool,
+    terminal_input_override_active: bool,
+) -> (bool, bool) {
+    let right_panel_allows_input =
+        terminal_input_override_active || right_panel_allows_terminal_autofocus(right_panel_mode);
+    let terminal_selected = terminal_should_accept_input(
+        active_view_mode,
+        active_session_path,
+        session_path,
+        search_focused,
+        command_mode_active,
+        tree_rename_active,
+    );
+    let allow_input = terminal_selected && right_panel_allows_input;
+    let focus_input = allow_input;
+    (allow_input, focus_input)
+}
+fn terminal_input_override_for_right_panel_mode(right_panel_mode: RightPanelMode) -> bool {
+    matches!(right_panel_mode, RightPanelMode::Settings)
+}
 fn terminal_eval_script(
     host_id: &str,
     theme: &TerminalTheme,
@@ -25465,7 +28230,7 @@ fn terminal_eval_script(
         const assetsReady = await ensureXtermAssets();
         dioxus.send({{
             kind: "debug",
-            message: `assets host=${{hostId}} ready=${{assetsReady}} terminal=${{!!window.Terminal}} fit=${{!!(window.FitAddon && window.FitAddon.FitAddon)}} canvas=${{!!(window.CanvasAddon && window.CanvasAddon.CanvasAddon)}} bootstrap=${{window.__yggtermXtermBootstrapError || "none"}}`
+            message: `assets host=${{hostId}} ready=${{assetsReady}} terminal=${{!!window.Terminal}} fit=${{!!(window.FitAddon && window.FitAddon.FitAddon)}} bootstrap=${{window.__yggtermXtermBootstrapError || "none"}}`
         }});
         if (
             !assetsReady
@@ -25553,6 +28318,7 @@ fn terminal_eval_script(
             cursorBlink: false,
             cursorStyle: 'bar',
             cursorWidth: 2,
+            customGlyphs: true,
             fontFamily: {font_family},
             fontSize: {font_size},
             fontWeight: {font_weight},
@@ -25602,6 +28368,7 @@ fn terminal_eval_script(
         host.style.setProperty('--yggterm-term-font-smoothing', {font_smoothing});
         host.style.setProperty('--yggterm-term-moz-font-smoothing', {moz_font_smoothing});
         let inputEnabled = Boolean({initial_input_enabled});
+        let programmaticFocusEnabled = Boolean({initial_input_enabled});
         host.style.cursor = inputEnabled ? 'text' : 'default';
         const runtimeStyleId = `yggterm-xterm-runtime-style-${{hostId}}`;
         if (!document.getElementById(runtimeStyleId)) {{
@@ -25641,14 +28408,32 @@ fn terminal_eval_script(
                 #${{hostId}} .xterm-helper-textarea {{
                     position: absolute !important;
                     top: 0 !important;
-                    left: -9999em !important;
-                    width: 0 !important;
-                    height: 0 !important;
+                    left: -10000px !important;
+                    width: 1px !important;
+                    height: 1px !important;
                     opacity: 0 !important;
                     z-index: -5 !important;
                     overflow: hidden !important;
+                    border: 0 !important;
+                    outline: none !important;
+                    box-shadow: none !important;
+                    background: transparent !important;
+                    color: transparent !important;
                     caret-color: transparent !important;
                     pointer-events: none !important;
+                    clip: rect(0, 0, 0, 0) !important;
+                    clip-path: inset(50%) !important;
+                    white-space: nowrap !important;
+                    appearance: none !important;
+                }}
+                #${{hostId}} .xterm,
+                #${{hostId}} .xterm-screen,
+                #${{hostId}} .xterm-screen canvas,
+                #${{hostId}} .xterm-rows,
+                #${{hostId}} .xterm-rows > div,
+                #${{hostId}} .xterm-rows span {{
+                    user-select: none !important;
+                    -webkit-user-select: none !important;
                 }}
                 #${{hostId}} .xterm-accessibility-tree:not(.debug) *::selection,
                 #${{hostId}} .xterm-accessibility-tree:not(.debug) *::-moz-selection {{
@@ -25670,21 +28455,42 @@ fn terminal_eval_script(
                     color: var(--yggterm-term-foreground) !important;
                     line-height: var(--yggterm-term-line-height) !important;
                 }}
+                #${{hostId}} .xterm-rows .xterm-cursor {{
+                    color: transparent !important;
+                    -webkit-text-fill-color: transparent !important;
+                    background: transparent !important;
+                    border-color: transparent !important;
+                    border-left: none !important;
+                    outline: none !important;
+                    text-shadow: none !important;
+                    box-shadow: inset 2px 0 0 0 var(--yggterm-term-cursor-muted) !important;
+                }}
+                #${{hostId}}.yggterm-term-focused .xterm-rows .xterm-cursor {{
+                    box-shadow: inset 2px 0 0 0 var(--yggterm-term-cursor) !important;
+                }}
                 #${{hostId}} .xterm-rows > div {{
-                    color: var(--yggterm-term-foreground) !important;
                     line-height: var(--yggterm-term-line-height) !important;
                 }}
                 #${{hostId}} .xterm-rows span,
                 #${{hostId}} .xterm-rows div {{
                     line-height: var(--yggterm-term-line-height) !important;
                 }}
-                #${{hostId}} .xterm-rows .xterm-dim,
-                #${{hostId}} .xterm-rows [style*="opacity: 0"],
-                #${{hostId}} .xterm-rows [style*="opacity:0"],
-                #${{hostId}} .xterm-rows span[style*="opacity: 0"],
-                #${{hostId}} .xterm-rows span[style*="opacity:0"] {{
+                #${{hostId}} .xterm-rows .xterm-dim:not([class*="xterm-fg-"]),
+                #${{hostId}} .xterm-rows [style*="opacity: 0"]:not([class*="xterm-fg-"]),
+                #${{hostId}} .xterm-rows [style*="opacity:0"]:not([class*="xterm-fg-"]),
+                #${{hostId}} .xterm-rows span[style*="opacity: 0"]:not([class*="xterm-fg-"]),
+                #${{hostId}} .xterm-rows span[style*="opacity:0"]:not([class*="xterm-fg-"]) {{
                     color: var(--yggterm-term-dim-foreground) !important;
                     opacity: 1 !important;
+                }}
+                #${{hostId}} .xterm-rows .xterm-dim[class*="xterm-fg-"] {{
+                    opacity: 1 !important;
+                }}
+                #${{hostId}} .xterm-rows .xterm-dim:not([class*="xterm-fg-"])[style*="background-color:#f0f0f2"] {{
+                    color: #151b23 !important;
+                }}
+                #${{hostId}} .xterm-rows .xterm-dim:not([class*="xterm-fg-"])[style*="background-color:#393939"] {{
+                    color: #fbfbfd !important;
                 }}
                 #${{hostId}} .xterm-viewport::-webkit-scrollbar {{
                     width: 0 !important;
@@ -25694,11 +28500,98 @@ fn terminal_eval_script(
             `;
             document.head.appendChild(runtimeStyle);
         }}
+        function applyNonSelectableSurfaceContract() {{
+            try {{
+                const selectionNodes = [
+                    host.querySelector('.xterm'),
+                    host.querySelector('.xterm-screen'),
+                    ...Array.from(host.querySelectorAll('.xterm-screen canvas, .xterm-rows, .xterm-rows > div, .xterm-rows span')),
+                ].filter(Boolean);
+                for (const node of selectionNodes) {{
+                    node.style.userSelect = 'none';
+                    node.style.webkitUserSelect = 'none';
+                }}
+            }} catch (_error) {{}}
+        }}
         function syncFocusClass() {{
             try {{
                 const helperTextarea = host.querySelector('.xterm-helper-textarea');
                 const focused = Boolean(helperTextarea && document.activeElement === helperTextarea);
                 host.classList.toggle('yggterm-term-focused', focused);
+            }} catch (_error) {{}}
+        }}
+        function enforceHelperTextareaContract() {{
+            try {{
+                const helperTextarea = host.querySelector('.xterm-helper-textarea');
+                if (!helperTextarea) {{
+                    return null;
+                }}
+                helperTextarea.style.setProperty('position', 'absolute', 'important');
+                helperTextarea.style.setProperty('top', '0px', 'important');
+                helperTextarea.style.setProperty('left', '-10000px', 'important');
+                helperTextarea.style.setProperty('width', '1px', 'important');
+                helperTextarea.style.setProperty('height', '1px', 'important');
+                helperTextarea.style.setProperty('opacity', '0', 'important');
+                helperTextarea.style.setProperty('z-index', '-5', 'important');
+                helperTextarea.style.setProperty('overflow', 'hidden', 'important');
+                helperTextarea.style.setProperty('border', '0', 'important');
+                helperTextarea.style.setProperty('outline', 'none', 'important');
+                helperTextarea.style.setProperty('box-shadow', 'none', 'important');
+                helperTextarea.style.setProperty('background', 'transparent', 'important');
+                helperTextarea.style.setProperty('color', 'transparent', 'important');
+                helperTextarea.style.setProperty('caret-color', 'transparent', 'important');
+                helperTextarea.style.setProperty('pointer-events', 'none', 'important');
+                helperTextarea.style.setProperty('clip', 'rect(0, 0, 0, 0)', 'important');
+                helperTextarea.style.setProperty('clip-path', 'inset(50%)', 'important');
+                helperTextarea.style.setProperty('white-space', 'nowrap', 'important');
+                helperTextarea.style.setProperty('appearance', 'none', 'important');
+                return helperTextarea;
+            }} catch (_error) {{
+                return null;
+            }}
+        }}
+        function normalizeLowContrastGlyphs() {{
+            try {{
+                const rowsLayer = host.querySelector('.xterm-rows');
+                if (!rowsLayer) {{
+                    return;
+                }}
+                const screen = host.querySelector('.xterm-screen');
+                const viewport = host.querySelector('.xterm-viewport');
+                const hostStyle = window.getComputedStyle(host);
+                const screenStyle = screen ? window.getComputedStyle(screen) : null;
+                const viewportStyle = viewport ? window.getComputedStyle(viewport) : null;
+                const backgroundColor =
+                    (viewportStyle && viewportStyle.backgroundColor)
+                    || (screenStyle && screenStyle.backgroundColor)
+                    || String(hostStyle.backgroundColor || '');
+                const background = parseCssColor(backgroundColor);
+                const backgroundLuminance = background ? relativeLuminance(background) : null;
+                const minimumVisibleContrast = 4.5;
+                const contrastSafeForeground = (sampleBackground) => {{
+                    const parsed = parseCssColor(sampleBackground);
+                    const luminance = parsed ? relativeLuminance(parsed) : null;
+                    return luminance != null && luminance > 0.46 ? '#0f172a' : '#fbfbfd';
+                }};
+                for (const node of Array.from(rowsLayer.querySelectorAll('span, div'))) {{
+                    const className = String(node.className || '');
+                    if (className.includes('xterm-cursor')) {{
+                        continue;
+                    }}
+                    const text = String(node.textContent || '').replace(/\s+/g, ' ').trim();
+                    if (!text) {{
+                        continue;
+                    }}
+                    const style = window.getComputedStyle(node);
+                    const rowBackground = !isTransparentCssColor(style.backgroundColor)
+                        ? String(style.backgroundColor || '')
+                        : backgroundColor;
+                    const contrast = contrastRatio(style.color, rowBackground);
+                    if (contrast == null || contrast >= minimumVisibleContrast) {{
+                        continue;
+                    }}
+                    node.style.setProperty('color', contrastSafeForeground(rowBackground), 'important');
+                }}
             }} catch (_error) {{}}
         }}
         let wheelEventCount = 0;
@@ -25743,16 +28636,16 @@ fn terminal_eval_script(
                 }}
                 const rawCursorNodes = Array.from(rowsLayer.querySelectorAll('.xterm-cursor'));
                 for (const node of rawCursorNodes) {{
-                    node.classList.remove('yggterm-hidden-raw-cursor');
-                    node.style.removeProperty('color');
-                    node.style.removeProperty('opacity');
-                    node.style.removeProperty('visibility');
-                    node.style.removeProperty('background');
-                    node.style.removeProperty('background-color');
-                    node.style.removeProperty('border-color');
-                    node.style.removeProperty('box-shadow');
-                    node.style.removeProperty('outline');
-                    node.style.removeProperty('text-shadow');
+                    node.classList.add('yggterm-hidden-raw-cursor');
+                    node.style.setProperty('color', 'transparent', 'important');
+                    node.style.setProperty('-webkit-text-fill-color', 'transparent', 'important');
+                    node.style.setProperty('background', 'transparent', 'important');
+                    node.style.setProperty('background-color', 'transparent', 'important');
+                    node.style.setProperty('border-color', 'transparent', 'important');
+                    node.style.setProperty('border-left-color', 'transparent', 'important');
+                    node.style.setProperty('border-bottom-color', 'transparent', 'important');
+                    node.style.setProperty('outline', 'none', 'important');
+                    node.style.setProperty('text-shadow', 'none', 'important');
                 }}
                 syncFocusClass();
             }} catch (_error) {{}}
@@ -25816,6 +28709,7 @@ fn terminal_eval_script(
                 xtermRoot.style.position = 'relative';
                 xtermRoot.style.overflow = 'hidden';
             }}
+            applyNonSelectableSurfaceContract();
             if (helpers) {{
                 helpers.style.position = 'absolute';
                 helpers.style.inset = '0';
@@ -25824,12 +28718,7 @@ fn terminal_eval_script(
                 helpers.style.pointerEvents = 'none';
             }}
             if (helperTextarea) {{
-                helperTextarea.style.position = 'absolute';
-                helperTextarea.style.top = '0px';
-                helperTextarea.style.left = '0px';
-                helperTextarea.style.width = '1px';
-                helperTextarea.style.height = '1px';
-                helperTextarea.style.opacity = '0';
+                enforceHelperTextareaContract();
                 helperTextarea.addEventListener('focus', syncFocusClass, true);
                 helperTextarea.addEventListener('blur', syncFocusClass, true);
             }}
@@ -25852,10 +28741,12 @@ fn terminal_eval_script(
                 rowsLayer.style.width = '100%';
                 rowsLayer.style.height = '100%';
             }}
+            normalizeLowContrastGlyphs();
             syncCursorOverlay();
         }};
         stretchXtermRoot();
         let paintCount = 0;
+        let lastPaintKey = '';
         let rebuildAttempts = 0;
         const emitPaint = () => {{
             const xtermRoot = host.querySelector('.xterm');
@@ -25868,20 +28759,34 @@ fn terminal_eval_script(
                 || Boolean(screen)
                 || Boolean(viewport)
                 || Boolean(rowsLayer);
+            normalizeLowContrastGlyphs();
             if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
                 window.__yggtermXtermHosts[hostId].paintCount = paintCount + 1;
                 window.__yggtermXtermHosts[hostId].lastVisiblePaint = visible;
             }}
-            dioxus.send({{
-                kind: "paint",
-                child_count: host.childElementCount,
-                xterm_present: Boolean(xtermRoot),
-                screen_present: Boolean(screen),
-                viewport_present: Boolean(viewport),
-                rows_present: Boolean(rowsLayer),
-                cols: term.cols,
-                rows: term.rows,
-            }});
+            const nextPaintKey = JSON.stringify([
+                host.childElementCount,
+                visible,
+                Boolean(xtermRoot),
+                Boolean(screen),
+                Boolean(viewport),
+                Boolean(rowsLayer),
+                Number(term.cols || 0),
+                Number(term.rows || 0),
+            ]);
+            if (nextPaintKey !== lastPaintKey) {{
+                lastPaintKey = nextPaintKey;
+                dioxus.send({{
+                    kind: "paint",
+                    child_count: host.childElementCount,
+                    xterm_present: Boolean(xtermRoot),
+                    screen_present: Boolean(screen),
+                    viewport_present: Boolean(viewport),
+                    rows_present: Boolean(rowsLayer),
+                    cols: term.cols,
+                    rows: term.rows,
+                }});
+            }}
             paintCount += 1;
             return visible;
         }};
@@ -25899,6 +28804,15 @@ fn terminal_eval_script(
             }} catch (_error) {{}}
             return 'unknown';
         }};
+        const terminalOwnsWheelInput = () => {{
+            try {{
+                const modes = term && term.modes ? term.modes : null;
+                const tracking = modes ? String(modes.mouseTrackingMode || '') : '';
+                return currentBufferKind() === 'alternate' || (tracking && tracking !== 'none');
+            }} catch (_error) {{
+                return false;
+            }}
+        }};
         const forceTerminalRepaint = (reason) => {{
             try {{
                 if (typeof term.clearTextureAtlas === 'function') {{
@@ -25912,6 +28826,7 @@ fn terminal_eval_script(
             }} catch (_error) {{}}
             requestAnimationFrame(() => {{
                 emitPaint();
+                enforceHelperTextareaContract();
                 scheduleCursorOverlaySync();
                 emitHostHealth();
             }});
@@ -25999,6 +28914,7 @@ fn terminal_eval_script(
             if (!inputEnabled) {{
                 return;
             }}
+            enforceHelperTextareaContract();
             try {{
                 term.focus();
             }} catch (_error) {{}}
@@ -26019,6 +28935,7 @@ fn terminal_eval_script(
         }};
         const setInputEnabled = (enabled, focus) => {{
             inputEnabled = Boolean(enabled);
+            programmaticFocusEnabled = inputEnabled && Boolean(focus);
             try {{
                 term.options.disableStdin = !inputEnabled;
             }} catch (_error) {{}}
@@ -26041,6 +28958,7 @@ fn terminal_eval_script(
                 }} catch (_error) {{}}
                 return;
             }}
+            ensureVisibleHost('set_input_enabled');
             scrollLiveCursorIntoView();
             requestVisiblePaint();
             if (focus) {{
@@ -26051,6 +28969,9 @@ fn terminal_eval_script(
         }};
         const shouldHandleWheel = (event) => {{
             if (!event || !inputEnabled) {{
+                return false;
+            }}
+            if (terminalOwnsWheelInput()) {{
                 return false;
             }}
             const target = event.target;
@@ -26078,6 +28999,9 @@ fn terminal_eval_script(
             event.stopPropagation();
         }};
         term.attachCustomWheelEventHandler((event) => {{
+            if (terminalOwnsWheelInput()) {{
+                return true;
+            }}
             if (!shouldHandleWheel(event)) {{
                 return true;
             }}
@@ -26085,7 +29009,7 @@ fn terminal_eval_script(
             return false;
         }});
         const handleHostPointerFocus = () => {{
-            window.requestAnimationFrame(() => focusTerminal());
+            window.requestAnimationFrame(() => setInputEnabled(true, true));
         }};
         const liveCursorNearBottom = () => {{
             try {{
@@ -26236,13 +29160,13 @@ fn terminal_eval_script(
             message: `constructed host=${{hostId}} cols=${{term.cols}} rows=${{term.rows}}`
         }});
         trackTerminalVisualState('constructed');
-        setInputEnabled(inputEnabled, inputEnabled);
+        setInputEnabled(inputEnabled, programmaticFocusEnabled);
         const scheduleResizeNudges = () => {{
             [140, 420, 900, 1600].forEach((delayMs) => {{
                 window.setTimeout(() => {{
                     emitResize();
                     requestVisiblePaint();
-                    if (inputEnabled) {{
+                    if (inputEnabled && programmaticFocusEnabled) {{
                         focusTerminal();
                     }}
                     if (delayMs >= 420) {{
@@ -26359,6 +29283,7 @@ fn terminal_eval_script(
             if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
                 window.__yggtermXtermHosts[hostId].renderEventCount = renderEventCount;
             }}
+            enforceHelperTextareaContract();
             trackTerminalVisualState('render');
             scheduleCursorOverlaySync();
             emitPaint();
@@ -26835,6 +29760,31 @@ fn terminal_set_input_enabled_script(host_id: &str, enabled: bool, focus: bool) 
         focus = if focus { "true" } else { "false" },
     )
 }
+fn terminal_set_input_enabled_script_for_session(
+    session_path: &str,
+    enabled: bool,
+    focus: bool,
+) -> String {
+    format!(
+        r#"
+        (() => {{
+          const sessionPath = {session_path:?};
+          const registry = window.__yggtermXtermHosts || {{}};
+          const entries = Object.values(registry)
+            .filter((entry) => entry && entry.sessionPath === sessionPath && typeof entry.setInputEnabled === "function")
+            .sort((a, b) => (b.mountedAt || 0) - (a.mountedAt || 0));
+          for (const entry of entries) {{
+            try {{
+              entry.setInputEnabled({enabled}, {focus});
+            }} catch (_error) {{}}
+          }}
+        }})();
+        "#,
+        session_path = session_path,
+        enabled = if enabled { "true" } else { "false" },
+        focus = if focus { "true" } else { "false" },
+    )
+}
 fn terminal_apply_script_for_session(session_path: &str, theme: &TerminalTheme) -> String {
     let session_path =
         serde_json::to_string(session_path).expect("serialize terminal session path");
@@ -27121,6 +30071,7 @@ fn RightRail(
     on_endpoint_change: EventHandler<String>,
     on_api_key_change: EventHandler<String>,
     on_model_change: EventHandler<String>,
+    on_focus_input: EventHandler<()>,
     on_set_ui_theme: EventHandler<UiTheme>,
     on_open_theme_editor: EventHandler<MouseEvent>,
     on_set_notification_delivery: EventHandler<NotificationDeliveryMode>,
@@ -27149,6 +30100,7 @@ fn RightRail(
                     on_endpoint_change,
                     on_api_key_change,
                     on_model_change,
+                    on_focus_input,
                     on_set_ui_theme,
                     on_open_theme_editor,
                     on_set_notification_delivery,
@@ -27213,6 +30165,7 @@ fn SettingsRailBody(
     on_endpoint_change: EventHandler<String>,
     on_api_key_change: EventHandler<String>,
     on_model_change: EventHandler<String>,
+    on_focus_input: EventHandler<()>,
     on_set_ui_theme: EventHandler<UiTheme>,
     on_open_theme_editor: EventHandler<MouseEvent>,
     on_set_notification_delivery: EventHandler<NotificationDeliveryMode>,
@@ -27264,27 +30217,36 @@ fn SettingsRailBody(
                 palette: snapshot.palette,
             }
             SettingsField {
+                field_key: "litellm-endpoint".to_string(),
                 label: "LiteLLM Endpoint".to_string(),
                 value: snapshot.settings.litellm_endpoint.clone(),
                 placeholder: "https://litellm.example/v1".to_string(),
                 secret: false,
+                autofocus: false,
                 palette: snapshot.palette,
+                on_focus_input: on_focus_input.clone(),
                 on_change: on_endpoint_change,
             }
             SettingsField {
+                field_key: "litellm-api-key".to_string(),
                 label: "API Key".to_string(),
                 value: snapshot.settings.litellm_api_key.clone(),
                 placeholder: "sk-...".to_string(),
                 secret: true,
+                autofocus: false,
                 palette: snapshot.palette,
+                on_focus_input: on_focus_input.clone(),
                 on_change: on_api_key_change,
             }
             SettingsField {
+                field_key: "interface-llm".to_string(),
                 label: "Interface LLM".to_string(),
                 value: snapshot.settings.interface_llm_model.clone(),
                 placeholder: "openai/gpt-5.4-mini".to_string(),
                 secret: false,
+                autofocus: false,
                 palette: snapshot.palette,
+                on_focus_input: on_focus_input,
                 on_change: on_model_change,
             }
             ThemeSettingsSection {
@@ -27513,6 +30475,9 @@ fn ConnectRailBody(
                          font-size:12px; outline:none; box-shadow: inset 0 1px 0 rgba(255,255,255,0.55);",
                         snapshot.palette.border, snapshot.palette.panel, snapshot.palette.text
                     ),
+                    onmousedown: |evt| evt.stop_propagation(),
+                    onclick: |evt| evt.stop_propagation(),
+                    onkeydown: |evt| evt.stop_propagation(),
                     oninput: move |evt| on_ssh_target_change.call(evt.value()),
                 }
             }
@@ -27535,6 +30500,9 @@ fn ConnectRailBody(
                          font-size:12px; outline:none; box-shadow: inset 0 1px 0 rgba(255,255,255,0.55);",
                         snapshot.palette.border, snapshot.palette.panel, snapshot.palette.text
                     ),
+                    onmousedown: |evt| evt.stop_propagation(),
+                    onclick: |evt| evt.stop_propagation(),
+                    onkeydown: |evt| evt.stop_propagation(),
                     oninput: move |evt| on_ssh_prefix_change.call(evt.value()),
                 }
             }
@@ -27578,7 +30546,7 @@ fn ContextMenuOverlay(
     on_move_selected_document_here: EventHandler<MouseEvent>,
     on_create_note: EventHandler<MouseEvent>,
     on_create_recipe: EventHandler<MouseEvent>,
-    on_regenerate: EventHandler<MouseEvent>,
+    on_rename_session: EventHandler<MouseEvent>,
     on_refresh_remote_machine: EventHandler<MouseEvent>,
     on_remove_ssh_target: EventHandler<MouseEvent>,
     on_delete_item: EventHandler<MouseEvent>,
@@ -27612,6 +30580,7 @@ fn ContextMenuOverlay(
             style: "position:fixed; inset:0; z-index:90; background:transparent;",
             onclick: move |evt| on_close.call(evt),
             div {
+                "data-context-menu": "1",
                 style: format!(
                     "position:absolute; {}; min-width:188px; max-width:220px; max-height:calc(100vh - 24px); overflow:auto; padding:6px; border-radius:10px; \
                      background:rgba(248,249,252,0.98); box-shadow: 0 18px 38px rgba(57,78,98,0.18), inset 0 0 0 1px rgba(214,220,228,0.9); \
@@ -27628,8 +30597,17 @@ fn ContextMenuOverlay(
                 }
                 if is_remote_machine_group_row(&row) {
                     button {
+                        "data-context-menu-action": "refresh-remote-sessions",
                         style: context_menu_action_style(palette, false),
-                        onclick: move |evt| on_refresh_remote_machine.call(evt),
+                        onmousedown: |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                        },
+                        onclick: move |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                            on_refresh_remote_machine.call(evt);
+                        },
                         "Refresh Remote Sessions"
                     }
                     if can_remove_saved_ssh_target {
@@ -27637,64 +30615,152 @@ fn ContextMenuOverlay(
                             style: format!("height:1px; margin:6px 4px; background:{}; opacity:0.7;", palette.border),
                         }
                         button {
+                            "data-context-menu-action": "delete",
                             style: context_menu_action_style_destructive(palette),
-                            onclick: move |evt| on_remove_ssh_target.call(evt),
+                            onmousedown: |evt| {
+                                evt.prevent_default();
+                                evt.stop_propagation();
+                            },
+                            onclick: move |evt| {
+                                evt.prevent_default();
+                                evt.stop_propagation();
+                                on_remove_ssh_target.call(evt);
+                            },
                             "Delete…"
                         }
                     }
                 } else if can_create_in_context {
                     if can_move_selected_document {
                         button {
+                            "data-context-menu-action": "move-selected-here",
                             style: context_menu_action_style(palette, true),
-                            onclick: move |evt| on_move_selected_document_here.call(evt),
+                            onmousedown: |evt| {
+                                evt.prevent_default();
+                                evt.stop_propagation();
+                            },
+                            onclick: move |evt| {
+                                evt.prevent_default();
+                                evt.stop_propagation();
+                                on_move_selected_document_here.call(evt);
+                            },
                             "Move Selected Here"
                         }
                     }
                     button {
+                        "data-context-menu-action": "add-folder",
                         style: context_menu_action_style(palette, false),
-                        onclick: move |evt| on_create_group.call(evt),
+                        onmousedown: |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                        },
+                        onclick: move |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                            on_create_group.call(evt);
+                        },
                         "Add Folder"
                     }
                     button {
+                        "data-context-menu-action": "new-session",
                         style: context_menu_action_style(palette, false),
-                        onclick: move |evt| on_create_group_codex.call(evt),
+                        onmousedown: |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                        },
+                        onclick: move |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                            on_create_group_codex.call(evt);
+                        },
                         "New Session"
                     }
                     button {
+                        "data-context-menu-action": "new-terminal",
                         style: context_menu_action_style(palette, false),
-                        onclick: move |evt| on_create_group_shell.call(evt),
+                        onmousedown: |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                        },
+                        onclick: move |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                            on_create_group_shell.call(evt);
+                        },
                         "New Terminal"
                     }
                     button {
+                        "data-context-menu-action": "new-paper",
                         style: context_menu_action_style(palette, true),
-                        onclick: move |evt| on_create_group_document.call(evt),
+                        onmousedown: |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                        },
+                        onclick: move |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                            on_create_group_document.call(evt);
+                        },
                         "New Paper"
                     }
                     div {
                         style: format!("height:1px; margin:6px 4px; background:{}; opacity:0.7;", palette.border),
                     }
                     button {
+                        "data-context-menu-action": "add-separator",
                         style: context_menu_action_style(palette, false),
-                        onclick: move |evt| on_create_group_recipe.call(evt),
+                        onmousedown: |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                        },
+                        onclick: move |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                            on_create_group_recipe.call(evt);
+                        },
                         "Add Separator"
                     }
                 } else if row.kind == BrowserRowKind::Session {
                     button {
+                        "data-context-menu-action": "rename-session",
                         style: context_menu_action_style(palette, false),
-                        onclick: move |evt| on_create_note.call(evt),
+                        onmousedown: |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                        },
+                        onclick: move |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                            on_rename_session.call(evt);
+                        },
+                        "Rename Session"
+                    }
+                    button {
+                        "data-context-menu-action": "new-paper",
+                        style: context_menu_action_style(palette, false),
+                        onmousedown: |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                        },
+                        onclick: move |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                            on_create_note.call(evt);
+                        },
                         "New Paper"
                     }
                     button {
+                        "data-context-menu-action": "new-terminal-plan",
                         style: context_menu_action_style(palette, false),
-                        onclick: move |evt| on_create_recipe.call(evt),
+                        onmousedown: |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                        },
+                        onclick: move |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                            on_create_recipe.call(evt);
+                        },
                         "New Terminal Plan"
-                    }
-                }
-                if is_local_stored_session_row(&row) {
-                    button {
-                        style: context_menu_action_style(palette, true),
-                        onclick: move |evt| on_regenerate.call(evt),
-                        "Regenerate Title"
                     }
                 }
                 if is_workspace_row(&row) {
@@ -27702,8 +30768,17 @@ fn ContextMenuOverlay(
                         style: format!("height:1px; margin:6px 4px; background:{}; opacity:0.7;", palette.border),
                     }
                     button {
+                        "data-context-menu-action": "delete",
                         style: context_menu_action_style_destructive(palette),
-                        onclick: move |evt| on_delete_item.call(evt),
+                        onmousedown: |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                        },
+                        onclick: move |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                            on_delete_item.call(evt);
+                        },
                         "Delete…"
                     }
                 }
@@ -27850,12 +30925,14 @@ fn ThemeEditorOverlay(
     };
     rsx! {
         div {
+            "data-theme-editor-overlay": "1",
             style: format!(
                 "position:fixed; inset:0; z-index:98; display:flex; align-items:center; justify-content:center; background:{};",
                 overlay_wash
             ),
             onclick: move |evt| on_close.call(evt),
             div {
+                "data-theme-editor-shell": "1",
                 style: format!(
                     "width:min(460px, calc(100vw - 44px)); display:flex; flex-direction:column; gap:14px; padding:14px; \
                      border-radius:22px; background:{}; color:{}; \
@@ -28006,6 +31083,7 @@ fn ThemeEditorOverlay(
                             div {
                                 style: "display:flex; align-items:center; gap:8px;",
                                 ThemeDialogButton {
+                                    data_action: None,
                                     primary: false,
                                     enabled: true,
                                     palette: snapshot.palette,
@@ -28015,6 +31093,7 @@ fn ThemeEditorOverlay(
                                     "Add Stop"
                                 }
                                 ThemeDialogButton {
+                                    data_action: None,
                                     primary: false,
                                     enabled: snapshot.theme_editor_selected_stop.is_some(),
                                     palette: snapshot.palette,
@@ -28198,6 +31277,7 @@ fn ThemeEditorOverlay(
                         style: "display:flex; align-items:center; gap:8px;",
                         if !preview_has_stops {
                             ThemeDialogButton {
+                                data_action: Some("seed".to_string()),
                                 primary: false,
                                 enabled: true,
                                 palette: snapshot.palette,
@@ -28208,6 +31288,7 @@ fn ThemeEditorOverlay(
                             }
                         }
                         ThemeDialogButton {
+                            data_action: Some("reset".to_string()),
                             primary: false,
                             enabled: true,
                             palette: snapshot.palette,
@@ -28217,6 +31298,7 @@ fn ThemeEditorOverlay(
                             "Reset to Base"
                         }
                         ThemeDialogButton {
+                            data_action: Some("apply".to_string()),
                             primary: true,
                             enabled: true,
                             palette: snapshot.palette,
@@ -28233,6 +31315,7 @@ fn ThemeEditorOverlay(
 }
 #[component]
 fn ThemeDialogButton(
+    data_action: Option<String>,
     primary: bool,
     enabled: bool,
     palette: Palette,
@@ -28246,8 +31329,10 @@ fn ThemeDialogButton(
     } else {
         theme_editor_action_button_style(palette, &accent, enabled, false)
     };
+    let action_attr = data_action.unwrap_or_default();
     rsx! {
         button {
+            "data-theme-editor-action": "{action_attr}",
             disabled: !enabled,
             style: style,
             onclick: move |evt| {
@@ -28277,11 +31362,14 @@ fn normalize_theme_editor_axis(value: f64) -> f32 {
 }
 #[component]
 fn SettingsField(
+    field_key: String,
     label: String,
     value: String,
     placeholder: String,
     secret: bool,
+    autofocus: bool,
     palette: Palette,
+    on_focus_input: EventHandler<()>,
     on_change: EventHandler<String>,
 ) -> Element {
     rsx! {
@@ -28292,10 +31380,29 @@ fn SettingsField(
                 "{label}"
             }
             input {
+                "data-settings-field-key": "{field_key}",
                 r#type: if secret { "password" } else { "text" },
                 value: "{value}",
                 placeholder: "{placeholder}",
                 style: settings_input_style(palette),
+                onmounted: move |evt| async move {
+                    if autofocus {
+                        let _ = evt.set_focus(true).await;
+                    }
+                },
+                onmousedown: move |evt| {
+                    evt.stop_propagation();
+                    on_focus_input.call(());
+                },
+                onclick: move |evt| {
+                    evt.stop_propagation();
+                    on_focus_input.call(());
+                },
+                onfocus: move |_| on_focus_input.call(()),
+                onkeydown: move |evt| {
+                    evt.stop_propagation();
+                    on_focus_input.call(());
+                },
                 oninput: move |evt| on_change.call(evt.value()),
             }
         }
@@ -28366,6 +31473,7 @@ fn ThemeSettingsSection(
                     }
                 }
                 button {
+                    "data-theme-editor-open-button": "1",
                     style: format!(
                         "display:flex; align-items:center; justify-content:space-between; height:34px; padding:0 12px; \
                          border:none; border-radius:11px; background:{}; color:{}; \
@@ -28730,8 +31838,8 @@ fn palette(theme: UiTheme) -> Palette {
             gradient: "linear-gradient(180deg, rgba(232,243,248,0.94) 0%, rgba(232,244,238,0.90) 48%, rgba(237,240,244,0.94) 100%)",
             close_hover: "#e81123",
             control_hover: "rgba(36,48,58,0.10)",
-            shadow: "0 24px 52px rgba(72,102,118,0.16)",
-            panel_shadow: "0 18px 44px rgba(69,108,136,0.18)",
+            shadow: "0 14px 30px rgba(72,102,118,0.10)",
+            panel_shadow: "0 10px 24px rgba(69,108,136,0.10)",
         },
         UiTheme::ZedDark => Palette {
             shell: "rgba(39,46,52,0.95)",
@@ -28748,8 +31856,8 @@ fn palette(theme: UiTheme) -> Palette {
             gradient: "linear-gradient(180deg, rgba(56,79,91,0.94) 0%, rgba(55,88,79,0.90) 54%, rgba(39,46,52,0.96) 100%)",
             close_hover: "#e81123",
             control_hover: "rgba(255,255,255,0.10)",
-            shadow: "0 26px 72px rgba(0,0,0,0.38)",
-            panel_shadow: "0 22px 52px rgba(0,0,0,0.28)",
+            shadow: "0 16px 38px rgba(0,0,0,0.24)",
+            panel_shadow: "0 12px 28px rgba(0,0,0,0.18)",
         },
     }
 }
@@ -28806,17 +31914,19 @@ fn shell_style(
     let frame_inset = if maximized { 0.0 } else { SHELL_FRAME_INSET_PX };
     let frame_outline = if maximized {
         "none".to_string()
+    } else if palette_is_dark(palette) {
+        "0 0 0 1px rgba(86,108,129,0.32)".to_string()
     } else {
-        "inset 0 0 0 1px rgba(214,222,232,0.72)".to_string()
+        "0 0 0 1px rgba(206,218,229,0.58)".to_string()
     };
     let box_shadow = if frame_outline == "none" {
         palette.shadow.to_string()
     } else {
-        format!("{}, {}", palette.shadow, frame_outline)
+        format!("{}, {}", frame_outline, palette.shadow)
     };
     format!(
         "position:absolute; inset:{}px; display:flex; flex-direction:column; overflow:hidden; \
-         border-radius:{}px; background-color:{}; background-image:{}; box-shadow:{}; backdrop-filter:{}; \
+         border-radius:{}px; background-color:{}; background-image:{}; box-shadow:{}; background-clip:padding-box; backdrop-filter:{}; \
          -webkit-backdrop-filter:{}; font-family:{};",
         frame_inset,
         radius,
@@ -28833,7 +31943,7 @@ fn sync_window_frame_state(shell: &mut ShellState) {
 }
 fn icon_button_style(palette: Palette) -> String {
     format!(
-        "width:28px; height:28px; border:none; border-radius:8px; background:{}; color:{}; font-size:13px; \
+        "width:26px; height:26px; border:none; border-radius:8px; background:{}; color:{}; font-size:13px; \
          box-shadow: inset 0 0 0 1px {}; user-select:none; -webkit-user-select:none; pointer-events:auto;",
         chrome_chip_fill(palette, false),
         chrome_chip_text_color(palette, false, false),
@@ -28845,7 +31955,7 @@ fn utility_icon_style(palette: Palette, selected: bool) -> String {
 }
 fn utility_icon_style_sized(palette: Palette, selected: bool, font_size_px: u8) -> String {
     format!(
-        "width:28px; height:28px; border:none; border-radius:10px; background:{}; color:{}; font-size:{}px; font-weight:{}; \
+        "width:26px; height:26px; border:none; border-radius:9px; background:{}; color:{}; font-size:{}px; font-weight:{}; \
          box-shadow: inset 0 0 0 1px {}; user-select:none; -webkit-user-select:none; pointer-events:auto;",
         chrome_chip_fill(palette, selected),
         if selected {
@@ -28881,7 +31991,7 @@ fn connect_button_style(palette: Palette, selected: bool) -> String {
         "rgba(9, 105, 218, 0.32)".to_string()
     };
     format!(
-        "height:28px; padding:0 11px; border:none; border-radius:10px; background:{}; color:{}; \
+        "height:26px; padding:0 11px; border:none; border-radius:10px; background:{}; color:{}; \
          font-size:11px; font-weight:700; white-space:nowrap; user-select:none; -webkit-user-select:none; pointer-events:auto; \
          box-shadow: inset 0 0 0 1px {};",
         fill, text, border
@@ -28912,12 +32022,41 @@ fn chip_style(palette: Palette, selected: bool) -> String {
         }
     )
 }
-fn titlebar_new_action_style(palette: Palette) -> String {
+fn titlebar_new_action_style(_palette: Palette) -> String {
     format!(
         "display:flex; align-items:center; width:100%; height:30px; border:none; border-radius:10px; padding:0 10px; \
-         background:transparent; color:{}; font-size:11px; font-weight:700; text-align:left; cursor:pointer; \
-         white-space:nowrap;",
-        palette.text
+         background:{}; color:{}; font-size:11px; font-weight:700; text-align:left; cursor:pointer; \
+         white-space:nowrap; box-shadow:{};",
+        "rgb(255,255,255)",
+        "#18222d",
+        "inset 0 0 0 1px rgba(214,223,232,0.92), 0 1px 2px rgba(15,23,42,0.08)",
+    )
+}
+fn titlebar_modal_action_style(_palette: Palette) -> String {
+    format!(
+        "display:inline-flex; align-items:center; justify-content:center; flex:0 1 134px; min-width:134px; max-width:100%; height:31px; padding:0 13px; border:none; border-radius:10px; \
+         background:{}; color:{}; font-size:11.5px; font-weight:700; text-align:center; cursor:pointer; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; box-shadow:{}; box-sizing:border-box;",
+        "rgb(255,255,255)",
+        "#18222d",
+        "inset 0 0 0 1px rgba(214,223,232,0.92), 0 1px 2px rgba(15,23,42,0.08)",
+    )
+}
+fn rename_ai_action_button_style(palette: Palette) -> String {
+    format!(
+        "display:inline-flex; align-items:center; justify-content:center; width:26px; height:26px; \
+         border:none; border-radius:9px; background:rgba(255,255,255,0.96); color:{}; \
+         box-shadow:inset 0 0 0 1px rgba(204,214,224,0.94), 0 1px 2px rgba(15,23,42,0.08); \
+         padding:0; flex:0 0 auto; cursor:pointer;",
+        palette.accent
+    )
+}
+fn titlebar_modal_icon_button_style(palette: Palette) -> String {
+    format!(
+        "display:inline-flex; align-items:center; justify-content:center; width:24px; height:24px; \
+         border:none; border-radius:9px; background:rgba(255,255,255,0.96); color:{}; \
+         box-shadow:inset 0 0 0 1px rgba(214,223,232,0.92), 0 1px 2px rgba(15,23,42,0.08); \
+         padding:0; flex:0 0 auto; cursor:pointer;",
+        palette.accent
     )
 }
 fn theme_editor_action_button_style(
@@ -29295,7 +32434,7 @@ mod tests {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
         assert!(script.contains("fontSize: 13"));
-        assert!(script.contains("lineHeight: 1.12"));
+        assert!(script.contains("lineHeight: 1"));
         assert!(script.contains("brightWhite"));
     }
     #[test]
@@ -29307,7 +32446,13 @@ mod tests {
         assert!(script.contains("const setInputEnabled = (enabled, focus) => {"));
         assert!(script.contains("host.addEventListener(\"wheel\", handleWheel"));
         assert!(script.contains("host.addEventListener(\"pointerdown\", handleHostPointerFocus"));
-        assert!(script.contains("setInputEnabled(inputEnabled, inputEnabled);"));
+        assert!(script.contains("let programmaticFocusEnabled = Boolean(true);"));
+        assert!(script.contains("programmaticFocusEnabled = inputEnabled && Boolean(focus);"));
+        assert!(
+            script.contains("window.requestAnimationFrame(() => setInputEnabled(true, true));")
+        );
+        assert!(script.contains("setInputEnabled(inputEnabled, programmaticFocusEnabled);"));
+        assert!(script.contains("if (inputEnabled && programmaticFocusEnabled) {"));
     }
     #[test]
     fn terminal_eval_script_waits_for_host_mount_before_giving_up() {
@@ -29316,6 +32461,258 @@ mod tests {
         assert!(script.contains("mounted on retry"));
         assert!(script.contains("after retries"));
         assert!(script.contains("await sleep(25)"));
+    }
+
+    #[test]
+    fn terminal_initial_programmatic_focus_only_grants_active_non_remote_terminal() {
+        assert!(terminal_initial_programmatic_focus(
+            WorkspaceViewMode::Terminal,
+            Some("local://shell"),
+            "local://shell",
+            false,
+            RightPanelMode::Hidden,
+            false,
+            false,
+            false,
+        ));
+        assert!(terminal_initial_programmatic_focus(
+            WorkspaceViewMode::Terminal,
+            Some("local://shell"),
+            "local://shell",
+            false,
+            RightPanelMode::Metadata,
+            false,
+            false,
+            false,
+        ));
+        assert!(!terminal_initial_programmatic_focus(
+            WorkspaceViewMode::Rendered,
+            Some("local://shell"),
+            "local://shell",
+            false,
+            RightPanelMode::Hidden,
+            false,
+            false,
+            false,
+        ));
+        assert!(!terminal_initial_programmatic_focus(
+            WorkspaceViewMode::Terminal,
+            Some("local://other"),
+            "local://shell",
+            false,
+            RightPanelMode::Hidden,
+            false,
+            false,
+            false,
+        ));
+        assert!(!terminal_initial_programmatic_focus(
+            WorkspaceViewMode::Terminal,
+            Some("remote-session://oc/123"),
+            "remote-session://oc/123",
+            true,
+            RightPanelMode::Hidden,
+            false,
+            false,
+            false,
+        ));
+        assert!(!terminal_initial_programmatic_focus(
+            WorkspaceViewMode::Terminal,
+            Some("local://shell"),
+            "local://shell",
+            false,
+            RightPanelMode::Settings,
+            false,
+            false,
+            false,
+        ));
+        assert!(!terminal_initial_programmatic_focus(
+            WorkspaceViewMode::Terminal,
+            Some("local://shell"),
+            "local://shell",
+            false,
+            RightPanelMode::Hidden,
+            true,
+            false,
+            false,
+        ));
+        assert!(!terminal_initial_programmatic_focus(
+            WorkspaceViewMode::Terminal,
+            Some("local://shell"),
+            "local://shell",
+            false,
+            RightPanelMode::Hidden,
+            false,
+            true,
+            false,
+        ));
+    }
+    #[test]
+    fn terminal_should_accept_input_keeps_active_terminal_live_with_settings_open() {
+        assert!(terminal_should_accept_input(
+            WorkspaceViewMode::Terminal,
+            Some("local://shell"),
+            "local://shell",
+            false,
+            false,
+            false,
+        ));
+        assert!(terminal_should_accept_input(
+            WorkspaceViewMode::Terminal,
+            Some("local://shell"),
+            "local://shell",
+            false,
+            false,
+            false,
+        ));
+        assert!(!terminal_should_accept_input(
+            WorkspaceViewMode::Rendered,
+            Some("local://shell"),
+            "local://shell",
+            false,
+            false,
+            false,
+        ));
+        assert!(!terminal_should_accept_input(
+            WorkspaceViewMode::Terminal,
+            Some("local://other"),
+            "local://shell",
+            false,
+            false,
+            false,
+        ));
+        assert!(!terminal_should_accept_input(
+            WorkspaceViewMode::Terminal,
+            Some("local://shell"),
+            "local://shell",
+            true,
+            false,
+            false,
+        ));
+        assert!(!terminal_should_accept_input(
+            WorkspaceViewMode::Terminal,
+            Some("local://shell"),
+            "local://shell",
+            false,
+            true,
+            false,
+        ));
+        assert!(!terminal_initial_programmatic_focus(
+            WorkspaceViewMode::Terminal,
+            Some("local://shell"),
+            "local://shell",
+            false,
+            RightPanelMode::Settings,
+            false,
+            false,
+            false,
+        ));
+        assert!(!terminal_should_accept_input(
+            WorkspaceViewMode::Terminal,
+            Some("local://shell"),
+            "local://shell",
+            false,
+            false,
+            true,
+        ));
+    }
+    #[test]
+    fn terminal_runtime_input_policy_keeps_terminal_live_with_passive_side_rails() {
+        assert_eq!(
+            terminal_runtime_input_policy(
+                WorkspaceViewMode::Terminal,
+                Some("local://shell"),
+                "local://shell",
+                RightPanelMode::Metadata,
+                false,
+                false,
+                false,
+                false,
+            ),
+            (true, true)
+        );
+        assert_eq!(
+            terminal_runtime_input_policy(
+                WorkspaceViewMode::Terminal,
+                Some("local://shell"),
+                "local://shell",
+                RightPanelMode::Notifications,
+                false,
+                false,
+                false,
+                false,
+            ),
+            (true, true)
+        );
+    }
+    #[test]
+    fn terminal_runtime_input_policy_only_requires_viewport_override_for_focusable_side_rails() {
+        assert_eq!(
+            terminal_runtime_input_policy(
+                WorkspaceViewMode::Terminal,
+                Some("local://shell"),
+                "local://shell",
+                RightPanelMode::Settings,
+                false,
+                false,
+                false,
+                false,
+            ),
+            (false, false)
+        );
+        assert_eq!(
+            terminal_runtime_input_policy(
+                WorkspaceViewMode::Terminal,
+                Some("local://shell"),
+                "local://shell",
+                RightPanelMode::Settings,
+                false,
+                false,
+                false,
+                true,
+            ),
+            (true, true)
+        );
+        assert_eq!(
+            terminal_runtime_input_policy(
+                WorkspaceViewMode::Terminal,
+                Some("local://shell"),
+                "local://shell",
+                RightPanelMode::Connect,
+                false,
+                false,
+                false,
+                false,
+            ),
+            (false, false)
+        );
+        assert_eq!(
+            terminal_runtime_input_policy(
+                WorkspaceViewMode::Terminal,
+                Some("local://shell"),
+                "local://shell",
+                RightPanelMode::Settings,
+                true,
+                false,
+                false,
+                true,
+            ),
+            (false, false)
+        );
+    }
+    #[test]
+    fn terminal_input_override_defaults_to_settings_panel_only() {
+        assert!(terminal_input_override_for_right_panel_mode(
+            RightPanelMode::Settings
+        ));
+        assert!(!terminal_input_override_for_right_panel_mode(
+            RightPanelMode::Hidden
+        ));
+        assert!(!terminal_input_override_for_right_panel_mode(
+            RightPanelMode::Metadata
+        ));
+        assert!(!terminal_input_override_for_right_panel_mode(
+            RightPanelMode::Connect
+        ));
     }
     #[test]
     fn terminal_eval_script_declares_sync_focus_before_stretch_root_uses_it() {
@@ -29342,6 +32739,36 @@ mod tests {
         assert!(script.contains("brightBlack"));
     }
     #[test]
+    fn terminal_eval_script_rebuilds_blank_retained_host_when_reenabled() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        let set_input_ix = script
+            .find("const setInputEnabled = (enabled, focus) => {")
+            .expect("setInputEnabled declaration present");
+        let rebuild_ix = script[set_input_ix..]
+            .find("ensureVisibleHost('set_input_enabled');")
+            .expect("blank-host rebuild is triggered when reenabling input");
+        let request_paint_ix = script[set_input_ix..]
+            .find("requestVisiblePaint();")
+            .expect("input reenabling still requests a visible paint");
+        assert!(rebuild_ix < request_paint_ix);
+    }
+
+    #[test]
+    fn terminal_eval_script_dedupes_paint_events_before_notifying_dioxus() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(
+            script.contains("let lastPaintKey = '';"),
+            "paint dedupe key should be tracked in the runtime bridge"
+        );
+        assert!(
+            script.contains("if (nextPaintKey !== lastPaintKey) {"),
+            "paint events should only notify dioxus when the visible paint shape changes"
+        );
+    }
+
+    #[test]
     fn terminal_apply_script_enforces_monospace_rendering_contract() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
@@ -29351,11 +32778,33 @@ mod tests {
         assert!(script.contains("font-synthesis: none"));
         assert!(script.contains("line-height: var(--yggterm-term-line-height)"));
         assert!(script.contains("letter-spacing: var(--yggterm-term-letter-spacing)"));
+        assert!(script.contains(".xterm-rows .xterm-cursor {"));
+        assert!(script.contains("border-left: none !important;"));
+        assert!(script.contains("-webkit-text-fill-color: transparent !important;"));
+        assert!(script.contains("var(--yggterm-term-cursor-muted)"));
+        assert!(script.contains(".yggterm-term-focused .xterm-rows .xterm-cursor {"));
         assert!(
             !script
                 .contains(".xterm .xterm-rows span {\n                    width: 100% !important;")
         );
     }
+    #[test]
+    fn terminal_eval_script_bootstraps_terminal_and_fit_assets_only() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(script.contains("injectScript(\"yggterm-xterm-script\""));
+        assert!(script.contains("injectScript(\"yggterm-xterm-fit-script\""));
+        assert!(!script.contains("CanvasAddon"));
+    }
+
+    #[test]
+    fn terminal_minimum_contrast_ratio_matches_vscode_default() {
+        let light = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let dark = terminal_theme(UiTheme::ZedDark, palette(UiTheme::ZedDark), 13.0, "");
+        assert_eq!(terminal_minimum_contrast_ratio(&light), 4.5);
+        assert_eq!(terminal_minimum_contrast_ratio(&dark), 4.5);
+    }
+
     #[test]
     fn terminal_eval_script_preserves_native_xterm_cursor_contract() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
@@ -29367,9 +32816,15 @@ mod tests {
         assert!(script.contains(
             "const rawCursorNodes = Array.from(rowsLayer.querySelectorAll('.xterm-cursor'));"
         ));
-        assert!(script.contains("node.classList.remove('yggterm-hidden-raw-cursor');"));
-        assert!(script.contains("node.style.removeProperty('background');"));
-        assert!(script.contains("node.style.removeProperty('border-color');"));
+        assert!(script.contains("node.classList.add('yggterm-hidden-raw-cursor');"));
+        assert!(script.contains(
+            "node.style.setProperty('-webkit-text-fill-color', 'transparent', 'important');"
+        ));
+        assert!(
+            script.contains(
+                "node.style.setProperty('border-left-color', 'transparent', 'important');"
+            )
+        );
         assert!(script.contains("const scheduleCursorOverlaySync = () => {"));
         assert!(script.contains("host.style.position = 'relative';"));
         assert!(!script.contains(".yggterm-cursor-overlay"));
@@ -29383,14 +32838,35 @@ mod tests {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
         assert!(script.contains(".xterm-helper-textarea"));
-        assert!(script.contains("left: -9999em !important;"));
-        assert!(script.contains("width: 0 !important;"));
-        assert!(script.contains("height: 0 !important;"));
+        assert!(script.contains("left: -10000px !important;"));
+        assert!(script.contains("width: 1px !important;"));
+        assert!(script.contains("height: 1px !important;"));
         assert!(script.contains("pointer-events: none !important;"));
+        assert!(script.contains("background: transparent !important;"));
+        assert!(script.contains("clip-path: inset(50%) !important;"));
+        assert!(script.contains("function enforceHelperTextareaContract()"));
+        assert!(
+            script.contains("helperTextarea.style.setProperty('left', '-10000px', 'important');")
+        );
+        assert!(script.contains("helperTextarea.style.setProperty('width', '1px', 'important');"));
+        assert!(
+            script.contains("helperTextarea.style.setProperty('outline', 'none', 'important');")
+        );
+        assert!(
+            script.contains(
+                "helperTextarea.style.setProperty('clip-path', 'inset(50%)', 'important');"
+            )
+        );
+        assert!(script.contains("#${hostId} .xterm-screen canvas"));
+        assert!(script.contains("user-select: none !important;"));
+        assert!(script.contains("-webkit-user-select: none !important;"));
+        assert!(script.contains("node.style.userSelect = 'none';"));
+        assert!(script.contains("node.style.webkitUserSelect = 'none';"));
         assert!(script.contains(".xterm-accessibility-tree:not(.debug) *::selection"));
         assert!(script.contains("background-color: transparent !important;"));
         assert!(script.contains("color: transparent !important;"));
     }
+
     #[test]
     fn terminal_probe_input_script_declares_keyboard_target_before_dispatch() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
@@ -29403,9 +32879,26 @@ mod tests {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
         assert!(script.contains("host.style.setProperty('--yggterm-term-dim-foreground'"));
-        assert!(script.contains(".xterm-rows .xterm-dim"));
+        assert!(script.contains(".xterm-rows {"));
+        assert!(script.contains("color: var(--yggterm-term-foreground) !important;"));
+        assert!(!script.contains(
+            ".xterm-rows > div {\n                    color: var(--yggterm-term-foreground) !important;"
+        ));
+        assert!(script.contains(".xterm-rows .xterm-dim:not([class*=\"xterm-fg-\"])"));
+        assert!(script.contains(".xterm-rows .xterm-dim[class*=\"xterm-fg-\"]"));
         assert!(script.contains("color: var(--yggterm-term-dim-foreground) !important;"));
         assert!(script.contains("opacity: 1 !important;"));
+        assert!(script.contains(
+            ".xterm-rows .xterm-dim:not([class*=\"xterm-fg-\"])[style*=\"background-color:#f0f0f2\"]"
+        ));
+        assert!(script.contains(
+            ".xterm-rows .xterm-dim:not([class*=\"xterm-fg-\"])[style*=\"background-color:#393939\"]"
+        ));
+        assert!(script.contains("function normalizeLowContrastGlyphs()"));
+        assert!(script.contains("const contrastSafeForeground = (sampleBackground) => {"));
+        assert!(script.contains(
+            "node.style.setProperty('color', contrastSafeForeground(rowBackground), 'important');"
+        ));
     }
     #[test]
     fn terminal_theme_uses_one_dark_palette_for_dark_mode() {
@@ -29419,9 +32912,37 @@ mod tests {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         assert_eq!(theme.background, "#fbfbfd");
         assert_eq!(theme.foreground, "#151b23");
+        assert_eq!(theme.cursor, "#0451a5");
+        assert_eq!(theme.red, "#a1260d");
+        assert_eq!(theme.green, "#0c6428");
+        assert_eq!(theme.yellow, "#7a4f00");
+        assert_eq!(theme.blue, "#0451a5");
+        assert_eq!(theme.magenta, "#6936aa");
+        assert_eq!(theme.cyan, "#0e6570");
         assert_eq!(theme.white, "#364152");
         assert_eq!(theme.bright_white, "#2d3642");
-        assert_eq!(theme.blue, "#0969da");
+        assert_eq!(theme.bright_green, "#0c6428");
+        assert_eq!(theme.bright_magenta, "#7340b3");
+    }
+
+    #[test]
+    fn terminal_light_palette_keeps_key_ansi_colors_readable() {
+        fn contrast_ratio(foreground: &str, background: &str) -> f32 {
+            let fg =
+                relative_terminal_luminance_from_hex(foreground).expect("foreground luminance");
+            let bg =
+                relative_terminal_luminance_from_hex(background).expect("background luminance");
+            let lighter = fg.max(bg);
+            let darker = fg.min(bg);
+            (lighter + 0.05) / (darker + 0.05)
+        }
+
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        assert!(contrast_ratio(&theme.green, &theme.background) >= 6.5);
+        assert!(contrast_ratio(&theme.yellow, &theme.background) >= 6.5);
+        assert!(contrast_ratio(&theme.blue, &theme.background) >= 6.5);
+        assert!(contrast_ratio(&theme.magenta, &theme.background) >= 6.5);
+        assert!(contrast_ratio(&theme.cyan, &theme.background) >= 6.5);
     }
     #[test]
     fn terminal_instance_key_changes_with_font_size() {
@@ -29434,9 +32955,9 @@ mod tests {
     #[test]
     fn terminal_frame_style_keeps_normal_padding_outside_distraction_free() {
         let style = terminal_frame_style(false);
-        assert_eq!(style.padding, "6px");
+        assert_eq!(style.padding, "4px");
         assert_eq!(style.shell_radius, "10px");
-        assert_eq!(style.host_radius, "8px");
+        assert_eq!(style.host_radius, "10px");
     }
     #[test]
     fn terminal_frame_style_goes_edge_to_edge_in_distraction_free_mode() {
@@ -29821,6 +33342,26 @@ mod tests {
         }
         let sorted = reachable_versioned_server_socket_candidates(&current);
         assert_eq!(sorted, vec![newest, middle, oldest]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_current_endpoint_for_spawn_removes_dangling_symlink_socket() {
+        let dir = std::env::temp_dir().join(format!(
+            "yggterm-dangling-socket-{}-{}",
+            std::process::id(),
+            current_millis()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let current = dir.join("server-2-1-5.sock");
+        let legacy = dir.join("server-2-1-4.sock");
+        std::os::unix::fs::symlink(&legacy, &current).expect("create dangling symlink");
+        let endpoint = ServerEndpoint::UnixSocket(current.clone());
+
+        prepare_current_endpoint_for_spawn(&endpoint).expect("prepare current endpoint");
+
+        assert!(!fs::symlink_metadata(&current).is_ok());
         let _ = fs::remove_dir_all(&dir);
     }
     #[test]
@@ -30695,20 +34236,94 @@ mod tests {
                 stored_preview_hydrated: true,
             }],
             &HashSet::from_iter([
+                "__live_sessions__".to_string(),
                 "local".to_string(),
                 "/home/pi".to_string(),
                 "/home/pi/gh".to_string(),
             ]),
         );
-        assert!(!rows.iter().any(|row| row.full_path == "__live_sessions__"));
-        let session_index = rows
+        assert!(rows.iter().any(|row| row.full_path == "__live_sessions__"));
+        assert!(rows.iter().any(|row| row.full_path
+            == "local://019cf672-8d68-70a1-bd8b-68487c4fc63d"
+            && row.depth == 1));
+        let local_tree_row = rows
             .iter()
-            .position(|row| row.full_path == "local://019cf672-8d68-70a1-bd8b-68487c4fc63d")
-            .expect("local live session row");
-        let session_row = &rows[session_index];
-        assert_eq!(session_row.label, "/home/pi/gh/yggterm");
-        assert_eq!(session_row.depth, 3);
-        assert_eq!(rows[session_index - 1].full_path, "/home/pi/gh");
+            .find(|row| {
+                row.full_path == "local://019cf672-8d68-70a1-bd8b-68487c4fc63d" && row.depth == 3
+            })
+            .expect("local tree live session row");
+        assert_eq!(local_tree_row.label, "/home/pi/gh/yggterm");
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.full_path == "local://019cf672-8d68-70a1-bd8b-68487c4fc63d")
+                .count(),
+            2
+        );
+    }
+    #[test]
+    fn merged_sidebar_rows_promote_retained_stored_codex_sessions_into_live_group() {
+        let stored_path = "/home/pi/.codex/sessions/example.jsonl".to_string();
+        let rows = merged_sidebar_rows(
+            &[BrowserRow {
+                kind: BrowserRowKind::Session,
+                full_path: stored_path.clone(),
+                label: "Example Codex".to_string(),
+                detail_label: String::new(),
+                document_kind: None,
+                group_kind: None,
+                session_title: Some("Example Codex".to_string()),
+                depth: 1,
+                host_label: "local".to_string(),
+                descendant_sessions: 1,
+                expanded: true,
+                session_id: Some("stored-codex".to_string()),
+                session_cwd: Some("/home/pi/.codex/sessions".to_string()),
+            }],
+            &[],
+            &[],
+            &[ManagedSessionView {
+                id: "stored-codex".to_string(),
+                session_path: stored_path.clone(),
+                title: "Example Codex".to_string(),
+                kind: SessionKind::Codex,
+                host_label: "local".to_string(),
+                source: SessionSource::Stored,
+                backend: TerminalBackend::Xterm,
+                bridge_available: true,
+                launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+                remote_deploy_state: RemoteDeployState::NotRequired,
+                launch_command: String::new(),
+                status_line: String::new(),
+                terminal_lines: vec!["› Example".to_string()],
+                rendered_sections: vec![],
+                preview: yggterm_server::SessionPreview {
+                    summary: vec![],
+                    blocks: vec![],
+                },
+                metadata: vec![SessionMetadataEntry {
+                    label: "Storage",
+                    value: stored_path.clone(),
+                }],
+                terminal_process_id: Some(42),
+                terminal_foreground_active: Some(false),
+                terminal_window_id: None,
+                terminal_host_token: Some("host-token".to_string()),
+                terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+                embedded_surface_id: None,
+                embedded_surface_detail: None,
+                last_launch_error: None,
+                last_window_error: None,
+                ssh_target: None,
+                ssh_prefix: None,
+                stored_preview_hydrated: true,
+            }],
+            &HashSet::from(["__live_sessions__".to_string()]),
+        );
+        assert!(rows.iter().any(|row| row.full_path == "__live_sessions__"));
+        assert!(
+            rows.iter()
+                .any(|row| row.full_path == stored_path && row.depth == 1)
+        );
     }
     #[test]
     fn merged_sidebar_rows_synthesize_local_tree_for_live_sessions_when_stored_tree_is_empty() {
@@ -31198,6 +34813,120 @@ mod tests {
         );
     }
     #[test]
+    fn enrich_sidebar_rows_with_live_titles_humanizes_short_local_shell_labels() {
+        let live_sessions = vec![ManagedSessionView {
+            id: "live-local-home".to_string(),
+            session_path: "local://home".to_string(),
+            title: "Dev Sta".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "localhost".to_string(),
+            source: yggterm_server::SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: true,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: "/bin/bash".to_string(),
+            status_line: String::new(),
+            terminal_lines: vec![],
+            rendered_sections: vec![],
+            preview: yggterm_server::SessionPreview {
+                summary: vec![],
+                blocks: vec![],
+            },
+            metadata: vec![SessionMetadataEntry {
+                label: "Cwd",
+                value: "/home/pi".to_string(),
+            }],
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: true,
+        }];
+        let mut rows = vec![BrowserRow {
+            kind: BrowserRowKind::Session,
+            full_path: "local://home".to_string(),
+            label: "/home/pi".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: Some("/home/pi".to_string()),
+            depth: 1,
+            host_label: "localhost".to_string(),
+            descendant_sessions: 1,
+            expanded: true,
+            session_id: Some("live-local-home".to_string()),
+            session_cwd: Some("/home/pi".to_string()),
+        }];
+        enrich_sidebar_rows_with_live_titles(&mut rows, &live_sessions, &[]);
+        assert_eq!(rows[0].label, "Pi Home Shell");
+        assert_eq!(rows[0].session_title.as_deref(), Some("Pi Home Shell"));
+    }
+    #[test]
+    fn enrich_sidebar_rows_with_live_titles_preserves_explicit_stored_session_title() {
+        let live_sessions = vec![ManagedSessionView {
+            id: "manual-title".to_string(),
+            session_path: "/home/pi/.codex/sessions/example.jsonl".to_string(),
+            title: "Please Sudo Apt Install Wezterm".to_string(),
+            kind: SessionKind::Codex,
+            host_label: "localhost".to_string(),
+            source: yggterm_server::SessionSource::Stored,
+            backend: TerminalBackend::Xterm,
+            bridge_available: true,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: vec![],
+            rendered_sections: vec![],
+            preview: yggterm_server::SessionPreview {
+                summary: vec![],
+                blocks: vec![],
+            },
+            metadata: vec![SessionMetadataEntry {
+                label: "Cwd",
+                value: "/home/pi".to_string(),
+            }],
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: true,
+        }];
+        let mut rows = vec![BrowserRow {
+            kind: BrowserRowKind::Session,
+            full_path: "/home/pi/.codex/sessions/example.jsonl".to_string(),
+            label: "Patch To Upstream".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: Some("Patch To Upstream".to_string()),
+            depth: 1,
+            host_label: "localhost".to_string(),
+            descendant_sessions: 0,
+            expanded: true,
+            session_id: Some("manual-title".to_string()),
+            session_cwd: Some("/home/pi".to_string()),
+        }];
+        enrich_sidebar_rows_with_live_titles(&mut rows, &live_sessions, &[]);
+        assert_eq!(rows[0].label, "Patch To Upstream");
+        assert_eq!(rows[0].session_title.as_deref(), Some("Patch To Upstream"));
+    }
+    #[test]
     fn merged_sidebar_rows_do_not_promote_live_documents_into_live_sessions() {
         let rows = merged_sidebar_rows(
             &[],
@@ -31244,7 +34973,7 @@ mod tests {
         );
     }
     #[test]
-    fn merged_sidebar_rows_do_not_promote_remote_cached_rows_as_live_sessions() {
+    fn merged_sidebar_rows_promote_restored_remote_live_sessions_even_before_bridge_ready() {
         let rows = merged_sidebar_rows(
             &[],
             &[RemoteMachineSnapshot {
@@ -31311,13 +35040,18 @@ mod tests {
             ]),
         );
         assert!(
-            !rows.iter().any(|row| row.full_path == "__live_sessions__"),
-            "cached remote rows should not show up under Live Sessions: {rows:?}"
+            rows.iter().any(|row| row.full_path == "__live_sessions__"),
+            "restored remote live sessions should still show up under Live Sessions: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.full_path == "remote-session://jojo/abc" && row.depth == 1),
+            "restored remote live session row should remain in Live Sessions while bridge startup is pending: {rows:?}"
         );
         assert!(
             rows.iter()
                 .any(|row| row.full_path == "__remote_machine__/jojo"),
-            "cached remote machine should still stay in the machine tree: {rows:?}"
+            "remote machine should still stay visible in the machine tree: {rows:?}"
         );
     }
     #[test]
@@ -31499,6 +35233,48 @@ mod tests {
         assert_eq!(
             machine_row.detail_label,
             "cached snapshot · remote bootstrap planned"
+        );
+    }
+    #[test]
+    fn merged_sidebar_rows_promote_cached_ready_machine_to_ok_affordance() {
+        let rows = merged_sidebar_rows(
+            &[],
+            &[RemoteMachineSnapshot {
+                machine_key: "jojo".to_string(),
+                label: "jojo".to_string(),
+                ssh_target: "jojo".to_string(),
+                prefix: None,
+                remote_binary_expr: None,
+                remote_deploy_state: RemoteDeployState::Ready,
+                health: RemoteMachineHealth::Cached,
+                sessions: vec![RemoteScannedSession {
+                    session_path: "remote-session://jojo/1".to_string(),
+                    session_id: "1".to_string(),
+                    cwd: "/home/pi".to_string(),
+                    started_at: "2026-04-16T00:00:00Z".to_string(),
+                    modified_epoch: 1,
+                    event_count: 1,
+                    user_message_count: 1,
+                    assistant_message_count: 0,
+                    title_hint: "1".to_string(),
+                    recent_context: String::new(),
+                    cached_precis: None,
+                    cached_summary: None,
+                    storage_path: "a".to_string(),
+                }],
+            }],
+            &[],
+            &[],
+            &HashSet::new(),
+        );
+        let machine_row = rows
+            .iter()
+            .find(|row| row.full_path == "__remote_machine__/jojo")
+            .expect("machine row");
+        assert_eq!(machine_row.label, "jojo [ok]");
+        assert_eq!(
+            machine_row.detail_label,
+            "cached snapshot · remote yggterm ready"
         );
     }
     #[test]
@@ -31771,11 +35547,48 @@ mod tests {
         );
         assert_eq!(
             tree_icon_kind(&test_sidebar_row("/home/pi/.codex/sessions/example.jsonl")),
-            "plain-terminal"
+            "codex"
         );
         assert_eq!(
             tree_icon_glyph(&test_sidebar_row("/home/pi/.codex/sessions/example.jsonl")),
-            Some("⌘")
+            Some("✦")
+        );
+    }
+    #[test]
+    fn preferred_open_mode_for_live_stored_codex_row_forces_terminal() {
+        let session_path = "/home/pi/.codex/sessions/example.jsonl";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        shell.server.set_view_mode(WorkspaceViewMode::Rendered);
+
+        assert_eq!(
+            preferred_open_mode_for_row(&shell, &test_sidebar_row(session_path)),
+            WorkspaceViewMode::Terminal
+        );
+    }
+    #[test]
+    fn preferred_open_mode_for_preview_only_document_keeps_rendered_view() {
+        let session_path = "/notes/example";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        shell.server.set_view_mode(WorkspaceViewMode::Rendered);
+        let row = BrowserRow {
+            kind: BrowserRowKind::Document,
+            full_path: session_path.to_string(),
+            label: "Example Note".to_string(),
+            detail_label: String::new(),
+            document_kind: Some(WorkspaceDocumentKind::Note),
+            group_kind: None,
+            session_title: Some("Example Note".to_string()),
+            depth: 1,
+            host_label: String::new(),
+            descendant_sessions: 0,
+            expanded: true,
+            session_id: None,
+            session_cwd: Some("/notes".to_string()),
+        };
+
+        assert_eq!(
+            preferred_open_mode_for_row(&shell, &row),
+            WorkspaceViewMode::Rendered
         );
     }
     #[test]
@@ -32634,6 +36447,15 @@ Waiting for the remote terminal to paint...\n";
         ));
     }
     #[test]
+    fn transient_local_daemon_error_matches_daemon_read_response_failures() {
+        assert!(is_transient_local_daemon_connect_error(
+            "reading daemon response"
+        ));
+        assert!(is_transient_local_daemon_connect_error(
+            "parsing daemon response: \"\""
+        ));
+    }
+    #[test]
     fn app_control_terminal_surface_flags_transport_error_output() {
         let host = json!({
             "child_count": 1,
@@ -32759,6 +36581,15 @@ Waiting for the remote terminal to paint...\n";
             "xterm_present": true,
             "helpers_present": true,
             "helper_textarea_present": true,
+            "helper_textarea_opacity": "1",
+            "helper_textarea_background": "rgb(255, 255, 255)",
+            "helper_textarea_outline_style": "auto",
+            "helper_textarea_outline_color": "rgb(59, 130, 246)",
+            "helper_textarea_box_shadow": "rgb(59, 130, 246) 0px 0px 0px 1px",
+            "helper_textarea_clip_path": "none",
+            "helper_textarea_clip": "auto",
+            "helper_textarea_pointer_events": "auto",
+            "input_enabled": true,
             "screen_present": true,
             "viewport_present": true,
             "rows_present": true,
@@ -32775,7 +36606,9 @@ Waiting for the remote terminal to paint...\n";
         let surface = summarize_terminal_surface_for_app_control(&[host], false);
         assert_eq!(
             surface.get("geometry_problem").and_then(Value::as_str),
-            Some("active terminal host helper textarea drifted outside the visible host")
+            Some(
+                "active terminal host helper textarea drifted outside the expected hidden contract"
+            )
         );
     }
     #[test]
@@ -33132,7 +36965,7 @@ Waiting for the remote terminal to paint...\n";
         );
     }
     #[test]
-    fn describe_viewport_snapshot_requires_terminal_input_before_interactive() {
+    fn describe_viewport_snapshot_accepts_visible_terminal_without_terminal_focus() {
         let snapshot = json!({
             "active_session_path": "remote-session://oc/test",
             "active_view_mode": "Terminal",
@@ -33169,6 +37002,14 @@ Waiting for the remote terminal to paint...\n";
                 "rows_present": true,
                 "canvas_count": 1,
                 "input_enabled": false,
+                "cursor_line_text": "› /status",
+                "cursor_node_count": 1,
+                "cursor_sample_rect": {
+                    "left": 302.0,
+                    "top": 214.0,
+                    "width": 8.0,
+                    "height": 17.0
+                },
                 "text_sample": "› /status",
                 "resume_overlay_visible": false,
                 "resume_overlay_text": "",
@@ -33189,7 +37030,7 @@ Waiting for the remote terminal to paint...\n";
             "preview_scroll_count": 1
         });
         let viewport = describe_viewport_snapshot(&snapshot, &dom);
-        assert_eq!(viewport.get("ready").and_then(Value::as_bool), Some(false));
+        assert_eq!(viewport.get("ready").and_then(Value::as_bool), Some(true));
         assert_eq!(
             viewport.get("interactive").and_then(Value::as_bool),
             Some(false)
@@ -33198,11 +37039,11 @@ Waiting for the remote terminal to paint...\n";
             viewport
                 .get("terminal_settled_kind")
                 .and_then(Value::as_str),
-            Some("recovering")
+            Some("visible")
         );
         assert_eq!(
             viewport.get("reason").and_then(Value::as_str),
-            Some("terminal rendered but input is still disabled")
+            Some("terminal rendered but focus is outside the terminal")
         );
     }
     #[test]
@@ -33378,6 +37219,28 @@ Waiting for the remote terminal to paint...\n";
         shell.bump_terminal_mount_epoch_for_session(active_session_path);
         assert!(!shell.startup_terminal_restore_should_open(active_session_path));
     }
+    #[test]
+    fn schedule_background_copy_scan_now_only_mutates_when_scan_is_deferred() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://test");
+        let mut shell = ShellState::new(bootstrap);
+        shell.next_background_copy_scan_after_ms = 500;
+
+        assert!(schedule_background_copy_scan_now(&mut shell, 200));
+        assert_eq!(shell.next_background_copy_scan_after_ms, 200);
+
+        assert!(!schedule_background_copy_scan_now(&mut shell, 300));
+        assert_eq!(shell.next_background_copy_scan_after_ms, 200);
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_memory_sample_from_smaps_rollup_parses_rss_pss_and_anonymous() {
+        let sample = process_memory_sample_from_smaps_rollup(
+            "Rss:                123456 kB\nPss:                 98765 kB\nAnonymous:           54321 kB\n",
+        );
+        assert_eq!(sample.rss_kb, 123456);
+        assert_eq!(sample.pss_kb, 98765);
+        assert_eq!(sample.anonymous_kb, 54321);
+    }
     fn test_shell_bootstrap_with_active_session(active_session_path: &str) -> ShellBootstrap {
         let active_tree = SessionNode {
             kind: SessionNodeKind::CodexSession,
@@ -33431,6 +37294,209 @@ Waiting for the remote terminal to paint...\n";
             linux_window_transparent: false,
             linux_window_profile_reason: "test".to_string(),
         }
+    }
+    fn test_shell_bootstrap_with_browser_tree(browser_tree: SessionNode) -> ShellBootstrap {
+        let mut bootstrap =
+            test_shell_bootstrap_with_active_session("/home/pi/.codex/sessions/example.jsonl");
+        bootstrap.tree = browser_tree.clone();
+        bootstrap.browser_tree = browser_tree;
+        bootstrap
+    }
+    fn test_browser_tree_with_local_group_sessions() -> SessionNode {
+        SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: vec![SessionNode {
+                kind: SessionNodeKind::Group,
+                name: "/home/pi/gh/codex-litellm".to_string(),
+                title: None,
+                document_kind: None,
+                group_kind: Some(WorkspaceGroupKind::Folder),
+                path: PathBuf::from("/home/pi/gh/codex-litellm"),
+                children: vec![
+                    SessionNode {
+                        kind: SessionNodeKind::CodexSession,
+                        name: "alpha".to_string(),
+                        title: Some("Alpha".to_string()),
+                        document_kind: None,
+                        group_kind: None,
+                        path: PathBuf::from("/home/pi/.codex/sessions/2026/04/17/alpha.jsonl"),
+                        children: Vec::new(),
+                        session_id: Some("alpha-session".to_string()),
+                        cwd: Some("/home/pi/gh/codex-litellm".to_string()),
+                    },
+                    SessionNode {
+                        kind: SessionNodeKind::CodexSession,
+                        name: "beta".to_string(),
+                        title: Some("Beta".to_string()),
+                        document_kind: None,
+                        group_kind: None,
+                        path: PathBuf::from("/home/pi/.codex/sessions/2026/04/17/beta.jsonl"),
+                        children: Vec::new(),
+                        session_id: Some("beta-session".to_string()),
+                        cwd: Some("/home/pi/gh/codex-litellm".to_string()),
+                    },
+                ],
+                session_id: None,
+                cwd: Some("/home/pi/gh/codex-litellm".to_string()),
+            }],
+            session_id: None,
+            cwd: None,
+        }
+    }
+    #[test]
+    fn select_all_tree_rows_includes_session_rows_for_bulk_regeneration() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_browser_tree(
+            test_browser_tree_with_local_group_sessions(),
+        ));
+        shell.select_all_tree_rows();
+        assert!(
+            shell
+                .selected_tree_paths
+                .contains("/home/pi/.codex/sessions/2026/04/17/alpha.jsonl")
+        );
+        assert!(
+            shell
+                .selected_tree_paths
+                .contains("/home/pi/.codex/sessions/2026/04/17/beta.jsonl")
+        );
+    }
+    #[test]
+    fn begin_tree_rename_allows_live_session_rows() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://test"));
+        let row = shell
+            .all_sidebar_rows_for_selection()
+            .into_iter()
+            .find(|row| row.kind == BrowserRowKind::Session && row.full_path == "local://test")
+            .expect("session row present");
+        shell.begin_tree_rename(&row);
+        assert_eq!(shell.tree_rename_path.as_deref(), Some("local://test"));
+        assert_eq!(shell.tree_rename_value, row.label);
+    }
+    #[test]
+    fn selected_copy_generation_rows_expand_group_subtree_into_sessions() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_browser_tree(
+            test_browser_tree_with_local_group_sessions(),
+        ));
+        let rows = shell.all_sidebar_rows_for_selection();
+        let group_row = rows
+            .iter()
+            .find(|row| row.full_path == "/home/pi/gh/codex-litellm")
+            .cloned()
+            .expect("group row present");
+        shell.select_tree_row(&group_row, TreeSelectionMode::Replace);
+        let selected = shell.selected_copy_generation_rows(Some(&group_row));
+        let paths = selected
+            .into_iter()
+            .map(|row| row.full_path)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                "/home/pi/.codex/sessions/2026/04/17/alpha.jsonl".to_string(),
+                "/home/pi/.codex/sessions/2026/04/17/beta.jsonl".to_string(),
+            ]
+        );
+    }
+    #[test]
+    fn selected_copy_generation_rows_expand_remote_machine_subtree_into_sessions() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_browser_tree(SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        }));
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: None,
+            active_session: None,
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: vec![RemoteMachineSnapshot {
+                machine_key: "jojo".to_string(),
+                label: "jojo".to_string(),
+                ssh_target: "pi@jojo".to_string(),
+                prefix: None,
+                remote_binary_expr: None,
+                remote_deploy_state: RemoteDeployState::Ready,
+                health: RemoteMachineHealth::Healthy,
+                sessions: vec![
+                    RemoteScannedSession {
+                        session_path: "remote-session://jojo/a".to_string(),
+                        session_id: "a".to_string(),
+                        cwd: "/home/pi/one".to_string(),
+                        started_at: "2026-04-17T00:00:00Z".to_string(),
+                        modified_epoch: 10,
+                        event_count: 10,
+                        user_message_count: 4,
+                        assistant_message_count: 4,
+                        title_hint: "Alpha".to_string(),
+                        recent_context: "USER: alpha".to_string(),
+                        cached_precis: None,
+                        cached_summary: None,
+                        storage_path: "/home/pi/.codex/sessions/a.jsonl".to_string(),
+                    },
+                    RemoteScannedSession {
+                        session_path: "remote-session://jojo/b".to_string(),
+                        session_id: "b".to_string(),
+                        cwd: "/home/pi/two".to_string(),
+                        started_at: "2026-04-17T00:01:00Z".to_string(),
+                        modified_epoch: 11,
+                        event_count: 12,
+                        user_message_count: 5,
+                        assistant_message_count: 5,
+                        title_hint: "Beta".to_string(),
+                        recent_context: "USER: beta".to_string(),
+                        cached_precis: None,
+                        cached_summary: None,
+                        storage_path: "/home/pi/.codex/sessions/b.jsonl".to_string(),
+                    },
+                ],
+            }],
+            ssh_targets: vec![SshConnectTarget {
+                label: "jojo".to_string(),
+                kind: SessionKind::Codex,
+                ssh_target: "pi@jojo".to_string(),
+                prefix: None,
+                cwd: None,
+            }],
+            live_sessions: Vec::new(),
+        });
+        let machine_row = BrowserRow {
+            kind: BrowserRowKind::Group,
+            full_path: "__remote_machine__/jojo".to_string(),
+            label: "jojo [ok]".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: None,
+            depth: 0,
+            host_label: "live".to_string(),
+            descendant_sessions: 2,
+            expanded: true,
+            session_id: None,
+            session_cwd: None,
+        };
+        shell.select_tree_row(&machine_row, TreeSelectionMode::Replace);
+        let selected = shell.selected_copy_generation_rows(Some(&machine_row));
+        let paths = selected
+            .into_iter()
+            .map(|row| row.full_path)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                "remote-session://jojo/a".to_string(),
+                "remote-session://jojo/b".to_string(),
+            ]
+        );
     }
     #[test]
     fn preserve_background_snapshot_keeps_live_active_session_from_snapshot_rows() {
@@ -33631,6 +37697,143 @@ Waiting for the remote terminal to paint...\n";
         assert!(!shell.server_busy);
     }
     #[test]
+    fn apply_snapshot_result_without_request_resyncs_stale_sidebar_selection_to_active_live_local_session()
+     {
+        let stale_path = "/home/pi/.codex/sessions/example.jsonl";
+        let active_session_path = "local://fresh-shell";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(
+            active_session_path,
+        ));
+        shell.browser = SessionBrowserState::new(SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: vec![
+                SessionNode {
+                    kind: SessionNodeKind::Group,
+                    name: "local".to_string(),
+                    title: None,
+                    document_kind: None,
+                    group_kind: None,
+                    path: PathBuf::from("local"),
+                    children: vec![SessionNode {
+                        kind: SessionNodeKind::Group,
+                        name: "/home/pi".to_string(),
+                        title: None,
+                        document_kind: None,
+                        group_kind: None,
+                        path: PathBuf::from("/home/pi"),
+                        children: vec![SessionNode {
+                            kind: SessionNodeKind::Group,
+                            name: "/home/pi/gh".to_string(),
+                            title: None,
+                            document_kind: None,
+                            group_kind: None,
+                            path: PathBuf::from("/home/pi/gh"),
+                            children: Vec::new(),
+                            session_id: None,
+                            cwd: Some("/home/pi/gh".to_string()),
+                        }],
+                        session_id: None,
+                        cwd: Some("/home/pi".to_string()),
+                    }],
+                    session_id: None,
+                    cwd: None,
+                },
+                SessionNode {
+                    kind: SessionNodeKind::CodexSession,
+                    name: "stale".to_string(),
+                    title: Some("stale".to_string()),
+                    document_kind: None,
+                    group_kind: None,
+                    path: PathBuf::from(stale_path),
+                    children: Vec::new(),
+                    session_id: Some("stale-session".to_string()),
+                    cwd: Some("/home/pi/.codex/sessions".to_string()),
+                },
+            ],
+            session_id: None,
+            cwd: None,
+        });
+        shell.browser.ensure_expanded_paths(vec![
+            "local".to_string(),
+            "/home/pi".to_string(),
+            "/home/pi/gh".to_string(),
+        ]);
+        let live_session = ManagedSessionView {
+            id: "fresh-shell-id".to_string(),
+            session_path: active_session_path.to_string(),
+            title: "Fresh Shell".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "local-shell".to_string(),
+            source: SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: vec!["pi@dev:~/gh/yggterm$".to_string()],
+            rendered_sections: Vec::new(),
+            preview: SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: vec![SessionMetadataEntry {
+                label: "Cwd",
+                value: "/home/pi/gh/yggterm".to_string(),
+            }],
+            terminal_process_id: Some(42),
+            terminal_foreground_active: Some(false),
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(active_session_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(live_session.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![snapshot_session_view_for_ui(live_session.clone())],
+        });
+        shell.needs_initial_server_sync = false;
+        shell.selected_tree_paths.clear();
+        shell.selected_tree_paths.insert(stale_path.to_string());
+        shell.selection_anchor = Some(stale_path.to_string());
+        shell.browser.select_path(stale_path.to_string());
+        shell.apply_daemon_snapshot_result(Ok((
+            ServerUiSnapshot {
+                active_session_path: Some(active_session_path.to_string()),
+                active_session: Some(snapshot_session_view_for_ui(live_session.clone())),
+                active_view_mode: WorkspaceViewMode::Terminal,
+                remote_machines: Vec::new(),
+                ssh_targets: Vec::new(),
+                live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+            },
+            Some("snapshot applied".to_string()),
+        )));
+        assert_eq!(
+            shell.server.active_session_path(),
+            Some(active_session_path)
+        );
+        assert_eq!(shell.selection_anchor.as_deref(), Some(active_session_path));
+        assert_eq!(
+            shell.selected_tree_paths,
+            HashSet::from([active_session_path.to_string()])
+        );
+    }
+    #[test]
     fn sidebar_busy_icon_prefers_live_active_summary_when_prompt_has_returned() {
         let session_path = "local://test";
         let session = ManagedSessionView {
@@ -33687,6 +37890,8 @@ Waiting for the remote terminal to paint...\n";
             terminal_loading: false,
             metadata_loading: false,
             sidebar_open: true,
+            sidebar_width: 300.0,
+            sidebar_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some(session_path.to_string()),
@@ -33721,6 +37926,7 @@ Waiting for the remote terminal to paint...\n";
             notifications: Vec::new(),
             titlebar_new_menu_open: false,
             titlebar_session_menu_open: false,
+            titlebar_overflow_menu_open: false,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             selected_tree_paths: vec![session_path.to_string()],
@@ -33841,6 +38047,8 @@ Waiting for the remote terminal to paint...\n";
             terminal_loading: false,
             metadata_loading: false,
             sidebar_open: true,
+            sidebar_width: 300.0,
+            sidebar_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some("local://active".to_string()),
@@ -33875,6 +38083,7 @@ Waiting for the remote terminal to paint...\n";
             notifications: Vec::new(),
             titlebar_new_menu_open: false,
             titlebar_session_menu_open: false,
+            titlebar_overflow_menu_open: false,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             selected_tree_paths: vec!["local://active".to_string()],
@@ -33891,6 +38100,516 @@ Waiting for the remote terminal to paint...\n";
             active_title: Some("Active".to_string()),
             active_precis: None,
             active_summary: Some("pi@dev:~/gh/yggterm$ >.".to_string()),
+            drag_paths: Vec::new(),
+            drag_hover_target: None,
+            optimistic_drag_paths: Vec::new(),
+            optimistic_drag_target: None,
+            drag_pointer: None,
+            pending_delete: None,
+            tree_rename_path: None,
+            tree_rename_value: String::new(),
+            theme_editor_open: false,
+            theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
+            theme_editor_selected_stop: None,
+            theme_accent: String::new(),
+            shell_tint: String::new(),
+            shell_gradient: String::new(),
+            optimistic_busy_paths: HashSet::new(),
+        };
+        assert!(!sidebar_row_shows_busy_icon(&snapshot, &row));
+    }
+    #[test]
+    fn sidebar_busy_icon_does_not_mark_active_live_session_busy_without_foreground_signal() {
+        let session_path = "local://active";
+        let active_session = ManagedSessionView {
+            id: "active".to_string(),
+            session_path: session_path.to_string(),
+            title: "Dev Sta".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "local-shell".to_string(),
+            source: SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: "/bin/bash".to_string(),
+            status_line: String::new(),
+            terminal_lines: Vec::new(),
+            rendered_sections: Vec::new(),
+            preview: SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: Vec::new(),
+            terminal_process_id: Some(456),
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+        let row = test_sidebar_row(session_path);
+        let snapshot = RenderSnapshot {
+            palette: palette(UiTheme::ZedLight),
+            search_query: String::new(),
+            search_active: false,
+            command_mode_active: false,
+            search_focused: false,
+            search_command_suggestions: Vec::new(),
+            search_sidebar_matches: Vec::new(),
+            search_sidebar_match_index: None,
+            search_content_hits: Vec::new(),
+            search_content_hit_index: None,
+            sidebar_loading: false,
+            preview_loading: false,
+            preview_failure: None,
+            terminal_loading: false,
+            metadata_loading: false,
+            sidebar_open: true,
+            sidebar_width: 300.0,
+            sidebar_resizing: false,
+            right_panel_mode: RightPanelMode::Notifications,
+            rows: vec![row.clone()],
+            selected_path: Some(session_path.to_string()),
+            selected_row: Some(row.clone()),
+            active_session: Some(active_session.clone()),
+            active_session_path: Some(session_path.to_string()),
+            active_view_mode: WorkspaceViewMode::Rendered,
+            retained_terminal_sessions: vec![active_session.clone()],
+            terminal_mount_epochs: HashMap::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![active_session],
+            total_leaf_sessions: 1,
+            last_action: String::new(),
+            ghostty_embedded_surface_supported: false,
+            ghostty_bridge_detail: String::new(),
+            server_daemon_detail: String::new(),
+            settings: AppSettings::default(),
+            install_context: InstallContext {
+                channel: yggterm_core::InstallChannel::Unknown,
+                update_policy: yggterm_core::UpdatePolicy::NotifyOnly,
+                repo: "test/repo".to_string(),
+                asset_label: "linux-aarch64".to_string(),
+                current_version: "0.0.0-test".to_string(),
+                executable_path: PathBuf::from("/tmp/yggterm-test"),
+                preferred_executable: None,
+                managed_root: None,
+                manager_hint: Some("test".to_string()),
+            },
+            maximized: false,
+            fullscreen: false,
+            always_on_top: false,
+            notifications: Vec::new(),
+            titlebar_new_menu_open: false,
+            titlebar_session_menu_open: false,
+            titlebar_overflow_menu_open: false,
+            alt_overlay_active: false,
+            alt_overlay_sequence: String::new(),
+            selected_tree_paths: vec![session_path.to_string()],
+            context_menu_row: None,
+            context_menu_position: None,
+            preview_layout: PreviewLayoutMode::Chat,
+            server_busy: false,
+            show_loading_tree: false,
+            ssh_connect_target: String::new(),
+            ssh_connect_prefix: String::new(),
+            pending_update_restart: None,
+            last_terminal_debug: String::new(),
+            last_tree_debug: String::new(),
+            active_title: Some("Dev Sta".to_string()),
+            active_precis: None,
+            active_summary: Some("Target: /home/pi\nCommand: /bin/bash".to_string()),
+            drag_paths: Vec::new(),
+            drag_hover_target: None,
+            optimistic_drag_paths: Vec::new(),
+            optimistic_drag_target: None,
+            drag_pointer: None,
+            pending_delete: None,
+            tree_rename_path: None,
+            tree_rename_value: String::new(),
+            theme_editor_open: false,
+            theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
+            theme_editor_selected_stop: None,
+            theme_accent: String::new(),
+            shell_tint: String::new(),
+            shell_gradient: String::new(),
+            optimistic_busy_paths: HashSet::new(),
+        };
+        assert!(!sidebar_row_shows_busy_icon(&snapshot, &row));
+    }
+    #[test]
+    fn sidebar_busy_icon_does_not_mark_bridge_pending_session_busy_without_terminal_sample() {
+        let session_path = "local://active";
+        let active_session = ManagedSessionView {
+            id: "active".to_string(),
+            session_path: session_path.to_string(),
+            title: "Dev Sta".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "local-shell".to_string(),
+            source: SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::BridgePending,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: "/bin/bash".to_string(),
+            status_line: "xterm.js · waiting for terminal host".to_string(),
+            terminal_lines: Vec::new(),
+            rendered_sections: Vec::new(),
+            preview: SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: Vec::new(),
+            terminal_process_id: Some(456),
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+        let row = test_sidebar_row(session_path);
+        let snapshot = RenderSnapshot {
+            palette: palette(UiTheme::ZedLight),
+            search_query: String::new(),
+            search_active: false,
+            command_mode_active: false,
+            search_focused: false,
+            search_command_suggestions: Vec::new(),
+            search_sidebar_matches: Vec::new(),
+            search_sidebar_match_index: None,
+            search_content_hits: Vec::new(),
+            search_content_hit_index: None,
+            sidebar_loading: false,
+            preview_loading: false,
+            preview_failure: None,
+            terminal_loading: false,
+            metadata_loading: false,
+            sidebar_open: true,
+            sidebar_width: 300.0,
+            sidebar_resizing: false,
+            right_panel_mode: RightPanelMode::Notifications,
+            rows: vec![row.clone()],
+            selected_path: Some(session_path.to_string()),
+            selected_row: Some(row.clone()),
+            active_session: Some(active_session.clone()),
+            active_session_path: Some(session_path.to_string()),
+            active_view_mode: WorkspaceViewMode::Rendered,
+            retained_terminal_sessions: vec![active_session.clone()],
+            terminal_mount_epochs: HashMap::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![active_session],
+            total_leaf_sessions: 1,
+            last_action: String::new(),
+            ghostty_embedded_surface_supported: false,
+            ghostty_bridge_detail: String::new(),
+            server_daemon_detail: String::new(),
+            settings: AppSettings::default(),
+            install_context: InstallContext {
+                channel: yggterm_core::InstallChannel::Unknown,
+                update_policy: yggterm_core::UpdatePolicy::NotifyOnly,
+                repo: "test/repo".to_string(),
+                asset_label: "linux-aarch64".to_string(),
+                current_version: "0.0.0-test".to_string(),
+                executable_path: PathBuf::from("/tmp/yggterm-test"),
+                preferred_executable: None,
+                managed_root: None,
+                manager_hint: Some("test".to_string()),
+            },
+            maximized: false,
+            fullscreen: false,
+            always_on_top: false,
+            notifications: Vec::new(),
+            titlebar_new_menu_open: false,
+            titlebar_session_menu_open: false,
+            titlebar_overflow_menu_open: false,
+            alt_overlay_active: false,
+            alt_overlay_sequence: String::new(),
+            selected_tree_paths: vec![session_path.to_string()],
+            context_menu_row: None,
+            context_menu_position: None,
+            preview_layout: PreviewLayoutMode::Chat,
+            server_busy: false,
+            show_loading_tree: false,
+            ssh_connect_target: String::new(),
+            ssh_connect_prefix: String::new(),
+            pending_update_restart: None,
+            last_terminal_debug: String::new(),
+            last_tree_debug: String::new(),
+            active_title: Some("Dev Sta".to_string()),
+            active_precis: None,
+            active_summary: Some("Target: /home/pi\nCommand: /bin/bash".to_string()),
+            drag_paths: Vec::new(),
+            drag_hover_target: None,
+            optimistic_drag_paths: Vec::new(),
+            optimistic_drag_target: None,
+            drag_pointer: None,
+            pending_delete: None,
+            tree_rename_path: None,
+            tree_rename_value: String::new(),
+            theme_editor_open: false,
+            theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
+            theme_editor_selected_stop: None,
+            theme_accent: String::new(),
+            shell_tint: String::new(),
+            shell_gradient: String::new(),
+            optimistic_busy_paths: HashSet::new(),
+        };
+        assert!(!sidebar_row_shows_busy_icon(&snapshot, &row));
+    }
+    #[test]
+    fn sidebar_busy_icon_ignores_rendered_preview_when_bridge_pending_has_no_terminal_lines() {
+        let session_path = "local://active";
+        let active_session = ManagedSessionView {
+            id: "active".to_string(),
+            session_path: session_path.to_string(),
+            title: "Dev Sta".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "local-shell".to_string(),
+            source: SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::BridgePending,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: "/bin/bash".to_string(),
+            status_line: "xterm.js · waiting for terminal host".to_string(),
+            terminal_lines: Vec::new(),
+            rendered_sections: vec![SessionRenderedSection {
+                title: "Recent",
+                lines: vec!["Launch command prepared: exec '/bin/bash' -i".to_string()],
+            }],
+            preview: SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: Vec::new(),
+            terminal_process_id: Some(456),
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+        let row = test_sidebar_row(session_path);
+        let snapshot = RenderSnapshot {
+            palette: palette(UiTheme::ZedLight),
+            search_query: String::new(),
+            search_active: false,
+            command_mode_active: false,
+            search_focused: false,
+            search_command_suggestions: Vec::new(),
+            search_sidebar_matches: Vec::new(),
+            search_sidebar_match_index: None,
+            search_content_hits: Vec::new(),
+            search_content_hit_index: None,
+            sidebar_loading: false,
+            preview_loading: false,
+            preview_failure: None,
+            terminal_loading: false,
+            metadata_loading: false,
+            sidebar_open: true,
+            sidebar_width: 300.0,
+            sidebar_resizing: false,
+            right_panel_mode: RightPanelMode::Notifications,
+            rows: vec![row.clone()],
+            selected_path: Some(session_path.to_string()),
+            selected_row: Some(row.clone()),
+            active_session: Some(active_session.clone()),
+            active_session_path: Some(session_path.to_string()),
+            active_view_mode: WorkspaceViewMode::Rendered,
+            retained_terminal_sessions: vec![active_session.clone()],
+            terminal_mount_epochs: HashMap::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![active_session],
+            total_leaf_sessions: 1,
+            last_action: String::new(),
+            ghostty_embedded_surface_supported: false,
+            ghostty_bridge_detail: String::new(),
+            server_daemon_detail: String::new(),
+            settings: AppSettings::default(),
+            install_context: InstallContext {
+                channel: yggterm_core::InstallChannel::Unknown,
+                update_policy: yggterm_core::UpdatePolicy::NotifyOnly,
+                repo: "test/repo".to_string(),
+                asset_label: "linux-aarch64".to_string(),
+                current_version: "0.0.0-test".to_string(),
+                executable_path: PathBuf::from("/tmp/yggterm-test"),
+                preferred_executable: None,
+                managed_root: None,
+                manager_hint: Some("test".to_string()),
+            },
+            maximized: false,
+            fullscreen: false,
+            always_on_top: false,
+            notifications: Vec::new(),
+            titlebar_new_menu_open: false,
+            titlebar_session_menu_open: false,
+            titlebar_overflow_menu_open: false,
+            alt_overlay_active: false,
+            alt_overlay_sequence: String::new(),
+            selected_tree_paths: vec![session_path.to_string()],
+            context_menu_row: None,
+            context_menu_position: None,
+            preview_layout: PreviewLayoutMode::Chat,
+            server_busy: false,
+            show_loading_tree: false,
+            ssh_connect_target: String::new(),
+            ssh_connect_prefix: String::new(),
+            pending_update_restart: None,
+            last_terminal_debug: String::new(),
+            last_tree_debug: String::new(),
+            active_title: Some("Dev Sta".to_string()),
+            active_precis: None,
+            active_summary: Some("Target: /home/pi\nCommand: /bin/bash".to_string()),
+            drag_paths: Vec::new(),
+            drag_hover_target: None,
+            optimistic_drag_paths: Vec::new(),
+            optimistic_drag_target: None,
+            drag_pointer: None,
+            pending_delete: None,
+            tree_rename_path: None,
+            tree_rename_value: String::new(),
+            theme_editor_open: false,
+            theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
+            theme_editor_selected_stop: None,
+            theme_accent: String::new(),
+            shell_tint: String::new(),
+            shell_gradient: String::new(),
+            optimistic_busy_paths: HashSet::new(),
+        };
+        assert!(!sidebar_row_shows_busy_icon(&snapshot, &row));
+    }
+    #[test]
+    fn sidebar_busy_icon_ignores_bootstrap_scaffold_lines_while_bridge_pending() {
+        let session_path = "local://active";
+        let active_session = ManagedSessionView {
+            id: "active".to_string(),
+            session_path: session_path.to_string(),
+            title: "Dev Sta".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "local-shell".to_string(),
+            source: SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::BridgePending,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: "exec '/bin/bash' -i".to_string(),
+            status_line: "xterm.js · waiting for terminal host".to_string(),
+            terminal_lines: vec![
+                "$ exec '/bin/bash' -i".to_string(),
+                "Queue live shell session local://active".to_string(),
+                "Target: /home/pi".to_string(),
+                "Command: /bin/bash".to_string(),
+                "Daemon runtime: local PTY managed directly by yggterm".to_string(),
+                "Daemon PTY: request main viewport terminal stream".to_string(),
+            ],
+            rendered_sections: Vec::new(),
+            preview: SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: Vec::new(),
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+        let row = test_sidebar_row(session_path);
+        let snapshot = RenderSnapshot {
+            palette: palette(UiTheme::ZedLight),
+            search_query: String::new(),
+            search_active: false,
+            command_mode_active: false,
+            search_focused: false,
+            search_command_suggestions: Vec::new(),
+            search_sidebar_matches: Vec::new(),
+            search_sidebar_match_index: None,
+            search_content_hits: Vec::new(),
+            search_content_hit_index: None,
+            sidebar_loading: false,
+            preview_loading: false,
+            preview_failure: None,
+            terminal_loading: false,
+            metadata_loading: false,
+            sidebar_open: true,
+            sidebar_width: 300.0,
+            sidebar_resizing: false,
+            right_panel_mode: RightPanelMode::Notifications,
+            rows: vec![row.clone()],
+            selected_path: Some(session_path.to_string()),
+            selected_row: Some(row.clone()),
+            active_session: Some(active_session.clone()),
+            active_session_path: Some(session_path.to_string()),
+            active_view_mode: WorkspaceViewMode::Rendered,
+            retained_terminal_sessions: vec![active_session.clone()],
+            terminal_mount_epochs: HashMap::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![active_session],
+            total_leaf_sessions: 1,
+            last_action: String::new(),
+            ghostty_embedded_surface_supported: false,
+            ghostty_bridge_detail: String::new(),
+            server_daemon_detail: String::new(),
+            settings: AppSettings::default(),
+            install_context: InstallContext {
+                channel: yggterm_core::InstallChannel::Unknown,
+                update_policy: yggterm_core::UpdatePolicy::NotifyOnly,
+                repo: "test/repo".to_string(),
+                asset_label: "linux-aarch64".to_string(),
+                current_version: "0.0.0-test".to_string(),
+                executable_path: PathBuf::from("/tmp/yggterm-test"),
+                preferred_executable: None,
+                managed_root: None,
+                manager_hint: Some("test".to_string()),
+            },
+            maximized: false,
+            fullscreen: false,
+            always_on_top: false,
+            notifications: Vec::new(),
+            titlebar_new_menu_open: false,
+            titlebar_session_menu_open: false,
+            titlebar_overflow_menu_open: false,
+            alt_overlay_active: false,
+            alt_overlay_sequence: String::new(),
+            selected_tree_paths: vec![session_path.to_string()],
+            context_menu_row: None,
+            context_menu_position: None,
+            preview_layout: PreviewLayoutMode::Chat,
+            server_busy: false,
+            show_loading_tree: false,
+            ssh_connect_target: String::new(),
+            ssh_connect_prefix: String::new(),
+            pending_update_restart: None,
+            last_terminal_debug: String::new(),
+            last_tree_debug: String::new(),
+            active_title: Some("Dev Sta".to_string()),
+            active_precis: None,
+            active_summary: Some("Target: /home/pi\nCommand: /bin/bash".to_string()),
             drag_paths: Vec::new(),
             drag_hover_target: None,
             optimistic_drag_paths: Vec::new(),
@@ -33962,6 +38681,8 @@ Waiting for the remote terminal to paint...\n";
             terminal_loading: false,
             metadata_loading: false,
             sidebar_open: true,
+            sidebar_width: 300.0,
+            sidebar_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some("local://active".to_string()),
@@ -33996,6 +38717,7 @@ Waiting for the remote terminal to paint...\n";
             notifications: Vec::new(),
             titlebar_new_menu_open: false,
             titlebar_session_menu_open: false,
+            titlebar_overflow_menu_open: false,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             selected_tree_paths: vec!["local://active".to_string()],
@@ -34083,6 +38805,8 @@ Waiting for the remote terminal to paint...\n";
             terminal_loading: false,
             metadata_loading: false,
             sidebar_open: true,
+            sidebar_width: 300.0,
+            sidebar_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some("local://active".to_string()),
@@ -34117,9 +38841,167 @@ Waiting for the remote terminal to paint...\n";
             notifications: Vec::new(),
             titlebar_new_menu_open: false,
             titlebar_session_menu_open: false,
+            titlebar_overflow_menu_open: false,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             selected_tree_paths: vec!["local://active".to_string()],
+            context_menu_row: None,
+            context_menu_position: None,
+            preview_layout: PreviewLayoutMode::Chat,
+            server_busy: false,
+            show_loading_tree: false,
+            ssh_connect_target: String::new(),
+            ssh_connect_prefix: String::new(),
+            pending_update_restart: None,
+            last_terminal_debug: String::new(),
+            last_tree_debug: String::new(),
+            active_title: Some("Active".to_string()),
+            active_precis: None,
+            active_summary: Some("pi@dev:~/gh/yggterm$ >.".to_string()),
+            drag_paths: Vec::new(),
+            drag_hover_target: None,
+            optimistic_drag_paths: Vec::new(),
+            optimistic_drag_target: None,
+            drag_pointer: None,
+            pending_delete: None,
+            tree_rename_path: None,
+            tree_rename_value: String::new(),
+            theme_editor_open: false,
+            theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
+            theme_editor_selected_stop: None,
+            theme_accent: String::new(),
+            shell_tint: String::new(),
+            shell_gradient: String::new(),
+            optimistic_busy_paths: HashSet::new(),
+        };
+        assert!(!sidebar_row_shows_busy_icon(&snapshot, &row));
+    }
+    #[test]
+    fn sidebar_busy_icon_clears_bridge_pending_spinner_for_restored_idle_remote_session() {
+        let restored_remote = ManagedSessionView {
+            id: "remote-idle".to_string(),
+            session_path: "remote-session://jojo/idle".to_string(),
+            title: "Remote Idle".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "jojo".to_string(),
+            source: SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::BridgePending,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: vec!["pi@jojo:~$".to_string()],
+            rendered_sections: Vec::new(),
+            preview: SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: Vec::new(),
+            terminal_process_id: Some(123),
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+        let active_session = ManagedSessionView {
+            id: "active".to_string(),
+            session_path: "local://active".to_string(),
+            title: "Active".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "local-shell".to_string(),
+            source: SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: vec!["pi@dev:~/gh/yggterm$".to_string()],
+            rendered_sections: Vec::new(),
+            preview: SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: Vec::new(),
+            terminal_process_id: Some(456),
+            terminal_foreground_active: Some(false),
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+        let row = test_sidebar_row("remote-session://jojo/idle");
+        let snapshot = RenderSnapshot {
+            palette: palette(UiTheme::ZedLight),
+            search_query: String::new(),
+            search_active: false,
+            command_mode_active: false,
+            search_focused: false,
+            search_command_suggestions: Vec::new(),
+            search_sidebar_matches: Vec::new(),
+            search_sidebar_match_index: None,
+            search_content_hits: Vec::new(),
+            search_content_hit_index: None,
+            sidebar_loading: false,
+            preview_loading: false,
+            preview_failure: None,
+            terminal_loading: false,
+            metadata_loading: false,
+            sidebar_open: true,
+            sidebar_width: 300.0,
+            sidebar_resizing: false,
+            right_panel_mode: RightPanelMode::Notifications,
+            rows: vec![row.clone()],
+            selected_path: Some(active_session.session_path.clone()),
+            selected_row: Some(row.clone()),
+            active_session: Some(active_session.clone()),
+            active_session_path: Some(active_session.session_path.clone()),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            retained_terminal_sessions: vec![restored_remote.clone(), active_session.clone()],
+            terminal_mount_epochs: HashMap::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![restored_remote, active_session.clone()],
+            total_leaf_sessions: 2,
+            last_action: String::new(),
+            ghostty_embedded_surface_supported: false,
+            ghostty_bridge_detail: String::new(),
+            server_daemon_detail: String::new(),
+            settings: AppSettings::default(),
+            install_context: InstallContext {
+                channel: yggterm_core::InstallChannel::Unknown,
+                update_policy: yggterm_core::UpdatePolicy::NotifyOnly,
+                repo: "test/repo".to_string(),
+                asset_label: "linux-aarch64".to_string(),
+                current_version: "0.0.0-test".to_string(),
+                executable_path: PathBuf::from("/tmp/yggterm-test"),
+                preferred_executable: None,
+                managed_root: None,
+                manager_hint: Some("test".to_string()),
+            },
+            maximized: false,
+            fullscreen: false,
+            always_on_top: false,
+            notifications: Vec::new(),
+            titlebar_new_menu_open: false,
+            titlebar_session_menu_open: false,
+            titlebar_overflow_menu_open: false,
+            alt_overlay_active: false,
+            alt_overlay_sequence: String::new(),
+            selected_tree_paths: vec![active_session.session_path.clone()],
             context_menu_row: None,
             context_menu_position: None,
             preview_layout: PreviewLayoutMode::Chat,
@@ -34207,6 +39089,8 @@ Waiting for the remote terminal to paint...\n";
             terminal_loading: false,
             metadata_loading: false,
             sidebar_open: true,
+            sidebar_width: 300.0,
+            sidebar_resizing: false,
             right_panel_mode: RightPanelMode::Notifications,
             rows: vec![row.clone()],
             selected_path: Some("local://active".to_string()),
@@ -34241,6 +39125,7 @@ Waiting for the remote terminal to paint...\n";
             notifications: Vec::new(),
             titlebar_new_menu_open: false,
             titlebar_session_menu_open: false,
+            titlebar_overflow_menu_open: false,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             selected_tree_paths: vec!["local://active".to_string()],
@@ -34276,17 +39161,834 @@ Waiting for the remote terminal to paint...\n";
         assert!(!sidebar_row_shows_busy_icon(&snapshot, &row));
     }
     #[test]
+    fn sidebar_busy_icon_prefers_live_foreground_false_over_placeholder_active_session() {
+        let session_path = "local://active";
+        let placeholder_active_session = ManagedSessionView {
+            id: "active-placeholder".to_string(),
+            session_path: session_path.to_string(),
+            title: "Active".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "local-shell".to_string(),
+            source: SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: Vec::new(),
+            rendered_sections: Vec::new(),
+            preview: SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: Vec::new(),
+            terminal_process_id: Some(456),
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+        let live_session = ManagedSessionView {
+            id: "active-live".to_string(),
+            session_path: session_path.to_string(),
+            title: "Active".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "local-shell".to_string(),
+            source: SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: vec!["pi@dev:~/gh/yggterm$".to_string()],
+            rendered_sections: Vec::new(),
+            preview: SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: Vec::new(),
+            terminal_process_id: Some(456),
+            terminal_foreground_active: Some(false),
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+        let row = test_sidebar_row(session_path);
+        let snapshot = RenderSnapshot {
+            palette: palette(UiTheme::ZedLight),
+            search_query: String::new(),
+            search_active: false,
+            command_mode_active: false,
+            search_focused: false,
+            search_command_suggestions: Vec::new(),
+            search_sidebar_matches: Vec::new(),
+            search_sidebar_match_index: None,
+            search_content_hits: Vec::new(),
+            search_content_hit_index: None,
+            sidebar_loading: false,
+            preview_loading: false,
+            preview_failure: None,
+            terminal_loading: false,
+            metadata_loading: false,
+            sidebar_open: true,
+            sidebar_width: 300.0,
+            sidebar_resizing: false,
+            right_panel_mode: RightPanelMode::Notifications,
+            rows: vec![row.clone()],
+            selected_path: Some(session_path.to_string()),
+            selected_row: Some(row.clone()),
+            active_session: Some(placeholder_active_session),
+            active_session_path: Some(session_path.to_string()),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            retained_terminal_sessions: vec![live_session.clone()],
+            terminal_mount_epochs: HashMap::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![live_session],
+            total_leaf_sessions: 1,
+            last_action: String::new(),
+            ghostty_embedded_surface_supported: false,
+            ghostty_bridge_detail: String::new(),
+            server_daemon_detail: String::new(),
+            settings: AppSettings::default(),
+            install_context: InstallContext {
+                channel: yggterm_core::InstallChannel::Unknown,
+                update_policy: yggterm_core::UpdatePolicy::NotifyOnly,
+                repo: "test/repo".to_string(),
+                asset_label: "linux-aarch64".to_string(),
+                current_version: "0.0.0-test".to_string(),
+                executable_path: PathBuf::from("/tmp/yggterm-test"),
+                preferred_executable: None,
+                managed_root: None,
+                manager_hint: Some("test".to_string()),
+            },
+            maximized: false,
+            fullscreen: false,
+            always_on_top: false,
+            notifications: Vec::new(),
+            titlebar_new_menu_open: false,
+            titlebar_session_menu_open: false,
+            titlebar_overflow_menu_open: false,
+            alt_overlay_active: false,
+            alt_overlay_sequence: String::new(),
+            selected_tree_paths: vec![session_path.to_string()],
+            context_menu_row: None,
+            context_menu_position: None,
+            preview_layout: PreviewLayoutMode::Chat,
+            server_busy: false,
+            show_loading_tree: false,
+            ssh_connect_target: String::new(),
+            ssh_connect_prefix: String::new(),
+            pending_update_restart: None,
+            last_terminal_debug: String::new(),
+            last_tree_debug: String::new(),
+            active_title: Some("Active".to_string()),
+            active_precis: None,
+            active_summary: Some("Local shell rooted at /home/pi/gh/yggterm.".to_string()),
+            drag_paths: Vec::new(),
+            drag_hover_target: None,
+            optimistic_drag_paths: Vec::new(),
+            optimistic_drag_target: None,
+            drag_pointer: None,
+            pending_delete: None,
+            tree_rename_path: None,
+            tree_rename_value: String::new(),
+            theme_editor_open: false,
+            theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
+            theme_editor_selected_stop: None,
+            theme_accent: String::new(),
+            shell_tint: String::new(),
+            shell_gradient: String::new(),
+            optimistic_busy_paths: HashSet::new(),
+        };
+        assert!(!sidebar_row_shows_busy_icon(&snapshot, &row));
+    }
+    #[test]
     fn terminal_initial_read_error_retries_before_attach_for_socket_connect_errors() {
         let error = anyhow::anyhow!("connecting to /tmp/yggterm.sock");
-        assert!(should_retry_terminal_initial_read_error(false, 0, &error));
-        assert!(should_retry_terminal_initial_read_error(false, 3, &error));
-        assert!(!should_retry_terminal_initial_read_error(false, 4, &error));
+        assert!(should_retry_terminal_initial_read_error(
+            false, 0, 0, false, &error
+        ));
+        assert!(should_retry_terminal_initial_read_error(
+            false, 3, 120, false, &error
+        ));
+        assert!(!should_retry_terminal_initial_read_error(
+            false, 4, 200, false, &error
+        ));
+    }
+    #[test]
+    fn local_terminal_initial_read_error_retries_longer_during_daemon_startup() {
+        let error = anyhow::anyhow!("connecting to /tmp/yggterm.sock");
+        assert!(should_retry_terminal_initial_read_error(
+            false, 0, 0, true, &error
+        ));
+        assert!(should_retry_terminal_initial_read_error(
+            false, 12, 2_000, true, &error
+        ));
+        assert!(!should_retry_terminal_initial_read_error(
+            false, 24, 2_000, true, &error
+        ));
+        assert!(!should_retry_terminal_initial_read_error(
+            false, 4, 6_000, true, &error
+        ));
+    }
+    #[test]
+    fn terminal_ensure_retries_transient_missing_terminal_spec_during_restore() {
+        let error = anyhow::anyhow!("no terminal spec for session: codex://test");
+        assert!(should_retry_terminal_ensure(&error));
+        assert!(should_retry_terminal_initial_read_error(
+            false, 0, 0, true, &error
+        ));
+    }
+    #[test]
+    fn app_control_state_promotes_settings_mode_from_rendered_dom() {
+        let mut snapshot = json!({
+            "shell": {
+                "right_panel_mode": "hidden",
+            }
+        });
+        let dom = json!({
+            "active_element": {
+                "data_settings_field_key": "interface-llm"
+            },
+            "settings_interface_llm_input_rect": {
+                "width": 260.0,
+                "height": 30.0
+            }
+        });
+        coerce_app_control_shell_state_from_dom(&mut snapshot, &dom);
+        assert_eq!(
+            snapshot
+                .get("shell")
+                .and_then(Value::as_object)
+                .and_then(|shell| shell.get("right_panel_mode"))
+                .and_then(Value::as_str),
+            Some("settings")
+        );
     }
     #[test]
     fn terminal_initial_read_error_does_not_retry_after_attach() {
         let error = anyhow::anyhow!("connecting to /tmp/yggterm.sock");
-        assert!(!should_retry_terminal_initial_read_error(true, 0, &error));
+        assert!(!should_retry_terminal_initial_read_error(
+            true, 0, 0, false, &error
+        ));
     }
+    #[test]
+    fn terminal_read_error_after_attach_retries_for_local_daemon_failures() {
+        let daemon_error = anyhow::anyhow!("reading daemon response");
+        let generic_error = anyhow::anyhow!("permission denied");
+        assert!(should_retry_terminal_read_error_after_attach(
+            false,
+            &daemon_error
+        ));
+        assert!(!should_retry_terminal_read_error_after_attach(
+            false,
+            &generic_error
+        ));
+        assert!(should_retry_terminal_read_error_after_attach(
+            true,
+            &generic_error
+        ));
+    }
+    #[test]
+    fn snapshot_terminal_mount_epoch_defaults_to_zero_until_a_real_mount_exists() {
+        let session_path = "local://test";
+        let snapshot = RenderSnapshot {
+            palette: palette(UiTheme::ZedLight),
+            search_query: String::new(),
+            search_active: false,
+            command_mode_active: false,
+            search_focused: false,
+            search_command_suggestions: Vec::new(),
+            search_sidebar_matches: Vec::new(),
+            search_sidebar_match_index: None,
+            search_content_hits: Vec::new(),
+            search_content_hit_index: None,
+            sidebar_loading: false,
+            preview_loading: false,
+            preview_failure: None,
+            terminal_loading: false,
+            metadata_loading: false,
+            sidebar_open: true,
+            sidebar_width: 300.0,
+            sidebar_resizing: false,
+            right_panel_mode: RightPanelMode::Notifications,
+            rows: Vec::new(),
+            selected_path: None,
+            selected_row: None,
+            active_session: None,
+            active_session_path: None,
+            active_view_mode: WorkspaceViewMode::Rendered,
+            retained_terminal_sessions: Vec::new(),
+            terminal_mount_epochs: HashMap::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: Vec::new(),
+            total_leaf_sessions: 0,
+            last_action: String::new(),
+            ghostty_embedded_surface_supported: false,
+            ghostty_bridge_detail: String::new(),
+            server_daemon_detail: String::new(),
+            settings: AppSettings::default(),
+            install_context: InstallContext {
+                channel: yggterm_core::InstallChannel::Unknown,
+                update_policy: yggterm_core::UpdatePolicy::NotifyOnly,
+                repo: "test/repo".to_string(),
+                asset_label: "linux-aarch64".to_string(),
+                current_version: "0.0.0-test".to_string(),
+                executable_path: PathBuf::from("/tmp/yggterm-test"),
+                preferred_executable: None,
+                managed_root: None,
+                manager_hint: Some("test".to_string()),
+            },
+            maximized: false,
+            fullscreen: false,
+            always_on_top: false,
+            notifications: Vec::new(),
+            titlebar_new_menu_open: false,
+            titlebar_session_menu_open: false,
+            titlebar_overflow_menu_open: false,
+            alt_overlay_active: false,
+            alt_overlay_sequence: String::new(),
+            selected_tree_paths: Vec::new(),
+            context_menu_row: None,
+            context_menu_position: None,
+            preview_layout: PreviewLayoutMode::Chat,
+            server_busy: false,
+            show_loading_tree: false,
+            ssh_connect_target: String::new(),
+            ssh_connect_prefix: String::new(),
+            pending_update_restart: None,
+            last_terminal_debug: String::new(),
+            last_tree_debug: String::new(),
+            active_title: None,
+            active_precis: None,
+            active_summary: None,
+            drag_paths: Vec::new(),
+            drag_hover_target: None,
+            optimistic_drag_paths: Vec::new(),
+            optimistic_drag_target: None,
+            drag_pointer: None,
+            pending_delete: None,
+            tree_rename_path: None,
+            tree_rename_value: String::new(),
+            theme_editor_open: false,
+            theme_editor_draft: clamp_theme_spec(&AppSettings::default().yggui_theme),
+            theme_editor_selected_stop: None,
+            theme_accent: String::new(),
+            shell_tint: String::new(),
+            shell_gradient: String::new(),
+            optimistic_busy_paths: HashSet::new(),
+        };
+        assert_eq!(snapshot_terminal_mount_epoch(&snapshot, session_path), 0);
+    }
+    #[test]
+    fn shell_snapshot_does_not_retain_preview_only_active_stored_terminal_session() {
+        let session_path = "/home/pi/.codex/sessions/example.jsonl";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        let session = ManagedSessionView {
+            id: "stored-session".to_string(),
+            session_path: session_path.to_string(),
+            title: "Stored Session".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "localhost".to_string(),
+            source: SessionSource::Stored,
+            backend: TerminalBackend::Xterm,
+            bridge_available: true,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Queued,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: Vec::new(),
+            rendered_sections: Vec::new(),
+            preview: SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: vec![SessionMetadataEntry {
+                label: "Cwd",
+                value: "/home/pi".to_string(),
+            }],
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: true,
+        };
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(session_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(session)),
+            active_view_mode: WorkspaceViewMode::Rendered,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: Vec::new(),
+        });
+        let snapshot = shell.snapshot();
+        assert!(snapshot.retained_terminal_sessions.is_empty());
+        assert_eq!(snapshot.active_session_path.as_deref(), Some(session_path));
+    }
+
+    #[test]
+    fn viewport_ready_observation_clears_stale_terminal_resume_notification() {
+        let session_path = "/home/pi/.codex/sessions/example.jsonl";
+        let notification_key = terminal_resume_notification_job_key(session_path);
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.begin_terminal_open_attempt(session_path, "req-test", 1, "open_row");
+        shell.upsert_job_notification(
+            notification_key.clone(),
+            NotificationTone::Error,
+            "Remote Terminal Failed",
+            "The live terminal on localhost failed during restore: reading daemon response",
+            None,
+            false,
+        );
+        shell.observe_terminal_open_attempt_from_viewport(&json!({
+            "active_session_path": session_path,
+            "active_view_mode": "Terminal",
+            "ready": true,
+            "interactive": true,
+            "terminal_settled_kind": "interactive",
+            "reason": null,
+            "terminal_resume_overlay": {
+                "visible": false,
+                "kind": "",
+                "phase": "",
+                "text_sample": ""
+            },
+            "active_terminal_surface": {
+                "problem": null
+            }
+        }));
+        assert!(
+            shell
+                .notifications
+                .iter()
+                .all(|notification| notification.job_key.as_deref()
+                    != Some(notification_key.as_str()))
+        );
+        assert!(shell.terminal_session_has_ready_attempt(session_path));
+    }
+
+    #[test]
+    fn seed_dynamic_top_level_expansions_skips_live_group_for_local_live_terminal() {
+        let session_path = "local://fresh-shell";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        let session = ManagedSessionView {
+            id: "fresh-shell".to_string(),
+            session_path: session_path.to_string(),
+            title: "Dev Yggterm".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "local".to_string(),
+            source: SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: true,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: Vec::new(),
+            rendered_sections: Vec::new(),
+            preview: SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: vec![SessionMetadataEntry {
+                label: "Cwd",
+                value: "/home/pi/gh/yggterm".to_string(),
+            }],
+            terminal_process_id: None,
+            terminal_foreground_active: Some(false),
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: Some("localhost".to_string()),
+            ssh_prefix: None,
+            stored_preview_hydrated: true,
+        };
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(session_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(session.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![snapshot_session_view_for_ui(session)],
+        });
+
+        shell.seed_dynamic_top_level_expansions();
+
+        assert!(
+            !shell
+                .browser
+                .expanded_paths()
+                .iter()
+                .any(|path| path == "__live_sessions__")
+        );
+        assert!(
+            shell
+                .browser
+                .expanded_paths()
+                .iter()
+                .any(|path| path == "local")
+        );
+        assert!(
+            shell
+                .browser
+                .expanded_paths()
+                .iter()
+                .any(|path| path == "/home")
+        );
+        assert!(
+            shell
+                .browser
+                .expanded_paths()
+                .iter()
+                .any(|path| path == "/home/pi")
+        );
+    }
+    #[test]
+    fn is_live_sidebar_row_accepts_stored_codex_session_paths() {
+        let codex_row = test_sidebar_row("/home/pi/.codex/sessions/example.jsonl");
+        let litellm_row = test_sidebar_row("/home/pi/.codex-litellm/sessions/example.jsonl");
+        assert!(is_live_sidebar_row(&codex_row));
+        assert!(is_live_sidebar_row(&litellm_row));
+    }
+    #[test]
+    fn shell_snapshot_retains_all_live_hot_terminal_sessions() {
+        let active_path = "local://fresh-shell";
+        let codex_path = "/home/pi/.codex/sessions/example.jsonl";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(active_path));
+        let active_session = ManagedSessionView {
+            id: "fresh-shell".to_string(),
+            session_path: active_path.to_string(),
+            title: "/home/pi shell".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "local-shell".to_string(),
+            source: SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: true,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: "pi@dev:~/gh/yggterm$".to_string(),
+            terminal_lines: vec!["pi@dev:~/gh/yggterm$".to_string()],
+            rendered_sections: Vec::new(),
+            preview: SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: vec![SessionMetadataEntry {
+                label: "Cwd",
+                value: "/home/pi/gh/yggterm".to_string(),
+            }],
+            terminal_process_id: Some(42),
+            terminal_foreground_active: Some(false),
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+        let codex_session = ManagedSessionView {
+            id: "stored-live-codex".to_string(),
+            session_path: codex_path.to_string(),
+            title: "Please Sudo Apt Install Wezterm".to_string(),
+            kind: SessionKind::Codex,
+            host_label: "localhost".to_string(),
+            source: SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: true,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: "codex".to_string(),
+            status_line: "› Find and fix a bug in @filename".to_string(),
+            terminal_lines: vec!["• wezterm is installed and available".to_string()],
+            rendered_sections: Vec::new(),
+            preview: SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: vec![SessionMetadataEntry {
+                label: "Cwd",
+                value: "/home/pi".to_string(),
+            }],
+            terminal_process_id: Some(77),
+            terminal_foreground_active: Some(false),
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: true,
+        };
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(active_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(active_session.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![
+                snapshot_session_view_for_ui(active_session),
+                snapshot_session_view_for_ui(codex_session),
+            ],
+        });
+        shell.sync_live_terminal_retention();
+        let snapshot = shell.snapshot();
+        let retained_paths = snapshot
+            .retained_terminal_sessions
+            .iter()
+            .map(|session| session.session_path.as_str())
+            .collect::<HashSet<_>>();
+        assert!(retained_paths.contains(active_path));
+        assert!(retained_paths.contains(codex_path));
+    }
+    #[test]
+    fn shell_snapshot_retains_active_stored_terminal_session_in_terminal_view() {
+        let session_path = "/home/pi/.codex/sessions/example.jsonl";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        let session = ManagedSessionView {
+            id: "stored-session".to_string(),
+            session_path: session_path.to_string(),
+            title: "Stored Session".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "localhost".to_string(),
+            source: SessionSource::Stored,
+            backend: TerminalBackend::Xterm,
+            bridge_available: true,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Queued,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: Vec::new(),
+            rendered_sections: Vec::new(),
+            preview: SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: vec![SessionMetadataEntry {
+                label: "Cwd",
+                value: "/home/pi".to_string(),
+            }],
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: true,
+        };
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(session_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(session)),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: Vec::new(),
+        });
+        let snapshot = shell.snapshot();
+        assert_eq!(snapshot.retained_terminal_sessions.len(), 1);
+        assert_eq!(
+            snapshot.retained_terminal_sessions[0].session_path,
+            session_path
+        );
+    }
+
+    #[test]
+    fn shell_snapshot_trims_inactive_live_payloads_for_sidebar_and_retention() {
+        let active_path = "local://active";
+        let inactive_path = "remote-session://jojo/heavy";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(active_path));
+        let heavy_lines = (0..160)
+            .map(|ix| format!("terminal line {ix}"))
+            .collect::<Vec<_>>();
+        let heavy_preview_lines = (0..24)
+            .map(|ix| format!("preview line {ix}"))
+            .collect::<Vec<_>>();
+        let heavy_rendered_lines = (0..24)
+            .map(|ix| format!("rendered line {ix}"))
+            .collect::<Vec<_>>();
+        let active_session = ManagedSessionView {
+            id: "active".to_string(),
+            session_path: active_path.to_string(),
+            title: "Active".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "localhost".to_string(),
+            source: SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: true,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: "bash".to_string(),
+            status_line: "pi@dev:~$".to_string(),
+            terminal_lines: heavy_lines.clone(),
+            rendered_sections: vec![SessionRenderedSection {
+                title: "Recent",
+                lines: heavy_rendered_lines.clone(),
+            }],
+            preview: SessionPreview {
+                summary: vec![SessionMetadataEntry {
+                    label: "Summary",
+                    value: "Active summary".to_string(),
+                }],
+                blocks: vec![SessionPreviewBlock {
+                    role: "ASSISTANT",
+                    timestamp: "now".to_string(),
+                    tone: PreviewTone::Assistant,
+                    folded: false,
+                    lines: heavy_preview_lines.clone(),
+                }],
+            },
+            metadata: vec![SessionMetadataEntry {
+                label: "Cwd",
+                value: "/home/pi".to_string(),
+            }],
+            terminal_process_id: Some(11),
+            terminal_foreground_active: Some(false),
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: true,
+        };
+        let inactive_session = ManagedSessionView {
+            id: "inactive".to_string(),
+            session_path: inactive_path.to_string(),
+            title: "Inactive".to_string(),
+            kind: SessionKind::SshShell,
+            host_label: "jojo".to_string(),
+            source: SessionSource::LiveSsh,
+            backend: TerminalBackend::Xterm,
+            bridge_available: true,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::Ready,
+            launch_command: "ssh jojo".to_string(),
+            status_line: "ready".to_string(),
+            terminal_lines: heavy_lines.clone(),
+            rendered_sections: vec![SessionRenderedSection {
+                title: "Rendered",
+                lines: heavy_rendered_lines.clone(),
+            }],
+            preview: SessionPreview {
+                summary: vec![SessionMetadataEntry {
+                    label: "Summary",
+                    value: "Inactive summary".to_string(),
+                }],
+                blocks: vec![SessionPreviewBlock {
+                    role: "ASSISTANT",
+                    timestamp: "later".to_string(),
+                    tone: PreviewTone::Assistant,
+                    folded: false,
+                    lines: heavy_preview_lines,
+                }],
+            },
+            metadata: vec![SessionMetadataEntry {
+                label: "Cwd",
+                value: "/home/pi".to_string(),
+            }],
+            terminal_process_id: Some(12),
+            terminal_foreground_active: Some(false),
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: Some("jojo".to_string()),
+            ssh_prefix: None,
+            stored_preview_hydrated: true,
+        };
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(active_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(active_session.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![
+                snapshot_session_view_for_ui(active_session),
+                snapshot_session_view_for_ui(inactive_session),
+            ],
+        });
+        shell.sync_live_terminal_retention();
+
+        let snapshot = shell.snapshot();
+        let active = snapshot.active_session.as_ref().expect("active session");
+        assert_eq!(active.terminal_lines.len(), 160);
+        assert_eq!(active.preview.blocks[0].lines.len(), 24);
+
+        let sidebar_inactive = snapshot
+            .live_sessions
+            .iter()
+            .find(|session| session.session_path == inactive_path)
+            .expect("inactive live session");
+        assert_eq!(
+            sidebar_inactive.terminal_lines.len(),
+            SNAPSHOT_LIVE_TERMINAL_LINE_LIMIT
+        );
+        assert_eq!(
+            sidebar_inactive.rendered_sections[0].lines.len(),
+            SNAPSHOT_RENDERED_SECTION_LINE_LIMIT
+        );
+
+        let retained_inactive = snapshot
+            .retained_terminal_sessions
+            .iter()
+            .find(|session| session.session_path == inactive_path)
+            .expect("inactive retained session");
+        assert_eq!(
+            retained_inactive.terminal_lines.len(),
+            SNAPSHOT_RETAINED_TERMINAL_LINE_LIMIT
+        );
+        assert_eq!(
+            retained_inactive.preview.blocks[0].lines.len(),
+            SNAPSHOT_PREVIEW_BLOCK_LINE_LIMIT
+        );
+    }
+
     #[test]
     fn terminal_bootstrap_waits_for_initial_active_terminal_epoch_sync() {
         assert!(terminal_bootstrap_should_wait_for_mount_epoch_sync(
@@ -34557,6 +40259,77 @@ Waiting for the remote terminal to paint...\n";
         );
     }
     #[test]
+    fn local_terminal_prefill_text_uses_hot_session_terminal_lines_and_status() {
+        let session = ManagedSessionView {
+            id: "abc".to_string(),
+            session_path: "/home/pi/.codex/sessions/2026/04/04/rollout-2026-04-04T17-07-32.jsonl"
+                .to_string(),
+            title: "Please Sudo Apt Install Wezterm".to_string(),
+            kind: SessionKind::Codex,
+            host_label: "localhost".to_string(),
+            source: yggterm_server::SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: yggterm_server::RemoteDeployState::NotRequired,
+            launch_command: "codex".to_string(),
+            status_line: "› Explain this codebase".to_string(),
+            terminal_lines: vec![
+                "• I had to add WezTerm’s official APT repository".to_string(),
+                "• wezterm is installed and available".to_string(),
+            ],
+            rendered_sections: Vec::new(),
+            preview: yggterm_server::SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: Vec::new(),
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+        assert_eq!(
+            local_terminal_prefill_text(&session).as_deref(),
+            Some(
+                "• I had to add WezTerm’s official APT repository\r\n• wezterm is installed and available\r\n› Explain this codebase\r\n"
+            )
+        );
+    }
+    #[test]
+    fn local_retained_terminal_surface_ready_accepts_prefilled_hot_mount() {
+        assert!(local_retained_terminal_surface_ready(
+            false, true, true, true, "", "",
+        ));
+        assert!(local_retained_terminal_surface_ready(
+            false,
+            true,
+            true,
+            false,
+            "pi@dev:~$",
+            "",
+        ));
+        assert!(!local_retained_terminal_surface_ready(
+            false, true, true, false, "", "",
+        ));
+        assert!(!local_retained_terminal_surface_ready(
+            true,
+            true,
+            true,
+            true,
+            "pi@jojo:~$",
+            "",
+        ));
+    }
+    #[test]
     fn terminal_resume_output_excerpt_strips_saved_transcript_boilerplate() {
         let data = "\
 Saved transcript · jojo · typing takes over the live terminal\r\n\
@@ -34758,6 +40531,32 @@ Updated at   Branch  Conversation\n\
         assert!(terminal_resume_notification_should_stay_visible_for_session(false, false, false));
         assert!(terminal_resume_notification_should_stay_visible_for_session(false, true, true));
         assert!(!terminal_resume_notification_should_stay_visible_for_session(false, true, false));
+    }
+    #[test]
+    fn abbreviated_shell_label_detection_flags_short_ui_titles() {
+        assert!(title_looks_like_abbreviated_shell_label("Dev Sta"));
+        assert!(title_looks_like_abbreviated_shell_label("Git UI"));
+        assert!(!title_looks_like_abbreviated_shell_label("Yggterm Shell"));
+        assert!(!title_looks_like_abbreviated_shell_label(
+            "Please Sudo Apt Install Wezterm"
+        ));
+    }
+    #[test]
+    fn humanized_title_for_copy_target_uses_home_user_shell_title() {
+        let target = CopyGenerationTarget {
+            session_path: "local://active".to_string(),
+            session_id: "active".to_string(),
+            cwd: "/home/pi".to_string(),
+            title: "Dev Sta".to_string(),
+            source_updated_at: None,
+            remote_context: None,
+            remote_machine: None,
+            storage_path: None,
+        };
+        assert_eq!(
+            humanized_title_for_copy_target(&target).as_deref(),
+            Some("Pi Home Shell")
+        );
     }
 }
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]

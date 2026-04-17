@@ -1,4 +1,4 @@
-use crate::codex_cli::terminal_identity_env_pairs;
+use crate::codex_cli::{terminal_identity_env_pairs, terminal_identity_env_removals};
 use anyhow::{Context, Result, bail};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::{HashMap, VecDeque};
@@ -118,6 +118,18 @@ impl TerminalManager {
 
     pub fn session_runtime_age_ms(&self, key: &str) -> Option<u64> {
         self.sessions.get(key).map(|session| session.age_ms())
+    }
+
+    pub fn session_process_id(&self, key: &str) -> Option<u32> {
+        self.sessions
+            .get(key)
+            .and_then(|session| session.process_id())
+    }
+
+    pub fn session_foreground_process_active(&self, key: &str) -> Option<bool> {
+        self.sessions
+            .get(key)
+            .and_then(|session| session.foreground_process_active())
     }
 
     pub fn session_snapshot(&self, key: &str) -> Option<String> {
@@ -486,6 +498,33 @@ impl PtySessionRuntime {
         }
     }
 
+    fn process_id(&self) -> Option<u32> {
+        let child = self.child.lock().expect("pty child lock poisoned");
+        child.process_id()
+    }
+
+    #[cfg(unix)]
+    fn foreground_process_group_leader(&self) -> Option<u32> {
+        let master = self.master.lock().expect("pty master lock poisoned");
+        let fd = master.as_raw_fd()?;
+        let pgid = unsafe { libc::tcgetpgrp(fd) };
+        (pgid > 0).then_some(pgid as u32)
+    }
+
+    #[cfg(not(unix))]
+    fn foreground_process_group_leader(&self) -> Option<u32> {
+        None
+    }
+
+    fn foreground_process_active(&self) -> Option<bool> {
+        if !self.is_running() {
+            return Some(false);
+        }
+        let child_pid = self.process_id()?;
+        let foreground_pgid = self.foreground_process_group_leader()?;
+        Some(foreground_pgid != child_pid)
+    }
+
     fn has_output(&self) -> bool {
         self.seq.load(Ordering::SeqCst) > 0
             || self.retained_bytes.load(Ordering::SeqCst) > 0
@@ -561,6 +600,14 @@ impl PtySessionRuntime {
         if cursor == 0 && chunks.is_empty() {
             chunks =
                 select_initial_attach_chunks_for_launch(&retained_chunks, &self.launch_command);
+        }
+        if cursor == 0
+            && !chunks
+                .iter()
+                .any(|chunk| terminal_chunk_has_visible_text(&chunk.data))
+            && let Some(snapshot_chunk) = self.screen_snapshot_chunk(next_cursor)
+        {
+            chunks = vec![snapshot_chunk];
         }
         if cursor == 0
             && self.is_running()
@@ -716,6 +763,9 @@ fn shell_command(launch_command: &str, cwd: Option<&str>) -> CommandBuilder {
         let mut command = CommandBuilder::new("cmd.exe");
         command.arg("/C");
         command.arg(launch_command);
+        for key in terminal_identity_env_removals() {
+            command.env_remove(key);
+        }
         for (key, value) in terminal_identity_env_pairs() {
             command.env(key, value);
         }
@@ -734,6 +784,9 @@ fn shell_command(launch_command: &str, cwd: Option<&str>) -> CommandBuilder {
         launch_command.to_string()
     };
     command.arg(wrapped_launch_command);
+    for key in terminal_identity_env_removals() {
+        command.env_remove(key);
+    }
     for (key, value) in terminal_identity_env_pairs() {
         command.env(key, value);
     }
@@ -1125,6 +1178,33 @@ mod tests {
     }
 
     #[test]
+    fn initial_attach_falls_back_to_screen_snapshot_when_local_chunk_buffer_is_empty() {
+        let runtime = PtySessionRuntime::spawn(
+            "local://test-shell",
+            "printf 'pi@dev:~/gh/yggterm$ echo ready\n'",
+            None,
+        )
+        .expect("spawn test runtime");
+        runtime.seed_snapshot("pi@dev:~/gh/yggterm$ echo ready\n");
+        runtime
+            .chunks
+            .lock()
+            .expect("pty chunk lock poisoned")
+            .clear();
+        runtime.retained_bytes.store(0, Ordering::SeqCst);
+
+        let read = runtime.read(0);
+        let combined = read
+            .chunks
+            .iter()
+            .map(|chunk| chunk.data.as_str())
+            .collect::<String>();
+
+        assert!(combined.contains("pi@dev:~/gh/yggterm$ echo ready"));
+        runtime.shutdown(None).expect("shutdown test runtime");
+    }
+
+    #[test]
     fn initial_attach_selection_keeps_last_meaningful_surface_ahead_of_trailing_noise() {
         let mut chunks = VecDeque::new();
         chunks.push_back(TerminalChunk {
@@ -1337,6 +1417,40 @@ mod tests {
 
         assert!(!combined.contains("__YGGTERM_ATTACH_READY__"));
         runtime.shutdown(None).expect("shutdown test runtime");
+    }
+
+    #[test]
+    fn spawned_terminal_shell_removes_no_color_from_child_env() {
+        let previous = std::env::var_os("NO_COLOR");
+        unsafe {
+            std::env::set_var("NO_COLOR", "1");
+        }
+        let runtime = PtySessionRuntime::spawn(
+            "local://env-test",
+            "python3 -c 'import os,sys; sys.stdout.write(os.getenv(\"NO_COLOR\", \"<unset>\"))'",
+            None,
+        )
+        .expect("spawn env test runtime");
+        let mut combined = String::new();
+        for _ in 0..40 {
+            let read = runtime.read(0);
+            combined = read
+                .chunks
+                .iter()
+                .map(|chunk| chunk.data.as_str())
+                .collect::<String>();
+            if !combined.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        runtime.shutdown(None).expect("shutdown test runtime");
+        match previous {
+            Some(value) => unsafe { std::env::set_var("NO_COLOR", value) },
+            None => unsafe { std::env::remove_var("NO_COLOR") },
+        }
+        assert!(combined.contains("<unset>"));
+        assert!(!combined.contains("1"));
     }
 
     #[test]

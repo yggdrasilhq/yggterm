@@ -14,6 +14,7 @@ const MANAGED_NPM_CACHE_DIRNAME: &str = "npm-cache";
 const EXPORTED_TERM_PROGRAM: &str = "vscode";
 const YGGTERM_TERM_PROGRAM: &str = "yggterm";
 const YGGTERM_TERM_PROGRAM_VERSION: &str = env!("CARGO_PKG_VERSION");
+const TERMINAL_IDENTITY_ENV_REMOVALS: &[&str] = &["NO_COLOR"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -222,17 +223,31 @@ pub(crate) fn terminal_identity_env_pairs() -> Vec<(&'static str, String)> {
     terminal_identity_env_pairs_with_home(true)
 }
 
+pub(crate) fn terminal_identity_env_removals() -> &'static [&'static str] {
+    TERMINAL_IDENTITY_ENV_REMOVALS
+}
+
 pub(crate) fn terminal_identity_shell_exports() -> Vec<String> {
-    terminal_identity_env_pairs()
-        .into_iter()
-        .map(|(key, value)| format!("export {key}={}", shell_single_quote(&value)))
+    terminal_identity_env_removals()
+        .iter()
+        .map(|key| format!("unset {key}"))
+        .chain(
+            terminal_identity_env_pairs()
+                .into_iter()
+                .map(|(key, value)| format!("export {key}={}", shell_single_quote(&value))),
+        )
         .collect()
 }
 
 pub(crate) fn terminal_identity_shell_exports_for_remote() -> Vec<String> {
-    terminal_identity_env_pairs_with_home(false)
-        .into_iter()
-        .map(|(key, value)| format!("export {key}={}", shell_single_quote(&value)))
+    terminal_identity_env_removals()
+        .iter()
+        .map(|key| format!("unset {key}"))
+        .chain(
+            terminal_identity_env_pairs_with_home(false)
+                .into_iter()
+                .map(|(key, value)| format!("export {key}={}", shell_single_quote(&value))),
+        )
         .collect()
 }
 
@@ -244,6 +259,9 @@ pub(crate) fn sync_terminal_identity_env(theme: UiTheme) {
     // The daemon owns terminal launch commands and needs a process-wide identity for child PTYs
     // and remote shell command synthesis. This is updated on startup/theme changes only.
     unsafe {
+        for key in terminal_identity_env_removals() {
+            env::remove_var(key);
+        }
         env::set_var("TERM", "xterm-256color");
         env::set_var("COLORTERM", "truecolor");
         env::set_var("TERM_PROGRAM", EXPORTED_TERM_PROGRAM);
@@ -251,6 +269,31 @@ pub(crate) fn sync_terminal_identity_env(theme: UiTheme) {
         env::set_var("YGGTERM_TERM_PROGRAM", YGGTERM_TERM_PROGRAM);
         env::set_var("YGGTERM_APPEARANCE", appearance);
         env::set_var("COLORFGBG", colorfgbg_for_appearance(appearance));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_identity_shell_exports_unset_no_color() {
+        let exports = terminal_identity_shell_exports();
+        assert_eq!(exports.first().map(String::as_str), Some("unset NO_COLOR"));
+    }
+
+    #[test]
+    fn sync_terminal_identity_env_removes_no_color() {
+        let previous = env::var_os("NO_COLOR");
+        unsafe {
+            env::set_var("NO_COLOR", "1");
+        }
+        sync_terminal_identity_env(UiTheme::ZedLight);
+        assert!(env::var_os("NO_COLOR").is_none());
+        match previous {
+            Some(value) => unsafe { env::set_var("NO_COLOR", value) },
+            None => unsafe { env::remove_var("NO_COLOR") },
+        }
     }
 }
 
