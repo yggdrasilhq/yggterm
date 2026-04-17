@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+#[cfg(target_os = "linux")]
 use cairo::{Context as CairoContext, Format, ImageSurface, Surface};
 use dioxus::desktop::DesktopContext;
 use serde_json::{Value, json};
