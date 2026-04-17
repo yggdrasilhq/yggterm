@@ -9,7 +9,6 @@ license = "Apache-2.0"
 yggui-contract = { path = "../yggui-contract" }
 anyhow.workspace = true
 base64 = "0.22"
-cairo-rs = { version = "0.18.5", features = ["png"] }
 dioxus = { version = "0.7.3", features = ["desktop"] }
 dioxus-desktop = "0.7.3"
 include_dir = "0.7"

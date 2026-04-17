@@ -8,7 +8,6 @@ license = "Apache-2.0"
 [dependencies]
 anyhow.workspace = true
 base64 = "0.22"
-cairo-rs = { version = "0.18.5", features = ["png"] }
 dioxus = { version = "0.7.3", features = ["desktop"] }
 dioxus-desktop = "0.7.3"
 include_dir = "0.7"
@@ -29,5 +28,6 @@ yggui = { path = "../yggui" }
 yggui-contract = { path = "../yggui-contract" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+cairo-rs = { version = "0.18.5", features = ["png"] }
 webkit2gtk = { version = "=2.0.1", features = ["v2_38"] }
 wry = "0.53.5"
