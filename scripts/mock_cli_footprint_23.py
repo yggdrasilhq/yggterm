@@ -23,6 +23,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--idle-wait-ms", type=int, default=14000)
     parser.add_argument("--idle-shutdown-ms", type=int, default=120000)
     parser.add_argument("--rss-ceiling-mib", type=int, default=384)
+    parser.add_argument("--iterations", type=int, default=3)
+    parser.add_argument("--growth-tolerance-mib", type=int, default=32)
     return parser.parse_args()
 
 
@@ -135,6 +137,31 @@ def cpu_time_ms_for_pid(pid: int) -> int:
     return int(((utime + stime) * 1000) / max(clk_tck, 1))
 
 
+def wait_for_trim_status(
+    mock_bin: str,
+    env: dict[str, str],
+    out_dir: Path,
+    name: str,
+    *,
+    idle_cap: int,
+    minimum_wait_ms: int,
+    poll_ms: int = 1000,
+) -> tuple[subprocess.CompletedProcess, dict]:
+    deadline = time.monotonic() + (max(minimum_wait_ms, 15000) / 1000.0)
+    last_result: subprocess.CompletedProcess | None = None
+    last_status: dict = {}
+    while time.monotonic() < deadline:
+        last_result, status_events = mock_cli(mock_bin, env, out_dir, name, "--scenario", "status")
+        last_status = scenario_result_data(status_events)
+        session_count = int(last_status.get("terminal_session_count") or 0)
+        retained_bytes = int(last_status.get("terminal_retained_bytes") or 0)
+        budget_bytes = max(session_count * idle_cap, 2 * 1024 * 1024) if idle_cap > 0 else 0
+        if last_result.returncode == 0 and budget_bytes > 0 and retained_bytes <= budget_bytes:
+            return last_result, last_status
+        time.sleep(poll_ms / 1000.0)
+    return last_result or subprocess.CompletedProcess([], 1), last_status
+
+
 def main() -> int:
     args = parse_args()
     out_dir = Path(args.out_dir)
@@ -150,6 +177,7 @@ def main() -> int:
 
     checks: list[dict] = []
     daemon_proc: subprocess.Popen | None = None
+    iteration_samples: list[dict] = []
 
     def record(name: str, passed: bool, details: dict) -> None:
         checks.append({"name": name, "passed": passed, "details": details})
@@ -183,98 +211,161 @@ def main() -> int:
             status0,
         )
 
-        footprint_result, footprint_events = mock_cli(
-            args.mock_bin,
-            env,
-            out_dir,
-            "03-terminal-footprint",
-            "--scenario",
-            "terminal-footprint",
-            "--session-count",
-            str(args.session_count),
-            "--burst-bytes",
-            str(args.burst_bytes),
-        )
-        footprint = scenario_result_data(footprint_events)
-        session_paths = footprint.get("session_paths") or []
-        retained_bytes = int(footprint.get("terminal_retained_bytes") or 0)
-        session_count = int(footprint.get("terminal_session_count") or 0)
-        session_cap = int(footprint.get("terminal_session_buffer_limit_bytes") or 0)
-        idle_cap = int(footprint.get("terminal_idle_buffer_limit_bytes") or 0)
-        pids = live_daemon_pids_for_home(home)
-        rss_peak = max((rss_bytes_for_pid(pid) for pid in pids), default=0)
-        record("footprint_scenario_ok", footprint_result.returncode == 0, footprint)
-        record("footprint_created_23_sessions", len(session_paths) == args.session_count, {"session_paths": session_paths})
-        record("footprint_session_count_at_least_23", session_count >= args.session_count, footprint)
-        record("footprint_retained_bytes_nonzero", retained_bytes > 0, footprint)
-        record(
-            "footprint_retained_bytes_bounded_per_session",
-            session_cap > 0 and retained_bytes <= session_count * session_cap,
-            footprint,
-        )
-        record(
-            "footprint_retained_bytes_under_64mib",
-            retained_bytes <= 64 * 1024 * 1024,
-            {"retained_bytes": retained_bytes},
-        )
-        record(
-            "daemon_rss_under_ceiling",
-            rss_peak <= args.rss_ceiling_mib * 1024 * 1024,
-            {"rss_bytes": rss_peak, "rss_ceiling_mib": args.rss_ceiling_mib},
-        )
+        growth_tolerance_bytes = args.growth_tolerance_mib * 1024 * 1024
+        session_cap = 0
+        idle_cap = 0
+        retained_bytes = 0
+        trimmed_bytes = 0
+        rss_peak = 0
+        rss_after_trim = 0
+        session_count = 0
+        for iteration in range(args.iterations):
+            name_prefix = f"{iteration + 1:02d}"
+            footprint_result, footprint_events = mock_cli(
+                args.mock_bin,
+                env,
+                out_dir,
+                f"{name_prefix}-terminal-footprint",
+                "--scenario",
+                "terminal-footprint",
+                "--session-count",
+                str(args.session_count),
+                "--burst-bytes",
+                str(args.burst_bytes),
+            )
+            footprint = scenario_result_data(footprint_events)
+            session_paths = footprint.get("session_paths") or []
+            retained_bytes = int(footprint.get("terminal_retained_bytes") or 0)
+            session_count = int(footprint.get("terminal_session_count") or 0)
+            session_cap = int(footprint.get("terminal_session_buffer_limit_bytes") or 0)
+            idle_cap = int(footprint.get("terminal_idle_buffer_limit_bytes") or 0)
+            pids = live_daemon_pids_for_home(home)
+            rss_peak = max((rss_bytes_for_pid(pid) for pid in pids), default=0)
+            record(f"footprint_scenario_ok_{name_prefix}", footprint_result.returncode == 0, footprint)
+            record(
+                f"footprint_created_{args.session_count}_sessions_{name_prefix}",
+                len(session_paths) == args.session_count,
+                {"session_paths": session_paths},
+            )
+            record(
+                f"footprint_session_count_at_least_{args.session_count}_{name_prefix}",
+                session_count >= args.session_count,
+                footprint,
+            )
+            record(f"footprint_retained_bytes_nonzero_{name_prefix}", retained_bytes > 0, footprint)
+            record(
+                f"footprint_retained_bytes_bounded_per_session_{name_prefix}",
+                session_cap > 0 and retained_bytes <= session_count * session_cap,
+                footprint,
+            )
+            record(
+                f"footprint_retained_bytes_under_64mib_{name_prefix}",
+                retained_bytes <= 64 * 1024 * 1024,
+                {"retained_bytes": retained_bytes},
+            )
+            record(
+                f"daemon_rss_under_ceiling_{name_prefix}",
+                rss_peak <= args.rss_ceiling_mib * 1024 * 1024,
+                {"rss_bytes": rss_peak, "rss_ceiling_mib": args.rss_ceiling_mib},
+            )
+            record(
+                f"single_daemon_after_load_{name_prefix}",
+                len(pids) == 1,
+                {"pids": pids},
+            )
 
-        status_after_result, status_after_events = mock_cli(args.mock_bin, env, out_dir, "04-status-after-load", "--scenario", "status")
-        status1 = scenario_result_data(status_after_events)
-        record("status_after_load_ok", status_after_result.returncode == 0, status1)
-        record(
-            "status_matches_loaded_terminal_bytes",
-            int(status1.get("terminal_retained_bytes") or -1) == retained_bytes,
-            {"loaded": retained_bytes, "status": status1.get("terminal_retained_bytes")},
-        )
-        record(
-            "status_matches_loaded_session_count",
-            int(status1.get("terminal_session_count") or -1) == session_count,
-            {"loaded": session_count, "status": status1.get("terminal_session_count")},
-        )
+            status_after_result, status_after_events = mock_cli(
+                args.mock_bin,
+                env,
+                out_dir,
+                f"{name_prefix}-status-after-load",
+                "--scenario",
+                "status",
+            )
+            status1 = scenario_result_data(status_after_events)
+            record(f"status_after_load_ok_{name_prefix}", status_after_result.returncode == 0, status1)
+            record(
+                f"status_matches_loaded_terminal_bytes_{name_prefix}",
+                int(status1.get("terminal_retained_bytes") or -1) == retained_bytes,
+                {"loaded": retained_bytes, "status": status1.get("terminal_retained_bytes")},
+            )
+            record(
+                f"status_matches_loaded_session_count_{name_prefix}",
+                int(status1.get("terminal_session_count") or -1) == session_count,
+                {"loaded": session_count, "status": status1.get("terminal_session_count")},
+            )
 
-        ping_after = run([str(Path(args.bin).resolve()), "server", "ping"], env=env, check=False)
-        record("ping_after_load_ok", ping_after.returncode == 0, {"returncode": ping_after.returncode})
+            ping_after = run([str(Path(args.bin).resolve()), "server", "ping"], env=env, check=False)
+            record(f"ping_after_load_ok_{name_prefix}", ping_after.returncode == 0, {"returncode": ping_after.returncode})
 
-        snapshot_result, snapshot_events = mock_cli(args.mock_bin, env, out_dir, "05-snapshot-after-load", "--scenario", "snapshot")
-        snapshot_data = scenario_result_data(snapshot_events)
-        record("snapshot_after_load_ok", snapshot_result.returncode == 0, snapshot_data)
+            snapshot_result, snapshot_events = mock_cli(
+                args.mock_bin,
+                env,
+                out_dir,
+                f"{name_prefix}-snapshot-after-load",
+                "--scenario",
+                "snapshot",
+            )
+            snapshot_data = scenario_result_data(snapshot_events)
+            record(f"snapshot_after_load_ok_{name_prefix}", snapshot_result.returncode == 0, snapshot_data)
 
-        time.sleep(args.idle_wait_ms / 1000.0)
-        status_trim_result, status_trim_events = mock_cli(args.mock_bin, env, out_dir, "06-status-after-trim", "--scenario", "status")
-        status2 = scenario_result_data(status_trim_events)
-        trimmed_bytes = int(status2.get("terminal_retained_bytes") or 0)
-        pids = live_daemon_pids_for_home(home)
-        rss_after_trim = max((rss_bytes_for_pid(pid) for pid in pids), default=0)
-        record("post_trim_status_ok", status_trim_result.returncode == 0, status2)
-        record(
-            "idle_trim_reduced_or_equal_bytes",
-            trimmed_bytes <= retained_bytes,
-            {"before": retained_bytes, "after": trimmed_bytes},
-        )
-        record(
-            "idle_trim_converges_near_idle_budget",
-            idle_cap > 0 and trimmed_bytes <= max(args.session_count * idle_cap, 2 * 1024 * 1024),
-            {"trimmed_bytes": trimmed_bytes, "idle_cap": idle_cap, "session_count": args.session_count},
-        )
-        record(
-            "daemon_alive_after_trim",
-            daemon_proc.poll() is None and bool(live_daemon_pids_for_home(home)),
-            {"poll": daemon_proc.poll(), "pids": live_daemon_pids_for_home(home)},
-        )
-        record(
-            "rss_not_worse_after_trim",
-            rss_after_trim <= rss_peak + (16 * 1024 * 1024),
-            {
-                "rss_peak": rss_peak,
-                "rss_after_trim": rss_after_trim,
-                "tolerance_bytes": 16 * 1024 * 1024,
-            },
-        )
+            status_trim_result, status2 = wait_for_trim_status(
+                args.mock_bin,
+                env,
+                out_dir,
+                f"{name_prefix}-status-after-trim",
+                idle_cap=idle_cap,
+                minimum_wait_ms=args.idle_wait_ms,
+            )
+            trimmed_bytes = int(status2.get("terminal_retained_bytes") or 0)
+            trimmed_session_count = int(status2.get("terminal_session_count") or 0)
+            pids = live_daemon_pids_for_home(home)
+            rss_after_trim = max((rss_bytes_for_pid(pid) for pid in pids), default=0)
+            record(f"post_trim_status_ok_{name_prefix}", status_trim_result.returncode == 0, status2)
+            record(
+                f"idle_trim_reduced_or_equal_bytes_{name_prefix}",
+                trimmed_bytes <= retained_bytes,
+                {"before": retained_bytes, "after": trimmed_bytes},
+            )
+            record(
+                f"idle_trim_converges_near_idle_budget_{name_prefix}",
+                idle_cap > 0 and trimmed_bytes <= max(trimmed_session_count * idle_cap, 2 * 1024 * 1024),
+                {
+                    "trimmed_bytes": trimmed_bytes,
+                    "idle_cap": idle_cap,
+                    "session_count": trimmed_session_count,
+                    "minimum_wait_ms": args.idle_wait_ms,
+                },
+            )
+            record(
+                f"daemon_alive_after_trim_{name_prefix}",
+                daemon_proc.poll() is None and bool(pids),
+                {"poll": daemon_proc.poll(), "pids": pids},
+            )
+            record(
+                f"rss_not_worse_after_trim_{name_prefix}",
+                rss_after_trim <= rss_peak + (16 * 1024 * 1024),
+                {
+                    "rss_peak": rss_peak,
+                    "rss_after_trim": rss_after_trim,
+                    "tolerance_bytes": 16 * 1024 * 1024,
+                },
+            )
+            record(
+                f"single_daemon_after_trim_{name_prefix}",
+                len(pids) == 1,
+                {"pids": pids},
+            )
+            iteration_samples.append(
+                {
+                    "iteration": iteration + 1,
+                    "loaded_retained_bytes": retained_bytes,
+                    "trimmed_retained_bytes": trimmed_bytes,
+                    "rss_peak": rss_peak,
+                    "rss_after_trim": rss_after_trim,
+                    "session_count": session_count,
+                }
+            )
 
         pids = live_daemon_pids_for_home(home)
         idle_pid = pids[0] if pids else 0
@@ -293,26 +384,26 @@ def main() -> int:
             },
         )
 
-        footprint2_result, footprint2_events = mock_cli(
-            args.mock_bin,
-            env,
-            out_dir,
-            "07-terminal-footprint-second-pass",
-            "--scenario",
-            "terminal-footprint",
-            "--session-count",
-            str(args.session_count),
-            "--burst-bytes",
-            str(args.burst_bytes),
-        )
-        footprint2 = scenario_result_data(footprint2_events)
-        retained_bytes2 = int(footprint2.get("terminal_retained_bytes") or 0)
-        session_count2 = int(footprint2.get("terminal_session_count") or 0)
-        record("second_footprint_scenario_ok", footprint2_result.returncode == 0, footprint2)
+        loaded_retained_values = [sample["loaded_retained_bytes"] for sample in iteration_samples]
+        trimmed_retained_values = [sample["trimmed_retained_bytes"] for sample in iteration_samples]
+        rss_peak_values = [sample["rss_peak"] for sample in iteration_samples]
         record(
-            "second_footprint_still_bounded",
-            session_cap > 0 and retained_bytes2 <= session_count2 * session_cap,
-            footprint2,
+            "loaded_retained_growth_bounded",
+            bool(loaded_retained_values)
+            and max(loaded_retained_values) - min(loaded_retained_values) <= growth_tolerance_bytes,
+            {"samples": iteration_samples, "growth_tolerance_bytes": growth_tolerance_bytes},
+        )
+        record(
+            "trimmed_retained_growth_bounded",
+            bool(trimmed_retained_values)
+            and max(trimmed_retained_values) - min(trimmed_retained_values) <= growth_tolerance_bytes,
+            {"samples": iteration_samples, "growth_tolerance_bytes": growth_tolerance_bytes},
+        )
+        record(
+            "daemon_rss_growth_bounded",
+            bool(rss_peak_values)
+            and max(rss_peak_values) - min(rss_peak_values) <= growth_tolerance_bytes,
+            {"samples": iteration_samples, "growth_tolerance_bytes": growth_tolerance_bytes},
         )
 
         shutdown_result, shutdown_events = mock_cli(args.mock_bin, env, out_dir, "08-graceful-shutdown", "--scenario", "graceful-shutdown")

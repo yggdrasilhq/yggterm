@@ -176,9 +176,23 @@ If a user says “this does not look like a button”, that is a design failure.
 - If the product has a global or sidebar search, the default preference is a centered search field in the titlebar.
 - The search field should feel like part of the shell, not a floating badge.
 - Search should generally be the visual anchor of the center titlebar slot.
+- In its idle state, search should read as a single compact field, not a stacked control with helper copy always visible.
+- In its focused state, the search result surface should wrap the search field itself into one continuous shell, closer to VS Code command/search behavior than to a detached popover under the field.
+- Search typography in chrome should err slightly larger and crisper than default web utility text. Tiny soft-looking placeholder or helper text is a design miss.
 - When an app has an active primary artifact such as a session, terminal, paper, or preview, its title should live in the titlebar to the left of the search field rather than consuming a duplicate header inside the main canvas.
 - Hovering the title control should expose the summary via tooltip, and clicking it may open a compact dropdown with the fuller summary and related actions.
 - Avoid showing both a titlebar title and a second in-canvas title card for the same artifact unless the inner canvas is itself an editor that must edit the title as content.
+
+#### Titlebar density
+
+- Titlebars should be compact and deliberate, with as little dead vertical padding as practical.
+- The search field should feel vertically centered with roughly balanced top and bottom breathing room.
+- When height must be shaved, remove it from the titlebar scaffold before shrinking the search field into a cramped control.
+
+#### Workspace edge behavior
+
+- When a supporting side rail or right inspector is hidden, the main workspace should run flush to that edge.
+- Do not preserve stale gutters where a hidden panel used to be. They read like layout bugs, not breathing room.
 
 #### Context menus
 
@@ -243,6 +257,17 @@ Debug-only telemetry is a design-support component, not just an engineering deta
 - Debug telemetry should be local-first and easy to inspect.
 - It should be safe to remove or gate behind debug builds without affecting the product UI.
 - If a complex interaction is likely to be reused, the telemetry strategy should be reusable too.
+- Debug telemetry must stay physically bounded on disk. Multi-GB observability files are a product bug, not just a debug inconvenience.
+- Telemetry files should rotate automatically, and smoke coverage should fail before a workspace can silently accumulate runaway local state.
+
+### Long-running workspaces
+
+Yggterm should be designed for sessions that stay alive for days, weeks, or months.
+
+- A long-lived workspace must survive local daemon restarts, stale sockets, transient helper failures, and app relaunches without dropping into a dead terminal whenever recovery is still possible.
+- Restore flows should prefer bounded retry and self-healing over fatal blank or frozen terminals when the underlying failure is a transient local-helper problem.
+- Performance work only counts if restore and interaction stay reliable over long runtimes. A faster shell that strands active sessions is not a win.
+- Smoke and proof coverage for terminal work should include long-running failure modes, especially daemon-loss recovery and bounded observability retention.
 
 ### Drag and drop
 

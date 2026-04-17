@@ -1,3 +1,11 @@
+yggterm (2.1.6-1) unstable; urgency=medium
+
+  * Filter unrecoverable pseudo-live sessions out of restore so fresh launches stop reopening empty live-session ghosts.
+  * Keep terminal focus stable across settings/context-menu flows and fix Rename Session on the active local live row.
+  * Harden the X11 keyboard smoke path so strict second-display terminal typing and titlebar/context-menu checks pass reliably.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 17 Apr 2026 23:35:00 +0530
+
 yggterm (2.1.5-1) unstable; urgency=medium
 
   * Stop helper-style CLI commands like server snapshot and --help from spawning stray desktop windows.
