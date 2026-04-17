@@ -152,8 +152,10 @@
     pointer-events: none;
 }
 
-.xterm .xterm-accessibility-tree:not(.debug) *::selection {
+.xterm .xterm-accessibility-tree:not(.debug) *::selection,
+.xterm .xterm-accessibility-tree:not(.debug) *::-moz-selection {
   color: transparent;
+  background-color: transparent;
 }
 
 .xterm .xterm-accessibility-tree {

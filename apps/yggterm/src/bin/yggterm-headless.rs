@@ -1,14 +1,16 @@
 use anyhow::Result;
 use yggterm_core::{SessionStore, detect_install_context, refresh_desktop_integration};
 use yggterm_server::{
-    AppControlViewMode, cleanup_legacy_daemons, default_endpoint, detect_ghostty_host, ping,
-    run_app_control_create_terminal, run_app_control_describe_rows, run_app_control_describe_state,
-    run_app_control_drag, run_app_control_dump_state, run_app_control_focus_window,
-    run_app_control_open_path, run_app_control_remove_session, run_app_control_scroll_preview,
+    AppControlRightPanelMode, AppControlViewMode, cleanup_legacy_daemons, default_endpoint,
+    detect_ghostty_host, ensure_local_daemon_running, ping, run_app_control_create_terminal,
+    run_app_control_describe_rows, run_app_control_describe_state, run_app_control_drag,
+    run_app_control_dump_state, run_app_control_focus_window, run_app_control_open_path,
+    run_app_control_remove_session, run_app_control_scroll_preview,
     run_app_control_send_terminal_input, run_app_control_set_fullscreen,
-    run_app_control_set_main_zoom, run_app_control_set_row_expanded, run_app_control_set_search,
-    run_attach, run_daemon, run_screenrecord_capture, run_screenshot_capture, run_trace_bundle,
-    run_trace_follow, run_trace_tail, shutdown, snapshot, status, try_run_remote_server_command,
+    run_app_control_set_main_zoom, run_app_control_set_right_panel_mode,
+    run_app_control_set_row_expanded, run_app_control_set_search, run_attach, run_daemon,
+    run_screenrecord_capture, run_screenshot_capture, run_trace_bundle, run_trace_follow,
+    run_trace_tail, shutdown, snapshot, status, try_run_remote_server_command,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +67,11 @@ fn print_server_help() {
   yggterm-headless server screenrecord <target> [output]
   yggterm-headless server app <subcommand>"
     );
+}
+
+fn ensure_local_server_ready_for_cli(store: &SessionStore) -> Result<()> {
+    let endpoint = default_endpoint(store.home_dir());
+    ensure_local_daemon_running(&endpoint)
 }
 
 fn main() -> Result<()> {
@@ -180,6 +187,7 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             BuiltinCliCommand::ServerSnapshot => {
+                ensure_local_server_ready_for_cli(&store)?;
                 let endpoint = default_endpoint(store.home_dir());
                 let (snapshot, _) = snapshot(&endpoint)?;
                 println!("{}", serde_json::to_string_pretty(&snapshot)?);
@@ -328,6 +336,23 @@ fn main() -> Result<()> {
                     "clear" => run_app_control_set_search("", Some(false), timeout_ms),
                     other => anyhow::bail!("unsupported app search action: {other}"),
                 }
+            }
+            "panel" | "right-panel" => {
+                let mode = args
+                    .iter()
+                    .skip(3)
+                    .find(|value| !value.starts_with("--"))
+                    .map(String::as_str)
+                    .unwrap_or("hidden");
+                let mode = match mode {
+                    "hidden" | "hide" | "close" | "none" => AppControlRightPanelMode::Hidden,
+                    "connect" => AppControlRightPanelMode::Connect,
+                    "notifications" | "notification" => AppControlRightPanelMode::Notifications,
+                    "settings" => AppControlRightPanelMode::Settings,
+                    "metadata" | "session-metadata" => AppControlRightPanelMode::Metadata,
+                    other => anyhow::bail!("unsupported app right panel mode: {other}"),
+                };
+                run_app_control_set_right_panel_mode(mode, timeout_ms)
             }
             "fullscreen" => {
                 let action = args
@@ -483,12 +508,14 @@ fn main() -> Result<()> {
         return Ok(());
     }
     if args.as_slice() == ["server", "ping"] {
+        ensure_local_server_ready_for_cli(&store)?;
         let endpoint = default_endpoint(store.home_dir());
         ping(&endpoint)?;
         println!("pong");
         return Ok(());
     }
     if args.as_slice() == ["server", "status"] {
+        ensure_local_server_ready_for_cli(&store)?;
         let endpoint = default_endpoint(store.home_dir());
         let runtime = status(&endpoint)?;
         println!("{}", serde_json::to_string_pretty(&runtime)?);
