@@ -1,3 +1,10 @@
+yggterm (2.1.7-1) unstable; urgency=medium
+
+  * Restore direct-install self-update by shipping yggterm-mock-cli in the GitHub release archives again.
+  * Remove the unconditional Cairo dependency from non-Linux desktop targets so the release packaging graph stops dragging Linux-only glib bits into other platforms.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 17 Apr 2026 23:59:00 +0530
+
 yggterm (2.1.6-1) unstable; urgency=medium
 
   * Filter unrecoverable pseudo-live sessions out of restore so fresh launches stop reopening empty live-session ghosts.
