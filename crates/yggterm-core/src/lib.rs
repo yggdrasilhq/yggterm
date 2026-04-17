@@ -32,9 +32,14 @@ pub use install::{
     detect_install_context, direct_install_root, install_mode_summary, install_release_update,
     refresh_desktop_integration, update_command_hint, write_direct_install_state,
 };
-pub use perf::{PERF_TELEMETRY_FILENAME, PerfSpan, append_perf_event, perf_telemetry_path};
+pub use perf::{
+    PERF_TELEMETRY_FILENAME, PERF_TELEMETRY_MAX_BYTES, PERF_TELEMETRY_ROTATED_FILENAME, PerfSpan,
+    append_bounded_jsonl_record, append_perf_event, perf_telemetry_path,
+};
 pub use titles::{
-    SessionTitleStore, looks_like_generated_fallback_title, looks_like_low_signal_generated_copy,
+    SessionTitleStore, best_effort_context_from_session_path, best_effort_precis_from_context,
+    best_effort_summary_from_context, best_effort_title_from_context,
+    looks_like_generated_fallback_title, looks_like_low_signal_generated_copy,
 };
 pub use trace::{
     EVENT_TRACE_FILENAME, EventTraceRecord, EventTraceSpan, append_trace_event, event_trace_path,
@@ -332,6 +337,51 @@ impl SessionStore {
     ) -> Result<Option<String>> {
         let resolver = SessionTitleResolver::new(&self.home)?;
         resolver.generate_for_context(settings, session_id, cwd, context, force)
+    }
+
+    pub fn save_manual_title_for_session_id(
+        &self,
+        session_id: &str,
+        cwd: &str,
+        title: &str,
+    ) -> Result<()> {
+        let resolver = SessionTitleResolver::new(&self.home)?;
+        resolver.save_manual_title_for_session(session_id, cwd, title)
+    }
+
+    pub fn save_manual_title_for_session_path(
+        &self,
+        session_path: &str,
+        title: &str,
+    ) -> Result<Option<String>> {
+        let path = PathBuf::from(session_path);
+        if !path.exists() || !is_codex_session_file(&path) {
+            return Ok(None);
+        }
+        let Some(identity) = read_codex_session_identity(&path)? else {
+            return Ok(None);
+        };
+        let resolver = SessionTitleResolver::new(&self.home)?;
+        resolver.save_manual_title_for_session(&identity.session_id, &identity.cwd, title)?;
+        Ok(Some(identity.session_id))
+    }
+
+    pub fn clear_title_for_session_id(&self, session_id: &str) -> Result<()> {
+        let resolver = SessionTitleResolver::new(&self.home)?;
+        resolver.clear_title_for_session(session_id)
+    }
+
+    pub fn clear_title_for_session_path(&self, session_path: &str) -> Result<Option<String>> {
+        let path = PathBuf::from(session_path);
+        if !path.exists() || !is_codex_session_file(&path) {
+            return Ok(None);
+        }
+        let Some(identity) = read_codex_session_identity(&path)? else {
+            return Ok(None);
+        };
+        let resolver = SessionTitleResolver::new(&self.home)?;
+        resolver.clear_title_for_session(&identity.session_id)?;
+        Ok(Some(identity.session_id))
     }
 
     pub fn resolve_precis_for_session_path(&self, session_path: &str) -> Result<Option<String>> {

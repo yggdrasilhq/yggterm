@@ -56,6 +56,8 @@ pub fn SideRailShell(visible: bool, width_px: usize, zoom_percent: f32, body: El
                  pointer-events:{}; zoom:{}%;",
                 rail_width, rail_width, rail_width, opacity, translate, pointer_events, zoom_percent
             ),
+            onmousedown: |evt| evt.stop_propagation(),
+            onclick: |evt| evt.stop_propagation(),
             {body}
         }
     }
