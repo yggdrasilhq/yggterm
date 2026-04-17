@@ -343,6 +343,26 @@ impl RemoteRuntimeRegistry {
             .context("listing runtime sessions")
     }
 
+    pub fn delete_session(&self, session_id: &str) -> Result<bool> {
+        let Some(session) = self.get_session(session_id)? else {
+            return Ok(false);
+        };
+        let runtime_dir = self.paths.sessions_dir.join(&session.session_id);
+        self.conn.execute(
+            "DELETE FROM runtime_events WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        let deleted = self.conn.execute(
+            "DELETE FROM runtime_sessions WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        if runtime_dir.exists() {
+            fs::remove_dir_all(&runtime_dir)
+                .with_context(|| format!("removing runtime dir {}", runtime_dir.display()))?;
+        }
+        Ok(deleted > 0)
+    }
+
     pub fn transition_session(
         &self,
         session_id: &str,
@@ -775,5 +795,45 @@ mod tests {
         .expect("read pty");
         assert_eq!(transcript, "hello");
         assert_eq!(pty, "world");
+    }
+
+    #[test]
+    fn delete_session_removes_rows_and_runtime_dir() {
+        let registry = test_registry();
+        registry
+            .register_session(RemoteRuntimeSessionInput {
+                session_id: Some("session-e".to_string()),
+                machine_key: "jojo".to_string(),
+                runtime_kind: RemoteRuntimeKind::Codex,
+                title: "Delete".to_string(),
+                cwd: None,
+                summary: None,
+                requires_terminal: true,
+            })
+            .expect("register session");
+        registry
+            .append_transcript_chunk("session-e", b"hello")
+            .expect("append transcript");
+        let runtime_dir = registry.paths().sessions_dir.join("session-e");
+        assert!(runtime_dir.exists());
+
+        assert!(
+            registry
+                .delete_session("session-e")
+                .expect("delete session")
+        );
+        assert!(
+            registry
+                .get_session("session-e")
+                .expect("reload deleted session")
+                .is_none()
+        );
+        assert!(
+            registry
+                .list_events("session-e", 10)
+                .expect("list deleted events")
+                .is_empty()
+        );
+        assert!(!runtime_dir.exists());
     }
 }

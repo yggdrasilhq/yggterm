@@ -49,10 +49,6 @@ pub fn TitlebarChrome(
                  -webkit-user-select:none;",
                 background, zoom_percent
             ),
-            onmousedown: move |_| window().drag(),
-            ondoubleclick: move |_| {
-                on_toggle_maximized.call(());
-            },
             div {
                 style: "position:absolute; inset:0; z-index:0;",
                 onmousedown: move |_| window().drag(),
