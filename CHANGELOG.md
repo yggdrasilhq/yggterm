@@ -4,6 +4,13 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.7
+
+### Fixed
+
+- restore direct-install self-update on Linux by shipping `yggterm-mock-cli` in the GitHub release archives again, so curl-installed machines like `jojo` can actually advance to the latest published version instead of aborting during update extraction
+- remove the unconditional Cairo dependency from non-Linux desktop targets and keep the CI release packager aligned with the direct installer payload, reducing cross-platform release drift and unblocking the follow-up packaging pass
+
 ## 2.1.6
 
 ### Fixed
