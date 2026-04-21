@@ -1,7 +1,6 @@
 use crate::drag_tree::DragDropPlacement;
 use dioxus::html::input_data::MouseButton;
 use dioxus::prelude::*;
-use std::env;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DragGhostPalette {
@@ -11,13 +10,10 @@ pub struct DragGhostPalette {
     pub accent_soft: &'static str,
 }
 
-fn linux_kde_wayland_safe_mode() -> bool {
+fn linux_x11_safe_mode() -> bool {
     #[cfg(target_os = "linux")]
     {
-        env::var_os("WAYLAND_DISPLAY").is_some()
-            && env::var("XDG_CURRENT_DESKTOP")
-                .map(|value| value.to_ascii_lowercase().contains("kde"))
-                .unwrap_or(false)
+        std::env::var_os("DISPLAY").is_some() && std::env::var_os("WAYLAND_DISPLAY").is_none()
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -34,7 +30,7 @@ pub fn DragGhostCard(
     target_hint: Option<String>,
     palette: DragGhostPalette,
 ) -> Element {
-    let blur_style = if linux_kde_wayland_safe_mode() {
+    let blur_style = if linux_x11_safe_mode() {
         "backdrop-filter:none; -webkit-backdrop-filter:none;"
     } else {
         "backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);"

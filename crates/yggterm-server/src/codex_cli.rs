@@ -7,7 +7,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 use yggterm_core::{ENV_YGGTERM_HOME, PerfSpan, append_trace_event, resolve_yggterm_home};
 use yggui_contract::UiTheme;
@@ -66,6 +66,8 @@ pub struct ManagedCliRefreshReport {
     pub ttl_remaining_ms: Option<u64>,
     #[serde(default)]
     pub install_attempted: bool,
+    #[serde(default)]
+    pub install_deferred: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -364,6 +366,47 @@ fn managed_cli_refresh_skip_detail(
     )
 }
 
+fn managed_cli_has_existing_managed_install(probes: &[(ManagedCliTool, ToolProbe)]) -> bool {
+    probes
+        .iter()
+        .any(|(_, probe)| probe.source == Some(ManagedCliBinarySource::Managed))
+}
+
+fn managed_cli_should_defer_initial_install(
+    background: bool,
+    probes: &[(ManagedCliTool, ToolProbe)],
+) -> bool {
+    background && !managed_cli_has_existing_managed_install(probes)
+}
+
+fn managed_cli_deferred_install_detail(tool: ManagedCliTool, probe: &ToolProbe) -> String {
+    if probe.source == Some(ManagedCliBinarySource::System) && probe.available {
+        format!(
+            "{} is currently available from PATH. Yggterm deferred the first managed install until you explicitly launch or resume a local {} session.",
+            tool.display_name(),
+            tool.display_name(),
+        )
+    } else {
+        format!(
+            "Yggterm deferred the first managed {} install until you explicitly launch or resume a local {} session.",
+            tool.display_name(),
+            tool.display_name(),
+        )
+    }
+}
+
+fn persist_managed_cli_refresh_state(
+    home: &Path,
+    probes: &[(ManagedCliTool, ToolProbe)],
+    refreshed_at_ms: u64,
+) -> Result<()> {
+    let state = managed_cli_refresh_state_from_probes(probes, refreshed_at_ms);
+    if state.managed_versions.is_empty() {
+        return Ok(());
+    }
+    save_managed_cli_refresh_state(home, &state)
+}
+
 fn ambient_terminal_appearance() -> String {
     env::var("YGGTERM_APPEARANCE")
         .ok()
@@ -574,6 +617,74 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn managed_cli_initial_background_refresh_defers_until_managed_install_exists() {
+        let system_only = vec![
+            (
+                ManagedCliTool::Codex,
+                ToolProbe {
+                    version: Some("1.2.3".to_string()),
+                    source: Some(ManagedCliBinarySource::System),
+                    available: true,
+                },
+            ),
+            (
+                ManagedCliTool::CodexLiteLlm,
+                ToolProbe {
+                    version: None,
+                    source: None,
+                    available: false,
+                },
+            ),
+        ];
+        let managed_present = vec![(
+            ManagedCliTool::Codex,
+            ToolProbe {
+                version: Some("1.2.3".to_string()),
+                source: Some(ManagedCliBinarySource::Managed),
+                available: true,
+            },
+        )];
+        assert!(managed_cli_should_defer_initial_install(true, &system_only));
+        assert!(!managed_cli_should_defer_initial_install(
+            false,
+            &system_only
+        ));
+        assert!(!managed_cli_should_defer_initial_install(
+            true,
+            &managed_present
+        ));
+    }
+
+    #[test]
+    fn summarize_managed_cli_report_mentions_deferred_initial_install() {
+        let report = ManagedCliRefreshReport {
+            scope: "local".to_string(),
+            background: true,
+            statuses: vec![ManagedCliToolStatus {
+                tool: ManagedCliTool::Codex,
+                package_name: "@openai/codex".to_string(),
+                binary_name: "codex".to_string(),
+                version_before: Some("1.2.3".to_string()),
+                version_after: Some("1.2.3".to_string()),
+                source_before: Some(ManagedCliBinarySource::System),
+                source_after: Some(ManagedCliBinarySource::System),
+                changed: false,
+                available: true,
+                action: "deferred_install".to_string(),
+                detail: "deferred".to_string(),
+            }],
+            skipped_recently: false,
+            ttl_remaining_ms: None,
+            install_attempted: false,
+            install_deferred: true,
+        };
+        assert_eq!(
+            summarize_managed_cli_report("local", &report),
+            "local: deferred initial managed Codex install until first use"
+        );
+    }
 }
 
 fn run_version_command(binary_path: &Path) -> Option<String> {
@@ -676,13 +787,26 @@ fn install_latest(
     for tool in tools {
         command.arg(format!("{}@latest", tool.package_name()));
     }
-    let status = command
-        .status()
+    let output = command
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
         .context("running npm install for managed Codex tools")?;
-    if status.success() {
+    if output.status.success() {
         Ok(())
     } else {
-        anyhow::bail!("managed Codex npm install exited with status {status}");
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            anyhow::bail!(
+                "managed Codex npm install exited with status {}",
+                output.status
+            );
+        }
+        anyhow::bail!(
+            "managed Codex npm install exited with status {}: {}",
+            output.status,
+            stderr
+        );
     }
 }
 
@@ -780,6 +904,7 @@ pub(crate) fn best_effort_cwd_shell_prefix(cwd: Option<&str>) -> Option<String> 
 
 pub(crate) fn ensure_local_managed_cli(tool: ManagedCliTool) -> Result<ManagedCliToolStatus> {
     let paths = ManagedCliPaths::resolve()?;
+    let now_ms = current_time_ms();
     append_trace_event(
         &paths.home,
         "server",
@@ -800,6 +925,24 @@ pub(crate) fn ensure_local_managed_cli(tool: ManagedCliTool) -> Result<ManagedCl
             None => format!("{} is available.", tool.display_name()),
         };
         let status = tool_status(tool, before.clone(), before, "ready", detail);
+        if status.source_after == Some(ManagedCliBinarySource::Managed)
+            && let Err(error) = persist_managed_cli_refresh_state(
+                &paths.home,
+                &[(tool, probe_tool(&paths, tool))],
+                now_ms,
+            )
+        {
+            append_trace_event(
+                &paths.home,
+                "server",
+                "managed_cli",
+                "ensure_state_write_error",
+                serde_json::json!({
+                    "tool": tool.binary_name(),
+                    "error": error.to_string(),
+                }),
+            );
+        }
         append_trace_event(
             &paths.home,
             "server",
@@ -834,6 +977,20 @@ pub(crate) fn ensure_local_managed_cli(tool: ManagedCliTool) -> Result<ManagedCl
             paths.prefix.display()
         ),
     );
+    if let Err(error) =
+        persist_managed_cli_refresh_state(&paths.home, &[(tool, probe_tool(&paths, tool))], now_ms)
+    {
+        append_trace_event(
+            &paths.home,
+            "server",
+            "managed_cli",
+            "ensure_state_write_error",
+            serde_json::json!({
+                "tool": tool.binary_name(),
+                "error": error.to_string(),
+            }),
+        );
+    }
     append_trace_event(
         &paths.home,
         "server",
@@ -877,6 +1034,7 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
     let npm_available = npm_binary().is_some();
     let mut install_error = None::<String>;
     let mut install_attempted = false;
+    let mut install_deferred = false;
     let mut skipped_recently = false;
     let mut ttl_remaining_ms = None::<u64>;
     if background && npm_available {
@@ -896,8 +1054,22 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
                 }),
             );
         }
+        install_deferred =
+            !skipped_recently && managed_cli_should_defer_initial_install(background, &before);
+        if install_deferred {
+            append_trace_event(
+                &paths.home,
+                "server",
+                "managed_cli",
+                "refresh_defer_initial_install",
+                serde_json::json!({
+                    "background": background,
+                    "reason": "missing_managed_install",
+                }),
+            );
+        }
     }
-    if npm_available && !skipped_recently {
+    if npm_available && !skipped_recently && !install_deferred {
         install_attempted = true;
         let install_perf = PerfSpan::start(&paths.home, "cli", "refresh_managed_codex_install");
         if let Err(error) = install_latest(&paths, &tools, background) {
@@ -909,7 +1081,7 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
             "tool_count": tools.len(),
         }));
     }
-    let after = if skipped_recently {
+    let after = if skipped_recently || install_deferred {
         before.clone()
     } else {
         probe_tools(&paths, &tools)
@@ -921,9 +1093,8 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
         "after",
     );
 
-    if npm_available && install_error.is_none() && !skipped_recently {
-        let state = managed_cli_refresh_state_from_probes(&after, now_ms);
-        if let Err(error) = save_managed_cli_refresh_state(&paths.home, &state) {
+    if npm_available && install_error.is_none() && !skipped_recently && !install_deferred {
+        if let Err(error) = persist_managed_cli_refresh_state(&paths.home, &after, now_ms) {
             append_trace_event(
                 &paths.home,
                 "server",
@@ -946,6 +1117,9 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
                     "skipped_recent",
                     managed_cli_refresh_skip_detail(tool, remaining_ms, ttl_ms),
                 )
+            } else if install_deferred {
+                let detail = managed_cli_deferred_install_detail(tool, &after_probe);
+                tool_status(tool, before_probe, after_probe, "deferred_install", detail)
             } else if let Some(error) = install_error.as_ref() {
                 tool_status(
                     tool,
@@ -1006,6 +1180,7 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
         "ttl_ms": ttl_ms,
         "npm_available": npm_available,
         "install_attempted": install_attempted,
+        "install_deferred": install_deferred,
         "skipped_recently": skipped_recently,
         "ttl_remaining_ms": ttl_remaining_ms,
         "statuses": statuses.iter().map(|status| serde_json::json!({
@@ -1023,6 +1198,7 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
         skipped_recently,
         ttl_remaining_ms,
         install_attempted,
+        install_deferred,
     };
     append_trace_event(
         &paths.home,
@@ -1033,6 +1209,7 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
             "background": background,
             "ttl_ms": ttl_ms,
             "install_attempted": install_attempted,
+            "install_deferred": install_deferred,
             "skipped_recently": skipped_recently,
             "ttl_remaining_ms": ttl_remaining_ms,
             "statuses": report.statuses.iter().map(|status| serde_json::json!({
@@ -1052,6 +1229,10 @@ pub(crate) fn summarize_managed_cli_report(
 ) -> String {
     if report.skipped_recently {
         return format!("{scope}: managed Codex refresh still fresh");
+    }
+
+    if report.install_deferred {
+        return format!("{scope}: deferred initial managed Codex install until first use");
     }
 
     let changed = report
