@@ -1,3 +1,12 @@
+yggterm (2.1.15-1) unstable; urgency=medium
+
+  * Restore local live sessions under both the local tree and Live Sessions so prompt-ready local shells stop leaving an empty promoted group after restore.
+  * Keep the managed Codex tool refresh off the hot path after a successful install by persisting a refresh TTL and proving the skip path in perf telemetry.
+  * Tighten Linux WebKit memory pressure defaults so repeated same-client runs stay under the child RSS soak budget instead of drifting upward between smoke cycles.
+  * Harden the second-X11 smoke around context-menu delete recovery, maximized-start titlebar contracts, idle IO-render sampling, and X11 click-origin drift.
+
+ -- Yggdrasil HQ <avi@gour.top>  Tue, 21 Apr 2026 16:53:09 +0530
+
 yggterm (2.1.14-1) unstable; urgency=medium
 
   * Add a real auto-hide titlebar contract on Linux, including hover reveal, empty-lane drag, double-click maximize/restore, and matching right-rail motion.

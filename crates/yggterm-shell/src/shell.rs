@@ -86,15 +86,15 @@ use yggterm_server::{
     YGG_LOADING_NOTIFICATION_AFTER_MS, YggOperationPriority, YggRequestMeta, YggSurface, YggTarget,
     YggtermServer, app_control_requests_pending, cleanup_legacy_daemons,
     complete_app_control_request, connect_ssh_custom, fetch_remote_generation_context,
-    focus_live_with_view, open_remote_session_with_view, open_stored_session,
-    open_stored_session_with_view, persist_remote_generated_copy, ping, refresh_managed_cli,
-    refresh_preview, refresh_remote_machine, remove_session, remove_ssh_target,
-    request_terminal_launch, set_all_preview_blocks_folded, set_view_mode as daemon_set_view_mode,
-    shutdown as daemon_shutdown, snapshot as daemon_snapshot, snapshot_session_view_for_ui,
-    stage_remote_clipboard_png, start_command_session, start_local_session_at,
-    start_ssh_session_at, status, take_next_app_control_request, terminal_ensure, terminal_read,
-    terminal_resize, terminal_snapshot, terminal_write,
-    toggle_preview_block as daemon_toggle_preview_block,
+    focus_live_with_view, managed_cli_refresh_ttl_ms, open_remote_session_with_view,
+    open_stored_session, open_stored_session_with_view, persist_remote_generated_copy, ping,
+    refresh_managed_cli, refresh_preview, refresh_remote_machine, remove_session,
+    remove_ssh_target, request_terminal_launch, set_all_preview_blocks_folded,
+    set_view_mode as daemon_set_view_mode, shutdown as daemon_shutdown,
+    snapshot as daemon_snapshot, snapshot_session_view_for_ui, stage_remote_clipboard_png,
+    start_command_session, start_local_session_at, start_ssh_session_at, status,
+    take_next_app_control_request, terminal_ensure, terminal_read, terminal_resize,
+    terminal_snapshot, terminal_write, toggle_preview_block as daemon_toggle_preview_block,
 };
 use yggui::{
     ChromePalette, DragDropPlacement, DragDropTarget, DragGhostCard, DragGhostPalette,
@@ -419,7 +419,7 @@ struct ShellState {
     remote_machine_refresh_requests: HashSet<String>,
     remote_machine_refresh_retry_after_ms: HashMap<String, u64>,
     managed_cli_refresh_requests: HashSet<String>,
-    managed_cli_refresh_completed: HashSet<String>,
+    managed_cli_refresh_completed: HashMap<String, u64>,
     managed_cli_refresh_retry_after_ms: HashMap<String, u64>,
     live_session_snapshot_refresh_in_flight: bool,
     next_live_session_snapshot_after_ms: u64,
@@ -1209,7 +1209,7 @@ impl ShellState {
             remote_machine_refresh_requests: HashSet::new(),
             remote_machine_refresh_retry_after_ms: HashMap::new(),
             managed_cli_refresh_requests: HashSet::new(),
-            managed_cli_refresh_completed: HashSet::new(),
+            managed_cli_refresh_completed: HashMap::new(),
             managed_cli_refresh_retry_after_ms: HashMap::new(),
             live_session_snapshot_refresh_in_flight: false,
             next_live_session_snapshot_after_ms: 0,
@@ -2678,15 +2678,14 @@ impl ShellState {
     }
     fn seed_dynamic_top_level_expansions(&mut self) {
         let mut paths = Vec::new();
-        let has_promoted_live_sessions = self.server.live_sessions().iter().any(|session| {
-            is_promoted_live_session(session) && !is_local_live_session_path(&session.session_path)
-        }) || self.retained_terminal_session_paths.iter().any(
-            |path| {
-                self.terminal_session_is_retained_live(path)
-                    && is_hot_terminal_sidebar_path(path)
-                    && !is_local_live_session_path(path)
-            },
-        );
+        let has_promoted_live_sessions = self
+            .server
+            .live_sessions()
+            .iter()
+            .any(|session| is_promoted_live_session(session))
+            || self.retained_terminal_session_paths.iter().any(|path| {
+                self.terminal_session_is_retained_live(path) && is_hot_terminal_sidebar_path(path)
+            });
         if has_promoted_live_sessions {
             paths.push("__live_sessions__".to_string());
         }
@@ -3058,16 +3057,19 @@ impl ShellState {
         let Some(active_path) = active_path else {
             return Vec::new();
         };
-        if !is_local_live_session_path(&active_path)
-            && (self.server.live_sessions().iter().any(|session| {
-                session.session_path == active_path && is_promoted_live_session(session)
-            }) || (self.terminal_session_is_retained_live(&active_path)
-                && is_hot_terminal_sidebar_path(&active_path)))
-        {
-            return vec!["__live_sessions__".to_string()];
+        let active_is_promoted_live = self.server.live_sessions().iter().any(|session| {
+            session.session_path == active_path && is_promoted_live_session(session)
+        }) || (self.terminal_session_is_retained_live(&active_path)
+            && is_hot_terminal_sidebar_path(&active_path));
+        let mut paths = Vec::new();
+        if active_is_promoted_live {
+            paths.push("__live_sessions__".to_string());
+        }
+        if active_is_promoted_live && !is_local_live_session_path(&active_path) {
+            return paths;
         }
         if let Some((machine_key, session_id)) = parse_remote_scanned_session_path(&active_path) {
-            let mut paths = vec![format!("__remote_machine__/{machine_key}")];
+            paths.push(format!("__remote_machine__/{machine_key}"));
             let active_cwd = active_session
                 .as_ref()
                 .map(|active| metadata_value(active, "Cwd"));
@@ -3116,7 +3118,7 @@ impl ShellState {
         } else {
             metadata_value(&active, "Cwd")
         };
-        let mut paths = vec!["local".to_string()];
+        paths.push("local".to_string());
         if local_anchor.is_empty() {
             return paths;
         }
@@ -7150,7 +7152,7 @@ fn spawn_background_managed_cli_refresh(state: Signal<ShellState>, scope_key: St
                     shell.managed_cli_refresh_retry_after_ms.remove(&scope_key);
                     shell
                         .managed_cli_refresh_completed
-                        .insert(scope_key.clone());
+                        .insert(scope_key.clone(), current_millis());
                     shell.last_action = message
                         .clone()
                         .unwrap_or_else(|| format!("codex tools checked for {scope_key}"));
@@ -7372,15 +7374,21 @@ fn pending_managed_cli_refreshes(
     remote_machines: &[RemoteMachineSnapshot],
     ssh_targets: &[SshConnectTarget],
     in_flight: &HashSet<String>,
-    completed: &HashSet<String>,
+    completed: &HashMap<String, u64>,
     retry_after_ms: &HashMap<String, u64>,
     now_ms: u64,
 ) -> Vec<String> {
+    let ttl_ms = managed_cli_refresh_ttl_ms();
     managed_cli_refresh_scope_keys(remote_machines, ssh_targets)
         .into_iter()
         .filter(|scope_key| !scope_key.is_empty())
         .filter(|scope_key| !in_flight.contains(scope_key))
-        .filter(|scope_key| !completed.contains(scope_key))
+        .filter(|scope_key| {
+            completed
+                .get(scope_key)
+                .copied()
+                .is_none_or(|completed_at_ms| completed_at_ms.saturating_add(ttl_ms) <= now_ms)
+        })
         .filter(|scope_key| {
             retry_after_ms
                 .get(scope_key)
@@ -14564,7 +14572,7 @@ fn app_control_dom_rect_visible(dom: &Value, key: &str) -> bool {
                 .get("height")
                 .and_then(Value::as_f64)
                 .unwrap_or_default()
-            > 0.0
+                > 0.0
     })
 }
 
@@ -41075,11 +41083,34 @@ mod tests {
             &remote_machines,
             &ssh_targets,
             &HashSet::new(),
-            &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
             1_000,
         );
         assert_eq!(pending, vec!["local".to_string(), "dev".to_string()]);
+    }
+    #[test]
+    fn pending_managed_cli_refreshes_wait_for_ttl_before_requeue() {
+        let ttl_ms = managed_cli_refresh_ttl_ms();
+        let completed = HashMap::from([(String::from("local"), 1_000u64)]);
+        let pending_before_ttl = pending_managed_cli_refreshes(
+            &[],
+            &[],
+            &HashSet::new(),
+            &completed,
+            &HashMap::new(),
+            1_000 + ttl_ms.saturating_sub(1),
+        );
+        assert!(pending_before_ttl.is_empty());
+        let pending_after_ttl = pending_managed_cli_refreshes(
+            &[],
+            &[],
+            &HashSet::new(),
+            &completed,
+            &HashMap::new(),
+            1_000 + ttl_ms,
+        );
+        assert_eq!(pending_after_ttl, vec!["local".to_string()]);
     }
     #[test]
     fn app_control_open_and_expand_defer_background_refreshes() {
@@ -45497,7 +45528,7 @@ Waiting for the remote terminal to paint...\n";
     }
 
     #[test]
-    fn seed_dynamic_top_level_expansions_skips_live_group_for_local_live_terminal() {
+    fn seed_dynamic_top_level_expansions_expands_live_group_for_local_live_terminal() {
         let session_path = "local://fresh-shell";
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
         let session = ManagedSessionView {
@@ -45548,7 +45579,7 @@ Waiting for the remote terminal to paint...\n";
         shell.seed_dynamic_top_level_expansions();
 
         assert!(
-            !shell
+            shell
                 .browser
                 .expanded_paths()
                 .iter()
@@ -45576,6 +45607,64 @@ Waiting for the remote terminal to paint...\n";
                 .any(|path| path == "/home/pi")
         );
     }
+
+    #[test]
+    fn active_session_visibility_paths_include_live_group_and_local_tree_for_local_live_terminal() {
+        let session_path = "local://fresh-shell";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        let session = ManagedSessionView {
+            id: "fresh-shell".to_string(),
+            session_path: session_path.to_string(),
+            title: "Dev Yggterm".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "local".to_string(),
+            source: SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: true,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: Vec::new(),
+            rendered_sections: Vec::new(),
+            preview: SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: vec![SessionMetadataEntry {
+                label: "Cwd",
+                value: "/home/pi/gh/yggterm".to_string(),
+            }],
+            terminal_process_id: None,
+            terminal_foreground_active: Some(false),
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: Some("localhost".to_string()),
+            ssh_prefix: None,
+            stored_preview_hydrated: true,
+        };
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(session_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(session.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![snapshot_session_view_for_ui(session)],
+        });
+
+        let paths = shell.active_session_visibility_paths();
+
+        assert!(paths.iter().any(|path| path == "__live_sessions__"));
+        assert!(paths.iter().any(|path| path == "local"));
+        assert!(paths.iter().any(|path| path == "/home"));
+        assert!(paths.iter().any(|path| path == "/home/pi"));
+    }
+
     #[test]
     fn is_live_sidebar_row_accepts_stored_codex_session_paths() {
         let codex_row = test_sidebar_row("/home/pi/.codex/sessions/example.jsonl");
