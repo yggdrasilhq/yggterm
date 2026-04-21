@@ -1036,6 +1036,10 @@ mod tests {
         assert!(looks_like_generated_fallback_title(
             "Local Shell Stay Alive Daemon"
         ));
+        assert!(looks_like_generated_fallback_title("Remote Codex 019cf82b"));
+        assert!(looks_like_generated_fallback_title(
+            "Remote Codex LiteLLM 019cf82b"
+        ));
         assert!(!looks_like_generated_fallback_title("Remove Them Entirely"));
     }
 
@@ -1806,7 +1810,21 @@ fn copy_candidate_entries(context: &str) -> Vec<CopyCandidate> {
                     "refine ",
                 ]
                 .iter()
-                .any(|needle| lower.contains(needle)));
+                .any(|needle| lower.contains(needle)))
+            || [
+                "investigating ",
+                "working on ",
+                "fixing ",
+                "debugging ",
+                "installing ",
+                "reviewing ",
+                "designing ",
+                "refining ",
+                "hardening ",
+                "auditing ",
+            ]
+            .iter()
+            .any(|needle| lower.starts_with(needle));
         let mut score = match section {
             "PRIMARY USER GOALS:" => 46,
             "RECENT SUBSTANTIVE TURNS:" => 28,
@@ -2351,6 +2369,7 @@ fn title_from_phrase(phrase: &str) -> Option<String> {
 pub fn looks_like_generated_fallback_title(title: &str) -> bool {
     let compact = title.trim();
     let lower = compact.to_ascii_lowercase();
+    let words = compact.split_whitespace().collect::<Vec<_>>();
     let prefixed_session_uuid = [
         "local::",
         "live::",
@@ -2368,6 +2387,17 @@ pub fn looks_like_generated_fallback_title(title: &str) -> bool {
         && compact.chars().skip(1).all(|ch| ch.is_ascii_hexdigit());
     let bare_hash = (compact.len() == 7 || compact.len() == 8)
         && compact.chars().all(|ch| ch.is_ascii_hexdigit());
+    let remote_codex_runtime_title = words.len() == 3
+        && words[0].eq_ignore_ascii_case("remote")
+        && words[1].eq_ignore_ascii_case("codex")
+        && words[2].len() == 8
+        && words[2].chars().all(|ch| ch.is_ascii_hexdigit());
+    let remote_codex_litellm_runtime_title = words.len() == 4
+        && words[0].eq_ignore_ascii_case("remote")
+        && words[1].eq_ignore_ascii_case("codex")
+        && words[2].eq_ignore_ascii_case("litellm")
+        && words[3].len() == 8
+        && words[3].chars().all(|ch| ch.is_ascii_hexdigit());
     let generic_runtime_title = matches!(
         lower.as_str(),
         "local shell"
@@ -2380,7 +2410,12 @@ pub fn looks_like_generated_fallback_title(title: &str) -> bool {
             | "command bin bash"
             | "daemon pty request main viewport"
     );
-    prefixed_session_uuid || prefixed_hash || bare_hash || generic_runtime_title
+    prefixed_session_uuid
+        || prefixed_hash
+        || bare_hash
+        || remote_codex_runtime_title
+        || remote_codex_litellm_runtime_title
+        || generic_runtime_title
 }
 
 pub fn looks_like_low_signal_generated_copy(text: &str) -> bool {
