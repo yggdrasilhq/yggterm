@@ -1,5 +1,6 @@
 use crate::app_capture::{
-    capture_visible_app_surface, describe_window, focus_app_window, record_visible_app_surface,
+    background_app_window, capture_visible_app_surface, describe_window, focus_app_window,
+    move_app_window_by, record_visible_app_surface,
 };
 use crate::terminal_observe::{
     TerminalOpenAttempt, TerminalOpenAttemptState, describe_terminal_open_attempt,
@@ -77,14 +78,15 @@ use yggterm_core::{
 };
 use yggterm_platform::{DockRect, send_user_notification};
 use yggterm_server::{
-    AppControlCommand, AppControlDragCommand, AppControlDragPlacement, AppControlPreviewLayout,
-    AppControlResponse, AppControlRightPanelMode, AppControlViewMode, GhosttyTerminalHostMode,
-    ManagedSessionView, PreviewTone, ProbeTerminalViewportInputMode, RemoteDeployState,
-    RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession, ServerEndpoint,
-    ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionPreviewBlock,
+    AppControlCommand, AppControlDragCommand, AppControlDragPlacement, AppControlKeyCommand,
+    AppControlPointerCommand, AppControlPreviewLayout, AppControlResponse,
+    AppControlRightPanelMode, AppControlViewMode, GhosttyTerminalHostMode, ManagedSessionView,
+    PreviewTone, ProbeTerminalViewportInputMode, RemoteDeployState, RemoteMachineHealth,
+    RemoteMachineSnapshot, RemoteScannedSession, ServerEndpoint, ServerRuntimeStatus,
+    ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionPreviewBlock,
     SessionRenderedSection, SessionSource, SshConnectTarget, TerminalBackend, WorkspaceViewMode,
-    YGG_LOADING_NOTIFICATION_AFTER_MS, YggOperationPriority, YggRequestMeta, YggSurface, YggTarget,
-    YggtermServer, app_control_requests_pending, cleanup_legacy_daemons,
+    YGG_LOADING_NOTIFICATION_AFTER_MS, YggOperationPriority, YggRequestMeta, YggSurface,
+    YggTarget, YggtermServer, app_control_requests_pending, cleanup_legacy_daemons,
     complete_app_control_request, connect_ssh_custom, fetch_remote_generation_context,
     focus_live_with_view, managed_cli_refresh_ttl_ms, open_remote_session_with_view,
     open_stored_session, open_stored_session_with_view, persist_remote_generated_copy, ping,
@@ -1902,12 +1904,8 @@ impl ShellState {
         self.persist_settings();
         self.last_action = format!("sidebar width {}px", next_width.round() as i64);
     }
-    fn handle_sidebar_resize_pointer(&mut self, client_x: f64, primary_down: bool) {
+    fn handle_sidebar_resize_pointer(&mut self, client_x: f64, _primary_down: bool) {
         if self.sidebar_resize_drag.is_none() {
-            return;
-        }
-        if !primary_down {
-            self.finish_sidebar_resize();
             return;
         }
         self.update_sidebar_resize(client_x);
@@ -7159,9 +7157,12 @@ fn spawn_background_managed_cli_refresh(state: Signal<ShellState>, scope_key: St
                     let queued = message
                         .as_deref()
                         .is_some_and(|value| value.starts_with("queued managed cli refresh"));
+                    let deferred = message.as_deref().is_some_and(|value| {
+                        value.contains("deferred initial managed Codex install until first use")
+                    });
                     shell.finish_job_notification(
                         &format!("managed-cli-refresh:{scope_key}"),
-                        if queued {
+                        if queued || deferred {
                             NotificationTone::Info
                         } else {
                             NotificationTone::Success
@@ -7169,11 +7170,15 @@ fn spawn_background_managed_cli_refresh(state: Signal<ShellState>, scope_key: St
                         if scope_key == "local" {
                             if queued {
                                 "Codex Tool Refresh Queued"
+                            } else if deferred {
+                                "Codex Tool Install Deferred"
                             } else {
                                 "Codex Tools Ready"
                             }
                         } else if queued {
                             "Remote Codex Tool Refresh Queued"
+                        } else if deferred {
+                            "Remote Codex Tool Install Deferred"
                         } else {
                             "Remote Codex Tools Ready"
                         },
@@ -7181,6 +7186,10 @@ fn spawn_background_managed_cli_refresh(state: Signal<ShellState>, scope_key: St
                             if queued {
                                 format!(
                                     "Queued a background refresh for the managed Codex tools on {scope_key}."
+                                )
+                            } else if deferred {
+                                format!(
+                                    "Deferred the first managed Codex tool install for {scope_key} until explicit use."
                                 )
                             } else {
                                 format!(
@@ -8254,6 +8263,455 @@ fn app_control_drag_pointer(row: &BrowserRow, placement: Option<DragDropPlacemen
         _ => 96.0,
     };
     (x, y)
+}
+fn app_control_pointer_script(command: &AppControlPointerCommand) -> String {
+    let payload = serde_json::to_string(command).unwrap_or_else(|_| "null".to_string());
+    format!(
+        r#"
+        (() => {{
+          const command = {payload};
+          if (!command) {{
+            return;
+          }}
+          const pointerState = window.__yggtermAppControlPointerState || {{
+            target: null,
+            x: 0,
+            y: 0,
+            buttons: 0,
+          }};
+          const resolveButton = (value) => {{
+            switch (String(value || 'primary')) {{
+              case 'secondary':
+                return {{ button: 2, buttons: 2 }};
+              case 'middle':
+                return {{ button: 1, buttons: 4 }};
+              default:
+                return {{ button: 0, buttons: 1 }};
+            }}
+          }};
+          const resolveTarget = (x, y) => {{
+            try {{
+              return document.elementFromPoint(Number(x) || 0, Number(y) || 0)
+                || document.body
+                || document.documentElement
+                || document;
+            }} catch (_error) {{
+              return document.body || document.documentElement || document;
+            }}
+          }};
+          const makeBase = (x, y, button, buttons, detail, relatedTarget) => {{
+            const clientX = Number(x) || 0;
+            const clientY = Number(y) || 0;
+            return {{
+              bubbles: true,
+              cancelable: true,
+              composed: true,
+              view: window,
+              clientX,
+              clientY,
+              screenX: Math.round((Number(window.screenX) || 0) + clientX),
+              screenY: Math.round((Number(window.screenY) || 0) + clientY),
+              button: Number(button) || 0,
+              buttons: Number(buttons) || 0,
+              detail: Number(detail) || 0,
+              relatedTarget: relatedTarget || null,
+            }};
+          }};
+          const dispatchPair = (target, mouseType, pointerType, init) => {{
+            if (!target || typeof target.dispatchEvent !== 'function') {{
+              return;
+            }}
+            try {{
+              target.dispatchEvent(new MouseEvent(mouseType, init));
+            }} catch (_error) {{}}
+            if (typeof PointerEvent === 'function') {{
+              try {{
+                target.dispatchEvent(new PointerEvent(pointerType, {{
+                  ...init,
+                  pointerId: 1,
+                  pointerType: 'mouse',
+                  isPrimary: true,
+                }}));
+              }} catch (_error) {{}}
+            }}
+          }};
+          const transition = (x, y, buttons) => {{
+            const next = resolveTarget(x, y);
+            const prev = pointerState.target;
+            const base = makeBase(x, y, 0, buttons, 0, null);
+            if (prev && prev !== next) {{
+              dispatchPair(prev, 'mouseout', 'pointerout', makeBase(x, y, 0, buttons, 0, next));
+              dispatchPair(prev, 'mouseleave', 'pointerleave', makeBase(x, y, 0, buttons, 0, next));
+            }}
+            if (next && prev !== next) {{
+              dispatchPair(next, 'mouseover', 'pointerover', makeBase(x, y, 0, buttons, 0, prev));
+              dispatchPair(next, 'mouseenter', 'pointerenter', makeBase(x, y, 0, buttons, 0, prev));
+            }}
+            dispatchPair(next, 'mousemove', 'pointermove', base);
+            pointerState.target = next;
+            pointerState.x = Number(x) || 0;
+            pointerState.y = Number(y) || 0;
+            pointerState.buttons = Number(buttons) || 0;
+            window.__yggtermAppControlPointerState = pointerState;
+            return next;
+          }};
+          const press = (x, y, buttonName) => {{
+            const info = resolveButton(buttonName);
+            const target = transition(x, y, 0);
+            dispatchPair(target, 'mousedown', 'pointerdown', makeBase(x, y, info.button, info.buttons, 1, null));
+            try {{
+              if (target && typeof target.focus === 'function') {{
+                target.focus({{ preventScroll: true }});
+              }}
+            }} catch (_error) {{}}
+            pointerState.target = target;
+            pointerState.buttons = info.buttons;
+            window.__yggtermAppControlPointerState = pointerState;
+            return info;
+          }};
+          const release = (x, y, buttonName, detail) => {{
+            const info = resolveButton(buttonName);
+            const target = transition(x, y, info.buttons);
+            dispatchPair(target, 'mouseup', 'pointerup', makeBase(x, y, info.button, 0, detail, null));
+            pointerState.target = target;
+            pointerState.buttons = 0;
+            window.__yggtermAppControlPointerState = pointerState;
+            return target;
+          }};
+          const clickAt = (x, y, buttonName, count) => {{
+            const clicks = Math.max(1, Number(count) || 1);
+            const info = press(x, y, buttonName);
+            window.setTimeout(() => {{
+              const target = release(x, y, buttonName, clicks);
+              dispatchPair(target, 'click', 'pointerup', makeBase(x, y, info.button, 0, clicks, null));
+              if (info.button === 2) {{
+                try {{
+                  target.dispatchEvent(new MouseEvent('contextmenu', makeBase(x, y, info.button, 0, clicks, null)));
+                }} catch (_error) {{}}
+              }}
+              if (clicks >= 2) {{
+                try {{
+                  target.dispatchEvent(new MouseEvent('dblclick', makeBase(x, y, info.button, 0, clicks, null)));
+                }} catch (_error) {{}}
+              }}
+            }}, 18);
+          }};
+          const dragTo = (startX, startY, endX, endY, buttonName, steps, stepDelayMs) => {{
+            const moveSteps = Math.max(1, Number(steps) || 1);
+            const delay = Math.max(1, Number(stepDelayMs) || 1);
+            const info = press(startX, startY, buttonName);
+            for (let index = 1; index <= moveSteps; index += 1) {{
+              window.setTimeout(() => {{
+                const ratio = index / moveSteps;
+                const nextX = Number(startX) + ((Number(endX) - Number(startX)) * ratio);
+                const nextY = Number(startY) + ((Number(endY) - Number(startY)) * ratio);
+                transition(nextX, nextY, info.buttons);
+              }}, delay * index);
+            }}
+            window.setTimeout(() => {{
+              release(endX, endY, buttonName, 1);
+            }}, delay * (moveSteps + 1));
+          }};
+          switch (String(command.action || '')) {{
+            case 'move':
+              transition(command.x, command.y, 0);
+              break;
+            case 'press':
+              press(command.x, command.y, command.button);
+              break;
+            case 'release':
+              release(pointerState.x, pointerState.y, command.button, 1);
+              break;
+            case 'click':
+              clickAt(command.x, command.y, command.button, command.count);
+              break;
+            case 'drag':
+              dragTo(
+                command.start_x,
+                command.start_y,
+                command.end_x,
+                command.end_y,
+                command.button,
+                command.steps,
+                command.step_delay_ms,
+              );
+              break;
+            default:
+              break;
+          }}
+        }})();
+        "#
+    )
+}
+fn app_control_key_script(command: &AppControlKeyCommand) -> String {
+    let payload = serde_json::to_string(command).unwrap_or_else(|_| "null".to_string());
+    format!(
+        r#"
+        (() => {{
+          const command = {payload};
+          if (!command) {{
+            return;
+          }}
+          const pointerState = window.__yggtermAppControlPointerState || {{}};
+          const isEditable = (target) => {{
+            if (!target) {{
+              return false;
+            }}
+            if (typeof HTMLInputElement !== 'undefined' && target instanceof HTMLInputElement) {{
+              return true;
+            }}
+            if (typeof HTMLTextAreaElement !== 'undefined' && target instanceof HTMLTextAreaElement) {{
+              return true;
+            }}
+            return Boolean(target.isContentEditable);
+          }};
+          const helperTextarea = () => {{
+            const active = document.activeElement;
+            if (active && active.classList && active.classList.contains('xterm-helper-textarea')) {{
+              return active;
+            }}
+            return document.querySelector('.xterm-helper-textarea');
+          }};
+          const activeTarget = () => {{
+            const active = document.activeElement;
+            if (active && active !== document.body && active !== document.documentElement) {{
+              return active;
+            }}
+            if (pointerState.target && typeof pointerState.target.dispatchEvent === 'function') {{
+              return pointerState.target;
+            }}
+            return document.body || document.documentElement || document;
+          }};
+          const focusTarget = (target) => {{
+            try {{
+              if (target && typeof target.focus === 'function') {{
+                target.focus({{ preventScroll: true }});
+              }}
+            }} catch (_error) {{}}
+          }};
+          const keySpec = (rawValue) => {{
+            const raw = String(rawValue || '');
+            const normalized = raw.trim().toLowerCase();
+            if (!normalized) {{
+              return null;
+            }}
+            if (normalized === 'escape' || normalized === 'esc') {{
+              return {{ key: 'Escape', code: 'Escape', keyCode: 27 }};
+            }}
+            if (normalized === 'backspace') {{
+              return {{ key: 'Backspace', code: 'Backspace', keyCode: 8 }};
+            }}
+            if (normalized === 'end') {{
+              return {{ key: 'End', code: 'End', keyCode: 35 }};
+            }}
+            if (normalized === 'enter' || normalized === 'return') {{
+              return {{ key: 'Enter', code: 'Enter', keyCode: 13 }};
+            }}
+            if (normalized === 'tab') {{
+              return {{ key: 'Tab', code: 'Tab', keyCode: 9 }};
+            }}
+            if (normalized === 'ctrl+u' || normalized === 'control+u') {{
+              return {{ key: 'u', code: 'KeyU', keyCode: 85, ctrlKey: true }};
+            }}
+            if (raw.length === 1) {{
+              const upper = raw.toUpperCase();
+              return {{
+                key: raw,
+                code: upper >= 'A' && upper <= 'Z' ? `Key${{upper}}` : '',
+                keyCode: raw.charCodeAt(0),
+              }};
+            }}
+            return {{
+              key: raw,
+              code: '',
+              keyCode: raw.length === 1 ? raw.charCodeAt(0) : 0,
+            }};
+          }};
+          const dispatchKey = (target, spec) => {{
+            if (!target || typeof target.dispatchEvent !== 'function' || !spec) {{
+              return;
+            }}
+            const keyInit = {{
+              key: spec.key,
+              code: spec.code || '',
+              keyCode: spec.keyCode || 0,
+              which: spec.keyCode || 0,
+              charCode: spec.key && spec.key.length === 1 ? (spec.keyCode || 0) : 0,
+              bubbles: true,
+              cancelable: true,
+              composed: true,
+              shiftKey: Boolean(spec.shiftKey),
+              altKey: Boolean(spec.altKey),
+              ctrlKey: Boolean(spec.ctrlKey),
+              metaKey: Boolean(spec.metaKey),
+            }};
+            try {{
+              target.dispatchEvent(new KeyboardEvent('keydown', keyInit));
+              if ((spec.key || '').length === 1 && !spec.ctrlKey && !spec.metaKey && !spec.altKey) {{
+                target.dispatchEvent(new KeyboardEvent('keypress', keyInit));
+              }}
+              target.dispatchEvent(new KeyboardEvent('keyup', keyInit));
+            }} catch (_error) {{}}
+          }};
+          const inputValue = (target) => {{
+            if (!target) {{
+              return '';
+            }}
+            if ('value' in target && typeof target.value === 'string') {{
+              return target.value;
+            }}
+            return typeof target.textContent === 'string' ? target.textContent : '';
+          }};
+          const setSelection = (target, start, end) => {{
+            try {{
+              if (typeof target.setSelectionRange === 'function') {{
+                target.setSelectionRange(start, end);
+                return;
+              }}
+            }} catch (_error) {{}}
+            if (target.isContentEditable && typeof window.getSelection === 'function') {{
+              const selection = window.getSelection();
+              if (!selection) {{
+                return;
+              }}
+              const textNode = target.firstChild || target;
+              const clampedStart = Math.max(0, Math.min(Number(start) || 0, (textNode.textContent || '').length));
+              const clampedEnd = Math.max(clampedStart, Math.min(Number(end) || clampedStart, (textNode.textContent || '').length));
+              try {{
+                const range = document.createRange();
+                range.setStart(textNode, clampedStart);
+                range.setEnd(textNode, clampedEnd);
+                selection.removeAllRanges();
+                selection.addRange(range);
+              }} catch (_error) {{}}
+            }}
+          }};
+          const selectionRange = (target) => {{
+            const value = inputValue(target);
+            if (typeof target.selectionStart === 'number' && typeof target.selectionEnd === 'number') {{
+              return {{
+                start: target.selectionStart,
+                end: target.selectionEnd,
+                value,
+              }};
+            }}
+            return {{
+              start: value.length,
+              end: value.length,
+              value,
+            }};
+          }};
+          const fireInput = (target, inputType, data) => {{
+            try {{
+              target.dispatchEvent(new InputEvent('beforeinput', {{
+                bubbles: true,
+                cancelable: true,
+                composed: true,
+                inputType,
+                data: data ?? null,
+              }}));
+            }} catch (_error) {{}}
+            try {{
+              target.dispatchEvent(new InputEvent('input', {{
+                bubbles: true,
+                cancelable: false,
+                composed: true,
+                inputType,
+                data: data ?? null,
+              }}));
+            }} catch (_error) {{
+              try {{
+                target.dispatchEvent(new Event('input', {{ bubbles: true, cancelable: false, composed: true }}));
+              }} catch (_error2) {{}}
+            }}
+          }};
+          const applyEditableMutation = (target, nextValue, nextStart, nextEnd, inputType, data) => {{
+            if (!target) {{
+              return;
+            }}
+            if ('value' in target && typeof target.value === 'string') {{
+              target.value = nextValue;
+            }} else if (target.isContentEditable) {{
+              target.textContent = nextValue;
+            }}
+            setSelection(target, nextStart, nextEnd);
+            fireInput(target, inputType, data);
+          }};
+          const handleEditablePress = (target, spec) => {{
+            if (!isEditable(target) || !spec) {{
+              return false;
+            }}
+            const state = selectionRange(target);
+            if (spec.ctrlKey && String(spec.key || '').toLowerCase() === 'u') {{
+              const nextValue = state.value.slice(state.end);
+              applyEditableMutation(target, nextValue, 0, 0, 'deleteSoftLineBackward', null);
+              return true;
+            }}
+            if (spec.key === 'End') {{
+              const end = state.value.length;
+              setSelection(target, end, end);
+              return true;
+            }}
+            if (spec.key === 'Backspace') {{
+              let start = state.start;
+              let end = state.end;
+              if (start === end && start > 0) {{
+                start -= 1;
+              }}
+              const nextValue = `${{state.value.slice(0, start)}}${{state.value.slice(end)}}`;
+              applyEditableMutation(target, nextValue, start, start, 'deleteContentBackward', null);
+              return true;
+            }}
+            if ((spec.key || '').length === 1 && !spec.ctrlKey && !spec.metaKey && !spec.altKey) {{
+              const nextValue = `${{state.value.slice(0, state.start)}}${{spec.key}}${{state.value.slice(state.end)}}`;
+              const nextCursor = state.start + spec.key.length;
+              applyEditableMutation(target, nextValue, nextCursor, nextCursor, 'insertText', spec.key);
+              return true;
+            }}
+            return false;
+          }};
+          const typeText = (target, text) => {{
+            const content = String(text || '');
+            if (!content) {{
+              return;
+            }}
+            const helper = helperTextarea();
+            if (helper && target === helper) {{
+              helper.value = content;
+              fireInput(helper, 'insertText', content);
+              helper.value = '';
+              return;
+            }}
+            if (isEditable(target)) {{
+              const state = selectionRange(target);
+              const nextValue = `${{state.value.slice(0, state.start)}}${{content}}${{state.value.slice(state.end)}}`;
+              const nextCursor = state.start + content.length;
+              applyEditableMutation(target, nextValue, nextCursor, nextCursor, 'insertText', content);
+              return;
+            }}
+            for (const char of Array.from(content)) {{
+              dispatchKey(target, keySpec(char));
+            }}
+          }};
+          const target = activeTarget();
+          focusTarget(target);
+          switch (String(command.action || '')) {{
+            case 'press':
+              for (const rawKey of Array.isArray(command.keys) ? command.keys : []) {{
+                const spec = keySpec(rawKey);
+                dispatchKey(target, spec);
+                handleEditablePress(target, spec);
+              }}
+              break;
+            case 'type':
+              typeText(target, command.text);
+              break;
+            default:
+              break;
+          }}
+        }})();
+        "#
+    )
 }
 fn spawn_connect_ssh_custom(mut state: Signal<ShellState>) {
     let target = state.read().ssh_connect_target.trim().to_string();
@@ -9774,9 +10232,15 @@ fn titlebar_wrapper_style(auto_hide_enabled: bool, revealed: bool) -> String {
     } else {
         emphasized_enter_transition(&["height", "min-height", "max-height"])
     };
+    let positioning = if auto_hide_enabled {
+        "position:absolute; inset:0 0 auto 0; width:100%;"
+    } else {
+        "position:relative;"
+    };
     format!(
-        "position:relative; display:flex; flex-direction:column; min-width:0; height:{}px; min-height:{}px; max-height:{}px; \
+        "{} display:flex; flex-direction:column; min-width:0; height:{}px; min-height:{}px; max-height:{}px; \
          overflow:{}; z-index:180; transition:{};",
+        positioning,
         height_px,
         height_px,
         height_px,
@@ -13628,6 +14092,60 @@ fn queue_drop_current_drag_target(mut state: Signal<ShellState>) {
     };
     queue_move_selected_items_to_group(state, placement, target_label);
 }
+fn browser_row_survives_pending_delete(row: &BrowserRow, pending: &PendingDeleteDialog) -> bool {
+    match row.kind {
+        BrowserRowKind::Separator => false,
+        BrowserRowKind::Session => !pending.session_paths.iter().any(|path| path == &row.full_path),
+        BrowserRowKind::Document => {
+            !pending.document_paths.iter().any(|path| path == &row.full_path)
+        }
+        BrowserRowKind::Group => {
+            row.group_kind != Some(WorkspaceGroupKind::Separator)
+                && !pending.group_paths.iter().any(|path| path == &row.full_path)
+        }
+    }
+}
+
+fn deletion_redirect_row(shell: &ShellState, pending: &PendingDeleteDialog) -> Option<BrowserRow> {
+    let active_path = shell.server.active_session_path().map(ToOwned::to_owned)?;
+    if !pending
+        .session_paths
+        .iter()
+        .any(|path| path == &active_path)
+    {
+        return None;
+    }
+    let rows = shell.browser.rows();
+    let active_index = rows
+        .iter()
+        .position(|row| row.full_path == active_path)
+        .or_else(|| {
+            shell.browser.selected_path().and_then(|selected_path| {
+                rows.iter()
+                    .position(|row| row.full_path == selected_path)
+            })
+        });
+    if let Some(active_index) = active_index {
+        if let Some(next_row) = rows
+            .iter()
+            .skip(active_index + 1)
+            .find(|row| browser_row_survives_pending_delete(row, pending))
+        {
+            return Some(next_row.clone());
+        }
+        if let Some(previous_row) = rows[..active_index]
+            .iter()
+            .rev()
+            .find(|row| browser_row_survives_pending_delete(row, pending))
+        {
+            return Some(previous_row.clone());
+        }
+    }
+    rows.iter()
+        .find(|row| browser_row_survives_pending_delete(row, pending))
+        .cloned()
+}
+
 fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool) {
     let pending = if let Some(pending) = state.read().pending_delete.clone() {
         pending
@@ -13662,33 +14180,7 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
         }
         pending
     };
-    let deletion_redirect_row = state.with(|shell| {
-        let active_path = shell.server.active_session_path().map(ToOwned::to_owned)?;
-        if !pending
-            .session_paths
-            .iter()
-            .any(|path| path == &active_path)
-        {
-            return None;
-        }
-        shell
-            .browser
-            .rows()
-            .iter()
-            .find(|row| row.full_path == active_path)
-            .cloned()
-            .map(|row| resolve_creation_context_row(shell.browser.rows(), &row))
-            .or_else(|| {
-                shell.browser.rows().iter().find_map(|row| {
-                    (row.kind == BrowserRowKind::Group
-                        && !pending
-                            .session_paths
-                            .iter()
-                            .any(|path| path == &row.full_path))
-                    .then(|| row.clone())
-                })
-            })
-    });
+    let deletion_redirect_row = state.with(|shell| deletion_redirect_row(shell, &pending));
     state.with_mut(|shell| {
         shell.server_busy = true;
         shell.pending_delete = None;
@@ -14899,6 +15391,14 @@ fn describe_app_state_snapshot(
         })
         .collect::<Vec<_>>();
     let update_call_to_action = shell.update_call_to_action();
+    let transparent_window = BOOTSTRAP
+        .get()
+        .map(|bootstrap| bootstrap.linux_window_transparent)
+        .unwrap_or(false);
+    let transparent_window_profile_reason = BOOTSTRAP
+        .get()
+        .map(|bootstrap| bootstrap.linux_window_profile_reason.clone())
+        .unwrap_or_default();
     json!({
         "window": describe_window(desktop),
         "client_instance": {
@@ -15014,6 +15514,9 @@ fn describe_app_state_snapshot(
             ),
             "titlebar_new_menu_open": shell.titlebar_new_menu_open,
             "fullscreen": shell.fullscreen,
+            "transparent_window": transparent_window,
+            "transparent_window_profile_reason": transparent_window_profile_reason,
+            "live_blur_supported": shell_live_blur_supported(),
             "server_busy": shell.server_busy,
             "needs_initial_server_sync": shell.needs_initial_server_sync,
             "latest_open_request_id": shell.latest_open_request_id,
@@ -16564,11 +17067,13 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                 sidebar_count: sidebars.length,
                 shell_root_rect: rectSummary(rootNode),
                 shell_root_background: rootNode ? String(window.getComputedStyle(rootNode).backgroundColor || '') : null,
+                shell_root_backdrop_filter: rootNode ? String(window.getComputedStyle(rootNode).getPropertyValue('backdrop-filter') || window.getComputedStyle(rootNode).getPropertyValue('-webkit-backdrop-filter') || '') : null,
                 shell_root_box_shadow: rootNode ? String(window.getComputedStyle(rootNode).boxShadow || '') : null,
                 shell_root_border_radius: rootNode ? String(window.getComputedStyle(rootNode).borderRadius || '') : null,
                 shell_frame_rect: rectSummary(shellFrame),
                 shell_frame_background: shellFrame ? String(window.getComputedStyle(shellFrame).backgroundColor || '') : null,
                 shell_frame_background_image: shellFrame ? String(window.getComputedStyle(shellFrame).backgroundImage || '') : null,
+                shell_frame_backdrop_filter: shellFrame ? String(window.getComputedStyle(shellFrame).getPropertyValue('backdrop-filter') || window.getComputedStyle(shellFrame).getPropertyValue('-webkit-backdrop-filter') || '') : null,
                 shell_frame_box_shadow: shellFrame ? String(window.getComputedStyle(shellFrame).boxShadow || '') : null,
                 shell_frame_border_radius: shellFrame ? String(window.getComputedStyle(shellFrame).borderRadius || '') : null,
                 right_side_rail_rect: rectSummary(rightSideRail),
@@ -18082,6 +18587,93 @@ async fn process_pending_app_control_requests(
                 data: Some(json!({
                     "enabled": enabled,
                     "window": describe_window(&desktop),
+                })),
+                error: None,
+            }
+        }
+        AppControlCommand::BackgroundWindow => match background_app_window(&desktop) {
+            Ok(data) => AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(data),
+                error: None,
+            },
+            Err(error) => AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: None,
+                error: Some(error.to_string()),
+            },
+        },
+        AppControlCommand::MoveWindowBy { delta_x, delta_y } => {
+            match move_app_window_by(&desktop, delta_x, delta_y) {
+                Ok(data) => AppControlResponse {
+                    request_id: request.request_id.clone(),
+                    handled_by_pid: std::process::id(),
+                    completed_at_ms: current_millis() as u128,
+                    output_path: None,
+                    data: Some(data),
+                    error: None,
+                },
+                Err(error) => AppControlResponse {
+                    request_id: request.request_id.clone(),
+                    handled_by_pid: std::process::id(),
+                    completed_at_ms: current_millis() as u128,
+                    output_path: None,
+                    data: None,
+                    error: Some(error.to_string()),
+                },
+            }
+        }
+        AppControlCommand::CloseWindow => {
+            let data = json!({
+                "close_requested": true,
+                "window": describe_window(&desktop),
+            });
+            let close_state = state;
+            spawn(async move {
+                sleep(Duration::from_millis(80)).await;
+                spawn_graceful_shutdown_and_close(close_state);
+            });
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(data),
+                error: None,
+            }
+        }
+        AppControlCommand::Pointer { command } => {
+            let script = app_control_pointer_script(&command);
+            let _ = document::eval(&script);
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(json!({
+                    "accepted": true,
+                    "command": command,
+                })),
+                error: None,
+            }
+        }
+        AppControlCommand::Key { command } => {
+            let script = app_control_key_script(&command);
+            let _ = document::eval(&script);
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(json!({
+                    "accepted": true,
+                    "command": command,
                 })),
                 error: None,
             }
@@ -36061,38 +36653,25 @@ fn palette(theme: UiTheme) -> Palette {
 fn shell_live_blur_supported() -> bool {
     #[cfg(target_os = "linux")]
     {
-        std::env::var_os("WAYLAND_DISPLAY").is_some() && !linux_kde_wayland_safe_mode()
+        std::env::var_os("WAYLAND_DISPLAY").is_some()
     }
     #[cfg(not(target_os = "linux"))]
     {
         true
     }
 }
-fn shell_backdrop_style(maximized: bool) -> &'static str {
-    if maximized || !shell_live_blur_supported() {
+fn shell_backdrop_style(maximized: bool, transparent_window: bool) -> &'static str {
+    if maximized || !transparent_window || !shell_live_blur_supported() {
         "none"
     } else {
         "blur(10px) saturate(135%)"
     }
 }
-fn linux_kde_wayland_safe_mode() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        std::env::var_os("WAYLAND_DISPLAY").is_some()
-            && std::env::var("XDG_CURRENT_DESKTOP")
-                .map(|value| value.to_ascii_lowercase().contains("kde"))
-                .unwrap_or(false)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        false
-    }
-}
 fn overlay_backdrop_style(default_style: &'static str) -> &'static str {
-    if linux_kde_wayland_safe_mode() {
-        "none"
-    } else {
+    if shell_live_blur_supported() {
         default_style
+    } else {
+        "none"
     }
 }
 fn shell_style(
@@ -36103,8 +36682,8 @@ fn shell_style(
     maximized: bool,
     transparent_window: bool,
 ) -> String {
-    let backdrop = shell_backdrop_style(maximized);
-    let effective_shell_fill = if shell_live_blur_supported() && !maximized {
+    let backdrop = shell_backdrop_style(maximized, transparent_window);
+    let effective_shell_fill = if transparent_window && shell_live_blur_supported() && !maximized {
         shell_tint.to_string()
     } else {
         palette.shell.to_string()
@@ -37505,13 +38084,16 @@ mod tests {
     fn titlebar_wrapper_only_clips_overflow_while_collapsed() {
         let collapsed = titlebar_wrapper_style(true, false);
         assert!(collapsed.contains("overflow:hidden"));
+        assert!(collapsed.contains("position:absolute"));
         let revealed = titlebar_wrapper_style(true, true);
         assert!(revealed.contains("overflow:visible"));
+        assert!(revealed.contains("position:absolute"));
         let always_visible = titlebar_wrapper_style(false, true);
         assert!(always_visible.contains("overflow:visible"));
+        assert!(always_visible.contains("position:relative"));
     }
     #[test]
-    fn sidebar_resize_pointer_without_primary_button_finishes_drag() {
+    fn sidebar_resize_pointer_without_primary_button_keeps_drag_until_release() {
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://test"));
         shell.sidebar_width = 364.0;
         shell.settings.tree_width = 364.0;
@@ -37523,6 +38105,11 @@ mod tests {
         assert_eq!(shell.settings.tree_width, 420.0);
 
         shell.handle_sidebar_resize_pointer(156.0, false);
+        assert!(shell.sidebar_resize_drag.is_some());
+        assert_eq!(shell.sidebar_width, 420.0);
+        assert_eq!(shell.settings.tree_width, 420.0);
+
+        shell.finish_sidebar_resize();
         assert!(shell.sidebar_resize_drag.is_none());
         assert_eq!(shell.sidebar_width, 420.0);
         assert_eq!(shell.settings.tree_width, 420.0);

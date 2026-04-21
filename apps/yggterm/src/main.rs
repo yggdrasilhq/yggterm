@@ -18,9 +18,11 @@ use yggterm_server::{
     AppControlPreviewLayout, AppControlRightPanelMode, AppControlViewMode, PersistedDaemonState,
     ProbeTerminalViewportInputMode, SessionKind, YggtermServer, cleanup_legacy_daemons,
     default_endpoint, detect_ghostty_host, ensure_local_daemon_running, ping,
+    run_app_control_background_window, run_app_control_close_window,
     run_app_control_create_terminal, run_app_control_describe_rows, run_app_control_describe_state,
     run_app_control_drag, run_app_control_dump_state, run_app_control_focus_window,
-    run_app_control_list_clients, run_app_control_open_path,
+    run_app_control_key, run_app_control_list_clients, run_app_control_open_path,
+    run_app_control_move_window_by, run_app_control_pointer,
     run_app_control_paste_terminal_clipboard, run_app_control_paste_terminal_clipboard_image,
     run_app_control_probe_terminal_viewport_input, run_app_control_probe_terminal_viewport_scroll,
     run_app_control_probe_terminal_viewport_select, run_app_control_reclaim_terminal_focus,
@@ -91,6 +93,100 @@ fn cli_positional_args(args: &[String], start: usize) -> Vec<&str> {
         index += 1;
     }
     positional
+}
+
+fn launch_app_background(
+    home_dir: &std::path::Path,
+    timeout_ms: u64,
+    wait_visible: bool,
+    allow_multi_window: bool,
+    skip_active_exec_handoff: bool,
+    log_path: Option<&str>,
+) -> Result<()> {
+    let current_exe = std::env::current_exe().context("resolving current yggterm executable")?;
+    let chosen_log_path = match log_path {
+        Some(path) => std::path::PathBuf::from(path),
+        None => {
+            let logs_dir = home_dir.join("app-launch-logs");
+            fs::create_dir_all(&logs_dir).with_context(|| {
+                format!("creating background app launch log dir {}", logs_dir.display())
+            })?;
+            let ts_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis())
+                .unwrap_or_default();
+            logs_dir.join(format!("launch-{ts_ms}.log"))
+        }
+    };
+    let stdout_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&chosen_log_path)
+        .with_context(|| format!("opening background app log {}", chosen_log_path.display()))?;
+    let stderr_file = stdout_file
+        .try_clone()
+        .with_context(|| format!("cloning background app log handle {}", chosen_log_path.display()))?;
+    let mut command = Command::new(&current_exe);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        .env(ENV_YGGTERM_HOME, home_dir);
+    if allow_multi_window {
+        command.env("YGGTERM_ALLOW_MULTI_WINDOW", "1");
+    }
+    if skip_active_exec_handoff {
+        command.env("YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF", "1");
+    }
+    let child = command
+        .spawn()
+        .with_context(|| format!("spawning background yggterm from {}", current_exe.display()))?;
+    let pid = child.id();
+    let mut client = None::<serde_json::Value>;
+    if wait_visible {
+        let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms.max(100));
+        while std::time::Instant::now() <= deadline {
+            let output = Command::new(&current_exe)
+                .args(["server", "app", "clients"])
+                .env(ENV_YGGTERM_HOME, home_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .with_context(|| format!("listing app clients via {}", current_exe.display()))?;
+            if output.status.success() {
+                if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                    client = payload
+                        .get("clients")
+                        .and_then(serde_json::Value::as_array)
+                        .and_then(|clients| {
+                            clients
+                                .iter()
+                                .find(|entry| {
+                                    entry
+                                        .get("pid")
+                                        .and_then(serde_json::Value::as_u64)
+                                        == Some(pid as u64)
+                                })
+                                .cloned()
+                        });
+                    if client.is_some() {
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "pid": pid,
+            "log_path": chosen_log_path,
+            "registered": client.is_some(),
+            "client": client,
+        }))?
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -352,6 +448,27 @@ fn main() -> Result<()> {
                 let output_path = cli_positional_args(&args, 3).into_iter().next();
                 run_screenrecord_capture("app", output_path, timeout_ms, duration_secs)
             }
+            "launch" => {
+                let wait_visible = args.iter().any(|arg| arg == "--wait-visible");
+                let allow_multi_window = args.iter().any(|arg| arg == "--allow-multi-window");
+                let skip_active_exec_handoff =
+                    args.iter().any(|arg| arg == "--skip-active-exec-handoff");
+                let log_path = args.windows(2).find_map(|window| {
+                    if window[0] == "--log" {
+                        Some(window[1].as_str())
+                    } else {
+                        None
+                    }
+                });
+                launch_app_background(
+                    store.home_dir(),
+                    timeout_ms,
+                    wait_visible,
+                    allow_multi_window,
+                    skip_active_exec_handoff,
+                    log_path,
+                )
+            }
             "clients" => run_app_control_list_clients(),
             "state" => run_app_control_describe_state(timeout_ms),
             "dump" => {
@@ -425,6 +542,29 @@ fn main() -> Result<()> {
                 run_app_control_set_row_expanded(row_path, args[2] == "expand", timeout_ms)
             }
             "focus" => run_app_control_focus_window(timeout_ms),
+            "background" | "minimize" => run_app_control_background_window(timeout_ms),
+            "move-window" | "move-by" | "nudge" => {
+                let delta_x = args.windows(2).find_map(|window| {
+                    if window[0] == "--delta-x" || window[0] == "--dx" {
+                        window[1].parse::<f64>().ok()
+                    } else {
+                        None
+                    }
+                });
+                let delta_y = args.windows(2).find_map(|window| {
+                    if window[0] == "--delta-y" || window[0] == "--dy" {
+                        window[1].parse::<f64>().ok()
+                    } else {
+                        None
+                    }
+                });
+                run_app_control_move_window_by(
+                    delta_x.context("missing --delta-x/--dx for server app move-window")?,
+                    delta_y.context("missing --delta-y/--dy for server app move-window")?,
+                    timeout_ms,
+                )
+            }
+            "close" | "quit" | "exit" => run_app_control_close_window(timeout_ms),
             "search" => {
                 let action = args.get(3).map(String::as_str).unwrap_or("set");
                 match action {
@@ -588,6 +728,125 @@ fn main() -> Result<()> {
                     }
                 });
                 run_app_control_drag(action, row_path, placement, timeout_ms)
+            }
+            "pointer" => {
+                let action = args
+                    .get(3)
+                    .map(String::as_str)
+                    .context("missing action for server app pointer")?;
+                let x = args.windows(2).find_map(|window| {
+                    if window[0] == "--x" {
+                        window[1].parse::<f64>().ok()
+                    } else {
+                        None
+                    }
+                });
+                let y = args.windows(2).find_map(|window| {
+                    if window[0] == "--y" {
+                        window[1].parse::<f64>().ok()
+                    } else {
+                        None
+                    }
+                });
+                let start_x = args.windows(2).find_map(|window| {
+                    if window[0] == "--start-x" {
+                        window[1].parse::<f64>().ok()
+                    } else {
+                        None
+                    }
+                });
+                let start_y = args.windows(2).find_map(|window| {
+                    if window[0] == "--start-y" {
+                        window[1].parse::<f64>().ok()
+                    } else {
+                        None
+                    }
+                });
+                let end_x = args.windows(2).find_map(|window| {
+                    if window[0] == "--end-x" {
+                        window[1].parse::<f64>().ok()
+                    } else {
+                        None
+                    }
+                });
+                let end_y = args.windows(2).find_map(|window| {
+                    if window[0] == "--end-y" {
+                        window[1].parse::<f64>().ok()
+                    } else {
+                        None
+                    }
+                });
+                let button = args.windows(2).find_map(|window| {
+                    if window[0] == "--button" {
+                        Some(window[1].as_str())
+                    } else {
+                        None
+                    }
+                });
+                let count = args.windows(2).find_map(|window| {
+                    if window[0] == "--count" {
+                        window[1].parse::<u8>().ok()
+                    } else {
+                        None
+                    }
+                });
+                let steps = args.windows(2).find_map(|window| {
+                    if window[0] == "--steps" {
+                        window[1].parse::<u16>().ok()
+                    } else {
+                        None
+                    }
+                });
+                let step_delay_ms = args.windows(2).find_map(|window| {
+                    if window[0] == "--step-delay-ms" {
+                        window[1].parse::<u64>().ok()
+                    } else {
+                        None
+                    }
+                });
+                run_app_control_pointer(
+                    action,
+                    x,
+                    y,
+                    start_x,
+                    start_y,
+                    end_x,
+                    end_y,
+                    button,
+                    count,
+                    steps,
+                    step_delay_ms,
+                    timeout_ms,
+                )
+            }
+            "key" => {
+                let action = args
+                    .get(3)
+                    .map(String::as_str)
+                    .context("missing action for server app key")?;
+                let positional = cli_positional_args(&args, 4);
+                let positional_owned = positional
+                    .iter()
+                    .map(|value| (*value).to_string())
+                    .collect::<Vec<_>>();
+                let text = args.windows(2).find_map(|window| {
+                    if window[0] == "--text" {
+                        Some(window[1].as_str())
+                    } else {
+                        None
+                    }
+                });
+                let keys = if action == "press" {
+                    positional_owned.clone()
+                } else {
+                    Vec::new()
+                };
+                run_app_control_key(
+                    action,
+                    &keys,
+                    text.or_else(|| positional.first().copied()),
+                    timeout_ms,
+                )
             }
             "terminal" => {
                 let action = args
@@ -955,6 +1214,16 @@ fn detect_linux_window_profile() -> LinuxWindowProfile {
 
     #[cfg(not(target_os = "linux"))]
     {
+        #[cfg(target_os = "windows")]
+        {
+            return LinuxWindowProfile {
+                transparent: true,
+                xrpd_session: false,
+                reason: "windows_transparent_profile",
+            };
+        }
+
+        #[cfg(not(target_os = "windows"))]
         LinuxWindowProfile {
             transparent: false,
             xrpd_session: false,
@@ -1180,29 +1449,29 @@ fn signal_process_is_alive(pid: u32) -> bool {
     pid != 0
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn signal_process_start_ticks(pid: u32) -> Option<u64> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     signal_parse_process_start_ticks_from_stat(&stat)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn signal_process_start_ticks(_pid: u32) -> Option<u64> {
     None
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn signal_parse_process_start_ticks_from_stat(stat: &str) -> Option<u64> {
     let (_, rest) = stat.rsplit_once(") ")?;
     rest.split_whitespace().nth(19)?.parse::<u64>().ok()
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn signal_parse_process_start_ticks_from_stat(_stat: &str) -> Option<u64> {
     None
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn signal_process_has_gui_client_argv(pid: u32) -> bool {
     let payload = match fs::read(format!("/proc/{pid}/cmdline")) {
         Ok(payload) => payload,
@@ -1223,7 +1492,7 @@ fn signal_process_has_gui_client_argv(pid: u32) -> bool {
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn signal_process_has_gui_client_argv(_pid: u32) -> bool {
     true
 }
@@ -1233,7 +1502,9 @@ fn signal_record_matches_live_process(pid: u32, path: &std::path::Path) -> bool 
         return false;
     }
     if let Some(expected_start_ticks) = read_signal_process_start_ticks_from_record(path) {
-        return signal_process_start_ticks(pid) == Some(expected_start_ticks);
+        if let Some(actual_start_ticks) = signal_process_start_ticks(pid) {
+            return actual_start_ticks == expected_start_ticks;
+        }
     }
     signal_process_has_gui_client_argv(pid)
 }
@@ -1332,11 +1603,15 @@ fn signal_client_scope_matches_pid(
     if let Some(scope) = read_signal_client_scope_from_record(path) {
         return signal_client_scope_matches(&scope, current);
     }
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     if let Some(scope) = read_signal_client_scope_from_proc(pid) {
         return signal_client_scope_matches(&scope, current);
     }
-    false
+    current.display.is_none()
+        && current.wayland_display.is_none()
+        && current.xdg_session_id.is_none()
+        && current.xdg_runtime_dir.is_none()
+        && current.xauthority.is_none()
 }
 
 fn read_signal_process_start_ticks_from_record(path: &std::path::Path) -> Option<u64> {
@@ -1389,7 +1664,7 @@ fn read_signal_client_scope_from_record(path: &std::path::Path) -> Option<Signal
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn read_signal_client_scope_from_proc(pid: u32) -> Option<SignalClientScope> {
     let payload = fs::read(format!("/proc/{pid}/environ")).ok()?;
     let mut scope = SignalClientScope {
