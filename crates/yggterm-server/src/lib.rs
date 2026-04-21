@@ -9,13 +9,15 @@ mod remote_runtime;
 mod terminal;
 
 pub use app_control::{
-    AppControlCommand, AppControlDragCommand, AppControlDragPlacement, AppControlPreviewLayout,
+    AppControlCommand, AppControlDragCommand, AppControlDragPlacement, AppControlKeyCommand,
+    AppControlPointerButton, AppControlPointerCommand, AppControlPreviewLayout,
     AppControlRequest, AppControlResponse, AppControlRightPanelMode, AppControlViewMode,
     ProbeTerminalViewportInputMode, ScreenshotTarget, app_control_captures_dir,
     app_control_requests_dir, app_control_requests_pending, app_control_responses_dir,
     complete_app_control_request, current_millis, default_recording_output_path,
-    default_screenshot_output_path, enqueue_app_control_request, enqueue_screen_recording_request,
-    enqueue_screenshot_request, take_next_app_control_request, wait_for_app_control_response,
+    default_screenshot_output_path, enqueue_app_control_request,
+    enqueue_screen_recording_request, enqueue_screenshot_request, take_next_app_control_request,
+    wait_for_app_control_response,
 };
 pub use attach::{AttachMetadata, run_attach};
 pub use codex_cli::{ManagedCliTool, ManagedCliToolStatus, managed_cli_refresh_ttl_ms};
@@ -1900,6 +1902,7 @@ impl YggtermServer {
                 skipped_recently: false,
                 ttl_remaining_ms: None,
                 install_attempted: false,
+                install_deferred: false,
             },
         )))
     }
@@ -8011,6 +8014,15 @@ fn parse_app_control_drag_placement(value: &str) -> Option<AppControlDragPlaceme
     }
 }
 
+fn parse_app_control_pointer_button(value: &str) -> Option<AppControlPointerButton> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "primary" | "left" | "1" => Some(AppControlPointerButton::Primary),
+        "middle" | "auxiliary" | "2" => Some(AppControlPointerButton::Middle),
+        "secondary" | "right" | "3" => Some(AppControlPointerButton::Secondary),
+        _ => None,
+    }
+}
+
 fn capture_embedded_app_screenshot(
     home: &std::path::Path,
     target: ScreenshotTarget,
@@ -8139,29 +8151,29 @@ fn process_is_alive(pid: u32) -> bool {
     pid != 0
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn process_start_ticks(pid: u32) -> Option<u64> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     parse_process_start_ticks_from_stat(&stat)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn process_start_ticks(_pid: u32) -> Option<u64> {
     None
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn parse_process_start_ticks_from_stat(stat: &str) -> Option<u64> {
     let (_, rest) = stat.rsplit_once(") ")?;
     rest.split_whitespace().nth(19)?.parse::<u64>().ok()
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn parse_process_start_ticks_from_stat(_stat: &str) -> Option<u64> {
     None
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn process_has_gui_client_argv(pid: u32) -> bool {
     let payload = match fs::read(format!("/proc/{pid}/cmdline")) {
         Ok(payload) => payload,
@@ -8179,7 +8191,7 @@ fn process_has_gui_client_argv(pid: u32) -> bool {
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn process_has_gui_client_argv(_pid: u32) -> bool {
     true
 }
@@ -8189,7 +8201,9 @@ fn client_instance_record_matches_live_process(record: &ClientInstanceRecord) ->
         return false;
     }
     if let Some(expected_start_ticks) = record.process_start_ticks {
-        return process_start_ticks(record.pid) == Some(expected_start_ticks);
+        if let Some(actual_start_ticks) = process_start_ticks(record.pid) {
+            return actual_start_ticks == expected_start_ticks;
+        }
     }
     process_has_gui_client_argv(record.pid)
 }
@@ -8651,6 +8665,35 @@ pub fn run_app_control_focus_window(timeout_ms: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn run_app_control_background_window(timeout_ms: u64) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(&home, AppControlCommand::BackgroundWindow, timeout_ms)?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_move_window_by(
+    delta_x: f64,
+    delta_y: f64,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::MoveWindowBy { delta_x, delta_y },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_close_window(timeout_ms: u64) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(&home, AppControlCommand::CloseWindow, timeout_ms)?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 pub fn run_app_control_set_fullscreen(enabled: bool, timeout_ms: u64) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
     let response = request_app_control(
@@ -9086,6 +9129,110 @@ pub fn run_app_control_drag(
             command: AppControlDragCommand::Clear,
         },
         other => anyhow::bail!("unsupported app drag action: {other}"),
+    };
+    let response = request_app_control(&home, command, timeout_ms)?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_pointer(
+    action: &str,
+    x: Option<f64>,
+    y: Option<f64>,
+    start_x: Option<f64>,
+    start_y: Option<f64>,
+    end_x: Option<f64>,
+    end_y: Option<f64>,
+    button: Option<&str>,
+    count: Option<u8>,
+    steps: Option<u16>,
+    step_delay_ms: Option<u64>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let button = button
+        .map(|value| {
+            parse_app_control_pointer_button(value).with_context(|| {
+                format!("unsupported app pointer button: {value}; use primary, middle, or secondary")
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let command = match action {
+        "move" | "hover" => AppControlCommand::Pointer {
+            command: AppControlPointerCommand::Move {
+                x: x.context("missing --x for server app pointer move")?,
+                y: y.context("missing --y for server app pointer move")?,
+            },
+        },
+        "press" => AppControlCommand::Pointer {
+            command: AppControlPointerCommand::Press {
+                x: x.context("missing --x for server app pointer press")?,
+                y: y.context("missing --y for server app pointer press")?,
+                button,
+            },
+        },
+        "release" => AppControlCommand::Pointer {
+            command: AppControlPointerCommand::Release { button },
+        },
+        "click" => AppControlCommand::Pointer {
+            command: AppControlPointerCommand::Click {
+                x: x.context("missing --x for server app pointer click")?,
+                y: y.context("missing --y for server app pointer click")?,
+                button,
+                count: count.unwrap_or(1).max(1),
+            },
+        },
+        "double-click" | "doubleclick" => AppControlCommand::Pointer {
+            command: AppControlPointerCommand::Click {
+                x: x.context("missing --x for server app pointer double-click")?,
+                y: y.context("missing --y for server app pointer double-click")?,
+                button,
+                count: count.unwrap_or(2).max(2),
+            },
+        },
+        "drag" => AppControlCommand::Pointer {
+            command: AppControlPointerCommand::Drag {
+                start_x: start_x.context("missing --start-x for server app pointer drag")?,
+                start_y: start_y.context("missing --start-y for server app pointer drag")?,
+                end_x: end_x.context("missing --end-x for server app pointer drag")?,
+                end_y: end_y.context("missing --end-y for server app pointer drag")?,
+                button,
+                steps: steps.unwrap_or(4).max(1),
+                step_delay_ms: step_delay_ms.unwrap_or(24).max(1),
+            },
+        },
+        other => anyhow::bail!("unsupported app pointer action: {other}"),
+    };
+    let response = request_app_control(&home, command, timeout_ms)?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_key(
+    action: &str,
+    keys: &[String],
+    text: Option<&str>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let command = match action {
+        "press" => AppControlCommand::Key {
+            command: AppControlKeyCommand::Press {
+                keys: keys
+                    .iter()
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect(),
+            },
+        },
+        "type" => AppControlCommand::Key {
+            command: AppControlKeyCommand::Type {
+                text: text.unwrap_or_default().to_string(),
+            },
+        },
+        other => anyhow::bail!("unsupported app key action: {other}"),
     };
     let response = request_app_control(&home, command, timeout_ms)?;
     write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
@@ -9854,6 +10001,18 @@ fn x11_scroll_probe_input(
     }))
 }
 
+fn app_control_skip_x11_synthetic_input() -> bool {
+    std::env::var("YGGTERM_APP_CONTROL_SKIP_X11_SYNTHETIC_INPUT")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 pub fn run_app_control_probe_terminal_viewport_input(
     session_path: &str,
     data: &str,
@@ -9865,10 +10024,12 @@ pub fn run_app_control_probe_terminal_viewport_input(
     press_ctrl_u: bool,
     timeout_ms: u64,
 ) -> anyhow::Result<()> {
-    if matches!(
+    if !app_control_skip_x11_synthetic_input()
+        && matches!(
         mode,
         ProbeTerminalViewportInputMode::Auto | ProbeTerminalViewportInputMode::Keyboard
-    ) {
+    )
+    {
         if let Ok(response) = x11_keyboard_probe_input(
             session_path,
             data,
@@ -9907,7 +10068,9 @@ pub fn run_app_control_probe_terminal_viewport_scroll(
     lines: i32,
     timeout_ms: u64,
 ) -> anyhow::Result<()> {
-    if let Ok(response) = x11_scroll_probe_input(session_path, lines, timeout_ms) {
+    if !app_control_skip_x11_synthetic_input()
+        && let Ok(response) = x11_scroll_probe_input(session_path, lines, timeout_ms)
+    {
         write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
         return Ok(());
     }

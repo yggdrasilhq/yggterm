@@ -5,10 +5,13 @@ use dioxus::desktop::DesktopContext;
 use serde_json::{Value, json};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use tao::dpi::PhysicalPosition;
 use yggterm_server::ScreenshotTarget;
 
 #[cfg(target_os = "macos")]
 use tao::platform::macos::WindowExtMacOS;
+#[cfg(target_os = "linux")]
+use tao::platform::unix::WindowExtUnix;
 #[cfg(target_os = "linux")]
 use webkit2gtk::{SnapshotOptions, SnapshotRegion, WebViewExt};
 #[cfg(target_os = "linux")]
@@ -56,12 +59,50 @@ pub async fn record_visible_app_surface(
 }
 
 pub fn focus_app_window(desktop: &DesktopContext) -> Result<Value> {
+    desktop.set_always_on_bottom(false);
     desktop.set_visible(true);
     desktop.set_minimized(false);
     desktop.set_focus();
     Ok(json!({
         "focused_requested": true,
         "focused": desktop.is_focused(),
+        "window": describe_window(desktop),
+    }))
+}
+
+pub fn background_app_window(desktop: &DesktopContext) -> Result<Value> {
+    desktop.set_always_on_bottom(true);
+    desktop.set_minimized(false);
+    #[cfg(target_os = "linux")]
+    {
+        use gtk::prelude::*;
+
+        if let Some(gdk_window) = desktop.gtk_window().window() {
+            gdk_window.lower();
+        }
+    }
+    Ok(json!({
+        "background_requested": true,
+        "keep_below_requested": true,
+        "window": describe_window(desktop),
+    }))
+}
+
+pub fn move_app_window_by(desktop: &DesktopContext, delta_x: f64, delta_y: f64) -> Result<Value> {
+    let before_position = desktop
+        .outer_position()
+        .context("reading app window position before move")?;
+    let next_x = before_position.x + delta_x.round() as i32;
+    let next_y = before_position.y + delta_y.round() as i32;
+    desktop.set_outer_position(PhysicalPosition::new(next_x, next_y));
+    Ok(json!({
+        "move_requested": true,
+        "delta_x": delta_x,
+        "delta_y": delta_y,
+        "before_position": {
+            "x": before_position.x,
+            "y": before_position.y,
+        },
         "window": describe_window(desktop),
     }))
 }
@@ -74,6 +115,7 @@ pub fn describe_window(desktop: &DesktopContext) -> Value {
         "title": desktop.title(),
         "visible": desktop.is_visible(),
         "focused": desktop.is_focused(),
+        "minimized": desktop.is_minimized(),
         "maximized": desktop.is_maximized(),
         "decorated": desktop.is_decorated(),
         "display": std::env::var("DISPLAY").ok(),
