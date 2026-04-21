@@ -1,3 +1,63 @@
+yggterm (2.1.14-1) unstable; urgency=medium
+
+  * Add a real auto-hide titlebar contract on Linux, including hover reveal, empty-lane drag, double-click maximize/restore, and matching right-rail motion.
+  * Fix the + menu seam and adjacent title-summary chip styling so the launcher popover keeps the same rounded chrome contract as the rest of the shell.
+  * Harden Linux maximize-restore and rounded-corner shape handling so flush-shell chrome survives round-trips without GTK shape warnings or broken input regions.
+  * Cap repeated WebKitGTK memory growth with a document-viewer cache model plus memory-pressure settings, and add a same-client WebKit child RSS soak gate.
+  * Extend the second-X11 smoke bundle to prove titlebar hover behavior, sidebar entry-exit animation, modal parity, maximize layout truth, and renderer memory budgets before packaging.
+
+ -- Yggdrasil HQ <avi@gour.top>  Tue, 21 Apr 2026 15:13:48 +0530
+
+yggterm (2.1.13-1) unstable; urgency=medium
+
+  * Stop restored stored terminals from scheduling duplicate startup bootstrap work while the retained host lease is still active.
+  * Keep titlebar search, settings fields, sidebar actions, and terminal reclaim from stealing focus from each other so terminal selection and refocus still work after opening settings.
+  * Restore the Linux flush-shell corner contract after maximize round-trips and lock the smoke to the real 10px radius root-window proof.
+  * Keep dark-theme terminal rows readable by overriding low-contrast inline row backgrounds in the xterm DOM theme bridge.
+  * Harden the codex smoke against prompt screenshot-state races and dispatch-coupled idle render samples while still blocking semantic churn and excessive terminal I/O.
+
+ -- Yggdrasil HQ <avi@gour.top>  Mon, 20 Apr 2026 17:59:20 +0530
+
+yggterm (2.1.12-1) unstable; urgency=medium
+
+  * Catch the white perimeter halo from the real root window, while recognizing XRDP-safe opaque shells as a separate flush-window profile.
+  * Remove the Linux opaque-window halo by making the nontransparent shell frame sit flush to the window bounds instead of using transparent-mode inset chrome.
+  * Recover stale local PTY runtimes for app-control send and clipboard paste flows, and require a writable runtime in the plain-shell smoke.
+
+ -- Yggdrasil HQ <avi@gour.top>  Mon, 20 Apr 2026 00:26:58 +0530
+
+yggterm (2.1.11-1) unstable; urgency=medium
+
+  * Add a live terminal-zoom smoke that proves zoom changes resize rows, preserve the retained xterm host, and restore cleanly to 100%.
+  * Harden rounded-corner artifact detection with repeated root-window captures so persistent square-corner failures still block packaging.
+  * Apply a one-time Linux transparent-window reconfigure pulse after spawn so fresh clients do not need a manual minimize/restore nudge.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sun, 19 Apr 2026 23:18:00 +0530
+
+yggterm (2.1.10-1) unstable; urgency=medium
+
+  * Catch flaky square-corner window artifact regressions from the real root window instead of cropped app screenshots.
+  * Harden the late-suite Codex TUI vitality smoke so light-theme status strips are judged by paintedness rather than dark-pixel assumptions.
+  * Extend live observability for sidebar focus ownership, shell-frame geometry, and renderer diagnostics while keeping the readable DOM terminal path as the default.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sat, 19 Apr 2026 22:26:00 +0530
+
+yggterm (2.1.9-1) unstable; urgency=medium
+
+  * Keep live-session titles and summaries consistent across the active surface, sidebar, and restored session memory.
+  * Harden retained-terminal restore, hot-session switching, titlebar focus ownership, and duplicate bootstrap scheduling.
+  * Fix the + menu shell, block-cursor contrast behavior, and the related light-theme xterm regressions.
+  * Strengthen the real X11 smoke gate so menu/cursor/metadata/bootstrap regressions fail before packaging while external codex-session-tui config failures are skipped.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sun, 19 Apr 2026 17:26:00 +0530
+
+yggterm (2.1.8-1) unstable; urgency=medium
+
+  * Make the theme editor apply changes live, remove the stale Apply Theme step, and keep grain-driven shell chrome active even without custom color stops.
+  * Keep clipboard image paste failures out of the PTY, stage local clipboard images locally, and strengthen the combined theme/clipboard/TUI smoke coverage.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sat, 18 Apr 2026 12:37:55 +0530
+
 yggterm (2.1.7-1) unstable; urgency=medium
 
   * Restore direct-install self-update by shipping yggterm-mock-cli in the GitHub release archives again.

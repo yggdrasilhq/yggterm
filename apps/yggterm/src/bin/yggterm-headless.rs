@@ -5,12 +5,13 @@ use yggterm_server::{
     detect_ghostty_host, ensure_local_daemon_running, ping, run_app_control_create_terminal,
     run_app_control_describe_rows, run_app_control_describe_state, run_app_control_drag,
     run_app_control_dump_state, run_app_control_focus_window, run_app_control_open_path,
-    run_app_control_remove_session, run_app_control_scroll_preview,
-    run_app_control_send_terminal_input, run_app_control_set_fullscreen,
-    run_app_control_set_main_zoom, run_app_control_set_right_panel_mode,
-    run_app_control_set_row_expanded, run_app_control_set_search, run_attach, run_daemon,
-    run_screenrecord_capture, run_screenshot_capture, run_trace_bundle, run_trace_follow,
-    run_trace_tail, shutdown, snapshot, status, try_run_remote_server_command,
+    run_app_control_paste_terminal_clipboard_image, run_app_control_remove_session,
+    run_app_control_scroll_preview, run_app_control_send_terminal_input,
+    run_app_control_set_fullscreen, run_app_control_set_main_zoom,
+    run_app_control_set_right_panel_mode, run_app_control_set_row_expanded,
+    run_app_control_set_search, run_attach, run_daemon, run_screenrecord_capture,
+    run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, snapshot,
+    status, try_run_remote_server_command,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -471,6 +472,19 @@ fn main() -> Result<()> {
                                 anyhow::anyhow!("missing --data for server app terminal send")
                             })?;
                         run_app_control_send_terminal_input(session_path, data, timeout_ms)
+                    }
+                    "paste-image" => {
+                        let session_path = args
+                            .iter()
+                            .skip(4)
+                            .find(|value| !value.starts_with("--"))
+                            .map(String::as_str)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "missing session path for server app terminal paste-image"
+                                )
+                            })?;
+                        run_app_control_paste_terminal_clipboard_image(session_path, timeout_ms)
                     }
                     other => anyhow::bail!("unsupported app terminal action: {other}"),
                 }

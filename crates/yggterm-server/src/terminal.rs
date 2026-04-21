@@ -863,8 +863,7 @@ fn select_initial_attach_chunks(chunks: &VecDeque<TerminalChunk>) -> Vec<Termina
         .map(|chunk| chunk.data.len())
         .sum::<usize>();
 
-    let available_chunk_budget =
-        INITIAL_ATTACH_MAX_CHUNKS.saturating_sub(trailing_chunk_budget.max(1));
+    let available_chunk_budget = INITIAL_ATTACH_MAX_CHUNKS.saturating_sub(trailing_chunk_budget);
     let available_byte_budget = INITIAL_ATTACH_MAX_BYTES.saturating_sub(trailing_byte_budget);
     let leading = select_initial_attach_tail(
         chunks,
@@ -988,6 +987,12 @@ fn terminal_chunk_is_disposable_initial_attach_suffix(data: &str) -> bool {
     if terminal_chunk_has_generic_attach_idle_footer(&stripped) {
         return true;
     }
+    if terminal_chunk_is_attach_model_footer_fragment(&stripped) {
+        return true;
+    }
+    if terminal_chunk_mentions_generic_attach_prompt(&stripped) {
+        return true;
+    }
     if terminal_chunk_has_meaningful_attach_text(&stripped) {
         return false;
     }
@@ -1033,24 +1038,40 @@ fn terminal_chunk_has_generic_attach_idle_footer(data: &str) -> bool {
     if normalized.is_empty() {
         return false;
     }
-    let mentions_generic_prompt = lines.iter().any(|line| {
-        let lower = line.to_ascii_lowercase();
-        lower.starts_with('›')
-            && (lower.contains("implement {feature}")
-                || lower.contains("explain this codebase")
-                || lower.contains("find and fix a bug")
-                || lower.contains("resume a previous session")
-                || lower.contains("write tests for")
-                || lower.contains("@filename")
-                || lower.contains("review my changes")
-                || lower.contains("summarize recent commits")
-                || lower.contains("create a pr"))
-    });
+    let mentions_generic_prompt = terminal_chunk_mentions_generic_attach_prompt(data);
     let mentions_model_footer = (normalized.contains("gpt-5")
         || normalized.contains("gpt-4")
         || normalized.contains("claude"))
         && normalized.contains("% left");
     mentions_generic_prompt && mentions_model_footer
+}
+
+fn terminal_chunk_is_attach_model_footer_fragment(data: &str) -> bool {
+    let normalized = data.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    (normalized.contains("gpt-5") || normalized.contains("gpt-4") || normalized.contains("claude"))
+        && normalized.contains("% left")
+}
+
+fn terminal_chunk_mentions_generic_attach_prompt(data: &str) -> bool {
+    data.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .any(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.starts_with('›')
+                && (lower.contains("implement {feature}")
+                    || lower.contains("explain this codebase")
+                    || lower.contains("find and fix a bug")
+                    || lower.contains("resume a previous session")
+                    || lower.contains("write tests for")
+                    || lower.contains("@filename")
+                    || lower.contains("review my changes")
+                    || lower.contains("summarize recent commits")
+                    || lower.contains("create a pr"))
+        })
 }
 
 fn strip_terminal_control_sequences(input: &str) -> String {

@@ -93,6 +93,23 @@ pub struct ReleaseUpdate {
     pub checksum_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseUpdateInstallStage {
+    Downloading,
+    Verifying,
+    Extracting,
+    Integrating,
+    Finalizing,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReleaseUpdateInstallProgress {
+    pub stage: ReleaseUpdateInstallStage,
+    pub percent: u8,
+    pub detail: String,
+}
+
 pub fn current_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
@@ -642,6 +659,17 @@ pub fn check_for_update(context: &InstallContext) -> Result<Option<ReleaseUpdate
 }
 
 pub fn install_release_update(context: &InstallContext, update: &ReleaseUpdate) -> Result<PathBuf> {
+    install_release_update_with_progress(context, update, |_| {})
+}
+
+pub fn install_release_update_with_progress<F>(
+    context: &InstallContext,
+    update: &ReleaseUpdate,
+    mut on_progress: F,
+) -> Result<PathBuf>
+where
+    F: FnMut(ReleaseUpdateInstallProgress),
+{
     if context.channel != InstallChannel::Direct {
         anyhow::bail!("self-update is only available for direct installs");
     }
@@ -654,16 +682,14 @@ pub fn install_release_update(context: &InstallContext, update: &ReleaseUpdate) 
     fs::create_dir_all(&version_dir)
         .with_context(|| format!("failed to create version dir {}", version_dir.display()))?;
 
-    let archive = release_client()?
-        .get(&update.archive_url)
-        .send()
-        .context("failed to download release archive")?
-        .error_for_status()
-        .context("failed to fetch release archive")?
-        .bytes()
-        .context("failed to read release archive bytes")?;
+    let archive = download_release_archive_with_progress(&update.archive_url, &mut on_progress)?;
 
     if let Some(checksum_url) = &update.checksum_url {
+        on_progress(ReleaseUpdateInstallProgress {
+            stage: ReleaseUpdateInstallStage::Verifying,
+            percent: 88,
+            detail: "Verifying archive checksum".to_string(),
+        });
         verify_archive_checksum(&archive, checksum_url)?;
     }
 
@@ -697,8 +723,23 @@ pub fn install_release_update(context: &InstallContext, update: &ReleaseUpdate) 
     } else {
         MOCK_CLI_NAME
     });
+    on_progress(ReleaseUpdateInstallProgress {
+        stage: ReleaseUpdateInstallStage::Extracting,
+        percent: 92,
+        detail: "Extracting Yggterm".to_string(),
+    });
     extract_binary_from_archive(&archive, &binary_name, &binary_path)?;
+    on_progress(ReleaseUpdateInstallProgress {
+        stage: ReleaseUpdateInstallStage::Extracting,
+        percent: 95,
+        detail: "Extracting headless helper".to_string(),
+    });
     extract_binary_from_archive(&archive, &headless_name, &headless_path)?;
+    on_progress(ReleaseUpdateInstallProgress {
+        stage: ReleaseUpdateInstallStage::Extracting,
+        percent: 97,
+        detail: "Extracting mock CLI".to_string(),
+    });
     extract_binary_from_archive(&archive, &mock_cli_name, &mock_cli_path)?;
     write_direct_install_state(
         root,
@@ -719,10 +760,81 @@ pub fn install_release_update(context: &InstallContext, update: &ReleaseUpdate) 
         managed_root: Some(root.clone()),
         manager_hint: context.manager_hint.clone(),
     };
+    on_progress(ReleaseUpdateInstallProgress {
+        stage: ReleaseUpdateInstallStage::Integrating,
+        percent: 99,
+        detail: "Refreshing desktop integration".to_string(),
+    });
     if run_install_integrate_with_binary(&binary_path, root).is_err() {
         let _ = refresh_desktop_integration(&updated_context);
     }
+    on_progress(ReleaseUpdateInstallProgress {
+        stage: ReleaseUpdateInstallStage::Finalizing,
+        percent: 100,
+        detail: format!("Installed Yggterm {}", update.version),
+    });
     Ok(binary_path)
+}
+
+fn download_release_archive_with_progress<F>(
+    archive_url: &str,
+    on_progress: &mut F,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(ReleaseUpdateInstallProgress),
+{
+    on_progress(ReleaseUpdateInstallProgress {
+        stage: ReleaseUpdateInstallStage::Downloading,
+        percent: 4,
+        detail: "Connecting to release download".to_string(),
+    });
+    let mut response = release_client()?
+        .get(archive_url)
+        .send()
+        .context("failed to download release archive")?
+        .error_for_status()
+        .context("failed to fetch release archive")?;
+    let total_bytes = response.content_length();
+    let capacity = total_bytes
+        .and_then(|len| usize::try_from(len).ok())
+        .unwrap_or_default();
+    let mut archive = Vec::with_capacity(capacity);
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut downloaded = 0_u64;
+    let mut last_percent = 4_u8;
+    loop {
+        let read = response
+            .read(&mut buffer)
+            .context("failed to read release archive bytes")?;
+        if read == 0 {
+            break;
+        }
+        archive.extend_from_slice(&buffer[..read]);
+        downloaded = downloaded.saturating_add(read as u64);
+        let next_percent = total_bytes
+            .filter(|total| *total > 0)
+            .map(|total| {
+                let span = downloaded.saturating_mul(80) / total;
+                4_u8.saturating_add(span.min(80) as u8)
+            })
+            .unwrap_or(12);
+        if next_percent > last_percent {
+            last_percent = next_percent;
+            on_progress(ReleaseUpdateInstallProgress {
+                stage: ReleaseUpdateInstallStage::Downloading,
+                percent: next_percent,
+                detail: "Downloading release archive".to_string(),
+            });
+        }
+    }
+    if last_percent < 84 {
+        on_progress(ReleaseUpdateInstallProgress {
+            stage: ReleaseUpdateInstallStage::Downloading,
+            percent: 84,
+            detail: "Download complete".to_string(),
+        });
+    }
+    Ok(archive)
 }
 
 fn run_install_integrate_with_binary(binary_path: &Path, root: &Path) -> Result<()> {

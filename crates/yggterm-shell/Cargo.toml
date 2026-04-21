@@ -29,5 +29,8 @@ yggui-contract = { path = "../yggui-contract" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 cairo-rs = { version = "0.18.5", features = ["png"] }
+gdk = "0.18.2"
+gdk-pixbuf = "0.18.5"
+gtk = "0.18.2"
 webkit2gtk = { version = "=2.0.1", features = ["v2_38"] }
 wry = "0.53.5"

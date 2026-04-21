@@ -221,6 +221,8 @@ Motion should be functional, not decorative.
 - notifications should stack and reflow smoothly
 - drag-and-drop should show clear make-way affordances
 - state changes should feel crisp, not rubbery
+- for shell chrome, prefer fast desktop durations with Material 3 style curves: emphasized decelerate when something enters or is revealed, emphasized accelerate when it exits, and the standard curve for small state shifts
+- hide/show motion should read as purposeful structure changes, not bouncy flourish; the workspace should feel tighter and more exact after motion, not more playful
 
 ### Notifications
 
@@ -327,6 +329,7 @@ If a project owns its own titlebar/chrome:
 - minimize/maximize/always-on-top should stay neutral by default
 - close should gain a red background with a white `X` on hover
 - outer radii should disappear in maximized state
+- optional titlebar auto-hide is acceptable, but it should collapse to a thin top-edge hover strip and return with a restrained desktop-fast reveal rather than snapping or peeking unpredictably
 
 ## Project Overlay Interface
 
