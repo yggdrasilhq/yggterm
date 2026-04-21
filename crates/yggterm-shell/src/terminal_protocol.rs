@@ -77,6 +77,7 @@ pub(crate) enum TerminalJsEvent {
         action: String,
         chars: usize,
     },
+    ClipboardPasteRequest,
     ClipboardImageRequest,
     ClipboardError {
         action: String,

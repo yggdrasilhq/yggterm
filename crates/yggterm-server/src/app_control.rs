@@ -93,6 +93,12 @@ pub enum AppControlCommand {
     SetUiTheme {
         theme: UiTheme,
     },
+    SetThemeEditorOpen {
+        open: bool,
+    },
+    ResetThemeEditor,
+    TriggerUpdateCheck,
+    RestartPendingUpdate,
     CaptureScreenshot {
         target: ScreenshotTarget,
         output_path: String,
@@ -130,6 +136,15 @@ pub enum AppControlCommand {
     SendTerminalInput {
         session_path: String,
         data: String,
+    },
+    ReclaimTerminalFocus {
+        session_path: String,
+    },
+    PasteTerminalClipboard {
+        session_path: String,
+    },
+    PasteTerminalClipboardImage {
+        session_path: String,
     },
     ProbeTerminalViewportInput {
         session_path: String,
@@ -178,6 +193,10 @@ impl AppControlCommand {
             Self::SetSearch { .. } => "set_search",
             Self::SetRightPanelMode { .. } => "set_right_panel_mode",
             Self::SetUiTheme { .. } => "set_ui_theme",
+            Self::SetThemeEditorOpen { .. } => "set_theme_editor_open",
+            Self::ResetThemeEditor => "reset_theme_editor",
+            Self::TriggerUpdateCheck => "trigger_update_check",
+            Self::RestartPendingUpdate => "restart_pending_update",
             Self::CaptureScreenshot { .. } => "capture_screenshot",
             Self::ScrollPreview { .. } => "scroll_preview",
             Self::SetPreviewLayout { .. } => "set_preview_layout",
@@ -187,6 +206,9 @@ impl AppControlCommand {
             Self::Drag { .. } => "drag",
             Self::CreateTerminal { .. } => "create_terminal",
             Self::SendTerminalInput { .. } => "send_terminal_input",
+            Self::ReclaimTerminalFocus { .. } => "reclaim_terminal_focus",
+            Self::PasteTerminalClipboard { .. } => "paste_terminal_clipboard",
+            Self::PasteTerminalClipboardImage { .. } => "paste_terminal_clipboard_image",
             Self::ProbeTerminalViewportInput { .. } => "probe_terminal_viewport_input",
             Self::ProbeTerminalViewportScroll { .. } => "probe_terminal_viewport_scroll",
             Self::ProbeTerminalViewportSelect { .. } => "probe_terminal_viewport_select",

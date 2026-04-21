@@ -5444,8 +5444,6 @@ checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
 [[package]]
 name = "wry"
 version = "0.53.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "728b7d4c8ec8d81cab295e0b5b8a4c263c0d41a785fb8f8c4df284e5411140a2"
 dependencies = [
  "base64",
  "block2",
@@ -5542,7 +5540,7 @@ checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
 
 [[package]]
 name = "yggterm"
-version = "2.1.7"
+version = "2.1.14"
 dependencies = [
  "anyhow",
  "ctrlc",
@@ -5560,7 +5558,7 @@ dependencies = [
 
 [[package]]
 name = "yggterm-core"
-version = "2.1.7"
+version = "2.1.14"
 dependencies = [
  "anyhow",
  "dirs",
@@ -5581,7 +5579,7 @@ dependencies = [
 
 [[package]]
 name = "yggterm-ghostty-bridge"
-version = "2.1.7"
+version = "2.1.14"
 dependencies = [
  "anyhow",
  "thiserror 2.0.18",
@@ -5590,11 +5588,11 @@ dependencies = [
 
 [[package]]
 name = "yggterm-gtk-glue"
-version = "2.1.7"
+version = "2.1.14"
 
 [[package]]
 name = "yggterm-platform"
-version = "2.1.7"
+version = "2.1.14"
 dependencies = [
  "anyhow",
  "objc2",
@@ -5603,7 +5601,7 @@ dependencies = [
 
 [[package]]
 name = "yggterm-server"
-version = "2.1.7"
+version = "2.1.14"
 dependencies = [
  "anyhow",
  "dirs",
@@ -5625,13 +5623,16 @@ dependencies = [
 
 [[package]]
 name = "yggterm-shell"
-version = "2.1.7"
+version = "2.1.14"
 dependencies = [
  "anyhow",
  "base64",
  "cairo-rs",
  "dioxus",
  "dioxus-desktop",
+ "gdk",
+ "gdk-pixbuf",
+ "gtk",
  "include_dir",
  "keyboard-types",
  "libc",
@@ -5654,7 +5655,7 @@ dependencies = [
 
 [[package]]
 name = "yggui"
-version = "2.1.7"
+version = "2.1.14"
 dependencies = [
  "anyhow",
  "base64",
@@ -5677,7 +5678,7 @@ dependencies = [
 
 [[package]]
 name = "yggui-contract"
-version = "2.1.7"
+version = "2.1.14"
 dependencies = [
  "serde",
 ]
