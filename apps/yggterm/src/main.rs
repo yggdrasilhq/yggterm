@@ -21,15 +21,19 @@ use yggterm_server::{
     run_app_control_create_terminal, run_app_control_describe_rows, run_app_control_describe_state,
     run_app_control_drag, run_app_control_dump_state, run_app_control_focus_window,
     run_app_control_list_clients, run_app_control_open_path,
+    run_app_control_paste_terminal_clipboard, run_app_control_paste_terminal_clipboard_image,
     run_app_control_probe_terminal_viewport_input, run_app_control_probe_terminal_viewport_scroll,
-    run_app_control_probe_terminal_viewport_select, run_app_control_remove_session,
-    run_app_control_scroll_preview, run_app_control_send_terminal_input,
-    run_app_control_set_fullscreen, run_app_control_set_main_zoom, run_app_control_set_maximized,
+    run_app_control_probe_terminal_viewport_select, run_app_control_reclaim_terminal_focus,
+    run_app_control_remove_session, run_app_control_reset_theme_editor,
+    run_app_control_restart_pending_update, run_app_control_scroll_preview,
+    run_app_control_send_terminal_input, run_app_control_set_fullscreen,
+    run_app_control_set_main_zoom, run_app_control_set_maximized,
     run_app_control_set_preview_layout, run_app_control_set_right_panel_mode,
-    run_app_control_set_row_expanded, run_app_control_set_search, run_app_control_set_ui_theme,
-    run_attach, run_daemon, run_screenrecord_capture, run_screenshot_capture, run_trace_bundle,
-    run_trace_follow, run_trace_tail, shutdown, snapshot, start_local_session, status,
-    try_run_remote_server_command,
+    run_app_control_set_row_expanded, run_app_control_set_search,
+    run_app_control_set_theme_editor_open, run_app_control_set_ui_theme,
+    run_app_control_trigger_update_check, run_attach, run_daemon, run_screenrecord_capture,
+    run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, snapshot,
+    start_local_session, status, try_run_remote_server_command,
 };
 use yggterm_shell::{ShellBootstrap, launch_shell, start_daemon_watchdog, warm_daemon_start};
 use yggui_contract::UiTheme;
@@ -41,6 +45,14 @@ const ENV_YGGTERM_ENABLE_ACCESSIBILITY: &str = "YGGTERM_ENABLE_ACCESSIBILITY";
 const ENV_YGGTERM_ENABLE_WEBKIT_COMPOSITING: &str = "YGGTERM_ENABLE_WEBKIT_COMPOSITING";
 const ENV_YGGTERM_ALLOW_MULTI_WINDOW: &str = "YGGTERM_ALLOW_MULTI_WINDOW";
 const ENV_YGGTERM_ENABLE_TRANSPARENT_WINDOW: &str = "YGGTERM_ENABLE_TRANSPARENT_WINDOW";
+const ENV_YGGTERM_WEBKIT_CACHE_MODEL: &str = "YGGTERM_WEBKIT_CACHE_MODEL";
+const ENV_YGGTERM_WEBKIT_MEMORY_LIMIT_MB: &str = "YGGTERM_WEBKIT_MEMORY_LIMIT_MB";
+const ENV_YGGTERM_WEBKIT_MEMORY_CONSERVATIVE_THRESHOLD: &str =
+    "YGGTERM_WEBKIT_MEMORY_CONSERVATIVE_THRESHOLD";
+const ENV_YGGTERM_WEBKIT_MEMORY_STRICT_THRESHOLD: &str =
+    "YGGTERM_WEBKIT_MEMORY_STRICT_THRESHOLD";
+const ENV_YGGTERM_WEBKIT_MEMORY_POLL_INTERVAL_SEC: &str =
+    "YGGTERM_WEBKIT_MEMORY_POLL_INTERVAL_SEC";
 const ENV_MALLOC_ARENA_MAX: &str = "MALLOC_ARENA_MAX";
 
 fn configure_linux_allocator_limits() -> Result<()> {
@@ -152,6 +164,7 @@ fn main() -> Result<()> {
     configure_linux_allocator_limits()?;
     configure_linux_accessibility_bridge();
     configure_linux_webkit_compositing();
+    configure_linux_webkit_memory_policy();
     tracing_subscriber::fmt()
         .with_env_filter("info")
         .with_target(false)
@@ -465,6 +478,33 @@ fn main() -> Result<()> {
                 };
                 run_app_control_set_ui_theme(theme, timeout_ms)
             }
+            "theme-editor" => {
+                let action = cli_positional_args(&args, 3)
+                    .into_iter()
+                    .next()
+                    .unwrap_or("open");
+                match action {
+                    "open" | "show" | "on" | "true" | "1" => {
+                        run_app_control_set_theme_editor_open(true, timeout_ms)
+                    }
+                    "close" | "hide" | "off" | "false" | "0" => {
+                        run_app_control_set_theme_editor_open(false, timeout_ms)
+                    }
+                    "reset" | "defaults" => run_app_control_reset_theme_editor(timeout_ms),
+                    other => anyhow::bail!("unsupported app theme-editor action: {other}"),
+                }
+            }
+            "update" => {
+                let action = cli_positional_args(&args, 3)
+                    .into_iter()
+                    .next()
+                    .unwrap_or("check");
+                match action {
+                    "check" | "trigger" => run_app_control_trigger_update_check(timeout_ms),
+                    "restart" => run_app_control_restart_pending_update(timeout_ms),
+                    other => anyhow::bail!("unsupported app update action: {other}"),
+                }
+            }
             "fullscreen" => {
                 let action = cli_positional_args(&args, 3)
                     .into_iter()
@@ -597,6 +637,27 @@ fn main() -> Result<()> {
                             })
                             .context("missing --data for server app terminal send")?;
                         run_app_control_send_terminal_input(session_path, data, timeout_ms)
+                    }
+                    "focus" => {
+                        let session_path = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
+                            .context("missing session path for server app terminal focus")?;
+                        run_app_control_reclaim_terminal_focus(session_path, timeout_ms)
+                    }
+                    "paste" => {
+                        let session_path = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
+                            .context("missing session path for server app terminal paste")?;
+                        run_app_control_paste_terminal_clipboard(session_path, timeout_ms)
+                    }
+                    "paste-image" => {
+                        let session_path = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
+                            .context("missing session path for server app terminal paste-image")?;
+                        run_app_control_paste_terminal_clipboard_image(session_path, timeout_ms)
                     }
                     "probe-type" => {
                         let session_path = cli_positional_args(&args, 4)
@@ -871,6 +932,7 @@ fn detect_linux_window_profile() -> LinuxWindowProfile {
                     "1" | "true" | "yes" | "on"
                 )
             });
+        let wayland_session = std::env::var_os("WAYLAND_DISPLAY").is_some();
         let xrpd_session = std::env::var_os("XRDP_SESSION").is_some()
             || std::env::var_os("XRDP_SOCKET_PATH").is_some();
         if transparent_opt_in {
@@ -880,26 +942,16 @@ fn detect_linux_window_profile() -> LinuxWindowProfile {
                 reason: "explicit_opt_in",
             };
         }
-        let x11_session =
-            std::env::var_os("DISPLAY").is_some() && std::env::var_os("WAYLAND_DISPLAY").is_none();
-        if xrpd_session && x11_session {
-            return LinuxWindowProfile {
-                transparent: true,
-                xrpd_session: true,
-                reason: "xrdp_x11_profile",
-            };
-        }
-        if xrpd_session {
-            return LinuxWindowProfile {
-                transparent: false,
-                xrpd_session: true,
-                reason: "xrdp_safe_mode",
-            };
-        }
         return LinuxWindowProfile {
-            transparent: true,
-            xrpd_session: false,
-            reason: "default_linux_profile",
+            transparent: wayland_session && !xrpd_session,
+            xrpd_session,
+            reason: if xrpd_session {
+                "xrdp_opaque_profile"
+            } else if wayland_session {
+                "wayland_transparent_profile"
+            } else {
+                "x11_opaque_profile"
+            },
         };
     }
 
@@ -946,6 +998,28 @@ fn configure_linux_webkit_compositing() {
 
 #[cfg(not(target_os = "linux"))]
 fn configure_linux_webkit_compositing() {}
+
+#[cfg(target_os = "linux")]
+fn configure_linux_webkit_memory_policy() {
+    if std::env::var_os(ENV_YGGTERM_WEBKIT_CACHE_MODEL).is_none() {
+        unsafe { std::env::set_var(ENV_YGGTERM_WEBKIT_CACHE_MODEL, "document-viewer") };
+    }
+    if std::env::var_os(ENV_YGGTERM_WEBKIT_MEMORY_LIMIT_MB).is_none() {
+        unsafe { std::env::set_var(ENV_YGGTERM_WEBKIT_MEMORY_LIMIT_MB, "384") };
+    }
+    if std::env::var_os(ENV_YGGTERM_WEBKIT_MEMORY_CONSERVATIVE_THRESHOLD).is_none() {
+        unsafe { std::env::set_var(ENV_YGGTERM_WEBKIT_MEMORY_CONSERVATIVE_THRESHOLD, "0.50") };
+    }
+    if std::env::var_os(ENV_YGGTERM_WEBKIT_MEMORY_STRICT_THRESHOLD).is_none() {
+        unsafe { std::env::set_var(ENV_YGGTERM_WEBKIT_MEMORY_STRICT_THRESHOLD, "0.65") };
+    }
+    if std::env::var_os(ENV_YGGTERM_WEBKIT_MEMORY_POLL_INTERVAL_SEC).is_none() {
+        unsafe { std::env::set_var(ENV_YGGTERM_WEBKIT_MEMORY_POLL_INTERVAL_SEC, "5.0") };
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_linux_webkit_memory_policy() {}
 
 fn load_initial_server_snapshot_fast(
     store: &SessionStore,

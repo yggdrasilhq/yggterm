@@ -270,6 +270,12 @@ fn managed_live_session_is_recoverable(key: &str, session: &ManagedSessionView) 
             .is_some_and(|target| !is_loopback_ssh_target(target))
 }
 
+fn active_session_snapshot_gap_is_recoverable(path: &str) -> bool {
+    path.starts_with("local://")
+        || path.starts_with("ssh://")
+        || path.starts_with("remote-session://")
+}
+
 fn live_session_uses_remote_runtime(session: &ManagedSessionView) -> bool {
     session.source == SessionSource::LiveSsh
         && (is_remote_scanned_live_session_path(&session.session_path)
@@ -1067,13 +1073,9 @@ impl YggtermServer {
         if self.active_session_path.as_deref() == Some(resolved_key.as_str())
             || self.active_session_path.as_deref() == Some(path)
         {
-            self.active_session_path = self
-                .live_session_order
-                .iter()
-                .find(|candidate| self.sessions.contains_key(candidate.as_str()))
-                .cloned()
-                .or_else(|| self.sessions.keys().next().cloned());
+            self.active_session_path = self.first_available_live_session_path();
         }
+        self.repair_active_session_path_after_live_session_change();
         Ok(true)
     }
 
@@ -1177,7 +1179,19 @@ impl YggtermServer {
         let active_session_path = active_session
             .as_ref()
             .map(|session| session.session_path.clone())
-            .or_else(|| self.active_session_path.clone());
+            .or_else(|| {
+                self.active_session_path.as_deref().and_then(|path| {
+                    (active_session_snapshot_gap_is_recoverable(path)
+                        && self.live_session_order.iter().any(|candidate| {
+                            candidate == path
+                                || self
+                                    .sessions
+                                    .get(candidate)
+                                    .is_some_and(|session| session.session_path == path)
+                        }))
+                    .then(|| path.to_string())
+                })
+            });
         ServerUiSnapshot {
             active_session_path,
             active_session: active_session.map(snapshot_session_view),
@@ -1236,6 +1250,22 @@ impl YggtermServer {
     }
 
     pub fn apply_snapshot(&mut self, snapshot: ServerUiSnapshot) {
+        let previous_active_path = self.active_session_path.clone();
+        let previous_active_session = previous_active_path
+            .as_ref()
+            .and_then(|path| self.sessions.get(path).cloned());
+        let preserve_active_snapshot_gap = previous_active_path
+            .as_deref()
+            .zip(previous_active_session.as_ref())
+            .is_some_and(|(path, _session)| {
+                snapshot.active_session_path.as_deref() == Some(path)
+                    && snapshot.active_session.is_none()
+                    && snapshot
+                        .live_sessions
+                        .iter()
+                        .all(|session| session.session_path != path)
+                    && active_session_snapshot_gap_is_recoverable(path)
+            });
         self.active_view_mode = snapshot.active_view_mode;
         self.active_session_path = snapshot.active_session_path.clone();
         self.remote_machines = snapshot.remote_machines;
@@ -1255,6 +1285,20 @@ impl YggtermServer {
             let key = live.session_path.clone();
             self.sessions
                 .insert(key, managed_session_from_snapshot(live));
+        }
+        if preserve_active_snapshot_gap
+            && let Some(active_path) = self.active_session_path.clone()
+            && let Some(session) = previous_active_session
+            && !self.sessions.contains_key(&active_path)
+        {
+            if !self
+                .live_session_order
+                .iter()
+                .any(|path| path == &active_path)
+            {
+                self.live_session_order.insert(0, active_path.clone());
+            }
+            self.sessions.insert(active_path, session);
         }
         if let Some(active_path) = self.active_session_path.clone()
             && !self.sessions.contains_key(&active_path)
@@ -2045,66 +2089,16 @@ impl YggtermServer {
         if self.sessions.contains_key(&session_path) {
             let mut applied_head_preview = false;
             if let Some(session) = self.sessions.get_mut(&session_path) {
-                session.session_path = session_path.clone();
-                session.title = resolved_title.clone();
-                session.kind = SessionKind::Codex;
-                session.host_label = machine.label.clone();
-                session.launch_command = remote_ssh_launch_command(
-                    &target.ssh_target,
-                    target.prefix.as_deref(),
+                configure_remote_resume_live_session(
+                    session,
+                    &session_path,
+                    session_id,
+                    &resolved_title,
+                    &target,
                     &remote_binary,
-                    &[
-                        "server",
-                        "remote",
-                        "resume-codex",
-                        session_id,
-                        cwd.unwrap_or(""),
-                        "--require-existing",
-                    ],
-                );
-                session.terminal_lines = vec![
-                    format!("$ {}", session.launch_command),
-                    format!("Queue remote Yggterm resume {session_id}"),
-                    format!("Target host: {}", target.ssh_target),
-                    format!("Workspace: {}", cwd.unwrap_or("<unknown>")),
-                    "Daemon PTY: request main viewport terminal stream".to_string(),
-                ];
-                upsert_session_metadata(
-                    &mut session.metadata,
-                    "Source",
-                    "remote-codex".to_string(),
-                );
-                upsert_session_metadata(&mut session.metadata, "Host", target.ssh_target.clone());
-                upsert_session_metadata(
-                    &mut session.metadata,
-                    "Restore",
-                    format!("yggterm server remote resume-codex {session_id} --require-existing"),
-                );
-                if let Some(cwd) = cwd {
-                    upsert_session_metadata(&mut session.metadata, "Cwd", cwd.to_string());
-                }
-                upsert_session_metadata(
-                    &mut session.metadata,
-                    "Status",
-                    format!(
-                        "remote resume queued · {}",
-                        match remote_deploy_state {
-                            RemoteDeployState::Ready => "remote yggterm ready",
-                            RemoteDeployState::CopyingBinary => "copying yggterm binary",
-                            RemoteDeployState::Planned => "remote bootstrap planned",
-                            RemoteDeployState::NotRequired => "not required",
-                        }
-                    ),
-                );
-                upsert_session_metadata(
-                    &mut session.metadata,
-                    "Deploy",
-                    match remote_deploy_state {
-                        RemoteDeployState::Ready => "ready".to_string(),
-                        RemoteDeployState::CopyingBinary => "copying".to_string(),
-                        RemoteDeployState::Planned => "planned".to_string(),
-                        RemoteDeployState::NotRequired => "not required".to_string(),
-                    },
+                    remote_deploy_state,
+                    cwd,
+                    self.theme,
                 );
                 if let Some(scanned) = machine
                     .sessions
@@ -2118,7 +2112,7 @@ impl YggtermServer {
                         &target.ssh_target,
                     );
                     if !launch_terminal {
-                        clear_session_preview_for_loading(session);
+                        mark_session_preview_loading(session);
                         applied_head_preview =
                             try_apply_remote_preview_head_payload(session, &target, scanned);
                     }
@@ -2150,61 +2144,16 @@ impl YggtermServer {
         );
         let mut applied_head_preview = false;
         if let Some(session) = self.sessions.get_mut(&session_path) {
-            session.session_path = session_path.clone();
-            session.title = resolved_title;
-            session.host_label = machine.label.clone();
-            session.launch_command = remote_ssh_launch_command(
-                &target.ssh_target,
-                target.prefix.as_deref(),
+            configure_remote_resume_live_session(
+                session,
+                &session_path,
+                session_id,
+                &resolved_title,
+                &target,
                 &remote_binary,
-                &[
-                    "server",
-                    "remote",
-                    "resume-codex",
-                    session_id,
-                    cwd.unwrap_or(""),
-                    "--require-existing",
-                ],
-            );
-            session.terminal_lines = vec![
-                format!("$ {}", session.launch_command),
-                format!("Queue remote Yggterm resume {session_id}"),
-                format!("Target host: {}", target.ssh_target),
-                format!("Workspace: {}", cwd.unwrap_or("<unknown>")),
-                "Daemon PTY: request main viewport terminal stream".to_string(),
-            ];
-            upsert_session_metadata(&mut session.metadata, "Source", "remote-codex".to_string());
-            upsert_session_metadata(&mut session.metadata, "Host", target.ssh_target.clone());
-            upsert_session_metadata(
-                &mut session.metadata,
-                "Restore",
-                format!("yggterm server remote resume-codex {session_id} --require-existing"),
-            );
-            if let Some(cwd) = cwd {
-                upsert_session_metadata(&mut session.metadata, "Cwd", cwd.to_string());
-            }
-            upsert_session_metadata(
-                &mut session.metadata,
-                "Status",
-                format!(
-                    "remote resume queued · {}",
-                    match remote_deploy_state {
-                        RemoteDeployState::Ready => "remote yggterm ready",
-                        RemoteDeployState::CopyingBinary => "copying yggterm binary",
-                        RemoteDeployState::Planned => "remote bootstrap planned",
-                        RemoteDeployState::NotRequired => "not required",
-                    }
-                ),
-            );
-            upsert_session_metadata(
-                &mut session.metadata,
-                "Deploy",
-                match remote_deploy_state {
-                    RemoteDeployState::Ready => "ready".to_string(),
-                    RemoteDeployState::CopyingBinary => "copying".to_string(),
-                    RemoteDeployState::Planned => "planned".to_string(),
-                    RemoteDeployState::NotRequired => "not required".to_string(),
-                },
+                remote_deploy_state,
+                cwd,
+                self.theme,
             );
             if let Some(scanned) = machine
                 .sessions
@@ -2218,7 +2167,7 @@ impl YggtermServer {
                     &target.ssh_target,
                 );
                 if !launch_terminal {
-                    clear_session_preview_for_loading(session);
+                    mark_session_preview_loading(session);
                     applied_head_preview =
                         try_apply_remote_preview_head_payload(session, &target, scanned);
                 }
@@ -2519,37 +2468,49 @@ impl YggtermServer {
     }
 
     pub fn restore_live_session(&mut self, live: PersistedLiveSession) {
+        let PersistedLiveSession {
+            key,
+            id,
+            title,
+            kind,
+            ssh_target,
+            prefix,
+            cwd,
+        } = live;
         let remote_scanned_key =
-            parse_remote_scanned_session_path(&live.key).map(|(raw_machine_key, session_id)| {
+            parse_remote_scanned_session_path(&key).map(|(raw_machine_key, session_id)| {
                 let machine_key = normalize_machine_key(raw_machine_key);
                 let normalized_live_key = remote_scanned_session_path(&machine_key, session_id);
                 (machine_key, session_id.to_string(), normalized_live_key)
             });
-        let normalized_kind = if remote_scanned_key.is_some() && live.kind == SessionKind::SshShell
-        {
+        let normalized_kind = if remote_scanned_key.is_some() && kind == SessionKind::SshShell {
             SessionKind::Codex
         } else {
-            live.kind
+            kind
         };
         let target = SshConnectTarget {
-            label: live
-                .ssh_target
+            label: ssh_target
                 .rsplit('@')
                 .next()
-                .unwrap_or(live.ssh_target.as_str())
+                .unwrap_or(ssh_target.as_str())
                 .to_string(),
-            kind: normalized_kind,
-            ssh_target: live.ssh_target,
-            prefix: live.prefix,
-            cwd: live.cwd,
+            kind: if remote_scanned_key.is_some() {
+                SessionKind::SshShell
+            } else {
+                normalized_kind
+            },
+            ssh_target,
+            prefix,
+            cwd,
         };
         self.upsert_ssh_target(&target);
         if let Some((machine_key, session_id, normalized_live_key)) = remote_scanned_key.as_ref() {
-            if let Some(machine) = self
+            let machine = self
                 .remote_machines
                 .iter()
                 .find(|machine| machine.machine_key == *machine_key)
-                .cloned()
+                .cloned();
+            if let Some(machine) = machine.as_ref()
                 && let Some(scanned) = machine
                     .sessions
                     .iter()
@@ -2563,26 +2524,71 @@ impl YggtermServer {
                     self.theme,
                     self.ghostty_host.bridge_enabled,
                 );
-                if !live.title.trim().is_empty()
-                    && !looks_like_generated_fallback_title(&live.title)
-                {
-                    session.title = live.title.clone();
+                if !title.trim().is_empty() && !looks_like_generated_fallback_title(&title) {
+                    session.title = title.clone();
                 }
                 self.sessions.insert(normalized_live_key.clone(), session);
                 self.live_session_order
                     .retain(|existing| existing != normalized_live_key);
                 self.live_session_order
                     .insert(0, normalized_live_key.clone());
+                return;
+            }
+            if kind != SessionKind::SshShell {
+                return;
+            }
+            let resolved_title =
+                if !title.trim().is_empty() && !looks_like_generated_fallback_title(&title) {
+                    title.clone()
+                } else {
+                    short_session_id(session_id)
+                };
+            let (remote_binary, remote_deploy_state) = machine
+                .as_ref()
+                .and_then(|machine| {
+                    machine
+                        .remote_binary_expr
+                        .clone()
+                        .map(|remote_binary| (remote_binary, machine.remote_deploy_state))
+                })
+                .unwrap_or_else(|| {
+                    (
+                        preferred_remote_binary_fallback(),
+                        machine
+                            .as_ref()
+                            .map(|machine| machine.remote_deploy_state)
+                            .unwrap_or(RemoteDeployState::Planned),
+                    )
+                });
+            self.insert_live_session_with_launch(
+                normalized_live_key,
+                session_id,
+                normalized_kind,
+                &target,
+                Some(resolved_title.clone()),
+                false,
+            );
+            if let Some(session) = self.sessions.get_mut(normalized_live_key) {
+                configure_remote_resume_live_session(
+                    session,
+                    normalized_live_key,
+                    session_id,
+                    &resolved_title,
+                    &target,
+                    &remote_binary,
+                    remote_deploy_state,
+                    target.cwd.as_deref(),
+                    self.theme,
+                );
             }
             return;
         }
-        let live_key = live.key.as_str();
         self.insert_live_session_with_launch(
-            live_key,
-            &live.id,
+            &key,
+            &id,
             normalized_kind,
             &target,
-            Some(live.title),
+            Some(title),
             false,
         );
     }
@@ -2985,6 +2991,24 @@ impl YggtermServer {
     fn resolve_live_session_key(&self, key_or_path: &str) -> Option<String> {
         self.resolve_live_session_entry(key_or_path)
             .map(|(resolved_key, _)| resolved_key)
+    }
+
+    fn first_available_live_session_path(&self) -> Option<String> {
+        self.live_session_order.iter().find_map(|candidate| {
+            self.resolve_session_storage_key(candidate)
+                .and_then(|key| self.sessions.get(key))
+                .map(|session| session.session_path.clone())
+        })
+    }
+
+    fn repair_active_session_path_after_live_session_change(&mut self) {
+        let Some(active_path) = self.active_session_path.clone() else {
+            return;
+        };
+        if self.resolve_session_storage_key(&active_path).is_some() {
+            return;
+        }
+        self.active_session_path = self.first_available_live_session_path();
     }
 
     fn resolve_live_session_entry(
@@ -5331,13 +5355,117 @@ fn apply_remote_scanned_session_preview(
     upsert_session_metadata(&mut session.metadata, "Messages", messages);
 }
 
-fn clear_session_preview_for_loading(session: &mut ManagedSessionView) {
-    session.preview.blocks.clear();
-    session.rendered_sections.clear();
+fn mark_session_preview_loading(session: &mut ManagedSessionView) {
     upsert_session_metadata(
         &mut session.metadata,
         "Preview Hydration",
         "loading".to_string(),
+    );
+}
+
+fn clear_session_preview_for_loading(session: &mut ManagedSessionView) {
+    session.preview.blocks.clear();
+    session.rendered_sections.clear();
+    mark_session_preview_loading(session);
+}
+
+fn configure_remote_resume_live_session(
+    session: &mut ManagedSessionView,
+    session_path: &str,
+    session_id: &str,
+    resolved_title: &str,
+    target: &SshConnectTarget,
+    remote_binary: &str,
+    remote_deploy_state: RemoteDeployState,
+    cwd: Option<&str>,
+    theme: UiTheme,
+) {
+    let launch_cwd = cwd
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            target
+                .cwd
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        });
+    session.id = session_id.to_string();
+    session.session_path = session_path.to_string();
+    session.title = resolved_title.to_string();
+    session.kind = SessionKind::Codex;
+    session.source = SessionSource::LiveSsh;
+    session.host_label = target.label.clone();
+    session.launch_phase = TerminalLaunchPhase::RemoteBootstrap;
+    session.remote_deploy_state = remote_deploy_state;
+    session.ssh_target = Some(target.ssh_target.clone());
+    session.ssh_prefix = target.prefix.clone();
+    session.launch_command = remote_ssh_launch_command(
+        &target.ssh_target,
+        target.prefix.as_deref(),
+        remote_binary,
+        &[
+            "server",
+            "remote",
+            "resume-codex",
+            session_id,
+            launch_cwd.unwrap_or(""),
+            "--require-existing",
+        ],
+    );
+    session.terminal_lines = vec![
+        format!("$ {}", session.launch_command),
+        format!("Queue remote Yggterm resume {session_id}"),
+        format!("Target host: {}", target.ssh_target),
+        format!("Workspace: {}", launch_cwd.unwrap_or("<unknown>")),
+        "Daemon PTY: request main viewport terminal stream".to_string(),
+    ];
+    upsert_session_metadata(&mut session.metadata, "Source", "remote-codex".to_string());
+    upsert_session_metadata(&mut session.metadata, "Host", target.ssh_target.clone());
+    upsert_session_metadata(&mut session.metadata, "UUID", session_id.to_string());
+    upsert_session_metadata(
+        &mut session.metadata,
+        "Restore",
+        format!("yggterm server remote resume-codex {session_id} --require-existing"),
+    );
+    if let Some(cwd) = launch_cwd {
+        upsert_session_metadata(&mut session.metadata, "Cwd", cwd.to_string());
+    }
+    upsert_session_metadata(
+        &mut session.metadata,
+        "Status",
+        format!(
+            "remote resume queued · {}",
+            match remote_deploy_state {
+                RemoteDeployState::Ready => "remote yggterm ready",
+                RemoteDeployState::CopyingBinary => "copying yggterm binary",
+                RemoteDeployState::Planned => "remote bootstrap planned",
+                RemoteDeployState::NotRequired => "not required",
+            }
+        ),
+    );
+    upsert_session_metadata(
+        &mut session.metadata,
+        "Deploy",
+        match remote_deploy_state {
+            RemoteDeployState::Ready => "ready".to_string(),
+            RemoteDeployState::CopyingBinary => "copying".to_string(),
+            RemoteDeployState::Planned => "planned".to_string(),
+            RemoteDeployState::NotRequired => "not required".to_string(),
+        },
+    );
+    upsert_session_metadata(
+        &mut session.metadata,
+        "Launch",
+        session.launch_command.clone(),
+    );
+    session.status_line = describe_status_line(
+        session.backend,
+        theme,
+        session.source,
+        session.launch_phase,
+        session.remote_deploy_state,
+        session.bridge_available,
     );
 }
 
@@ -8437,6 +8565,38 @@ pub fn run_app_control_set_ui_theme(theme: UiTheme, timeout_ms: u64) -> anyhow::
     Ok(())
 }
 
+pub fn run_app_control_set_theme_editor_open(open: bool, timeout_ms: u64) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::SetThemeEditorOpen { open },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_reset_theme_editor(timeout_ms: u64) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(&home, AppControlCommand::ResetThemeEditor, timeout_ms)?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_trigger_update_check(timeout_ms: u64) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(&home, AppControlCommand::TriggerUpdateCheck, timeout_ms)?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_restart_pending_update(timeout_ms: u64) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(&home, AppControlCommand::RestartPendingUpdate, timeout_ms)?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 pub fn run_app_control_set_preview_layout(
     layout: AppControlPreviewLayout,
     timeout_ms: u64,
@@ -8967,6 +9127,54 @@ pub fn run_app_control_send_terminal_input(
     Ok(())
 }
 
+pub fn run_app_control_reclaim_terminal_focus(
+    session_path: &str,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::ReclaimTerminalFocus {
+            session_path: session_path.to_string(),
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_paste_terminal_clipboard(
+    session_path: &str,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::PasteTerminalClipboard {
+            session_path: session_path.to_string(),
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_paste_terminal_clipboard_image(
+    session_path: &str,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::PasteTerminalClipboardImage {
+            session_path: session_path.to_string(),
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 fn app_control_state_response(home: &Path, timeout_ms: u64) -> anyhow::Result<AppControlResponse> {
     request_app_control(home, AppControlCommand::DescribeState, timeout_ms)
 }
@@ -9013,7 +9221,98 @@ fn terminal_host_probe_snapshot(host: &Value) -> Value {
         "cols": host.get("cols").and_then(Value::as_u64),
         "rows": host.get("rows").and_then(Value::as_u64),
         "text_tail": host.get("text_sample").and_then(Value::as_str).unwrap_or_default(),
+        "data_event_count": host.get("data_event_count").and_then(Value::as_u64),
+        "write_command_count": host.get("write_command_count").and_then(Value::as_u64),
+        "last_write_queued_at_ms": host.get("last_write_queued_at_ms").and_then(Value::as_u64),
     })
+}
+
+fn terminal_probe_focus_ready(snapshot: &Value) -> bool {
+    let input_enabled = snapshot
+        .get("input_enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let helper_focused = snapshot
+        .get("helper_textarea_focused")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let host_has_active_element = snapshot
+        .get("host_has_active_element")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    input_enabled && (helper_focused || host_has_active_element)
+}
+
+fn terminal_probe_snapshot_timeout_ms(timeout_ms: u64) -> u64 {
+    timeout_ms.clamp(750, 4_000)
+}
+
+fn terminal_probe_snapshot_changed(before: &Value, after: &Value, data: &str) -> bool {
+    let before_text = before
+        .get("text_tail")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let after_text = after
+        .get("text_tail")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !data.is_empty() && after_text.contains(data) && after_text != before_text {
+        return true;
+    }
+    let before_data_events = before
+        .get("data_event_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let after_data_events = after
+        .get("data_event_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if after_data_events > before_data_events {
+        return true;
+    }
+    let before_write_commands = before
+        .get("write_command_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let after_write_commands = after
+        .get("write_command_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if after_write_commands > before_write_commands {
+        return true;
+    }
+    let before_last_write = before
+        .get("last_write_queued_at_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let after_last_write = after
+        .get("last_write_queued_at_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if after_last_write > before_last_write {
+        return true;
+    }
+    after_text != before_text
+}
+
+fn x11_keyboard_probe_requires_focused_retry(
+    before: &Value,
+    after: &Value,
+    data: &str,
+    press_enter: bool,
+    press_tab: bool,
+    press_ctrl_c: bool,
+    press_ctrl_e: bool,
+    press_ctrl_u: bool,
+) -> bool {
+    if !terminal_probe_snapshot_changed(before, after, data) {
+        return true;
+    }
+    if data.is_empty() && (press_enter || press_tab || press_ctrl_c || press_ctrl_e || press_ctrl_u)
+    {
+        return true;
+    }
+    false
 }
 
 fn active_terminal_probe_context(
@@ -9262,9 +9561,15 @@ fn visible_window_id_for_pid(
         .context("no visible Yggterm X11 window found for terminal probe")
 }
 
-fn focus_terminal_viewport_via_x11(context: &X11TerminalProbeContext) -> anyhow::Result<String> {
+fn focus_terminal_viewport_via_x11(
+    home: &Path,
+    context: &X11TerminalProbeContext,
+) -> anyhow::Result<String> {
     let window_id =
         visible_window_id_for_pid(&context.display, context.xauthority.as_deref(), context.pid)?;
+    if terminal_probe_focus_ready(&context.before) {
+        return Ok(window_id);
+    }
     let _ = run_xdotool_checked_owned(
         &context.display,
         context.xauthority.as_deref(),
@@ -9283,22 +9588,50 @@ fn focus_terminal_viewport_via_x11(context: &X11TerminalProbeContext) -> anyhow:
             window_id.clone(),
         ],
     );
-    run_xdotool_checked_owned(
-        &context.display,
-        context.xauthority.as_deref(),
-        &[
-            "mousemove".to_string(),
-            "--sync".to_string(),
-            "--window".to_string(),
-            window_id.clone(),
-            context.x.to_string(),
-            context.y.to_string(),
-            "click".to_string(),
-            "1".to_string(),
-        ],
-    )?;
-    std::thread::sleep(Duration::from_millis(120));
-    Ok(window_id)
+    let click_points = [
+        (context.x, context.y),
+        (context.scroll_x, context.scroll_y),
+        (context.x, context.y),
+    ];
+    let mut last_snapshot = context.before.clone();
+    for (x, y) in click_points {
+        run_xdotool_checked_owned(
+            &context.display,
+            context.xauthority.as_deref(),
+            &[
+                "mousemove".to_string(),
+                "--window".to_string(),
+                window_id.clone(),
+                x.to_string(),
+                y.to_string(),
+            ],
+        )?;
+        run_xdotool_checked_owned(
+            &context.display,
+            context.xauthority.as_deref(),
+            &[
+                "click".to_string(),
+                "--window".to_string(),
+                window_id.clone(),
+                "1".to_string(),
+            ],
+        )?;
+        std::thread::sleep(Duration::from_millis(140));
+        let refreshed = active_terminal_probe_context(
+            home,
+            &context.session_path,
+            terminal_probe_snapshot_timeout_ms(4_000),
+        )?;
+        if terminal_probe_focus_ready(&refreshed.before) {
+            return Ok(window_id);
+        }
+        last_snapshot = refreshed.before;
+    }
+    anyhow::bail!(
+        "terminal viewport click did not yield helper focus for probe input: session={} snapshot={}",
+        context.session_path,
+        last_snapshot
+    )
 }
 
 fn x11_keyboard_probe_input(
@@ -9312,75 +9645,122 @@ fn x11_keyboard_probe_input(
     timeout_ms: u64,
 ) -> anyhow::Result<Value> {
     let home = resolve_yggterm_home()?;
-    let before_context = active_terminal_probe_context(&home, session_path, timeout_ms)?;
-    let window_id = focus_terminal_viewport_via_x11(&before_context)?;
-    if press_ctrl_c {
-        run_xdotool_checked_owned(
-            &before_context.display,
-            before_context.xauthority.as_deref(),
-            &xdotool_chord_args(Some(&window_id), "ctrl", "c"),
-        )?;
-        std::thread::sleep(Duration::from_millis(40));
-    }
-    if press_ctrl_e {
-        run_xdotool_checked_owned(
-            &before_context.display,
-            before_context.xauthority.as_deref(),
-            &xdotool_chord_args(Some(&window_id), "ctrl", "e"),
-        )?;
-        std::thread::sleep(Duration::from_millis(40));
-    }
-    if press_ctrl_u {
-        run_xdotool_checked_owned(
-            &before_context.display,
-            before_context.xauthority.as_deref(),
-            &xdotool_chord_args(Some(&window_id), "ctrl", "u"),
-        )?;
-        std::thread::sleep(Duration::from_millis(40));
-    }
-    if !data.is_empty() {
-        let type_result = run_xdotool_checked_owned(
-            &before_context.display,
-            before_context.xauthority.as_deref(),
-            &xdotool_type_args(Some(&window_id), data),
-        );
-        if type_result.is_ok() {
-            std::thread::sleep(Duration::from_millis(xdotool_type_settle_delay_ms(data)));
-        } else {
-            let supported_keys = data
-                .chars()
-                .map(xdotool_key_for_char)
-                .collect::<Option<Vec<_>>>()
-                .with_context(|| {
-                    format!("xdotool type failed and no per-key fallback exists for {data:?}")
-                })?;
-            for key in supported_keys {
-                run_xdotool_checked_owned(
-                    &before_context.display,
-                    before_context.xauthority.as_deref(),
-                    &xdotool_key_args(Some(&window_id), key),
-                )?;
-                std::thread::sleep(Duration::from_millis(18));
+    let snapshot_timeout_ms = terminal_probe_snapshot_timeout_ms(timeout_ms);
+    let before_context = active_terminal_probe_context(&home, session_path, snapshot_timeout_ms)?;
+    let window_id = focus_terminal_viewport_via_x11(&home, &before_context)?;
+    let mut keyboard_backend = "xdotool_window".to_string();
+    let mut send_keys = |target_window: Option<&str>,
+                         target_display: &str,
+                         target_xauthority: Option<&str>|
+     -> anyhow::Result<()> {
+        if press_ctrl_c {
+            run_xdotool_checked_owned(
+                target_display,
+                target_xauthority,
+                &xdotool_chord_args(target_window, "ctrl", "c"),
+            )?;
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        if press_ctrl_e {
+            run_xdotool_checked_owned(
+                target_display,
+                target_xauthority,
+                &xdotool_chord_args(target_window, "ctrl", "e"),
+            )?;
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        if press_ctrl_u {
+            run_xdotool_checked_owned(
+                target_display,
+                target_xauthority,
+                &xdotool_chord_args(target_window, "ctrl", "u"),
+            )?;
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        if !data.is_empty() {
+            let type_result = run_xdotool_checked_owned(
+                target_display,
+                target_xauthority,
+                &xdotool_type_args(target_window, data),
+            );
+            if type_result.is_ok() {
+                std::thread::sleep(Duration::from_millis(xdotool_type_settle_delay_ms(data)));
+            } else {
+                let supported_keys = data
+                    .chars()
+                    .map(xdotool_key_for_char)
+                    .collect::<Option<Vec<_>>>()
+                    .with_context(|| {
+                        if target_window.is_some() {
+                            format!("xdotool type failed and no per-key fallback exists for {data:?}")
+                        } else {
+                            format!(
+                                "xdotool focused-window type failed and no per-key fallback exists for {data:?}"
+                            )
+                        }
+                    })?;
+                for key in supported_keys {
+                    run_xdotool_checked_owned(
+                        target_display,
+                        target_xauthority,
+                        &xdotool_key_args(target_window, key),
+                    )?;
+                    std::thread::sleep(Duration::from_millis(18));
+                }
             }
         }
-    }
-    if press_tab {
-        run_xdotool_checked_owned(
-            &before_context.display,
-            before_context.xauthority.as_deref(),
-            &xdotool_key_args(Some(&window_id), "Tab"),
-        )?;
-        std::thread::sleep(Duration::from_millis(40));
-    }
-    if press_enter {
-        run_xdotool_checked_owned(
-            &before_context.display,
-            before_context.xauthority.as_deref(),
-            &xdotool_key_args(Some(&window_id), "Return"),
-        )?;
-    }
+        if press_tab {
+            run_xdotool_checked_owned(
+                target_display,
+                target_xauthority,
+                &xdotool_key_args(target_window, "Tab"),
+            )?;
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        if press_enter {
+            run_xdotool_checked_owned(
+                target_display,
+                target_xauthority,
+                &xdotool_key_args(target_window, "Return"),
+            )?;
+        }
+        Ok(())
+    };
+    send_keys(
+        Some(&window_id),
+        &before_context.display,
+        before_context.xauthority.as_deref(),
+    )?;
     std::thread::sleep(Duration::from_millis(if press_enter { 220 } else { 120 }));
-    let after_context = active_terminal_probe_context(&home, session_path, timeout_ms)?;
+    let mut after_context =
+        active_terminal_probe_context(&home, session_path, snapshot_timeout_ms)?;
+    if x11_keyboard_probe_requires_focused_retry(
+        &before_context.before,
+        &after_context.before,
+        data,
+        press_enter,
+        press_tab,
+        press_ctrl_c,
+        press_ctrl_e,
+        press_ctrl_u,
+    ) {
+        let retry_context =
+            active_terminal_probe_context(&home, session_path, snapshot_timeout_ms)?;
+        let _ = focus_terminal_viewport_via_x11(&home, &retry_context)?;
+        std::thread::sleep(Duration::from_millis(180));
+        send_keys(
+            None,
+            &retry_context.display,
+            retry_context.xauthority.as_deref(),
+        )?;
+        keyboard_backend = if data.is_empty() {
+            "xdotool_focused_window_keys".to_string()
+        } else {
+            "xdotool_focused_window".to_string()
+        };
+        std::thread::sleep(Duration::from_millis(if press_enter { 220 } else { 140 }));
+        after_context = active_terminal_probe_context(&home, session_path, snapshot_timeout_ms)?;
+    }
     Ok(json!({
         "accepted": true,
         "session_path": session_path,
@@ -9396,7 +9776,7 @@ fn x11_keyboard_probe_input(
         "mode": "keyboard",
         "used_core_trigger": false,
         "used_term_input": false,
-        "keyboard_backend": "xdotool",
+        "keyboard_backend": keyboard_backend,
         "window_id": window_id,
         "click_point": {
             "x": before_context.x,
@@ -9411,8 +9791,9 @@ fn x11_scroll_probe_input(
     timeout_ms: u64,
 ) -> anyhow::Result<Value> {
     let home = resolve_yggterm_home()?;
-    let before_context = active_terminal_probe_context(&home, session_path, timeout_ms)?;
-    let window_id = focus_terminal_viewport_via_x11(&before_context)?;
+    let snapshot_timeout_ms = terminal_probe_snapshot_timeout_ms(timeout_ms);
+    let before_context = active_terminal_probe_context(&home, session_path, snapshot_timeout_ms)?;
+    let window_id = focus_terminal_viewport_via_x11(&home, &before_context)?;
     if lines != 0 {
         let button = if lines > 0 { "5" } else { "4" };
         let repeat = lines.unsigned_abs().max(1).to_string();
@@ -9421,14 +9802,29 @@ fn x11_scroll_probe_input(
             before_context.xauthority.as_deref(),
             &[
                 "mousemove".to_string(),
-                "--sync".to_string(),
                 "--window".to_string(),
                 window_id.clone(),
                 before_context.scroll_x.to_string(),
                 before_context.scroll_y.to_string(),
+            ],
+        )?;
+        run_xdotool_checked_owned(
+            &before_context.display,
+            before_context.xauthority.as_deref(),
+            &[
                 "click".to_string(),
+                "--window".to_string(),
+                window_id.clone(),
                 "1".to_string(),
+            ],
+        )?;
+        run_xdotool_checked_owned(
+            &before_context.display,
+            before_context.xauthority.as_deref(),
+            &[
                 "click".to_string(),
+                "--window".to_string(),
+                window_id.clone(),
                 "--repeat".to_string(),
                 repeat,
                 "--delay".to_string(),
@@ -9438,7 +9834,7 @@ fn x11_scroll_probe_input(
         )?;
         std::thread::sleep(Duration::from_millis(120));
     }
-    let after_context = active_terminal_probe_context(&home, session_path, timeout_ms)?;
+    let after_context = active_terminal_probe_context(&home, session_path, snapshot_timeout_ms)?;
     Ok(json!({
         "accepted": true,
         "session_path": session_path,
@@ -10834,70 +11230,22 @@ fn synthesize_remote_scanned_session_view(
                 machine.remote_deploy_state,
             )
         });
-    session.remote_deploy_state = remote_deploy_state;
-    session.session_path = scanned.session_path.clone();
-    session.host_label = machine.label.clone();
-    session.title = if scanned.title_hint.trim().is_empty() {
+    let resolved_title = if scanned.title_hint.trim().is_empty() {
         short_session_id(&scanned.session_id)
     } else {
         scanned.title_hint.clone()
     };
-    session.launch_command = remote_ssh_launch_command(
-        &target.ssh_target,
-        target.prefix.as_deref(),
+    configure_remote_resume_live_session(
+        &mut session,
+        &scanned.session_path,
+        &scanned.session_id,
+        &resolved_title,
+        &target,
         &remote_binary,
-        &[
-            "server",
-            "remote",
-            "resume-codex",
-            &scanned.session_id,
-            &scanned.cwd,
-        ],
+        remote_deploy_state,
+        Some(scanned.cwd.as_str()),
+        theme,
     );
-    session.terminal_lines = vec![
-        format!("$ {}", session.launch_command),
-        format!("Queue remote Yggterm resume {}", scanned.session_id),
-        format!("Target host: {}", target.ssh_target),
-        format!("Workspace: {}", scanned.cwd),
-        "Daemon PTY: request main viewport terminal stream".to_string(),
-    ];
-    upsert_session_metadata(&mut session.metadata, "Source", "remote-codex".to_string());
-    upsert_session_metadata(&mut session.metadata, "Host", target.ssh_target.clone());
-    upsert_session_metadata(&mut session.metadata, "UUID", scanned.session_id.clone());
-    upsert_session_metadata(
-        &mut session.metadata,
-        "Restore",
-        format!("yggterm server remote resume-codex {}", scanned.session_id),
-    );
-    upsert_session_metadata(
-        &mut session.metadata,
-        "Deploy",
-        match remote_deploy_state {
-            RemoteDeployState::Ready => "ready".to_string(),
-            RemoteDeployState::CopyingBinary => "copying".to_string(),
-            RemoteDeployState::Planned => "planned".to_string(),
-            RemoteDeployState::NotRequired => "not required".to_string(),
-        },
-    );
-    upsert_session_metadata(
-        &mut session.metadata,
-        "Status",
-        format!(
-            "remote resume queued · {}",
-            match remote_deploy_state {
-                RemoteDeployState::Ready => "remote yggterm ready",
-                RemoteDeployState::CopyingBinary => "copying yggterm binary",
-                RemoteDeployState::Planned => "remote bootstrap planned",
-                RemoteDeployState::NotRequired => "not required",
-            }
-        ),
-    );
-    upsert_session_metadata(
-        &mut session.metadata,
-        "Launch",
-        session.launch_command.clone(),
-    );
-    upsert_session_metadata(&mut session.metadata, "Cwd", scanned.cwd.clone());
     apply_remote_scanned_session_preview(&mut session, scanned, &machine.label, &target.ssh_target);
     session
 }
@@ -11683,8 +12031,8 @@ mod tests {
         PersistedDaemonState, PersistedLiveSession, PersistedStoredSession, PreviewTone,
         REMOTE_OUTPUT_SENTINEL, RemoteCommandCacheEntry, RemoteDeployState, RemoteMachineHealth,
         RemoteMachineSnapshot, RemotePreviewPayload, RemoteScannedSession, ServerEndpoint,
-        SessionKind, SessionMetadataEntry, SessionNode, SessionNodeKind, SessionPreview,
-        SessionPreviewBlock, SessionSource, SnapshotPreview, SnapshotPreviewBlock,
+        ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionNode, SessionNodeKind,
+        SessionPreview, SessionPreviewBlock, SessionSource, SnapshotPreview, SnapshotPreviewBlock,
         SnapshotRenderedSection, SnapshotSessionView, SshConnectTarget, StoredPreviewHydrationMode,
         TerminalBackend, TerminalLaunchPhase, UiTheme, WorkspaceViewMode, YggtermServer,
         active_client_instance_records, apply_remote_preview_payload,
@@ -11772,11 +12120,47 @@ mod tests {
                 "123".to_string(),
                 "--clearmodifiers".to_string(),
                 "--delay".to_string(),
-                "1".to_string(),
+                "8".to_string(),
                 "--".to_string(),
                 "/status".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn keyboard_probe_retries_focused_delivery_for_action_only_inputs() {
+        let before = json!({
+            "text_tail": "› /status",
+            "data_event_count": 10,
+            "write_command_count": 20,
+            "last_write_queued_at_ms": 30,
+        });
+        let after = before.clone();
+        assert!(super::x11_keyboard_probe_requires_focused_retry(
+            &before, &after, "", true, false, false, false, false
+        ));
+        assert!(super::x11_keyboard_probe_requires_focused_retry(
+            &before, &after, "", false, true, false, false, false
+        ));
+    }
+
+    #[test]
+    fn keyboard_probe_skips_focused_retry_when_snapshot_changed_for_typed_data() {
+        let before = json!({
+            "text_tail": "› ",
+            "data_event_count": 10,
+            "write_command_count": 20,
+            "last_write_queued_at_ms": 30,
+        });
+        let after = json!({
+            "text_tail": "› /status",
+            "data_event_count": 11,
+            "write_command_count": 21,
+            "last_write_queued_at_ms": 31,
+        });
+        assert!(!super::x11_keyboard_probe_requires_focused_retry(
+            &before, &after, "/status", false, false, false, false, false
+        ));
     }
 
     #[test]
@@ -13183,6 +13567,51 @@ terminal_window_id: None,
     }
 
     #[test]
+    fn snapshot_does_not_export_deleted_local_active_gap() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let other_key = server.start_local_session(
+            SessionKind::Shell,
+            Some("/home/pi/gh/yggterm"),
+            Some("Proof Three"),
+        );
+        let other_path = server
+            .sessions
+            .get(&other_key)
+            .expect("other session")
+            .session_path
+            .clone();
+        server.active_session_path = Some("local://deleted".to_string());
+
+        let snapshot = server.snapshot();
+
+        assert_eq!(snapshot.active_session_path, None);
+        assert_eq!(
+            snapshot
+                .live_sessions
+                .into_iter()
+                .map(|session| session.session_path)
+                .collect::<Vec<_>>(),
+            vec![other_path]
+        );
+    }
+
+    #[test]
     fn remote_preview_open_does_not_queue_terminal_resume() -> Result<()> {
         let tree = SessionNode {
             kind: SessionNodeKind::Group,
@@ -14337,6 +14766,82 @@ terminal_window_id: None,
     }
 
     #[test]
+    fn apply_snapshot_does_not_resurrect_missing_previous_live_active_session() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let stale_path = "codex://019cf82b-196b-7152-b4d2-e053f7286318";
+        server.sessions.insert(
+            stale_path.to_string(),
+            ManagedSessionView {
+                id: "019cf82b-196b-7152-b4d2-e053f7286318".to_string(),
+                session_path: stale_path.to_string(),
+                title: "Yggterm Shell".to_string(),
+                kind: SessionKind::Codex,
+                host_label: "localhost".to_string(),
+                source: SessionSource::LiveLocal,
+                backend: TerminalBackend::Xterm,
+                bridge_available: true,
+                launch_phase: TerminalLaunchPhase::Running,
+                remote_deploy_state: RemoteDeployState::NotRequired,
+                launch_command: "codex".to_string(),
+                status_line: String::new(),
+                terminal_lines: vec![],
+                rendered_sections: vec![],
+                preview: SessionPreview {
+                    summary: vec![],
+                    blocks: vec![],
+                },
+                metadata: vec![SessionMetadataEntry {
+                    label: "Cwd",
+                    value: "/home/pi/gh/yggterm".to_string(),
+                }],
+                terminal_process_id: None,
+                terminal_foreground_active: Some(false),
+                terminal_window_id: None,
+                terminal_host_token: None,
+                terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+                embedded_surface_id: None,
+                embedded_surface_detail: None,
+                last_launch_error: None,
+                last_window_error: None,
+                ssh_target: None,
+                ssh_prefix: None,
+                stored_preview_hydrated: false,
+            },
+        );
+        server.live_session_order = vec![stale_path.to_string()];
+        server.active_session_path = Some(stale_path.to_string());
+
+        server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(stale_path.to_string()),
+            active_session: None,
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: Vec::new(),
+        });
+
+        assert_eq!(server.active_session_path(), None);
+        assert!(server.live_sessions().is_empty());
+        assert!(!server.sessions.contains_key(stale_path));
+    }
+
+    #[test]
     fn restore_persisted_state_defers_inactive_stored_transcript_hydration() -> Result<()> {
         let transcript_dir = std::env::temp_dir().join(format!(
             "yggterm-server-restore-deferred-{}-{}",
@@ -14969,6 +15474,111 @@ terminal_window_id: None,
                 .live_session_order
                 .iter()
                 .any(|path| path == "codex-runtime://cleanup-me")
+        );
+    }
+
+    #[test]
+    fn remove_live_session_does_not_fallback_to_stored_session() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: vec![SessionNode {
+                kind: SessionNodeKind::CodexSession,
+                name: "saved".to_string(),
+                title: Some("Saved".to_string()),
+                document_kind: None,
+                group_kind: None,
+                path: PathBuf::from("/home/pi/.codex/sessions/example.jsonl"),
+                children: Vec::new(),
+                session_id: Some("saved".to_string()),
+                cwd: Some("/home/pi".to_string()),
+            }],
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let live_path = server.start_local_session(SessionKind::Shell, Some("/tmp"), Some("Temp"));
+        server.active_session_path = Some(live_path.clone());
+
+        assert!(
+            server
+                .remove_live_session(&live_path)
+                .expect("remove live local session")
+        );
+        assert_eq!(server.active_session_path(), None);
+        assert!(
+            server
+                .sessions
+                .contains_key("/home/pi/.codex/sessions/example.jsonl")
+        );
+        assert!(!server.sessions.contains_key(&live_path));
+    }
+
+    #[test]
+    fn remove_live_session_repairs_normalized_active_path_alias() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let removed_key =
+            server.start_local_session(SessionKind::Shell, Some("/tmp/remove"), Some("Remove"));
+        let survivor_key =
+            server.start_local_session(SessionKind::Shell, Some("/tmp/keep"), Some("Keep"));
+        let removed_path = server
+            .sessions
+            .get(&removed_key)
+            .expect("removed session")
+            .session_path
+            .clone();
+        let survivor_path = server
+            .sessions
+            .get(&survivor_key)
+            .expect("survivor session")
+            .session_path
+            .clone();
+        server.active_session_path = Some(removed_path.clone());
+
+        assert!(
+            server
+                .remove_live_session(&removed_path)
+                .expect("remove live local session")
+        );
+
+        assert_eq!(server.active_session_path(), Some(survivor_path.as_str()));
+        assert_eq!(
+            server
+                .active_session()
+                .map(|session| session.session_path.as_str()),
+            Some(survivor_path.as_str())
+        );
+        assert!(!server.sessions.contains_key(&removed_key));
+        assert!(
+            !server
+                .live_session_order
+                .iter()
+                .any(|path| path == &removed_key || path == &removed_path)
         );
     }
 

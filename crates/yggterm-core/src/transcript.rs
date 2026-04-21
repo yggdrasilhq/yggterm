@@ -530,18 +530,16 @@ fn looks_like_generation_noise(text: &str, role: TranscriptRole) -> bool {
     let lower = text.to_ascii_lowercase();
     let min_len = match role {
         TranscriptRole::User => 8,
-        TranscriptRole::Assistant => 16,
+        TranscriptRole::Assistant => 12,
         TranscriptRole::System => return true,
     };
     if lower.len() < min_len {
         return true;
     }
-    if role == TranscriptRole::User
-        && matches!(
-            lower.as_str(),
-            "ok" | "okay" | "thanks" | "thank you" | "yes" | "no" | "hi" | "hello"
-        )
-    {
+    if matches!(
+        lower.as_str(),
+        "ok" | "okay" | "thanks" | "thank you" | "yes" | "no" | "hi" | "hello" | "done"
+    ) {
         return true;
     }
     [
