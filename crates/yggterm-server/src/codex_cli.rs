@@ -1,11 +1,14 @@
 use crate::{SessionKind, shell_single_quote};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 use yggterm_core::{ENV_YGGTERM_HOME, PerfSpan, append_trace_event, resolve_yggterm_home};
 use yggui_contract::UiTheme;
 
@@ -15,6 +18,9 @@ const EXPORTED_TERM_PROGRAM: &str = "vscode";
 const YGGTERM_TERM_PROGRAM: &str = "yggterm";
 const YGGTERM_TERM_PROGRAM_VERSION: &str = env!("CARGO_PKG_VERSION");
 const TERMINAL_IDENTITY_ENV_REMOVALS: &[&str] = &["NO_COLOR"];
+const MANAGED_CLI_REFRESH_STATE_FILENAME: &str = "managed-cli-refresh-state.json";
+const MANAGED_CLI_REFRESH_TTL_ENV: &str = "YGGTERM_MANAGED_CLI_REFRESH_TTL_MS";
+pub const DEFAULT_MANAGED_CLI_REFRESH_TTL_MS: u64 = 6 * 60 * 60_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -54,6 +60,20 @@ pub struct ManagedCliRefreshReport {
     pub scope: String,
     pub background: bool,
     pub statuses: Vec<ManagedCliToolStatus>,
+    #[serde(default)]
+    pub skipped_recently: bool,
+    #[serde(default)]
+    pub ttl_remaining_ms: Option<u64>,
+    #[serde(default)]
+    pub install_attempted: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct ManagedCliRefreshState {
+    #[serde(default)]
+    last_successful_refresh_ms: Option<u64>,
+    #[serde(default)]
+    managed_versions: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -175,6 +195,175 @@ impl ManagedCliPaths {
     }
 }
 
+pub fn managed_cli_refresh_ttl_ms() -> u64 {
+    env::var(MANAGED_CLI_REFRESH_TTL_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MANAGED_CLI_REFRESH_TTL_MS)
+}
+
+fn current_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+fn managed_cli_refresh_state_path(home: &Path) -> PathBuf {
+    home.join(MANAGED_CLI_REFRESH_STATE_FILENAME)
+}
+
+fn load_managed_cli_refresh_state(home: &Path) -> ManagedCliRefreshState {
+    let path = managed_cli_refresh_state_path(home);
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return ManagedCliRefreshState::default();
+    };
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+fn save_managed_cli_refresh_state(home: &Path, state: &ManagedCliRefreshState) -> Result<()> {
+    let path = managed_cli_refresh_state_path(home);
+    let Some(parent) = path.parent() else {
+        anyhow::bail!("managed cli refresh state path has no parent");
+    };
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "creating managed cli refresh state directory {}",
+            parent.display()
+        )
+    })?;
+    let encoded =
+        serde_json::to_vec_pretty(state).context("serializing managed cli refresh state")?;
+    let temp_path = parent.join(format!(
+        ".{}.tmp-{}-{}",
+        path.file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("managed-cli-refresh-state.json"),
+        std::process::id(),
+        current_time_ms()
+    ));
+    fs::write(&temp_path, encoded).with_context(|| {
+        format!(
+            "writing managed cli refresh temp state {}",
+            temp_path.display()
+        )
+    })?;
+    if let Err(error) = fs::rename(&temp_path, &path) {
+        if error.kind() == ErrorKind::AlreadyExists {
+            let _ = fs::remove_file(&path);
+            fs::rename(&temp_path, &path).with_context(|| {
+                format!(
+                    "replacing managed cli refresh state {} after removing the previous file",
+                    path.display()
+                )
+            })?;
+        } else {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error).with_context(|| {
+                format!(
+                    "renaming managed cli refresh state {} into place",
+                    path.display()
+                )
+            });
+        }
+    }
+    Ok(())
+}
+
+fn probe_tools(
+    paths: &ManagedCliPaths,
+    tools: &[ManagedCliTool],
+) -> Vec<(ManagedCliTool, ToolProbe)> {
+    tools
+        .iter()
+        .copied()
+        .map(|tool| (tool, probe_tool(paths, tool)))
+        .collect::<Vec<_>>()
+}
+
+fn record_managed_cli_probe_span(
+    home: &Path,
+    name: &str,
+    probes: &[(ManagedCliTool, ToolProbe)],
+    phase: &str,
+) {
+    let perf = PerfSpan::start(home, "cli", name);
+    perf.finish(serde_json::json!({
+        "phase": phase,
+        "tools": probes
+            .iter()
+            .map(|(tool, probe)| serde_json::json!({
+                "tool": tool.binary_name(),
+                "available": probe.available,
+                "source": probe.source,
+                "version": probe.version,
+            }))
+            .collect::<Vec<_>>(),
+    }));
+}
+
+fn managed_cli_refresh_skip_remaining_ms(
+    before: &[(ManagedCliTool, ToolProbe)],
+    state: &ManagedCliRefreshState,
+    now_ms: u64,
+    ttl_ms: u64,
+) -> Option<u64> {
+    let refreshed_at_ms = state.last_successful_refresh_ms?;
+    let age_ms = now_ms.saturating_sub(refreshed_at_ms);
+    if age_ms >= ttl_ms {
+        return None;
+    }
+    for (tool, probe) in before {
+        if !probe.available || probe.source != Some(ManagedCliBinarySource::Managed) {
+            return None;
+        }
+        let Some(version) = probe.version.as_ref() else {
+            return None;
+        };
+        if state.managed_versions.get(tool.binary_name()) != Some(version) {
+            return None;
+        }
+    }
+    Some(ttl_ms.saturating_sub(age_ms))
+}
+
+fn managed_cli_refresh_state_from_probes(
+    probes: &[(ManagedCliTool, ToolProbe)],
+    refreshed_at_ms: u64,
+) -> ManagedCliRefreshState {
+    let managed_versions = probes
+        .iter()
+        .filter_map(|(tool, probe)| {
+            (probe.source == Some(ManagedCliBinarySource::Managed))
+                .then_some(
+                    probe
+                        .version
+                        .as_ref()
+                        .map(|version| (tool.binary_name().to_string(), version.clone())),
+                )
+                .flatten()
+        })
+        .collect::<BTreeMap<_, _>>();
+    ManagedCliRefreshState {
+        last_successful_refresh_ms: Some(refreshed_at_ms),
+        managed_versions,
+    }
+}
+
+fn managed_cli_refresh_skip_detail(
+    tool: ManagedCliTool,
+    ttl_remaining_ms: u64,
+    ttl_ms: u64,
+) -> String {
+    format!(
+        "Skipped {} refresh because Yggterm refreshed the managed toolchain recently. About {}s remain in the {}s refresh window.",
+        tool.display_name(),
+        ttl_remaining_ms / 1000,
+        ttl_ms / 1000,
+    )
+}
+
 fn ambient_terminal_appearance() -> String {
     env::var("YGGTERM_APPEARANCE")
         .ok()
@@ -294,6 +483,96 @@ mod tests {
             Some(value) => unsafe { env::set_var("NO_COLOR", value) },
             None => unsafe { env::remove_var("NO_COLOR") },
         }
+    }
+
+    #[test]
+    fn managed_cli_recent_refresh_skip_requires_fresh_managed_versions() {
+        let ttl_ms = managed_cli_refresh_ttl_ms();
+        let now_ms = 10_000u64;
+        let before = vec![
+            (
+                ManagedCliTool::Codex,
+                ToolProbe {
+                    version: Some("1.2.3".to_string()),
+                    source: Some(ManagedCliBinarySource::Managed),
+                    available: true,
+                },
+            ),
+            (
+                ManagedCliTool::CodexLiteLlm,
+                ToolProbe {
+                    version: Some("4.5.6".to_string()),
+                    source: Some(ManagedCliBinarySource::Managed),
+                    available: true,
+                },
+            ),
+        ];
+        let state = ManagedCliRefreshState {
+            last_successful_refresh_ms: Some(now_ms.saturating_sub(1_000)),
+            managed_versions: BTreeMap::from([
+                ("codex".to_string(), "1.2.3".to_string()),
+                ("codex-litellm".to_string(), "4.5.6".to_string()),
+            ]),
+        };
+        let remaining_ms = managed_cli_refresh_skip_remaining_ms(&before, &state, now_ms, ttl_ms);
+        assert_eq!(remaining_ms, Some(ttl_ms.saturating_sub(1_000)));
+    }
+
+    #[test]
+    fn managed_cli_recent_refresh_skip_rejects_system_or_stale_tools() {
+        let ttl_ms = managed_cli_refresh_ttl_ms();
+        let now_ms = 10_000u64;
+        let stale_state = ManagedCliRefreshState {
+            last_successful_refresh_ms: Some(now_ms.saturating_sub(1_000)),
+            managed_versions: BTreeMap::from([
+                ("codex".to_string(), "1.2.2".to_string()),
+                ("codex-litellm".to_string(), "4.5.6".to_string()),
+            ]),
+        };
+        let system_before = vec![
+            (
+                ManagedCliTool::Codex,
+                ToolProbe {
+                    version: Some("1.2.3".to_string()),
+                    source: Some(ManagedCliBinarySource::System),
+                    available: true,
+                },
+            ),
+            (
+                ManagedCliTool::CodexLiteLlm,
+                ToolProbe {
+                    version: Some("4.5.6".to_string()),
+                    source: Some(ManagedCliBinarySource::Managed),
+                    available: true,
+                },
+            ),
+        ];
+        let managed_before = vec![
+            (
+                ManagedCliTool::Codex,
+                ToolProbe {
+                    version: Some("1.2.3".to_string()),
+                    source: Some(ManagedCliBinarySource::Managed),
+                    available: true,
+                },
+            ),
+            (
+                ManagedCliTool::CodexLiteLlm,
+                ToolProbe {
+                    version: Some("4.5.6".to_string()),
+                    source: Some(ManagedCliBinarySource::Managed),
+                    available: true,
+                },
+            ),
+        ];
+        assert_eq!(
+            managed_cli_refresh_skip_remaining_ms(&system_before, &stale_state, now_ms, ttl_ms),
+            None
+        );
+        assert_eq!(
+            managed_cli_refresh_skip_remaining_ms(&managed_before, &stale_state, now_ms, ttl_ms),
+            None
+        );
     }
 }
 
@@ -572,33 +851,102 @@ pub(crate) fn ensure_local_managed_cli(tool: ManagedCliTool) -> Result<ManagedCl
 
 pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRefreshReport> {
     let paths = ManagedCliPaths::resolve()?;
+    let now_ms = current_time_ms();
+    let ttl_ms = managed_cli_refresh_ttl_ms();
     append_trace_event(
         &paths.home,
         "server",
         "managed_cli",
         "refresh_begin",
-        serde_json::json!({ "background": background }),
+        serde_json::json!({
+            "background": background,
+            "ttl_ms": ttl_ms,
+        }),
     );
     let perf = PerfSpan::start(&paths.home, "cli", "refresh_managed_codex");
     let tools = [ManagedCliTool::Codex, ManagedCliTool::CodexLiteLlm];
-    let before = tools
-        .into_iter()
-        .map(|tool| (tool, probe_tool(&paths, tool)))
-        .collect::<Vec<_>>();
+    let before = probe_tools(&paths, &tools);
+    record_managed_cli_probe_span(
+        &paths.home,
+        "refresh_managed_codex_probe",
+        &before,
+        "before",
+    );
 
+    let refresh_state = load_managed_cli_refresh_state(&paths.home);
     let npm_available = npm_binary().is_some();
     let mut install_error = None::<String>;
-    if npm_available {
+    let mut install_attempted = false;
+    let mut skipped_recently = false;
+    let mut ttl_remaining_ms = None::<u64>;
+    if background && npm_available {
+        ttl_remaining_ms =
+            managed_cli_refresh_skip_remaining_ms(&before, &refresh_state, now_ms, ttl_ms);
+        skipped_recently = ttl_remaining_ms.is_some();
+        if let Some(remaining_ms) = ttl_remaining_ms {
+            append_trace_event(
+                &paths.home,
+                "server",
+                "managed_cli",
+                "refresh_skip_recent",
+                serde_json::json!({
+                    "ttl_ms": ttl_ms,
+                    "ttl_remaining_ms": remaining_ms,
+                    "last_successful_refresh_ms": refresh_state.last_successful_refresh_ms,
+                }),
+            );
+        }
+    }
+    if npm_available && !skipped_recently {
+        install_attempted = true;
+        let install_perf = PerfSpan::start(&paths.home, "cli", "refresh_managed_codex_install");
         if let Err(error) = install_latest(&paths, &tools, background) {
             install_error = Some(error.to_string());
+        }
+        install_perf.finish(serde_json::json!({
+            "background": background,
+            "success": install_error.is_none(),
+            "tool_count": tools.len(),
+        }));
+    }
+    let after = if skipped_recently {
+        before.clone()
+    } else {
+        probe_tools(&paths, &tools)
+    };
+    record_managed_cli_probe_span(
+        &paths.home,
+        "refresh_managed_codex_post_probe",
+        &after,
+        "after",
+    );
+
+    if npm_available && install_error.is_none() && !skipped_recently {
+        let state = managed_cli_refresh_state_from_probes(&after, now_ms);
+        if let Err(error) = save_managed_cli_refresh_state(&paths.home, &state) {
+            append_trace_event(
+                &paths.home,
+                "server",
+                "managed_cli",
+                "refresh_state_write_error",
+                serde_json::json!({ "error": error.to_string() }),
+            );
         }
     }
 
     let statuses = before
         .into_iter()
-        .map(|(tool, before_probe)| {
-            let after_probe = probe_tool(&paths, tool);
-            if let Some(error) = install_error.as_ref() {
+        .zip(after)
+        .map(|((tool, before_probe), (_, after_probe))| {
+            if let Some(remaining_ms) = ttl_remaining_ms {
+                tool_status(
+                    tool,
+                    before_probe.clone(),
+                    after_probe,
+                    "skipped_recent",
+                    managed_cli_refresh_skip_detail(tool, remaining_ms, ttl_ms),
+                )
+            } else if let Some(error) = install_error.as_ref() {
                 tool_status(
                     tool,
                     before_probe,
@@ -655,7 +1003,11 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
 
     perf.finish(serde_json::json!({
         "background": background,
+        "ttl_ms": ttl_ms,
         "npm_available": npm_available,
+        "install_attempted": install_attempted,
+        "skipped_recently": skipped_recently,
+        "ttl_remaining_ms": ttl_remaining_ms,
         "statuses": statuses.iter().map(|status| serde_json::json!({
             "tool": status.binary_name.clone(),
             "changed": status.changed,
@@ -668,6 +1020,9 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
         scope: "local".to_string(),
         background,
         statuses,
+        skipped_recently,
+        ttl_remaining_ms,
+        install_attempted,
     };
     append_trace_event(
         &paths.home,
@@ -676,6 +1031,10 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
         "refresh_end",
         serde_json::json!({
             "background": background,
+            "ttl_ms": ttl_ms,
+            "install_attempted": install_attempted,
+            "skipped_recently": skipped_recently,
+            "ttl_remaining_ms": ttl_remaining_ms,
             "statuses": report.statuses.iter().map(|status| serde_json::json!({
                 "tool": status.binary_name.clone(),
                 "action": status.action.clone(),
@@ -691,6 +1050,10 @@ pub(crate) fn summarize_managed_cli_report(
     scope: &str,
     report: &ManagedCliRefreshReport,
 ) -> String {
+    if report.skipped_recently {
+        return format!("{scope}: managed Codex refresh still fresh");
+    }
+
     let changed = report
         .statuses
         .iter()

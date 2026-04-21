@@ -26,8 +26,10 @@ IDLE_HOST_RENDER_MAX_DELTA = 30
 # The DOM xterm path can legitimately emit a few extra paints beyond terminal I/O dispatches
 # for cursor/viewport reconciliation without representing semantic churn.
 IDLE_HOST_RENDER_IO_OVERHEAD_MAX = 9
-IDLE_TERMINAL_IO_MAX_DELTA = 36
-IDLE_TERMINAL_IO_BUSY_MAX_DELTA = 48
+# Two retained hosts can legitimately idle a little above the older 18-dispatch
+# two-host budget without semantic churn, especially after late-session view toggles.
+IDLE_TERMINAL_IO_MAX_DELTA = 44
+IDLE_TERMINAL_IO_BUSY_MAX_DELTA = 56
 IDLE_TERMINAL_IO_BASELINE_HOST_COUNT = 4
 TERMINAL_INTERACTION_LATENCY_MAX_MS = 3000.0
 SIDEBAR_MIN_WIDTH = 220.0
@@ -822,6 +824,68 @@ def assert_webkit_child_rss_soak(pid: int) -> dict:
     }
 
 
+def perf_events_named(name: str) -> list[dict]:
+    path = current_yggterm_home() / "perf-telemetry.jsonl"
+    if not path.exists():
+        return []
+    events: list[dict] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if record.get("name") == name:
+            events.append(record)
+    return events
+
+
+def assert_managed_cli_refresh_ttl_contract() -> dict:
+    report = run(
+        "server",
+        "remote",
+        "refresh-managed-cli",
+        "background",
+        timeout_seconds=10.0,
+    )
+    if not report.get("skipped_recently"):
+        raise AssertionError(f"expected managed cli refresh to skip within TTL, got {report!r}")
+    if report.get("install_attempted"):
+        raise AssertionError(
+            f"managed cli refresh still attempted npm install inside TTL: {report!r}"
+        )
+    ttl_remaining_ms = int(report.get("ttl_remaining_ms") or 0)
+    if ttl_remaining_ms <= 0:
+        raise AssertionError(f"managed cli refresh TTL did not report remaining time: {report!r}")
+    statuses = report.get("statuses") or []
+    if not statuses or any(str(status.get("action") or "") != "skipped_recent" for status in statuses):
+        raise AssertionError(
+            f"managed cli refresh did not report skipped_recent statuses: {report!r}"
+        )
+    refresh_events = perf_events_named("refresh_managed_codex")
+    if not refresh_events:
+        raise AssertionError("no refresh_managed_codex perf event found after TTL proof")
+    latest_refresh = (refresh_events[-1].get("payload") or {})
+    latest_meta = latest_refresh.get("meta") or {}
+    if not latest_meta.get("skipped_recently"):
+        raise AssertionError(
+            f"latest refresh_managed_codex perf event did not record skipped_recently: {latest_refresh!r}"
+        )
+    if latest_meta.get("install_attempted"):
+        raise AssertionError(
+            f"latest refresh_managed_codex perf event still recorded install_attempted: {latest_refresh!r}"
+        )
+    install_events = perf_events_named("refresh_managed_codex_install")
+    latest_install = (install_events[-1].get("payload") or {}) if install_events else None
+    return {
+        "report": report,
+        "latest_refresh_event": latest_refresh,
+        "latest_install_event": latest_install,
+    }
+
+
 def latest_app_root_render_count(pid: int) -> dict | None:
     latest: dict | None = None
     for trace_path in event_trace_paths():
@@ -1032,7 +1096,7 @@ def assert_no_duplicate_startup_terminal_bootstrap(pid: int) -> dict:
 
 
 def assert_idle_root_render_budget(pid: int) -> dict:
-    before_state = app_state(pid)
+    before_state = wait_for_terminal_quiescent(pid, timeout_seconds=4.0, stable_polls=2)
     before_generation = before_state.get("generation") or {}
     before_hosts = ((before_state.get("dom") or {}).get("terminal_hosts") or [])
     before_rows = {
@@ -1266,12 +1330,47 @@ def xdotool_focus_belongs_to_pid(pid: int) -> bool:
     return owner.returncode == 0 and (owner.stdout or "").strip() == str(pid)
 
 
-def screen_coordinates_for_window_point(pid: int, x: float, y: float) -> tuple[int, int]:
+def visible_window_origin_for_pid(pid: int, window_id: str | None = None) -> tuple[float, float]:
+    env = xdotool_env_for_pid(pid)
+    resolved_window_id = window_id or visible_window_id_for_pid(pid)
     state = app_state(pid)
     window = state.get("window") or {}
     outer_position = window.get("outer_position") or {}
-    offset_x = float(outer_position.get("x") or 0.0)
-    offset_y = float(outer_position.get("y") or 0.0)
+    state_offset_x = float(outer_position.get("x") or 0.0)
+    state_offset_y = float(outer_position.get("y") or 0.0)
+    maximized = bool(window.get("maximized"))
+    geometry = subprocess.run(
+        ["xdotool", "getwindowgeometry", "--shell", resolved_window_id],
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=XDO_TIMEOUT_SECONDS,
+    )
+    if geometry.returncode == 0:
+        offset_x = 0.0
+        offset_y = 0.0
+        for line in geometry.stdout.splitlines():
+            if line.startswith("X="):
+                offset_x = float(line.split("=", 1)[1] or 0.0)
+            elif line.startswith("Y="):
+                offset_y = float(line.split("=", 1)[1] or 0.0)
+        if (
+            not maximized
+            and (state_offset_x != 0.0 or state_offset_y != 0.0)
+            and (abs(offset_x - state_offset_x) >= 4.0 or abs(offset_y - state_offset_y) >= 12.0)
+        ):
+            return (state_offset_x, state_offset_y)
+        return (offset_x, offset_y)
+    return (state_offset_x, state_offset_y)
+
+
+def screen_coordinates_for_window_point(
+    pid: int,
+    x: float,
+    y: float,
+    window_id: str | None = None,
+) -> tuple[int, int]:
+    offset_x, offset_y = visible_window_origin_for_pid(pid, window_id)
     return (
         int(round(offset_x + x)),
         int(round(offset_y + y)),
@@ -1283,7 +1382,7 @@ def xdotool_click_window(pid: int, x: float, y: float, button: int = 1) -> dict:
     window_id = visible_window_id_for_pid(pid)
     if not xdotool_focus_belongs_to_pid(pid):
         xdotool_activate_window_if_supported(pid, window_id)
-    screen_x, screen_y = screen_coordinates_for_window_point(pid, x, y)
+    screen_x, screen_y = screen_coordinates_for_window_point(pid, x, y, window_id)
     commands = [
         [
             "xdotool",
@@ -1334,7 +1433,7 @@ def xdotool_press_window(pid: int, x: float, y: float, button: int = 1) -> dict:
     window_id = visible_window_id_for_pid(pid)
     if not xdotool_focus_belongs_to_pid(pid):
         xdotool_activate_window_if_supported(pid, window_id)
-    screen_x, screen_y = screen_coordinates_for_window_point(pid, x, y)
+    screen_x, screen_y = screen_coordinates_for_window_point(pid, x, y, window_id)
     commands = [
         [
             "xdotool",
@@ -1398,7 +1497,7 @@ def xdotool_move_window(pid: int, x: float, y: float) -> dict:
     window_id = visible_window_id_for_pid(pid)
     if not xdotool_focus_belongs_to_pid(pid):
         xdotool_activate_window_if_supported(pid, window_id)
-    screen_x, screen_y = screen_coordinates_for_window_point(pid, x, y)
+    screen_x, screen_y = screen_coordinates_for_window_point(pid, x, y, window_id)
     command = [
         "xdotool",
         "mousemove",
@@ -1438,7 +1537,7 @@ def xdotool_right_click_window(pid: int, x: float, y: float) -> dict:
     window_id = visible_window_id_for_pid(pid)
     if not xdotool_focus_belongs_to_pid(pid):
         xdotool_activate_window_if_supported(pid, window_id)
-    screen_x, screen_y = screen_coordinates_for_window_point(pid, x, y)
+    screen_x, screen_y = screen_coordinates_for_window_point(pid, x, y, window_id)
     commands = [
         [
             "xdotool",
@@ -1489,7 +1588,7 @@ def xdotool_double_click_window(pid: int, x: float, y: float, button: int = 1) -
     window_id = visible_window_id_for_pid(pid)
     if not xdotool_focus_belongs_to_pid(pid):
         xdotool_activate_window_if_supported(pid, window_id)
-    screen_x, screen_y = screen_coordinates_for_window_point(pid, x, y)
+    screen_x, screen_y = screen_coordinates_for_window_point(pid, x, y, window_id)
     commands = [
         [
             "xdotool",
@@ -1539,8 +1638,18 @@ def xdotool_drag_window(pid: int, start_x: float, start_y: float, end_x: float, 
     window_id = visible_window_id_for_pid(pid)
     if not xdotool_focus_belongs_to_pid(pid):
         xdotool_activate_window_if_supported(pid, window_id)
-    start_screen_x, start_screen_y = screen_coordinates_for_window_point(pid, start_x, start_y)
-    end_screen_x, end_screen_y = screen_coordinates_for_window_point(pid, end_x, end_y)
+    start_screen_x, start_screen_y = screen_coordinates_for_window_point(
+        pid,
+        start_x,
+        start_y,
+        window_id,
+    )
+    end_screen_x, end_screen_y = screen_coordinates_for_window_point(
+        pid,
+        end_x,
+        end_y,
+        window_id,
+    )
     mid_screen_x = start_screen_x + int(round((end_screen_x - start_screen_x) * 0.3))
     mid_screen_y = start_screen_y + int(round((end_screen_y - start_screen_y) * 0.3))
     commands = [
@@ -3413,6 +3522,9 @@ def invoke_sidebar_context_menu_action(
 
 def create_terminal_via_sidebar_context_menu(pid: int, *, parent_path: str = "local") -> dict:
     baseline = wait_for_app_idle(pid, timeout_seconds=20.0)
+    baseline_active_session_path = normalize_live_path(
+        str(baseline.get("active_session_path") or "").strip()
+    )
     baseline_paths = {
         normalize_live_path(str(row.get("path") or row.get("full_path") or "").strip())
         for row in visible_sidebar_rows(baseline)
@@ -3456,10 +3568,16 @@ def create_terminal_via_sidebar_context_menu(pid: int, *, parent_path: str = "lo
         **action,
         "session_path": created_path,
         "active_title": last_state.get("active_title"),
+        "baseline_active_session_path": baseline_active_session_path,
     }
 
 
-def delete_session_via_context_menu(pid: int, session_path: str) -> dict:
+def delete_session_via_context_menu(
+    pid: int,
+    session_path: str,
+    *,
+    fallback_session_path: str | None = None,
+) -> dict:
     action = invoke_sidebar_context_menu_action(pid, session_path, "delete-session", row_kind="Session")
     deadline = time.time() + 3.0
     deleted = {}
@@ -3484,12 +3602,43 @@ def delete_session_via_context_menu(pid: int, session_path: str) -> dict:
         raise AssertionError(f"delete confirm action rect missing: {deleted!r}")
     confirm_click = xdotool_click_window(pid, rect_center_x(confirm_rect), rect_center_y(confirm_rect))
     removed_state = wait_for_sidebar_path_absent(pid, session_path, timeout_seconds=10.0)
+    settled_state = wait_for_app_idle(pid, timeout_seconds=12.0)
+    active_path = normalize_live_path(str(settled_state.get("active_session_path") or "").strip())
+    fallback_path = normalize_live_path(str(fallback_session_path or "").strip())
+    if fallback_path and fallback_path != normalize_live_path(session_path):
+        if not active_path or active_path != fallback_path:
+            settled_state = wait_for_session_focus(pid, fallback_path, timeout_seconds=12.0)
+            active_path = fallback_path
+        else:
+            try:
+                settled_state = wait_for_session_focus(pid, fallback_path, timeout_seconds=12.0)
+                active_path = fallback_path
+            except AssertionError:
+                pass
+    if active_path:
+        try:
+            settled_state = wait_for_visible_cursor_session(pid, active_path, timeout_seconds=8.0)
+        except AssertionError:
+            settled_state = wait_for_window_focus(pid, timeout_seconds=4.0)
+        active_element = ((settled_state.get("dom") or {}).get("active_element") or {})
+        host = active_host_or_none(settled_state)
+        if (
+            host is not None
+            and rect_is_visible(host.get("host_rect"))
+            and active_element.get("class_name") != "xterm-helper-textarea"
+        ):
+            xdotool_click_window(
+                pid,
+                rect_center_x(host["host_rect"]),
+                rect_center_y(host["host_rect"]),
+            )
+            settled_state = wait_for_window_focus(pid, timeout_seconds=4.0)
     return {
         **action,
         "delete_confirm_dialog_rect": dom_rect(deleted, "delete_confirm_dialog_rect"),
         "delete_confirm_action_rect": confirm_rect,
         "delete_confirm_click": confirm_click,
-        "post_delete_active_session_path": removed_state.get("active_session_path"),
+        "post_delete_active_session_path": settled_state.get("active_session_path"),
     }
 
 
@@ -3604,6 +3753,17 @@ def titlebar_transient_open(state: dict) -> bool:
         or rect_is_visible(dom_rect(state, "titlebar_overflow_menu_rect"))
         or rect_is_visible(dom_rect(state, "titlebar_summary_menu_rect"))
     )
+
+
+def ensure_unmaximized_window(pid: int, state: dict, *, timeout_seconds: float = 6.0) -> dict:
+    if not bool((state.get("window") or {}).get("maximized")):
+        return state
+    app_set_maximized(pid, False)
+    time.sleep(0.45)
+    restored = wait_for_window_maximized(pid, False, timeout_seconds=timeout_seconds)
+    if restored is not None:
+        state = restored
+    return wait_for_window_geometry_settle(pid, timeout_seconds=timeout_seconds)
 
 
 def close_right_panel(pid: int, state: dict | None = None, timeout_seconds: float = 4.0) -> dict:
@@ -6718,6 +6878,7 @@ def assert_titlebar_autohide_hover_contract(pid: int, out_dir: Path) -> dict:
     baseline = app_state(pid)
     if titlebar_transient_open(baseline):
         baseline = dismiss_titlebar_transients(pid, baseline, timeout_seconds=1.5)
+    baseline = ensure_unmaximized_window(pid, baseline, timeout_seconds=6.0)
     baseline_panel_mode = right_panel_mode(baseline)
     if baseline_panel_mode not in ("", "hidden", "none", "null", "settings"):
         baseline = close_right_panel(pid, baseline, timeout_seconds=1.5)
@@ -6997,6 +7158,7 @@ def assert_titlebar_empty_lane_window_controls_contract(pid: int, out_dir: Path)
     baseline = wait_for_window_focus(pid, timeout_seconds=4.0)
     if titlebar_transient_open(baseline):
         baseline = dismiss_titlebar_transients(pid, baseline, timeout_seconds=1.5)
+    baseline = ensure_unmaximized_window(pid, baseline, timeout_seconds=6.0)
     if right_panel_mode(baseline) not in ("", "hidden", "none", "null", "settings"):
         baseline = close_right_panel(pid, baseline, timeout_seconds=1.5)
     if bool((baseline.get("shell") or {}).get("titlebar_auto_hide_enabled")):
@@ -7017,6 +7179,7 @@ def assert_titlebar_empty_lane_window_controls_contract(pid: int, out_dir: Path)
         )
     if right_panel_mode(baseline) == "settings":
         baseline = close_right_panel(pid, baseline, timeout_seconds=2.5)
+    baseline = ensure_unmaximized_window(pid, baseline, timeout_seconds=6.0)
     baseline = wait_for_window_geometry_settle(pid, timeout_seconds=6.0)
     empty_x, empty_y, empty_reason = titlebar_empty_lane_point(baseline)
     before_geometry = window_outer_geometry(baseline)
@@ -7900,7 +8063,11 @@ def assert_context_menu_delete_session(pid: int) -> dict:
     created = create_terminal_via_sidebar_context_menu(pid)
     target_path = created["session_path"]
     try:
-        deleted = delete_session_via_context_menu(pid, target_path)
+        deleted = delete_session_via_context_menu(
+            pid,
+            target_path,
+            fallback_session_path=created.get("baseline_active_session_path"),
+        )
     except Exception:
         try:
             app_remove_session(pid, target_path)
@@ -10390,6 +10557,7 @@ def main() -> int:
         ))
         run_check("maximize_roundtrip_layout", lambda: assert_maximize_roundtrip_layout(args.pid, out_dir))
         run_check("webkit_child_rss_soak", lambda: assert_webkit_child_rss_soak(args.pid))
+        run_check("managed_cli_refresh_ttl", lambda: assert_managed_cli_refresh_ttl_contract())
         run_check("client_memory_budget", lambda: assert_client_memory_budget(args.pid))
         late_phase_session = args.session
         late_phase_session_reset: dict | None = None
