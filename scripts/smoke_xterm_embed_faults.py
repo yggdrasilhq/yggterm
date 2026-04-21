@@ -14,7 +14,7 @@ from PIL import Image, ImageStat
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BIN = ROOT / "target" / "debug" / "yggterm"
+BIN = Path(os.environ.get("YGGTERM_BIN") or (ROOT / "target" / "debug" / "yggterm"))
 ENV = os.environ.copy()
 XDO_TIMEOUT_SECONDS = 4.0
 PERF_TELEMETRY_MAX_BYTES = 16 * 1024 * 1024
@@ -39,6 +39,7 @@ TITLEBAR_VISIBLE_MIN_HEIGHT_PX = 28.0
 TITLEBAR_EMPTY_LANE_MIN_WIDTH_PX = 18.0
 TITLEBAR_PLUS_SESSION_GAP_MIN_PX = 4.0
 TITLEBAR_PLUS_SESSION_GAP_MAX_PX = 18.0
+TITLEBAR_AUTOHIDE_CONTENT_BALANCE_MAX_PX = 1.5
 RIGHT_PANEL_EXIT_ANIMATION_SAMPLE_SECONDS = 0.09
 RIGHT_PANEL_EXIT_ANIMATION_SETTLE_SECONDS = 0.36
 WINDOW_SETTLE_MIN_WIDTH_PX = 1100
@@ -52,6 +53,27 @@ WEBKIT_CHILD_RSS_SETTLE_SECONDS = 0.9
 LAST_SEARCH_FOCUS_OVERLAY_CONTRACT: dict | None = None
 LAST_TITLEBAR_NEW_MENU_SHELL_CONTRACT: dict | None = None
 LAST_TITLEBAR_SESSION_SHELL_CONTRACT: dict | None = None
+POINTER_DRIVER = (ENV.get("YGGTERM_POINTER_DRIVER") or "xdotool").strip().lower()
+KEY_DRIVER = (ENV.get("YGGTERM_KEY_DRIVER") or POINTER_DRIVER or "xdotool").strip().lower()
+AVOID_FOREGROUND = (ENV.get("YGGTERM_SMOKE_AVOID_FOREGROUND") or "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+PROBLEM_NOTIFICATION_MARKERS = (
+    "connection refused",
+    "no such file or directory",
+    "server unavailable",
+    "daemon did not become reachable",
+    "local yggterm daemon",
+    "reading daemon response",
+    "parsing daemon response",
+    "timed out waiting for app control response",
+    "failed sock",
+    "sock connection",
+    ".sock",
+)
 
 
 def event_trace_paths() -> list[Path]:
@@ -102,6 +124,69 @@ def run_timed(*args: str, check: bool = True, timeout_seconds: float = 20.0) -> 
     return response, elapsed_ms
 
 
+def app_pointer_command(pid: int, action: str, **kwargs) -> dict:
+    args = [
+        "server",
+        "app",
+        "pointer",
+        action,
+        "--pid",
+        str(pid),
+        "--timeout-ms",
+        "8000",
+    ]
+    for key, value in kwargs.items():
+        if value is None:
+            continue
+        flag = f"--{key.replace('_', '-')}"
+        args.extend([flag, str(value)])
+    payload = run(*args)
+    return (payload.get("data") or payload) if isinstance(payload, dict) else {}
+
+
+def app_key_command(pid: int, action: str, *keys: str, text: str | None = None) -> dict:
+    args = [
+        "server",
+        "app",
+        "key",
+        action,
+        "--pid",
+        str(pid),
+        "--timeout-ms",
+        "8000",
+    ]
+    if text is not None:
+        args.extend(["--text", text])
+    args.extend(keys)
+    payload = run(*args)
+    return (payload.get("data") or payload) if isinstance(payload, dict) else {}
+
+
+def app_move_window_by(pid: int, delta_x: float, delta_y: float) -> dict:
+    payload = run(
+        "server",
+        "app",
+        "move-window",
+        "--pid",
+        str(pid),
+        "--delta-x",
+        str(delta_x),
+        "--delta-y",
+        str(delta_y),
+        "--timeout-ms",
+        "8000",
+    )
+    return (payload.get("data") or payload) if isinstance(payload, dict) else {}
+
+
+def app_pointer_button_name(button: int) -> str:
+    return {
+        1: "primary",
+        2: "middle",
+        3: "secondary",
+    }.get(int(button), "primary")
+
+
 def app_state(pid: int, timeout_ms: int = 20000, retries: int = 2) -> dict:
     last_error = None
     for attempt in range(retries + 1):
@@ -132,6 +217,15 @@ def viewport_state(state: dict) -> dict:
 
 
 def app_focus(pid: int) -> dict:
+    if AVOID_FOREGROUND:
+        state = app_state(pid)
+        return {
+            "data": {
+                "skipped": True,
+                "reason": "avoid_foreground",
+                "window": state.get("window") or {},
+            }
+        }
     return run("server", "app", "focus", "--pid", str(pid), "--timeout-ms", "8000")
 
 
@@ -842,7 +936,67 @@ def perf_events_named(name: str) -> list[dict]:
     return events
 
 
+def assert_managed_cli_initial_install_deferred_contract() -> dict:
+    report = run(
+        "server",
+        "remote",
+        "refresh-managed-cli",
+        "background",
+        timeout_seconds=10.0,
+    )
+    if report.get("install_attempted"):
+        raise AssertionError(
+            f"managed cli background refresh still attempted the first install: {report!r}"
+        )
+    if not report.get("install_deferred"):
+        raise AssertionError(
+            f"managed cli background refresh did not defer the first install: {report!r}"
+        )
+    statuses = report.get("statuses") or []
+    if not statuses or any(str(status.get("action") or "") != "deferred_install" for status in statuses):
+        raise AssertionError(
+            f"managed cli initial install defer did not report deferred_install statuses: {report!r}"
+        )
+    refresh_events = perf_events_named("refresh_managed_codex")
+    if not refresh_events:
+        raise AssertionError("no refresh_managed_codex perf event found after cold background proof")
+    latest_refresh = (refresh_events[-1].get("payload") or {})
+    latest_meta = latest_refresh.get("meta") or {}
+    if latest_meta.get("install_attempted"):
+        raise AssertionError(
+            f"latest refresh_managed_codex perf event still recorded install_attempted: {latest_refresh!r}"
+        )
+    if not latest_meta.get("install_deferred"):
+        raise AssertionError(
+            f"latest refresh_managed_codex perf event did not record install_deferred: {latest_refresh!r}"
+        )
+    install_events = perf_events_named("refresh_managed_codex_install")
+    if install_events:
+        raise AssertionError(
+            f"unexpected refresh_managed_codex_install event before explicit tool use: {install_events[-1]!r}"
+        )
+    return {
+        "report": report,
+        "latest_refresh_event": latest_refresh,
+    }
+
+
 def assert_managed_cli_refresh_ttl_contract() -> dict:
+    install_report = run(
+        "server",
+        "remote",
+        "refresh-managed-cli",
+        "foreground",
+        timeout_seconds=120.0,
+    )
+    if not install_report.get("install_attempted"):
+        raise AssertionError(
+            f"expected foreground managed cli refresh to perform the install path, got {install_report!r}"
+        )
+    if install_report.get("install_deferred"):
+        raise AssertionError(
+            f"foreground managed cli refresh unexpectedly deferred the install: {install_report!r}"
+        )
     report = run(
         "server",
         "remote",
@@ -879,7 +1033,10 @@ def assert_managed_cli_refresh_ttl_contract() -> dict:
         )
     install_events = perf_events_named("refresh_managed_codex_install")
     latest_install = (install_events[-1].get("payload") or {}) if install_events else None
+    if latest_install is None:
+        raise AssertionError("no refresh_managed_codex_install perf event found after explicit install")
     return {
+        "install_report": install_report,
         "report": report,
         "latest_refresh_event": latest_refresh,
         "latest_install_event": latest_install,
@@ -1378,6 +1535,22 @@ def screen_coordinates_for_window_point(
 
 
 def xdotool_click_window(pid: int, x: float, y: float, button: int = 1) -> dict:
+    if POINTER_DRIVER == "app":
+        app_pointer_command(
+            pid,
+            "click",
+            x=x,
+            y=y,
+            button=app_pointer_button_name(button),
+        )
+        time.sleep(0.18)
+        return {
+            "window_id": "app",
+            "x": int(round(x)),
+            "y": int(round(y)),
+            "button": int(button),
+            "driver": "app",
+        }
     env = xdotool_env_for_pid(pid)
     window_id = visible_window_id_for_pid(pid)
     if not xdotool_focus_belongs_to_pid(pid):
@@ -1429,6 +1602,22 @@ def xdotool_click_window(pid: int, x: float, y: float, button: int = 1) -> dict:
 
 
 def xdotool_press_window(pid: int, x: float, y: float, button: int = 1) -> dict:
+    if POINTER_DRIVER == "app":
+        app_pointer_command(
+            pid,
+            "press",
+            x=x,
+            y=y,
+            button=app_pointer_button_name(button),
+        )
+        time.sleep(0.08)
+        return {
+            "window_id": "app",
+            "x": int(round(x)),
+            "y": int(round(y)),
+            "button": int(button),
+            "driver": "app",
+        }
     env = xdotool_env_for_pid(pid)
     window_id = visible_window_id_for_pid(pid)
     if not xdotool_focus_belongs_to_pid(pid):
@@ -1478,6 +1667,18 @@ def xdotool_press_window(pid: int, x: float, y: float, button: int = 1) -> dict:
 
 
 def xdotool_release_button(pid: int, button: int = 1) -> dict:
+    if POINTER_DRIVER == "app":
+        app_pointer_command(
+            pid,
+            "release",
+            button=app_pointer_button_name(button),
+        )
+        time.sleep(0.08)
+        return {
+            "window_id": "app",
+            "button": int(button),
+            "driver": "app",
+        }
     env = xdotool_env_for_pid(pid)
     proc = subprocess.run(
         ["xdotool", "mouseup", str(button)],
@@ -1493,6 +1694,15 @@ def xdotool_release_button(pid: int, button: int = 1) -> dict:
 
 
 def xdotool_move_window(pid: int, x: float, y: float) -> dict:
+    if POINTER_DRIVER == "app":
+        app_pointer_command(pid, "move", x=x, y=y)
+        time.sleep(0.08)
+        return {
+            "window_id": "app",
+            "x": int(round(x)),
+            "y": int(round(y)),
+            "driver": "app",
+        }
     env = xdotool_env_for_pid(pid)
     window_id = visible_window_id_for_pid(pid)
     if not xdotool_focus_belongs_to_pid(pid):
@@ -1533,6 +1743,16 @@ def xdotool_move_window(pid: int, x: float, y: float) -> dict:
 
 
 def xdotool_right_click_window(pid: int, x: float, y: float) -> dict:
+    if POINTER_DRIVER == "app":
+        app_pointer_command(pid, "click", x=x, y=y, button="secondary")
+        time.sleep(0.18)
+        return {
+            "window_id": "app",
+            "x": int(round(x)),
+            "y": int(round(y)),
+            "button": 3,
+            "driver": "app",
+        }
     env = xdotool_env_for_pid(pid)
     window_id = visible_window_id_for_pid(pid)
     if not xdotool_focus_belongs_to_pid(pid):
@@ -1584,6 +1804,23 @@ def xdotool_right_click_window(pid: int, x: float, y: float) -> dict:
 
 
 def xdotool_double_click_window(pid: int, x: float, y: float, button: int = 1) -> dict:
+    if POINTER_DRIVER == "app":
+        app_pointer_command(
+            pid,
+            "double-click",
+            x=x,
+            y=y,
+            button=app_pointer_button_name(button),
+            count=2,
+        )
+        time.sleep(0.22)
+        return {
+            "window_id": "app",
+            "x": int(round(x)),
+            "y": int(round(y)),
+            "button": int(button),
+            "driver": "app",
+        }
     env = xdotool_env_for_pid(pid)
     window_id = visible_window_id_for_pid(pid)
     if not xdotool_focus_belongs_to_pid(pid):
@@ -1634,6 +1871,25 @@ def xdotool_double_click_window(pid: int, x: float, y: float, button: int = 1) -
 
 
 def xdotool_drag_window(pid: int, start_x: float, start_y: float, end_x: float, end_y: float) -> dict:
+    if POINTER_DRIVER == "app":
+        app_pointer_command(
+            pid,
+            "drag",
+            start_x=start_x,
+            start_y=start_y,
+            end_x=end_x,
+            end_y=end_y,
+            button="primary",
+            steps=4,
+            step_delay_ms=28,
+        )
+        time.sleep(0.34)
+        return {
+            "window_id": "app",
+            "start": {"x": int(round(start_x)), "y": int(round(start_y))},
+            "end": {"x": int(round(end_x)), "y": int(round(end_y))},
+            "driver": "app",
+        }
     env = xdotool_env_for_pid(pid)
     window_id = visible_window_id_for_pid(pid)
     if not xdotool_focus_belongs_to_pid(pid):
@@ -1715,7 +1971,31 @@ def xdotool_drag_window(pid: int, start_x: float, start_y: float, end_x: float, 
     }
 
 
+def titlebar_drag_window(pid: int, start_x: float, start_y: float, end_x: float, end_y: float) -> dict:
+    if POINTER_DRIVER == "app":
+        move = app_move_window_by(pid, end_x - start_x, end_y - start_y)
+        time.sleep(0.34)
+        return {
+            "window_id": "app",
+            "start": {"x": int(round(start_x)), "y": int(round(start_y))},
+            "end": {"x": int(round(end_x)), "y": int(round(end_y))},
+            "driver": "app-window",
+            "move": move,
+        }
+    drag = xdotool_drag_window(pid, start_x, start_y, end_x, end_y)
+    drag["driver"] = "xdotool"
+    return drag
+
+
 def xdotool_key_window(pid: int, *keys: str) -> dict:
+    if KEY_DRIVER == "app":
+        app_key_command(pid, "press", *keys)
+        time.sleep(0.12)
+        return {
+            "window_id": "app",
+            "keys": list(keys),
+            "driver": "app",
+        }
     env = xdotool_env_for_pid(pid)
     window_id = visible_window_id_for_pid(pid)
     if not xdotool_focus_belongs_to_pid(pid):
@@ -1737,6 +2017,14 @@ def xdotool_key_window(pid: int, *keys: str) -> dict:
 
 
 def xdotool_key_focused(pid: int, *keys: str) -> dict:
+    if KEY_DRIVER == "app":
+        app_key_command(pid, "press", *keys)
+        time.sleep(0.12)
+        return {
+            "window_id": "app",
+            "keys": list(keys),
+            "driver": "app",
+        }
     env = xdotool_env_for_pid(pid)
     window_id = visible_window_id_for_pid(pid)
     if not xdotool_focus_belongs_to_pid(pid):
@@ -1758,6 +2046,14 @@ def xdotool_key_focused(pid: int, *keys: str) -> dict:
 
 
 def xdotool_type_window(pid: int, text: str) -> dict:
+    if KEY_DRIVER == "app":
+        app_key_command(pid, "type", text=text)
+        time.sleep(0.12)
+        return {
+            "window_id": "app",
+            "text": text,
+            "driver": "app",
+        }
     env = xdotool_env_for_pid(pid)
     window_id = visible_window_id_for_pid(pid)
     if not xdotool_focus_belongs_to_pid(pid):
@@ -1779,6 +2075,14 @@ def xdotool_type_window(pid: int, text: str) -> dict:
 
 
 def xdotool_type_focused(pid: int, text: str) -> dict:
+    if KEY_DRIVER == "app":
+        app_key_command(pid, "type", text=text)
+        time.sleep(0.12)
+        return {
+            "window_id": "app",
+            "text": text,
+            "driver": "app",
+        }
     env = xdotool_env_for_pid(pid)
     window_id = visible_window_id_for_pid(pid)
     if not xdotool_focus_belongs_to_pid(pid):
@@ -2151,6 +2455,27 @@ def parse_css_rgb(value: str) -> tuple[float, float, float] | None:
             if alpha <= 0.0:
                 return None
             return tuple(int(part) / 255.0 for part in parts[:3])  # type: ignore[return-value]
+    return None
+
+
+def parse_css_alpha(value: str | None) -> float | None:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    if text == "transparent":
+        return 0.0
+    if text.startswith("#"):
+        return 1.0
+    if text.startswith("rgb(") and text.endswith(")"):
+        return 1.0
+    if text.startswith("rgba(") and text.endswith(")"):
+        parts = [part.strip() for part in text[5:-1].split(",")]
+        if len(parts) != 4:
+            return None
+        try:
+            return float(parts[3])
+        except ValueError:
+            return None
     return None
 
 
@@ -3693,6 +4018,36 @@ def rect_right(rect: dict) -> float:
     return float(rect.get("left") or 0.0) + float(rect.get("width") or 0.0)
 
 
+def visible_shell_content_rects(state: dict) -> list[tuple[str, dict]]:
+    rects: list[tuple[str, dict]] = []
+    for key in ("sidebar_rect", "main_surface_rect", "right_side_rail_rect"):
+        rect = dom_rect(state, key)
+        if rect_is_visible(rect):
+            rects.append((key, rect))
+    return rects
+
+
+def shell_content_vertical_balance(state: dict) -> dict:
+    dom = state.get("dom") or {}
+    window_height = float(dom.get("window_inner_height") or 0.0)
+    if window_height <= 0:
+        raise AssertionError(f"window inner height missing from app state: {state!r}")
+    rects = visible_shell_content_rects(state)
+    if not rects:
+        raise AssertionError(f"shell content rects missing from app state: {state!r}")
+    top_edge = min(float(rect.get("top") or 0.0) for _, rect in rects)
+    bottom_edge = max(rect_bottom(rect) for _, rect in rects)
+    top_gap = top_edge
+    bottom_gap = window_height - bottom_edge
+    return {
+        "window_inner_height": window_height,
+        "top_gap": top_gap,
+        "bottom_gap": bottom_gap,
+        "gap_delta": abs(top_gap - bottom_gap),
+        "rects": {name: rect for name, rect in rects},
+    }
+
+
 def window_outer_geometry(state: dict) -> tuple[int, int, int, int]:
     window = state.get("window") or {}
     outer_position = window.get("outer_position") or {}
@@ -4003,6 +4358,40 @@ def visible_notifications(state: dict) -> list[dict]:
     return []
 
 
+def problem_notifications(state: dict) -> list[dict]:
+    shell = state.get("shell") or {}
+    notifications = []
+    history = shell.get("notifications")
+    if isinstance(history, list):
+        notifications.extend(history)
+    visible = shell.get("visible_notifications")
+    if isinstance(visible, list):
+        notifications.extend(visible)
+    bad = []
+    seen = set()
+    for notification in notifications:
+        if not isinstance(notification, dict):
+            continue
+        identifier = notification.get("id")
+        if identifier in seen:
+            continue
+        seen.add(identifier)
+        haystack = " ".join(
+            str(notification.get(key) or "")
+            for key in ("title", "message", "tone")
+        ).lower()
+        if any(marker in haystack for marker in PROBLEM_NOTIFICATION_MARKERS):
+            bad.append(notification)
+    return bad
+
+
+def assert_no_problem_notifications(state: dict, *, context: str) -> dict:
+    bad = problem_notifications(state)
+    if bad:
+        raise AssertionError(f"{context}: bad daemon/socket notifications observed: {bad!r}")
+    return {"context": context, "bad_notification_count": 0}
+
+
 def wait_for_interactive(pid: int, timeout_seconds: float = 20.0) -> dict:
     deadline = time.time() + timeout_seconds
     last_state = {}
@@ -4163,6 +4552,8 @@ def wait_for_notifications_clear(pid: int, timeout_seconds: float = 6.0) -> dict
 
 
 def wait_for_window_focus(pid: int, timeout_seconds: float = 3.0) -> dict:
+    if AVOID_FOREGROUND:
+        return app_state(pid)
     deadline = time.time() + timeout_seconds
     last_state = {}
     last_focus_attempt = 0.0
@@ -5371,6 +5762,43 @@ def assert_titlebar_new_menu_shell_contract(pid: int) -> dict:
         "hovered_seam_mismatch_pixels": hovered_mismatch_pixels,
     }
     LAST_TITLEBAR_NEW_MENU_SHELL_CONTRACT = result
+    return result
+
+
+def assert_background_blur_contract(pid: int) -> dict:
+    state = wait_for_interactive(pid, timeout_seconds=10.0)
+    dom = state.get("dom") or {}
+    shell = state.get("shell") or {}
+    live_blur_supported = bool(shell.get("live_blur_supported"))
+    transparent_window = bool(shell.get("transparent_window"))
+    profile_reason = str(shell.get("transparent_window_profile_reason") or "")
+    shell_frame_backdrop = str(dom.get("shell_frame_backdrop_filter") or "").strip().lower()
+    shell_root_backdrop = str(dom.get("shell_root_backdrop_filter") or "").strip().lower()
+    shell_frame_background = str(dom.get("shell_frame_background") or "").strip()
+    shell_root_background = str(dom.get("shell_root_background") or "").strip()
+    shell_fill_alpha = parse_css_alpha(shell_frame_background)
+    if shell_fill_alpha is None:
+        shell_fill_alpha = parse_css_alpha(shell_root_background)
+    blur_expected = live_blur_supported and transparent_window
+    active_filter = shell_frame_backdrop or shell_root_backdrop
+    result = {
+        "live_blur_supported": live_blur_supported,
+        "transparent_window": transparent_window,
+        "profile_reason": profile_reason,
+        "shell_frame_backdrop_filter": shell_frame_backdrop,
+        "shell_root_backdrop_filter": shell_root_backdrop,
+        "shell_frame_background": shell_frame_background,
+        "shell_root_background": shell_root_background,
+        "shell_fill_alpha": shell_fill_alpha,
+    }
+    if blur_expected:
+        if active_filter in ("", "none"):
+            raise AssertionError(f"expected live shell blur, but computed backdrop filter is absent: {result!r}")
+        if shell_fill_alpha is not None and shell_fill_alpha >= 0.97:
+            raise AssertionError(f"expected translucent shell fill on blur-capable backend: {result!r}")
+    else:
+        if active_filter not in ("", "none"):
+            raise AssertionError(f"unexpected live shell blur on opaque/safe backend: {result!r}")
     return result
 
 
@@ -6932,6 +7360,12 @@ def assert_titlebar_autohide_hover_contract(pid: int, out_dir: Path) -> dict:
         raise AssertionError(
             f"titlebar auto-hide collapse left too much height instead of the hover strip: rect={collapsed_rect!r}"
         )
+    collapsed_balance = shell_content_vertical_balance(collapsed)
+    if collapsed_balance["gap_delta"] > TITLEBAR_AUTOHIDE_CONTENT_BALANCE_MAX_PX:
+        raise AssertionError(
+            "titlebar auto-hide collapse still biases the shell content vertically instead of overlaying it: "
+            f"balance={collapsed_balance!r}"
+        )
     app_screenshot(pid, out_dir / "titlebar-autohide-collapsed.png")
     hover_y = float(collapsed_rect["top"]) + min(
         max(1.0, float(collapsed_rect["height"]) / 2.0),
@@ -7029,7 +7463,7 @@ def assert_titlebar_autohide_hover_contract(pid: int, out_dir: Path) -> dict:
         restored_drag_reason,
     ) = titlebar_empty_lane_point(revealed)
     drag_before = window_outer_geometry(revealed)
-    reveal_drag = xdotool_drag_window(
+    reveal_drag = titlebar_drag_window(
         pid,
         restored_drag_x,
         restored_drag_y,
@@ -7045,7 +7479,7 @@ def assert_titlebar_autohide_hover_contract(pid: int, out_dir: Path) -> dict:
             f"point={restored_drag_reason} before={drag_before!r} after={drag_after!r} drag={reveal_drag!r}"
         )
     dragged_point_x, dragged_point_y, _ = titlebar_empty_lane_point(dragged)
-    reveal_drag_restore = xdotool_drag_window(
+    reveal_drag_restore = titlebar_drag_window(
         pid,
         dragged_point_x,
         dragged_point_y,
@@ -7125,6 +7559,7 @@ def assert_titlebar_autohide_hover_contract(pid: int, out_dir: Path) -> dict:
         "enable_click": enable_click,
         "collapse_move": collapse_move,
         "collapsed_rect": collapsed_rect,
+        "collapsed_balance": collapsed_balance,
         "hover_move": hover_move,
         "revealed_rect": revealed_rect,
         "revealed_drag_point": {
@@ -7202,7 +7637,7 @@ def assert_titlebar_empty_lane_window_controls_contract(pid: int, out_dir: Path)
     baseline = wait_for_window_geometry_settle(pid, timeout_seconds=6.0)
 
     drag_x, drag_y, drag_reason = titlebar_empty_lane_point(baseline)
-    drag = xdotool_drag_window(pid, drag_x, drag_y, drag_x + 96.0, drag_y + 48.0)
+    drag = titlebar_drag_window(pid, drag_x, drag_y, drag_x + 96.0, drag_y + 48.0)
     moved = wait_for_window_geometry_settle(pid, timeout_seconds=6.0)
     moved_geometry = window_outer_geometry(moved)
     drag_delta = (moved_geometry[0] - before_geometry[0], moved_geometry[1] - before_geometry[1])
@@ -7212,7 +7647,7 @@ def assert_titlebar_empty_lane_window_controls_contract(pid: int, out_dir: Path)
             f"reason={drag_reason} before={before_geometry!r} after={moved_geometry!r} drag={drag!r}"
         )
     moved_x, moved_y, _ = titlebar_empty_lane_point(moved)
-    restore_drag = xdotool_drag_window(pid, moved_x, moved_y, moved_x - 96.0, moved_y - 48.0)
+    restore_drag = titlebar_drag_window(pid, moved_x, moved_y, moved_x - 96.0, moved_y - 48.0)
     restored = wait_for_window_geometry_settle(pid, timeout_seconds=6.0)
     restored_geometry = window_outer_geometry(restored)
     if abs(restored_geometry[0] - before_geometry[0]) > 28 or abs(restored_geometry[1] - before_geometry[1]) > 28:
@@ -9317,8 +9752,8 @@ def assert_terminal_interaction_latency(pid: int, session: str) -> dict:
     active = host_for_session(active_state, session)
     cursor_line_text = str(active.get("cursor_line_text") or active.get("cursor_row_text") or "")
     text_tail = str(active.get("text_sample") or "")
-    cleanup_response = xdotool_key_window(pid, "ctrl+u")
-    if not cleanup_response or not cleanup_response.get("window_id"):
+    cleanup_response = terminal_send(pid, session, "\u0015")
+    if not cleanup_response or not bool((cleanup_response.get("data") or {}).get("accepted")):
         raise AssertionError(
             f"terminal cleanup control-U could not be delivered after latency probe: "
             f"response={cleanup_response!r}"
@@ -10447,7 +10882,9 @@ def assert_theme_contract(pid: int, out_dir: Path) -> dict:
 
 
 def main() -> int:
+    global BIN
     parser = argparse.ArgumentParser()
+    parser.add_argument("--bin")
     parser.add_argument("--pid", type=int, required=True)
     parser.add_argument("--session", required=True)
     parser.add_argument("--session-kind", choices=("codex", "plain"), default="codex")
@@ -10458,6 +10895,9 @@ def main() -> int:
 
     if args.home:
         ENV["YGGTERM_HOME"] = str(Path(args.home).expanduser())
+    if args.bin:
+        BIN = Path(args.bin).expanduser()
+        ENV["YGGTERM_BIN"] = str(BIN)
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -10508,6 +10948,8 @@ def main() -> int:
         "requested_session": requested_session,
         "session_kind": args.session_kind,
         "initial_settle": initial_settle,
+        "pointer_driver": POINTER_DRIVER,
+        "key_driver": KEY_DRIVER,
         "checks": {},
     }
     if disposable_codex_create is not None:
@@ -10528,10 +10970,12 @@ def main() -> int:
         run_check("startup_bootstrap_dedupe", lambda: assert_no_duplicate_startup_terminal_bootstrap(args.pid))
         run_check("focus", lambda: assert_focus_and_visibility(args.pid, state))
         run_check("geometry", lambda: assert_geometry(state))
+        run_check("notification_health_initial", lambda: assert_no_problem_notifications(state, context="initial"))
         titlebar_state, titlebar_centering = wait_for_titlebar_centering(args.pid)
         state = titlebar_state
         run_check("titlebar_centering", lambda: titlebar_centering)
         run_check("terminal_viewport_inset", lambda: assert_terminal_viewport_inset(state))
+        run_check("background_blur", lambda: assert_background_blur_contract(args.pid))
         run_check("sidebar_resize", lambda: assert_sidebar_resize_persists_to_settings(args.pid))
         run_check("search_focus_overlay", lambda: assert_search_focus_overlay_contract(args.pid, args.session))
         run_check("titlebar_new_menu_shell", lambda: assert_titlebar_new_menu_shell_contract(args.pid))
@@ -10557,6 +11001,11 @@ def main() -> int:
         ))
         run_check("maximize_roundtrip_layout", lambda: assert_maximize_roundtrip_layout(args.pid, out_dir))
         run_check("webkit_child_rss_soak", lambda: assert_webkit_child_rss_soak(args.pid))
+        if args.session_kind != "codex":
+            run_check(
+                "managed_cli_initial_install_deferred",
+                lambda: assert_managed_cli_initial_install_deferred_contract(),
+            )
         run_check("managed_cli_refresh_ttl", lambda: assert_managed_cli_refresh_ttl_contract())
         run_check("client_memory_budget", lambda: assert_client_memory_budget(args.pid))
         late_phase_session = args.session
@@ -10620,6 +11069,10 @@ def main() -> int:
         run_check("observability_budget", lambda: assert_observability_budget())
         run_check("themes", lambda: assert_theme_contract(args.pid, out_dir))
         run_check("idle_root_render_budget", lambda: assert_idle_root_render_budget(args.pid))
+        run_check(
+            "notification_health_final",
+            lambda: assert_no_problem_notifications(app_state(args.pid), context="final"),
+        )
         final_state = app_state(args.pid)
         with (out_dir / "final-state.json").open("w") as fh:
             json.dump(final_state, fh, indent=2)

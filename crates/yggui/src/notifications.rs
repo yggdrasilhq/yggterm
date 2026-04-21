@@ -114,20 +114,6 @@ fn contrast_text_for_layer(foreground: &str, background: &str, emphasized: bool)
     }
 }
 
-fn linux_kde_wayland_safe_mode() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        env::var_os("WAYLAND_DISPLAY").is_some()
-            && env::var("XDG_CURRENT_DESKTOP")
-                .map(|value| value.to_ascii_lowercase().contains("kde"))
-                .unwrap_or(false)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        false
-    }
-}
-
 fn linux_x11_safe_mode() -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -215,7 +201,7 @@ pub fn ToastCard(
     let body_fg = contrast_text_for_layer(background, shell_background, false);
     let (tone_accent, close_fg) =
         toast_tone_colors(item.tone, palette, background, shell_background);
-    let blur_style = if linux_kde_wayland_safe_mode() || linux_x11_safe_mode() {
+    let blur_style = if linux_x11_safe_mode() {
         "backdrop-filter:none; -webkit-backdrop-filter:none;"
     } else {
         "backdrop-filter: blur(28px) saturate(165%); -webkit-backdrop-filter: blur(28px) saturate(165%);"
