@@ -1,5 +1,9 @@
 use dioxus::desktop::window;
+use dioxus::html::input_data::MouseButton;
 use dioxus::prelude::*;
+use std::time::{Duration, Instant};
+
+use crate::motion::standard_transition;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum HoveredChromeControl {
@@ -41,6 +45,11 @@ pub fn TitlebarChrome(
     right: Element,
     on_toggle_maximized: EventHandler<()>,
 ) -> Element {
+    const TITLEBAR_DRAG_THRESHOLD_PX: f64 = 5.0;
+    const TITLEBAR_DOUBLE_CLICK_MAX_DELAY: Duration = Duration::from_millis(420);
+    const TITLEBAR_DOUBLE_CLICK_MAX_DELTA_PX: f64 = 12.0;
+    let mut pending_drag_origin = use_signal(|| None::<(f64, f64)>);
+    let mut last_titlebar_click = use_signal(|| None::<(Instant, f64, f64)>);
     rsx! {
         div {
             style: format!(
@@ -49,17 +58,61 @@ pub fn TitlebarChrome(
                  -webkit-user-select:none;",
                 background, zoom_percent
             ),
+            onmousemove: move |evt| {
+                let Some((start_x, start_y)) = pending_drag_origin() else {
+                    return;
+                };
+                if !evt.held_buttons().contains(MouseButton::Primary) {
+                    pending_drag_origin.set(None);
+                    return;
+                }
+                let pointer = evt.client_coordinates();
+                let delta_x = pointer.x - start_x;
+                let delta_y = pointer.y - start_y;
+                if delta_x.hypot(delta_y) >= TITLEBAR_DRAG_THRESHOLD_PX {
+                    pending_drag_origin.set(None);
+                    last_titlebar_click.set(None);
+                    window().drag();
+                }
+            },
+            onmouseup: move |_| pending_drag_origin.set(None),
             div {
                 style: "position:absolute; inset:0; z-index:0;",
-                onmousedown: move |_| window().drag(),
-                ondoubleclick: move |_| {
-                    on_toggle_maximized.call(());
+                onmousedown: move |evt| {
+                    if evt.trigger_button() != Some(MouseButton::Primary) {
+                        return;
+                    }
+                    evt.prevent_default();
+                    let pointer = evt.client_coordinates();
+                    pending_drag_origin.set(Some((pointer.x, pointer.y)));
+                },
+                onclick: move |evt| {
+                    if evt.trigger_button() != Some(MouseButton::Primary) {
+                        return;
+                    }
+                    evt.prevent_default();
+                    pending_drag_origin.set(None);
+                    let pointer = evt.client_coordinates();
+                    let now = Instant::now();
+                    if let Some((previous_click_at, previous_x, previous_y)) = last_titlebar_click() {
+                        let elapsed = now.duration_since(previous_click_at);
+                        let delta_x = pointer.x - previous_x;
+                        let delta_y = pointer.y - previous_y;
+                        if elapsed <= TITLEBAR_DOUBLE_CLICK_MAX_DELAY
+                            && delta_x.hypot(delta_y) <= TITLEBAR_DOUBLE_CLICK_MAX_DELTA_PX
+                        {
+                            last_titlebar_click.set(None);
+                            on_toggle_maximized.call(());
+                            return;
+                        }
+                    }
+                    last_titlebar_click.set(Some((now, pointer.x, pointer.y)));
                 },
             }
             div {
                 style: "position:relative; z-index:1; min-width:0; height:100%; display:flex; align-items:center; justify-content:flex-start; box-sizing:border-box; pointer-events:none;",
                 div {
-                    style: "display:flex; align-items:center; justify-content:flex-start; min-width:0; width:100%; height:100%; pointer-events:auto;",
+                    style: "display:inline-flex; align-items:center; justify-content:flex-start; min-width:0; max-width:100%; height:100%; pointer-events:auto;",
                     {left}
                 }
             }
@@ -73,7 +126,7 @@ pub fn TitlebarChrome(
             div {
                 style: "position:relative; z-index:1; min-width:0; height:100%; display:flex; align-items:center; justify-content:flex-end; box-sizing:border-box; pointer-events:none;",
                 div {
-                    style: "display:flex; align-items:center; justify-content:flex-end; min-width:0; width:100%; height:100%; pointer-events:auto;",
+                    style: "display:inline-flex; align-items:center; justify-content:flex-end; min-width:0; max-width:100%; height:100%; pointer-events:auto;",
                     {right}
                 }
             }
@@ -210,15 +263,19 @@ fn WindowControlButton(
         format!(
             "width:32px; height:30px; border:none; border-radius:10px; background:{}; color:{}; \
              display:flex; align-items:center; justify-content:center; font-size:13px; font-weight:600; \
-             user-select:none; -webkit-user-select:none;",
-            background, color
+             user-select:none; -webkit-user-select:none; transition:{};",
+            background,
+            color,
+            standard_transition(&["background-color", "color"])
         )
     } else {
         format!(
             "width:34px; height:30px; border:none; border-radius:0; background:{}; color:{}; \
              display:flex; align-items:center; justify-content:center; font-size:13px; font-weight:600; \
-             user-select:none; -webkit-user-select:none;",
-            background, color
+             user-select:none; -webkit-user-select:none; transition:{};",
+            background,
+            color,
+            standard_transition(&["background-color", "color"])
         )
     };
     rsx! {

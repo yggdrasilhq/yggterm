@@ -13,7 +13,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "2.1.7"
+version = "2.1.14"
 edition = "2024"
 authors = ["Yggdrasil HQ"]
 
@@ -38,3 +38,4 @@ opt-level = 2
 [patch.crates-io]
 dioxus-desktop = { path = "vendor/dioxus-desktop" }
 dioxus-interpreter-js = { path = "vendor/dioxus-interpreter-js" }
+wry = { path = "vendor/wry" }

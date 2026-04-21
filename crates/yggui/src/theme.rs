@@ -86,7 +86,12 @@ pub fn append_theme_stop(spec: &YgguiThemeSpec, color: Option<&str>) -> YgguiThe
 pub fn gradient_css(theme: UiTheme, spec: &YgguiThemeSpec) -> String {
     let spec = clamp_theme_spec(spec);
     if spec.colors.is_empty() {
-        return default_gradient(theme).to_string();
+        let mut layers = vec![default_gradient(theme).to_string()];
+        let grain = grain_layer(theme, spec.grain);
+        if !grain.is_empty() {
+            layers.push(grain);
+        }
+        return layers.join(", ");
     }
     let mut layers = spec
         .colors
@@ -486,5 +491,17 @@ mod tests {
         let gradient = gradient_css(UiTheme::ZedDark, &spec);
         assert!(!gradient.contains("69,89,82"));
         assert!(!gradient.contains("75,102,94"));
+    }
+
+    #[test]
+    fn gradient_css_preserves_grain_when_theme_has_no_color_stops() {
+        let spec = YgguiThemeSpec {
+            colors: Vec::new(),
+            brightness: 0.56,
+            grain: 0.24,
+        };
+        let gradient = gradient_css(UiTheme::ZedLight, &spec);
+        assert!(gradient.contains("linear-gradient("));
+        assert!(gradient.contains("radial-gradient(circle"));
     }
 }

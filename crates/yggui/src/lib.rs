@@ -3,6 +3,7 @@
 pub mod chrome;
 pub mod drag_tree;
 pub mod drag_visuals;
+pub mod motion;
 pub mod notifications;
 pub mod rails;
 pub mod theme;
@@ -18,6 +19,10 @@ pub use drag_tree::{
     staging_tree_child_path, tree_parent_path, tree_path_contains, valid_drop_target,
 };
 pub use drag_visuals::{DragGhostCard, DragGhostPalette, TreeDropZones};
+pub use motion::{
+    emphasized_enter_transition, emphasized_exit_transition, standard_accelerate_transition,
+    standard_decelerate_transition, standard_transition, transition,
+};
 pub use notifications::{TOAST_CSS, ToastCard, ToastItem, ToastPalette, ToastTone, ToastViewport};
 pub use rails::{RailHeader, RailScrollBody, RailSectionTitle, SideRailShell};
 pub use theme::{
