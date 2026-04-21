@@ -332,7 +332,7 @@ impl EditWebsocket {
 
                 // Notify that the edits have been applied
                 if msg.response.send(()).is_err() {
-                    tracing::error!("Error sending edits applied notification");
+                    tracing::debug!("Dropped edits applied notification because the waiter was gone");
                 }
             }
             tracing::trace!("Webview {} closed the connection", location.webview_id);

@@ -1,5 +1,7 @@
 use dioxus::prelude::*;
 
+use crate::motion::{emphasized_enter_transition, emphasized_exit_transition};
+
 const RAIL_SCROLLBAR_CSS: &str = r#"
 .yggui-rail-scroll {
   scrollbar-width: thin;
@@ -46,15 +48,29 @@ pub fn SideRailShell(visible: bool, width_px: usize, zoom_percent: f32, body: El
         "translateX(14px)"
     };
     let pointer_events = if visible { "auto" } else { "none" };
+    let transition = if visible {
+        emphasized_enter_transition(&["width", "min-width", "max-width", "opacity", "transform"])
+    } else {
+        emphasized_exit_transition(&["width", "min-width", "max-width", "opacity", "transform"])
+    };
     rsx! {
         div {
+            "data-yggui-side-rail": "1",
+            "data-yggui-side-rail-visible": if visible { "1" } else { "0" },
             style: format!(
                 "width:{}px; min-width:{}px; max-width:{}px; display:flex; flex-direction:column; \
                  background:transparent; overflow:hidden; text-rendering:optimizeLegibility; \
                  -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale; \
-                 transition: width 180ms ease, min-width 180ms ease, max-width 180ms ease, opacity 180ms ease, transform 180ms ease; opacity:{}; transform:{}; \
+                 transition:{}; opacity:{}; transform:{}; \
                  pointer-events:{}; zoom:{}%;",
-                rail_width, rail_width, rail_width, opacity, translate, pointer_events, zoom_percent
+                rail_width,
+                rail_width,
+                rail_width,
+                transition,
+                opacity,
+                translate,
+                pointer_events,
+                zoom_percent
             ),
             onmousedown: |evt| evt.stop_propagation(),
             onclick: |evt| evt.stop_propagation(),
@@ -67,6 +83,7 @@ pub fn SideRailShell(visible: bool, width_px: usize, zoom_percent: f32, body: El
 pub fn RailHeader(title: String, color: String) -> Element {
     rsx! {
         div {
+            "data-yggui-rail-header": "1",
             style: format!(
                 "padding:16px 16px 10px 16px; font-size:12px; font-weight:700; letter-spacing:0.01em; color:{}; \
                  text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
@@ -82,6 +99,7 @@ pub fn RailScrollBody(content: Element) -> Element {
     rsx! {
         style { "{RAIL_SCROLLBAR_CSS}" }
         div {
+            "data-yggui-rail-scroll": "1",
             class: "yggui-rail-scroll",
             style: "flex:1; overflow:auto; padding:10px 16px 14px 16px; display:flex; flex-direction:column; gap:14px; \
              text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",

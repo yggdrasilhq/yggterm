@@ -640,6 +640,20 @@ pub(crate) fn terminal_bootstrap_should_wait_for_mount_epoch_sync(
         && latest_open_request_id == 0
 }
 
+pub(crate) fn terminal_bootstrap_activation_epoch(
+    active_view_mode: WorkspaceViewMode,
+    active_session_path: Option<&str>,
+    session_path: &str,
+    latest_open_request_id: u64,
+) -> u64 {
+    if active_view_mode == WorkspaceViewMode::Terminal && active_session_path == Some(session_path)
+    {
+        latest_open_request_id
+    } else {
+        0
+    }
+}
+
 pub(crate) fn summarize_terminal_surface_for_app_control(
     hosts: &[Value],
     overlay_context_visible: bool,
@@ -982,7 +996,7 @@ fn terminal_host_geometry_problem_for_app_control(host: &Value) -> Option<&'stat
         && helpers_width >= 200.0
         && viewport_width >= 200.0
         && width_delta > 12.0
-        && width_delta <= 18.0
+        && width_delta <= 28.0
         && (screen_width - helpers_width).abs() <= 4.0
         && (host_width - viewport_width).abs() <= 4.0;
     if host_width >= 240.0
@@ -1318,10 +1332,6 @@ pub(crate) fn terminal_chunk_is_transport_error(data: &str) -> bool {
                 || normalized.contains("refused")
                 || normalized.contains("timed out")))
         || normalized.contains("terminal session not found")
-        || normalized.contains("permission denied")
-        || normalized.contains("no route to host")
-        || normalized.contains("broken pipe")
-        || normalized.contains("connection reset by peer")
     {
         return true;
     }
@@ -1360,6 +1370,14 @@ pub(crate) fn terminal_chunk_is_transport_error(data: &str) -> bool {
                 && (line.contains(" closed")
                     || line.contains("refused")
                     || line.contains("timed out")))
+            || line == "permission denied"
+            || line == "no route to host"
+            || line == "broken pipe"
+            || line == "connection reset by peer"
+            || line.ends_with(": permission denied")
+            || line.ends_with(": no route to host")
+            || line.ends_with(": broken pipe")
+            || line.ends_with(": connection reset by peer")
             || ((line.starts_with("ssh:")
                 || line.starts_with("error:")
                 || line.starts_with("fatal:")
@@ -1429,7 +1447,10 @@ pub(crate) fn strip_terminal_control_sequences(data: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{terminal_chunk_has_codex_prompt_output, terminal_host_problem_for_app_control};
+    use super::{
+        WorkspaceViewMode, terminal_bootstrap_activation_epoch,
+        terminal_chunk_has_codex_prompt_output, terminal_host_problem_for_app_control,
+    };
     use serde_json::json;
 
     #[test]
@@ -1648,6 +1669,37 @@ mod tests {
             Some(
                 "active terminal host helper textarea is visibly mounted instead of visually hidden"
             )
+        );
+    }
+
+    #[test]
+    fn terminal_bootstrap_activation_epoch_tracks_active_terminal_session_focus_cycles() {
+        assert_eq!(
+            terminal_bootstrap_activation_epoch(
+                WorkspaceViewMode::Terminal,
+                Some("local://active"),
+                "local://active",
+                42,
+            ),
+            42
+        );
+        assert_eq!(
+            terminal_bootstrap_activation_epoch(
+                WorkspaceViewMode::Terminal,
+                Some("local://other"),
+                "local://active",
+                42,
+            ),
+            0
+        );
+        assert_eq!(
+            terminal_bootstrap_activation_epoch(
+                WorkspaceViewMode::Rendered,
+                Some("local://active"),
+                "local://active",
+                42,
+            ),
+            0
         );
     }
 }
