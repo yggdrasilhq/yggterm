@@ -27,10 +27,12 @@ pub use icon::{
     AppIconAssets, LinuxInstalledIconSet, YGGTERM_ICON_ASSETS, install_linux_icon_assets,
 };
 pub use install::{
-    ENV_YGGTERM_DIRECT_INSTALL_ROOT, InstallChannel, InstallContext, ReleaseUpdate, UpdatePolicy,
-    YGGTERM_DESKTOP_APP_ID, check_for_update, current_asset_label, current_version,
-    detect_install_context, direct_install_root, install_mode_summary, install_release_update,
-    refresh_desktop_integration, update_command_hint, write_direct_install_state,
+    ENV_YGGTERM_DIRECT_INSTALL_ROOT, InstallChannel, InstallContext, ReleaseUpdate,
+    ReleaseUpdateInstallProgress, ReleaseUpdateInstallStage, UpdatePolicy, YGGTERM_DESKTOP_APP_ID,
+    check_for_update, current_asset_label, current_version, detect_install_context,
+    direct_install_root, install_mode_summary, install_release_update,
+    install_release_update_with_progress, refresh_desktop_integration, update_command_hint,
+    write_direct_install_state,
 };
 pub use perf::{
     PERF_TELEMETRY_FILENAME, PERF_TELEMETRY_MAX_BYTES, PERF_TELEMETRY_ROTATED_FILENAME, PerfSpan,
@@ -104,6 +106,7 @@ pub struct AppSettings {
     pub yggui_theme: YgguiThemeSpec,
     pub show_tree: bool,
     pub show_settings: bool,
+    pub auto_hide_titlebar: bool,
     pub tree_width: f32,
     pub rendered_font_size: f32,
     pub terminal_font_size: f32,
@@ -129,9 +132,10 @@ impl Default for AppSettings {
             yggui_theme: YgguiThemeSpec::default(),
             show_tree: true,
             show_settings: false,
+            auto_hide_titlebar: false,
             tree_width: 300.0,
             rendered_font_size: 10.0,
-            terminal_font_size: 13.0,
+            terminal_font_size: 14.0,
             terminal_light_theme_name: "VS Code Light+".to_string(),
             terminal_dark_theme_name: "Dark+".to_string(),
             ui_font_size: 14.0,
@@ -566,6 +570,10 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
         settings.show_settings =
             serde_json::from_value(value.clone()).context("failed to parse show_settings")?;
     }
+    if let Some(value) = object.get("auto_hide_titlebar") {
+        settings.auto_hide_titlebar =
+            serde_json::from_value(value.clone()).context("failed to parse auto_hide_titlebar")?;
+    }
     if let Some(value) = object.get("tree_width") {
         settings.tree_width =
             serde_json::from_value(value.clone()).context("failed to parse tree_width")?;
@@ -648,6 +656,7 @@ fn serialize_settings_value(settings: &AppSettings) -> Value {
         "theme": settings.yggui_theme,
         "show_tree": settings.show_tree,
         "show_settings": settings.show_settings,
+        "auto_hide_titlebar": settings.auto_hide_titlebar,
         "tree_width": settings.tree_width,
         "rendered_font_size": settings.rendered_font_size,
         "terminal_font_size": settings.terminal_font_size,
@@ -1455,5 +1464,24 @@ mod tests {
         .expect("legacy settings should parse");
         assert_eq!(parsed.terminal_light_theme_name, "Aardvark Blue");
         assert_eq!(parsed.terminal_dark_theme_name, "Aardvark Blue");
+    }
+
+    #[test]
+    fn settings_parse_titlebar_auto_hide_toggle() {
+        let parsed = parse_settings_value(&serde_json::json!({
+            "auto_hide_titlebar": true
+        }))
+        .expect("settings should parse");
+        assert!(parsed.auto_hide_titlebar);
+    }
+
+    #[test]
+    fn settings_serialize_titlebar_auto_hide_toggle() {
+        let mut settings = AppSettings::default();
+        settings.auto_hide_titlebar = true;
+        assert_eq!(
+            serialize_settings_value(&settings).get("auto_hide_titlebar"),
+            Some(&serde_json::json!(true))
+        );
     }
 }
