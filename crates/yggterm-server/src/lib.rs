@@ -18,7 +18,7 @@ pub use app_control::{
     enqueue_screenshot_request, take_next_app_control_request, wait_for_app_control_response,
 };
 pub use attach::{AttachMetadata, run_attach};
-pub use codex_cli::{ManagedCliTool, ManagedCliToolStatus};
+pub use codex_cli::{ManagedCliTool, ManagedCliToolStatus, managed_cli_refresh_ttl_ms};
 pub use daemon::{
     ServerEndpoint, ServerRequest, ServerResponse, ServerRuntimeStatus, TerminalStreamChunk,
     cleanup_legacy_daemons, connect_ssh, connect_ssh_custom, default_endpoint,
@@ -1897,6 +1897,9 @@ impl YggtermServer {
                 scope: "local".to_string(),
                 background: false,
                 statuses: vec![status],
+                skipped_recently: false,
+                ttl_remaining_ms: None,
+                install_attempted: false,
             },
         )))
     }
