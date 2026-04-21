@@ -60,6 +60,27 @@ pub enum AppControlDragPlacement {
     After,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AppControlPointerButton {
+    #[default]
+    Primary,
+    Middle,
+    Secondary,
+}
+
+fn default_app_control_click_count() -> u8 {
+    1
+}
+
+fn default_app_control_drag_steps() -> u16 {
+    4
+}
+
+fn default_app_control_pointer_step_delay_ms() -> u64 {
+    24
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum AppControlDragCommand {
@@ -72,6 +93,56 @@ pub enum AppControlDragCommand {
     },
     Drop,
     Clear,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum AppControlPointerCommand {
+    Move {
+        x: f64,
+        y: f64,
+    },
+    Press {
+        x: f64,
+        y: f64,
+        #[serde(default)]
+        button: AppControlPointerButton,
+    },
+    Release {
+        #[serde(default)]
+        button: AppControlPointerButton,
+    },
+    Click {
+        x: f64,
+        y: f64,
+        #[serde(default)]
+        button: AppControlPointerButton,
+        #[serde(default = "default_app_control_click_count")]
+        count: u8,
+    },
+    Drag {
+        start_x: f64,
+        start_y: f64,
+        end_x: f64,
+        end_y: f64,
+        #[serde(default)]
+        button: AppControlPointerButton,
+        #[serde(default = "default_app_control_drag_steps")]
+        steps: u16,
+        #[serde(default = "default_app_control_pointer_step_delay_ms")]
+        step_delay_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum AppControlKeyCommand {
+    Press {
+        keys: Vec<String>,
+    },
+    Type {
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -121,6 +192,18 @@ pub enum AppControlCommand {
     },
     SetFullscreen {
         enabled: bool,
+    },
+    BackgroundWindow,
+    MoveWindowBy {
+        delta_x: f64,
+        delta_y: f64,
+    },
+    CloseWindow,
+    Pointer {
+        command: AppControlPointerCommand,
+    },
+    Key {
+        command: AppControlKeyCommand,
     },
     Drag {
         command: AppControlDragCommand,
@@ -203,6 +286,11 @@ impl AppControlCommand {
             Self::CaptureScreenRecording { .. } => "capture_screen_recording",
             Self::SetMaximized { .. } => "set_maximized",
             Self::SetFullscreen { .. } => "set_fullscreen",
+            Self::BackgroundWindow => "background_window",
+            Self::MoveWindowBy { .. } => "move_window_by",
+            Self::CloseWindow => "close_window",
+            Self::Pointer { .. } => "pointer",
+            Self::Key { .. } => "key",
             Self::Drag { .. } => "drag",
             Self::CreateTerminal { .. } => "create_terminal",
             Self::SendTerminalInput { .. } => "send_terminal_input",
