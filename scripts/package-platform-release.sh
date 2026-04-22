@@ -21,6 +21,21 @@ case "$TARGET_LABEL" in
     ;;
 esac
 
+APP_VERSION="$(
+  awk '
+    $0 == "[workspace.package]" { in_section = 1; next }
+    /^\[/ { in_section = 0 }
+    in_section && $1 == "version" {
+      gsub(/"/, "", $3)
+      print $3
+      exit
+    }
+  ' "${ROOT_DIR}/Cargo.toml"
+)"
+if [[ -z "$APP_VERSION" ]]; then
+  APP_VERSION="0.0.0"
+fi
+
 BUILD_CMD=("${CARGO_CMD[@]}" build --release -p yggterm --bin yggterm --bin yggterm-headless --bin yggterm-mock-cli --no-default-features)
 BIN_PATH="${ROOT_DIR}/target/release/${BIN_NAME}"
 HEADLESS_BIN_PATH="${ROOT_DIR}/target/release/${HEADLESS_BIN_NAME}"
@@ -45,6 +60,115 @@ find_webview2_loader() {
     candidate="$(compgen -G "${HOME}/.cargo/registry/src/*/webview2-com-sys-*/x64/WebView2Loader.dll" | head -n 1 || true)"
   fi
   printf '%s' "$candidate"
+}
+
+python_zip() {
+  local archive_path="$1"
+  shift
+  local python_cmd=""
+  if command -v python3 >/dev/null 2>&1; then
+    python_cmd="python3"
+  elif command -v python >/dev/null 2>&1; then
+    python_cmd="python"
+  else
+    echo "python is required to create zip archives" >&2
+    exit 1
+  fi
+  "$python_cmd" - "$archive_path" "$@" <<'PY'
+import pathlib
+import sys
+import zipfile
+
+archive = pathlib.Path(sys.argv[1])
+entries = [pathlib.Path(value) for value in sys.argv[2:]]
+archive.parent.mkdir(parents=True, exist_ok=True)
+with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as handle:
+    for entry in entries:
+        if entry.is_dir():
+            for child in sorted(entry.rglob("*")):
+                if child.is_dir():
+                    continue
+                handle.write(child, child.relative_to(entry.parent))
+        else:
+            handle.write(entry, entry.name)
+PY
+}
+
+build_macos_release_bundle() {
+  local gui_binary_path="$1"
+  local app_path="${DIST_DIR}/Yggterm.app"
+  local contents_path="${app_path}/Contents"
+  local macos_path="${contents_path}/MacOS"
+  local resources_path="${contents_path}/Resources"
+  local icon_png="${ROOT_DIR}/assets/brand/yggterm-icon-512.png"
+  local icon_file="yggterm.png"
+  local iconset_path="${DIST_DIR}/yggterm.iconset"
+  local app_zip_path="${DIST_DIR}/Yggterm-${TARGET_LABEL}.app.zip"
+
+  rm -rf "$app_path" "$iconset_path"
+  mkdir -p "$macos_path" "$resources_path"
+  cp "$gui_binary_path" "${macos_path}/Yggterm"
+  chmod 0755 "${macos_path}/Yggterm" || true
+
+  if [[ -f "$icon_png" ]]; then
+    cp "$icon_png" "${resources_path}/yggterm.png"
+    if command -v sips >/dev/null 2>&1 && command -v iconutil >/dev/null 2>&1; then
+      mkdir -p "$iconset_path"
+      while IFS=: read -r size name; do
+        [[ -n "$size" ]] || continue
+        sips -z "$size" "$size" "$icon_png" --out "${iconset_path}/${name}" >/dev/null
+      done <<'SIZES'
+16:icon_16x16.png
+32:icon_16x16@2x.png
+32:icon_32x32.png
+64:icon_32x32@2x.png
+128:icon_128x128.png
+256:icon_128x128@2x.png
+256:icon_256x256.png
+512:icon_256x256@2x.png
+512:icon_512x512.png
+1024:icon_512x512@2x.png
+SIZES
+      if iconutil -c icns "$iconset_path" -o "${resources_path}/yggterm.icns" >/dev/null 2>&1; then
+        icon_file="yggterm.icns"
+      fi
+      rm -rf "$iconset_path"
+    fi
+  fi
+
+  cat > "${contents_path}/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>
+  <string>Yggterm</string>
+  <key>CFBundleDisplayName</key>
+  <string>Yggterm</string>
+  <key>CFBundleIdentifier</key>
+  <string>dev.yggdrasilhq.yggterm</string>
+  <key>CFBundleExecutable</key>
+  <string>Yggterm</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>${APP_VERSION}</string>
+  <key>CFBundleVersion</key>
+  <string>${APP_VERSION}</string>
+  <key>CFBundleIconFile</key>
+  <string>${icon_file}</string>
+</dict>
+</plist>
+PLIST
+
+  if command -v ditto >/dev/null 2>&1; then
+    rm -f "$app_zip_path"
+    ditto -c -k --keepParent "$app_path" "$app_zip_path"
+  else
+    python_zip "$app_zip_path" "$app_path"
+  fi
+  checksum_file "$app_zip_path" "${app_zip_path}.sha256"
+  echo "Release app bundle: ${app_zip_path}"
 }
 
 pushd "$ROOT_DIR" >/dev/null
@@ -120,6 +244,23 @@ fi
 tar -C "$DIST_DIR" -czf "${DIST_DIR}/yggterm-${TARGET_LABEL}.tar.gz" "${TAR_CONTENTS[@]}"
 
 checksum_file "${DIST_DIR}/yggterm-${TARGET_LABEL}.tar.gz" "${DIST_DIR}/yggterm-${TARGET_LABEL}.tar.gz.sha256"
+
+if [[ "$TARGET_LABEL" == macos-* ]]; then
+  build_macos_release_bundle "${DIST_DIR}/${OUT_BASENAME}"
+fi
+
+if [[ "$TARGET_LABEL" == windows-* ]]; then
+  WINDOWS_ZIP_PATH="${DIST_DIR}/yggterm-${TARGET_LABEL}.zip"
+  rm -f "$WINDOWS_ZIP_PATH"
+  python_zip \
+    "$WINDOWS_ZIP_PATH" \
+    "${DIST_DIR}/${OUT_BASENAME}" \
+    "${DIST_DIR}/${HEADLESS_OUT_BASENAME}" \
+    "${DIST_DIR}/${MOCK_CLI_OUT_BASENAME}" \
+    "${DIST_DIR}/${WEBVIEW2_OUT_BASENAME}"
+  checksum_file "$WINDOWS_ZIP_PATH" "${WINDOWS_ZIP_PATH}.sha256"
+  echo "Release zip: ${WINDOWS_ZIP_PATH}"
+fi
 
 echo "Release binary: ${DIST_DIR}/${OUT_BASENAME}"
 echo "Release headless binary: ${DIST_DIR}/${HEADLESS_OUT_BASENAME}"
