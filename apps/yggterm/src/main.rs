@@ -8,6 +8,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use yggterm_platform::configure_gui_entry_process;
 use yggterm_core::{
     ENV_YGGTERM_DIRECT_INSTALL_ROOT, ENV_YGGTERM_HOME, InstallContext, PerfSpan, SessionNode,
     SessionNodeKind, SessionStore, UpdatePolicy, WorkspaceDocumentKind, WorkspaceGroupKind,
@@ -299,6 +300,9 @@ fn main() -> Result<()> {
         .init();
 
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.is_empty() {
+        configure_gui_entry_process("Yggterm", "dev.yggterm.Yggterm")?;
+    }
     let current_exe = std::env::current_exe()?;
     let install_context = detect_install_context(&current_exe)?;
     maybe_handoff_to_preferred_executable(&current_exe, &args, &install_context)?;

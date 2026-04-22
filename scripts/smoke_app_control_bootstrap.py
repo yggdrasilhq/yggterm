@@ -11,6 +11,8 @@ ROOT = Path(__file__).resolve().parents[1]
 BIN = Path(os.environ.get("YGGTERM_BIN") or (ROOT / "target" / "debug" / "yggterm"))
 ENV = os.environ.copy()
 PROBLEM_NOTIFICATION_MARKERS = (
+    "codex tool refresh failed",
+    "remote codex tool refresh failed",
     "connection refused",
     "no such file or directory",
     "server unavailable",
@@ -222,6 +224,18 @@ def assert_blur_expectation(state: dict, expectation: str) -> dict:
     return summary
 
 
+def assert_sidebar_rows_present(rows: dict) -> dict:
+    row_count = int(rows.get("row_count") or len(rows.get("rows") or []))
+    if row_count <= 0:
+        raise RuntimeError(f"sidebar rows were empty on first boot: {rows!r}")
+    first_row = ((rows.get("rows") or [{}])[0] or {})
+    return {
+        "row_count": row_count,
+        "first_row_label": first_row.get("label"),
+        "first_row_path": first_row.get("full_path"),
+    }
+
+
 def wait_for_ready_state(
     bin_path: Path,
     pid: int,
@@ -284,6 +298,7 @@ def main() -> int:
     )
     blur = assert_blur_expectation(state, args.expect_live_blur)
     rows = app_rows(bin_path, pid, args.timeout_ms)
+    sidebar = assert_sidebar_rows_present(rows)
 
     state_path = out_dir / "state.json"
     rows_path = out_dir / "rows.json"
@@ -313,6 +328,7 @@ def main() -> int:
         ),
         "problem_notifications": problem_notifications(state),
         "blur": blur,
+        "sidebar": sidebar,
         "state_path": str(state_path),
         "rows_path": str(rows_path),
         "screenshot_path": str(screenshot_path) if screenshot_path.exists() else None,
