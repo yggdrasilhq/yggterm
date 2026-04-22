@@ -89,6 +89,24 @@ pub fn configure_gui_entry_process(app_name: &str, app_id: &str) -> Result<()> {
     }
 }
 
+pub fn configure_background_service_command(command: &mut Command) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = command;
+    }
+}
+
 pub fn send_user_notification(title: &str, message: &str) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
