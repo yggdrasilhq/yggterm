@@ -11,6 +11,8 @@ use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSBitmapImageRepPro
 use objc2_core_graphics::{CGWindowImageOption, CGWindowListOption, CGRectNull};
 #[cfg(target_os = "macos")]
 use objc2_foundation::NSDictionary;
+#[cfg(target_os = "macos")]
+use png::Transformations;
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Console::{FreeConsole, GetConsoleWindow};
 #[cfg(target_os = "windows")]
@@ -198,6 +200,36 @@ pub fn capture_macos_window_cg_screenshot(
     .context("encoding CG window image as PNG")?;
     std::fs::write(output_path, png_data.to_vec())
         .with_context(|| format!("writing macOS CG window screenshot {}", output_path.display()))?;
+    ensure_macos_png_not_blank(output_path, "CG window capture")?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_macos_png_not_blank(output_path: &Path, context_label: &str) -> Result<()> {
+    let file = std::fs::File::open(output_path)
+        .with_context(|| format!("opening macOS screenshot {}", output_path.display()))?;
+    let mut decoder = png::Decoder::new(file);
+    decoder.set_transformations(Transformations::EXPAND | Transformations::STRIP_16);
+    let mut reader = decoder
+        .read_info()
+        .with_context(|| format!("reading PNG info for {}", output_path.display()))?;
+    let mut buffer = vec![0; reader.output_buffer_size()];
+    let info = reader
+        .next_frame(&mut buffer)
+        .with_context(|| format!("decoding PNG pixels for {}", output_path.display()))?;
+    let pixels = &buffer[..info.buffer_size()];
+    if pixels.is_empty() {
+        bail!(
+            "{context_label} wrote an empty PNG for {}; refusing the capture",
+            output_path.display()
+        );
+    }
+    if pixels.iter().all(|byte| *byte == 0) {
+        bail!(
+            "{context_label} produced an all-zero PNG for {}; likely a blank window capture",
+            output_path.display()
+        );
+    }
     Ok(())
 }
 
