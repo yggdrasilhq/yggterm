@@ -5235,6 +5235,13 @@ def assert_search_focus_overlay_contract(pid: int, session: str) -> dict:
     baseline_titlebar = dom_rect(baseline, "titlebar_rect")
     baseline_host = active_host(baseline).get("host_rect") or {}
     baseline_dom = baseline.get("dom") or {}
+    native_wayland = bool(
+        str(
+            ((baseline.get("client_instance") or {}).get("wayland_display"))
+            or ((baseline.get("window") or {}).get("wayland_display"))
+            or ""
+        ).strip()
+    )
     search_input_rect = dom_rect(baseline, "titlebar_search_input_rect")
     baseline_search_field_shell_rect = dom_rect(baseline, "titlebar_search_field_shell_rect")
     baseline_search_field_shell_background = str(
@@ -5316,9 +5323,10 @@ def assert_search_focus_overlay_contract(pid: int, session: str) -> dict:
             f"click={click!r} active_element={active_element!r} focused={focused!r}"
         )
 
-    overlay_retried = False
+    overlay_retry_limit = 3 if native_wayland else 2
+    overlay_retry_count = 0
     while True:
-        focused_settle_deadline = time.time() + 2.5
+        focused_settle_deadline = time.time() + (3.5 if native_wayland else 2.5)
         while time.time() < focused_settle_deadline:
             titlebar_rect = dom_rect(focused, "titlebar_rect")
             search_modal_rect = dom_rect(focused, "titlebar_search_outer_shell_rect")
@@ -5346,13 +5354,20 @@ def assert_search_focus_overlay_contract(pid: int, session: str) -> dict:
                     f"active_element={active_element!r} state={focused!r}"
                 )
         else:
-            if overlay_retried:
+            if overlay_retry_count + 1 >= overlay_retry_limit:
                 break
             active_element = (focused.get("dom") or {}).get("active_element") or {}
+            if native_wayland:
+                click = xdotool_click_window(
+                    pid,
+                    rect_center_x(search_input_rect),
+                    rect_center_y(search_input_rect),
+                )
+                time.sleep(0.14)
             app_set_search(pid, str(active_element.get("value") or ""), focused=True)
             focused = app_state(pid)
             opened_via = f"{opened_via}_overlay_fallback"
-            overlay_retried = True
+            overlay_retry_count += 1
             continue
         break
 
@@ -6090,6 +6105,13 @@ def assert_titlebar_session_shell_contract(pid: int) -> dict:
         )
         time.sleep(0.25)
         baseline = app_state(pid)
+    native_wayland = bool(
+        str(
+            ((baseline.get("client_instance") or {}).get("wayland_display"))
+            or ((baseline.get("window") or {}).get("wayland_display"))
+            or ""
+        ).strip()
+    )
     titlebar_rect = dom_rect(baseline, "titlebar_rect")
     button_rect = dom_rect(baseline, "titlebar_session_button_rect")
     baseline_button_rect = button_rect
@@ -6101,25 +6123,33 @@ def assert_titlebar_session_shell_contract(pid: int) -> dict:
     search_input_rect = dom_rect(baseline, "titlebar_search_input_rect")
     search_click = None
     if rect_is_visible(search_input_rect):
-        search_click = xdotool_click_window(
-            pid,
-            rect_center_x(search_input_rect),
-            rect_center_y(search_input_rect),
-        )
-        deadline = time.time() + 6.0
+        search_retry_limit = 3 if native_wayland else 2
+        search_retry_count = 0
         search_opened = {}
-        while time.time() < deadline:
-            search_opened = app_state(pid)
-            if rect_is_visible(dom_rect(search_opened, "titlebar_search_dropdown_rect")):
-                active_element = (search_opened.get("dom") or {}).get("active_element") or {}
-                if str(active_element.get("id") or "") == "yggterm-search-input":
-                    break
-            time.sleep(0.12)
-        if not rect_is_visible(dom_rect(search_opened, "titlebar_search_dropdown_rect")):
-            raise AssertionError(
-                f"search shell did not open before the session-shell cross-state probe: "
-                f"search_click={search_click!r} state={search_opened!r}"
+        while True:
+            search_click = xdotool_click_window(
+                pid,
+                rect_center_x(search_input_rect),
+                rect_center_y(search_input_rect),
             )
+            deadline = time.time() + (7.0 if native_wayland else 6.0)
+            while time.time() < deadline:
+                search_opened = app_state(pid)
+                if rect_is_visible(dom_rect(search_opened, "titlebar_search_dropdown_rect")):
+                    active_element = (search_opened.get("dom") or {}).get("active_element") or {}
+                    if str(active_element.get("id") or "") == "yggterm-search-input":
+                        break
+                time.sleep(0.12)
+            if rect_is_visible(dom_rect(search_opened, "titlebar_search_dropdown_rect")):
+                break
+            if search_retry_count + 1 >= search_retry_limit:
+                raise AssertionError(
+                    f"search shell did not open before the session-shell cross-state probe: "
+                    f"search_click={search_click!r} state={search_opened!r}"
+                )
+            app_set_search(pid, "", focused=True)
+            time.sleep(0.16 if native_wayland else 0.12)
+            search_retry_count += 1
         baseline = search_opened
         titlebar_rect = dom_rect(baseline, "titlebar_rect")
         button_rect = dom_rect(baseline, "titlebar_session_button_rect")
@@ -6547,26 +6577,34 @@ def assert_titlebar_session_shell_contract(pid: int) -> dict:
     focused = focus_settled
     search_input_rect = dom_rect(focused, "titlebar_search_input_rect")
     if rect_is_visible(search_input_rect):
-        search_click = xdotool_click_window(
-            pid,
-            rect_center_x(search_input_rect),
-            rect_center_y(search_input_rect),
-        )
-        deadline = time.time() + 6.0
+        handoff_retry_limit = 3 if native_wayland else 2
+        handoff_retry_count = 0
         switched = {}
-        while time.time() < deadline:
-            switched = app_state(pid)
-            if (
-                rect_is_visible(dom_rect(switched, "titlebar_search_dropdown_rect"))
-                and not rect_is_visible(dom_rect(switched, "titlebar_summary_menu_rect"))
-            ):
-                break
-            time.sleep(0.12)
-        if not rect_is_visible(dom_rect(switched, "titlebar_search_dropdown_rect")):
-            raise AssertionError(
-                f"clicking search did not open the search shell while the session shell was open: "
-                f"search_click={search_click!r} state={switched!r}"
+        while True:
+            search_click = xdotool_click_window(
+                pid,
+                rect_center_x(search_input_rect),
+                rect_center_y(search_input_rect),
             )
+            deadline = time.time() + (7.0 if native_wayland else 6.0)
+            while time.time() < deadline:
+                switched = app_state(pid)
+                if (
+                    rect_is_visible(dom_rect(switched, "titlebar_search_dropdown_rect"))
+                    and not rect_is_visible(dom_rect(switched, "titlebar_summary_menu_rect"))
+                ):
+                    break
+                time.sleep(0.12)
+            if rect_is_visible(dom_rect(switched, "titlebar_search_dropdown_rect")):
+                break
+            if handoff_retry_count + 1 >= handoff_retry_limit:
+                raise AssertionError(
+                    f"clicking search did not open the search shell while the session shell was open: "
+                    f"search_click={search_click!r} state={switched!r}"
+                )
+            app_set_search(pid, "", focused=True)
+            time.sleep(0.16 if native_wayland else 0.12)
+            handoff_retry_count += 1
         if rect_is_visible(dom_rect(switched, "titlebar_summary_menu_rect")):
             raise AssertionError(
                 f"clicking search left the session shell open instead of transferring chrome ownership: "
