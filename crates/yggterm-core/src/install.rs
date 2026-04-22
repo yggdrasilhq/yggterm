@@ -612,8 +612,12 @@ fn refresh_macos_launcher(launcher_path: &Path, target: &Path) -> Result<()> {
             })?;
         }
     }
-    let bytes = fs::read(target)
-        .with_context(|| format!("failed to read macOS target executable {}", target.display()))?;
+    let bytes = fs::read(target).with_context(|| {
+        format!(
+            "failed to read macOS target executable {}",
+            target.display()
+        )
+    })?;
     write_if_changed(launcher_path, &bytes)?;
     let mut permissions = fs::metadata(launcher_path)?.permissions();
     permissions.set_mode(0o755);
@@ -671,7 +675,6 @@ fn refresh_windows_integration(context: &InstallContext) -> Result<Vec<String>> 
         .to_string_lossy()
         .to_string();
     let launcher_path = refresh_windows_gui_launcher(&context.executable_path)?;
-    let launcher_target = launcher_path.as_os_str().to_string_lossy().to_string();
     let working_dir = context
         .executable_path
         .parent()
@@ -701,7 +704,7 @@ fn refresh_windows_integration(context: &InstallContext) -> Result<Vec<String>> 
         powershell_escape(legacy_shortcut_dir.as_os_str().to_string_lossy().as_ref()),
         powershell_escape(legacy_shortcut_dir.as_os_str().to_string_lossy().as_ref()),
         powershell_escape(shortcut_path.as_os_str().to_string_lossy().as_ref()),
-        powershell_escape(&launcher_target),
+        powershell_escape(&target_path),
         powershell_escape(&working_dir),
         powershell_escape(&target_path),
         powershell_escape(&target_path),
