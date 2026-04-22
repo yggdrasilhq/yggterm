@@ -42,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--remote-dir")
     parser.add_argument("--timeout-ms", type=int, default=30000)
     parser.add_argument("--attach-only", action="store_true")
+    parser.add_argument("--install", action="store_true")
     parser.add_argument("--keep-remote-dir", action="store_true")
     parser.add_argument(
         "--expect-live-blur",
@@ -426,6 +427,32 @@ PLIST
     return remote_app
 
 
+def install_staged_macos_app_bundle(host: str, remote_app: str) -> dict:
+    home_dir = ssh_shell(host, "printf '%s\\n' \"$HOME\"").stdout.strip()
+    if not home_dir:
+        raise RuntimeError(f"could not resolve remote home directory on {host}")
+    install_root = f"{home_dir}/Applications"
+    installed_app = f"{install_root}/Yggterm.app"
+    ssh_shell(
+        host,
+        f"mkdir -p {quote(install_root)} && "
+        f"rm -rf {quote(installed_app)} && "
+        f"(command -v ditto >/dev/null 2>&1 && ditto {quote(remote_app)} {quote(installed_app)} "
+        f"|| cp -R {quote(remote_app)} {quote(installed_app)})",
+    )
+    installed_bin = ssh_shell(
+        host,
+        f"find {quote(installed_app)}/Contents/MacOS -maxdepth 1 -type f | head -n1",
+    ).stdout.strip()
+    if not installed_bin:
+        raise RuntimeError(f"installed macOS app bundle did not expose a launcher under {installed_app}")
+    return {
+        "install_root": install_root,
+        "installed_app": installed_app,
+        "installed_bin": installed_bin,
+    }
+
+
 def normalize_staged_macos_payload(
     host: str, remote_dir: str, remote_bin: str, remote_app: str | None
 ) -> tuple[str, str | None]:
@@ -736,6 +763,7 @@ def main() -> int:
     frontmost_app_name = None
     background_response = None
     background_error = None
+    install_summary = None
     prelaunch_cleanup = cleanup_stale_remote_macos_clients(args.host)
     yggterm_processes_before_launch = remote_macos_yggterm_processes(args.host)
 
@@ -748,6 +776,10 @@ def main() -> int:
         )
         if not remote_app:
             remote_app = stage_macos_app_bundle(args.host, remote_dir, remote_bin)
+        if args.install:
+            install_summary = install_staged_macos_app_bundle(args.host, remote_app)
+            remote_app = str(install_summary.get("installed_app") or "").strip() or remote_app
+            remote_bin = str(install_summary.get("installed_bin") or "").strip() or remote_bin
         try:
             remote_version = remote_binary_version(args.host, remote_bin)
         except Exception:
@@ -771,6 +803,7 @@ def main() -> int:
             "remote_clients_probe": remote_clients_probe,
             "frontmost_app_name": frontmost_app_name,
             "prelaunch_cleanup": prelaunch_cleanup,
+            "install_summary": install_summary,
             "pid": None,
             "owned_launch": False,
             "launch": None,
@@ -985,6 +1018,7 @@ def main() -> int:
             "remote_clients_probe": remote_clients_probe,
             "frontmost_app_name": frontmost_app_name,
             "prelaunch_cleanup": prelaunch_cleanup,
+            "install_summary": install_summary,
             "yggterm_processes_before_launch": yggterm_processes_before_launch,
             "owned_clients_after_launch": owned_clients_after_launch,
             "pid": pid,
@@ -1009,6 +1043,7 @@ def main() -> int:
             "remote_clients_probe": remote_clients_probe,
             "frontmost_app_name": frontmost_app_name,
             "prelaunch_cleanup": prelaunch_cleanup,
+            "install_summary": install_summary,
             "yggterm_processes_before_launch": yggterm_processes_before_launch,
             "owned_clients_after_launch": remote_owned_macos_clients(args.host, remote_dir),
             "pid": pid or None,

@@ -69,7 +69,8 @@ try {
     active_executable = $installedExe
     icon_revision = $version
   } | ConvertTo-Json
-  Set-Content -Path (Join-Path $InstallRoot "install-state.json") -Value $state -Encoding UTF8
+  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText((Join-Path $InstallRoot "install-state.json"), $state, $utf8NoBom)
 
   & $installedExe install integrate | Out-Null
 

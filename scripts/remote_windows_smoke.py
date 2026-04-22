@@ -125,6 +125,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--remote-dir-name")
     parser.add_argument("--timeout-ms", type=int, default=20000)
     parser.add_argument("--attach-only", action="store_true")
+    parser.add_argument("--install", action="store_true")
     parser.add_argument("--keep-remote-dir", action="store_true")
     parser.add_argument(
         "--expect-live-blur",
@@ -315,6 +316,101 @@ def resolve_remote_bin(host: str, remote_dir_name: str, requested_bin: str | Non
     if not remote_bin:
         raise RuntimeError(f"could not resolve a remote Windows yggterm binary on {host}")
     return remote_bin
+
+
+def infer_windows_asset_label(*values: str) -> str:
+    for value in values:
+        lower = str(value or "").lower()
+        if "windows-aarch64" in lower:
+            return "windows-aarch64"
+        if "windows-x86_64" in lower or "windows-amd64" in lower or "windows-x64" in lower:
+            return "windows-x86_64"
+    return "windows-x86_64"
+
+
+def install_staged_windows_artifact(
+    host: str,
+    remote_root: str,
+    remote_bin: str,
+    artifact_hint: str,
+) -> dict:
+    asset_label = infer_windows_asset_label(artifact_hint, remote_bin)
+    statements = [
+        f"$RemoteRoot = {ps_literal(remote_root)}",
+        f"$StagedBin = {ps_literal(remote_bin)}",
+        f"$AssetLabel = {ps_literal(asset_label)}",
+        "$ErrorActionPreference = 'Stop'",
+        "$versionText = (& $StagedBin --version 2>$null | Out-String).Trim()",
+        "if (-not $versionText) { throw 'failed to read staged yggterm version' }",
+        "$version = $versionText",
+        "if ($versionText -match '([0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][^\\s]+)?)') { $version = $Matches[1] }",
+        "$installRoot = Join-Path $env:LOCALAPPDATA 'Yggterm'",
+        "$versionDir = Join-Path (Join-Path $installRoot 'versions') $version",
+        "New-Item -ItemType Directory -Force -Path $installRoot, (Split-Path -Parent $versionDir), $versionDir | Out-Null",
+        "$installedExe = Join-Path $versionDir 'yggterm.exe'",
+        "$installedHeadless = Join-Path $versionDir 'yggterm-headless.exe'",
+        "$installedMock = Join-Path $versionDir 'yggterm-mock-cli.exe'",
+        "$installedLoader = Join-Path $versionDir 'WebView2Loader.dll'",
+        "$stagedHeadless = Get-ChildItem -Path $RemoteRoot -Filter 'yggterm-headless*.exe' -File -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -Last 1",
+        "$stagedMock = Get-ChildItem -Path $RemoteRoot -Filter 'yggterm-mock-cli*.exe' -File -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -Last 1",
+        "$stagedLoader = Get-ChildItem -Path $RemoteRoot -Filter 'WebView2Loader*.dll' -File -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -Last 1",
+        "if (-not $stagedHeadless) { throw 'staged artifact is missing yggterm-headless.exe' }",
+        "if (-not $stagedLoader) { throw 'staged artifact is missing WebView2Loader.dll' }",
+        "Copy-Item $StagedBin $installedExe -Force",
+        "Copy-Item $stagedHeadless.FullName $installedHeadless -Force",
+        "if ($stagedMock) { Copy-Item $stagedMock.FullName $installedMock -Force }",
+        "Copy-Item $stagedLoader.FullName $installedLoader -Force",
+        "$statePayload = @{ channel = 'direct'; repo = 'yggdrasilhq/yggterm'; asset_label = $AssetLabel; active_version = $version; active_executable = $installedExe; icon_revision = $version }",
+        "$state = $statePayload | ConvertTo-Json -Depth 6",
+        "$utf8NoBom = New-Object System.Text.UTF8Encoding($false)",
+        "[System.IO.File]::WriteAllText((Join-Path $installRoot 'install-state.json'), $state, $utf8NoBom)",
+        "$integrateOutput = $null",
+        "$startMenuShortcut = Join-Path $env:APPDATA 'Microsoft\\Windows\\Start Menu\\Programs\\Yggterm.lnk'",
+        "$legacyShortcut = Join-Path $env:APPDATA 'Microsoft\\Windows\\Start Menu\\Programs\\Yggterm\\Yggterm.lnk'",
+        "$legacyShortcutDir = Join-Path $env:APPDATA 'Microsoft\\Windows\\Start Menu\\Programs\\Yggterm'",
+        "$appPathsKey = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\yggterm.exe'",
+        "$uninstallKey = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Yggterm'",
+        "if (Test-Path -LiteralPath $legacyShortcut) { Remove-Item -LiteralPath $legacyShortcut -Force -ErrorAction SilentlyContinue }",
+        "if (Test-Path -LiteralPath $legacyShortcutDir) { Remove-Item -LiteralPath $legacyShortcutDir -Recurse -Force -ErrorAction SilentlyContinue }",
+        "$ws = New-Object -ComObject WScript.Shell",
+        "$sc = $ws.CreateShortcut($startMenuShortcut)",
+        "$sc.TargetPath = $installedExe",
+        "$sc.WorkingDirectory = $versionDir",
+        "$sc.IconLocation = \"$installedExe,0\"",
+        "$sc.Description = 'Remote-first terminal workspace'",
+        "$sc.Save()",
+        "& reg.exe add 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\yggterm.exe' /ve /d $installedExe /f | Out-Null",
+        "& reg.exe add 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\yggterm.exe' /v Path /d $versionDir /f | Out-Null",
+        "& reg.exe add 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Yggterm' /v DisplayName /d 'Yggterm' /f | Out-Null",
+        "& reg.exe add 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Yggterm' /v DisplayVersion /d $version /f | Out-Null",
+        "& reg.exe add 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Yggterm' /v DisplayIcon /d $installedExe /f | Out-Null",
+        "& reg.exe add 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Yggterm' /v InstallLocation /d $installRoot /f | Out-Null",
+        "& reg.exe add 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Yggterm' /v Publisher /d 'YggdrasilHQ' /f | Out-Null",
+        "$installedMockPath = $null",
+        "if (Test-Path $installedMock) { $installedMockPath = $installedMock }",
+        "$result = @{ asset_label = $AssetLabel; version_text = $versionText; version = $version; install_root = $installRoot; installed_exe = $installedExe; installed_headless = $installedHeadless; installed_mock = $installedMockPath; installed_loader = $installedLoader; integrate_output = $integrateOutput; start_menu_shortcut = $startMenuShortcut; start_menu_shortcut_exists = (Test-Path $startMenuShortcut); legacy_start_menu_shortcut_exists = (Test-Path $legacyShortcut); app_paths_exists = (Test-Path $appPathsKey); uninstall_key_exists = (Test-Path $uninstallKey) }",
+        "$result | ConvertTo-Json -Depth 8 -Compress",
+    ]
+    script = ";\n".join(statements) + "\n"
+    return run_remote_powershell_json(host, script)
+
+
+def query_windows_install_integration(host: str) -> dict:
+    statements = [
+        "$ErrorActionPreference = 'Stop'",
+        "$installRoot = Join-Path $env:LOCALAPPDATA 'Yggterm'",
+        "$installState = Join-Path $installRoot 'install-state.json'",
+        "$startMenuShortcut = Join-Path $env:APPDATA 'Microsoft\\Windows\\Start Menu\\Programs\\Yggterm.lnk'",
+        "$legacyShortcut = Join-Path $env:APPDATA 'Microsoft\\Windows\\Start Menu\\Programs\\Yggterm\\Yggterm.lnk'",
+        "$appPathsKey = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\yggterm.exe'",
+        "$uninstallKey = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Yggterm'",
+        "$installStateJson = $null",
+        "if (Test-Path $installState) { try { $installStateJson = Get-Content $installState -Raw | ConvertFrom-Json } catch {} }",
+        "$result = @{ install_root = $installRoot; install_root_exists = (Test-Path $installRoot); install_state_path = $installState; install_state_exists = (Test-Path $installState); install_state = $installStateJson; start_menu_shortcut = $startMenuShortcut; start_menu_shortcut_exists = (Test-Path $startMenuShortcut); legacy_start_menu_shortcut_exists = (Test-Path $legacyShortcut); app_paths_exists = (Test-Path $appPathsKey); uninstall_key_exists = (Test-Path $uninstallKey) }",
+        "$result | ConvertTo-Json -Depth 8 -Compress",
+    ]
+    script = ";\n".join(statements) + "\n"
+    return run_remote_powershell_json(host, script)
 
 
 def remote_app_json_command(
@@ -841,6 +937,7 @@ def main() -> int:
     launch_payload = None
     direct_spawn_pid = 0
     local_artifact_sha256 = None
+    artifact_hint = ""
     remote_version = None
     staged_support_files: list[str] = []
     staged_companion_binaries: list[str] = []
@@ -856,6 +953,8 @@ def main() -> int:
     windows_error_events_before_launch: list[dict] = []
     windows_error_events_after_launch: list[dict] = []
     new_windows_error_events: list[dict] = []
+    install_summary: dict | None = None
+    install_integration: dict | None = None
 
     try:
         try:
@@ -883,6 +982,7 @@ def main() -> int:
         if artifact_value:
             artifact = Path(artifact_value).expanduser()
             if artifact.exists():
+                artifact_hint = artifact.name
                 local_artifact_sha256 = sha256_file(artifact)
                 stage_artifact(args.host, artifact, remote_root)
                 staged_support_files = stage_support_files(
@@ -897,6 +997,14 @@ def main() -> int:
                 )
 
         remote_bin = resolve_remote_bin(args.host, remote_dir_name, args.remote_bin)
+        if args.install:
+            install_summary = install_staged_windows_artifact(
+                args.host,
+                remote_root,
+                remote_bin,
+                artifact_hint or remote_bin,
+            )
+            remote_bin = str(install_summary.get("installed_exe") or "").strip() or remote_bin
         remote_control_bin = next(
             (
                 path
@@ -906,10 +1014,27 @@ def main() -> int:
             ),
             remote_bin,
         )
+        if args.install:
+            installed_headless = str((install_summary or {}).get("installed_headless") or "").strip()
+            if installed_headless:
+                remote_control_bin = installed_headless
         try:
             remote_version = remote_binary_version(args.host, remote_bin)
         except Exception:
             remote_version = None
+        if install_summary is not None and not remote_version:
+            remote_version = str(install_summary.get("version") or "").strip() or None
+        if args.install:
+            install_integration = query_windows_install_integration(args.host)
+            if not (
+                bool(install_integration.get("install_state_exists"))
+                and bool(install_integration.get("start_menu_shortcut_exists"))
+                and bool(install_integration.get("app_paths_exists"))
+            ):
+                raise RuntimeError(
+                    "Windows staged install did not produce the expected shell integration: "
+                    f"{install_integration!r}"
+                )
         remote_root_path = PureWindowsPath(remote_root)
         remote_home = str(remote_root_path / "home")
         remote_log = str(remote_root_path / "client.log")
@@ -1071,6 +1196,8 @@ def main() -> int:
             "local_artifact_sha256": local_artifact_sha256,
             "staged_support_files": staged_support_files,
             "staged_companion_binaries": staged_companion_binaries,
+            "install_summary": install_summary,
+            "install_integration": install_integration,
             "owned_processes_before_launch": owned_processes_before_launch,
             "killed_processes_prelaunch": killed_processes_prelaunch,
             "owned_processes_after_prelaunch_cleanup": owned_processes_after_prelaunch_cleanup,
@@ -1106,6 +1233,8 @@ def main() -> int:
             "local_artifact_sha256": local_artifact_sha256,
             "staged_support_files": staged_support_files,
             "staged_companion_binaries": staged_companion_binaries,
+            "install_summary": install_summary,
+            "install_integration": install_integration,
             "owned_processes_before_launch": owned_processes_before_launch,
             "killed_processes_prelaunch": killed_processes_prelaunch,
             "owned_processes_after_prelaunch_cleanup": owned_processes_after_prelaunch_cleanup,
