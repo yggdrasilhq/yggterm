@@ -642,15 +642,10 @@ fn refresh_windows_gui_launcher(executable_path: &Path) -> Result<PathBuf> {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| working_dir.clone());
     let launcher_path = install_root.join("Yggterm.vbs");
-    let command = format!(
-        "cmd.exe /c start \"\" /D \"{}\" /B \"{}\"",
+    let script = format!(
+        "Set shell = CreateObject(\"WScript.Shell\")\r\nshell.CurrentDirectory = \"{}\"\r\nshell.Run \"\"\"{}\"\"\", 0, False\r\n",
         vbscript_escape(working_dir.as_os_str().to_string_lossy().as_ref()),
         vbscript_escape(executable_path.as_os_str().to_string_lossy().as_ref()),
-    );
-    let script = format!(
-        "Set shell = CreateObject(\"WScript.Shell\")\r\nshell.CurrentDirectory = \"{}\"\r\nshell.Run \"{}\", 0, False\r\n",
-        vbscript_escape(working_dir.as_os_str().to_string_lossy().as_ref()),
-        vbscript_escape(&command),
     );
     write_if_changed(&launcher_path, script.as_bytes())?;
     Ok(launcher_path)
