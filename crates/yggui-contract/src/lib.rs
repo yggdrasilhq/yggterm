@@ -44,3 +44,10 @@ impl Default for YgguiThemeSpec {
         }
     }
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum YgguiClipboardContents {
+    Text { text: String },
+    PngBase64 { png_base64: String },
+}

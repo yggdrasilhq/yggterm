@@ -4,6 +4,14 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.16
+
+### Fixed
+
+- harden remote Windows proof runs so startup system-error dialogs and fresh Application-log crashes are treated as release blockers instead of slipping through green screenshots
+- stage macOS remote smoke launches as a real `Yggterm.app`, add native bundle icon generation for direct installs, and fail fast when the frontmost app name still leaks the raw artifact name instead of `Yggterm`
+- stop cleaning up live macOS GUI clients as if they were stale Linux `/proc` entries, and move the native mac window onto a unified full-size transparent titlebar path in the shared shell layer
+
 ## 2.1.15
 
 ### Fixed

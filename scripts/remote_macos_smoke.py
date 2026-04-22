@@ -5,11 +5,17 @@ import time
 from pathlib import Path
 
 from remote_linux_x11_smoke import quote, scp_from, scp_to, ssh_shell
-from smoke_app_control_bootstrap import assert_blur_expectation, problem_notifications
+from smoke_app_control_bootstrap import (
+    assert_blur_expectation,
+    problem_notifications,
+    screenshot_backend,
+    screenshot_backend_attempts,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ARTIFACT = ROOT / "dist" / "yggterm-macos-x86_64"
+DEFAULT_ICON = ROOT / "assets" / "brand" / "yggterm-icon-512.png"
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,12 +38,32 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_remote_dir(host: str, remote_dir: str) -> str:
+    if remote_dir.startswith("/"):
+        return remote_dir
+    proc = ssh_shell(host, "printf '%s\\n' \"$HOME\"")
+    home_dir = proc.stdout.strip()
+    if not home_dir:
+        raise RuntimeError(f"could not resolve remote home directory on {host}")
+    return f"{home_dir}/{remote_dir}"
+
+
 def remote_env_exports(env: dict[str, str]) -> str:
     chunks = []
     for key, value in env.items():
         if value:
             chunks.append(f"export {key}={quote(value)}")
     return "; ".join(chunks)
+
+
+def frontmost_macos_app_name(host: str) -> str | None:
+    proc = ssh_shell(
+        host,
+        'osascript -e \'tell application "System Events" to get name of first application process whose frontmost is true\'',
+        check=False,
+    )
+    text = proc.stdout.strip() or proc.stderr.strip()
+    return text or None
 
 
 def macos_session_info(host: str) -> dict:
@@ -49,11 +75,22 @@ user="$(id -un)"
 console_user="$(stat -f '%Su' /dev/console 2>/dev/null || true)"
 arch="$(uname -m)"
 python3_bin="$(command -v python3 || true)"
+finder_count="$(pgrep -x Finder | wc -l | tr -d ' ')"
+dock_count="$(pgrep -x Dock | wc -l | tr -d ' ')"
+loginwindow_count="$(pgrep -x loginwindow | wc -l | tr -d ' ')"
+aqua_domain_present=0
+if launchctl print "gui/$uid" >/dev/null 2>&1; then
+  aqua_domain_present=1
+fi
 printf 'uid=%s\n' "$uid"
 printf 'user=%s\n' "$user"
 printf 'console_user=%s\n' "$console_user"
 printf 'arch=%s\n' "$arch"
 printf 'python3=%s\n' "$python3_bin"
+printf 'finder_count=%s\n' "$finder_count"
+printf 'dock_count=%s\n' "$dock_count"
+printf 'loginwindow_count=%s\n' "$loginwindow_count"
+printf 'aqua_domain_present=%s\n' "$aqua_domain_present"
 printf '__SW_VERS__\n'
 sw_vers
 """,
@@ -78,8 +115,21 @@ sw_vers
         "console_user": props.get("console_user") or "",
         "arch": props.get("arch") or "",
         "python3": props.get("python3") or "",
+        "finder_count": int(props.get("finder_count") or 0),
+        "dock_count": int(props.get("dock_count") or 0),
+        "loginwindow_count": int(props.get("loginwindow_count") or 0),
+        "aqua_domain_present": props.get("aqua_domain_present") == "1",
         "sw_vers": "\n".join(sw_vers_lines).strip(),
     }
+
+
+def macos_desktop_ready(session_info: dict) -> bool:
+    return (
+        session_info.get("console_user") == session_info.get("user")
+        and bool(session_info.get("aqua_domain_present"))
+        and int(session_info.get("finder_count") or 0) > 0
+        and int(session_info.get("dock_count") or 0) > 0
+    )
 
 
 def stage_artifact(host: str, artifact: Path, remote_dir: str) -> str:
@@ -105,6 +155,78 @@ def stage_artifact(host: str, artifact: Path, remote_dir: str) -> str:
     return remote_rel
 
 
+def stage_macos_app_bundle(host: str, remote_dir: str, remote_bin: str) -> str:
+    remote_app = f"{remote_dir}/Yggterm.app"
+    remote_icon = f"{remote_dir}/yggterm-icon-512.png"
+    if DEFAULT_ICON.exists():
+        scp_to(host, DEFAULT_ICON, remote_icon)
+    ssh_shell(
+        host,
+        f"""
+set -e
+app={quote(remote_app)}
+bin={quote(remote_bin)}
+resources="$app/Contents/Resources"
+macos="$app/Contents/MacOS"
+mkdir -p "$resources" "$macos"
+cp "$bin" "$macos/Yggterm"
+chmod +x "$macos/Yggterm"
+icon_file="yggterm.png"
+if [ -f {quote(remote_icon)} ]; then
+  cp {quote(remote_icon)} "$resources/yggterm.png"
+  if command -v sips >/dev/null 2>&1 && command -v iconutil >/dev/null 2>&1; then
+    iconset={quote(remote_dir + '/yggterm.iconset')}
+    rm -rf "$iconset"
+    mkdir -p "$iconset"
+    for spec in \
+      "16:icon_16x16.png" \
+      "32:icon_16x16@2x.png" \
+      "32:icon_32x32.png" \
+      "64:icon_32x32@2x.png" \
+      "128:icon_128x128.png" \
+      "256:icon_128x128@2x.png" \
+      "256:icon_256x256.png" \
+      "512:icon_256x256@2x.png" \
+      "512:icon_512x512.png" \
+      "1024:icon_512x512@2x.png"
+    do
+      size="${{spec%%:*}}"
+      name="${{spec#*:}}"
+      sips -z "$size" "$size" {quote(remote_icon)} --out "$iconset/$name" >/dev/null
+    done
+    if iconutil -c icns "$iconset" -o "$resources/yggterm.icns" >/dev/null 2>&1; then
+      icon_file="yggterm.icns"
+    fi
+    rm -rf "$iconset"
+  fi
+fi
+cat > "$app/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>
+  <string>Yggterm</string>
+  <key>CFBundleDisplayName</key>
+  <string>Yggterm</string>
+  <key>CFBundleIdentifier</key>
+  <string>dev.yggterm.Yggterm.Smoke</string>
+  <key>CFBundleExecutable</key>
+  <string>Yggterm</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleIconFile</key>
+  <string>$icon_file</string>
+  <key>LSBackgroundOnly</key>
+  <false/>
+</dict>
+</plist>
+PLIST
+""",
+    )
+    return remote_app
+
+
 def resolve_remote_bin(host: str, remote_dir: str, args: argparse.Namespace) -> str:
     if args.remote_bin:
         return args.remote_bin
@@ -124,6 +246,27 @@ def resolve_remote_bin(host: str, remote_dir: str, args: argparse.Namespace) -> 
     if proc.returncode != 0 or not path:
         raise RuntimeError(f"could not resolve a remote macOS yggterm binary on {host}")
     return path
+
+
+def remote_binary_version(host: str, remote_bin: str) -> str | None:
+    proc = ssh_shell(host, f"{quote(remote_bin)} --version", check=False)
+    text = proc.stdout.strip() or proc.stderr.strip()
+    return text or None
+
+
+def probe_remote_clients(host: str, remote_bin: str) -> dict | None:
+    proc = ssh_shell(
+        host,
+        f"{quote(remote_bin)} server app clients --timeout-ms 5000",
+        check=False,
+    )
+    text = proc.stdout.strip()
+    if proc.returncode != 0 or not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
 
 
 def remote_json_command(
@@ -200,8 +343,20 @@ def spawn_direct_macos_app(
     remote_bin: str,
     env: dict[str, str],
     remote_log: str,
+    remote_app: str | None = None,
 ) -> dict:
     exports = remote_env_exports(env)
+    if remote_app:
+        ssh_shell(
+            host,
+            f"mkdir -p {quote(Path(remote_log).parent.as_posix())}; "
+            f"{exports}; open -na {quote(remote_app)} >/dev/null 2>&1",
+        )
+        return {
+            "mode": "app_bundle_open",
+            "app_bundle": remote_app,
+            "stdout_log": remote_log,
+        }
     proc = ssh_shell(
         host,
         f"mkdir -p {quote(Path(remote_log).parent.as_posix())}; "
@@ -299,14 +454,60 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     proof_dir = out_dir / "proof"
     proof_dir.mkdir(parents=True, exist_ok=True)
-    remote_dir = args.remote_dir or f"yggterm-remote-macos-{int(time.time())}"
+    remote_dir = resolve_remote_dir(
+        args.host,
+        args.remote_dir or f"yggterm-remote-macos-{int(time.time())}",
+    )
     remote_home = f"{remote_dir}/home"
     remote_log = f"{remote_dir}/client.log"
     local_summary_path = out_dir / "summary.json"
+    remote_bin = ""
+    remote_app = None
+    remote_version = None
+    remote_bin_error = None
+    remote_clients_probe = None
+    frontmost_app_name = None
 
     session_info = macos_session_info(args.host)
     ssh_shell(args.host, f"mkdir -p {quote(remote_dir)} {quote(remote_home)}")
-    remote_bin = ""
+    try:
+        remote_bin = resolve_remote_bin(args.host, remote_dir, args)
+        remote_app = stage_macos_app_bundle(args.host, remote_dir, remote_bin)
+        try:
+            remote_version = remote_binary_version(args.host, remote_bin)
+        except Exception:
+            remote_version = None
+        try:
+            remote_clients_probe = probe_remote_clients(args.host, remote_bin)
+        except Exception:
+            remote_clients_probe = None
+    except Exception as exc:  # noqa: BLE001
+        remote_bin_error = str(exc)
+    if not macos_desktop_ready(session_info):
+        summary = {
+            "host": args.host,
+            "session_info": session_info,
+            "remote_dir": remote_dir,
+            "remote_home": remote_home,
+            "remote_bin": remote_bin or None,
+            "remote_app": remote_app,
+            "remote_version": remote_version,
+            "remote_bin_error": remote_bin_error,
+            "remote_clients_probe": remote_clients_probe,
+            "frontmost_app_name": frontmost_app_name,
+            "pid": None,
+            "owned_launch": False,
+            "launch": None,
+            "prereq_failure": "no_active_aqua_session",
+            "error": (
+                "remote macOS host does not currently expose an interactive Aqua desktop session "
+                f"for user {session_info.get('user')!r}: {session_info!r}"
+            ),
+            "local_proof_dir": str(proof_dir),
+        }
+        local_summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        print(local_summary_path)
+        return 1
     launch_env = {
         "YGGTERM_HOME": remote_home,
         "YGGTERM_ALLOW_MULTI_WINDOW": "1",
@@ -317,7 +518,8 @@ def main() -> int:
     launch_payload = None
     direct_spawn_pid = 0
     try:
-        remote_bin = resolve_remote_bin(args.host, remote_dir, args)
+        if not remote_bin:
+            raise RuntimeError(remote_bin_error or f"could not resolve remote macOS binary on {args.host}")
         if args.attach_only:
             clients_payload = remote_json_command(
                 args.host,
@@ -362,18 +564,30 @@ def main() -> int:
                         remote_bin,
                         launch_env,
                         remote_log,
+                        remote_app,
                     ),
                 }
+                owned_launch = True
                 direct_spawn_pid = int(
                     ((launch_payload.get("spawn") or {}).get("spawn_pid")) or 0
                 )
+                if remote_app:
+                    for _ in range(40):
+                        frontmost_app_name = frontmost_macos_app_name(args.host)
+                        if frontmost_app_name:
+                            break
+                        time.sleep(0.25)
+                    if frontmost_app_name != "Yggterm":
+                        raise RuntimeError(
+                            "staged macOS app bundle did not present the correct frontmost app name: "
+                            f"{frontmost_app_name!r}"
+                        )
                 pid = wait_for_client_pid(
                     args.host,
                     remote_bin,
                     launch_env,
                     args.timeout_ms,
                 )
-                owned_launch = True
 
         state = wait_for_ready_state(
             args.host,
@@ -430,6 +644,8 @@ def main() -> int:
             "rows_path": str(rows_path),
             "screenshot_path": str(screenshot_path) if screenshot_path.exists() else None,
             "screenshot_response": screenshot_response,
+            "screenshot_backend": screenshot_backend(screenshot_response),
+            "screenshot_backend_attempts": screenshot_backend_attempts(screenshot_response),
             "screenshot_error": screenshot_error,
         }
         summary_path.write_text(json.dumps(proof_summary, indent=2), encoding="utf-8")
@@ -440,6 +656,10 @@ def main() -> int:
             "remote_dir": remote_dir,
             "remote_home": remote_home,
             "remote_bin": remote_bin,
+            "remote_app": remote_app,
+            "remote_version": remote_version,
+            "remote_clients_probe": remote_clients_probe,
+            "frontmost_app_name": frontmost_app_name,
             "pid": pid,
             "owned_launch": owned_launch,
             "launch": launch_payload,
@@ -456,6 +676,11 @@ def main() -> int:
             "remote_dir": remote_dir,
             "remote_home": remote_home,
             "remote_bin": remote_bin or None,
+            "remote_app": remote_app,
+            "remote_version": remote_version,
+            "remote_bin_error": remote_bin_error,
+            "remote_clients_probe": remote_clients_probe,
+            "frontmost_app_name": frontmost_app_name,
             "pid": pid or None,
             "owned_launch": owned_launch,
             "launch": launch_payload,
@@ -466,6 +691,18 @@ def main() -> int:
         print(local_summary_path)
         return_code = 1
     finally:
+        if owned_launch and direct_spawn_pid > 0:
+            ssh_shell(
+                args.host,
+                f"kill -TERM {direct_spawn_pid} >/dev/null 2>&1 || true",
+                check=False,
+            )
+            time.sleep(0.5)
+            ssh_shell(
+                args.host,
+                f"kill -0 {direct_spawn_pid} >/dev/null 2>&1 && kill -KILL {direct_spawn_pid} >/dev/null 2>&1 || true",
+                check=False,
+            )
         if pid > 0 and owned_launch:
             try:
                 remote_json_command(

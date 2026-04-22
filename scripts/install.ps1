@@ -46,10 +46,20 @@ try {
 
   $sourceExe = Join-Path $tempDir "yggterm-$targetLabel.exe"
   $sourceHeadlessExe = Join-Path $tempDir "yggterm-headless-$targetLabel.exe"
+  $sourceWebView2Loader = Join-Path $tempDir "WebView2Loader-$targetLabel.dll"
+  if (-not (Test-Path $sourceWebView2Loader)) {
+    $sourceWebView2Loader = Join-Path $tempDir "WebView2Loader.dll"
+  }
   $installedExe = Join-Path $versionDir "yggterm.exe"
   $installedHeadlessExe = Join-Path $versionDir "yggterm-headless.exe"
+  $installedWebView2Loader = Join-Path $versionDir "WebView2Loader.dll"
   Copy-Item $sourceExe $installedExe -Force
   Copy-Item $sourceHeadlessExe $installedHeadlessExe -Force
+  if (Test-Path $sourceWebView2Loader) {
+    Copy-Item $sourceWebView2Loader $installedWebView2Loader -Force
+  } else {
+    throw "release archive is missing WebView2Loader.dll"
+  }
 
   $state = @{
     channel = "direct"

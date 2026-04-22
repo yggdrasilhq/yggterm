@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 use yggterm_core::UiTheme;
+use yggui_contract::YgguiClipboardContents;
 
 const APP_CONTROL_REQUESTS_DIR: &str = "app-control-requests";
 const APP_CONTROL_RESPONSES_DIR: &str = "app-control-responses";
@@ -137,12 +138,8 @@ pub enum AppControlPointerCommand {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum AppControlKeyCommand {
-    Press {
-        keys: Vec<String>,
-    },
-    Type {
-        text: String,
-    },
+    Press { keys: Vec<String> },
+    Type { text: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -192,6 +189,12 @@ pub enum AppControlCommand {
     },
     SetFullscreen {
         enabled: bool,
+    },
+    SetWindowChromeHover {
+        active: bool,
+    },
+    SetClipboardContents {
+        contents: YgguiClipboardContents,
     },
     BackgroundWindow,
     MoveWindowBy {
@@ -286,6 +289,8 @@ impl AppControlCommand {
             Self::CaptureScreenRecording { .. } => "capture_screen_recording",
             Self::SetMaximized { .. } => "set_maximized",
             Self::SetFullscreen { .. } => "set_fullscreen",
+            Self::SetWindowChromeHover { .. } => "set_window_chrome_hover",
+            Self::SetClipboardContents { .. } => "set_clipboard_contents",
             Self::BackgroundWindow => "background_window",
             Self::MoveWindowBy { .. } => "move_window_by",
             Self::CloseWindow => "close_window",
