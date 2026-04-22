@@ -6,6 +6,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from PIL import Image
+
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = Path(os.environ.get("YGGTERM_BIN") or (ROOT / "target" / "debug" / "yggterm"))
@@ -154,6 +156,28 @@ def screenshot_backend_attempts(payload: dict | None) -> list[str]:
     if not isinstance(attempts, list):
         return []
     return [str(item) for item in attempts if str(item).strip()]
+
+
+def assert_screenshot_file_usable(path: Path) -> dict:
+    if not path.exists():
+        raise RuntimeError(f"screenshot file was not created: {path}")
+    with Image.open(path) as image:
+        rgba = image.convert("RGBA")
+        extrema = rgba.getextrema()
+        if len(extrema) != 4:
+            raise RuntimeError(f"unexpected screenshot channel layout for {path}: {extrema!r}")
+        if all(channel_max == 0 for _, channel_max in extrema):
+            raise RuntimeError(
+                f"screenshot {path} is fully blank, all RGBA channels are zero: extrema={extrema!r}"
+            )
+        if extrema[3][1] == 0:
+            raise RuntimeError(
+                f"screenshot {path} is fully transparent, alpha never rises above zero: extrema={extrema!r}"
+            )
+        return {
+            "size": {"width": rgba.width, "height": rgba.height},
+            "extrema": extrema,
+        }
 
 
 def problem_notifications(state: dict) -> list[dict]:
@@ -309,8 +333,10 @@ def main() -> int:
 
     screenshot = None
     screenshot_error = None
+    screenshot_quality = None
     try:
         screenshot = app_screenshot(bin_path, pid, screenshot_path, args.timeout_ms)
+        screenshot_quality = assert_screenshot_file_usable(screenshot_path)
     except Exception as exc:  # noqa: BLE001
         screenshot_error = str(exc)
 
@@ -335,6 +361,7 @@ def main() -> int:
         "screenshot_response": screenshot,
         "screenshot_backend": screenshot_backend(screenshot),
         "screenshot_backend_attempts": screenshot_backend_attempts(screenshot),
+        "screenshot_quality": screenshot_quality,
         "screenshot_error": screenshot_error,
     }
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
