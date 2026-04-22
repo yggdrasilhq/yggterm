@@ -10,7 +10,7 @@ pub mod theme;
 
 pub use chrome::{
     ChromeControlIcon, ChromePalette, HoveredChromeControl, TitlebarChrome, WindowControlsStrip,
-    search_input_style,
+    search_field_shell_style, search_input_style,
 };
 pub use drag_tree::{
     DragDropPlacement, DragDropTarget, TreeDropPlacement, TreeReorderItem, TreeReorderPlanItem,

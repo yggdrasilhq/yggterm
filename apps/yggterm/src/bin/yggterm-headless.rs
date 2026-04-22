@@ -1,17 +1,20 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use yggterm_core::{SessionStore, detect_install_context, refresh_desktop_integration};
 use yggterm_server::{
     AppControlRightPanelMode, AppControlViewMode, cleanup_legacy_daemons, default_endpoint,
-    detect_ghostty_host, ensure_local_daemon_running, ping, run_app_control_create_terminal,
-    run_app_control_describe_rows, run_app_control_describe_state, run_app_control_drag,
-    run_app_control_dump_state, run_app_control_focus_window, run_app_control_open_path,
+    detect_ghostty_host, ensure_local_daemon_running, ping, run_app_control_background_window,
+    run_app_control_close_window, run_app_control_create_terminal, run_app_control_describe_rows,
+    run_app_control_describe_state, run_app_control_drag, run_app_control_dump_state,
+    run_app_control_focus_window, run_app_control_list_clients, run_app_control_move_window_by,
+    run_app_control_open_path, run_app_control_paste_terminal_clipboard,
     run_app_control_paste_terminal_clipboard_image, run_app_control_remove_session,
     run_app_control_scroll_preview, run_app_control_send_terminal_input,
+    run_app_control_set_clipboard_png_base64, run_app_control_set_clipboard_text,
     run_app_control_set_fullscreen, run_app_control_set_main_zoom,
     run_app_control_set_right_panel_mode, run_app_control_set_row_expanded,
-    run_app_control_set_search, run_attach, run_daemon, run_screenrecord_capture,
-    run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, snapshot,
-    status, try_run_remote_server_command,
+    run_app_control_set_search, run_app_control_set_window_chrome_hover, run_attach, run_daemon,
+    run_screenrecord_capture, run_screenshot_capture, run_trace_bundle, run_trace_follow,
+    run_trace_tail, shutdown, snapshot, status, try_run_remote_server_command,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +71,41 @@ fn print_server_help() {
   yggterm-headless server screenrecord <target> [output]
   yggterm-headless server app <subcommand>"
     );
+}
+
+fn cli_positional_args(args: &[String], start: usize) -> Vec<&str> {
+    let mut positional = Vec::new();
+    let mut index = start;
+    while index < args.len() {
+        let value = args[index].as_str();
+        if value.starts_with("--") {
+            if index + 1 < args.len() && !args[index + 1].starts_with("--") {
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        positional.push(value);
+        index += 1;
+    }
+    positional
+}
+
+fn cli_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    let inline_prefix = format!("{flag}=");
+    for (index, value) in args.iter().enumerate() {
+        if value == flag {
+            return args
+                .get(index + 1)
+                .map(String::as_str)
+                .filter(|next| !next.starts_with("--"));
+        }
+        if let Some(inline) = value.strip_prefix(&inline_prefix) {
+            return Some(inline);
+        }
+    }
+    None
 }
 
 fn ensure_local_server_ready_for_cli(store: &SessionStore) -> Result<()> {
@@ -197,6 +235,22 @@ fn main() -> Result<()> {
         }
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "app" {
+        let preferred_pid = args.windows(2).find_map(|window| {
+            if window[0] == "--pid" {
+                window[1].parse::<u32>().ok()
+            } else {
+                None
+            }
+        });
+        if let Some(preferred_pid) = preferred_pid {
+            unsafe {
+                std::env::set_var("YGGTERM_APP_CONTROL_PID", preferred_pid.to_string());
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("YGGTERM_APP_CONTROL_PID");
+            }
+        }
         let timeout_ms = args
             .windows(2)
             .find_map(|window| {
@@ -219,11 +273,9 @@ fn main() -> Result<()> {
                         }
                     })
                     .unwrap_or("app");
-                let output_path = args
-                    .iter()
-                    .skip(3)
-                    .find(|value| !value.starts_with("--") && *value != target)
-                    .map(String::as_str);
+                let output_path = cli_positional_args(&args, 3)
+                    .into_iter()
+                    .find(|value| *value != target);
                 run_screenshot_capture(target, output_path, timeout_ms)
             }
             "screenrecord" => {
@@ -237,20 +289,15 @@ fn main() -> Result<()> {
                         }
                     })
                     .unwrap_or(10);
-                let output_path = args
-                    .iter()
-                    .skip(3)
-                    .find(|value| !value.starts_with("--"))
-                    .map(String::as_str);
+                let output_path = cli_positional_args(&args, 3).into_iter().next();
                 run_screenrecord_capture("app", output_path, timeout_ms, duration_secs)
             }
+            "clients" => run_app_control_list_clients(),
             "state" => run_app_control_describe_state(timeout_ms),
             "dump" => {
-                let output_path = args
-                    .iter()
-                    .skip(3)
-                    .find(|value| !value.starts_with("--"))
-                    .map(String::as_str)
+                let output_path = cli_positional_args(&args, 3)
+                    .into_iter()
+                    .next()
                     .ok_or_else(|| anyhow::anyhow!("missing output path for server app dump"))?;
                 run_app_control_dump_state(output_path, timeout_ms)
             }
@@ -299,29 +346,59 @@ fn main() -> Result<()> {
                 run_app_control_set_main_zoom(value, view_mode, timeout_ms)
             }
             "expand" | "collapse" => {
-                let row_path = args
-                    .iter()
-                    .skip(3)
-                    .find(|value| !value.starts_with("--"))
-                    .map(String::as_str)
+                let row_path = cli_positional_args(&args, 3)
+                    .into_iter()
+                    .next()
                     .ok_or_else(|| {
                         anyhow::anyhow!("missing row path for server app expand/collapse")
                     })?;
                 run_app_control_set_row_expanded(row_path, args[2] == "expand", timeout_ms)
             }
             "focus" => run_app_control_focus_window(timeout_ms),
+            "background" | "minimize" => run_app_control_background_window(timeout_ms),
+            "move-window" | "move-by" | "nudge" => {
+                let delta_x = args.windows(2).find_map(|window| {
+                    if window[0] == "--delta-x" || window[0] == "--dx" {
+                        window[1].parse::<f64>().ok()
+                    } else {
+                        None
+                    }
+                });
+                let delta_y = args.windows(2).find_map(|window| {
+                    if window[0] == "--delta-y" || window[0] == "--dy" {
+                        window[1].parse::<f64>().ok()
+                    } else {
+                        None
+                    }
+                });
+                run_app_control_move_window_by(
+                    delta_x.context("missing --delta-x/--dx for server app move-window")?,
+                    delta_y.context("missing --delta-y/--dy for server app move-window")?,
+                    timeout_ms,
+                )
+            }
+            "close" | "quit" | "exit" => run_app_control_close_window(timeout_ms),
+            "chrome-hover" | "titlebar-hover" => {
+                let active = cli_positional_args(&args, 3)
+                    .into_iter()
+                    .next()
+                    .map(|value| match value {
+                        "on" | "true" | "1" | "hover" | "enter" => Some(true),
+                        "off" | "false" | "0" | "leave" => Some(false),
+                        _ => None,
+                    })
+                    .flatten()
+                    .context("missing or invalid hover state for server app chrome-hover")?;
+                run_app_control_set_window_chrome_hover(active, timeout_ms)
+            }
             "search" => {
                 let action = args.get(3).map(String::as_str).unwrap_or("set");
                 match action {
                     "set" => {
-                        let query = args
-                            .iter()
-                            .skip(4)
-                            .find(|value| !value.starts_with("--"))
-                            .map(String::as_str)
-                            .ok_or_else(|| {
-                                anyhow::anyhow!("missing query for server app search set")
-                            })?;
+                        let query = cli_flag_value(&args, "--query")
+                            .or_else(|| cli_flag_value(&args, "--value"))
+                            .or_else(|| cli_positional_args(&args, 4).into_iter().next())
+                            .unwrap_or("");
                         let focused = args.windows(2).find_map(|window| {
                             if window[0] != "--focus" {
                                 return None;
@@ -338,12 +415,44 @@ fn main() -> Result<()> {
                     other => anyhow::bail!("unsupported app search action: {other}"),
                 }
             }
+            "clipboard" => {
+                let action = args.get(3).map(String::as_str).unwrap_or("text");
+                match action {
+                    "text" | "set" => {
+                        let value = cli_flag_value(&args, "--value")
+                            .or_else(|| cli_flag_value(&args, "--text"))
+                            .or_else(|| {
+                                args.iter()
+                                    .skip(4)
+                                    .find(|value| !value.starts_with("--"))
+                                    .map(String::as_str)
+                            })
+                            .unwrap_or("");
+                        run_app_control_set_clipboard_text(value, timeout_ms)
+                    }
+                    "png" | "image" | "png-base64" => {
+                        let value = cli_flag_value(&args, "--base64")
+                            .or_else(|| cli_flag_value(&args, "--value"))
+                            .or_else(|| {
+                                args.iter()
+                                    .skip(4)
+                                    .find(|value| !value.starts_with("--"))
+                                    .map(String::as_str)
+                            })
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "missing --base64/--value for server app clipboard image"
+                                )
+                            })?;
+                        run_app_control_set_clipboard_png_base64(value, timeout_ms)
+                    }
+                    other => anyhow::bail!("unsupported app clipboard action: {other}"),
+                }
+            }
             "panel" | "right-panel" => {
-                let mode = args
-                    .iter()
-                    .skip(3)
-                    .find(|value| !value.starts_with("--"))
-                    .map(String::as_str)
+                let mode = cli_positional_args(&args, 3)
+                    .into_iter()
+                    .next()
                     .unwrap_or("hidden");
                 let mode = match mode {
                     "hidden" | "hide" | "close" | "none" => AppControlRightPanelMode::Hidden,
@@ -356,11 +465,9 @@ fn main() -> Result<()> {
                 run_app_control_set_right_panel_mode(mode, timeout_ms)
             }
             "fullscreen" => {
-                let action = args
-                    .iter()
-                    .skip(3)
-                    .find(|value| !value.starts_with("--"))
-                    .map(String::as_str)
+                let action = cli_positional_args(&args, 3)
+                    .into_iter()
+                    .next()
                     .unwrap_or("toggle");
                 let current_state = yggterm_server::request_app_control(
                     store.home_dir(),
@@ -383,11 +490,9 @@ fn main() -> Result<()> {
                 run_app_control_set_fullscreen(enabled, timeout_ms)
             }
             "open" => {
-                let session_path = args
-                    .iter()
-                    .skip(3)
-                    .find(|value| !value.starts_with("--"))
-                    .map(String::as_str)
+                let session_path = cli_positional_args(&args, 3)
+                    .into_iter()
+                    .next()
                     .ok_or_else(|| anyhow::anyhow!("missing session path for server app open"))?;
                 let view_mode = args.windows(2).find_map(|window| {
                     if window[0] != "--view" {
@@ -406,11 +511,7 @@ fn main() -> Result<()> {
                     .get(3)
                     .map(String::as_str)
                     .ok_or_else(|| anyhow::anyhow!("missing action for server app drag"))?;
-                let row_path = args
-                    .iter()
-                    .skip(4)
-                    .find(|value| !value.starts_with("--"))
-                    .map(String::as_str);
+                let row_path = cli_positional_args(&args, 4).into_iter().next();
                 let placement = args.windows(2).find_map(|window| {
                     if window[0] == "--placement" {
                         Some(window[1].as_str())
@@ -451,11 +552,9 @@ fn main() -> Result<()> {
                         run_app_control_create_terminal(machine_key, cwd, title_hint, timeout_ms)
                     }
                     "send" => {
-                        let session_path = args
-                            .iter()
-                            .skip(4)
-                            .find(|value| !value.starts_with("--"))
-                            .map(String::as_str)
+                        let session_path = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
                             .ok_or_else(|| {
                                 anyhow::anyhow!("missing session path for server app terminal send")
                             })?;
@@ -473,12 +572,21 @@ fn main() -> Result<()> {
                             })?;
                         run_app_control_send_terminal_input(session_path, data, timeout_ms)
                     }
+                    "paste" => {
+                        let session_path = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "missing session path for server app terminal paste"
+                                )
+                            })?;
+                        run_app_control_paste_terminal_clipboard(session_path, timeout_ms)
+                    }
                     "paste-image" => {
-                        let session_path = args
-                            .iter()
-                            .skip(4)
-                            .find(|value| !value.starts_with("--"))
-                            .map(String::as_str)
+                        let session_path = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
                             .ok_or_else(|| {
                                 anyhow::anyhow!(
                                     "missing session path for server app terminal paste-image"
@@ -496,11 +604,9 @@ fn main() -> Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("missing action for server app session"))?;
                 match action {
                     "remove" | "delete" => {
-                        let session_path = args
-                            .iter()
-                            .skip(4)
-                            .find(|value| !value.starts_with("--"))
-                            .map(String::as_str)
+                        let session_path = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
                             .ok_or_else(|| {
                                 anyhow::anyhow!(
                                     "missing session path for server app session remove"
@@ -543,4 +649,27 @@ fn main() -> Result<()> {
     }
 
     anyhow::bail!("yggterm-headless only supports server subcommands");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cli_positional_args;
+
+    #[test]
+    fn cli_positional_args_skips_flag_values() {
+        let args = vec![
+            "server".to_string(),
+            "app".to_string(),
+            "screenshot".to_string(),
+            "--pid".to_string(),
+            "7064".to_string(),
+            "C:\\Users\\Admin\\window.png".to_string(),
+            "--timeout-ms".to_string(),
+            "20000".to_string(),
+        ];
+        assert_eq!(
+            cli_positional_args(&args, 3),
+            vec!["C:\\Users\\Admin\\window.png"]
+        );
+    }
 }

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import base64
 import colorsys
 import io
 import json
@@ -608,6 +609,7 @@ def app_set_search(pid: int, query: str, *, focused: bool | None = None) -> dict
         "set",
         "--pid",
         str(pid),
+        "--query",
         query,
         "--timeout-ms",
         "12000",
@@ -625,6 +627,19 @@ def app_set_right_panel_mode(pid: int, mode: str) -> dict:
         mode,
         "--pid",
         str(pid),
+        "--timeout-ms",
+        "12000",
+    )
+
+
+def app_set_window_chrome_hover(pid: int, active: bool) -> dict:
+    return run(
+        "server",
+        "app",
+        "chrome-hover",
+        "--pid",
+        str(pid),
+        "on" if active else "off",
         "--timeout-ms",
         "12000",
     )
@@ -739,6 +754,32 @@ def client_display_metadata(pid: int) -> tuple[str, str]:
     display = str(client_instance.get("display") or window.get("display") or "").strip()
     xauthority = str(client_instance.get("xauthority") or window.get("xauthority") or "").strip()
     return display, xauthority
+
+
+def client_gui_env_for_pid(pid: int) -> dict:
+    env = ENV.copy()
+    state = app_state(pid)
+    client_instance = state.get("client_instance") or {}
+    window = state.get("window") or {}
+    display = str(client_instance.get("display") or window.get("display") or "").strip()
+    xauthority = str(client_instance.get("xauthority") or window.get("xauthority") or "").strip()
+    wayland_display = str(
+        client_instance.get("wayland_display") or window.get("wayland_display") or ""
+    ).strip()
+    xdg_runtime_dir = str(
+        client_instance.get("xdg_runtime_dir") or window.get("xdg_runtime_dir") or ""
+    ).strip()
+    if display:
+        env["DISPLAY"] = display
+    if xauthority:
+        env["XAUTHORITY"] = xauthority
+    if wayland_display:
+        env["WAYLAND_DISPLAY"] = wayland_display
+    if xdg_runtime_dir:
+        env["XDG_RUNTIME_DIR"] = xdg_runtime_dir
+    if not display and not wayland_display:
+        raise AssertionError(f"client {pid} is missing GUI display metadata")
+    return env
 
 
 def process_rss_kb(pid: int) -> int:
@@ -1359,11 +1400,11 @@ def assert_idle_root_render_budget(pid: int) -> dict:
 
 
 def xdotool_env_for_pid(pid: int) -> dict:
-    env = ENV.copy()
-    display, xauthority = client_display_metadata(pid)
+    env = client_gui_env_for_pid(pid)
+    display = str(env.get("DISPLAY") or "").strip()
+    xauthority = str(env.get("XAUTHORITY") or "").strip()
     if not display:
         raise AssertionError(f"client {pid} is missing display metadata")
-    env["DISPLAY"] = display
     if xauthority:
         env["XAUTHORITY"] = xauthority
     return env
@@ -1973,15 +2014,10 @@ def xdotool_drag_window(pid: int, start_x: float, start_y: float, end_x: float, 
 
 def titlebar_drag_window(pid: int, start_x: float, start_y: float, end_x: float, end_y: float) -> dict:
     if POINTER_DRIVER == "app":
-        move = app_move_window_by(pid, end_x - start_x, end_y - start_y)
+        drag = xdotool_drag_window(pid, start_x, start_y, end_x, end_y)
         time.sleep(0.34)
-        return {
-            "window_id": "app",
-            "start": {"x": int(round(start_x)), "y": int(round(start_y))},
-            "end": {"x": int(round(end_x)), "y": int(round(end_y))},
-            "driver": "app-window",
-            "move": move,
-        }
+        drag["driver"] = "app"
+        return drag
     drag = xdotool_drag_window(pid, start_x, start_y, end_x, end_y)
     drag["driver"] = "xdotool"
     return drag
@@ -2103,99 +2139,46 @@ def xdotool_type_focused(pid: int, text: str) -> dict:
     }
 
 
-def spawn_clipboard_owner_for_pid(pid: int, args: list[str], payload: bytes) -> subprocess.Popen:
-    env = xdotool_env_for_pid(pid)
-    # Keep the test owner alive across clipboard-manager snoops plus the
-    # app's image-first probe before the text fallback runs.
-    proc = subprocess.Popen(
-        ["xclip", "-selection", "clipboard", "-loops", "20", *args],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        env=env,
-    )
-    assert proc.stdin is not None
-    proc.stdin.write(payload)
-    proc.stdin.close()
-    time.sleep(0.2)
-    if proc.poll() not in (None, 0):
-        stderr = (proc.stderr.read() if proc.stderr is not None else b"").decode("utf-8", "replace").strip()
-        raise AssertionError(stderr or f"xclip clipboard owner failed: {args!r}")
-    return proc
-
-
 def stop_clipboard_owner(proc: subprocess.Popen | None) -> None:
-    if proc is None:
-        return
-    if proc.poll() is None:
-        proc.terminate()
-        try:
-            proc.wait(timeout=1.5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=1.5)
+    return
 
 
-def set_clipboard_text_for_pid(pid: int, text: str) -> subprocess.Popen:
-    return spawn_clipboard_owner_for_pid(pid, ["-i"], text.encode("utf-8"))
+def set_clipboard_text_for_pid(pid: int, text: str) -> subprocess.Popen | None:
+    run(
+        "server",
+        "app",
+        "clipboard",
+        "text",
+        "--pid",
+        str(pid),
+        "--value",
+        text,
+        "--timeout-ms",
+        "12000",
+    )
+    time.sleep(0.18)
+    return None
 
 
-def set_clipboard_png_for_pid(pid: int) -> subprocess.Popen:
+def set_clipboard_png_for_pid(pid: int) -> subprocess.Popen | None:
     image = Image.new("RGBA", (12, 12), (124, 200, 255, 255))
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
-    env = xdotool_env_for_pid(pid)
-    script = r"""
-import signal
-import sys
-import gi
-gi.require_version('Gdk', '3.0')
-gi.require_version('GdkPixbuf', '2.0')
-gi.require_version('Gtk', '3.0')
-from gi.repository import Gdk, GdkPixbuf, GLib, Gtk
-
-payload = sys.stdin.buffer.read()
-if not payload:
-    raise SystemExit('missing png payload')
-
-loader = GdkPixbuf.PixbufLoader.new_with_type('png')
-loader.write(payload)
-loader.close()
-pixbuf = loader.get_pixbuf()
-if pixbuf is None:
-    raise SystemExit('failed to decode png payload')
-
-clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
-clipboard.set_image(pixbuf)
-clipboard.store()
-
-loop = GLib.MainLoop()
-
-def _stop(*_args):
-    try:
-        loop.quit()
-    except Exception:
-        pass
-
-signal.signal(signal.SIGTERM, _stop)
-signal.signal(signal.SIGINT, _stop)
-loop.run()
-"""
-    proc = subprocess.Popen(
-        ["python3", "-c", script],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        env=env,
+    payload = base64.b64encode(buffer.getvalue()).decode("ascii")
+    run(
+        "server",
+        "app",
+        "clipboard",
+        "image",
+        "--pid",
+        str(pid),
+        "--base64",
+        payload,
+        "--timeout-ms",
+        "12000",
     )
-    assert proc.stdin is not None
-    proc.stdin.write(buffer.getvalue())
-    proc.stdin.close()
-    time.sleep(0.3)
-    if proc.poll() not in (None, 0):
-        stderr = (proc.stderr.read() if proc.stderr is not None else b"").decode("utf-8", "replace").strip()
-        raise AssertionError(stderr or "gtk clipboard owner failed for image/png")
-    return proc
+    time.sleep(0.18)
+    return None
 
 
 def right_panel_mode(state: dict) -> str:
@@ -2251,6 +2234,30 @@ def wait_for_titlebar_autohide_state(
         "titlebar auto-hide state did not settle: "
         f"enabled={enabled!r} revealed={revealed!r} hover_active={hover_active!r} "
         f"toggle_enabled={toggle_enabled!r} state={last_state!r}"
+    )
+
+
+def titlebar_drag_request_count(state: dict) -> int:
+    shell = state.get("shell") or {}
+    return int(shell.get("titlebar_drag_request_count") or 0)
+
+
+def wait_for_titlebar_drag_request(
+    pid: int,
+    previous_count: int,
+    *,
+    timeout_seconds: float = 2.5,
+) -> dict:
+    deadline = time.time() + timeout_seconds
+    last_state = {}
+    while time.time() < deadline:
+        last_state = app_state(pid)
+        if titlebar_drag_request_count(last_state) > previous_count:
+            return last_state
+        time.sleep(0.12)
+    raise AssertionError(
+        "titlebar drag request did not register through app-control observability: "
+        f"previous_count={previous_count} state={last_state!r}"
     )
 
 
@@ -2517,6 +2524,33 @@ def parse_css_px(value: object) -> float | None:
         return float(text)
     except ValueError:
         return None
+
+
+def parse_css_radius_values(value: object) -> list[float]:
+    text = str(value or "").strip().lower().replace("/", " ").replace(",", " ")
+    if not text:
+        return []
+    values: list[float] = []
+    for part in text.split():
+        px = parse_css_px(part)
+        if px is not None:
+            values.append(px)
+    return values
+
+
+def css_radius_delta(left: object, right: object) -> float | None:
+    left_values = parse_css_radius_values(left)
+    right_values = parse_css_radius_values(right)
+    if not left_values or not right_values:
+        return None
+    max_len = max(len(left_values), len(right_values))
+    if len(left_values) == 1:
+        left_values = left_values * max_len
+    if len(right_values) == 1:
+        right_values = right_values * max_len
+    if len(left_values) != len(right_values):
+        return None
+    return max(abs(l - r) for l, r in zip(left_values, right_values))
 
 
 def rgba_distance(left: tuple[int, int, int, int], right: tuple[int, int, int, int]) -> float:
@@ -5200,13 +5234,38 @@ def assert_search_focus_overlay_contract(pid: int, session: str) -> dict:
         baseline = app_state(pid)
     baseline_titlebar = dom_rect(baseline, "titlebar_rect")
     baseline_host = active_host(baseline).get("host_rect") or {}
+    baseline_dom = baseline.get("dom") or {}
     search_input_rect = dom_rect(baseline, "titlebar_search_input_rect")
+    baseline_search_field_shell_rect = dom_rect(baseline, "titlebar_search_field_shell_rect")
+    baseline_search_field_shell_background = str(
+        baseline_dom.get("titlebar_search_field_shell_background") or ""
+    )
+    baseline_search_field_shell_box_shadow = str(
+        baseline_dom.get("titlebar_search_field_shell_box_shadow") or ""
+    ).lower()
+    baseline_search_field_shell_border_radius = str(
+        baseline_dom.get("titlebar_search_field_shell_border_radius") or ""
+    )
     if not rect_is_visible(baseline_titlebar):
         raise AssertionError(f"baseline titlebar rect missing: {baseline_titlebar!r}")
     if not rect_is_visible(baseline_host):
         raise AssertionError(f"baseline host rect missing: {baseline_host!r}")
     if not rect_is_visible(search_input_rect):
         raise AssertionError(f"baseline titlebar search input rect missing: {search_input_rect!r}")
+    if not rect_is_visible(baseline_search_field_shell_rect):
+        raise AssertionError(
+            f"baseline titlebar search field shell rect missing: {baseline_search_field_shell_rect!r}"
+        )
+    if is_transparent_css_color(baseline_search_field_shell_background):
+        raise AssertionError(
+            "baseline titlebar search field shell lost its visible chrome before focus: "
+            f"background={baseline_search_field_shell_background!r}"
+        )
+    if baseline_search_field_shell_box_shadow in ("", "none"):
+        raise AssertionError(
+            "baseline titlebar search field shell lost its supporting chrome shadow/border before focus: "
+            f"box_shadow={baseline_search_field_shell_box_shadow!r}"
+        )
 
     app_set_search(pid, "", focused=False)
     time.sleep(0.12)
@@ -5257,33 +5316,45 @@ def assert_search_focus_overlay_contract(pid: int, session: str) -> dict:
             f"click={click!r} active_element={active_element!r} focused={focused!r}"
         )
 
-    focused_settle_deadline = time.time() + 2.5
-    while time.time() < focused_settle_deadline:
-        titlebar_rect = dom_rect(focused, "titlebar_rect")
-        search_modal_rect = dom_rect(focused, "titlebar_search_outer_shell_rect")
-        search_shell_rect = dom_rect(focused, "titlebar_search_field_shell_rect")
-        search_dropdown_rect = dom_rect(focused, "titlebar_search_dropdown_rect")
-        search_dropdown_header_rect = dom_rect(focused, "titlebar_search_dropdown_header_rect")
-        search_dropdown_entry_rects = list((focused.get("dom") or {}).get("titlebar_search_dropdown_entry_rects") or [])
-        if (
-            rect_is_visible(titlebar_rect)
-            and rect_is_visible(search_modal_rect)
-            and rect_is_visible(search_shell_rect)
-            and rect_is_visible(search_dropdown_rect)
-            and rect_is_visible(search_dropdown_header_rect)
-            and search_dropdown_entry_rects
-            and rect_bottom(search_modal_rect) >= rect_bottom(search_dropdown_rect) + 2.0
-            and float(search_dropdown_rect["top"]) >= rect_bottom(search_shell_rect) + 2.0
-        ):
-            break
-        time.sleep(0.08)
-        focused = app_state(pid)
-        active_element = (focused.get("dom") or {}).get("active_element") or {}
-        if str(active_element.get("id") or "") != "yggterm-search-input":
-            raise AssertionError(
-                f"focused search lost the active input while waiting for overlay settle: "
-                f"active_element={active_element!r} state={focused!r}"
-            )
+    overlay_retried = False
+    while True:
+        focused_settle_deadline = time.time() + 2.5
+        while time.time() < focused_settle_deadline:
+            titlebar_rect = dom_rect(focused, "titlebar_rect")
+            search_modal_rect = dom_rect(focused, "titlebar_search_outer_shell_rect")
+            search_shell_rect = dom_rect(focused, "titlebar_search_field_shell_rect")
+            search_dropdown_rect = dom_rect(focused, "titlebar_search_dropdown_rect")
+            search_dropdown_header_rect = dom_rect(focused, "titlebar_search_dropdown_header_rect")
+            search_dropdown_entry_rects = list((focused.get("dom") or {}).get("titlebar_search_dropdown_entry_rects") or [])
+            if (
+                rect_is_visible(titlebar_rect)
+                and rect_is_visible(search_modal_rect)
+                and rect_is_visible(search_shell_rect)
+                and rect_is_visible(search_dropdown_rect)
+                and rect_is_visible(search_dropdown_header_rect)
+                and search_dropdown_entry_rects
+                and rect_bottom(search_modal_rect) >= rect_bottom(search_dropdown_rect) + 2.0
+                and float(search_dropdown_rect["top"]) >= rect_bottom(search_shell_rect) + 2.0
+            ):
+                break
+            time.sleep(0.08)
+            focused = app_state(pid)
+            active_element = (focused.get("dom") or {}).get("active_element") or {}
+            if str(active_element.get("id") or "") != "yggterm-search-input":
+                raise AssertionError(
+                    f"focused search lost the active input while waiting for overlay settle: "
+                    f"active_element={active_element!r} state={focused!r}"
+                )
+        else:
+            if overlay_retried:
+                break
+            active_element = (focused.get("dom") or {}).get("active_element") or {}
+            app_set_search(pid, str(active_element.get("value") or ""), focused=True)
+            focused = app_state(pid)
+            opened_via = f"{opened_via}_overlay_fallback"
+            overlay_retried = True
+            continue
+        break
 
     titlebar_rect = dom_rect(focused, "titlebar_rect")
     search_modal_rect = dom_rect(focused, "titlebar_search_outer_shell_rect")
@@ -5363,12 +5434,51 @@ def assert_search_focus_overlay_contract(pid: int, session: str) -> dict:
                 f"rect={rect!r} header={search_dropdown_header_rect!r} shell={search_shell_rect!r}"
             )
     dom = focused.get("dom") or {}
+    search_field_shell_background = str(dom.get("titlebar_search_field_shell_background") or "")
+    search_field_shell_box_shadow = str(dom.get("titlebar_search_field_shell_box_shadow") or "").lower()
+    search_field_shell_border_radius = str(dom.get("titlebar_search_field_shell_border_radius") or "")
     search_input_background = str(dom.get("titlebar_search_input_background") or "")
     search_input_box_shadow = str(dom.get("titlebar_search_input_box_shadow") or "").lower()
+    search_input_border_radius = str(dom.get("titlebar_search_input_border_radius") or "")
     search_shell_background = str(dom.get("titlebar_search_outer_shell_background") or "")
     search_shell_box_shadow = str(dom.get("titlebar_search_outer_shell_box_shadow") or "").lower()
+    search_shell_border_radius = str(dom.get("titlebar_search_outer_shell_border_radius") or "")
     search_dropdown_background = str(dom.get("titlebar_search_dropdown_background") or "")
     search_dropdown_box_shadow = str(dom.get("titlebar_search_dropdown_box_shadow") or "").lower()
+    search_field_shell_radius_delta = css_radius_delta(
+        baseline_search_field_shell_border_radius,
+        search_field_shell_border_radius,
+    )
+    search_field_shell_radius_values = parse_css_radius_values(search_field_shell_border_radius)
+    search_shell_radius_values = parse_css_radius_values(search_shell_border_radius)
+    if is_transparent_css_color(search_field_shell_background):
+        raise AssertionError(
+            "focused search field shell lost its visible chrome and fell back to the old floating-capsule behavior: "
+            f"background={search_field_shell_background!r}"
+        )
+    if not css_colors_close(
+        baseline_search_field_shell_background,
+        search_field_shell_background,
+        tolerance=0.04,
+    ):
+        raise AssertionError(
+            "focused search field shell changed its fill instead of preserving the idle field treatment: "
+            f"baseline={baseline_search_field_shell_background!r} focused={search_field_shell_background!r}"
+        )
+    if search_field_shell_box_shadow in ("", "none"):
+        raise AssertionError(
+            "focused search field shell lost its chrome instead of preserving the field inside the search modal: "
+            f"box_shadow={search_field_shell_box_shadow!r}"
+        )
+    if search_field_shell_radius_delta is None or search_field_shell_radius_delta > 1.0:
+        raise AssertionError(
+            "focused search field changed its corner geometry instead of keeping the same compact field shape: "
+            f"baseline={baseline_search_field_shell_border_radius!r} focused={search_field_shell_border_radius!r}"
+        )
+    if search_field_shell_radius_values and max(search_field_shell_radius_values) > 12.5:
+        raise AssertionError(
+            f"focused search field became pill-like instead of staying softly rounded: {search_field_shell_border_radius!r}"
+        )
     if not is_transparent_css_color(search_input_background):
         raise AssertionError(
             f"focused search input still draws its own chrome instead of blending into the floating shell: "
@@ -5385,6 +5495,11 @@ def assert_search_focus_overlay_contract(pid: int, session: str) -> dict:
     if search_shell_box_shadow in ("", "none"):
         raise AssertionError(
             f"focused search shell lost its floating panel shadow: {search_shell_box_shadow!r}"
+        )
+    if search_shell_radius_values and max(search_shell_radius_values) > 15.0:
+        raise AssertionError(
+            "focused search outer shell drifted into a large pill instead of a VS Code-like modal surface: "
+            f"border_radius={search_shell_border_radius!r}"
         )
     if search_dropdown_background not in ("", "transparent", "rgba(0, 0, 0, 0)"):
         raise AssertionError(
@@ -5456,6 +5571,7 @@ def assert_search_focus_overlay_contract(pid: int, session: str) -> dict:
         "opened_via": opened_via,
         "baseline_titlebar_rect": baseline_titlebar,
         "focused_titlebar_rect": titlebar_rect,
+        "baseline_search_field_shell_rect": baseline_search_field_shell_rect,
         "search_modal_rect": search_modal_rect,
         "search_shell_rect": search_shell_rect,
         "search_dropdown_rect": search_dropdown_rect,
@@ -5463,10 +5579,19 @@ def assert_search_focus_overlay_contract(pid: int, session: str) -> dict:
         "search_dropdown_entry_rects": search_dropdown_entry_rects,
         "baseline_host_rect": baseline_host,
         "focused_host_rect": host_rect,
+        "baseline_search_field_shell_background": baseline_search_field_shell_background,
+        "baseline_search_field_shell_box_shadow": baseline_search_field_shell_box_shadow,
+        "baseline_search_field_shell_border_radius": baseline_search_field_shell_border_radius,
+        "search_field_shell_background": search_field_shell_background,
+        "search_field_shell_box_shadow": search_field_shell_box_shadow,
+        "search_field_shell_border_radius": search_field_shell_border_radius,
+        "search_field_shell_radius_delta": search_field_shell_radius_delta,
         "search_input_background": search_input_background,
         "search_input_box_shadow": search_input_box_shadow,
+        "search_input_border_radius": search_input_border_radius,
         "search_shell_background": search_shell_background,
         "search_shell_box_shadow": search_shell_box_shadow,
+        "search_shell_border_radius": search_shell_border_radius,
         "search_dropdown_background": search_dropdown_background,
         "search_dropdown_box_shadow": search_dropdown_box_shadow,
         "focus_release_click": click,
@@ -5520,6 +5645,8 @@ def assert_titlebar_new_menu_shell_contract(pid: int) -> dict:
     opened_button_visible_count = int((opened.get("dom") or {}).get("titlebar_new_button_visible_count") or 0)
     opened_button_rects = list((opened.get("dom") or {}).get("titlebar_new_button_rects") or [])
     opened_button_background = str((opened.get("dom") or {}).get("titlebar_new_button_background") or "").strip()
+    opened_button_box_shadow = str((opened.get("dom") or {}).get("titlebar_new_button_box_shadow") or "").strip()
+    opened_button_border_radius = str((opened.get("dom") or {}).get("titlebar_new_button_border_radius") or "").strip()
     session_button_box_shadow = str((opened.get("dom") or {}).get("titlebar_session_button_box_shadow") or "").strip()
     session_button_border_radius = str(
         (opened.get("dom") or {}).get("titlebar_session_button_border_radius") or ""
@@ -5589,6 +5716,11 @@ def assert_titlebar_new_menu_shell_contract(pid: int) -> dict:
     if is_transparent_css_color(menu_background):
         raise AssertionError(
             f"titlebar new panel lost its shared modal background: background={menu_background!r}"
+        )
+    if str(opened_button_box_shadow or "").strip().lower() in ("", "none"):
+        raise AssertionError(
+            "titlebar new tab lost its attached-surface chrome, which leaves the top tab visually detached from the body: "
+            f"box_shadow={opened_button_box_shadow!r}"
         )
     if menu_box_shadow in ("", "none"):
         raise AssertionError(
@@ -5743,6 +5875,8 @@ def assert_titlebar_new_menu_shell_contract(pid: int) -> dict:
         "button_visible_count": opened_button_visible_count,
         "button_rects": opened_button_rects,
         "button_background": opened_button_background,
+        "button_box_shadow": opened_button_box_shadow,
+        "button_border_radius": opened_button_border_radius,
         "session_button_rect": session_button_rect,
         "session_button_box_shadow": session_button_box_shadow,
         "session_button_border_radius": session_button_border_radius,
@@ -7340,11 +7474,14 @@ def assert_titlebar_autohide_hover_contract(pid: int, out_dir: Path) -> dict:
     settle_rect = dom_rect(enabled_state, "main_surface_body_rect") or dom_rect(enabled_state, "sidebar_rect")
     if not rect_is_visible(settle_rect):
         raise AssertionError(f"main surface rect missing before titlebar auto-hide collapse probe: {enabled_state!r}")
-    collapse_move = xdotool_move_window(
-        pid,
-        rect_center_x(settle_rect),
-        rect_center_y(settle_rect),
-    )
+    if POINTER_DRIVER == "app":
+        collapse_move = app_set_window_chrome_hover(pid, False)
+    else:
+        collapse_move = xdotool_move_window(
+            pid,
+            rect_center_x(settle_rect),
+            rect_center_y(settle_rect),
+        )
     collapsed = wait_for_titlebar_autohide_state(
         pid,
         enabled=True,
@@ -7371,7 +7508,10 @@ def assert_titlebar_autohide_hover_contract(pid: int, out_dir: Path) -> dict:
         max(1.0, float(collapsed_rect["height"]) / 2.0),
         max(1.0, float(collapsed_rect["height"]) - 1.0),
     )
-    hover_move = xdotool_move_window(pid, rect_center_x(collapsed_rect), hover_y)
+    if POINTER_DRIVER == "app":
+        hover_move = app_set_window_chrome_hover(pid, True)
+    else:
+        hover_move = xdotool_move_window(pid, rect_center_x(collapsed_rect), hover_y)
     revealed = wait_for_titlebar_autohide_state(
         pid,
         enabled=True,
@@ -7390,6 +7530,13 @@ def assert_titlebar_autohide_hover_contract(pid: int, out_dir: Path) -> dict:
         raise AssertionError(
             f"titlebar hover reveal brought the lane back but search input stayed hidden: state={revealed!r}"
         )
+    revealed_balance = shell_content_vertical_balance(revealed)
+    if revealed_balance["gap_delta"] > TITLEBAR_AUTOHIDE_CONTENT_BALANCE_MAX_PX:
+        raise AssertionError(
+            "titlebar hover reveal biased the shell content vertically instead of preserving the overlay contract: "
+            f"balance={revealed_balance!r}"
+        )
+    revealed_titlebar_centering = assert_titlebar_centering(revealed)
     app_screenshot(pid, out_dir / "titlebar-autohide-revealed.png")
     (
         revealed_drag_x,
@@ -7426,11 +7573,14 @@ def assert_titlebar_autohide_hover_contract(pid: int, out_dir: Path) -> dict:
         raise AssertionError(
             f"main surface rect missing before restored auto-hide collapse probe: {restored_after_maximize!r}"
         )
-    xdotool_move_window(
-        pid,
-        rect_center_x(settle_rect),
-        rect_center_y(settle_rect),
-    )
+    if POINTER_DRIVER == "app":
+        app_set_window_chrome_hover(pid, False)
+    else:
+        xdotool_move_window(
+            pid,
+            rect_center_x(settle_rect),
+            rect_center_y(settle_rect),
+        )
     collapsed_after_restore = wait_for_titlebar_autohide_state(
         pid,
         enabled=True,
@@ -7448,7 +7598,10 @@ def assert_titlebar_autohide_hover_contract(pid: int, out_dir: Path) -> dict:
         max(1.0, float(collapsed_after_restore_rect["height"]) / 2.0),
         max(1.0, float(collapsed_after_restore_rect["height"]) - 1.0),
     )
-    xdotool_move_window(pid, rect_center_x(collapsed_after_restore_rect), hover_y)
+    if POINTER_DRIVER == "app":
+        app_set_window_chrome_hover(pid, True)
+    else:
+        xdotool_move_window(pid, rect_center_x(collapsed_after_restore_rect), hover_y)
     revealed = wait_for_titlebar_autohide_state(
         pid,
         enabled=True,
@@ -7470,35 +7623,55 @@ def assert_titlebar_autohide_hover_contract(pid: int, out_dir: Path) -> dict:
         restored_drag_x + 96.0,
         restored_drag_y + 48.0,
     )
-    dragged = wait_for_window_geometry_settle(pid, timeout_seconds=6.0)
-    drag_after = window_outer_geometry(dragged)
-    drag_delta = (drag_after[0] - drag_before[0], drag_after[1] - drag_before[1])
-    if abs(drag_delta[0]) < 40 and abs(drag_delta[1]) < 20:
-        raise AssertionError(
-            f"titlebar hover reveal restored the chrome visually but the empty lane still did not drag the window: "
-            f"point={restored_drag_reason} before={drag_before!r} after={drag_after!r} drag={reveal_drag!r}"
+    drag_delta = None
+    if POINTER_DRIVER == "app":
+        dragged = wait_for_titlebar_drag_request(
+            pid,
+            titlebar_drag_request_count(revealed),
+            timeout_seconds=2.5,
         )
-    dragged_point_x, dragged_point_y, _ = titlebar_empty_lane_point(dragged)
-    reveal_drag_restore = titlebar_drag_window(
-        pid,
-        dragged_point_x,
-        dragged_point_y,
-        dragged_point_x - 96.0,
-        dragged_point_y - 48.0,
-    )
-    revealed = wait_for_window_geometry_settle(pid, timeout_seconds=6.0)
+        drag_after = window_outer_geometry(dragged)
+        drag_delta = (drag_after[0] - drag_before[0], drag_after[1] - drag_before[1])
+    else:
+        dragged = wait_for_window_geometry_settle(pid, timeout_seconds=6.0)
+        drag_after = window_outer_geometry(dragged)
+        drag_delta = (drag_after[0] - drag_before[0], drag_after[1] - drag_before[1])
+        if abs(drag_delta[0]) < 40 and abs(drag_delta[1]) < 20:
+            raise AssertionError(
+                f"titlebar hover reveal restored the chrome visually but the empty lane still did not drag the window: "
+                f"point={restored_drag_reason} before={drag_before!r} after={drag_after!r} drag={reveal_drag!r}"
+            )
+    if POINTER_DRIVER == "app":
+        reveal_drag_restore = None
+        revealed = dragged
+    else:
+        dragged_point_x, dragged_point_y, _ = titlebar_empty_lane_point(dragged)
+        reveal_drag_restore = titlebar_drag_window(
+            pid,
+            dragged_point_x,
+            dragged_point_y,
+            dragged_point_x - 96.0,
+            dragged_point_y - 48.0,
+        )
+        revealed = wait_for_window_geometry_settle(pid, timeout_seconds=6.0)
     drag_restored = window_outer_geometry(revealed)
-    if abs(drag_restored[0] - drag_before[0]) > 28 or abs(drag_restored[1] - drag_before[1]) > 28:
+    if POINTER_DRIVER != "app" and (
+        abs(drag_restored[0] - drag_before[0]) > 28
+        or abs(drag_restored[1] - drag_before[1]) > 28
+    ):
         raise AssertionError(
             f"titlebar hover reveal drag moved the window but did not restore cleanly for the rest of the probe: "
             f"before={drag_before!r} restored={drag_restored!r} restore_drag={reveal_drag_restore!r}"
         )
     search_pin = app_set_search(pid, "titlebar autohide smoke", focused=True)
-    pin_move = xdotool_move_window(
-        pid,
-        rect_center_x(settle_rect),
-        rect_center_y(settle_rect),
-    )
+    if POINTER_DRIVER == "app":
+        pin_move = app_set_window_chrome_hover(pid, False)
+    else:
+        pin_move = xdotool_move_window(
+            pid,
+            rect_center_x(settle_rect),
+            rect_center_y(settle_rect),
+        )
     pinned = wait_for_titlebar_autohide_state(
         pid,
         enabled=True,
@@ -7513,11 +7686,14 @@ def assert_titlebar_autohide_hover_contract(pid: int, out_dir: Path) -> dict:
             f"titlebar did not stay pinned open while search owned it: rect={pinned_rect!r} state={pinned!r}"
         )
     clear_search = app_set_search(pid, "", focused=False)
-    clear_move = xdotool_move_window(
-        pid,
-        rect_center_x(settle_rect),
-        rect_center_y(settle_rect),
-    )
+    if POINTER_DRIVER == "app":
+        clear_move = app_set_window_chrome_hover(pid, False)
+    else:
+        clear_move = xdotool_move_window(
+            pid,
+            rect_center_x(settle_rect),
+            rect_center_y(settle_rect),
+        )
     repacked = wait_for_titlebar_autohide_state(
         pid,
         enabled=True,
@@ -7562,6 +7738,8 @@ def assert_titlebar_autohide_hover_contract(pid: int, out_dir: Path) -> dict:
         "collapsed_balance": collapsed_balance,
         "hover_move": hover_move,
         "revealed_rect": revealed_rect,
+        "revealed_balance": revealed_balance,
+        "revealed_titlebar_centering": revealed_titlebar_centering,
         "revealed_drag_point": {
             "x": round(revealed_drag_x, 2),
             "y": round(revealed_drag_y, 2),
@@ -7638,23 +7816,36 @@ def assert_titlebar_empty_lane_window_controls_contract(pid: int, out_dir: Path)
 
     drag_x, drag_y, drag_reason = titlebar_empty_lane_point(baseline)
     drag = titlebar_drag_window(pid, drag_x, drag_y, drag_x + 96.0, drag_y + 48.0)
-    moved = wait_for_window_geometry_settle(pid, timeout_seconds=6.0)
-    moved_geometry = window_outer_geometry(moved)
-    drag_delta = (moved_geometry[0] - before_geometry[0], moved_geometry[1] - before_geometry[1])
-    if abs(drag_delta[0]) < 40 and abs(drag_delta[1]) < 20:
-        raise AssertionError(
-            f"titlebar empty lane still does not drag the window in the visible chrome state: "
-            f"reason={drag_reason} before={before_geometry!r} after={moved_geometry!r} drag={drag!r}"
+    drag_delta = None
+    if POINTER_DRIVER == "app":
+        moved = wait_for_titlebar_drag_request(
+            pid,
+            titlebar_drag_request_count(baseline),
+            timeout_seconds=2.5,
         )
-    moved_x, moved_y, _ = titlebar_empty_lane_point(moved)
-    restore_drag = titlebar_drag_window(pid, moved_x, moved_y, moved_x - 96.0, moved_y - 48.0)
-    restored = wait_for_window_geometry_settle(pid, timeout_seconds=6.0)
-    restored_geometry = window_outer_geometry(restored)
-    if abs(restored_geometry[0] - before_geometry[0]) > 28 or abs(restored_geometry[1] - before_geometry[1]) > 28:
-        raise AssertionError(
-            f"titlebar drag moved the window but did not restore within tolerance: "
-            f"before={before_geometry!r} restored={restored_geometry!r} restore_drag={restore_drag!r}"
-        )
+        moved_geometry = window_outer_geometry(moved)
+        drag_delta = (moved_geometry[0] - before_geometry[0], moved_geometry[1] - before_geometry[1])
+        restore_drag = None
+        restored = moved
+        restored_geometry = moved_geometry
+    else:
+        moved = wait_for_window_geometry_settle(pid, timeout_seconds=6.0)
+        moved_geometry = window_outer_geometry(moved)
+        drag_delta = (moved_geometry[0] - before_geometry[0], moved_geometry[1] - before_geometry[1])
+        if abs(drag_delta[0]) < 40 and abs(drag_delta[1]) < 20:
+            raise AssertionError(
+                f"titlebar empty lane still does not drag the window in the visible chrome state: "
+                f"reason={drag_reason} before={before_geometry!r} after={moved_geometry!r} drag={drag!r}"
+            )
+        moved_x, moved_y, _ = titlebar_empty_lane_point(moved)
+        restore_drag = titlebar_drag_window(pid, moved_x, moved_y, moved_x - 96.0, moved_y - 48.0)
+        restored = wait_for_window_geometry_settle(pid, timeout_seconds=6.0)
+        restored_geometry = window_outer_geometry(restored)
+        if abs(restored_geometry[0] - before_geometry[0]) > 28 or abs(restored_geometry[1] - before_geometry[1]) > 28:
+            raise AssertionError(
+                f"titlebar drag moved the window but did not restore within tolerance: "
+                f"before={before_geometry!r} restored={restored_geometry!r} restore_drag={restore_drag!r}"
+            )
     after_shot = out_dir / "titlebar-empty-lane-after.png"
     app_screenshot(pid, after_shot)
     return {
@@ -9384,6 +9575,7 @@ def assert_cursor_focus_blur_contract(pid: int, session: str) -> dict:
     focus_click = xdotool_click_window(pid, rect_center_x(click_rect), rect_center_y(click_rect))
     deadline = time.time() + 8.0
     focused_state = {}
+    accepted_unfocused_outline = False
     while time.time() < deadline:
         focused_state = app_state(pid)
         shell = focused_state.get("shell") or {}
@@ -9392,6 +9584,10 @@ def assert_cursor_focus_blur_contract(pid: int, session: str) -> dict:
             focused_host.get("cursor_sample_text") or focused_host.get("cursor_buffer_cell_text") or ""
         )
         focused_block_cursor = "xterm-cursor-block" in str(focused_host.get("cursor_sample_class_name") or "")
+        focused_outline_cursor = "xterm-cursor-outline" in str(
+            focused_host.get("cursor_sample_class_name") or ""
+        )
+        window_focused = bool((focused_state.get("window") or {}).get("focused"))
         focused_terminal_surface = bool(focused_host.get("helper_textarea_focused")) or (
             focused_block_cursor
             and rect_is_visible(
@@ -9399,13 +9595,20 @@ def assert_cursor_focus_blur_contract(pid: int, session: str) -> dict:
             )
             and (not focused_glyph_text or not is_transparent_css_color(str(focused_host.get("cursor_sample_background") or "")))
         )
+        allow_unfocused_outline = (
+            AVOID_FOREGROUND
+            and not window_focused
+            and bool(focused_host.get("helper_textarea_focused"))
+            and focused_outline_cursor
+        )
         if (
             focused_state.get("active_session_path") == session
             and focused_state.get("active_view_mode") == "Terminal"
             and not shell.get("search_focused")
             and focused_terminal_surface
-            and focused_block_cursor
+            and (focused_block_cursor or allow_unfocused_outline)
         ):
+            accepted_unfocused_outline = allow_unfocused_outline and not focused_block_cursor
             break
         time.sleep(0.12)
     else:
@@ -9414,9 +9617,13 @@ def assert_cursor_focus_blur_contract(pid: int, session: str) -> dict:
         )
     focused_host = active_host(focused_state)
     focused_glyph = assert_cursor_glyph_visibility(focused_state)
-    if "xterm-cursor-block" not in str(focused_host.get("cursor_sample_class_name") or ""):
+    if not accepted_unfocused_outline and "xterm-cursor-block" not in str(
+        focused_host.get("cursor_sample_class_name") or ""
+    ):
         raise AssertionError(f"focused cursor is not a block cursor: {focused_host!r}")
-    if is_transparent_css_color(str(focused_host.get("cursor_sample_background") or "")):
+    if not accepted_unfocused_outline and is_transparent_css_color(
+        str(focused_host.get("cursor_sample_background") or "")
+    ):
         raise AssertionError(f"focused block cursor lost its fill: {focused_host!r}")
 
     app_set_search(pid, "", focused=True)
@@ -9495,6 +9702,7 @@ def assert_cursor_focus_blur_contract(pid: int, session: str) -> dict:
     return {
         "focus_click": focus_click,
         "focused": focused_glyph,
+        "focused_cursor_mode": "unfocused-outline" if accepted_unfocused_outline else "focused-block",
         "blurred": blurred_glyph,
         "blurred_row_color": str(blurred_host.get("cursor_row_color") or ""),
     }
@@ -9528,6 +9736,7 @@ def assert_cursor_mouse_hold_contract(pid: int, session: str) -> dict:
     click_rect = click_host.get("host_rect") or {}
     focus_click = None
     focused_before_type = {}
+    accepted_unfocused_outline = False
     for _ in range(2):
         focus_click = xdotool_click_window(pid, rect_center_x(click_rect), rect_center_y(click_rect))
         focus_deadline = time.time() + 2.0
@@ -9537,17 +9746,27 @@ def assert_cursor_mouse_hold_contract(pid: int, session: str) -> dict:
             host = active_host(focused_before_type)
             glyph_text = str(host.get("cursor_sample_text") or host.get("cursor_buffer_cell_text") or "")
             block_cursor_visible = "xterm-cursor-block" in str(host.get("cursor_sample_class_name") or "")
+            outline_cursor_visible = "xterm-cursor-outline" in str(host.get("cursor_sample_class_name") or "")
+            window_focused = bool((focused_before_type.get("window") or {}).get("focused"))
             focused_terminal_surface = bool(host.get("helper_textarea_focused")) or (
                 block_cursor_visible
                 and rect_is_visible(host.get("cursor_sample_rect") or host.get("cursor_expected_rect") or {})
                 and (not glyph_text or not is_transparent_css_color(str(host.get("cursor_sample_background") or "")))
+            )
+            allow_unfocused_outline = (
+                AVOID_FOREGROUND
+                and not window_focused
+                and bool(host.get("helper_textarea_focused"))
+                and outline_cursor_visible
             )
             if (
                 focused_before_type.get("active_session_path") == probe_session
                 and focused_before_type.get("active_view_mode") == "Terminal"
                 and not shell.get("search_focused")
                 and focused_terminal_surface
+                and (block_cursor_visible or allow_unfocused_outline)
             ):
+                accepted_unfocused_outline = allow_unfocused_outline and not block_cursor_visible
                 break
             time.sleep(0.12)
         else:
@@ -9561,18 +9780,27 @@ def assert_cursor_mouse_hold_contract(pid: int, session: str) -> dict:
         host = active_host(focused_state)
         glyph_text = str(host.get("cursor_sample_text") or host.get("cursor_buffer_cell_text") or "")
         block_cursor_visible = "xterm-cursor-block" in str(host.get("cursor_sample_class_name") or "")
+        outline_cursor_visible = "xterm-cursor-outline" in str(host.get("cursor_sample_class_name") or "")
+        window_focused = bool((focused_state.get("window") or {}).get("focused"))
         focused_terminal_surface = bool(host.get("helper_textarea_focused")) or (
             block_cursor_visible
             and rect_is_visible(host.get("cursor_sample_rect") or host.get("cursor_expected_rect") or {})
             and (not glyph_text or not is_transparent_css_color(str(host.get("cursor_sample_background") or "")))
+        )
+        allow_unfocused_outline = (
+            AVOID_FOREGROUND
+            and not window_focused
+            and bool(host.get("helper_textarea_focused"))
+            and outline_cursor_visible
         )
         if (
             focused_state.get("active_session_path") == probe_session
             and focused_state.get("active_view_mode") == "Terminal"
             and not shell.get("search_focused")
             and focused_terminal_surface
-            and block_cursor_visible
+            and (block_cursor_visible or allow_unfocused_outline)
         ):
+            accepted_unfocused_outline = allow_unfocused_outline and not block_cursor_visible
             break
         time.sleep(0.12)
     else:
@@ -9595,7 +9823,14 @@ def assert_cursor_mouse_hold_contract(pid: int, session: str) -> dict:
             held_state = app_state(pid)
             held_host = active_host(held_state)
             held_glyph = assert_cursor_glyph_visibility(held_state)
-            if "xterm-cursor-block" in str(held_host.get("cursor_sample_class_name") or ""):
+            held_class_name = str(held_host.get("cursor_sample_class_name") or "")
+            held_accept_unfocused_outline = (
+                accepted_unfocused_outline
+                and not bool((held_state.get("window") or {}).get("focused"))
+                and bool(held_host.get("helper_textarea_focused"))
+                and "xterm-cursor-outline" in held_class_name
+            )
+            if "xterm-cursor-block" in held_class_name or held_accept_unfocused_outline:
                 break
             if time.time() >= deadline:
                 break
@@ -9603,7 +9838,9 @@ def assert_cursor_mouse_hold_contract(pid: int, session: str) -> dict:
             raise AssertionError(
                 f"cursor mouse-hold moved focus away from the active terminal: state={held_state!r}"
             )
-        if "xterm-cursor-block" not in str(held_host.get("cursor_sample_class_name") or ""):
+        if not held_accept_unfocused_outline and "xterm-cursor-block" not in str(
+            held_host.get("cursor_sample_class_name") or ""
+        ):
             raise AssertionError(f"cursor lost block state during mouse hold: {held_host!r}")
         if str(held_glyph.get("cursor_sample_text") or "").strip():
             held_contrast = held_glyph.get("cursor_glyph_contrast")
@@ -9626,6 +9863,7 @@ def assert_cursor_mouse_hold_contract(pid: int, session: str) -> dict:
         "release": release,
         "baseline_glyph": baseline_glyph,
         "held_glyph": held_glyph,
+        "baseline_cursor_mode": "unfocused-outline" if accepted_unfocused_outline else "focused-block",
         "probe_session": probe_session,
         "held_state_path": str(held_state_path),
         "held_screenshot_path": str(held_shot),
