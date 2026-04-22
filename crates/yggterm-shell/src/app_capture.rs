@@ -39,7 +39,10 @@ use yggterm_platform::capture_windows_hwnd_screenshot;
 #[cfg(target_os = "windows")]
 use yggterm_platform::capture_windows_window_screenshot;
 #[cfg(target_os = "macos")]
-use yggterm_platform::{capture_macos_window_recording, capture_macos_window_screenshot};
+use yggterm_platform::{
+    capture_macos_window_cg_screenshot, capture_macos_window_recording,
+    capture_macos_window_screencapture,
+};
 
 #[derive(Debug, Clone)]
 pub struct SurfaceCapture {
@@ -436,8 +439,21 @@ async fn platform_capture_visible_app_surface(
         if target != ScreenshotTarget::App {
             anyhow::bail!("preview viewport screenshot capture is not implemented for macOS yet");
         }
-        capture_macos_window_screenshot(desktop.window.ns_window().cast(), output_path)?;
-        return Ok(SurfaceCapture::new(output_path, "macos_window_screenshot"));
+        let ns_window = desktop.window.ns_window();
+        let ns_window_ptr = ns_window.cast();
+        let mut backend_attempts = Vec::new();
+        match capture_macos_window_cg_screenshot(ns_window_ptr, output_path) {
+            Ok(()) => {
+                return Ok(SurfaceCapture::new(output_path, "macos_cg_window_capture"));
+            }
+            Err(error) => {
+                backend_attempts.push(format!("macos_cg_window_capture: {error:#}"));
+            }
+        }
+        capture_macos_window_screencapture(ns_window_ptr, output_path)?;
+        let mut capture = SurfaceCapture::new(output_path, "macos_screencapture_window");
+        capture.backend_attempts = backend_attempts;
+        return Ok(capture);
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
