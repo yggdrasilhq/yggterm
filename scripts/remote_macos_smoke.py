@@ -9,6 +9,7 @@ from remote_linux_x11_smoke import quote, scp_from, scp_to, ssh_shell
 from smoke_app_control_bootstrap import (
     assert_sidebar_rows_present,
     assert_blur_expectation,
+    assert_screenshot_file_usable,
     problem_notifications,
     screenshot_backend,
     screenshot_backend_attempts,
@@ -956,6 +957,7 @@ def main() -> int:
 
         screenshot_response = None
         screenshot_error = None
+        screenshot_quality = None
         try:
             screenshot_response = capture_remote_screenshot(
                 args.host,
@@ -966,6 +968,7 @@ def main() -> int:
                 f"{remote_dir}/window.png",
                 screenshot_path,
             )
+            screenshot_quality = assert_screenshot_file_usable(screenshot_path)
         except Exception as exc:  # noqa: BLE001
             screenshot_error = str(exc)
         if owned_launch and pid > 0:
@@ -1000,6 +1003,7 @@ def main() -> int:
             "screenshot_response": screenshot_response,
             "screenshot_backend": screenshot_backend(screenshot_response),
             "screenshot_backend_attempts": screenshot_backend_attempts(screenshot_response),
+            "screenshot_quality": screenshot_quality,
             "screenshot_error": screenshot_error,
             "background_response": background_response,
             "background_error": background_error,
