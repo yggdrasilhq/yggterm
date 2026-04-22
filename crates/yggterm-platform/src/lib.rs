@@ -4,7 +4,13 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 #[cfg(target_os = "macos")]
-use objc2::{msg_send, runtime::AnyObject};
+use objc2::{AnyThread, msg_send, runtime::AnyObject};
+#[cfg(target_os = "macos")]
+use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSBitmapImageRepPropertyKey};
+#[cfg(target_os = "macos")]
+use objc2_core_graphics::{CGWindowImageOption, CGWindowListOption, CGRectNull};
+#[cfg(target_os = "macos")]
+use objc2_foundation::NSDictionary;
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Console::{FreeConsole, GetConsoleWindow};
 #[cfg(target_os = "windows")]
@@ -160,6 +166,43 @@ pub fn capture_linux_x11_window_screenshot(pid: u32, output_path: &Path) -> Resu
 
 #[cfg(target_os = "macos")]
 pub fn capture_macos_window_screenshot(
+    ns_window_ptr: *mut std::ffi::c_void,
+    output_path: &Path,
+) -> Result<()> {
+    match capture_macos_window_cg_screenshot(ns_window_ptr, output_path) {
+        Ok(()) => Ok(()),
+        Err(cg_error) => capture_macos_window_screencapture(ns_window_ptr, output_path)
+            .with_context(|| format!("fallback screencapture failed after CG capture error: {cg_error:#}")),
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn capture_macos_window_cg_screenshot(
+    ns_window_ptr: *mut std::ffi::c_void,
+    output_path: &Path,
+) -> Result<()> {
+    let window_number = macos_window_number(ns_window_ptr)?;
+    #[allow(deprecated)]
+    let cg_image = objc2_core_graphics::CGWindowListCreateImage(
+        unsafe { CGRectNull },
+        CGWindowListOption::OptionIncludingWindow,
+        window_number as u32,
+        CGWindowImageOption::BestResolution,
+    )
+    .with_context(|| format!("capturing CG window image for window {window_number}"))?;
+    let bitmap = NSBitmapImageRep::initWithCGImage(NSBitmapImageRep::alloc(), &cg_image);
+    let properties = NSDictionary::<NSBitmapImageRepPropertyKey, AnyObject>::new();
+    let png_data = unsafe {
+        bitmap.representationUsingType_properties(NSBitmapImageFileType::PNG, &properties)
+    }
+    .context("encoding CG window image as PNG")?;
+    std::fs::write(output_path, png_data.to_vec())
+        .with_context(|| format!("writing macOS CG window screenshot {}", output_path.display()))?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub fn capture_macos_window_screencapture(
     ns_window_ptr: *mut std::ffi::c_void,
     output_path: &Path,
 ) -> Result<()> {
