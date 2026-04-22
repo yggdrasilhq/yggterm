@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import re
 import time
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from smoke_app_control_bootstrap import (
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ICON = ROOT / "assets" / "brand" / "yggterm-icon-512.png"
+REMOTE_MACOS_HOME_PREFIX = "yggterm-remote-macos-"
 
 
 def default_artifact() -> Path:
@@ -86,36 +88,81 @@ def remote_notify_macos(host: str, title: str, body: str) -> None:
     )
 
 
-def remote_owned_macos_clients(host: str, remote_dir: str | None = None) -> dict:
-    scope = (remote_dir or "").strip()
+def extract_remote_macos_root(command: str) -> str:
+    marker = command.find(REMOTE_MACOS_HOME_PREFIX)
+    if marker < 0:
+        return ""
+    start = marker
+    while start > 0 and not command[start - 1].isspace() and command[start - 1] not in "\"'":
+        start -= 1
+    token = command[start:].split(None, 1)[0].strip().strip("\"'")
+    marker = token.find(REMOTE_MACOS_HOME_PREFIX)
+    if marker < 0:
+        return ""
+    prefix = token[:marker].rstrip("/")
+    suffix = token[marker:]
+    root_name = suffix.split("/", 1)[0]
+    if prefix.startswith("/"):
+        return f"{prefix}/{root_name}" if prefix else f"/{root_name}"
+    return root_name
+
+
+def remote_macos_process_rows(host: str) -> list[dict]:
     proc = ssh_shell(
         host,
-        r"""
-ps -axo pid=,ppid=,command= | awk '
-  /\/Users\/[^ ]+\/yggterm-remote-macos-[^ ]*/ {
-    pid=$1
-    ppid=$2
-    sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+/, "", $0)
-    print pid "\t" ppid "\t" $0
-  }
-'
-""",
+        "ps -ww -axo pid=,ppid=,etime=,command=",
         check=False,
     )
-    clients: list[dict] = []
+    rows: list[dict] = []
     for line in proc.stdout.splitlines():
-        parts = line.split("\t", 2)
-        if len(parts) != 3:
+        match = re.match(r"\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)\Z", line)
+        if not match:
             continue
-        try:
-            pid = int(parts[0].strip())
-            ppid = int(parts[1].strip())
-        except ValueError:
+        rows.append(
+            {
+                "pid": int(match.group(1)),
+                "ppid": int(match.group(2)),
+                "etime": match.group(3),
+                "command": match.group(4).strip(),
+            }
+        )
+    return rows
+
+
+def remote_macos_yggterm_processes(host: str) -> dict:
+    clients = [
+        row
+        for row in remote_macos_process_rows(host)
+        if "yggterm" in str(row.get("command") or "").lower()
+    ]
+    return {"count": len(clients), "clients": clients}
+
+
+def scope_matches_remote_dir(command: str, scope: str) -> bool:
+    if not scope:
+        return True
+    scope_name = Path(scope).name
+    return scope in command or (scope_name and scope_name in command)
+
+
+def remote_owned_macos_clients(host: str, remote_dir: str | None = None) -> dict:
+    scope = (remote_dir or "").strip()
+    clients: list[dict] = []
+    for row in remote_macos_process_rows(host):
+        command = str(row.get("command") or "").strip()
+        if REMOTE_MACOS_HOME_PREFIX not in command:
             continue
-        command = parts[2].strip()
-        if scope and scope not in command:
+        if scope and not scope_matches_remote_dir(command, scope):
             continue
-        clients.append({"pid": pid, "ppid": ppid, "command": command})
+        clients.append(
+            {
+                "pid": int(row.get("pid") or 0),
+                "ppid": int(row.get("ppid") or 0),
+                "etime": row.get("etime"),
+                "command": command,
+                "root": extract_remote_macos_root(command),
+            }
+        )
     return {"count": len(clients), "clients": clients}
 
 
@@ -148,43 +195,25 @@ def kill_remote_owned_macos_clients(host: str, remote_dir: str) -> dict:
 
 
 def cleanup_stale_remote_macos_clients(host: str) -> dict:
-    proc = ssh_shell(
-        host,
-        r"""
-ps -axo pid=,command= | awk '
-  /\/Users\/[^ ]+\/yggterm-remote-macos-[^ ]*/ {
-    pid=$1
-    sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", $0)
-    print pid "\t" $0
-  }
-'
-""",
-        check=False,
-    )
+    remote_home_proc = ssh_shell(host, "printf '%s\\n' \"$HOME\"", check=False)
+    remote_home = remote_home_proc.stdout.strip()
+    inventory = remote_owned_macos_clients(host)
     stale_entries: list[dict] = []
     stale_pids: list[int] = []
     stale_roots: set[str] = set()
-    for line in proc.stdout.splitlines():
-        parts = line.split("\t", 1)
-        if len(parts) != 2:
-            continue
-        try:
-            pid = int(parts[0].strip())
-        except ValueError:
-            continue
-        command = parts[1].strip()
-        root = ""
-        marker = command.find("/yggterm-remote-macos-")
-        if marker >= 0:
-            next_space = command.find(" ", marker)
-            path_part = command if next_space < 0 else command[:next_space]
-            before_contents = path_part.split("/Yggterm.app/Contents/MacOS/Yggterm", 1)[0]
-            before_server = before_contents.split("/yggterm-macos-", 1)[0]
-            root = before_server
+    cleanup_roots: set[str] = set()
+    for client in inventory.get("clients") or []:
+        pid = int(client.get("pid") or 0)
+        command = str(client.get("command") or "").strip()
+        root = str(client.get("root") or "").strip()
         stale_entries.append({"pid": pid, "command": command, "root": root})
         stale_pids.append(pid)
         if root:
             stale_roots.add(root)
+            if root.startswith("/"):
+                cleanup_roots.add(root)
+            elif remote_home:
+                cleanup_roots.add(f"{remote_home.rstrip('/')}/{root}")
 
     if stale_pids:
         pid_args = " ".join(str(pid) for pid in stale_pids)
@@ -192,14 +221,15 @@ ps -axo pid=,command= | awk '
         time.sleep(0.75)
         ssh_shell(host, f"kill -KILL {pid_args} >/dev/null 2>&1 || true", check=False)
 
-    if stale_roots:
-        root_args = " ".join(quote(root) for root in sorted(stale_roots))
+    if cleanup_roots:
+        root_args = " ".join(quote(root) for root in sorted(cleanup_roots))
         ssh_shell(host, f"rm -rf {root_args}", check=False)
 
     return {
         "count": len(stale_entries),
         "entries": stale_entries,
         "roots": sorted(stale_roots),
+        "cleanup_roots": sorted(cleanup_roots),
     }
 
 
@@ -660,6 +690,27 @@ def capture_remote_screenshot(
     return payload
 
 
+def remote_background_window(
+    host: str,
+    remote_bin: str,
+    env: dict[str, str],
+    pid: int,
+    timeout_ms: int,
+) -> dict:
+    payload = remote_json_command(
+        host,
+        remote_bin,
+        env,
+        ["server", "app", "background", "--pid", str(pid), "--timeout-ms", str(timeout_ms)],
+        check=False,
+    )
+    if not payload:
+        raise RuntimeError(f"remote macOS background command returned no payload for pid {pid}")
+    if payload.get("error"):
+        raise RuntimeError(str(payload.get("error")))
+    return payload
+
+
 def cleanup_remote_dir(host: str, remote_dir: str) -> None:
     ssh_shell(host, f"rm -rf {quote(remote_dir)}", check=False)
 
@@ -683,7 +734,10 @@ def main() -> int:
     remote_bin_error = None
     remote_clients_probe = None
     frontmost_app_name = None
+    background_response = None
+    background_error = None
     prelaunch_cleanup = cleanup_stale_remote_macos_clients(args.host)
+    yggterm_processes_before_launch = remote_macos_yggterm_processes(args.host)
 
     session_info = macos_session_info(args.host)
     ssh_shell(args.host, f"mkdir -p {quote(remote_dir)} {quote(remote_home)}")
@@ -740,10 +794,14 @@ def main() -> int:
     launch_payload = None
     direct_spawn_pid = 0
     try:
+        cleanup_count = int(prelaunch_cleanup.get("count") or 0)
         remote_notify_macos(
             args.host,
             "Yggterm automated testing",
-            "Automated testing is starting. The Yggterm window should close when the run finishes.",
+            (
+                f"Automated testing is starting. Cleaned up {cleanup_count} stale automation window(s). "
+                "Yggterm may briefly come to the front, then it will be moved behind other apps and closed."
+            ),
         )
         if not remote_bin:
             raise RuntimeError(remote_bin_error or f"could not resolve remote macOS binary on {args.host}")
@@ -873,6 +931,17 @@ def main() -> int:
             )
         except Exception as exc:  # noqa: BLE001
             screenshot_error = str(exc)
+        if owned_launch and pid > 0:
+            try:
+                background_response = remote_background_window(
+                    args.host,
+                    remote_bin,
+                    launch_env,
+                    pid,
+                    args.timeout_ms,
+                )
+            except Exception as exc:  # noqa: BLE001
+                background_error = str(exc)
 
         proof_summary = {
             "bin": remote_bin,
@@ -894,6 +963,8 @@ def main() -> int:
             "screenshot_backend": screenshot_backend(screenshot_response),
             "screenshot_backend_attempts": screenshot_backend_attempts(screenshot_response),
             "screenshot_error": screenshot_error,
+            "background_response": background_response,
+            "background_error": background_error,
         }
         summary_path.write_text(json.dumps(proof_summary, indent=2), encoding="utf-8")
         if remote_app and frontmost_app_name != "Yggterm":
@@ -914,6 +985,7 @@ def main() -> int:
             "remote_clients_probe": remote_clients_probe,
             "frontmost_app_name": frontmost_app_name,
             "prelaunch_cleanup": prelaunch_cleanup,
+            "yggterm_processes_before_launch": yggterm_processes_before_launch,
             "owned_clients_after_launch": owned_clients_after_launch,
             "pid": pid,
             "owned_launch": owned_launch,
@@ -937,6 +1009,7 @@ def main() -> int:
             "remote_clients_probe": remote_clients_probe,
             "frontmost_app_name": frontmost_app_name,
             "prelaunch_cleanup": prelaunch_cleanup,
+            "yggterm_processes_before_launch": yggterm_processes_before_launch,
             "owned_clients_after_launch": remote_owned_macos_clients(args.host, remote_dir),
             "pid": pid or None,
             "owned_launch": owned_launch,
@@ -994,9 +1067,15 @@ def main() -> int:
                 pass
         owned_clients_after_close = wait_for_remote_owned_macos_clients_gone(args.host, remote_dir)
         forced_cleanup_after_close = None
+        cleanup_error = None
         if int(owned_clients_after_close.get("count") or 0) > 0:
             forced_cleanup_after_close = kill_remote_owned_macos_clients(args.host, remote_dir)
             owned_clients_after_close = wait_for_remote_owned_macos_clients_gone(args.host, remote_dir)
+        if int(owned_clients_after_close.get("count") or 0) > 0:
+            cleanup_error = (
+                "harness-owned macOS Yggterm instances survived post-run cleanup: "
+                f"{owned_clients_after_close!r}"
+            )
         remote_notify_macos(
             args.host,
             "Yggterm automated testing",
@@ -1005,11 +1084,16 @@ def main() -> int:
         try:
             summary = json.loads(local_summary_path.read_text(encoding="utf-8"))
             summary["owned_clients_after_close"] = owned_clients_after_close
+            summary["yggterm_processes_after_close"] = remote_macos_yggterm_processes(args.host)
             if forced_cleanup_after_close is not None:
                 summary["forced_cleanup_after_close"] = forced_cleanup_after_close
+            if cleanup_error is not None:
+                summary["cleanup_error"] = cleanup_error
             local_summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
         except Exception:
             pass
+        if cleanup_error is not None:
+            return_code = 1
         if not args.keep_remote_dir:
             cleanup_remote_dir(args.host, remote_dir)
     return return_code
