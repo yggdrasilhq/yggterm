@@ -11,6 +11,7 @@ from pathlib import Path, PureWindowsPath
 
 from remote_linux_x11_smoke import scp_from, scp_to
 from remote_windows_live_app import (
+    configure_remote_transport,
     extract_json_text,
     ps_literal,
     run_remote_powershell,
@@ -121,6 +122,8 @@ def parse_args() -> argparse.Namespace:
         description="Stage or attach to Yggterm on a remote Windows host and run a minimal app-control smoke."
     )
     parser.add_argument("--host", required=True)
+    parser.add_argument("--proxy-jump")
+    parser.add_argument("--ssh-port", type=int)
     parser.add_argument("--artifact", default=str(default_artifact()))
     parser.add_argument("--remote-bin")
     parser.add_argument("--out-dir")
@@ -922,6 +925,7 @@ def cleanup_remote_dir(host: str, remote_root: str) -> None:
 
 def main() -> int:
     args = parse_args()
+    configure_remote_transport(args.proxy_jump, args.ssh_port)
     out_dir = Path(args.out_dir or f"/tmp/yggterm-remote-windows-smoke-{args.host}")
     out_dir.mkdir(parents=True, exist_ok=True)
     proof_dir = out_dir / "proof"
