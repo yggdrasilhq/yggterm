@@ -352,6 +352,7 @@ def install_staged_windows_artifact(
         "$installedHeadless = Join-Path $versionDir 'yggterm-headless.exe'",
         "$installedMock = Join-Path $versionDir 'yggterm-mock-cli.exe'",
         "$installedLoader = Join-Path $versionDir 'WebView2Loader.dll'",
+        "$launcher = Join-Path $installRoot 'Yggterm.vbs'",
         "$stagedHeadless = Get-ChildItem -Path $RemoteRoot -Filter 'yggterm-headless*.exe' -File -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -Last 1",
         "$stagedMock = Get-ChildItem -Path $RemoteRoot -Filter 'yggterm-mock-cli*.exe' -File -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -Last 1",
         "$stagedLoader = Get-ChildItem -Path $RemoteRoot -Filter 'WebView2Loader*.dll' -File -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -Last 1",
@@ -366,6 +367,8 @@ def install_staged_windows_artifact(
         "$utf8NoBom = New-Object System.Text.UTF8Encoding($false)",
         "[System.IO.File]::WriteAllText((Join-Path $installRoot 'install-state.json'), $state, $utf8NoBom)",
         "$integrateOutput = $null",
+        "$launcherScript = @\"\nSet shell = CreateObject(\"\"WScript.Shell\"\")\nshell.CurrentDirectory = \"$versionDir\"\nshell.Run \"cmd.exe /c start \"\"\"\" /D \"\"$versionDir\"\" /B \"\"$installedExe\"\"\", 0, False\n\"@",
+        "[System.IO.File]::WriteAllText($launcher, $launcherScript, $utf8NoBom)",
         "$startMenuShortcut = Join-Path $env:APPDATA 'Microsoft\\Windows\\Start Menu\\Programs\\Yggterm.lnk'",
         "$legacyShortcut = Join-Path $env:APPDATA 'Microsoft\\Windows\\Start Menu\\Programs\\Yggterm\\Yggterm.lnk'",
         "$legacyShortcutDir = Join-Path $env:APPDATA 'Microsoft\\Windows\\Start Menu\\Programs\\Yggterm'",
@@ -375,8 +378,8 @@ def install_staged_windows_artifact(
         "if (Test-Path -LiteralPath $legacyShortcutDir) { Remove-Item -LiteralPath $legacyShortcutDir -Recurse -Force -ErrorAction SilentlyContinue }",
         "$ws = New-Object -ComObject WScript.Shell",
         "$sc = $ws.CreateShortcut($startMenuShortcut)",
-        "$sc.TargetPath = $installedExe",
-        "$sc.WorkingDirectory = $versionDir",
+        "$sc.TargetPath = $launcher",
+        "$sc.WorkingDirectory = $installRoot",
         "$sc.IconLocation = \"$installedExe,0\"",
         "$sc.Description = 'Remote-first terminal workspace'",
         "$sc.Save()",
@@ -389,7 +392,7 @@ def install_staged_windows_artifact(
         "& reg.exe add 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Yggterm' /v Publisher /d 'YggdrasilHQ' /f | Out-Null",
         "$installedMockPath = $null",
         "if (Test-Path $installedMock) { $installedMockPath = $installedMock }",
-        "$result = @{ asset_label = $AssetLabel; version_text = $versionText; version = $version; install_root = $installRoot; installed_exe = $installedExe; installed_headless = $installedHeadless; installed_mock = $installedMockPath; installed_loader = $installedLoader; integrate_output = $integrateOutput; start_menu_shortcut = $startMenuShortcut; start_menu_shortcut_exists = (Test-Path $startMenuShortcut); legacy_start_menu_shortcut_exists = (Test-Path $legacyShortcut); app_paths_exists = (Test-Path $appPathsKey); uninstall_key_exists = (Test-Path $uninstallKey) }",
+        "$result = @{ asset_label = $AssetLabel; version_text = $versionText; version = $version; install_root = $installRoot; installed_exe = $installedExe; installed_headless = $installedHeadless; installed_mock = $installedMockPath; installed_loader = $installedLoader; launcher = $launcher; launcher_exists = (Test-Path $launcher); integrate_output = $integrateOutput; start_menu_shortcut = $startMenuShortcut; start_menu_shortcut_exists = (Test-Path $startMenuShortcut); legacy_start_menu_shortcut_exists = (Test-Path $legacyShortcut); app_paths_exists = (Test-Path $appPathsKey); uninstall_key_exists = (Test-Path $uninstallKey) }",
         "$result | ConvertTo-Json -Depth 8 -Compress",
     ]
     script = ";\n".join(statements) + "\n"
@@ -401,13 +404,14 @@ def query_windows_install_integration(host: str) -> dict:
         "$ErrorActionPreference = 'Stop'",
         "$installRoot = Join-Path $env:LOCALAPPDATA 'Yggterm'",
         "$installState = Join-Path $installRoot 'install-state.json'",
+        "$launcher = Join-Path $installRoot 'Yggterm.vbs'",
         "$startMenuShortcut = Join-Path $env:APPDATA 'Microsoft\\Windows\\Start Menu\\Programs\\Yggterm.lnk'",
         "$legacyShortcut = Join-Path $env:APPDATA 'Microsoft\\Windows\\Start Menu\\Programs\\Yggterm\\Yggterm.lnk'",
         "$appPathsKey = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\yggterm.exe'",
         "$uninstallKey = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Yggterm'",
         "$installStateJson = $null",
         "if (Test-Path $installState) { try { $installStateJson = Get-Content $installState -Raw | ConvertFrom-Json } catch {} }",
-        "$result = @{ install_root = $installRoot; install_root_exists = (Test-Path $installRoot); install_state_path = $installState; install_state_exists = (Test-Path $installState); install_state = $installStateJson; start_menu_shortcut = $startMenuShortcut; start_menu_shortcut_exists = (Test-Path $startMenuShortcut); legacy_start_menu_shortcut_exists = (Test-Path $legacyShortcut); app_paths_exists = (Test-Path $appPathsKey); uninstall_key_exists = (Test-Path $uninstallKey) }",
+        "$result = @{ install_root = $installRoot; install_root_exists = (Test-Path $installRoot); install_state_path = $installState; install_state_exists = (Test-Path $installState); install_state = $installStateJson; launcher = $launcher; launcher_exists = (Test-Path $launcher); start_menu_shortcut = $startMenuShortcut; start_menu_shortcut_exists = (Test-Path $startMenuShortcut); legacy_start_menu_shortcut_exists = (Test-Path $legacyShortcut); app_paths_exists = (Test-Path $appPathsKey); uninstall_key_exists = (Test-Path $uninstallKey) }",
         "$result | ConvertTo-Json -Depth 8 -Compress",
     ]
     script = ";\n".join(statements) + "\n"
@@ -1029,6 +1033,7 @@ def main() -> int:
             install_integration = query_windows_install_integration(args.host)
             if not (
                 bool(install_integration.get("install_state_exists"))
+                and bool(install_integration.get("launcher_exists"))
                 and bool(install_integration.get("start_menu_shortcut_exists"))
                 and bool(install_integration.get("app_paths_exists"))
             ):
