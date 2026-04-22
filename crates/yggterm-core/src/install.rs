@@ -622,6 +622,37 @@ fn refresh_macos_launcher(launcher_path: &Path, target: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
+fn vbscript_escape(value: &str) -> String {
+    value.replace('"', "\"\"")
+}
+
+#[cfg(target_os = "windows")]
+fn refresh_windows_gui_launcher(executable_path: &Path) -> Result<PathBuf> {
+    let working_dir = executable_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let install_root = working_dir
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| working_dir.clone());
+    let launcher_path = install_root.join("Yggterm.vbs");
+    let command = format!(
+        "cmd.exe /c start \"\" /D \"{}\" /B \"{}\"",
+        vbscript_escape(working_dir.as_os_str().to_string_lossy().as_ref()),
+        vbscript_escape(executable_path.as_os_str().to_string_lossy().as_ref()),
+    );
+    let script = format!(
+        "Set shell = CreateObject(\"WScript.Shell\")\r\nshell.CurrentDirectory = \"{}\"\r\nshell.Run \"{}\", 0, False\r\n",
+        vbscript_escape(working_dir.as_os_str().to_string_lossy().as_ref()),
+        vbscript_escape(&command),
+    );
+    write_if_changed(&launcher_path, script.as_bytes())?;
+    Ok(launcher_path)
+}
+
+#[cfg(target_os = "windows")]
 fn refresh_windows_integration(context: &InstallContext) -> Result<Vec<String>> {
     let mut notes = Vec::new();
     let roaming = dirs::data_dir().context("unable to resolve roaming data dir")?;
@@ -639,6 +670,8 @@ fn refresh_windows_integration(context: &InstallContext) -> Result<Vec<String>> 
         .as_os_str()
         .to_string_lossy()
         .to_string();
+    let launcher_path = refresh_windows_gui_launcher(&context.executable_path)?;
+    let launcher_target = launcher_path.as_os_str().to_string_lossy().to_string();
     let working_dir = context
         .executable_path
         .parent()
@@ -668,7 +701,7 @@ fn refresh_windows_integration(context: &InstallContext) -> Result<Vec<String>> 
         powershell_escape(legacy_shortcut_dir.as_os_str().to_string_lossy().as_ref()),
         powershell_escape(legacy_shortcut_dir.as_os_str().to_string_lossy().as_ref()),
         powershell_escape(shortcut_path.as_os_str().to_string_lossy().as_ref()),
-        powershell_escape(&target_path),
+        powershell_escape(&launcher_target),
         powershell_escape(&working_dir),
         powershell_escape(&target_path),
         powershell_escape(&target_path),
@@ -691,6 +724,10 @@ fn refresh_windows_integration(context: &InstallContext) -> Result<Vec<String>> 
     notes.push(format!(
         "Start Menu shortcut refreshed at {}",
         shortcut_path.display()
+    ));
+    notes.push(format!(
+        "Windows GUI launcher refreshed at {}",
+        launcher_path.display()
     ));
     notes.push("Windows App Paths registration refreshed for yggterm.exe".to_string());
     notes.push("Windows uninstall metadata refreshed for Yggterm".to_string());
