@@ -5406,6 +5406,16 @@ def assert_search_focus_overlay_contract(pid: int, session: str) -> dict:
             f"search shell grew taller than the titlebar instead of remaining an anchored field: "
             f"titlebar={titlebar_rect!r} search_shell={search_shell_rect!r}"
         )
+    if abs(float(search_shell_rect["height"]) - float(baseline_search_field_shell_rect["height"])) > 1.0:
+        raise AssertionError(
+            f"focused search field shell changed height instead of preserving the idle field shape: "
+            f"baseline={baseline_search_field_shell_rect!r} focused={search_shell_rect!r}"
+        )
+    if abs(float(search_shell_rect["width"]) - float(baseline_search_field_shell_rect["width"])) > 2.0:
+        raise AssertionError(
+            f"focused search field shell changed width instead of staying anchored to the same titlebar slot: "
+            f"baseline={baseline_search_field_shell_rect!r} focused={search_shell_rect!r}"
+        )
     if float(search_dropdown_header_rect["top"]) < rect_bottom(search_shell_rect) + 2.0:
         raise AssertionError(
             f"search dropdown overlaps upward into the search field/titlebar geometry: "
@@ -5469,6 +5479,15 @@ def assert_search_focus_overlay_contract(pid: int, session: str) -> dict:
         raise AssertionError(
             "focused search field shell lost its chrome instead of preserving the field inside the search modal: "
             f"box_shadow={search_field_shell_box_shadow!r}"
+        )
+    if css_colors_close(
+        search_shell_background,
+        search_field_shell_background,
+        tolerance=0.012,
+    ):
+        raise AssertionError(
+            "focused search modal shell is visually collapsing into the field instead of reading as a VS Code-like attached surface: "
+            f"panel={search_shell_background!r} field={search_field_shell_background!r}"
         )
     if search_field_shell_radius_delta is None or search_field_shell_radius_delta > 1.0:
         raise AssertionError(

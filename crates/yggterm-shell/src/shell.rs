@@ -40,9 +40,9 @@ use dioxus::prelude::*;
 use dioxus_core::{ScopeId, schedule_update, spawn_forever};
 use dioxus_desktop::UserWindowEvent as DesktopUserWindowEvent;
 use keyboard_types::{Key, Modifiers};
-use once_cell::sync::OnceCell;
 #[cfg(target_os = "macos")]
 use objc2_foundation::{NSProcessInfo, NSString};
+use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::borrow::Cow;
@@ -62,15 +62,13 @@ use tao::event::ElementState;
 use tao::event::Event as TaoEvent;
 use tao::keyboard::Key as TaoKey;
 use tao::keyboard::KeyCode as TaoKeyCode;
+#[cfg(target_os = "macos")]
+use tao::platform::macos::WindowBuilderExtMacOS;
 #[cfg(target_os = "linux")]
 use tao::platform::unix::WindowExtUnix;
-use tao::window::ResizeDirection;
-#[cfg(target_os = "macos")]
-use tao::{
-    platform::macos::WindowBuilderExtMacOS,
-};
 #[cfg(target_os = "windows")]
 use tao::platform::windows::WindowBuilderExtWindows;
+use tao::window::ResizeDirection;
 use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
@@ -100,11 +98,10 @@ use yggterm_server::{
     YggtermServer, app_control_requests_pending, cleanup_legacy_daemons,
     complete_app_control_request, connect_ssh_custom, fetch_remote_generation_context,
     focus_live_with_view, local_headless_companion_executable_from_current,
-    managed_cli_refresh_ttl_ms, open_remote_session_with_view,
-    open_stored_session, open_stored_session_with_view, persist_remote_generated_copy, ping,
-    refresh_local_managed_cli_now, refresh_managed_cli, refresh_preview,
-    refresh_remote_machine, remove_session,
-    remove_ssh_target, request_terminal_launch, set_all_preview_blocks_folded,
+    managed_cli_refresh_ttl_ms, open_remote_session_with_view, open_stored_session,
+    open_stored_session_with_view, persist_remote_generated_copy, ping,
+    refresh_local_managed_cli_now, refresh_managed_cli, refresh_preview, refresh_remote_machine,
+    remove_session, remove_ssh_target, request_terminal_launch, set_all_preview_blocks_folded,
     set_view_mode as daemon_set_view_mode, shutdown as daemon_shutdown,
     snapshot as daemon_snapshot, snapshot_session_view_for_ui, stage_remote_clipboard_png,
     start_command_session, start_local_session_at, start_ssh_session_at, status,
@@ -510,6 +507,8 @@ struct ClientInstanceRecord {
     started_at_ms: u64,
     #[serde(default)]
     process_start_ticks: Option<u64>,
+    #[serde(default)]
+    executable_path: Option<String>,
     #[serde(default)]
     display: Option<String>,
     #[serde(default)]
@@ -20002,6 +20001,7 @@ fn register_client_instance(
         pid,
         started_at_ms,
         process_start_ticks: process_start_ticks(pid),
+        executable_path: current_client_executable_path(),
         display: env_var("DISPLAY"),
         wayland_display: env_var("WAYLAND_DISPLAY"),
         xdg_session_id: env_var("XDG_SESSION_ID"),
@@ -20025,6 +20025,7 @@ fn register_client_instance(
             "pid": pid,
             "path": path.display().to_string(),
             "started_at_ms": started_at_ms,
+            "executable_path": record.executable_path,
             "display": record.display,
             "wayland_display": record.wayland_display,
             "xdg_session_id": record.xdg_session_id,
@@ -20034,6 +20035,13 @@ fn register_client_instance(
     );
     Ok(ClientInstanceRegistration { path })
 }
+
+fn current_client_executable_path() -> Option<String> {
+    let executable = std::env::current_exe().ok()?;
+    let executable = executable.canonicalize().unwrap_or(executable);
+    Some(executable.to_string_lossy().to_string())
+}
+
 fn env_var(key: &str) -> Option<String> {
     std::env::var(key)
         .ok()
@@ -22861,14 +22869,14 @@ fn Titlebar(
         "Search live sessions, folders, and hot terminals. Prefix '/' to run a yggterm command."
     };
     let floating_panel_background = if palette_is_dark(snapshot.palette) {
-        "rgb(14,19,24)"
+        "rgb(15,20,25)"
     } else {
-        "rgb(248,250,253)"
+        "rgb(242,246,250)"
     };
     let floating_panel_shadow = if palette_is_dark(snapshot.palette) {
-        "0 20px 48px rgba(0,0,0,0.28)"
+        "0 20px 48px rgba(0,0,0,0.30)"
     } else {
-        "0 20px 48px rgba(74,93,122,0.18)"
+        "0 20px 48px rgba(74,93,122,0.19)"
     };
     let floating_panel_border = chrome_chip_border(snapshot.palette);
     let floating_panel_box_shadow = format!(
@@ -22876,8 +22884,11 @@ fn Titlebar(
         floating_panel_shadow, floating_panel_border
     );
     let floating_panel_tab_box_shadow = format!(
-        "0 -1px 0 {}, 1px 0 0 {}, -1px 0 0 {}",
-        floating_panel_border, floating_panel_border, floating_panel_border
+        "0 -1px 0 {}, 1px 0 0 {}, -1px 0 0 {}, 0 1px 0 {}",
+        floating_panel_border,
+        floating_panel_border,
+        floating_panel_border,
+        floating_panel_background
     );
     let floating_panel_attached_box_shadow = format!(
         "{}, 1px 0 0 {}, -1px 0 0 {}, 0 1px 0 {}",
@@ -22899,8 +22910,8 @@ fn Titlebar(
         search_field_shell_style(palette_is_dark(snapshot.palette));
     let search_shell_style = if search_dropdown_open {
         format!(
-            "position:absolute; left:0; right:0; top:3px; z-index:221; display:flex; flex-direction:column; gap:6px; \
-             width:min(620px, 100%); min-width:280px; padding:8px; border-radius:14px; \
+            "position:absolute; left:0; right:0; top:2px; z-index:221; display:flex; flex-direction:column; gap:8px; \
+             width:min(620px, 100%); min-width:280px; padding:10px 10px 8px 10px; border-radius:14px; \
              background:{}; box-shadow:{}; overflow:hidden; transition:background 120ms ease, box-shadow 120ms ease;",
             search_panel_background, search_panel_shadow
         )
@@ -22911,7 +22922,7 @@ fn Titlebar(
             .to_string()
     };
     let search_modal_style = if search_dropdown_open {
-        "display:flex; flex-direction:column; gap:8px; width:100%; min-width:0; padding:0; box-sizing:border-box; overflow:hidden;"
+        "display:flex; flex-direction:column; gap:10px; width:100%; min-width:0; padding:0; box-sizing:border-box; overflow:hidden;"
             .to_string()
     } else {
         "display:flex; align-items:center; width:100%; min-width:0; height:100%; padding:0; gap:0; box-sizing:border-box; overflow:visible;"
@@ -22924,7 +22935,7 @@ fn Titlebar(
     };
     let search_dropdown_panel_style = if search_dropdown_open {
         format!(
-            "position:static; display:flex; flex-direction:column; gap:6px; min-width:0; padding:8px 2px 0 2px; \
+            "position:static; display:flex; flex:0 0 auto; flex-direction:column; gap:6px; min-width:0; padding:10px 0 0 0; \
              border-top:1px solid {}; background:transparent; box-shadow:none; overflow:hidden;",
             search_divider_color
         )
@@ -39241,6 +39252,7 @@ mod tests {
             pid: std::process::id(),
             started_at_ms: 1,
             process_start_ticks: process_start_ticks(std::process::id()),
+            executable_path: Some("/tmp/yggterm-test".to_string()),
             display: Some(":10.0".to_string()),
             wayland_display: None,
             xdg_session_id: Some("test-session".to_string()),

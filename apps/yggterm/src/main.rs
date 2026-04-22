@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use anyhow::{Context, Result};
 use std::fs;
 use std::io::Read;
@@ -8,31 +10,30 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use yggterm_platform::configure_gui_entry_process;
 use yggterm_core::{
     ENV_YGGTERM_DIRECT_INSTALL_ROOT, ENV_YGGTERM_HOME, InstallContext, PerfSpan, SessionNode,
     SessionNodeKind, SessionStore, UpdatePolicy, WorkspaceDocumentKind, WorkspaceGroupKind,
     append_trace_event, check_for_update, current_version, detect_install_context,
     install_release_update, refresh_desktop_integration,
 };
+use yggterm_platform::configure_gui_entry_process;
 use yggterm_server::{
     AppControlPreviewLayout, AppControlRightPanelMode, AppControlViewMode, PersistedDaemonState,
-    ProbeTerminalViewportInputMode, SessionKind, YggtermServer, cleanup_legacy_daemons,
-    default_endpoint, detect_ghostty_host, ensure_local_daemon_running,
-    local_headless_companion_executable_from_current, ping,
-    run_app_control_background_window, run_app_control_close_window,
-    run_app_control_create_terminal, run_app_control_describe_rows, run_app_control_describe_state,
-    run_app_control_drag, run_app_control_dump_state, run_app_control_focus_window,
-    run_app_control_key, run_app_control_list_clients, run_app_control_move_window_by,
-    run_app_control_open_path, run_app_control_paste_terminal_clipboard,
-    run_app_control_paste_terminal_clipboard_image, run_app_control_pointer,
-    run_app_control_probe_terminal_viewport_input, run_app_control_probe_terminal_viewport_scroll,
-    run_app_control_probe_terminal_viewport_select, run_app_control_reclaim_terminal_focus,
-    run_app_control_remove_session, run_app_control_reset_theme_editor,
-    run_app_control_restart_pending_update, run_app_control_scroll_preview,
-    run_app_control_send_terminal_input, run_app_control_set_clipboard_png_base64,
-    run_app_control_set_clipboard_text, run_app_control_set_fullscreen,
-    run_app_control_set_main_zoom, run_app_control_set_maximized,
+    ProbeTerminalViewportInputMode, SessionKind, YggtermServer, active_client_instance_records,
+    cleanup_legacy_daemons, default_endpoint, detect_ghostty_host, ensure_local_daemon_running,
+    local_headless_companion_executable_from_current, ping, run_app_control_background_window,
+    run_app_control_close_window, run_app_control_create_terminal, run_app_control_describe_rows,
+    run_app_control_describe_state, run_app_control_drag, run_app_control_dump_state,
+    run_app_control_focus_window, run_app_control_key, run_app_control_list_clients,
+    run_app_control_move_window_by, run_app_control_open_path,
+    run_app_control_paste_terminal_clipboard, run_app_control_paste_terminal_clipboard_image,
+    run_app_control_pointer, run_app_control_probe_terminal_viewport_input,
+    run_app_control_probe_terminal_viewport_scroll, run_app_control_probe_terminal_viewport_select,
+    run_app_control_reclaim_terminal_focus, run_app_control_remove_session,
+    run_app_control_reset_theme_editor, run_app_control_restart_pending_update,
+    run_app_control_scroll_preview, run_app_control_send_terminal_input,
+    run_app_control_set_clipboard_png_base64, run_app_control_set_clipboard_text,
+    run_app_control_set_fullscreen, run_app_control_set_main_zoom, run_app_control_set_maximized,
     run_app_control_set_preview_layout, run_app_control_set_right_panel_mode,
     run_app_control_set_row_expanded, run_app_control_set_search,
     run_app_control_set_theme_editor_open, run_app_control_set_ui_theme,
@@ -309,7 +310,7 @@ fn main() -> Result<()> {
     let store = SessionStore::open_or_init()?;
     install_panic_logging(store.home_dir());
     let startup_home = store.home_dir().to_path_buf();
-    maybe_focus_existing_client(store.home_dir(), &args)?;
+    maybe_focus_existing_client(store.home_dir(), &args, &current_exe)?;
     append_trace_event(
         &startup_home,
         "gui",
@@ -1454,7 +1455,11 @@ fn signal_client_instance_dirs_for_scan(
     dirs
 }
 
-fn maybe_focus_existing_client(home_dir: &std::path::Path, args: &[String]) -> Result<()> {
+fn maybe_focus_existing_client(
+    home_dir: &std::path::Path,
+    args: &[String],
+    current_exe: &std::path::Path,
+) -> Result<()> {
     if !args.is_empty()
         || std::env::var_os(ENV_YGGTERM_ALLOW_MULTI_WINDOW).is_some()
         || std::env::var_os(ENV_YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF).is_some()
@@ -1462,13 +1467,61 @@ fn maybe_focus_existing_client(home_dir: &std::path::Path, args: &[String]) -> R
         return Ok(());
     }
     let endpoint = default_endpoint(home_dir);
-    if compatible_signal_client_count(home_dir, &endpoint)? == 0 {
+    let active_records = active_client_instance_records(home_dir, &endpoint)?;
+    let Some(target_pid) = active_records
+        .iter()
+        .filter(|record| record_matches_executable(record.executable_path.as_deref(), current_exe))
+        .max_by_key(|record| record.started_at_ms)
+        .map(|record| record.pid)
+    else {
         return Ok(());
+    };
+    unsafe {
+        std::env::set_var("YGGTERM_APP_CONTROL_PID", target_pid.to_string());
     }
-    if run_app_control_focus_window(3_000).is_ok() {
+    let focused = run_app_control_focus_window(3_000).is_ok();
+    unsafe {
+        std::env::remove_var("YGGTERM_APP_CONTROL_PID");
+    }
+    if focused {
         std::process::exit(0);
     }
     Ok(())
+}
+
+fn canonical_executable_for_match(path: &std::path::Path) -> std::path::PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn record_matches_executable(
+    record_executable_path: Option<&str>,
+    current_exe: &std::path::Path,
+) -> bool {
+    let Some(record_path) = record_executable_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    executable_paths_match(
+        &canonical_executable_for_match(&std::path::PathBuf::from(record_path)),
+        &canonical_executable_for_match(current_exe),
+    )
+}
+
+fn executable_paths_match(left: &std::path::Path, right: &std::path::Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        return left
+            .to_string_lossy()
+            .replace('/', "\\")
+            .eq_ignore_ascii_case(&right.to_string_lossy().replace('/', "\\"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        left == right
+    }
 }
 
 fn maybe_handoff_to_preferred_executable(
@@ -1975,8 +2028,9 @@ fn run_server_smoke() -> Result<()> {
 mod tests {
     use super::{
         BuiltinCliCommand, SignalClientScope, classify_builtin_cli_command,
-        compatible_signal_client_count, signal_client_instances_dir, signal_client_scope_matches,
-        signal_parse_process_start_ticks_from_stat, signal_process_start_ticks,
+        compatible_signal_client_count, record_matches_executable, signal_client_instances_dir,
+        signal_client_scope_matches, signal_parse_process_start_ticks_from_stat,
+        signal_process_start_ticks,
     };
     use std::fs;
     use yggterm_server::ServerEndpoint;
@@ -2073,5 +2127,17 @@ mod tests {
         assert_eq!(live, 1);
 
         let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn record_matches_executable_requires_same_path() {
+        let current = std::env::current_exe().expect("current exe");
+        let current_text = current.to_string_lossy().to_string();
+        assert!(record_matches_executable(Some(&current_text), &current));
+        assert!(!record_matches_executable(
+            Some("/tmp/not-yggterm"),
+            &current
+        ));
+        assert!(!record_matches_executable(None, &current));
     }
 }

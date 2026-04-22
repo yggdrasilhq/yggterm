@@ -344,17 +344,17 @@ fn WindowControlGlyph(icon: ChromeControlIcon) -> Element {
 pub fn search_field_shell_style(dark_surface: bool) -> String {
     format!(
         "position:relative; display:flex; align-items:center; width:100%; min-width:0; height:26px; padding:0 8px; \
-         border-radius:10px; background:{}; box-sizing:border-box; box-shadow: inset 0 0 0 1px {}; \
+         min-height:26px; max-height:26px; flex:0 0 26px; border-radius:10px; background:{}; box-sizing:border-box; box-shadow:{}; \
          transition:{};",
         if dark_surface {
-            "rgba(8,12,16,0.88)"
+            "rgba(9,13,17,0.94)"
         } else {
-            "rgba(255,255,255,0.9)"
+            "rgba(255,255,255,0.96)"
         },
         if dark_surface {
-            "rgba(214,229,242,0.24)"
+            "inset 0 0 0 1px rgba(214,229,242,0.22), 0 1px 0 rgba(255,255,255,0.05)"
         } else {
-            "rgba(201,214,226,0.74)"
+            "inset 0 0 0 1px rgba(198,212,226,0.82), 0 1px 0 rgba(255,255,255,0.38)"
         },
         standard_transition(&["background-color", "box-shadow"])
     )
@@ -363,7 +363,7 @@ pub fn search_field_shell_style(dark_surface: bool) -> String {
 pub fn search_input_style(text_color: &str, _dark_surface: bool) -> String {
     format!(
         "width:100%; height:100%; padding:0 3px; border:none; background:transparent; color:{}; outline:none; \
-         box-sizing:border-box; display:block; margin:0; \
+         box-sizing:border-box; display:block; margin:0; min-width:0; flex:1 1 auto; appearance:none; -webkit-appearance:none; border-radius:0; \
          font-size:13.5px; font-weight:550; letter-spacing:-0.012em; line-height:1; \
          font-family:'Inter Variable', Inter, system-ui, sans-serif; text-rendering:optimizeLegibility; \
          -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale; \

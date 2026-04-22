@@ -6,9 +6,11 @@ use std::process::{Command, Stdio};
 #[cfg(target_os = "macos")]
 use objc2::{AnyThread, msg_send, runtime::AnyObject};
 #[cfg(target_os = "macos")]
-use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSBitmapImageRepPropertyKey};
+use objc2_app_kit::{
+    NSBitmapImageFileType, NSBitmapImageRep, NSBitmapImageRepPropertyKey, NSWindow,
+};
 #[cfg(target_os = "macos")]
-use objc2_core_graphics::{CGWindowImageOption, CGWindowListOption, CGRectNull};
+use objc2_core_graphics::{CGRectNull, CGWindowImageOption, CGWindowListOption};
 #[cfg(target_os = "macos")]
 use objc2_foundation::NSDictionary;
 #[cfg(target_os = "macos")]
@@ -173,8 +175,18 @@ pub fn capture_macos_window_screenshot(
 ) -> Result<()> {
     match capture_macos_window_cg_screenshot(ns_window_ptr, output_path) {
         Ok(()) => Ok(()),
-        Err(cg_error) => capture_macos_window_screencapture(ns_window_ptr, output_path)
-            .with_context(|| format!("fallback screencapture failed after CG capture error: {cg_error:#}")),
+        Err(cg_error) => {
+            match capture_macos_window_view_cache_screenshot(ns_window_ptr, output_path) {
+                Ok(()) => Ok(()),
+                Err(view_error) => capture_macos_window_screencapture(ns_window_ptr, output_path)
+                    .with_context(|| {
+                        format!(
+                            "fallback screencapture failed after CG capture error: {cg_error:#}; \
+view cache error: {view_error:#}"
+                        )
+                    }),
+            }
+        }
     }
 }
 
@@ -198,9 +210,45 @@ pub fn capture_macos_window_cg_screenshot(
         bitmap.representationUsingType_properties(NSBitmapImageFileType::PNG, &properties)
     }
     .context("encoding CG window image as PNG")?;
-    std::fs::write(output_path, png_data.to_vec())
-        .with_context(|| format!("writing macOS CG window screenshot {}", output_path.display()))?;
+    std::fs::write(output_path, png_data.to_vec()).with_context(|| {
+        format!(
+            "writing macOS CG window screenshot {}",
+            output_path.display()
+        )
+    })?;
     ensure_macos_png_not_blank(output_path, "CG window capture")?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub fn capture_macos_window_view_cache_screenshot(
+    ns_window_ptr: *mut std::ffi::c_void,
+    output_path: &Path,
+) -> Result<()> {
+    let ns_window = macos_ns_window(ns_window_ptr)?;
+    let content_view = ns_window
+        .contentView()
+        .context("reading macOS content view for cached display capture")?;
+    let capture_view = unsafe { content_view.superview() }.unwrap_or(content_view);
+    let bounds = capture_view.bounds();
+    capture_view.displayIfNeeded();
+    capture_view.displayIfNeededIgnoringOpacity();
+    let bitmap = capture_view
+        .bitmapImageRepForCachingDisplayInRect(bounds)
+        .context("allocating macOS cached display bitmap")?;
+    capture_view.cacheDisplayInRect_toBitmapImageRep(bounds, &bitmap);
+    let properties = NSDictionary::<NSBitmapImageRepPropertyKey, AnyObject>::new();
+    let png_data = unsafe {
+        bitmap.representationUsingType_properties(NSBitmapImageFileType::PNG, &properties)
+    }
+    .context("encoding macOS cached display capture as PNG")?;
+    std::fs::write(output_path, png_data.to_vec()).with_context(|| {
+        format!(
+            "writing macOS cached display screenshot {}",
+            output_path.display()
+        )
+    })?;
+    ensure_macos_png_not_blank(output_path, "cached display capture")?;
     Ok(())
 }
 
@@ -253,6 +301,36 @@ pub fn capture_macos_window_screencapture(
     if !status.success() {
         bail!("screencapture exited with status {status}");
     }
+    ensure_macos_png_not_blank(output_path, "screencapture window capture")?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub fn capture_macos_screen_rect_screencapture(
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    output_path: &Path,
+) -> Result<()> {
+    if width == 0 || height == 0 {
+        bail!("cannot capture a macOS screen rect with an empty size");
+    }
+    let rect = format!("{x},{y},{width},{height}");
+    let status = Command::new("screencapture")
+        .arg("-x")
+        .arg("-R")
+        .arg(rect)
+        .arg(output_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("running macOS screencapture for rect screenshot")?;
+    if !status.success() {
+        bail!("screencapture rect capture exited with status {status}");
+    }
+    ensure_macos_png_not_blank(output_path, "screencapture rect capture")?;
     Ok(())
 }
 
@@ -397,15 +475,20 @@ public static class YggtermPrintWindowCapture {{\n\
 
 #[cfg(target_os = "macos")]
 fn macos_window_number(ns_window_ptr: *mut std::ffi::c_void) -> Result<i64> {
-    if ns_window_ptr.is_null() {
-        bail!("tao returned a null NSWindow pointer");
-    }
-    let ns_window = ns_window_ptr.cast::<AnyObject>();
+    let ns_window = macos_ns_window(ns_window_ptr)? as *const NSWindow as *mut AnyObject;
     let window_number: i64 = unsafe { msg_send![ns_window, windowNumber] };
     if window_number <= 0 {
         bail!("invalid NSWindow windowNumber {window_number}");
     }
     Ok(window_number)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_ns_window(ns_window_ptr: *mut std::ffi::c_void) -> Result<&'static NSWindow> {
+    if ns_window_ptr.is_null() {
+        bail!("tao returned a null NSWindow pointer");
+    }
+    Ok(unsafe { &*(ns_window_ptr.cast::<NSWindow>()) })
 }
 
 pub fn host_platform() -> HostPlatform {
