@@ -548,7 +548,8 @@ def remote_json_command(
     check: bool = True,
 ) -> dict:
     exports = remote_env_exports(env)
-    command = f"{exports}; {quote(remote_bin)} " + " ".join(quote(arg) for arg in args)
+    command_prefix = f"{exports}; " if exports else ""
+    command = command_prefix + f"{quote(remote_bin)} " + " ".join(quote(arg) for arg in args)
     proc = ssh_shell(host, command, check=check)
     text = proc.stdout.strip()
     if not text:
@@ -823,6 +824,7 @@ def main() -> int:
         "YGGTERM_ALLOW_MULTI_WINDOW": "1",
         "YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF": "1",
     }
+    control_env = {} if args.attach_only else dict(launch_env)
     pid = 0
     owned_launch = False
     launch_payload = None
@@ -843,7 +845,7 @@ def main() -> int:
             clients_payload = remote_json_command(
                 args.host,
                 remote_bin,
-                launch_env,
+                control_env,
                 ["server", "app", "clients", "--timeout-ms", str(args.timeout_ms)],
             )
             pid = choose_client_pid(clients_payload)
@@ -931,7 +933,7 @@ def main() -> int:
         state = wait_for_ready_state(
             args.host,
             remote_bin,
-            launch_env,
+            control_env,
             pid,
             args.timeout_ms,
         )
@@ -939,7 +941,7 @@ def main() -> int:
         rows_payload = remote_json_command(
             args.host,
             remote_bin,
-            launch_env,
+            control_env,
             ["server", "app", "rows", "--pid", str(pid), "--timeout-ms", str(args.timeout_ms)],
         )
         rows = rows_payload.get("data") if isinstance(rows_payload.get("data"), dict) else rows_payload
@@ -958,7 +960,7 @@ def main() -> int:
             screenshot_response = capture_remote_screenshot(
                 args.host,
                 remote_bin,
-                launch_env,
+                control_env,
                 pid,
                 args.timeout_ms,
                 f"{remote_dir}/window.png",
@@ -971,7 +973,7 @@ def main() -> int:
                 background_response = remote_background_window(
                     args.host,
                     remote_bin,
-                    launch_env,
+                    control_env,
                     pid,
                     args.timeout_ms,
                 )
@@ -1076,7 +1078,7 @@ def main() -> int:
                 remote_json_command(
                     args.host,
                     remote_bin,
-                    launch_env,
+                    control_env,
                     ["server", "app", "close", "--pid", str(pid), "--timeout-ms", str(args.timeout_ms)],
                     check=False,
                 )
@@ -1097,7 +1099,7 @@ def main() -> int:
                 remote_json_command(
                     args.host,
                     remote_bin,
-                    launch_env,
+                    control_env,
                     ["server", "shutdown"],
                     check=False,
                 )

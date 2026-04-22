@@ -60,11 +60,11 @@ if ($clients.Count -gt 0) {
 $state = $null
 $screenshotBase64 = $null
 if ($chosen) {
-  $pid = [int]$chosen.pid
-  $statePayload = & $bin server app state --pid $pid --timeout-ms $TimeoutMs | ConvertFrom-Json
+  $clientPid = [int]$chosen.pid
+  $statePayload = & $bin server app state --pid $clientPid --timeout-ms $TimeoutMs | ConvertFrom-Json
   $state = $statePayload.data
   if ($ScreenshotPath) {
-    & $bin server app screenshot --pid $pid $ScreenshotPath --timeout-ms $TimeoutMs | Out-Null
+    & $bin server app screenshot --pid $clientPid $ScreenshotPath --timeout-ms $TimeoutMs | Out-Null
     if (Test-Path $ScreenshotPath) {
       $bytes = [System.IO.File]::ReadAllBytes($ScreenshotPath)
       $screenshotBase64 = [Convert]::ToBase64String($bytes)
@@ -100,6 +100,31 @@ def run_remote_powershell(host: str, script: str) -> subprocess.CompletedProcess
         text=True,
         capture_output=True,
         input=script,
+    )
+    stderr = strip_windows_ssh_noise(proc.stderr)
+    stdout = proc.stdout.strip()
+    if proc.returncode != 0:
+        raise RuntimeError(stderr or stdout or f"powershell failed on {host}")
+    return proc
+
+
+def run_remote_powershell_encoded(host: str, script: str) -> subprocess.CompletedProcess:
+    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    proc = subprocess.run(
+        [
+            *SSH_BASE,
+            host,
+            "powershell",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-EncodedCommand",
+            encoded,
+        ],
+        text=True,
+        capture_output=True,
     )
     stderr = strip_windows_ssh_noise(proc.stderr)
     stdout = proc.stdout.strip()
@@ -156,7 +181,7 @@ def main() -> int:
         + f"$ScreenshotPath = {ps_literal(screenshot_remote)}\n"
         + POWERSHELL_SNIPPET
     )
-    proc = run_remote_powershell(args.host, launcher)
+    proc = run_remote_powershell_encoded(args.host, launcher)
     try:
         payload = json.loads(extract_json_text(proc.stdout))
     except Exception as exc:  # noqa: BLE001
