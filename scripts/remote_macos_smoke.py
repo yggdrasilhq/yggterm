@@ -21,6 +21,30 @@ DEFAULT_ICON = ROOT / "assets" / "brand" / "yggterm-icon-512.png"
 REMOTE_MACOS_HOME_PREFIX = "yggterm-remote-macos-"
 
 
+def workspace_version() -> str | None:
+    cargo_toml = ROOT / "Cargo.toml"
+    try:
+        text = cargo_toml.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = re.search(
+        r'^\[workspace\.package\][\s\S]*?^version\s*=\s*"([^"]+)"',
+        text,
+        re.MULTILINE,
+    )
+    if not match:
+        return None
+    return str(match.group(1)).strip() or None
+
+
+def artifact_under_dist(path: Path) -> bool:
+    try:
+        path.resolve().relative_to((ROOT / "dist").resolve())
+        return True
+    except ValueError:
+        return False
+
+
 def default_artifact() -> Path:
     candidates = [
         ROOT / "dist" / "yggterm-macos-x86_64.app.zip",
@@ -80,7 +104,11 @@ def frontmost_macos_app_name(host: str) -> str | None:
         'osascript -e \'tell application "System Events" to get name of first application process whose frontmost is true\'',
         check=False,
     )
+    if proc.returncode != 0:
+        return None
     text = proc.stdout.strip() or proc.stderr.strip()
+    if "execution error" in text.lower():
+        return None
     return text or None
 
 
@@ -141,6 +169,34 @@ def remote_macos_yggterm_processes(host: str) -> dict:
         if "yggterm" in str(row.get("command") or "").lower()
     ]
     return {"count": len(clients), "clients": clients}
+
+
+def remote_macos_bundle_processes(host: str, executable_path: str | None) -> dict:
+    target = str(executable_path or "").strip()
+    clients = []
+    for row in remote_macos_process_rows(host):
+        command = str(row.get("command") or "").strip()
+        if "yggterm" not in command.lower():
+            continue
+        if target and target not in command:
+            continue
+        clients.append(row)
+    return {"count": len(clients), "clients": clients}
+
+
+def kill_remote_macos_bundle_processes(host: str, executable_path: str | None) -> dict:
+    inventory = remote_macos_bundle_processes(host, executable_path)
+    pids = [int(client.get("pid") or 0) for client in inventory.get("clients") or []]
+    pids = [pid for pid in pids if pid > 0]
+    if pids:
+        pid_args = " ".join(str(pid) for pid in pids)
+        ssh_shell(host, f"kill -TERM {pid_args} >/dev/null 2>&1 || true", check=False)
+        time.sleep(0.75)
+        ssh_shell(host, f"kill -KILL {pid_args} >/dev/null 2>&1 || true", check=False)
+    return {
+        "before": inventory,
+        "after": remote_macos_bundle_processes(host, executable_path),
+    }
 
 
 def scope_matches_remote_dir(command: str, scope: str) -> bool:
@@ -619,17 +675,6 @@ def spawn_direct_macos_app(
     remote_app: str | None = None,
 ) -> dict:
     exports = remote_env_exports(env)
-    if remote_app:
-        ssh_shell(
-            host,
-            f"mkdir -p {quote(Path(remote_log).parent.as_posix())}; "
-            f"{exports}; open -na {quote(remote_app)} >/dev/null 2>&1",
-        )
-        return {
-            "mode": "app_bundle_open",
-            "app_bundle": remote_app,
-            "stdout_log": remote_log,
-        }
     proc = ssh_shell(
         host,
         f"mkdir -p {quote(Path(remote_log).parent.as_posix())}; "
@@ -637,6 +682,8 @@ def spawn_direct_macos_app(
     )
     spawn_pid = int((proc.stdout.strip().splitlines() or ["0"])[-1])
     return {
+        "mode": "bundle_binary_direct_launch" if remote_app else "direct_process_launch",
+        "app_bundle": remote_app,
         "spawn_pid": spawn_pid,
         "stdout_log": remote_log,
     }
@@ -743,6 +790,27 @@ def remote_background_window(
     return payload
 
 
+def remote_focus_window(
+    host: str,
+    remote_bin: str,
+    env: dict[str, str],
+    pid: int,
+    timeout_ms: int,
+) -> dict:
+    payload = remote_json_command(
+        host,
+        remote_bin,
+        env,
+        ["server", "app", "focus", "--pid", str(pid), "--timeout-ms", str(timeout_ms)],
+        check=False,
+    )
+    if not payload:
+        raise RuntimeError(f"remote macOS focus command returned no payload for pid {pid}")
+    if payload.get("error"):
+        raise RuntimeError(str(payload.get("error")))
+    return payload
+
+
 def cleanup_remote_dir(host: str, remote_dir: str) -> None:
     ssh_shell(host, f"rm -rf {quote(remote_dir)}", check=False)
 
@@ -764,18 +832,27 @@ def main() -> int:
     remote_bin = ""
     remote_app = None
     remote_version = None
+    expected_workspace_version = None
     remote_bin_error = None
     remote_clients_probe = None
     frontmost_app_name = None
+    focus_response = None
+    focus_error = None
     background_response = None
     background_error = None
     install_summary = None
+    killed_installed_processes_prelaunch = None
     prelaunch_cleanup = cleanup_stale_remote_macos_clients(args.host)
     yggterm_processes_before_launch = remote_macos_yggterm_processes(args.host)
 
     session_info = macos_session_info(args.host)
     ssh_shell(args.host, f"mkdir -p {quote(remote_dir)} {quote(remote_home)}")
     try:
+        artifact_value = str(args.artifact or "").strip()
+        if artifact_value:
+            artifact = Path(artifact_value).expanduser()
+            if artifact.exists() and artifact_under_dist(artifact):
+                expected_workspace_version = workspace_version()
         remote_bin, remote_app = resolve_remote_launch_target(args.host, remote_dir, args)
         remote_bin, remote_app = normalize_staged_macos_payload(
             args.host, remote_dir, remote_bin, remote_app
@@ -786,10 +863,19 @@ def main() -> int:
             install_summary = install_staged_macos_app_bundle(args.host, remote_app)
             remote_app = str(install_summary.get("installed_app") or "").strip() or remote_app
             remote_bin = str(install_summary.get("installed_bin") or "").strip() or remote_bin
+            killed_installed_processes_prelaunch = kill_remote_macos_bundle_processes(
+                args.host,
+                remote_bin,
+            )
         try:
             remote_version = remote_binary_version(args.host, remote_bin)
         except Exception:
             remote_version = None
+        if expected_workspace_version and remote_version and remote_version != expected_workspace_version:
+            raise RuntimeError(
+                "remote macOS smoke staged a stale artifact from dist/: "
+                f"workspace_version={expected_workspace_version!r} artifact_version={remote_version!r}"
+            )
         try:
             remote_clients_probe = probe_remote_clients(args.host, remote_bin)
         except Exception:
@@ -805,11 +891,13 @@ def main() -> int:
             "remote_bin": remote_bin or None,
             "remote_app": remote_app,
             "remote_version": remote_version,
+            "workspace_version": expected_workspace_version,
             "remote_bin_error": remote_bin_error,
             "remote_clients_probe": remote_clients_probe,
             "frontmost_app_name": frontmost_app_name,
             "prelaunch_cleanup": prelaunch_cleanup,
             "install_summary": install_summary,
+            "killed_installed_processes_prelaunch": killed_installed_processes_prelaunch,
             "pid": None,
             "owned_launch": False,
             "launch": None,
@@ -843,6 +931,8 @@ def main() -> int:
                 "Yggterm may briefly come to the front, then it will be moved behind other apps and closed."
             ),
         )
+        if remote_bin_error:
+            raise RuntimeError(remote_bin_error)
         if not remote_bin:
             raise RuntimeError(remote_bin_error or f"could not resolve remote macOS binary on {args.host}")
         if args.attach_only:
@@ -856,7 +946,7 @@ def main() -> int:
         else:
             if remote_app:
                 launch_payload = {
-                    "mode": "app_bundle_open",
+                    "mode": "app_bundle_binary_launch",
                     "spawn": spawn_direct_macos_app(
                         args.host,
                         remote_bin,
@@ -962,6 +1052,17 @@ def main() -> int:
         screenshot_error = None
         screenshot_quality = None
         try:
+            focus_response = remote_focus_window(
+                args.host,
+                remote_bin,
+                control_env,
+                pid,
+                args.timeout_ms,
+            )
+        except Exception as exc:  # noqa: BLE001
+            focus_error = str(exc)
+        frontmost_app_name = frontmost_macos_app_name(args.host)
+        try:
             screenshot_response = capture_remote_screenshot(
                 args.host,
                 remote_bin,
@@ -1008,11 +1109,13 @@ def main() -> int:
             "screenshot_backend_attempts": screenshot_backend_attempts(screenshot_response),
             "screenshot_quality": screenshot_quality,
             "screenshot_error": screenshot_error,
+            "focus_response": focus_response,
+            "focus_error": focus_error,
             "background_response": background_response,
             "background_error": background_error,
         }
         summary_path.write_text(json.dumps(proof_summary, indent=2), encoding="utf-8")
-        if remote_app and frontmost_app_name != "Yggterm":
+        if remote_app and frontmost_app_name and frontmost_app_name != "Yggterm":
             raise RuntimeError(
                 f"staged macOS app bundle still exposed the wrong frontmost app name: {frontmost_app_name!r}"
             )
@@ -1027,10 +1130,12 @@ def main() -> int:
             "remote_bin": remote_bin,
             "remote_app": remote_app,
             "remote_version": remote_version,
+            "workspace_version": expected_workspace_version,
             "remote_clients_probe": remote_clients_probe,
             "frontmost_app_name": frontmost_app_name,
             "prelaunch_cleanup": prelaunch_cleanup,
             "install_summary": install_summary,
+            "killed_installed_processes_prelaunch": killed_installed_processes_prelaunch,
             "yggterm_processes_before_launch": yggterm_processes_before_launch,
             "owned_clients_after_launch": owned_clients_after_launch,
             "pid": pid,
@@ -1051,11 +1156,13 @@ def main() -> int:
             "remote_bin": remote_bin or None,
             "remote_app": remote_app,
             "remote_version": remote_version,
+            "workspace_version": expected_workspace_version,
             "remote_bin_error": remote_bin_error,
             "remote_clients_probe": remote_clients_probe,
             "frontmost_app_name": frontmost_app_name,
             "prelaunch_cleanup": prelaunch_cleanup,
             "install_summary": install_summary,
+            "killed_installed_processes_prelaunch": killed_installed_processes_prelaunch,
             "yggterm_processes_before_launch": yggterm_processes_before_launch,
             "owned_clients_after_launch": remote_owned_macos_clients(args.host, remote_dir),
             "pid": pid or None,
