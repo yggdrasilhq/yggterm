@@ -85,7 +85,7 @@ use yggterm_core::{
     looks_like_low_signal_generated_copy, read_codex_session_identity_fields, resolve_yggterm_home,
     save_settings_file, unique_session_short_ids_for_pairs, update_command_hint,
 };
-use yggterm_platform::{DockRect, send_user_notification};
+use yggterm_platform::{DockRect, configure_background_service_command, send_user_notification};
 use yggterm_server::{
     AppControlCommand, AppControlDragCommand, AppControlDragPlacement, AppControlKeyCommand,
     AppControlPointerCommand, AppControlPreviewLayout, AppControlResponse,
@@ -221,7 +221,7 @@ const TITLEBAR_RESPONSIVE_CSS: &str = r#"
 [data-yggterm-titlebar-right] .yggterm-titlebar-overflow-trigger {
     display: none !important;
 }
-@media (max-width: 1320px) {
+@media (max-width: 1200px) {
     [data-yggterm-titlebar-right] .yggterm-titlebar-inline-secondary,
     [data-yggterm-titlebar-right] .yggterm-titlebar-inline-update {
         display: none !important;
@@ -230,7 +230,7 @@ const TITLEBAR_RESPONSIVE_CSS: &str = r#"
         display: inline-flex !important;
     }
 }
-@media (max-width: 1120px) {
+@media (max-width: 1020px) {
     [data-yggterm-titlebar-right] .yggterm-titlebar-connect-primary {
         display: none !important;
     }
@@ -6633,6 +6633,7 @@ fn spawn_daemon_process(endpoint: &ServerEndpoint) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(log_file.try_clone()?)
         .stderr(log_file);
+    configure_background_service_command(&mut command);
     if let Some(parent) = daemon_exe.parent() {
         command.current_dir(parent);
     }

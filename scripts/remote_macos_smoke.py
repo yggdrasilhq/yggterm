@@ -7,9 +7,11 @@ from pathlib import Path
 
 from remote_linux_x11_smoke import configure_remote_transport, quote, scp_from, scp_to, ssh_shell
 from smoke_app_control_bootstrap import (
+    assert_active_terminal_host_ready,
     assert_sidebar_rows_present,
     assert_blur_expectation,
     assert_screenshot_file_usable,
+    assert_titlebar_utility_buttons_inline,
     problem_notifications,
     screenshot_backend,
     screenshot_backend_attempts,
@@ -55,6 +57,38 @@ def default_artifact() -> Path:
         if candidate.exists():
             return candidate
     return candidates[-1]
+
+
+def discover_macos_companion_binaries(artifact: Path) -> list[Path]:
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+
+    def add_candidate(path: Path) -> None:
+        resolved = path.expanduser()
+        if resolved.exists() and resolved not in seen:
+            seen.add(resolved)
+            candidates.append(resolved)
+
+    lower = artifact.name.lower()
+    for suffix in ("x86_64", "aarch64"):
+        add_candidate(artifact.with_name(f"yggterm-headless-macos-{suffix}"))
+        add_candidate(artifact.with_name(f"yggterm-mock-cli-macos-{suffix}"))
+    if lower.endswith(".app.zip"):
+        add_candidate(artifact.with_name("yggterm-headless-macos-x86_64"))
+        add_candidate(artifact.with_name("yggterm-mock-cli-macos-x86_64"))
+    add_candidate(artifact.with_name("yggterm-headless"))
+    add_candidate(artifact.with_name("yggterm-mock-cli"))
+    return candidates
+
+
+def stage_support_files(host: str, files: list[Path], remote_dir: str) -> list[str]:
+    staged: list[str] = []
+    for path in files:
+        remote_path = f"{remote_dir}/{path.name}"
+        scp_to(host, path, remote_path)
+        ssh_shell(host, f"chmod +x {quote(remote_path)}", check=False)
+        staged.append(remote_path)
+    return staged
 
 
 def parse_args() -> argparse.Namespace:
@@ -394,7 +428,9 @@ def stage_artifact(host: str, artifact: Path, remote_dir: str) -> tuple[str, str
         if remote_app:
             remote_bin = ssh_shell(
                 host,
-                f"find {quote(remote_app)}/Contents/MacOS -maxdepth 1 -type f | head -n1",
+                f"if [ -f {quote(remote_app + '/Contents/MacOS/Yggterm')} ]; then "
+                f"printf '%s\\n' {quote(remote_app + '/Contents/MacOS/Yggterm')}; "
+                f"else find {quote(remote_app)}/Contents/MacOS -maxdepth 1 -type f | head -n1; fi",
             ).stdout.strip()
             if not remote_bin:
                 raise RuntimeError(
@@ -431,6 +467,33 @@ macos="$app/Contents/MacOS"
 mkdir -p "$resources" "$macos"
 cp "$bin" "$macos/Yggterm"
 chmod +x "$macos/Yggterm"
+bin_dir="$(dirname "$bin")"
+for candidate in \
+  "$bin_dir/yggterm-headless" \
+  "$bin_dir/yggterm-headless-bin" \
+  "$bin_dir/yggterm-headless-macos-x86_64" \
+  {quote(remote_dir + '/yggterm-headless')} \
+  {quote(remote_dir + '/yggterm-headless-bin')} \
+  {quote(remote_dir + '/yggterm-headless-macos-x86_64')}
+do
+  if [ -f "$candidate" ]; then
+    cp "$candidate" "$macos/yggterm-headless"
+    chmod +x "$macos/yggterm-headless"
+    break
+  fi
+done
+for candidate in \
+  "$bin_dir/yggterm-mock-cli" \
+  "$bin_dir/yggterm-mock-cli-macos-x86_64" \
+  {quote(remote_dir + '/yggterm-mock-cli')} \
+  {quote(remote_dir + '/yggterm-mock-cli-macos-x86_64')}
+do
+  if [ -f "$candidate" ]; then
+    cp "$candidate" "$macos/yggterm-mock-cli"
+    chmod +x "$macos/yggterm-mock-cli"
+    break
+  fi
+done
 icon_file="yggterm.png"
 if [ -f {quote(remote_icon)} ]; then
   cp {quote(remote_icon)} "$resources/yggterm.png"
@@ -502,7 +565,9 @@ def install_staged_macos_app_bundle(host: str, remote_app: str) -> dict:
     )
     installed_bin = ssh_shell(
         host,
-        f"find {quote(installed_app)}/Contents/MacOS -maxdepth 1 -type f | head -n1",
+        f"if [ -f {quote(installed_app + '/Contents/MacOS/Yggterm')} ]; then "
+        f"printf '%s\\n' {quote(installed_app + '/Contents/MacOS/Yggterm')}; "
+        f"else find {quote(installed_app)}/Contents/MacOS -maxdepth 1 -type f | head -n1; fi",
     ).stdout.strip()
     if not installed_bin:
         raise RuntimeError(f"installed macOS app bundle did not expose a launcher under {installed_app}")
@@ -510,6 +575,8 @@ def install_staged_macos_app_bundle(host: str, remote_app: str) -> dict:
         "install_root": install_root,
         "installed_app": installed_app,
         "installed_bin": installed_bin,
+        "installed_headless": f"{installed_app}/Contents/MacOS/yggterm-headless",
+        "installed_mock_cli": f"{installed_app}/Contents/MacOS/yggterm-mock-cli",
     }
 
 
@@ -546,7 +613,9 @@ def normalize_staged_macos_payload(
         if app:
             resolved = ssh_shell(
                 host,
-                f"find {quote(app)}/Contents/MacOS -maxdepth 1 -type f | head -n1",
+                f"if [ -f {quote(app + '/Contents/MacOS/Yggterm')} ]; then "
+                f"printf '%s\\n' {quote(app + '/Contents/MacOS/Yggterm')}; "
+                f"else find {quote(app)}/Contents/MacOS -maxdepth 1 -type f | head -n1; fi",
             ).stdout.strip()
             if not resolved:
                 raise RuntimeError(f"staged macOS app bundle {app} did not expose an executable")
@@ -736,6 +805,79 @@ def wait_for_ready_state(
     )
 
 
+def remote_create_plain_terminal(
+    host: str,
+    remote_bin: str,
+    env: dict[str, str],
+    pid: int,
+    *,
+    title: str = "Remote Smoke Plain",
+    timeout_ms: int = 30000,
+) -> dict:
+    payload = remote_json_command(
+        host,
+        remote_bin,
+        env,
+        [
+            "server",
+            "app",
+            "terminal",
+            "new",
+            "--pid",
+            str(pid),
+            "--title",
+            title,
+            "--timeout-ms",
+            str(timeout_ms),
+        ],
+    )
+    if payload.get("error"):
+        raise RuntimeError(f"plain terminal creation failed on {host}: {payload['error']}")
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise RuntimeError(f"plain terminal creation returned no data payload on {host}: {payload!r}")
+    session_path = str(data.get("active_session_path") or "").strip()
+    if not session_path:
+        raise RuntimeError(f"plain terminal creation did not return an active_session_path on {host}")
+    return data
+
+
+def wait_for_terminal_ready_state(
+    host: str,
+    remote_bin: str,
+    env: dict[str, str],
+    pid: int,
+    timeout_ms: int,
+    session_path: str,
+    *,
+    wait_seconds: float = 45.0,
+) -> tuple[dict, dict]:
+    deadline = time.time() + wait_seconds
+    last_state = {}
+    last_error = ""
+    while time.time() < deadline:
+        try:
+            last_state = remote_json_command(
+                host,
+                remote_bin,
+                env,
+                ["server", "app", "state", "--pid", str(pid), "--timeout-ms", str(timeout_ms)],
+                expect_data=True,
+            )
+            bad_notifications = problem_notifications(last_state)
+            if bad_notifications:
+                raise RuntimeError(f"bad daemon/socket notifications observed: {bad_notifications!r}")
+            terminal = assert_active_terminal_host_ready(last_state, session_path)
+            return last_state, terminal
+        except Exception as exc:  # noqa: BLE001
+            last_error = str(exc)
+            time.sleep(0.25)
+    raise RuntimeError(
+        f"remote macOS terminal never became ready for pid {pid} within {wait_seconds:.1f}s: "
+        f"{last_error} state={last_state!r}"
+    )
+
+
 def capture_remote_screenshot(
     host: str,
     remote_bin: str,
@@ -841,6 +983,8 @@ def main() -> int:
     background_response = None
     background_error = None
     install_summary = None
+    bundle_binaries = None
+    staged_support_files: list[str] = []
     killed_installed_processes_prelaunch = None
     prelaunch_cleanup = cleanup_stale_remote_macos_clients(args.host)
     yggterm_processes_before_launch = remote_macos_yggterm_processes(args.host)
@@ -853,6 +997,12 @@ def main() -> int:
             artifact = Path(artifact_value).expanduser()
             if artifact.exists() and artifact_under_dist(artifact):
                 expected_workspace_version = workspace_version()
+            if artifact.exists():
+                staged_support_files = stage_support_files(
+                    args.host,
+                    discover_macos_companion_binaries(artifact),
+                    remote_dir,
+                )
         remote_bin, remote_app = resolve_remote_launch_target(args.host, remote_dir, args)
         remote_bin, remote_app = normalize_staged_macos_payload(
             args.host, remote_dir, remote_bin, remote_app
@@ -867,6 +1017,21 @@ def main() -> int:
                 args.host,
                 remote_bin,
             )
+        if remote_app:
+            bundle_binaries = {
+                "gui": f"{remote_app}/Contents/MacOS/Yggterm",
+                "headless": f"{remote_app}/Contents/MacOS/yggterm-headless",
+                "mock_cli": f"{remote_app}/Contents/MacOS/yggterm-mock-cli",
+            }
+            if ssh_shell(
+                args.host,
+                f"test -x {quote(bundle_binaries['headless'])}",
+                check=False,
+            ).returncode != 0:
+                raise RuntimeError(
+                    "staged macOS app bundle is missing the headless companion: "
+                    f"{bundle_binaries!r}"
+                )
         try:
             remote_version = remote_binary_version(args.host, remote_bin)
         except Exception:
@@ -897,6 +1062,7 @@ def main() -> int:
             "frontmost_app_name": frontmost_app_name,
             "prelaunch_cleanup": prelaunch_cleanup,
             "install_summary": install_summary,
+            "staged_support_files": staged_support_files,
             "killed_installed_processes_prelaunch": killed_installed_processes_prelaunch,
             "pid": None,
             "owned_launch": False,
@@ -1031,6 +1197,22 @@ def main() -> int:
             pid,
             args.timeout_ms,
         )
+        titlebar = assert_titlebar_utility_buttons_inline(state)
+        created_terminal = remote_create_plain_terminal(
+            args.host,
+            remote_bin,
+            control_env,
+            pid,
+            timeout_ms=args.timeout_ms,
+        )
+        state, terminal = wait_for_terminal_ready_state(
+            args.host,
+            remote_bin,
+            control_env,
+            pid,
+            args.timeout_ms,
+            str(created_terminal.get("active_session_path") or "").strip(),
+        )
         blur = assert_blur_expectation(state, args.expect_live_blur)
         rows_payload = remote_json_command(
             args.host,
@@ -1101,6 +1283,10 @@ def main() -> int:
             "problem_notifications": problem_notifications(state),
             "blur": blur,
             "sidebar": sidebar,
+            "titlebar_right_controls": titlebar,
+            "created_terminal": created_terminal,
+            "terminal": terminal,
+            "bundle_binaries": bundle_binaries,
             "state_path": str(state_path),
             "rows_path": str(rows_path),
             "screenshot_path": str(screenshot_path) if screenshot_path.exists() else None,
@@ -1135,6 +1321,8 @@ def main() -> int:
             "frontmost_app_name": frontmost_app_name,
             "prelaunch_cleanup": prelaunch_cleanup,
             "install_summary": install_summary,
+            "staged_support_files": staged_support_files,
+            "bundle_binaries": bundle_binaries,
             "killed_installed_processes_prelaunch": killed_installed_processes_prelaunch,
             "yggterm_processes_before_launch": yggterm_processes_before_launch,
             "owned_clients_after_launch": owned_clients_after_launch,
@@ -1162,6 +1350,8 @@ def main() -> int:
             "frontmost_app_name": frontmost_app_name,
             "prelaunch_cleanup": prelaunch_cleanup,
             "install_summary": install_summary,
+            "staged_support_files": staged_support_files,
+            "bundle_binaries": bundle_binaries,
             "killed_installed_processes_prelaunch": killed_installed_processes_prelaunch,
             "yggterm_processes_before_launch": yggterm_processes_before_launch,
             "owned_clients_after_launch": remote_owned_macos_clients(args.host, remote_dir),

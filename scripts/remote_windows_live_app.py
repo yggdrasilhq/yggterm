@@ -129,12 +129,13 @@ def configure_remote_transport(proxy_jump: str | None, ssh_port: int | None) -> 
 
 
 def ssh_base() -> list[str]:
+    connect_timeout = str(os.environ.get("YGGTERM_REMOTE_CONNECT_TIMEOUT") or "").strip() or "40"
     args = [
         "ssh",
         "-o",
         "BatchMode=yes",
         "-o",
-        "ConnectTimeout=8",
+        f"ConnectTimeout={connect_timeout}",
         "-o",
         "StrictHostKeyChecking=accept-new",
     ]
@@ -187,12 +188,12 @@ def run_remote_powershell_encoded(host: str, script: str) -> subprocess.Complete
 
 
 def run_remote_powershell_best_effort(host: str, script: str) -> subprocess.CompletedProcess:
-    compacted_script = "\n".join(line.strip() for line in script.splitlines() if line.strip())
-    encoded = base64.b64encode(compacted_script.encode("utf-16le")).decode("ascii")
+    encoded_script = script.strip() + "\n"
+    encoded = base64.b64encode(encoded_script.encode("utf-16le")).decode("ascii")
     if len(encoded) > 7900:
         return run_remote_powershell(host, script)
     try:
-        return run_remote_powershell_encoded(host, compacted_script)
+        return run_remote_powershell_encoded(host, encoded_script)
     except RuntimeError as exc:
         if "The command line is too long." in str(exc):
             return run_remote_powershell(host, script)
