@@ -25,7 +25,17 @@ from smoke_app_control_bootstrap import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_ARTIFACT = ROOT / "dist" / "yggterm-windows-x86_64.exe"
+
+
+def default_artifact() -> Path:
+    candidates = [
+        ROOT / "dist" / "yggterm-windows-x86_64.zip",
+        ROOT / "dist" / "yggterm-windows-x86_64.exe",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[-1]
 
 WINDOWS_HELPERS = r"""
 $ErrorActionPreference = "Stop"
@@ -108,7 +118,7 @@ def parse_args() -> argparse.Namespace:
         description="Stage or attach to Yggterm on a remote Windows host and run a minimal app-control smoke."
     )
     parser.add_argument("--host", required=True)
-    parser.add_argument("--artifact", default=str(DEFAULT_ARTIFACT))
+    parser.add_argument("--artifact", default=str(default_artifact()))
     parser.add_argument("--remote-bin")
     parser.add_argument("--out-dir")
     parser.add_argument("--remote-dir-name")
@@ -181,6 +191,16 @@ def stage_artifact(host: str, artifact: Path, remote_root: str) -> None:
             + WINDOWS_HELPERS
             + "\n"
             + f"tar -xzf (Join-Path $RemoteRoot {ps_literal(artifact.name)}) -C $RemoteRoot\n"
+        )
+        run_remote_powershell(host, script)
+        return
+    if artifact.suffix.lower() == ".zip":
+        script = (
+            f"$RemoteRoot = {ps_literal(remote_root)}\n"
+            + WINDOWS_HELPERS
+            + "\n"
+            + f"Expand-Archive -Path (Join-Path $RemoteRoot {ps_literal(artifact.name)}) "
+            + "-DestinationPath $RemoteRoot -Force\n"
         )
         run_remote_powershell(host, script)
 

@@ -14,8 +14,18 @@ from smoke_app_control_bootstrap import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_ARTIFACT = ROOT / "dist" / "yggterm-macos-x86_64"
 DEFAULT_ICON = ROOT / "assets" / "brand" / "yggterm-icon-512.png"
+
+
+def default_artifact() -> Path:
+    candidates = [
+        ROOT / "dist" / "Yggterm-macos-x86_64.app.zip",
+        ROOT / "dist" / "yggterm-macos-x86_64",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[-1]
 
 
 def parse_args() -> argparse.Namespace:
@@ -23,7 +33,7 @@ def parse_args() -> argparse.Namespace:
         description="Stage or attach to Yggterm on a remote macOS host and run a minimal app-control smoke."
     )
     parser.add_argument("--host", required=True)
-    parser.add_argument("--artifact", default=str(DEFAULT_ARTIFACT))
+    parser.add_argument("--artifact", default=str(default_artifact()))
     parser.add_argument("--remote-bin")
     parser.add_argument("--out-dir")
     parser.add_argument("--remote-dir")
@@ -132,7 +142,7 @@ def macos_desktop_ready(session_info: dict) -> bool:
     )
 
 
-def stage_artifact(host: str, artifact: Path, remote_dir: str) -> str:
+def stage_artifact(host: str, artifact: Path, remote_dir: str) -> tuple[str, str | None]:
     ssh_shell(host, f"mkdir -p {quote(remote_dir)}")
     remote_rel = f"{remote_dir}/{artifact.name}"
     scp_to(host, artifact, remote_rel)
@@ -150,9 +160,40 @@ def stage_artifact(host: str, artifact: Path, remote_dir: str) -> str:
         ).stdout.strip()
         if not remote_bin:
             raise RuntimeError(f"could not resolve staged macOS yggterm binary from archive {artifact}")
-        return remote_bin
+        return remote_bin, None
+    if artifact.suffix.lower() == ".zip":
+        ssh_shell(
+            host,
+            f"rm -rf {quote(remote_dir)}/Yggterm.app && "
+            f"(command -v ditto >/dev/null 2>&1 && ditto -x -k {quote(remote_rel)} {quote(remote_dir)} "
+            f"|| unzip -oq {quote(remote_rel)} -d {quote(remote_dir)})",
+        )
+        remote_app = ssh_shell(
+            host,
+            f"find {quote(remote_dir)} -maxdepth 2 -type d -name '*.app' | head -n1",
+        ).stdout.strip()
+        if remote_app:
+            remote_bin = ssh_shell(
+                host,
+                f"find {quote(remote_app)}/Contents/MacOS -maxdepth 1 -type f | head -n1",
+            ).stdout.strip()
+            if not remote_bin:
+                raise RuntimeError(
+                    f"staged macOS app bundle {remote_app} did not expose an executable under Contents/MacOS"
+                )
+            ssh_shell(host, f"chmod +x {quote(remote_bin)}")
+            return remote_bin, remote_app
+        remote_bin = ssh_shell(
+            host,
+            f"find {quote(remote_dir)} -maxdepth 1 -type f -name 'yggterm*' "
+            f"! -name '*headless*' ! -name '*mock-cli*' | head -n1",
+        ).stdout.strip()
+        if not remote_bin:
+            raise RuntimeError(f"could not resolve staged macOS payload from zip {artifact}")
+        ssh_shell(host, f"chmod +x {quote(remote_bin)}")
+        return remote_bin, None
     ssh_shell(host, f"chmod +x {quote(remote_rel)}")
-    return remote_rel
+    return remote_rel, None
 
 
 def stage_macos_app_bundle(host: str, remote_dir: str, remote_bin: str) -> str:
@@ -227,9 +268,9 @@ PLIST
     return remote_app
 
 
-def resolve_remote_bin(host: str, remote_dir: str, args: argparse.Namespace) -> str:
+def resolve_remote_launch_target(host: str, remote_dir: str, args: argparse.Namespace) -> tuple[str, str | None]:
     if args.remote_bin:
-        return args.remote_bin
+        return args.remote_bin, None
     artifact_value = str(args.artifact or "").strip()
     if artifact_value:
         artifact = Path(artifact_value).expanduser()
@@ -245,7 +286,7 @@ def resolve_remote_bin(host: str, remote_dir: str, args: argparse.Namespace) -> 
     path = proc.stdout.strip()
     if proc.returncode != 0 or not path:
         raise RuntimeError(f"could not resolve a remote macOS yggterm binary on {host}")
-    return path
+    return path, None
 
 
 def remote_binary_version(host: str, remote_bin: str) -> str | None:
@@ -471,8 +512,9 @@ def main() -> int:
     session_info = macos_session_info(args.host)
     ssh_shell(args.host, f"mkdir -p {quote(remote_dir)} {quote(remote_home)}")
     try:
-        remote_bin = resolve_remote_bin(args.host, remote_dir, args)
-        remote_app = stage_macos_app_bundle(args.host, remote_dir, remote_bin)
+        remote_bin, remote_app = resolve_remote_launch_target(args.host, remote_dir, args)
+        if not remote_app:
+            remote_app = stage_macos_app_bundle(args.host, remote_dir, remote_bin)
         try:
             remote_version = remote_binary_version(args.host, remote_bin)
         except Exception:
