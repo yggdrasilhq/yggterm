@@ -8099,10 +8099,12 @@ fn capture_embedded_app_screen_recording(
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientInstanceRecord {
-    pid: u32,
-    started_at_ms: u128,
+    pub pid: u32,
+    pub started_at_ms: u128,
     #[serde(default)]
-    process_start_ticks: Option<u64>,
+    pub process_start_ticks: Option<u64>,
+    #[serde(default)]
+    pub executable_path: Option<String>,
     #[serde(default)]
     pub display: Option<String>,
     #[serde(default)]
@@ -8253,8 +8255,9 @@ fn format_available_client_instances(records: &[ClientInstanceRecord]) -> String
         .iter()
         .map(|record| {
             format!(
-                "pid={} display={} wayland={} session={}",
+                "pid={} exe={} display={} wayland={} session={}",
                 record.pid,
+                record.executable_path.as_deref().unwrap_or("-"),
                 record.display.as_deref().unwrap_or("-"),
                 record.wayland_display.as_deref().unwrap_or("-"),
                 record.xdg_session_id.as_deref().unwrap_or("-"),
@@ -8319,7 +8322,7 @@ fn ensure_live_app_control_pid(
     }
 }
 
-pub(crate) fn active_client_instance_records(
+pub fn active_client_instance_records(
     home: &Path,
     endpoint: &ServerEndpoint,
 ) -> anyhow::Result<Vec<ClientInstanceRecord>> {
@@ -15923,6 +15926,7 @@ terminal_window_id: None,
             pid,
             started_at_ms,
             process_start_ticks: None,
+            executable_path: Some("/tmp/yggterm-test".to_string()),
             display: Some(display.to_string()),
             wayland_display: None,
             xdg_session_id: Some("test-session".to_string()),
@@ -15973,6 +15977,7 @@ terminal_window_id: None,
             pid: std::process::id(),
             started_at_ms: 42,
             process_start_ticks: process_start_ticks(std::process::id()),
+            executable_path: Some("/tmp/yggterm-test".to_string()),
             display: Some(":10.0".to_string()),
             wayland_display: None,
             xdg_session_id: Some("test-session".to_string()),
