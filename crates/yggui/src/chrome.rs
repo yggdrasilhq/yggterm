@@ -344,7 +344,7 @@ fn WindowControlGlyph(icon: ChromeControlIcon) -> Element {
 pub fn search_field_shell_style(dark_surface: bool) -> String {
     format!(
         "position:relative; display:flex; align-items:center; width:100%; min-width:0; height:26px; padding:0 8px; \
-         min-height:26px; max-height:26px; flex:0 0 26px; border-radius:10px; background:{}; box-sizing:border-box; box-shadow:{}; \
+         min-height:26px; max-height:26px; flex:1 1 auto; border-radius:10px; background:{}; box-sizing:border-box; box-shadow:{}; \
          transition:{};",
         if dark_surface {
             "rgba(9,13,17,0.94)"
