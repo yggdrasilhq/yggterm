@@ -85,6 +85,13 @@ pub enum WorkspaceViewMode {
 
 const REMOTE_COMMAND_CACHE_VERIFY_TTL_MS: u64 = 10 * 60_000;
 
+pub fn refresh_local_managed_cli_now(background: bool) -> anyhow::Result<String> {
+    Ok(summarize_managed_cli_report(
+        "local",
+        &refresh_local_managed_cli(background)?,
+    ))
+}
+
 #[derive(Debug, Clone)]
 struct RemoteCommandCacheEntry {
     binary_expr: String,

@@ -335,7 +335,8 @@ fn flatten_rows(
     }
 
     let descendant_sessions = count_leaf_sessions(node);
-    if !is_leaf
+    if depth > 0
+        && !is_leaf
         && node.group_kind != Some(WorkspaceGroupKind::Separator)
         && descendant_sessions == 0
         && node.title.is_none()
@@ -616,7 +617,9 @@ fn session_id_suffix(id: &str, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::unique_session_short_ids_for_pairs;
+    use super::{BrowserRowKind, SessionBrowserState, unique_session_short_ids_for_pairs};
+    use crate::{SessionNode, SessionNodeKind, WorkspaceGroupKind};
+    use std::path::PathBuf;
 
     #[test]
     fn unique_session_short_ids_widen_only_colliding_suffixes() {
@@ -640,5 +643,26 @@ mod tests {
         let ids = unique_session_short_ids_for_pairs(&sessions);
         assert_eq!(ids.get("a").map(String::as_str), Some("duplicate-id"));
         assert_eq!(ids.get("b").map(String::as_str), Some("duplicate-id"));
+    }
+
+    #[test]
+    fn root_group_stays_visible_when_sidebar_is_otherwise_empty() {
+        let root = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "local [ok]".to_string(),
+            title: Some("local".to_string()),
+            document_kind: None,
+            group_kind: Some(WorkspaceGroupKind::Folder),
+            path: PathBuf::from("local"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let browser = SessionBrowserState::new(root);
+        let rows = browser.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, BrowserRowKind::Group);
+        assert_eq!(rows[0].label, "local");
+        assert_eq!(rows[0].full_path, "local");
     }
 }

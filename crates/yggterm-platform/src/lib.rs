@@ -5,6 +5,14 @@ use std::process::{Command, Stdio};
 
 #[cfg(target_os = "macos")]
 use objc2::{msg_send, runtime::AnyObject};
+#[cfg(target_os = "windows")]
+use windows::Win32::System::Console::{FreeConsole, GetConsoleWindow};
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, ShowWindow};
+#[cfg(target_os = "windows")]
+use windows::core::HSTRING;
 
 #[derive(Debug, Clone, Copy)]
 pub enum HostPlatform {
@@ -44,6 +52,31 @@ pub struct DockRect {
 #[derive(Debug, Clone)]
 pub struct DockedGhosttyWindow {
     pub window_id: String,
+}
+
+pub fn configure_gui_entry_process(app_name: &str, app_id: &str) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = app_name;
+        let app_id = HSTRING::from(app_id);
+        unsafe {
+            SetCurrentProcessExplicitAppUserModelID(&app_id)
+                .context("setting Windows AppUserModelID for GUI entry")?;
+            let console = GetConsoleWindow();
+            if !console.0.is_null() {
+                let _ = ShowWindow(console, SW_HIDE);
+                let _ = FreeConsole();
+            }
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app_name;
+        let _ = app_id;
+        Ok(())
+    }
 }
 
 pub fn send_user_notification(title: &str, message: &str) -> Result<()> {

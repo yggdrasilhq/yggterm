@@ -895,7 +895,7 @@ fn build_codex_browser_tree(
     let mut root = CodexBrowserTreeNode {
         name: String::from("local [ok]"),
         full_path: String::from("local"),
-        explicit_title: None,
+        explicit_title: Some(String::from("local")),
         document: None,
         group_kind: Some(WorkspaceGroupKind::Folder),
         project: None,
