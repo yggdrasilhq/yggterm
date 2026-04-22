@@ -110,6 +110,11 @@ jobs:
         run: |
           test -f ./target/release/yggterm.exe
 
+      - name: Validate GUI subsystem
+        shell: powershell
+        run: |
+          ./scripts/verify_windows_gui_subsystem.ps1 -Path ./target/release/yggterm.exe
+
       - name: Validate PowerShell installer syntax
         shell: powershell
         run: |
