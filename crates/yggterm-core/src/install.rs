@@ -288,7 +288,10 @@ fn load_direct_install_state(root: &Path) -> Result<Option<DirectInstallState>> 
     }
     let bytes = fs::read(&path)
         .with_context(|| format!("failed to read install state {}", path.display()))?;
-    let compat: DirectInstallStateCompat = serde_json::from_slice(&bytes)
+    let json_bytes = bytes
+        .strip_prefix(&[0xEF, 0xBB, 0xBF])
+        .unwrap_or(bytes.as_slice());
+    let compat: DirectInstallStateCompat = serde_json::from_slice(json_bytes)
         .with_context(|| format!("failed to parse install state {}", path.display()))?;
     let state = DirectInstallState {
         channel: compat.channel,
@@ -626,41 +629,53 @@ fn refresh_windows_integration(context: &InstallContext) -> Result<Vec<String>> 
         .join("Microsoft")
         .join("Windows")
         .join("Start Menu")
-        .join("Programs")
-        .join("Yggterm");
+        .join("Programs");
     fs::create_dir_all(&shortcut_dir)?;
     let shortcut_path = shortcut_dir.join("Yggterm.lnk");
+    let legacy_shortcut_dir = shortcut_dir.join("Yggterm");
+    let legacy_shortcut_path = legacy_shortcut_dir.join("Yggterm.lnk");
+    let target_path = context
+        .executable_path
+        .as_os_str()
+        .to_string_lossy()
+        .to_string();
+    let working_dir = context
+        .executable_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .as_os_str()
+        .to_string_lossy()
+        .to_string();
     let ps = format!(
-        "$ws = New-Object -ComObject WScript.Shell; \
+        "if (Test-Path -LiteralPath '{}') {{ Remove-Item -LiteralPath '{}' -Force -ErrorAction SilentlyContinue }}; \
+         if (Test-Path -LiteralPath '{}') {{ Remove-Item -LiteralPath '{}' -Recurse -Force -ErrorAction SilentlyContinue }}; \
+         $ws = New-Object -ComObject WScript.Shell; \
          $sc = $ws.CreateShortcut('{}'); \
          $sc.TargetPath = '{}'; \
          $sc.WorkingDirectory = '{}'; \
-         $sc.IconLocation = '{}'; \
-         $sc.Save();",
+         $sc.IconLocation = '{},0'; \
+         $sc.Description = 'Remote-first terminal workspace'; \
+         $sc.Save(); \
+         & reg.exe add 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\yggterm.exe' /ve /d '{}' /f | Out-Null; \
+         & reg.exe add 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\yggterm.exe' /v Path /d '{}' /f | Out-Null; \
+         & reg.exe add 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Yggterm' /v DisplayName /d 'Yggterm' /f | Out-Null; \
+         & reg.exe add 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Yggterm' /v DisplayVersion /d '{}' /f | Out-Null; \
+         & reg.exe add 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Yggterm' /v DisplayIcon /d '{}' /f | Out-Null; \
+         & reg.exe add 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Yggterm' /v InstallLocation /d '{}' /f | Out-Null; \
+         & reg.exe add 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Yggterm' /v Publisher /d 'YggdrasilHQ' /f | Out-Null;",
+        powershell_escape(legacy_shortcut_path.as_os_str().to_string_lossy().as_ref()),
+        powershell_escape(legacy_shortcut_path.as_os_str().to_string_lossy().as_ref()),
+        powershell_escape(legacy_shortcut_dir.as_os_str().to_string_lossy().as_ref()),
+        powershell_escape(legacy_shortcut_dir.as_os_str().to_string_lossy().as_ref()),
         powershell_escape(shortcut_path.as_os_str().to_string_lossy().as_ref()),
-        powershell_escape(
-            context
-                .executable_path
-                .as_os_str()
-                .to_string_lossy()
-                .as_ref()
-        ),
-        powershell_escape(
-            context
-                .executable_path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .as_os_str()
-                .to_string_lossy()
-                .as_ref()
-        ),
-        powershell_escape(
-            context
-                .executable_path
-                .as_os_str()
-                .to_string_lossy()
-                .as_ref()
-        ),
+        powershell_escape(&target_path),
+        powershell_escape(&working_dir),
+        powershell_escape(&target_path),
+        powershell_escape(&target_path),
+        powershell_escape(&working_dir),
+        powershell_escape(&context.current_version),
+        powershell_escape(&target_path),
+        powershell_escape(&working_dir),
     );
     let status = std::process::Command::new("powershell")
         .arg("-NoProfile")
@@ -677,6 +692,8 @@ fn refresh_windows_integration(context: &InstallContext) -> Result<Vec<String>> 
         "Start Menu shortcut refreshed at {}",
         shortcut_path.display()
     ));
+    notes.push("Windows App Paths registration refreshed for yggterm.exe".to_string());
+    notes.push("Windows uninstall metadata refreshed for Yggterm".to_string());
     Ok(notes)
 }
 
