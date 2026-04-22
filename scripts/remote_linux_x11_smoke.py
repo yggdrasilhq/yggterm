@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import shlex
 import shutil
 import subprocess
@@ -11,9 +12,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ARTIFACT = ROOT / "dist" / "yggterm-linux-x86_64"
 SMOKE_SCRIPT = ROOT / "scripts" / "smoke_xterm_embed_faults.py"
-SSH_BASE = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
-SCP_BASE = ["scp", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
-
 LINUX_SESSION_SNIPPET = r"""
 import json
 import os
@@ -244,6 +242,8 @@ def parse_args() -> argparse.Namespace:
         description="Stage a Linux Yggterm binary on a remote host and run the smoke suite there."
     )
     parser.add_argument("--host", required=True)
+    parser.add_argument("--proxy-jump")
+    parser.add_argument("--ssh-port", type=int)
     parser.add_argument("--artifact", default=str(DEFAULT_ARTIFACT))
     parser.add_argument("--remote-bin")
     parser.add_argument("--session", default="local://remote-smoke")
@@ -259,6 +259,65 @@ def parse_args() -> argparse.Namespace:
 
 def quote(value: str) -> str:
     return shlex.quote(value)
+
+
+def configure_remote_transport(proxy_jump: str | None, ssh_port: int | None) -> None:
+    if proxy_jump:
+        os.environ["YGGTERM_REMOTE_PROXY_JUMP"] = proxy_jump
+    else:
+        os.environ.pop("YGGTERM_REMOTE_PROXY_JUMP", None)
+    if ssh_port:
+        os.environ["YGGTERM_REMOTE_PORT"] = str(ssh_port)
+    else:
+        os.environ.pop("YGGTERM_REMOTE_PORT", None)
+
+
+def _ssh_transport_args() -> list[str]:
+    args: list[str] = []
+    proxy_jump = str(os.environ.get("YGGTERM_REMOTE_PROXY_JUMP") or "").strip()
+    if proxy_jump:
+        args.extend(["-J", proxy_jump])
+    ssh_port = str(os.environ.get("YGGTERM_REMOTE_PORT") or "").strip()
+    if ssh_port:
+        args.extend(["-p", ssh_port])
+    return args
+
+
+def _scp_transport_args() -> list[str]:
+    args: list[str] = []
+    proxy_jump = str(os.environ.get("YGGTERM_REMOTE_PROXY_JUMP") or "").strip()
+    if proxy_jump:
+        args.extend(["-J", proxy_jump])
+    ssh_port = str(os.environ.get("YGGTERM_REMOTE_PORT") or "").strip()
+    if ssh_port:
+        args.extend(["-P", ssh_port])
+    return args
+
+
+def ssh_base() -> list[str]:
+    return [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=8",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        *_ssh_transport_args(),
+    ]
+
+
+def scp_base() -> list[str]:
+    return [
+        "scp",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=8",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        *_scp_transport_args(),
+    ]
 
 
 def local_run(
@@ -288,14 +347,14 @@ def ssh_shell(
     timeout_seconds: float | None = None,
 ) -> subprocess.CompletedProcess:
     return local_run(
-        [*SSH_BASE, host, f"bash -lc {quote(command)}"],
+        [*ssh_base(), host, f"bash -lc {quote(command)}"],
         check=check,
         timeout_seconds=timeout_seconds,
     )
 
 
 def ssh_python_json(host: str, snippet: str) -> dict:
-    proc = local_run([*SSH_BASE, host, "python3", "-"], input_text=snippet, check=True)
+    proc = local_run([*ssh_base(), host, "python3", "-"], input_text=snippet, check=True)
     text = proc.stdout.strip()
     if not text:
         raise RuntimeError(f"remote python returned empty output on {host}")
@@ -303,12 +362,12 @@ def ssh_python_json(host: str, snippet: str) -> dict:
 
 
 def scp_to(host: str, local_path: Path, remote_path: str) -> None:
-    local_run([*SCP_BASE, str(local_path), f"{host}:{remote_path}"], check=True)
+    local_run([*scp_base(), str(local_path), f"{host}:{remote_path}"], check=True)
 
 
 def scp_from(host: str, remote_path: str, local_path: Path) -> None:
     local_path.parent.mkdir(parents=True, exist_ok=True)
-    local_run([*SCP_BASE, "-r", f"{host}:{remote_path}", str(local_path)], check=True)
+    local_run([*scp_base(), "-r", f"{host}:{remote_path}", str(local_path)], check=True)
 
 
 def remote_env_exports(env: dict[str, str]) -> str:
@@ -601,6 +660,7 @@ def remote_create_plain_terminal(
 
 def main() -> int:
     args = parse_args()
+    configure_remote_transport(args.proxy_jump, args.ssh_port)
     timestamp = int(time.time())
     out_dir = Path(args.out_dir or f"/tmp/yggterm-remote-smoke-{args.host}-{timestamp}")
     out_dir.mkdir(parents=True, exist_ok=True)

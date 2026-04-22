@@ -5,7 +5,7 @@ import re
 import time
 from pathlib import Path
 
-from remote_linux_x11_smoke import quote, scp_from, scp_to, ssh_shell
+from remote_linux_x11_smoke import configure_remote_transport, quote, scp_from, scp_to, ssh_shell
 from smoke_app_control_bootstrap import (
     assert_sidebar_rows_present,
     assert_blur_expectation,
@@ -38,6 +38,8 @@ def parse_args() -> argparse.Namespace:
         description="Stage or attach to Yggterm on a remote macOS host and run a minimal app-control smoke."
     )
     parser.add_argument("--host", required=True)
+    parser.add_argument("--proxy-jump")
+    parser.add_argument("--ssh-port", type=int)
     parser.add_argument("--artifact", default=str(default_artifact()))
     parser.add_argument("--remote-bin")
     parser.add_argument("--out-dir")
@@ -747,6 +749,7 @@ def cleanup_remote_dir(host: str, remote_dir: str) -> None:
 
 def main() -> int:
     args = parse_args()
+    configure_remote_transport(args.proxy_jump, args.ssh_port)
     out_dir = Path(args.out_dir or f"/tmp/yggterm-remote-macos-smoke-{args.host}")
     out_dir.mkdir(parents=True, exist_ok=True)
     proof_dir = out_dir / "proof"

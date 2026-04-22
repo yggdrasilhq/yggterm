@@ -2,11 +2,10 @@
 import argparse
 import base64
 import json
+import os
 import subprocess
 from pathlib import Path
 
-
-SSH_BASE = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
 
 POWERSHELL_SNIPPET = r"""
 $ErrorActionPreference = "Stop"
@@ -87,6 +86,8 @@ def parse_args() -> argparse.Namespace:
         description="Inspect a live Yggterm client on a remote Windows host over SSH."
     )
     parser.add_argument("--host", required=True)
+    parser.add_argument("--proxy-jump")
+    parser.add_argument("--ssh-port", type=int)
     parser.add_argument("--bin")
     parser.add_argument("--timeout-ms", type=int, default=8000)
     parser.add_argument("--out-dir")
@@ -94,9 +95,39 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def configure_remote_transport(proxy_jump: str | None, ssh_port: int | None) -> None:
+    if proxy_jump:
+        os.environ["YGGTERM_REMOTE_PROXY_JUMP"] = proxy_jump
+    else:
+        os.environ.pop("YGGTERM_REMOTE_PROXY_JUMP", None)
+    if ssh_port:
+        os.environ["YGGTERM_REMOTE_PORT"] = str(ssh_port)
+    else:
+        os.environ.pop("YGGTERM_REMOTE_PORT", None)
+
+
+def ssh_base() -> list[str]:
+    args = [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=8",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+    ]
+    proxy_jump = str(os.environ.get("YGGTERM_REMOTE_PROXY_JUMP") or "").strip()
+    if proxy_jump:
+        args.extend(["-J", proxy_jump])
+    ssh_port = str(os.environ.get("YGGTERM_REMOTE_PORT") or "").strip()
+    if ssh_port:
+        args.extend(["-p", ssh_port])
+    return args
+
+
 def run_remote_powershell(host: str, script: str) -> subprocess.CompletedProcess:
     proc = subprocess.run(
-        [*SSH_BASE, host, "powershell", "-NoProfile", "-NonInteractive", "-File", "-"],
+        [*ssh_base(), host, "powershell", "-NoProfile", "-NonInteractive", "-File", "-"],
         text=True,
         capture_output=True,
         input=script,
@@ -112,7 +143,7 @@ def run_remote_powershell_encoded(host: str, script: str) -> subprocess.Complete
     encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
     proc = subprocess.run(
         [
-            *SSH_BASE,
+            *ssh_base(),
             host,
             "powershell",
             "-NoLogo",
@@ -172,6 +203,7 @@ def extract_json_text(stdout: str) -> str:
 
 def main() -> int:
     args = parse_args()
+    configure_remote_transport(args.proxy_jump, args.ssh_port)
     out_dir = Path(args.out_dir or f"/tmp/yggterm-remote-windows-{args.host}")
     out_dir.mkdir(parents=True, exist_ok=True)
     screenshot_remote = "" if args.skip_screenshot else r"$env:TEMP\yggterm-remote-live.png"
@@ -187,6 +219,10 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         detail = proc.stderr.strip() or proc.stdout.strip() or str(exc)
         raise RuntimeError(detail) from exc
+    if payload.get("chosen_client") and not isinstance(payload.get("state"), dict):
+        raise RuntimeError(
+            "remote Windows live-app inspection found a client but did not receive an app-control state payload"
+        )
 
     screenshot_base64 = payload.pop("screenshot_base64", None)
     if screenshot_base64:
