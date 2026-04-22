@@ -1289,7 +1289,16 @@ fn detect_linux_window_profile() -> LinuxWindowProfile {
             };
         }
 
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "macos")]
+        {
+            return LinuxWindowProfile {
+                transparent: true,
+                xrpd_session: false,
+                reason: "macos_transparent_profile",
+            };
+        }
+
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         LinuxWindowProfile {
             transparent: false,
             xrpd_session: false,
