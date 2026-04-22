@@ -136,6 +136,24 @@ def app_screenshot(bin_path: Path, pid: int, output_path: Path, timeout_ms: int)
     return payload
 
 
+def screenshot_backend(payload: dict | None) -> str | None:
+    data = (payload or {}).get("data")
+    if not isinstance(data, dict):
+        return None
+    backend = data.get("capture_backend")
+    return str(backend) if backend else None
+
+
+def screenshot_backend_attempts(payload: dict | None) -> list[str]:
+    data = (payload or {}).get("data")
+    if not isinstance(data, dict):
+        return []
+    attempts = data.get("capture_backend_attempts")
+    if not isinstance(attempts, list):
+        return []
+    return [str(item) for item in attempts if str(item).strip()]
+
+
 def problem_notifications(state: dict) -> list[dict]:
     shell = state.get("shell") or {}
     notifications = []
@@ -179,6 +197,16 @@ def blur_summary(state: dict) -> dict:
 
 def assert_blur_expectation(state: dict, expectation: str) -> dict:
     summary = blur_summary(state)
+    if (
+        expectation != "ignore"
+        and summary.get("live_blur_supported") is None
+        and summary.get("transparent_window") is None
+        and summary.get("profile_reason") is None
+    ):
+        raise RuntimeError(
+            "app state did not expose blur observability fields; the staged binary is likely stale "
+            f"or missing the current app-control contract: {summary!r}"
+        )
     live = bool(summary.get("live_blur_supported"))
     if expectation == "required" and not live:
         raise RuntimeError(f"expected live blur support but state reported otherwise: {summary!r}")
@@ -282,6 +310,8 @@ def main() -> int:
         "rows_path": str(rows_path),
         "screenshot_path": str(screenshot_path) if screenshot_path.exists() else None,
         "screenshot_response": screenshot,
+        "screenshot_backend": screenshot_backend(screenshot),
+        "screenshot_backend_attempts": screenshot_backend_attempts(screenshot),
         "screenshot_error": screenshot_error,
     }
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")

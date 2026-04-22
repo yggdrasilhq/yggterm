@@ -1,4 +1,6 @@
-use crate::{YGGTERM_ICON_ASSETS, install_linux_icon_assets};
+use crate::YGGTERM_ICON_ASSETS;
+#[cfg(target_os = "linux")]
+use crate::install_linux_icon_assets;
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -504,32 +506,94 @@ fn refresh_macos_integration(context: &InstallContext) -> Result<Vec<String>> {
     fs::create_dir_all(&macos_dir)?;
     fs::create_dir_all(&resources_dir)?;
 
-    let launcher = macos_dir.join("yggterm");
+    let launcher = macos_dir.join("Yggterm");
     let target = context
         .preferred_executable
         .as_ref()
         .unwrap_or(&context.executable_path);
     refresh_macos_launcher(&launcher, target)?;
+    let bundle_icon_name = refresh_macos_bundle_icon(&resources_dir)?;
     write_if_changed(
         &contents_dir.join("Info.plist"),
         format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>CFBundleName</key>\n  <string>Yggterm</string>\n  <key>CFBundleDisplayName</key>\n  <string>Yggterm</string>\n  <key>CFBundleIdentifier</key>\n  <string>dev.yggterm.Yggterm</string>\n  <key>CFBundleExecutable</key>\n  <string>yggterm</string>\n  <key>CFBundlePackageType</key>\n  <string>APPL</string>\n  <key>CFBundleVersion</key>\n  <string>{}</string>\n  <key>CFBundleShortVersionString</key>\n  <string>{}</string>\n  <key>CFBundleIconFile</key>\n  <string>yggterm.png</string>\n  <key>LSBackgroundOnly</key>\n  <false/>\n  <key>NSAppTransportSecurity</key>\n  <dict>\n    <key>NSAllowsLocalNetworking</key>\n    <true/>\n    <key>NSAllowsArbitraryLoadsInWebContent</key>\n    <true/>\n  </dict>\n</dict>\n</plist>\n",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>CFBundleName</key>\n  <string>Yggterm</string>\n  <key>CFBundleDisplayName</key>\n  <string>Yggterm</string>\n  <key>CFBundleIdentifier</key>\n  <string>dev.yggterm.Yggterm</string>\n  <key>CFBundleExecutable</key>\n  <string>Yggterm</string>\n  <key>CFBundlePackageType</key>\n  <string>APPL</string>\n  <key>CFBundleVersion</key>\n  <string>{}</string>\n  <key>CFBundleShortVersionString</key>\n  <string>{}</string>\n  <key>CFBundleIconFile</key>\n  <string>{}</string>\n  <key>LSBackgroundOnly</key>\n  <false/>\n  <key>NSAppTransportSecurity</key>\n  <dict>\n    <key>NSAllowsLocalNetworking</key>\n    <true/>\n    <key>NSAllowsArbitraryLoadsInWebContent</key>\n    <true/>\n  </dict>\n</dict>\n</plist>\n",
             env!("CARGO_PKG_VERSION"),
-            env!("CARGO_PKG_VERSION")
+            env!("CARGO_PKG_VERSION"),
+            bundle_icon_name,
         )
         .as_bytes(),
-    )?;
-    write_if_changed(
-        &resources_dir.join("yggterm.png"),
-        YGGTERM_ICON_ASSETS.png_512_bytes,
     )?;
     notes.push(format!("app bundle refreshed at {}", app_dir.display()));
     Ok(notes)
 }
 
 #[cfg(target_os = "macos")]
+fn refresh_macos_bundle_icon(resources_dir: &Path) -> Result<&'static str> {
+    use std::process::Command;
+
+    let source_png = resources_dir.join("yggterm.png");
+    write_if_changed(&source_png, YGGTERM_ICON_ASSETS.png_512_bytes)?;
+    let iconset_dir = resources_dir.join("yggterm.iconset");
+    let icns_path = resources_dir.join("yggterm.icns");
+    let sizes = [
+        (16, "icon_16x16.png"),
+        (32, "icon_16x16@2x.png"),
+        (32, "icon_32x32.png"),
+        (64, "icon_32x32@2x.png"),
+        (128, "icon_128x128.png"),
+        (256, "icon_128x128@2x.png"),
+        (256, "icon_256x256.png"),
+        (512, "icon_256x256@2x.png"),
+        (512, "icon_512x512.png"),
+        (1024, "icon_512x512@2x.png"),
+    ];
+    let mut generated_icns = false;
+    let can_build_icns = Command::new("sh")
+        .arg("-c")
+        .arg("command -v sips >/dev/null 2>&1 && command -v iconutil >/dev/null 2>&1")
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if can_build_icns {
+        let _ = fs::remove_dir_all(&iconset_dir);
+        fs::create_dir_all(&iconset_dir)?;
+        let mut generated_iconset = true;
+        for (size, name) in sizes {
+            let status = Command::new("sips")
+                .arg("-z")
+                .arg(size.to_string())
+                .arg(size.to_string())
+                .arg(&source_png)
+                .arg("--out")
+                .arg(iconset_dir.join(name))
+                .status();
+            if !status.is_ok_and(|status| status.success()) {
+                generated_iconset = false;
+                break;
+            }
+        }
+        if generated_iconset {
+            let status = Command::new("iconutil")
+                .arg("-c")
+                .arg("icns")
+                .arg(&iconset_dir)
+                .arg("-o")
+                .arg(&icns_path)
+                .status();
+            generated_icns = status.is_ok_and(|status| status.success()) && icns_path.is_file();
+        }
+        let _ = fs::remove_dir_all(&iconset_dir);
+    }
+    Ok(if generated_icns {
+        "yggterm.icns"
+    } else {
+        "yggterm.png"
+    })
+}
+
+#[cfg(target_os = "macos")]
 fn refresh_macos_launcher(launcher_path: &Path, target: &Path) -> Result<()> {
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::PermissionsExt;
 
     if let Ok(metadata) = fs::symlink_metadata(launcher_path) {
         if metadata.file_type().is_dir() {
@@ -545,14 +609,12 @@ fn refresh_macos_launcher(launcher_path: &Path, target: &Path) -> Result<()> {
             })?;
         }
     }
-
-    symlink(target, launcher_path).with_context(|| {
-        format!(
-            "failed to create macOS app launcher {} -> {}",
-            launcher_path.display(),
-            target.display()
-        )
-    })?;
+    let bytes = fs::read(target)
+        .with_context(|| format!("failed to read macOS target executable {}", target.display()))?;
+    write_if_changed(launcher_path, &bytes)?;
+    let mut permissions = fs::metadata(launcher_path)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(launcher_path, permissions)?;
     Ok(())
 }
 
