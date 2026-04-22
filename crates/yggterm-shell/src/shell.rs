@@ -20481,10 +20481,12 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
         }),
     );
     #[cfg(target_os = "macos")]
+    let linux_transparent_window = linux_window_transparent;
+    #[cfg(target_os = "macos")]
     let window = WindowBuilder::new()
         .with_title("Yggterm")
         .with_window_icon(Some(window_icon::load_yggterm_window_icon()))
-        .with_transparent(false)
+        .with_transparent(linux_transparent_window)
         .with_decorations(true)
         .with_title_hidden(true)
         .with_titlebar_transparent(true)

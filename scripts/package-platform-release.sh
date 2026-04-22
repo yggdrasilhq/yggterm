@@ -103,7 +103,7 @@ build_macos_release_bundle() {
   local icon_png="${ROOT_DIR}/assets/brand/yggterm-icon-512.png"
   local icon_file="yggterm.png"
   local iconset_path="${DIST_DIR}/yggterm.iconset"
-  local app_zip_path="${DIST_DIR}/Yggterm-${TARGET_LABEL}.app.zip"
+  local app_zip_path="${DIST_DIR}/yggterm-${TARGET_LABEL}.app.zip"
 
   rm -rf "$app_path" "$iconset_path"
   mkdir -p "$macos_path" "$resources_path"
