@@ -69,6 +69,8 @@ use tao::window::ResizeDirection;
 use tao::{
     platform::macos::WindowBuilderExtMacOS,
 };
+#[cfg(target_os = "windows")]
+use tao::platform::windows::WindowBuilderExtWindows;
 use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
@@ -100,7 +102,8 @@ use yggterm_server::{
     focus_live_with_view, local_headless_companion_executable_from_current,
     managed_cli_refresh_ttl_ms, open_remote_session_with_view,
     open_stored_session, open_stored_session_with_view, persist_remote_generated_copy, ping,
-    refresh_managed_cli, refresh_preview, refresh_remote_machine, remove_session,
+    refresh_local_managed_cli_now, refresh_managed_cli, refresh_preview,
+    refresh_remote_machine, remove_session,
     remove_ssh_target, request_terminal_launch, set_all_preview_blocks_folded,
     set_view_mode as daemon_set_view_mode, shutdown as daemon_shutdown,
     snapshot as daemon_snapshot, snapshot_session_view_for_ui, stage_remote_clipboard_png,
@@ -7183,11 +7186,11 @@ fn spawn_background_managed_cli_refresh(state: Signal<ShellState>, scope_key: St
     spawn(async move {
         let request_scope = scope_key.clone();
         let outcome = task::spawn_blocking(move || {
-            refresh_managed_cli(
-                &endpoint,
-                (request_scope != "local").then_some(request_scope.as_str()),
-                true,
-            )
+            if request_scope == "local" {
+                refresh_local_managed_cli_now(true).map(Some)
+            } else {
+                refresh_managed_cli(&endpoint, Some(request_scope.as_str()), true)
+            }
         })
         .await;
         let request_id = request_meta.request_id.clone();
@@ -20497,14 +20500,19 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     let linux_transparent_window = linux_window_transparent;
     #[cfg(not(target_os = "macos"))]
-    let window = WindowBuilder::new()
-        .with_title("Yggterm")
-        .with_window_icon(Some(window_icon::load_yggterm_window_icon()))
-        .with_transparent(linux_transparent_window)
-        .with_decorations(false)
-        .with_resizable(true)
-        .with_inner_size(LogicalSize::new(1460.0, 920.0))
-        .with_min_inner_size(LogicalSize::new(1024.0, 720.0));
+    let window = {
+        let window = WindowBuilder::new()
+            .with_title("Yggterm")
+            .with_window_icon(Some(window_icon::load_yggterm_window_icon()))
+            .with_transparent(linux_transparent_window)
+            .with_decorations(false)
+            .with_resizable(true)
+            .with_inner_size(LogicalSize::new(1460.0, 920.0))
+            .with_min_inner_size(LogicalSize::new(1024.0, 720.0));
+        #[cfg(target_os = "windows")]
+        let window = window.with_taskbar_icon(Some(window_icon::load_yggterm_window_icon()));
+        window
+    };
     let mut config = Config::new()
         .with_window(window)
         .with_close_behaviour(WindowCloseBehaviour::WindowCloses)
@@ -37020,14 +37028,14 @@ fn shell_style(
     } else {
         palette.shell.to_string()
     };
-    let linux_window_flush_shell = cfg!(target_os = "linux");
-    let frame_inset = if maximized || linux_window_flush_shell {
+    let native_window_flush_shell = cfg!(any(target_os = "linux", target_os = "macos"));
+    let frame_inset = if maximized || native_window_flush_shell {
         0.0
     } else {
         SHELL_FRAME_INSET_PX
     };
     let effective_radius = if maximized { 0 } else { radius };
-    let suppress_outer_shadow = cfg!(target_os = "linux");
+    let suppress_outer_shadow = cfg!(any(target_os = "linux", target_os = "macos"));
     let frame_outline = if maximized || suppress_outer_shadow {
         "none".to_string()
     } else if palette_is_dark(palette) {
