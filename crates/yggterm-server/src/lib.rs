@@ -67,6 +67,7 @@ use std::time::{Duration, Instant, SystemTime};
 use time::{OffsetDateTime, UtcOffset, macros::format_description};
 use tracing::warn;
 use uuid::Uuid;
+use yggterm_platform::configure_background_service_command;
 use yggterm_core::{
     PerfSpan, SessionNode, SessionNodeKind, SessionStore, SessionTitleStore, TranscriptRole,
     WorkspaceDocument, WorkspaceDocumentKind, append_trace_event, event_trace_path,
@@ -7582,8 +7583,12 @@ fn reap_spawned_child_in_background(mut child: std::process::Child) {
 }
 
 fn spawn_local_daemon_process(current_exe: &Path) -> anyhow::Result<()> {
-    let daemon_exe = local_headless_companion_executable_from_current(current_exe)
-        .unwrap_or_else(|| current_exe.to_path_buf());
+    let daemon_exe = local_headless_companion_executable_from_current(current_exe).with_context(|| {
+        format!(
+            "missing yggterm-headless companion next to {}; build yggterm-headless or install a release bundle that includes it",
+            current_exe.display()
+        )
+    })?;
     let mut command = Command::new(&daemon_exe);
     command
         .arg("server")
@@ -7591,6 +7596,7 @@ fn spawn_local_daemon_process(current_exe: &Path) -> anyhow::Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    configure_background_service_command(&mut command);
     if let Some(parent) = daemon_exe.parent() {
         command.current_dir(parent);
     }
@@ -13604,6 +13610,29 @@ terminal_window_id: None,
         fs::create_dir_all(&profile)?;
         let current = profile.join("yggterm");
         let headless = profile.join("yggterm-headless");
+        fs::write(&current, b"gui")?;
+        fs::write(&headless, b"headless")?;
+
+        assert_eq!(
+            local_remote_bootstrap_executable_from_current(&current),
+            Some(headless.clone())
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn local_remote_bootstrap_executable_uses_adjacent_bundle_headless_binary() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-bootstrap-bundle-{}-{}",
+            std::process::id(),
+            current_millis_u64()
+        ));
+        let macos_dir = root.join("Yggterm.app/Contents/MacOS");
+        fs::create_dir_all(&macos_dir)?;
+        let current = macos_dir.join("Yggterm");
+        let headless = macos_dir.join("yggterm-headless");
         fs::write(&current, b"gui")?;
         fs::write(&headless, b"headless")?;
 

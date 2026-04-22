@@ -295,12 +295,13 @@ def _scp_transport_args() -> list[str]:
 
 
 def ssh_base() -> list[str]:
+    connect_timeout = str(os.environ.get("YGGTERM_REMOTE_CONNECT_TIMEOUT") or "").strip() or "40"
     return [
         "ssh",
         "-o",
         "BatchMode=yes",
         "-o",
-        "ConnectTimeout=8",
+        f"ConnectTimeout={connect_timeout}",
         "-o",
         "StrictHostKeyChecking=accept-new",
         *_ssh_transport_args(),
@@ -308,12 +309,13 @@ def ssh_base() -> list[str]:
 
 
 def scp_base() -> list[str]:
+    connect_timeout = str(os.environ.get("YGGTERM_REMOTE_CONNECT_TIMEOUT") or "").strip() or "40"
     return [
         "scp",
         "-o",
         "BatchMode=yes",
         "-o",
-        "ConnectTimeout=8",
+        f"ConnectTimeout={connect_timeout}",
         "-o",
         "StrictHostKeyChecking=accept-new",
         *_scp_transport_args(),
