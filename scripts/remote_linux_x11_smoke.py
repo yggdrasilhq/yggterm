@@ -253,6 +253,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--remote-dir")
     parser.add_argument("--timeout-ms", type=int, default=20000)
     parser.add_argument("--smoke-timeout-sec", type=int, default=420)
+    parser.add_argument("--only-check", action="append", default=[])
     parser.add_argument("--keep-remote-dir", action="store_true")
     return parser.parse_args()
 
@@ -820,12 +821,16 @@ def main() -> int:
         )
 
         try:
+            only_check_args = "".join(
+                f" --only-check {quote(check_name)}" for check_name in args.only_check
+            )
             smoke_proc = ssh_shell(
                 args.host,
                 f"{exports}; YGGTERM_BIN={quote(remote_bin)} YGGTERM_SMOKE_AVOID_FOREGROUND=1 "
                 f"{quote(python_cmd)} {quote(remote_smoke_script)} "
                 f"--bin {quote(remote_bin)} --pid {pid} --session {quote(smoke_session)} "
-                f"--session-kind {quote(args.session_kind)} --out {quote(remote_out)} --home {quote(remote_home)}",
+                f"--session-kind {quote(args.session_kind)} --out {quote(remote_out)} --home {quote(remote_home)}"
+                f"{only_check_args}",
                 check=False,
                 timeout_seconds=max(30, args.smoke_timeout_sec),
             )
