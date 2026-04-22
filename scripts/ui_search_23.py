@@ -53,7 +53,7 @@ def run_json(host: str, command: str) -> dict:
 
 
 def app_search(host: str, binary: str, query: str, timeout_ms: int, focused: bool | None) -> dict:
-    cmd = f"{binary} server app search set {json.dumps(query)} --timeout-ms {timeout_ms}"
+    cmd = f"{binary} server app search set --query {json.dumps(query)} --timeout-ms {timeout_ms}"
     if focused is not None:
         cmd += f" --focus {'on' if focused else 'off'}"
     return run_json(host, cmd)

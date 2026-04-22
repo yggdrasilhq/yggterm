@@ -10,14 +10,13 @@ mod terminal;
 
 pub use app_control::{
     AppControlCommand, AppControlDragCommand, AppControlDragPlacement, AppControlKeyCommand,
-    AppControlPointerButton, AppControlPointerCommand, AppControlPreviewLayout,
-    AppControlRequest, AppControlResponse, AppControlRightPanelMode, AppControlViewMode,
+    AppControlPointerButton, AppControlPointerCommand, AppControlPreviewLayout, AppControlRequest,
+    AppControlResponse, AppControlRightPanelMode, AppControlViewMode,
     ProbeTerminalViewportInputMode, ScreenshotTarget, app_control_captures_dir,
     app_control_requests_dir, app_control_requests_pending, app_control_responses_dir,
     complete_app_control_request, current_millis, default_recording_output_path,
-    default_screenshot_output_path, enqueue_app_control_request,
-    enqueue_screen_recording_request, enqueue_screenshot_request, take_next_app_control_request,
-    wait_for_app_control_response,
+    default_screenshot_output_path, enqueue_app_control_request, enqueue_screen_recording_request,
+    enqueue_screenshot_request, take_next_app_control_request, wait_for_app_control_response,
 };
 pub use attach::{AttachMetadata, run_attach};
 pub use codex_cli::{ManagedCliTool, ManagedCliToolStatus, managed_cli_refresh_ttl_ms};
@@ -76,7 +75,7 @@ use yggterm_core::{
     read_codex_transcript_messages, read_codex_transcript_messages_limited, read_trace_tail,
     resolve_yggterm_home,
 };
-use yggui_contract::UiTheme;
+use yggui_contract::{UiTheme, YgguiClipboardContents};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkspaceViewMode {
@@ -7020,6 +7019,15 @@ fn local_remote_bootstrap_executable() -> Option<PathBuf> {
     local_remote_bootstrap_executable_from_current(&current)
 }
 
+pub fn local_headless_companion_executable_from_current(current: &Path) -> Option<PathBuf> {
+    local_remote_bootstrap_executable_from_current(current)
+}
+
+pub fn local_headless_companion_executable() -> Option<PathBuf> {
+    let current = std::env::current_exe().ok()?;
+    local_headless_companion_executable_from_current(&current)
+}
+
 fn resolve_remote_yggterm_binary(
     ssh_target: &str,
     exec_prefix: Option<&str>,
@@ -7567,13 +7575,18 @@ fn reap_spawned_child_in_background(mut child: std::process::Child) {
 }
 
 fn spawn_local_daemon_process(current_exe: &Path) -> anyhow::Result<()> {
-    let mut command = Command::new(current_exe);
+    let daemon_exe = local_headless_companion_executable_from_current(current_exe)
+        .unwrap_or_else(|| current_exe.to_path_buf());
+    let mut command = Command::new(&daemon_exe);
     command
         .arg("server")
         .arg("daemon")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if let Some(parent) = daemon_exe.parent() {
+        command.current_dir(parent);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -8705,6 +8718,53 @@ pub fn run_app_control_set_fullscreen(enabled: bool, timeout_ms: u64) -> anyhow:
     Ok(())
 }
 
+pub fn run_app_control_set_window_chrome_hover(
+    active: bool,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::SetWindowChromeHover { active },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_set_clipboard_text(text: &str, timeout_ms: u64) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::SetClipboardContents {
+            contents: YgguiClipboardContents::Text {
+                text: text.to_string(),
+            },
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_set_clipboard_png_base64(
+    png_base64: &str,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::SetClipboardContents {
+            contents: YgguiClipboardContents::PngBase64 {
+                png_base64: png_base64.to_string(),
+            },
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 pub fn run_app_control_set_maximized(enabled: bool, timeout_ms: u64) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
     let response = request_app_control(
@@ -9153,7 +9213,9 @@ pub fn run_app_control_pointer(
     let button = button
         .map(|value| {
             parse_app_control_pointer_button(value).with_context(|| {
-                format!("unsupported app pointer button: {value}; use primary, middle, or secondary")
+                format!(
+                    "unsupported app pointer button: {value}; use primary, middle, or secondary"
+                )
             })
         })
         .transpose()?
@@ -10026,9 +10088,9 @@ pub fn run_app_control_probe_terminal_viewport_input(
 ) -> anyhow::Result<()> {
     if !app_control_skip_x11_synthetic_input()
         && matches!(
-        mode,
-        ProbeTerminalViewportInputMode::Auto | ProbeTerminalViewportInputMode::Keyboard
-    )
+            mode,
+            ProbeTerminalViewportInputMode::Auto | ProbeTerminalViewportInputMode::Keyboard
+        )
     {
         if let Ok(response) = x11_keyboard_probe_input(
             session_path,
