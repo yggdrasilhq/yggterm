@@ -19,6 +19,7 @@ from remote_windows_live_app import (
 from smoke_app_control_bootstrap import (
     assert_sidebar_rows_present,
     assert_blur_expectation,
+    assert_screenshot_file_usable,
     problem_notifications,
     screenshot_backend,
     screenshot_backend_attempts,
@@ -367,7 +368,10 @@ def install_staged_windows_artifact(
         "$utf8NoBom = New-Object System.Text.UTF8Encoding($false)",
         "[System.IO.File]::WriteAllText((Join-Path $installRoot 'install-state.json'), $state, $utf8NoBom)",
         "$integrateOutput = $null",
-        "$launcherScript = @\"\nSet shell = CreateObject(\"\"WScript.Shell\"\")\nshell.CurrentDirectory = \"$versionDir\"\nshell.Run \"cmd.exe /c start \"\"\"\" /D \"\"$versionDir\"\" /B \"\"$installedExe\"\"\", 0, False\n\"@",
+        "$launcherScript = "
+        + "('Set shell = CreateObject(\"\"WScript.Shell\"\")' + \"`r`n\" "
+        + "+ 'shell.CurrentDirectory = \"\"' + $versionDir + '\"\"' + \"`r`n\" "
+        + "+ 'shell.Run \"\"cmd.exe /c start \"\"\"\" /D \"\"' + $versionDir + '\"\" /B \"\"' + $installedExe + '\"\"\", 0, False' + \"`r`n\")",
         "[System.IO.File]::WriteAllText($launcher, $launcherScript, $utf8NoBom)",
         "$startMenuShortcut = Join-Path $env:APPDATA 'Microsoft\\Windows\\Start Menu\\Programs\\Yggterm.lnk'",
         "$legacyShortcut = Join-Path $env:APPDATA 'Microsoft\\Windows\\Start Menu\\Programs\\Yggterm\\Yggterm.lnk'",
@@ -887,7 +891,7 @@ def capture_remote_screenshot(
     return payload
 
 
-def assert_windows_screenshot_quality(payload: dict | None) -> dict:
+def assert_windows_screenshot_quality(payload: dict | None, screenshot_path: Path) -> dict:
     backend = screenshot_backend(payload)
     attempts = screenshot_backend_attempts(payload)
     if not backend:
@@ -897,9 +901,11 @@ def assert_windows_screenshot_quality(payload: dict | None) -> dict:
             "Windows screenshot fell back to desktop screen copy, which is not release-grade "
             f"for proof capture because other windows/dialogs can pollute the image: attempts={attempts!r}"
         )
+    quality = assert_screenshot_file_usable(screenshot_path)
     return {
         "backend": backend,
         "attempts": attempts,
+        "image": quality,
     }
 
 
@@ -1160,7 +1166,10 @@ def main() -> int:
                 remote_screenshot_scp,
                 screenshot_path,
             )
-            screenshot_quality = assert_windows_screenshot_quality(screenshot_response)
+            screenshot_quality = assert_windows_screenshot_quality(
+                screenshot_response,
+                screenshot_path,
+            )
         except Exception as exc:  # noqa: BLE001
             screenshot_error = str(exc)
             screenshot_quality = None
@@ -1186,6 +1195,7 @@ def main() -> int:
             "screenshot_response": screenshot_response,
             "screenshot_backend": (screenshot_quality or {}).get("backend"),
             "screenshot_backend_attempts": (screenshot_quality or {}).get("attempts") or [],
+            "screenshot_quality": (screenshot_quality or {}).get("image"),
             "screenshot_error": screenshot_error,
         }
         summary_path.write_text(json.dumps(proof_summary, indent=2), encoding="utf-8")
