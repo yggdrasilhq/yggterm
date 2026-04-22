@@ -4,6 +4,11 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+### Fixed
+
+- add explicit `--proxy-jump` and `--ssh-port` routing controls to the shared Linux, macOS, and Windows remote smoke runners, so cross-machine GUI proof no longer depends on brittle per-host `~/.ssh/config` aliases
+- make the Windows live-app inspector fail when it finds a client registration without a real app-control state payload, so stale or non-responsive live clients stop looking healthy in remote diagnostics
+
 ## 2.1.22
 
 ### Fixed
