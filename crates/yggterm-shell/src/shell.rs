@@ -12272,6 +12272,23 @@ fn merged_sidebar_rows_uncached(
         && promoted_live_sessions.is_empty()
         && local_tree_live_sessions.is_empty()
     {
+        if stored_rows.is_empty() {
+            return vec![BrowserRow {
+                kind: BrowserRowKind::Group,
+                full_path: "local".to_string(),
+                label: "local".to_string(),
+                detail_label: String::new(),
+                document_kind: None,
+                group_kind: Some(WorkspaceGroupKind::Folder),
+                session_title: None,
+                depth: 0,
+                host_label: "local".to_string(),
+                descendant_sessions: 0,
+                expanded: true,
+                session_id: None,
+                session_cwd: None,
+            }];
+        }
         return stored_rows.to_vec();
     }
     let mut rows = Vec::with_capacity(
@@ -20494,6 +20511,7 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
         .with_title_hidden(true)
         .with_titlebar_transparent(true)
         .with_fullsize_content_view(true)
+        .with_traffic_light_inset(tao::dpi::LogicalPosition::new(16.0, 14.0))
         .with_resizable(true)
         .with_inner_size(LogicalSize::new(1460.0, 920.0))
         .with_min_inner_size(LogicalSize::new(1024.0, 720.0));
@@ -22797,7 +22815,7 @@ fn Titlebar(
     let command_mode_active = snapshot.command_mode_active;
     let search_query = snapshot.search_query.clone();
     let native_macos_titlebar = cfg!(target_os = "macos");
-    let titlebar_leading_inset = if native_macos_titlebar { 76 } else { 0 };
+    let titlebar_leading_inset = if native_macos_titlebar { 88 } else { 0 };
     let active_title = snapshot.active_title.clone().or_else(|| {
         snapshot
             .active_session
@@ -40339,6 +40357,19 @@ mod tests {
         );
         assert_eq!(session_row.label, "Tree Smoke");
         assert_eq!(session_row.depth, 4);
+    }
+    #[test]
+    fn merged_sidebar_rows_keep_local_root_visible_when_everything_is_empty() {
+        let rows = merged_sidebar_rows(&[], &[], &[], &[], &HashSet::new());
+        assert_eq!(rows.len(), 1);
+        let root = &rows[0];
+        assert_eq!(root.kind, BrowserRowKind::Group);
+        assert_eq!(root.full_path, "local");
+        assert_eq!(root.label, "local");
+        assert_eq!(root.depth, 0);
+        assert_eq!(root.group_kind, Some(WorkspaceGroupKind::Folder));
+        assert_eq!(root.descendant_sessions, 0);
+        assert!(root.expanded);
     }
     #[test]
     fn merged_sidebar_rows_promote_remote_live_sessions_into_live_group() {
