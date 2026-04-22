@@ -17,25 +17,28 @@ use yggterm_core::{
 use yggterm_server::{
     AppControlPreviewLayout, AppControlRightPanelMode, AppControlViewMode, PersistedDaemonState,
     ProbeTerminalViewportInputMode, SessionKind, YggtermServer, cleanup_legacy_daemons,
-    default_endpoint, detect_ghostty_host, ensure_local_daemon_running, ping,
+    default_endpoint, detect_ghostty_host, ensure_local_daemon_running,
+    local_headless_companion_executable_from_current, ping,
     run_app_control_background_window, run_app_control_close_window,
     run_app_control_create_terminal, run_app_control_describe_rows, run_app_control_describe_state,
     run_app_control_drag, run_app_control_dump_state, run_app_control_focus_window,
-    run_app_control_key, run_app_control_list_clients, run_app_control_open_path,
-    run_app_control_move_window_by, run_app_control_pointer,
-    run_app_control_paste_terminal_clipboard, run_app_control_paste_terminal_clipboard_image,
+    run_app_control_key, run_app_control_list_clients, run_app_control_move_window_by,
+    run_app_control_open_path, run_app_control_paste_terminal_clipboard,
+    run_app_control_paste_terminal_clipboard_image, run_app_control_pointer,
     run_app_control_probe_terminal_viewport_input, run_app_control_probe_terminal_viewport_scroll,
     run_app_control_probe_terminal_viewport_select, run_app_control_reclaim_terminal_focus,
     run_app_control_remove_session, run_app_control_reset_theme_editor,
     run_app_control_restart_pending_update, run_app_control_scroll_preview,
-    run_app_control_send_terminal_input, run_app_control_set_fullscreen,
+    run_app_control_send_terminal_input, run_app_control_set_clipboard_png_base64,
+    run_app_control_set_clipboard_text, run_app_control_set_fullscreen,
     run_app_control_set_main_zoom, run_app_control_set_maximized,
     run_app_control_set_preview_layout, run_app_control_set_right_panel_mode,
     run_app_control_set_row_expanded, run_app_control_set_search,
     run_app_control_set_theme_editor_open, run_app_control_set_ui_theme,
-    run_app_control_trigger_update_check, run_attach, run_daemon, run_screenrecord_capture,
-    run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, snapshot,
-    start_local_session, status, try_run_remote_server_command,
+    run_app_control_set_window_chrome_hover, run_app_control_trigger_update_check, run_attach,
+    run_daemon, run_screenrecord_capture, run_screenshot_capture, run_trace_bundle,
+    run_trace_follow, run_trace_tail, shutdown, snapshot, start_local_session, status,
+    try_run_remote_server_command,
 };
 use yggterm_shell::{ShellBootstrap, launch_shell, start_daemon_watchdog, warm_daemon_start};
 use yggui_contract::UiTheme;
@@ -95,6 +98,22 @@ fn cli_positional_args(args: &[String], start: usize) -> Vec<&str> {
     positional
 }
 
+fn cli_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    let inline_prefix = format!("{flag}=");
+    for (index, value) in args.iter().enumerate() {
+        if value == flag {
+            return args
+                .get(index + 1)
+                .map(String::as_str)
+                .filter(|next| !next.starts_with("--"));
+        }
+        if let Some(inline) = value.strip_prefix(&inline_prefix) {
+            return Some(inline);
+        }
+    }
+    None
+}
+
 fn launch_app_background(
     home_dir: &std::path::Path,
     timeout_ms: u64,
@@ -104,12 +123,17 @@ fn launch_app_background(
     log_path: Option<&str>,
 ) -> Result<()> {
     let current_exe = std::env::current_exe().context("resolving current yggterm executable")?;
+    let control_exe = local_headless_companion_executable_from_current(&current_exe)
+        .unwrap_or_else(|| current_exe.clone());
     let chosen_log_path = match log_path {
         Some(path) => std::path::PathBuf::from(path),
         None => {
             let logs_dir = home_dir.join("app-launch-logs");
             fs::create_dir_all(&logs_dir).with_context(|| {
-                format!("creating background app launch log dir {}", logs_dir.display())
+                format!(
+                    "creating background app launch log dir {}",
+                    logs_dir.display()
+                )
             })?;
             let ts_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -123,15 +147,21 @@ fn launch_app_background(
         .append(true)
         .open(&chosen_log_path)
         .with_context(|| format!("opening background app log {}", chosen_log_path.display()))?;
-    let stderr_file = stdout_file
-        .try_clone()
-        .with_context(|| format!("cloning background app log handle {}", chosen_log_path.display()))?;
+    let stderr_file = stdout_file.try_clone().with_context(|| {
+        format!(
+            "cloning background app log handle {}",
+            chosen_log_path.display()
+        )
+    })?;
     let mut command = Command::new(&current_exe);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
         .env(ENV_YGGTERM_HOME, home_dir);
+    if let Some(parent) = current_exe.parent() {
+        command.current_dir(parent);
+    }
     if allow_multi_window {
         command.env("YGGTERM_ALLOW_MULTI_WINDOW", "1");
     }
@@ -146,13 +176,18 @@ fn launch_app_background(
     if wait_visible {
         let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms.max(100));
         while std::time::Instant::now() <= deadline {
-            let output = Command::new(&current_exe)
+            let output = Command::new(&control_exe)
                 .args(["server", "app", "clients"])
                 .env(ENV_YGGTERM_HOME, home_dir)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
+                .current_dir(
+                    control_exe
+                        .parent()
+                        .unwrap_or_else(|| current_exe.parent().unwrap_or(home_dir)),
+                )
                 .output()
-                .with_context(|| format!("listing app clients via {}", current_exe.display()))?;
+                .with_context(|| format!("listing app clients via {}", control_exe.display()))?;
             if output.status.success() {
                 if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
                     client = payload
@@ -162,9 +197,7 @@ fn launch_app_background(
                             clients
                                 .iter()
                                 .find(|entry| {
-                                    entry
-                                        .get("pid")
-                                        .and_then(serde_json::Value::as_u64)
+                                    entry.get("pid").and_then(serde_json::Value::as_u64)
                                         == Some(pid as u64)
                                 })
                                 .cloned()
@@ -565,14 +598,47 @@ fn main() -> Result<()> {
                 )
             }
             "close" | "quit" | "exit" => run_app_control_close_window(timeout_ms),
+            "chrome-hover" | "titlebar-hover" => {
+                let active = cli_positional_args(&args, 3)
+                    .into_iter()
+                    .next()
+                    .map(|value| match value {
+                        "on" | "true" | "1" | "hover" | "enter" => Some(true),
+                        "off" | "false" | "0" | "leave" => Some(false),
+                        _ => None,
+                    })
+                    .flatten()
+                    .context("missing or invalid hover state for server app chrome-hover")?;
+                run_app_control_set_window_chrome_hover(active, timeout_ms)
+            }
+            "clipboard" => {
+                let action = args.get(3).map(String::as_str).unwrap_or("text");
+                match action {
+                    "text" | "set" => {
+                        let value = cli_flag_value(&args, "--value")
+                            .or_else(|| cli_flag_value(&args, "--text"))
+                            .or_else(|| cli_positional_args(&args, 4).into_iter().next())
+                            .unwrap_or("");
+                        run_app_control_set_clipboard_text(value, timeout_ms)
+                    }
+                    "png" | "image" | "png-base64" => {
+                        let value = cli_flag_value(&args, "--base64")
+                            .or_else(|| cli_flag_value(&args, "--value"))
+                            .or_else(|| cli_positional_args(&args, 4).into_iter().next())
+                            .context("missing --base64/--value for server app clipboard image")?;
+                        run_app_control_set_clipboard_png_base64(value, timeout_ms)
+                    }
+                    other => anyhow::bail!("unsupported app clipboard action: {other}"),
+                }
+            }
             "search" => {
                 let action = args.get(3).map(String::as_str).unwrap_or("set");
                 match action {
                     "set" => {
-                        let query = cli_positional_args(&args, 4)
-                            .into_iter()
-                            .next()
-                            .context("missing query for server app search set")?;
+                        let query = cli_flag_value(&args, "--query")
+                            .or_else(|| cli_flag_value(&args, "--value"))
+                            .or_else(|| cli_positional_args(&args, 4).into_iter().next())
+                            .unwrap_or("");
                         let focused = args.windows(2).find_map(|window| {
                             if window[0] != "--focus" {
                                 return None;

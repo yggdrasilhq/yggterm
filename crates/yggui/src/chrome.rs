@@ -42,6 +42,7 @@ pub fn TitlebarChrome(
     left: Element,
     center: Element,
     right: Element,
+    on_request_window_drag: EventHandler<()>,
     on_toggle_maximized: EventHandler<()>,
 ) -> Element {
     const TITLEBAR_DRAG_THRESHOLD_PX: f64 = 5.0;
@@ -64,6 +65,7 @@ pub fn TitlebarChrome(
                 evt.prevent_default();
                 let pointer = evt.client_coordinates();
                 pending_drag_origin.set(Some((pointer.x, pointer.y)));
+                on_request_window_drag.call(());
                 window().drag();
             },
             onmousemove: move |evt| {
@@ -79,6 +81,7 @@ pub fn TitlebarChrome(
                 let delta_y = pointer.y - start_y;
                 if delta_x.hypot(delta_y) >= TITLEBAR_DRAG_THRESHOLD_PX {
                     pending_drag_origin.set(None);
+                    on_request_window_drag.call(());
                     window().drag();
                 }
             },
@@ -338,26 +341,33 @@ fn WindowControlGlyph(icon: ChromeControlIcon) -> Element {
     }
 }
 
-pub fn search_input_style(text_color: &str, dark_surface: bool) -> String {
+pub fn search_field_shell_style(dark_surface: bool) -> String {
     format!(
-        "width:100%; height:26px; padding:0 11px; border-radius:8px; \
-         border:none; background:{}; color:{}; outline:none; box-sizing:border-box; display:block; margin:0; \
-         font-size:13.5px; font-weight:550; letter-spacing:-0.012em; line-height:1; \
-         font-family:'Inter Variable', Inter, system-ui, sans-serif; text-rendering:optimizeLegibility; \
-         -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale; \
-         box-shadow: inset 0 0 0 1px {}; user-select:text; -webkit-user-select:text; \
-         caret-color:{};",
+        "position:relative; display:flex; align-items:center; width:100%; min-width:0; height:26px; padding:0 8px; \
+         border-radius:10px; background:{}; box-sizing:border-box; box-shadow: inset 0 0 0 1px {}; \
+         transition:{};",
         if dark_surface {
             "rgba(8,12,16,0.88)"
         } else {
             "rgba(255,255,255,0.9)"
         },
-        text_color,
         if dark_surface {
             "rgba(214,229,242,0.24)"
         } else {
             "rgba(201,214,226,0.74)"
         },
-        text_color
+        standard_transition(&["background-color", "box-shadow"])
+    )
+}
+
+pub fn search_input_style(text_color: &str, _dark_surface: bool) -> String {
+    format!(
+        "width:100%; height:100%; padding:0 3px; border:none; background:transparent; color:{}; outline:none; \
+         box-sizing:border-box; display:block; margin:0; \
+         font-size:13.5px; font-weight:550; letter-spacing:-0.012em; line-height:1; \
+         font-family:'Inter Variable', Inter, system-ui, sans-serif; text-rendering:optimizeLegibility; \
+         -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale; \
+         box-shadow:none; user-select:text; -webkit-user-select:text; caret-color:{};",
+        text_color, text_color
     )
 }
