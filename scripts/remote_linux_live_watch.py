@@ -156,6 +156,22 @@ def launch_env_from_session(
     return env
 
 
+def pid_sequence_summary(pid_samples: list[tuple[int, ...]]) -> dict[str, object]:
+    non_empty = [tuple(sample) for sample in pid_samples if sample]
+    unique: list[list[int]] = []
+    for sample in non_empty:
+        rendered = list(sample)
+        if not unique or unique[-1] != rendered:
+            unique.append(rendered)
+    return {
+        "initial": unique[0] if unique else [],
+        "final": unique[-1] if unique else [],
+        "changes": max(0, len(unique) - 1),
+        "missing_samples": sum(1 for sample in pid_samples if not sample),
+        "samples": [list(sample) for sample in pid_samples],
+    }
+
+
 def main() -> int:
     args = parse_args()
     timestamp = int(time.time())
@@ -208,17 +224,35 @@ def main() -> int:
             sample["processes"] = ssh_python_json(args.host, PROCESS_SAMPLE_SNIPPET)
             process_rows = (sample["processes"] or {}).get("rows") or []
             sample["owned_pid_present"] = any(int(row.get("pid") or 0) == pid for row in process_rows)
+            sample["plasmashell_pids"] = sorted(
+                int(row.get("pid") or 0)
+                for row in process_rows
+                if str(row.get("comm") or "") == "plasmashell"
+            )
+            sample["kwin_pids"] = sorted(
+                int(row.get("pid") or 0)
+                for row in process_rows
+                if str(row.get("comm") or "").startswith("kwin_")
+            )
             samples.append(sample)
             time.sleep(args.poll_sec)
 
         metadata["samples"] = samples
         yggterm_fd_counts: list[int] = []
         ssh_generation_context_counts: list[int] = []
+        plasmashell_pid_samples: list[tuple[int, ...]] = []
+        kwin_pid_samples: list[tuple[int, ...]] = []
         missing_owned_pid_samples = 0
         for sample in samples:
             processes = sample.get("processes") or {}
             ssh_generation_context_counts.append(
                 int(processes.get("ssh_generation_context_count") or 0)
+            )
+            plasmashell_pid_samples.append(
+                tuple(int(pid_value) for pid_value in (sample.get("plasmashell_pids") or []))
+            )
+            kwin_pid_samples.append(
+                tuple(int(pid_value) for pid_value in (sample.get("kwin_pids") or []))
             )
             process_rows = processes.get("rows") or []
             owned_row = next(
@@ -245,13 +279,15 @@ def main() -> int:
             "max_ssh_generation_context_count": (
                 max(ssh_generation_context_counts) if ssh_generation_context_counts else 0
             ),
+            "plasmashell": pid_sequence_summary(plasmashell_pid_samples),
+            "kwin": pid_sequence_summary(kwin_pid_samples),
         }
         journal_proc = ssh_shell(
             args.host,
             (
                 "journalctl --user -b "
                 f"--since '@{int(started)}' --no-pager | "
-                "rg -i 'yggterm|plasmashell|kwin|too many open files|libpng|segfault|abort|crash' -n || true"
+                "rg -i 'yggterm|plasmashell|kwin|too many open files|libpng|segfault|abort|crash|screenGeometry|plasmoid' -n || true"
             ),
             check=False,
         )
@@ -268,22 +304,9 @@ def main() -> int:
                 if shot_exists.returncode == 0:
                     scp_from(args.host, remote_shot, out_dir / "watch-final.png")
                 if args.capture_frame:
-                    frame_proc = ssh_shell(
-                        args.host,
-                        (
-                            f"{exports}; export QT_QPA_PLATFORM=wayland; "
-                            f"if command -v spectacle >/dev/null 2>&1; then "
-                            f"spectacle --background --nonotify --activewindow --output '{remote_frame_shot}' "
-                            "--delay 450 >/dev/null 2>&1; "
-                            "fi"
-                        ),
-                        check=False,
-                        timeout_seconds=20.0,
+                    metadata["frame_capture_skipped"] = (
+                        "spectacle_disabled_for_remote_ssh_watch; use app-control screenshot instead"
                     )
-                    metadata["frame_capture_returncode"] = frame_proc.returncode
-                    frame_exists = ssh_shell(args.host, f"test -f '{remote_frame_shot}'", check=False)
-                    if frame_exists.returncode == 0:
-                        scp_from(args.host, remote_frame_shot, out_dir / "watch-frame.png")
 
         summary_path = out_dir / "summary.json"
         summary_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
@@ -314,6 +337,9 @@ def main() -> int:
         watch_summary = metadata.get("watch_summary") or {}
         fd_growth = watch_summary.get("fd_growth")
         max_fd_count = watch_summary.get("max_fd_count")
+        plasmashell_changes = int(
+            ((watch_summary.get("plasmashell") or {}).get("changes") or 0)
+        )
         runaway_journal = any(
             "too many open files" in line.lower() or "main process exited" in line.lower()
             for line in metadata.get("journal_matches") or []
@@ -325,7 +351,13 @@ def main() -> int:
             and max_fd_count >= 192
         )
         owned_pid_missing = int(watch_summary.get("owned_pid_missing_samples") or 0) > 0
-        return 0 if not (app_control_failures or runaway_journal or runaway_fd or owned_pid_missing) else 1
+        return 0 if not (
+            app_control_failures
+            or runaway_journal
+            or runaway_fd
+            or owned_pid_missing
+            or plasmashell_changes
+        ) else 1
     finally:
         if args.keep_remote_dir:
             (out_dir / "remote-dir.txt").write_text(f"{remote_dir}\n", encoding="utf-8")

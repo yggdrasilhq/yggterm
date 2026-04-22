@@ -4082,6 +4082,33 @@ def shell_content_vertical_balance(state: dict) -> dict:
     }
 
 
+def assert_titlebar_revealed_push_contract(state: dict) -> dict:
+    titlebar_rect = dom_rect(state, "titlebar_rect")
+    if not rect_is_visible(titlebar_rect):
+        raise AssertionError(f"titlebar rect missing for revealed push contract: {state!r}")
+    balance = shell_content_vertical_balance(state)
+    titlebar_bottom = rect_bottom(titlebar_rect)
+    top_gap = float(balance["top_gap"])
+    bottom_gap = float(balance["bottom_gap"])
+    if abs(top_gap - titlebar_bottom) > 2.0:
+        raise AssertionError(
+            "titlebar reveal did not push the shell content below the restored titlebar lane: "
+            f"titlebar_bottom={titlebar_bottom:.2f} balance={balance!r}"
+        )
+    if bottom_gap > 1.5:
+        raise AssertionError(
+            "titlebar reveal introduced a bottom gutter instead of only reserving the titlebar lane: "
+            f"balance={balance!r}"
+        )
+    return {
+        "titlebar_rect": titlebar_rect,
+        "titlebar_bottom": round(titlebar_bottom, 2),
+        "top_gap": round(top_gap, 2),
+        "bottom_gap": round(bottom_gap, 2),
+        "rects": balance["rects"],
+    }
+
+
 def window_outer_geometry(state: dict) -> tuple[int, int, int, int]:
     window = state.get("window") or {}
     outer_position = window.get("outer_position") or {}
@@ -7587,12 +7614,7 @@ def assert_titlebar_autohide_hover_contract(pid: int, out_dir: Path) -> dict:
         raise AssertionError(
             f"titlebar hover reveal brought the lane back but search input stayed hidden: state={revealed!r}"
         )
-    revealed_balance = shell_content_vertical_balance(revealed)
-    if revealed_balance["gap_delta"] > TITLEBAR_AUTOHIDE_CONTENT_BALANCE_MAX_PX:
-        raise AssertionError(
-            "titlebar hover reveal biased the shell content vertically instead of preserving the overlay contract: "
-            f"balance={revealed_balance!r}"
-        )
+    revealed_push = assert_titlebar_revealed_push_contract(revealed)
     revealed_titlebar_centering = assert_titlebar_centering(revealed)
     app_screenshot(pid, out_dir / "titlebar-autohide-revealed.png")
     (
@@ -7795,7 +7817,7 @@ def assert_titlebar_autohide_hover_contract(pid: int, out_dir: Path) -> dict:
         "collapsed_balance": collapsed_balance,
         "hover_move": hover_move,
         "revealed_rect": revealed_rect,
-        "revealed_balance": revealed_balance,
+        "revealed_push": revealed_push,
         "revealed_titlebar_centering": revealed_titlebar_centering,
         "revealed_drag_point": {
             "x": round(revealed_drag_x, 2),
@@ -11186,6 +11208,7 @@ def main() -> int:
     parser.add_argument("--out", default="/tmp/xterm-embed-faults")
     parser.add_argument("--reopen", action="store_true")
     parser.add_argument("--home")
+    parser.add_argument("--only-check", action="append", default=[])
     args = parser.parse_args()
 
     if args.home:
@@ -11199,41 +11222,72 @@ def main() -> int:
     requested_session = args.session
     disposable_codex_session: str | None = None
     disposable_codex_create: dict | None = None
+    selected_checks = set(args.only_check)
+    no_session_setup_checks = {
+        "background_blur",
+        "client_memory_budget",
+        "focus",
+        "geometry",
+        "managed_cli_refresh_ttl",
+        "maximize_roundtrip_layout",
+        "notification_health_initial",
+        "right_panel_animation",
+        "search_focus_overlay",
+        "settings_terminal_reclaim",
+        "theme_editor_contract",
+        "titlebar_autohide_hover",
+        "titlebar_centering",
+        "titlebar_empty_lane_window_controls",
+        "titlebar_modal_visual_parity",
+        "titlebar_new_menu_shell",
+        "titlebar_overflow_menu",
+        "titlebar_session_shell",
+        "webkit_child_rss_soak",
+    }
+    needs_session_setup = not selected_checks or not selected_checks.issubset(
+        no_session_setup_checks
+    )
 
     initial_state = app_state(args.pid)
-    if args.session_kind != "codex" and (args.reopen or (
-        initial_state.get("active_session_path") != args.session
-        or initial_state.get("active_view_mode") != "Terminal"
-    )):
-        app_open(args.pid, args.session, view="terminal")
-    initial_settle = "interactive_only"
-    if args.session_kind == "plain":
-        try:
-            state = ensure_plain_shell_runtime(args.pid, args.session)["state"]
-            initial_settle = "quiescent"
-        except AssertionError:
-            created = app_create_terminal(args.pid, title="Smoke Plain Terminal")
-            fresh_session = str(created.get("active_session_path") or "").strip()
-            if not fresh_session:
-                raise
-            args.session = fresh_session
-            state = ensure_plain_shell_runtime(args.pid, args.session)["state"]
-            initial_settle = "quiescent_fresh_terminal"
-    elif args.session_kind == "codex":
-        disposable_codex_create = create_terminal_via_sidebar_context_menu(args.pid)
-        disposable_codex_session = disposable_codex_create["session_path"]
-        args.session = disposable_codex_session
-        state = ensure_live_codex_runtime(args.pid, args.session)["state"]
-        initial_settle = "interactive_disposable_codex_session"
+    initial_prompt_pixels = None
+    if needs_session_setup:
+        if args.session_kind != "codex" and (
+            args.reopen
+            or (initial_state.get("active_session_path") != args.session)
+            or (initial_state.get("active_view_mode") != "Terminal")
+        ):
+            app_open(args.pid, args.session, view="terminal")
+        initial_settle = "interactive_only"
+        if args.session_kind == "plain":
+            try:
+                state = ensure_plain_shell_runtime(args.pid, args.session)["state"]
+                initial_settle = "quiescent"
+            except AssertionError:
+                created = app_create_terminal(args.pid, title="Smoke Plain Terminal")
+                fresh_session = str(created.get("active_session_path") or "").strip()
+                if not fresh_session:
+                    raise
+                args.session = fresh_session
+                state = ensure_plain_shell_runtime(args.pid, args.session)["state"]
+                initial_settle = "quiescent_fresh_terminal"
+        elif args.session_kind == "codex":
+            disposable_codex_create = create_terminal_via_sidebar_context_menu(args.pid)
+            disposable_codex_session = disposable_codex_create["session_path"]
+            args.session = disposable_codex_session
+            state = ensure_live_codex_runtime(args.pid, args.session)["state"]
+            initial_settle = "interactive_disposable_codex_session"
+        else:
+            state = wait_for_interactive_session(args.pid, args.session, timeout_seconds=25.0)
+        state, initial_prompt_pixels = capture_prompt_visible_screenshot(
+            args.pid,
+            args.session,
+            out_dir / "initial.png",
+            context="initial screenshot",
+            timeout_seconds=8.0,
+        )
     else:
-        state = wait_for_interactive_session(args.pid, args.session, timeout_seconds=25.0)
-    state, initial_prompt_pixels = capture_prompt_visible_screenshot(
-        args.pid,
-        args.session,
-        out_dir / "initial.png",
-        context="initial screenshot",
-        timeout_seconds=8.0,
-    )
+        initial_settle = "app_control_only"
+        state = initial_state
     with (out_dir / "initial-state.json").open("w") as fh:
         json.dump(state, fh, indent=2)
 
@@ -11245,12 +11299,15 @@ def main() -> int:
         "initial_settle": initial_settle,
         "pointer_driver": POINTER_DRIVER,
         "key_driver": KEY_DRIVER,
+        "only_checks": list(args.only_check),
         "checks": {},
     }
     if disposable_codex_create is not None:
         summary["checks"]["disposable_codex_session_created"] = disposable_codex_create
 
     def run_check(name: str, fn):
+        if args.only_check and name not in args.only_check:
+            return None
         print(f"RUN {name}", flush=True)
         result = fn()
         summary["checks"][name] = result
