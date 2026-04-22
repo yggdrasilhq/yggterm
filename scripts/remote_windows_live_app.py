@@ -45,15 +45,37 @@ function Resolve-YggtermBinary {
 
 $bin = Resolve-YggtermBinary -Requested $RequestedBin
 $clientsPayload = & $bin server app clients --timeout-ms $TimeoutMs | ConvertFrom-Json
-$clients = @()
+$rawClients = @()
 if ($clientsPayload.clients) {
-  $clients = @($clientsPayload.clients)
+  $rawClients = @($clientsPayload.clients)
 } elseif ($clientsPayload.data) {
-  $clients = @($clientsPayload.data)
+  $rawClients = @($clientsPayload.data)
+}
+$clients = @()
+foreach ($client in $rawClients) {
+  $clientPid = [int]($client.pid)
+  $procInfo = Get-Process -Id $clientPid -ErrorAction SilentlyContinue |
+    Select-Object Id, Responding, MainWindowTitle, MainWindowHandle, Path
+  $clients += [pscustomobject]@{
+    pid = $clientPid
+    started_at_ms = $client.started_at_ms
+    display = $client.display
+    wayland_display = $client.wayland_display
+    xauthority = $client.xauthority
+    xdg_runtime_dir = $client.xdg_runtime_dir
+    xdg_session_id = $client.xdg_session_id
+    process_path = if ($procInfo) { $procInfo.Path } else { $null }
+    responding = if ($procInfo) { $procInfo.Responding } else { $null }
+    main_window_title = if ($procInfo) { $procInfo.MainWindowTitle } else { $null }
+    main_window_handle = if ($procInfo) { $procInfo.MainWindowHandle } else { $null }
+  }
 }
 $chosen = $null
 if ($clients.Count -gt 0) {
-  $chosen = $clients | Sort-Object {[int]($_.pid)} | Select-Object -Last 1
+  $matching = @($clients | Where-Object { $_.process_path -eq $bin })
+  if ($matching.Count -gt 0) {
+    $chosen = $matching | Sort-Object {[int]($_.pid)} | Select-Object -Last 1
+  }
 }
 
 $state = $null
@@ -164,6 +186,19 @@ def run_remote_powershell_encoded(host: str, script: str) -> subprocess.Complete
     return proc
 
 
+def run_remote_powershell_best_effort(host: str, script: str) -> subprocess.CompletedProcess:
+    compacted_script = "\n".join(line.strip() for line in script.splitlines() if line.strip())
+    encoded = base64.b64encode(compacted_script.encode("utf-16le")).decode("ascii")
+    if len(encoded) > 7900:
+        return run_remote_powershell(host, script)
+    try:
+        return run_remote_powershell_encoded(host, compacted_script)
+    except RuntimeError as exc:
+        if "The command line is too long." in str(exc):
+            return run_remote_powershell(host, script)
+        raise
+
+
 def ps_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
@@ -213,7 +248,7 @@ def main() -> int:
         + f"$ScreenshotPath = {ps_literal(screenshot_remote)}\n"
         + POWERSHELL_SNIPPET
     )
-    proc = run_remote_powershell_encoded(args.host, launcher)
+    proc = run_remote_powershell_best_effort(args.host, launcher)
     try:
         payload = json.loads(extract_json_text(proc.stdout))
     except Exception as exc:  # noqa: BLE001
