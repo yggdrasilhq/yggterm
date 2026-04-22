@@ -3,7 +3,9 @@ use anyhow::{Context, Result};
 use cairo::{Context as CairoContext, Format, ImageSurface, Surface};
 use dioxus::desktop::DesktopContext;
 use serde_json::{Value, json};
-use std::fs::{self, File};
+use std::fs;
+#[cfg(target_os = "linux")]
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use tao::dpi::PhysicalPosition;
 use yggterm_server::ScreenshotTarget;
@@ -12,32 +14,74 @@ use yggterm_server::ScreenshotTarget;
 use tao::platform::macos::WindowExtMacOS;
 #[cfg(target_os = "linux")]
 use tao::platform::unix::WindowExtUnix;
+#[cfg(target_os = "windows")]
+use tao::platform::windows::WindowExtWindows;
 #[cfg(target_os = "linux")]
 use webkit2gtk::{SnapshotOptions, SnapshotRegion, WebViewExt};
 #[cfg(target_os = "linux")]
 use wry::WebViewExtUnix;
+#[cfg(target_os = "windows")]
+use webview2_com::{Microsoft::Web::WebView2::Win32::COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG, wait_with_pump};
+#[cfg(target_os = "windows")]
+use webview2_com::CapturePreviewCompletedHandler;
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::HGLOBAL;
+#[cfg(target_os = "windows")]
+use windows::core::Result as WindowsResult;
+#[cfg(target_os = "windows")]
+use windows::Win32::System::Com::{STATFLAG_NONAME, STREAM_SEEK_SET, StructuredStorage::CreateStreamOnHGlobal};
+#[cfg(target_os = "windows")]
+use wry::WebViewExtWindows;
 #[cfg(target_os = "linux")]
 use yggterm_platform::capture_linux_x11_window_screenshot;
+#[cfg(target_os = "windows")]
+use yggterm_platform::capture_windows_hwnd_screenshot;
+#[cfg(target_os = "windows")]
+use yggterm_platform::capture_windows_window_screenshot;
 #[cfg(target_os = "macos")]
 use yggterm_platform::{capture_macos_window_recording, capture_macos_window_screenshot};
+
+#[derive(Debug, Clone)]
+pub struct SurfaceCapture {
+    pub output_path: PathBuf,
+    pub backend: &'static str,
+    pub backend_attempts: Vec<String>,
+}
+
+impl SurfaceCapture {
+    fn new(output_path: &Path, backend: &'static str) -> Self {
+        Self {
+            output_path: output_path.to_path_buf(),
+            backend,
+            backend_attempts: Vec::new(),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn with_attempts(mut self, backend_attempts: Vec<String>) -> Self {
+        self.backend_attempts = backend_attempts;
+        self
+    }
+}
 
 pub async fn capture_visible_app_surface(
     desktop: &DesktopContext,
     output_path: &Path,
     target: ScreenshotTarget,
     dom_snapshot: Option<&Value>,
-) -> Result<PathBuf> {
+) -> Result<SurfaceCapture> {
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating screenshot dir {}", parent.display()))?;
     }
-    platform_capture_visible_app_surface(desktop, output_path, target, dom_snapshot).await?;
-    let metadata = fs::metadata(output_path)
-        .with_context(|| format!("reading screenshot metadata {}", output_path.display()))?;
+    let capture = platform_capture_visible_app_surface(desktop, output_path, target, dom_snapshot)
+        .await?;
+    let metadata = fs::metadata(&capture.output_path)
+        .with_context(|| format!("reading screenshot metadata {}", capture.output_path.display()))?;
     if !metadata.is_file() || metadata.len() == 0 {
         anyhow::bail!("native screenshot capture produced no file output");
     }
-    Ok(output_path.to_path_buf())
+    Ok(capture)
 }
 
 pub async fn record_visible_app_surface(
@@ -111,6 +155,10 @@ pub fn describe_window(desktop: &DesktopContext) -> Value {
     let inner = desktop.inner_size();
     let outer = desktop.outer_size();
     let position = desktop.outer_position().ok();
+    #[cfg(target_os = "windows")]
+    let native_window_handle = Some(desktop.window.hwnd() as i64);
+    #[cfg(not(target_os = "windows"))]
+    let native_window_handle: Option<i64> = None;
     json!({
         "title": desktop.title(),
         "visible": desktop.is_visible(),
@@ -118,6 +166,7 @@ pub fn describe_window(desktop: &DesktopContext) -> Value {
         "minimized": desktop.is_minimized(),
         "maximized": desktop.is_maximized(),
         "decorated": desktop.is_decorated(),
+        "native_window_handle": native_window_handle,
         "display": std::env::var("DISPLAY").ok(),
         "wayland_display": std::env::var("WAYLAND_DISPLAY").ok(),
         "xdg_session_id": std::env::var("XDG_SESSION_ID").ok(),
@@ -138,6 +187,70 @@ pub fn describe_window(desktop: &DesktopContext) -> Value {
             })
         }),
     })
+}
+
+#[cfg(target_os = "windows")]
+fn capture_windows_webview_surface(desktop: &DesktopContext, output_path: &Path) -> Result<()> {
+    let webview = desktop.webview.webview();
+    let stream = unsafe {
+        CreateStreamOnHGlobal(HGLOBAL::default(), true)
+            .context("creating WebView2 in-memory screenshot stream")?
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    unsafe {
+        webview
+            .CapturePreview(
+                COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG,
+                &stream,
+                &CapturePreviewCompletedHandler::create(Box::new(move |error_code: WindowsResult<()>| {
+                    let _ = tx.send(error_code.map(|_| ()));
+                    Ok(())
+                })),
+            )
+            .context("requesting WebView2 preview capture")?;
+    }
+    wait_with_pump(rx)
+        .context("waiting for WebView2 preview capture")?
+        .context("WebView2 preview capture failed")?;
+    unsafe {
+        stream
+            .Seek(0, STREAM_SEEK_SET, None)
+            .context("rewinding WebView2 screenshot stream")?;
+    }
+    let mut bytes = Vec::new();
+    let mut stat = unsafe { std::mem::zeroed() };
+    unsafe {
+        stream
+            .Stat(&mut stat, STATFLAG_NONAME)
+            .context("reading WebView2 screenshot stream metadata")?;
+    }
+    if stat.cbSize > 0 {
+        bytes.reserve(stat.cbSize as usize);
+    }
+    loop {
+        let mut buffer = [0_u8; 16 * 1024];
+        let mut read = 0_u32;
+        unsafe {
+            stream
+                .Read(
+                    buffer.as_mut_ptr() as *mut _,
+                    buffer.len() as u32,
+                    Some(&mut read),
+                )
+                .ok()
+                .context("reading WebView2 screenshot stream")?;
+        }
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read as usize]);
+    }
+    if bytes.is_empty() {
+        anyhow::bail!("WebView2 preview capture returned no image bytes");
+    }
+    fs::write(output_path, &bytes)
+        .with_context(|| format!("writing Windows WebView2 screenshot {}", output_path.display()))?;
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -230,13 +343,13 @@ async fn platform_capture_visible_app_surface(
     output_path: &Path,
     target: ScreenshotTarget,
     dom_snapshot: Option<&Value>,
-) -> Result<()> {
+) -> Result<SurfaceCapture> {
     if target == ScreenshotTarget::App
         && std::env::var_os("DISPLAY").is_some()
         && std::env::var_os("WAYLAND_DISPLAY").is_none()
         && capture_linux_x11_window_screenshot(std::process::id(), output_path).is_ok()
     {
-        return Ok(());
+        return Ok(SurfaceCapture::new(output_path, "linux_x11_window"));
     }
     let gtk_webview = desktop.webview.webview();
     let surface = gtk_webview
@@ -250,15 +363,16 @@ async fn platform_capture_visible_app_surface(
             surface
                 .write_to_png(&mut output)
                 .with_context(|| format!("writing screenshot png {}", output_path.display()))?;
+            Ok(SurfaceCapture::new(output_path, "linux_webkit_snapshot"))
         }
         ScreenshotTarget::PreviewViewport => {
             let rect = preview_viewport_capture_rect(
                 dom_snapshot.context("preview viewport capture requires a DOM snapshot")?,
             )?;
             crop_visible_surface_to_rect(&surface, rect, output_path)?;
+            Ok(SurfaceCapture::new(output_path, "linux_preview_viewport_crop"))
         }
     }
-    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -267,16 +381,66 @@ async fn platform_capture_visible_app_surface(
     output_path: &Path,
     target: ScreenshotTarget,
     dom_snapshot: Option<&Value>,
-) -> Result<()> {
+) -> Result<SurfaceCapture> {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = dom_snapshot;
+        if target != ScreenshotTarget::App {
+            anyhow::bail!("preview viewport screenshot capture is not implemented for Windows yet");
+        }
+        let mut backend_attempts = Vec::new();
+        match capture_windows_webview_surface(desktop, output_path) {
+            Ok(()) => {
+                return Ok(SurfaceCapture::new(
+                    output_path,
+                    "windows_webview2_capture_preview",
+                ));
+            }
+            Err(error) => {
+                backend_attempts.push(format!(
+                    "windows_webview2_capture_preview: {error:#}"
+                ));
+            }
+        }
+        let hwnd = desktop.window.hwnd();
+        let size = desktop.outer_size();
+        match capture_windows_hwnd_screenshot(output_path, hwnd, size.width, size.height) {
+            Ok(()) => {
+                return Ok(
+                    SurfaceCapture::new(output_path, "windows_printwindow")
+                        .with_attempts(backend_attempts),
+                );
+            }
+            Err(error) => {
+                backend_attempts.push(format!("windows_printwindow: {error:#}"));
+            }
+        }
+        let position = desktop
+            .outer_position()
+            .context("reading Windows window position for screenshot")?;
+        capture_windows_window_screenshot(
+            output_path,
+            position.x,
+            position.y,
+            size.width,
+            size.height,
+        )?;
+        return Ok(
+            SurfaceCapture::new(output_path, "windows_screen_copy")
+                .with_attempts(backend_attempts),
+        );
+    }
+
     #[cfg(target_os = "macos")]
     {
         if target != ScreenshotTarget::App {
             anyhow::bail!("preview viewport screenshot capture is not implemented for macOS yet");
         }
-        return capture_macos_window_screenshot(desktop.window.ns_window().cast(), output_path);
+        capture_macos_window_screenshot(desktop.window.ns_window().cast(), output_path)?;
+        return Ok(SurfaceCapture::new(output_path, "macos_window_screenshot"));
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = desktop;
         let _ = output_path;

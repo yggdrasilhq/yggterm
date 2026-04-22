@@ -101,8 +101,10 @@ def run_remote_powershell(host: str, script: str) -> subprocess.CompletedProcess
         capture_output=True,
         input=script,
     )
+    stderr = strip_windows_ssh_noise(proc.stderr)
+    stdout = proc.stdout.strip()
     if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or f"powershell failed on {host}")
+        raise RuntimeError(stderr or stdout or f"powershell failed on {host}")
     return proc
 
 
@@ -110,11 +112,36 @@ def ps_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def strip_windows_ssh_noise(text: str) -> str:
+    lines = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("** WARNING: connection is not using a post-quantum key exchange algorithm."):
+            continue
+        if line.startswith('** This session may be vulnerable to "store now, decrypt later" attacks.'):
+            continue
+        if line.startswith("** The server may need to be upgraded. See https://openssh.com/pq.html"):
+            continue
+        lines.append(raw_line)
+    return "\n".join(lines).strip()
+
+
 def extract_json_text(stdout: str) -> str:
-    for line in reversed(stdout.splitlines()):
-        candidate = line.strip()
-        if candidate.startswith("{") or candidate.startswith("["):
-            return candidate
+    lines = stdout.splitlines()
+    for start in range(len(lines)):
+        if not lines[start].lstrip().startswith(("{", "[")):
+            continue
+        for end in range(len(lines), start, -1):
+            candidate = "\n".join(lines[start:end]).strip()
+            if not candidate.endswith(("}", "]")):
+                continue
+            try:
+                json.loads(candidate)
+                return candidate
+            except Exception:
+                continue
     raise RuntimeError(f"could not find JSON payload in PowerShell output: {stdout!r}")
 
 
