@@ -1992,14 +1992,16 @@ fn run_server_smoke() -> Result<()> {
     fs::create_dir_all(&temp_home)?;
     let endpoint = default_endpoint(&temp_home);
     let current_exe = std::env::current_exe()?;
-    let mut child = Command::new(current_exe)
+    let mut command = Command::new(current_exe);
+    command
         .arg("server")
         .arg("daemon")
         .env(ENV_YGGTERM_HOME, &temp_home)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::null());
+    yggterm_platform::configure_background_service_command(&mut command);
+    let mut child = command.spawn()?;
 
     let result = (|| -> Result<()> {
         for _ in 0..40 {
