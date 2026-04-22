@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license = "Apache-2.0"
+build = "build.rs"
 
 [[bin]]
 name = "yggterm"
@@ -30,7 +31,13 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 yggterm-core = { path = "../../crates/yggterm-core" }
+yggterm-platform = { path = "../../crates/yggterm-platform" }
 yggterm-server = { path = "../../crates/yggterm-server" }
 yggterm-shell = { path = "../../crates/yggterm-shell" }
 yggui = { path = "../../crates/yggui" }
 yggui-contract = { path = "../../crates/yggui-contract" }
+
+[build-dependencies]
+png = "0.17"
+ico = "0.4"
+winresource = "0.1"

@@ -17,6 +17,7 @@ from remote_windows_live_app import (
     strip_windows_ssh_noise,
 )
 from smoke_app_control_bootstrap import (
+    assert_sidebar_rows_present,
     assert_blur_expectation,
     problem_notifications,
     screenshot_backend,
@@ -1118,6 +1119,7 @@ def main() -> int:
             ["server", "app", "rows", "--pid", str(app_pid), "--timeout-ms", str(args.timeout_ms)],
         )
         rows = rows_payload.get("data") if isinstance(rows_payload.get("data"), dict) else rows_payload
+        sidebar = assert_sidebar_rows_present(rows)
 
         state_path = proof_dir / "state.json"
         rows_path = proof_dir / "rows.json"
@@ -1172,6 +1174,7 @@ def main() -> int:
             ),
             "problem_notifications": problem_notifications(state),
             "blur": blur,
+            "sidebar": sidebar,
             "state_path": str(state_path),
             "rows_path": str(rows_path),
             "screenshot_path": str(screenshot_path) if screenshot_path.exists() else None,
