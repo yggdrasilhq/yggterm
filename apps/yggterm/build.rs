@@ -18,7 +18,11 @@ fn decode_png_rgba(path: &Path) -> (u32, u32, Vec<u8>) {
     let info = reader
         .next_frame(&mut buffer)
         .expect("decode app icon pixels");
-    (info.width, info.height, buffer[..info.buffer_size()].to_vec())
+    (
+        info.width,
+        info.height,
+        buffer[..info.buffer_size()].to_vec(),
+    )
 }
 
 fn write_windows_icon(icon_png: &Path, out_dir: &Path) -> PathBuf {
@@ -39,6 +43,10 @@ fn main() {
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
+    }
+
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-link-arg-bin=yggterm=/SUBSYSTEM:WINDOWS");
     }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
