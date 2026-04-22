@@ -39,6 +39,7 @@ def default_artifact() -> Path:
 
 WINDOWS_HELPERS = r"""
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
 
 function Ensure-RemoteRoot {
   param([string]$DirName)
@@ -184,8 +185,9 @@ def ensure_remote_dir(host: str, remote_dir_name: str) -> str:
 
 def stage_artifact(host: str, artifact: Path, remote_root: str) -> None:
     remote_artifact = str(PureWindowsPath(remote_root) / artifact.name)
+    lower_name = artifact.name.lower()
     scp_to(host, artifact, windows_scp_path(remote_artifact))
-    if artifact.suffixes[-2:] == [".tar", ".gz"]:
+    if lower_name.endswith(".tar.gz"):
         script = (
             f"$RemoteRoot = {ps_literal(remote_root)}\n"
             + WINDOWS_HELPERS
@@ -194,7 +196,7 @@ def stage_artifact(host: str, artifact: Path, remote_root: str) -> None:
         )
         run_remote_powershell(host, script)
         return
-    if artifact.suffix.lower() == ".zip":
+    if lower_name.endswith(".zip"):
         script = (
             f"$RemoteRoot = {ps_literal(remote_root)}\n"
             + WINDOWS_HELPERS

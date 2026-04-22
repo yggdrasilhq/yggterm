@@ -19,6 +19,7 @@ DEFAULT_ICON = ROOT / "assets" / "brand" / "yggterm-icon-512.png"
 
 def default_artifact() -> Path:
     candidates = [
+        ROOT / "dist" / "yggterm-macos-x86_64.app.zip",
         ROOT / "dist" / "Yggterm-macos-x86_64.app.zip",
         ROOT / "dist" / "yggterm-macos-x86_64",
     ]
@@ -74,6 +75,132 @@ def frontmost_macos_app_name(host: str) -> str | None:
     )
     text = proc.stdout.strip() or proc.stderr.strip()
     return text or None
+
+
+def remote_notify_macos(host: str, title: str, body: str) -> None:
+    ssh_shell(
+        host,
+        "osascript -e "
+        + quote(f'display notification "{body}" with title "{title}"'),
+        check=False,
+    )
+
+
+def remote_owned_macos_clients(host: str, remote_dir: str | None = None) -> dict:
+    scope = (remote_dir or "").strip()
+    proc = ssh_shell(
+        host,
+        r"""
+ps -axo pid=,ppid=,command= | awk '
+  /\/Users\/[^ ]+\/yggterm-remote-macos-[^ ]*/ {
+    pid=$1
+    ppid=$2
+    sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+/, "", $0)
+    print pid "\t" ppid "\t" $0
+  }
+'
+""",
+        check=False,
+    )
+    clients: list[dict] = []
+    for line in proc.stdout.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) != 3:
+            continue
+        try:
+            pid = int(parts[0].strip())
+            ppid = int(parts[1].strip())
+        except ValueError:
+            continue
+        command = parts[2].strip()
+        if scope and scope not in command:
+            continue
+        clients.append({"pid": pid, "ppid": ppid, "command": command})
+    return {"count": len(clients), "clients": clients}
+
+
+def wait_for_remote_owned_macos_clients_gone(
+    host: str, remote_dir: str, timeout_seconds: float = 8.0
+) -> dict:
+    deadline = time.time() + timeout_seconds
+    last_inventory = remote_owned_macos_clients(host, remote_dir)
+    while time.time() < deadline:
+        if int(last_inventory.get("count") or 0) == 0:
+            return last_inventory
+        time.sleep(0.25)
+        last_inventory = remote_owned_macos_clients(host, remote_dir)
+    return last_inventory
+
+
+def kill_remote_owned_macos_clients(host: str, remote_dir: str) -> dict:
+    inventory = remote_owned_macos_clients(host, remote_dir)
+    pids = [int(client.get("pid") or 0) for client in inventory.get("clients") or []]
+    pids = [pid for pid in pids if pid > 0]
+    if pids:
+        pid_args = " ".join(str(pid) for pid in pids)
+        ssh_shell(host, f"kill -TERM {pid_args} >/dev/null 2>&1 || true", check=False)
+        time.sleep(0.5)
+        ssh_shell(host, f"kill -KILL {pid_args} >/dev/null 2>&1 || true", check=False)
+    return {
+        "before": inventory,
+        "after": remote_owned_macos_clients(host, remote_dir),
+    }
+
+
+def cleanup_stale_remote_macos_clients(host: str) -> dict:
+    proc = ssh_shell(
+        host,
+        r"""
+ps -axo pid=,command= | awk '
+  /\/Users\/[^ ]+\/yggterm-remote-macos-[^ ]*/ {
+    pid=$1
+    sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", $0)
+    print pid "\t" $0
+  }
+'
+""",
+        check=False,
+    )
+    stale_entries: list[dict] = []
+    stale_pids: list[int] = []
+    stale_roots: set[str] = set()
+    for line in proc.stdout.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) != 2:
+            continue
+        try:
+            pid = int(parts[0].strip())
+        except ValueError:
+            continue
+        command = parts[1].strip()
+        root = ""
+        marker = command.find("/yggterm-remote-macos-")
+        if marker >= 0:
+            next_space = command.find(" ", marker)
+            path_part = command if next_space < 0 else command[:next_space]
+            before_contents = path_part.split("/Yggterm.app/Contents/MacOS/Yggterm", 1)[0]
+            before_server = before_contents.split("/yggterm-macos-", 1)[0]
+            root = before_server
+        stale_entries.append({"pid": pid, "command": command, "root": root})
+        stale_pids.append(pid)
+        if root:
+            stale_roots.add(root)
+
+    if stale_pids:
+        pid_args = " ".join(str(pid) for pid in stale_pids)
+        ssh_shell(host, f"kill -TERM {pid_args} >/dev/null 2>&1 || true", check=False)
+        time.sleep(0.75)
+        ssh_shell(host, f"kill -KILL {pid_args} >/dev/null 2>&1 || true", check=False)
+
+    if stale_roots:
+        root_args = " ".join(quote(root) for root in sorted(stale_roots))
+        ssh_shell(host, f"rm -rf {root_args}", check=False)
+
+    return {
+        "count": len(stale_entries),
+        "entries": stale_entries,
+        "roots": sorted(stale_roots),
+    }
 
 
 def macos_session_info(host: str) -> dict:
@@ -145,23 +272,24 @@ def macos_desktop_ready(session_info: dict) -> bool:
 def stage_artifact(host: str, artifact: Path, remote_dir: str) -> tuple[str, str | None]:
     ssh_shell(host, f"mkdir -p {quote(remote_dir)}")
     remote_rel = f"{remote_dir}/{artifact.name}"
+    lower_name = artifact.name.lower()
     scp_to(host, artifact, remote_rel)
-    if artifact.suffixes[-2:] == [".tar", ".gz"]:
+    if lower_name.endswith(".tar.gz"):
         ssh_shell(
             host,
             f"tar -xzf {quote(remote_rel)} -C {quote(remote_dir)} && "
             f"find {quote(remote_dir)} -maxdepth 1 -type f -name 'yggterm*' "
-            f"! -name '*headless*' ! -name '*mock-cli*' -exec chmod +x {{}} +",
+            f"! -name '*headless*' ! -name '*mock-cli*' ! -name '*.sha256' -exec chmod +x {{}} +",
         )
         remote_bin = ssh_shell(
             host,
             f"find {quote(remote_dir)} -maxdepth 1 -type f -name 'yggterm*' "
-            f"! -name '*headless*' ! -name '*mock-cli*' | head -n1",
+            f"! -name '*headless*' ! -name '*mock-cli*' ! -name '*.sha256' | head -n1",
         ).stdout.strip()
         if not remote_bin:
             raise RuntimeError(f"could not resolve staged macOS yggterm binary from archive {artifact}")
         return remote_bin, None
-    if artifact.suffix.lower() == ".zip":
+    if lower_name.endswith(".zip"):
         ssh_shell(
             host,
             f"rm -rf {quote(remote_dir)}/Yggterm.app && "
@@ -266,6 +394,48 @@ PLIST
 """,
     )
     return remote_app
+
+
+def normalize_staged_macos_payload(
+    host: str, remote_dir: str, remote_bin: str, remote_app: str | None
+) -> tuple[str, str | None]:
+    lower_remote = remote_bin.lower()
+    if lower_remote.endswith(".tar.gz"):
+        ssh_shell(
+            host,
+            f"tar -xzf {quote(remote_bin)} -C {quote(remote_dir)} && "
+            f"find {quote(remote_dir)} -maxdepth 1 -type f -name 'yggterm*' "
+            f"! -name '*headless*' ! -name '*mock-cli*' ! -name '*.sha256' -exec chmod +x {{}} +",
+        )
+        resolved = ssh_shell(
+            host,
+            f"find {quote(remote_dir)} -maxdepth 1 -type f -name 'yggterm*' "
+            f"! -name '*headless*' ! -name '*mock-cli*' ! -name '*.tar.gz' ! -name '*.sha256' | head -n1",
+        ).stdout.strip()
+        if not resolved:
+            raise RuntimeError(f"could not resolve staged macOS binary from remote archive {remote_bin}")
+        return resolved, remote_app
+    if lower_remote.endswith(".zip"):
+        ssh_shell(
+            host,
+            f"rm -rf {quote(remote_dir)}/Yggterm.app && "
+            f"(command -v ditto >/dev/null 2>&1 && ditto -x -k {quote(remote_bin)} {quote(remote_dir)} "
+            f"|| unzip -oq {quote(remote_bin)} -d {quote(remote_dir)})",
+        )
+        app = ssh_shell(
+            host,
+            f"find {quote(remote_dir)} -maxdepth 2 -type d -name '*.app' | head -n1",
+        ).stdout.strip()
+        if app:
+            resolved = ssh_shell(
+                host,
+                f"find {quote(app)}/Contents/MacOS -maxdepth 1 -type f | head -n1",
+            ).stdout.strip()
+            if not resolved:
+                raise RuntimeError(f"staged macOS app bundle {app} did not expose an executable")
+            ssh_shell(host, f"chmod +x {quote(resolved)}")
+            return resolved, app
+    return remote_bin, remote_app
 
 
 def resolve_remote_launch_target(host: str, remote_dir: str, args: argparse.Namespace) -> tuple[str, str | None]:
@@ -481,7 +651,12 @@ def capture_remote_screenshot(
             str(timeout_ms),
         ],
     )
-    scp_from(host, remote_path, local_path)
+    if payload.get("error"):
+        raise RuntimeError(str(payload.get("error")))
+    resolved_output = str(payload.get("output_path") or remote_path).strip()
+    if not resolved_output:
+        raise RuntimeError("remote screenshot command returned no output path")
+    scp_from(host, resolved_output, local_path)
     return payload
 
 
@@ -508,11 +683,15 @@ def main() -> int:
     remote_bin_error = None
     remote_clients_probe = None
     frontmost_app_name = None
+    prelaunch_cleanup = cleanup_stale_remote_macos_clients(args.host)
 
     session_info = macos_session_info(args.host)
     ssh_shell(args.host, f"mkdir -p {quote(remote_dir)} {quote(remote_home)}")
     try:
         remote_bin, remote_app = resolve_remote_launch_target(args.host, remote_dir, args)
+        remote_bin, remote_app = normalize_staged_macos_payload(
+            args.host, remote_dir, remote_bin, remote_app
+        )
         if not remote_app:
             remote_app = stage_macos_app_bundle(args.host, remote_dir, remote_bin)
         try:
@@ -537,6 +716,7 @@ def main() -> int:
             "remote_bin_error": remote_bin_error,
             "remote_clients_probe": remote_clients_probe,
             "frontmost_app_name": frontmost_app_name,
+            "prelaunch_cleanup": prelaunch_cleanup,
             "pid": None,
             "owned_launch": False,
             "launch": None,
@@ -560,6 +740,11 @@ def main() -> int:
     launch_payload = None
     direct_spawn_pid = 0
     try:
+        remote_notify_macos(
+            args.host,
+            "Yggterm automated testing",
+            "Automated testing is starting. The Yggterm window should close when the run finishes.",
+        )
         if not remote_bin:
             raise RuntimeError(remote_bin_error or f"could not resolve remote macOS binary on {args.host}")
         if args.attach_only:
@@ -571,36 +756,9 @@ def main() -> int:
             )
             pid = choose_client_pid(clients_payload)
         else:
-            try:
-                launch_payload = remote_json_command(
-                    args.host,
-                    remote_bin,
-                    launch_env,
-                    [
-                        "server",
-                        "app",
-                        "launch",
-                        "--wait-visible",
-                        "--allow-multi-window",
-                        "--skip-active-exec-handoff",
-                        "--timeout-ms",
-                        str(args.timeout_ms),
-                        "--log",
-                        remote_log,
-                    ],
-                )
-                pid = int(launch_payload.get("pid") or 0)
-                if pid <= 0:
-                    raise RuntimeError(
-                        f"background app launch did not return a pid on {args.host}: {launch_payload!r}"
-                    )
-                owned_launch = True
-            except Exception as exc:  # noqa: BLE001
-                if not should_fallback_direct_launch(exc):
-                    raise
+            if remote_app:
                 launch_payload = {
-                    "mode": "direct_process_fallback",
-                    "error": str(exc),
+                    "mode": "app_bundle_open",
                     "spawn": spawn_direct_macos_app(
                         args.host,
                         remote_bin,
@@ -610,26 +768,73 @@ def main() -> int:
                     ),
                 }
                 owned_launch = True
-                direct_spawn_pid = int(
-                    ((launch_payload.get("spawn") or {}).get("spawn_pid")) or 0
-                )
-                if remote_app:
-                    for _ in range(40):
-                        frontmost_app_name = frontmost_macos_app_name(args.host)
-                        if frontmost_app_name:
-                            break
-                        time.sleep(0.25)
-                    if frontmost_app_name != "Yggterm":
-                        raise RuntimeError(
-                            "staged macOS app bundle did not present the correct frontmost app name: "
-                            f"{frontmost_app_name!r}"
-                        )
+                for _ in range(40):
+                    frontmost_app_name = frontmost_macos_app_name(args.host)
+                    if frontmost_app_name:
+                        break
+                    time.sleep(0.25)
                 pid = wait_for_client_pid(
                     args.host,
                     remote_bin,
                     launch_env,
                     args.timeout_ms,
                 )
+            else:
+                try:
+                    launch_payload = remote_json_command(
+                        args.host,
+                        remote_bin,
+                        launch_env,
+                        [
+                            "server",
+                            "app",
+                            "launch",
+                            "--wait-visible",
+                            "--allow-multi-window",
+                            "--skip-active-exec-handoff",
+                            "--timeout-ms",
+                            str(args.timeout_ms),
+                            "--log",
+                            remote_log,
+                        ],
+                    )
+                    pid = int(launch_payload.get("pid") or 0)
+                    if pid <= 0:
+                        raise RuntimeError(
+                            f"background app launch did not return a pid on {args.host}: {launch_payload!r}"
+                        )
+                    owned_launch = True
+                    frontmost_app_name = frontmost_macos_app_name(args.host)
+                except Exception as exc:  # noqa: BLE001
+                    if not should_fallback_direct_launch(exc):
+                        raise
+                    launch_payload = {
+                        "mode": "direct_process_fallback",
+                        "error": str(exc),
+                        "spawn": spawn_direct_macos_app(
+                            args.host,
+                            remote_bin,
+                            launch_env,
+                            remote_log,
+                            remote_app,
+                        ),
+                    }
+                    owned_launch = True
+                    direct_spawn_pid = int(
+                        ((launch_payload.get("spawn") or {}).get("spawn_pid")) or 0
+                    )
+                    for _ in range(40):
+                        frontmost_app_name = frontmost_macos_app_name(args.host)
+                        if frontmost_app_name:
+                            break
+                        time.sleep(0.25)
+                    pid = wait_for_client_pid(
+                        args.host,
+                        remote_bin,
+                        launch_env,
+                        args.timeout_ms,
+                    )
+        owned_clients_after_launch = remote_owned_macos_clients(args.host, remote_dir)
 
         state = wait_for_ready_state(
             args.host,
@@ -691,6 +896,12 @@ def main() -> int:
             "screenshot_error": screenshot_error,
         }
         summary_path.write_text(json.dumps(proof_summary, indent=2), encoding="utf-8")
+        if remote_app and frontmost_app_name != "Yggterm":
+            raise RuntimeError(
+                f"staged macOS app bundle still exposed the wrong frontmost app name: {frontmost_app_name!r}"
+            )
+        if screenshot_error:
+            raise RuntimeError(f"macOS screenshot capture failed: {screenshot_error}")
 
         summary = {
             "host": args.host,
@@ -702,6 +913,8 @@ def main() -> int:
             "remote_version": remote_version,
             "remote_clients_probe": remote_clients_probe,
             "frontmost_app_name": frontmost_app_name,
+            "prelaunch_cleanup": prelaunch_cleanup,
+            "owned_clients_after_launch": owned_clients_after_launch,
             "pid": pid,
             "owned_launch": owned_launch,
             "launch": launch_payload,
@@ -723,6 +936,8 @@ def main() -> int:
             "remote_bin_error": remote_bin_error,
             "remote_clients_probe": remote_clients_probe,
             "frontmost_app_name": frontmost_app_name,
+            "prelaunch_cleanup": prelaunch_cleanup,
+            "owned_clients_after_launch": remote_owned_macos_clients(args.host, remote_dir),
             "pid": pid or None,
             "owned_launch": owned_launch,
             "launch": launch_payload,
@@ -755,12 +970,18 @@ def main() -> int:
                     check=False,
                 )
             except Exception:
-                if direct_spawn_pid > 0:
-                    ssh_shell(
-                        args.host,
-                        f"kill -TERM {direct_spawn_pid} >/dev/null 2>&1 || true",
-                        check=False,
-                    )
+                pass
+            ssh_shell(
+                args.host,
+                f"kill -TERM {pid} >/dev/null 2>&1 || true",
+                check=False,
+            )
+            time.sleep(0.5)
+            ssh_shell(
+                args.host,
+                f"kill -0 {pid} >/dev/null 2>&1 && kill -KILL {pid} >/dev/null 2>&1 || true",
+                check=False,
+            )
             try:
                 remote_json_command(
                     args.host,
@@ -771,6 +992,24 @@ def main() -> int:
                 )
             except Exception:
                 pass
+        owned_clients_after_close = wait_for_remote_owned_macos_clients_gone(args.host, remote_dir)
+        forced_cleanup_after_close = None
+        if int(owned_clients_after_close.get("count") or 0) > 0:
+            forced_cleanup_after_close = kill_remote_owned_macos_clients(args.host, remote_dir)
+            owned_clients_after_close = wait_for_remote_owned_macos_clients_gone(args.host, remote_dir)
+        remote_notify_macos(
+            args.host,
+            "Yggterm automated testing",
+            "Automated testing finished. The test window should now be closed.",
+        )
+        try:
+            summary = json.loads(local_summary_path.read_text(encoding="utf-8"))
+            summary["owned_clients_after_close"] = owned_clients_after_close
+            if forced_cleanup_after_close is not None:
+                summary["forced_cleanup_after_close"] = forced_cleanup_after_close
+            local_summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        except Exception:
+            pass
         if not args.keep_remote_dir:
             cleanup_remote_dir(args.host, remote_dir)
     return return_code
