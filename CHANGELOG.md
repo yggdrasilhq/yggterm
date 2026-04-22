@@ -4,6 +4,13 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.26
+
+### Fixed
+
+- stop live restored remote sessions from reissuing background `server remote generation-context` SSH work on every active-session hydration tick, which was leaking file descriptors on KDE/Wayland until Yggterm died with `Too many open files` and could destabilize Plasma
+- harden the Linux live desktop watcher with owned-client FD tracking, `generation-context` helper counts, and a `--reuse-existing-home` mode, so compositor-crash regressions now fail against the real restored-profile launcher path instead of only passing staged temp-home runs
+
 ## 2.1.25
 
 ### Fixed

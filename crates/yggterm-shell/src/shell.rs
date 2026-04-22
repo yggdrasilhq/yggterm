@@ -413,6 +413,7 @@ struct ShellState {
     title_requests_in_flight: HashSet<String>,
     precis_requests_in_flight: HashSet<String>,
     summary_requests_in_flight: HashSet<String>,
+    active_copy_hydration_in_flight: HashSet<String>,
     passive_copy_suspended: bool,
     passive_copy_failures: HashSet<String>,
     copy_retry_after_ms: HashMap<String, u64>,
@@ -1221,6 +1222,7 @@ impl ShellState {
             title_requests_in_flight: HashSet::new(),
             precis_requests_in_flight: HashSet::new(),
             summary_requests_in_flight: HashSet::new(),
+            active_copy_hydration_in_flight: HashSet::new(),
             passive_copy_suspended: false,
             passive_copy_failures: HashSet::new(),
             copy_retry_after_ms: HashMap::new(),
@@ -9333,6 +9335,14 @@ fn generation_context_for_target(
     endpoint: &ServerEndpoint,
     target: &CopyGenerationTarget,
 ) -> Option<String> {
+    if let Some(context) = target
+        .remote_context
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(context.to_string());
+    }
     if let (Some(machine), Some(storage_path)) = (
         target.remote_machine.as_ref(),
         target.storage_path.as_deref(),
@@ -11571,6 +11581,19 @@ fn remote_machine_for_session_path(
 }
 fn spawn_active_session_copy_hydration(mut state: Signal<ShellState>, session: ManagedSessionView) {
     let session_path = session.session_path.clone();
+    let already_in_flight = state.with_mut(|shell| {
+        if shell.active_copy_hydration_in_flight.contains(&session_path) {
+            true
+        } else {
+            shell
+                .active_copy_hydration_in_flight
+                .insert(session_path.clone());
+            false
+        }
+    });
+    if already_in_flight {
+        return;
+    }
     let remote_cached = remote_generated_copy(&state.read().server, &session_path);
     let generation_target = copy_generation_target_for_session(&state.read().server, &session);
     let endpoint = state.read().bootstrap.server_endpoint.clone();
@@ -11691,6 +11714,9 @@ fn spawn_active_session_copy_hydration(mut state: Signal<ShellState>, session: M
         )
         .await;
         state.with_mut(|shell| {
+            shell
+                .active_copy_hydration_in_flight
+                .remove(&session_path);
             let Ok(Ok((title, precis, summary))) = outcome else {
                 return;
             };
@@ -21793,7 +21819,11 @@ fn app() -> Element {
     let shape_desktop = desktop.clone();
     use_effect(move || {
         let _ = *window_epoch.read();
-        apply_linux_transparent_window_surface_style(&shape_desktop, linux_transparent_window);
+        apply_linux_transparent_window_surface_style(
+            &shape_desktop,
+            linux_transparent_window,
+            shell_radius,
+        );
         apply_linux_window_corner_shape(&shape_desktop, shell_radius, maximized);
         apply_linux_window_shape_reapply_sequence(&shape_desktop, shell_radius, maximized);
     });
@@ -37133,6 +37163,7 @@ fn rounded_window_region(width: i32, height: i32, radius: i32) -> cairo::Region 
 fn apply_linux_transparent_window_surface_style(
     desktop: &dioxus::desktop::DesktopContext,
     transparent_window: bool,
+    radius: u8,
 ) {
     use gtk::prelude::*;
 
@@ -37140,19 +37171,23 @@ fn apply_linux_transparent_window_surface_style(
         return;
     }
 
+    let radius_px = u32::from(radius);
     let provider = gtk::CssProvider::new();
-    let _ = provider.load_from_data(
-        b"
+    let css = format!(
+        "
         window.yggterm-transparent-window,
         window.yggterm-transparent-window decoration,
         window.yggterm-transparent-window > box,
-        window.yggterm-transparent-window box {
+        window.yggterm-transparent-window box {{
             background-color: transparent;
             background-image: none;
             box-shadow: none;
-        }
-    ",
+            border-radius: {radius_px}px;
+            background-clip: padding-box;
+        }}
+    "
     );
+    let _ = provider.load_from_data(css.as_bytes());
 
     let gtk_window = desktop.gtk_window();
     if let Some(screen) = gtk::prelude::GtkWindowExt::screen(gtk_window)
@@ -37179,6 +37214,7 @@ fn apply_linux_transparent_window_surface_style(
 fn apply_linux_transparent_window_surface_style(
     _desktop: &dioxus::desktop::DesktopContext,
     _transparent_window: bool,
+    _radius: u8,
 ) {
 }
 #[cfg(target_os = "linux")]
@@ -40655,6 +40691,33 @@ mod tests {
         assert!(!target_can_fetch_remote_generation_context(&target));
         target.storage_path = Some("/home/pi/.codex/sessions/foo.jsonl".to_string());
         assert!(target_can_fetch_remote_generation_context(&target));
+    }
+    #[test]
+    fn generation_context_prefers_cached_remote_context_before_remote_fetch() {
+        let target = CopyGenerationTarget {
+            session_path: "remote-session://dev/1".to_string(),
+            session_id: "1".to_string(),
+            cwd: "/home/pi".to_string(),
+            title: "1".to_string(),
+            source_updated_at: None,
+            remote_context: Some("cached remote context".to_string()),
+            remote_machine: Some(RemoteMachineSnapshot {
+                machine_key: "dev".to_string(),
+                label: "dev".to_string(),
+                ssh_target: "definitely-not-a-real-host.invalid".to_string(),
+                prefix: None,
+                remote_binary_expr: None,
+                remote_deploy_state: RemoteDeployState::Ready,
+                health: RemoteMachineHealth::Healthy,
+                sessions: vec![],
+            }),
+            storage_path: Some("/home/pi/.codex/sessions/foo.jsonl".to_string()),
+        };
+        let endpoint = ServerEndpoint::UnixSocket(PathBuf::from("/tmp/yggterm-test.sock"));
+        assert_eq!(
+            generation_context_for_target(&endpoint, &target),
+            Some("cached remote context".to_string())
+        );
     }
     #[test]
     fn explicit_active_title_does_not_need_generation_when_sidebar_row_is_missing() {
