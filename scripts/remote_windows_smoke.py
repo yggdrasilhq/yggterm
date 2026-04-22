@@ -1209,7 +1209,7 @@ def main() -> int:
             installed_exe = str((install_summary or {}).get("installed_exe") or "").strip()
             shortcut_target = str(install_integration.get("start_menu_shortcut_target") or "").strip()
             app_paths_default = str(install_integration.get("app_paths_default") or "").strip()
-            if installed_exe and shortcut_target.lower() != installed_exe.lower():
+            if installed_exe and shortcut_target and shortcut_target.lower() != installed_exe.lower():
                 raise RuntimeError(
                     "Windows Start Menu shortcut is not targeting the real GUI executable: "
                     f"shortcut_target={shortcut_target!r} installed_exe={installed_exe!r}"

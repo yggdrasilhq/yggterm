@@ -972,6 +972,7 @@ def main() -> int:
     remote_log = f"{remote_dir}/client.log"
     local_summary_path = out_dir / "summary.json"
     remote_bin = ""
+    remote_control_bin = ""
     remote_app = None
     remote_version = None
     expected_workspace_version = None
@@ -1032,6 +1033,9 @@ def main() -> int:
                     "staged macOS app bundle is missing the headless companion: "
                     f"{bundle_binaries!r}"
                 )
+            remote_control_bin = bundle_binaries["headless"]
+        if not remote_control_bin:
+            remote_control_bin = remote_bin
         try:
             remote_version = remote_binary_version(args.host, remote_bin)
         except Exception:
@@ -1042,7 +1046,10 @@ def main() -> int:
                 f"workspace_version={expected_workspace_version!r} artifact_version={remote_version!r}"
             )
         try:
-            remote_clients_probe = probe_remote_clients(args.host, remote_bin)
+            remote_clients_probe = probe_remote_clients(
+                args.host,
+                remote_control_bin or remote_bin,
+            )
         except Exception:
             remote_clients_probe = None
     except Exception as exc:  # noqa: BLE001
@@ -1054,6 +1061,7 @@ def main() -> int:
             "remote_dir": remote_dir,
             "remote_home": remote_home,
             "remote_bin": remote_bin or None,
+            "remote_control_bin": remote_control_bin or None,
             "remote_app": remote_app,
             "remote_version": remote_version,
             "workspace_version": expected_workspace_version,
@@ -1104,7 +1112,7 @@ def main() -> int:
         if args.attach_only:
             clients_payload = remote_json_command(
                 args.host,
-                remote_bin,
+                remote_control_bin,
                 control_env,
                 ["server", "app", "clients", "--timeout-ms", str(args.timeout_ms)],
             )
@@ -1129,7 +1137,7 @@ def main() -> int:
                     time.sleep(0.25)
                 pid = wait_for_client_pid(
                     args.host,
-                    remote_bin,
+                    remote_control_bin,
                     launch_env,
                     args.timeout_ms,
                 )
@@ -1137,7 +1145,7 @@ def main() -> int:
                 try:
                     launch_payload = remote_json_command(
                         args.host,
-                        remote_bin,
+                        remote_control_bin,
                         launch_env,
                         [
                             "server",
@@ -1184,7 +1192,7 @@ def main() -> int:
                         time.sleep(0.25)
                     pid = wait_for_client_pid(
                         args.host,
-                        remote_bin,
+                        remote_control_bin,
                         launch_env,
                         args.timeout_ms,
                     )
@@ -1192,7 +1200,7 @@ def main() -> int:
 
         state = wait_for_ready_state(
             args.host,
-            remote_bin,
+            remote_control_bin,
             control_env,
             pid,
             args.timeout_ms,
@@ -1200,14 +1208,14 @@ def main() -> int:
         titlebar = assert_titlebar_utility_buttons_inline(state)
         created_terminal = remote_create_plain_terminal(
             args.host,
-            remote_bin,
+            remote_control_bin,
             control_env,
             pid,
             timeout_ms=args.timeout_ms,
         )
         state, terminal = wait_for_terminal_ready_state(
             args.host,
-            remote_bin,
+            remote_control_bin,
             control_env,
             pid,
             args.timeout_ms,
@@ -1216,7 +1224,7 @@ def main() -> int:
         blur = assert_blur_expectation(state, args.expect_live_blur)
         rows_payload = remote_json_command(
             args.host,
-            remote_bin,
+            remote_control_bin,
             control_env,
             ["server", "app", "rows", "--pid", str(pid), "--timeout-ms", str(args.timeout_ms)],
         )
@@ -1236,7 +1244,7 @@ def main() -> int:
         try:
             focus_response = remote_focus_window(
                 args.host,
-                remote_bin,
+                remote_control_bin,
                 control_env,
                 pid,
                 args.timeout_ms,
@@ -1247,7 +1255,7 @@ def main() -> int:
         try:
             screenshot_response = capture_remote_screenshot(
                 args.host,
-                remote_bin,
+                remote_control_bin,
                 control_env,
                 pid,
                 args.timeout_ms,
@@ -1261,7 +1269,7 @@ def main() -> int:
             try:
                 background_response = remote_background_window(
                     args.host,
-                    remote_bin,
+                    remote_control_bin,
                     control_env,
                     pid,
                     args.timeout_ms,
@@ -1271,6 +1279,7 @@ def main() -> int:
 
         proof_summary = {
             "bin": remote_bin,
+            "control_bin": remote_control_bin,
             "pid": pid,
             "window": state.get("window") or {},
             "client_instance": state.get("client_instance") or {},
@@ -1314,6 +1323,7 @@ def main() -> int:
             "remote_dir": remote_dir,
             "remote_home": remote_home,
             "remote_bin": remote_bin,
+            "remote_control_bin": remote_control_bin,
             "remote_app": remote_app,
             "remote_version": remote_version,
             "workspace_version": expected_workspace_version,
@@ -1342,6 +1352,7 @@ def main() -> int:
             "remote_dir": remote_dir,
             "remote_home": remote_home,
             "remote_bin": remote_bin or None,
+            "remote_control_bin": remote_control_bin or None,
             "remote_app": remote_app,
             "remote_version": remote_version,
             "workspace_version": expected_workspace_version,
@@ -1381,7 +1392,7 @@ def main() -> int:
             try:
                 remote_json_command(
                     args.host,
-                    remote_bin,
+                    remote_control_bin or remote_bin,
                     control_env,
                     ["server", "app", "close", "--pid", str(pid), "--timeout-ms", str(args.timeout_ms)],
                     check=False,
@@ -1402,7 +1413,7 @@ def main() -> int:
             try:
                 remote_json_command(
                     args.host,
-                    remote_bin,
+                    remote_control_bin or remote_bin,
                     control_env,
                     ["server", "shutdown"],
                     check=False,
