@@ -96,6 +96,8 @@ PY
 
 build_macos_release_bundle() {
   local gui_binary_path="$1"
+  local headless_binary_path="$2"
+  local mock_cli_binary_path="$3"
   local app_path="${DIST_DIR}/Yggterm.app"
   local contents_path="${app_path}/Contents"
   local macos_path="${contents_path}/MacOS"
@@ -109,6 +111,14 @@ build_macos_release_bundle() {
   mkdir -p "$macos_path" "$resources_path"
   cp "$gui_binary_path" "${macos_path}/Yggterm"
   chmod 0755 "${macos_path}/Yggterm" || true
+  if [[ -f "$headless_binary_path" ]]; then
+    cp "$headless_binary_path" "${macos_path}/yggterm-headless"
+    chmod 0755 "${macos_path}/yggterm-headless" || true
+  fi
+  if [[ -f "$mock_cli_binary_path" ]]; then
+    cp "$mock_cli_binary_path" "${macos_path}/yggterm-mock-cli"
+    chmod 0755 "${macos_path}/yggterm-mock-cli" || true
+  fi
 
   if [[ -f "$icon_png" ]]; then
     cp "$icon_png" "${resources_path}/yggterm.png"
@@ -246,7 +256,10 @@ tar -C "$DIST_DIR" -czf "${DIST_DIR}/yggterm-${TARGET_LABEL}.tar.gz" "${TAR_CONT
 checksum_file "${DIST_DIR}/yggterm-${TARGET_LABEL}.tar.gz" "${DIST_DIR}/yggterm-${TARGET_LABEL}.tar.gz.sha256"
 
 if [[ "$TARGET_LABEL" == macos-* ]]; then
-  build_macos_release_bundle "${DIST_DIR}/${OUT_BASENAME}"
+  build_macos_release_bundle \
+    "${DIST_DIR}/${OUT_BASENAME}" \
+    "${DIST_DIR}/${HEADLESS_OUT_BASENAME}" \
+    "${DIST_DIR}/${MOCK_CLI_OUT_BASENAME}"
 fi
 
 if [[ "$TARGET_LABEL" == windows-* ]]; then

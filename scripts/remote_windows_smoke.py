@@ -15,12 +15,16 @@ from remote_windows_live_app import (
     extract_json_text,
     ps_literal,
     run_remote_powershell,
+    run_remote_powershell_best_effort,
+    ssh_base,
     strip_windows_ssh_noise,
 )
 from smoke_app_control_bootstrap import (
+    assert_active_terminal_host_ready,
     assert_sidebar_rows_present,
     assert_blur_expectation,
     assert_screenshot_file_usable,
+    assert_titlebar_utility_buttons_inline,
     problem_notifications,
     screenshot_backend,
     screenshot_backend_attempts,
@@ -165,7 +169,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def run_remote_powershell_json(host: str, script: str) -> dict:
-    proc = run_remote_powershell(host, script)
+    proc = run_remote_powershell_best_effort(host, script)
     try:
         return json.loads(extract_json_text(proc.stdout))
     except Exception as exc:  # noqa: BLE001
@@ -175,7 +179,7 @@ def run_remote_powershell_json(host: str, script: str) -> dict:
 
 def run_remote_cmd(host: str, command: str, *, check: bool = True) -> subprocess.CompletedProcess:
     proc = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, "cmd", "/c", command],
+        [*ssh_base(), host, "cmd", "/c", command],
         text=True,
         capture_output=True,
     )
@@ -398,7 +402,7 @@ def install_staged_windows_artifact(
         "$launcherScript = "
         + "('Set shell = CreateObject(\"\"WScript.Shell\"\")' + \"`r`n\" "
         + "+ 'shell.CurrentDirectory = \"\"' + $versionDir + '\"\"' + \"`r`n\" "
-        + "+ 'shell.Run \"\"cmd.exe /c start \"\"\"\" /D \"\"' + $versionDir + '\"\" /B \"\"' + $installedExe + '\"\"\", 0, False' + \"`r`n\")",
+        + "+ 'shell.Run \"\"\"\"' + $installedExe + '\"\"\"\", 0, False' + \"`r`n\")",
         "[System.IO.File]::WriteAllText($launcher, $launcherScript, $utf8NoBom)",
         "$startMenuShortcut = Join-Path $env:APPDATA 'Microsoft\\Windows\\Start Menu\\Programs\\Yggterm.lnk'",
         "$legacyShortcut = Join-Path $env:APPDATA 'Microsoft\\Windows\\Start Menu\\Programs\\Yggterm\\Yggterm.lnk'",
@@ -441,18 +445,14 @@ def query_windows_install_integration(host: str) -> dict:
         "$appPathsKey = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\yggterm.exe'",
         "$uninstallKey = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Yggterm'",
         "$installStateJson = $null",
-        "$shortcutTargetPath = $null",
-        "$shortcutWorkingDirectory = $null",
-        "$shortcutIconLocation = $null",
         "$appPathsDefault = $null",
         "$installedExeSubsystem = $null",
         "if (Test-Path $installState) { try { $installStateJson = Get-Content $installState -Raw | ConvertFrom-Json } catch {} }",
-        "if (Test-Path $startMenuShortcut) { $ws = New-Object -ComObject WScript.Shell; $sc = $ws.CreateShortcut($startMenuShortcut); $shortcutTargetPath = $sc.TargetPath; $shortcutWorkingDirectory = $sc.WorkingDirectory; $shortcutIconLocation = $sc.IconLocation }",
         "if (Test-Path $appPathsKey) { try { $appPathsDefault = (Get-ItemProperty -Path $appPathsKey).'(default)' } catch {} }",
         "$installedExePath = $null",
         "if ($installStateJson -and $installStateJson.active_executable) { $installedExePath = [string]$installStateJson.active_executable }",
         "if ($installedExePath -and (Test-Path $installedExePath)) { $fs = [System.IO.File]::Open($installedExePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite); try { $br = New-Object System.IO.BinaryReader($fs); $fs.Seek(0x3C, [System.IO.SeekOrigin]::Begin) | Out-Null; $peOffset = $br.ReadInt32(); $fs.Seek($peOffset + 0x5C, [System.IO.SeekOrigin]::Begin) | Out-Null; $installedExeSubsystem = [int]$br.ReadUInt16() } finally { $fs.Dispose() } }",
-        "$result = @{ install_root = $installRoot; install_root_exists = (Test-Path $installRoot); install_state_path = $installState; install_state_exists = (Test-Path $installState); install_state = $installStateJson; launcher = $launcher; launcher_exists = (Test-Path $launcher); start_menu_shortcut = $startMenuShortcut; start_menu_shortcut_exists = (Test-Path $startMenuShortcut); start_menu_shortcut_target = $shortcutTargetPath; start_menu_shortcut_working_directory = $shortcutWorkingDirectory; start_menu_shortcut_icon_location = $shortcutIconLocation; legacy_start_menu_shortcut_exists = (Test-Path $legacyShortcut); app_paths_exists = (Test-Path $appPathsKey); app_paths_default = $appPathsDefault; uninstall_key_exists = (Test-Path $uninstallKey); installed_exe_subsystem = $installedExeSubsystem }",
+        "$result = @{ install_root = $installRoot; install_root_exists = (Test-Path $installRoot); install_state_path = $installState; install_state_exists = (Test-Path $installState); install_state = $installStateJson; launcher = $launcher; launcher_exists = (Test-Path $launcher); start_menu_shortcut = $startMenuShortcut; start_menu_shortcut_exists = (Test-Path $startMenuShortcut); legacy_start_menu_shortcut_exists = (Test-Path $legacyShortcut); app_paths_exists = (Test-Path $appPathsKey); app_paths_default = $appPathsDefault; uninstall_key_exists = (Test-Path $uninstallKey); installed_exe_subsystem = $installedExeSubsystem }",
         "$result | ConvertTo-Json -Depth 8 -Compress",
     ]
     script = ";\n".join(statements) + "\n"
@@ -485,6 +485,79 @@ def remote_app_json_command(
             raise RuntimeError(f"expected data payload from {args!r} on {host}: {payload!r}")
         return data
     return payload
+
+
+def remote_create_plain_terminal(
+    host: str,
+    remote_bin: str,
+    remote_home: str,
+    pid: int,
+    timeout_ms: int,
+    *,
+    title: str = "Remote Smoke Plain",
+) -> dict:
+    payload = remote_app_json_command(
+        host,
+        remote_bin,
+        remote_home,
+        [
+            "server",
+            "app",
+            "terminal",
+            "new",
+            "--pid",
+            str(pid),
+            "--title",
+            title,
+            "--timeout-ms",
+            str(timeout_ms),
+        ],
+    )
+    if payload.get("error"):
+        raise RuntimeError(f"plain terminal creation failed on {host}: {payload['error']}")
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise RuntimeError(f"plain terminal creation returned no data payload on {host}: {payload!r}")
+    session_path = str(data.get("active_session_path") or "").strip()
+    if not session_path:
+        raise RuntimeError(f"plain terminal creation did not return an active_session_path on {host}")
+    return data
+
+
+def wait_for_terminal_ready_state(
+    host: str,
+    remote_bin: str,
+    remote_home: str,
+    app_pid: int,
+    timeout_ms: int,
+    session_path: str,
+    *,
+    wait_seconds: float = 45.0,
+) -> tuple[dict, dict]:
+    deadline = time.time() + wait_seconds
+    last_state = {}
+    last_error = ""
+    while time.time() < deadline:
+        try:
+            last_state = remote_app_json_command(
+                host,
+                remote_bin,
+                remote_home,
+                ["server", "app", "state", "--pid", str(app_pid), "--timeout-ms", str(timeout_ms)],
+                expect_data=True,
+            )
+            bad_notifications = problem_notifications(last_state)
+            if bad_notifications:
+                raise RuntimeError(f"bad daemon/socket notifications observed: {bad_notifications!r}")
+            terminal = assert_active_terminal_host_ready(last_state, session_path)
+            return last_state, terminal
+        except Exception as exc:  # noqa: BLE001
+            last_error = str(exc)
+            time.sleep(0.25)
+    raise RuntimeError(
+        f"remote Windows terminal never became ready for pid {app_pid} within {wait_seconds:.1f}s: "
+        f"{last_error} state={last_state!r}"
+    )
 
 
 def windows_session_info(host: str) -> dict:
@@ -536,6 +609,21 @@ Write-Output ($events | ConvertTo-Json -Depth 6 -Compress)
         return payload
     if isinstance(payload, dict):
         return [payload]
+    return []
+
+
+def list_visible_console_windows(host: str) -> list[dict]:
+    script = r"""
+$names = @('cmd','powershell','pwsh','conhost','wt','WindowsTerminal','OpenConsole');
+$rows = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 -and $names -contains $_.ProcessName } | Select-Object Id, ProcessName, SessionId, MainWindowHandle, MainWindowTitle, Path);
+@{ rows = $rows } | ConvertTo-Json -Depth 6 -Compress
+"""
+    payload = run_remote_powershell_json(host, script)
+    rows = payload.get("rows") if isinstance(payload, dict) else payload
+    if isinstance(rows, list):
+        return rows
+    if isinstance(rows, dict):
+        return [rows]
     return []
 
 
@@ -760,9 +848,10 @@ def launch_interactive_windows_app(
             metadata_text = proc.stdout.lstrip("\ufeff").strip()
             break
         time.sleep(0.25)
-    task_query = run_remote_cmd(host, f"schtasks /Query /TN {task_name} /FO LIST /V", check=False)
+    task_query = None
     run_remote_cmd(host, f"schtasks /Delete /TN {task_name} /F", check=False)
     if not metadata_text:
+        task_query = run_remote_cmd(host, f"schtasks /Query /TN {task_name} /FO LIST /V", check=False)
         raise RuntimeError(
             "interactive Windows launch did not produce metadata: "
             f"task_query={task_query.stdout.strip() or task_query.stderr.strip()!r}"
@@ -778,7 +867,7 @@ def launch_interactive_windows_app(
         "launcher_path": remote_launcher,
         "metadata_path": remote_metadata,
         "metadata": metadata,
-        "task_query": task_query.stdout.strip() or None,
+        "task_query": task_query.stdout.strip() if task_query else None,
     }
 
 
@@ -1002,6 +1091,9 @@ def main() -> int:
     staged_companion_binaries: list[str] = []
     dismissed_error_dialogs_prelaunch = None
     dismissed_error_dialogs_prescreenshot = None
+    visible_console_windows_before_launch: list[dict] = []
+    visible_console_windows_after_terminal_create: list[dict] = []
+    new_visible_console_windows: list[dict] = []
     owned_processes_before_launch: list[dict] = []
     owned_processes_after_prelaunch_cleanup: list[dict] = []
     killed_processes_prelaunch: list[dict] = []
@@ -1022,6 +1114,10 @@ def main() -> int:
             windows_error_events_before_launch = collect_recent_windows_error_events(args.host)
         except Exception:
             windows_error_events_before_launch = []
+        try:
+            visible_console_windows_before_launch = list_visible_console_windows(args.host)
+        except Exception:
+            visible_console_windows_before_launch = []
         owned_processes_before_launch = list_windows_harness_processes(args.host)
         if owned_processes_before_launch:
             killed_processes_prelaunch = kill_windows_processes(
@@ -1178,6 +1274,39 @@ def main() -> int:
             app_pid,
             args.timeout_ms,
         )
+        titlebar = assert_titlebar_utility_buttons_inline(state)
+        created_terminal = remote_create_plain_terminal(
+            args.host,
+            remote_control_bin,
+            remote_home,
+            app_pid,
+            args.timeout_ms,
+        )
+        state, terminal = wait_for_terminal_ready_state(
+            args.host,
+            remote_control_bin,
+            remote_home,
+            app_pid,
+            args.timeout_ms,
+            str(created_terminal.get("active_session_path") or "").strip(),
+        )
+        try:
+            visible_console_windows_after_terminal_create = list_visible_console_windows(args.host)
+        except Exception:
+            visible_console_windows_after_terminal_create = []
+        baseline_console_window_ids = {
+            int(window.get("Id") or 0) for window in visible_console_windows_before_launch
+        }
+        new_visible_console_windows = [
+            window
+            for window in visible_console_windows_after_terminal_create
+            if int(window.get("Id") or 0) not in baseline_console_window_ids
+        ]
+        if new_visible_console_windows:
+            raise RuntimeError(
+                "Windows launch/workflow surfaced new visible console windows instead of staying first-class GUI-only: "
+                f"{new_visible_console_windows!r}"
+            )
         try:
             windows_error_events_after_launch = collect_recent_windows_error_events(args.host)
         except Exception:
@@ -1270,6 +1399,9 @@ def main() -> int:
             "problem_notifications": problem_notifications(state),
             "blur": blur,
             "sidebar": sidebar,
+            "titlebar_right_controls": titlebar,
+            "created_terminal": created_terminal,
+            "terminal": terminal,
             "state_path": str(state_path),
             "rows_path": str(rows_path),
             "screenshot_path": str(screenshot_path) if screenshot_path.exists() else None,
@@ -1305,6 +1437,9 @@ def main() -> int:
             "owned_processes_after_prelaunch_cleanup": owned_processes_after_prelaunch_cleanup,
             "dismissed_error_dialogs_prelaunch": dismissed_error_dialogs_prelaunch,
             "dismissed_error_dialogs_prescreenshot": dismissed_error_dialogs_prescreenshot,
+            "visible_console_windows_before_launch": visible_console_windows_before_launch,
+            "visible_console_windows_after_terminal_create": visible_console_windows_after_terminal_create,
+            "new_visible_console_windows": new_visible_console_windows,
             "windows_error_events_before_launch": windows_error_events_before_launch,
             "windows_error_events_after_launch": windows_error_events_after_launch,
             "new_windows_error_events": new_windows_error_events,
@@ -1345,6 +1480,9 @@ def main() -> int:
             "owned_processes_after_prelaunch_cleanup": owned_processes_after_prelaunch_cleanup,
             "dismissed_error_dialogs_prelaunch": dismissed_error_dialogs_prelaunch,
             "dismissed_error_dialogs_prescreenshot": dismissed_error_dialogs_prescreenshot,
+            "visible_console_windows_before_launch": visible_console_windows_before_launch,
+            "visible_console_windows_after_terminal_create": visible_console_windows_after_terminal_create,
+            "new_visible_console_windows": new_visible_console_windows,
             "windows_error_events_before_launch": windows_error_events_before_launch,
             "windows_error_events_after_launch": windows_error_events_after_launch,
             "new_windows_error_events": new_windows_error_events,
