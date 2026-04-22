@@ -145,6 +145,7 @@ print(
         {
             "uid": uid,
             "user": user,
+            "home_dir": pwd.getpwuid(uid).pw_dir,
             "runtime_dir": str(runtime_dir),
             "wayland_sockets": [
                 path.name
@@ -203,7 +204,8 @@ for pid in sorted(os.listdir("/proc")):
         continue
     env = proc_env(pid)
     home = str(env.get("YGGTERM_HOME") or "")
-    if not home.startswith("/tmp/yggterm-remote-smoke-"):
+    smoke_tag = str(env.get("YGGTERM_REMOTE_SMOKE_TAG") or "")
+    if smoke_tag != "1" and not home.startswith("/tmp/yggterm-remote-smoke-"):
         continue
     exe = str(cmdline[0] or "")
     if "yggterm" not in pathlib.Path(exe).name.lower() and not any("yggterm" in part.lower() for part in cmdline):
@@ -525,6 +527,17 @@ def remote_cleanup_owned_clients(host: str, timeout_ms: int) -> dict:
     }
 
 
+def wait_for_remote_owned_clients_gone(host: str, timeout_seconds: float = 8.0) -> dict:
+    deadline = time.time() + timeout_seconds
+    last_inventory = remote_owned_clients(host)
+    while time.time() < deadline:
+        if int(last_inventory.get("count") or 0) == 0:
+            return last_inventory
+        time.sleep(0.25)
+        last_inventory = remote_owned_clients(host)
+    return last_inventory
+
+
 def wait_for_remote_state(
     host: str,
     remote_bin: str,
@@ -591,12 +604,9 @@ def main() -> int:
     timestamp = int(time.time())
     out_dir = Path(args.out_dir or f"/tmp/yggterm-remote-smoke-{args.host}-{timestamp}")
     out_dir.mkdir(parents=True, exist_ok=True)
-    remote_dir = args.remote_dir or f"/tmp/yggterm-remote-smoke-{timestamp}"
-    ssh_shell(args.host, f"rm -rf {quote(remote_dir)} && mkdir -p {quote(remote_dir)}")
 
     metadata: dict[str, object] = {
         "host": args.host,
-        "remote_dir": remote_dir,
         "session": args.session,
         "session_kind": args.session_kind,
         "backend": args.backend,
@@ -610,6 +620,13 @@ def main() -> int:
         metadata["session_info"] = session_info
         if not session_info.get("python3"):
             raise RuntimeError(f"python3 is missing on {args.host}")
+        remote_dir = args.remote_dir or (
+            f"{str(session_info.get('home_dir') or '').rstrip('/')}/.cache/yggterm-remote-smoke-{timestamp}"
+        )
+        if not str(remote_dir).startswith("/"):
+            raise RuntimeError(f"could not resolve a writable remote home dir on {args.host}: {session_info!r}")
+        ssh_shell(args.host, f"rm -rf {quote(remote_dir)} && mkdir -p {quote(remote_dir)}")
+        metadata["remote_dir"] = remote_dir
 
         picked = session_info.get("picked_session") or {}
         leader_env = session_info.get("leader_env") or {}
@@ -645,6 +662,7 @@ def main() -> int:
             "YGGTERM_POINTER_DRIVER": "app",
             "YGGTERM_KEY_DRIVER": "app",
             "YGGTERM_APP_CONTROL_SKIP_X11_SYNTHETIC_INPUT": "1",
+            "YGGTERM_REMOTE_SMOKE_TAG": "1",
             "NO_AT_BRIDGE": "1",
         }
         effective_backend = args.backend
@@ -798,7 +816,7 @@ def main() -> int:
             f"{exports}; {quote(remote_bin)} server shutdown >/dev/null 2>&1 || true",
             check=False,
         )
-        metadata["owned_clients_after_close"] = remote_owned_clients(args.host)
+        metadata["owned_clients_after_close"] = wait_for_remote_owned_clients_gone(args.host)
         metadata["ok"] = (smoke_proc is not None and smoke_proc.returncode == 0) and not bool(
             metadata.get("final_problem_notifications")
         )

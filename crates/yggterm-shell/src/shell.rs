@@ -25,6 +25,11 @@ use crate::terminal_themes::{
 };
 use crate::window_icon;
 use anyhow::{Context, Result, anyhow};
+use arboard::{Clipboard as NativeClipboard, ImageData as NativeClipboardImageData};
+#[cfg(target_os = "linux")]
+use arboard::{GetExtLinux, LinuxClipboardKind, SetExtLinux};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use dioxus::desktop::{
     Config, LogicalSize, WindowBuilder, WindowCloseBehaviour, WindowEvent as DesktopWindowEvent,
     use_window, use_wry_event_handler, window,
@@ -36,14 +41,19 @@ use dioxus_core::{ScopeId, schedule_update, spawn_forever};
 use dioxus_desktop::UserWindowEvent as DesktopUserWindowEvent;
 use keyboard_types::{Key, Modifiers};
 use once_cell::sync::OnceCell;
+#[cfg(target_os = "macos")]
+use objc2_foundation::{NSProcessInfo, NSString};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -57,7 +67,6 @@ use tao::platform::unix::WindowExtUnix;
 use tao::window::ResizeDirection;
 #[cfg(target_os = "macos")]
 use tao::{
-    dpi::{LogicalPosition, Position},
     platform::macos::WindowBuilderExtMacOS,
 };
 use time::OffsetDateTime;
@@ -85,10 +94,11 @@ use yggterm_server::{
     RemoteMachineSnapshot, RemoteScannedSession, ServerEndpoint, ServerRuntimeStatus,
     ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionPreviewBlock,
     SessionRenderedSection, SessionSource, SshConnectTarget, TerminalBackend, WorkspaceViewMode,
-    YGG_LOADING_NOTIFICATION_AFTER_MS, YggOperationPriority, YggRequestMeta, YggSurface,
-    YggTarget, YggtermServer, app_control_requests_pending, cleanup_legacy_daemons,
+    YGG_LOADING_NOTIFICATION_AFTER_MS, YggOperationPriority, YggRequestMeta, YggSurface, YggTarget,
+    YggtermServer, app_control_requests_pending, cleanup_legacy_daemons,
     complete_app_control_request, connect_ssh_custom, fetch_remote_generation_context,
-    focus_live_with_view, managed_cli_refresh_ttl_ms, open_remote_session_with_view,
+    focus_live_with_view, local_headless_companion_executable_from_current,
+    managed_cli_refresh_ttl_ms, open_remote_session_with_view,
     open_stored_session, open_stored_session_with_view, persist_remote_generated_copy, ping,
     refresh_managed_cli, refresh_preview, refresh_remote_machine, remove_session,
     remove_ssh_target, request_terminal_launch, set_all_preview_blocks_folded,
@@ -108,11 +118,11 @@ use yggui::{
     default_theme_editor_spec, dominant_accent, emphasized_enter_transition,
     emphasized_exit_transition, gradient_css, preview_surface_css,
     resolve_drag_drop_target as resolve_tree_drag_drop_target, resolve_tree_drop_placement,
-    search_input_style, shell_tint, standard_accelerate_transition, standard_decelerate_transition,
-    standard_transition, tree_parent_path, tree_path_contains,
+    search_field_shell_style, search_input_style, shell_tint, standard_accelerate_transition,
+    standard_decelerate_transition, standard_transition, tree_parent_path, tree_path_contains,
     valid_drop_target as valid_tree_drop_target,
 };
-use yggui_contract::{UiTheme, YgguiThemeSpec};
+use yggui_contract::{UiTheme, YgguiClipboardContents, YgguiThemeSpec};
 static BOOTSTRAP: OnceCell<ShellBootstrap> = OnceCell::new();
 static PASSIVE_COPY_SUSPENDED: AtomicBool = AtomicBool::new(false);
 static PREVIEW_BLOCK_CACHE: OnceCell<Mutex<PreviewBlockCache>> = OnceCell::new();
@@ -369,6 +379,10 @@ struct ShellState {
     titlebar_new_menu_ignore_toggle_until_ms: u64,
     titlebar_session_menu_open: bool,
     titlebar_overflow_menu_open: bool,
+    titlebar_drag_request_count: u64,
+    titlebar_drag_request_at_ms: u64,
+    titlebar_maximize_toggle_request_count: u64,
+    titlebar_maximize_toggle_request_at_ms: u64,
     alt_overlay_active: bool,
     alt_overlay_sequence: String,
     selected_tree_paths: HashSet<String>,
@@ -404,6 +418,7 @@ struct ShellState {
     copy_retry_after_ms: HashMap<String, u64>,
     title_autogen_retry_after_ms: HashMap<String, u64>,
     title_autogen_retry_pending: HashSet<String>,
+    native_clipboard_owner: Option<Rc<RefCell<NativeClipboardOwner>>>,
     terminal_image_paste_in_flight: HashSet<String>,
     terminal_attach_in_flight: HashSet<String>,
     terminal_bootstrap_owner_by_session: HashMap<String, String>,
@@ -459,6 +474,17 @@ struct DockSignature {
 #[derive(Debug, Clone)]
 struct ClientInstanceRegistration {
     path: PathBuf,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum NativeClipboardOwnerKind {
+    Text,
+    Image,
+}
+struct NativeClipboardOwner {
+    clipboard: NativeClipboard,
+    kind: NativeClipboardOwnerKind,
+    updated_at_ms: u64,
 }
 #[derive(Debug, Clone, PartialEq)]
 struct PendingTreeDrag {
@@ -1159,6 +1185,10 @@ impl ShellState {
             titlebar_new_menu_ignore_toggle_until_ms: 0,
             titlebar_session_menu_open: false,
             titlebar_overflow_menu_open: false,
+            titlebar_drag_request_count: 0,
+            titlebar_drag_request_at_ms: 0,
+            titlebar_maximize_toggle_request_count: 0,
+            titlebar_maximize_toggle_request_at_ms: 0,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             selected_tree_paths: HashSet::new(),
@@ -1194,6 +1224,7 @@ impl ShellState {
             copy_retry_after_ms: HashMap::new(),
             title_autogen_retry_after_ms: HashMap::new(),
             title_autogen_retry_pending: HashSet::new(),
+            native_clipboard_owner: None,
             terminal_image_paste_in_flight: HashSet::new(),
             terminal_attach_in_flight: HashSet::new(),
             terminal_bootstrap_owner_by_session: HashMap::new(),
@@ -3558,6 +3589,18 @@ impl ShellState {
     fn update_theme_grain(&mut self, value: f32) {
         self.theme_editor_draft.grain = value.clamp(0.0, 1.0);
         self.sync_theme_editor_live_theme();
+    }
+    fn note_titlebar_drag_request(&mut self) {
+        self.titlebar_drag_request_count = self.titlebar_drag_request_count.saturating_add(1);
+        self.titlebar_drag_request_at_ms = current_millis();
+        self.last_action = "titlebar drag requested".to_string();
+    }
+    fn note_titlebar_maximize_toggle_request(&mut self) {
+        self.titlebar_maximize_toggle_request_count = self
+            .titlebar_maximize_toggle_request_count
+            .saturating_add(1);
+        self.titlebar_maximize_toggle_request_at_ms = current_millis();
+        self.last_action = "titlebar maximize toggle requested".to_string();
     }
     fn toggle_maximized(&mut self) {
         let next = !self.maximized;
@@ -6578,14 +6621,19 @@ fn reap_spawned_child_in_background(mut child: std::process::Child) {
 }
 fn spawn_daemon_process(endpoint: &ServerEndpoint) -> Result<()> {
     let current_exe = current_spawn_executable()?;
+    let daemon_exe = local_headless_companion_executable_from_current(&current_exe)
+        .unwrap_or_else(|| current_exe.clone());
     let log_file = daemon_startup_log_file(endpoint)?;
-    let mut command = Command::new(current_exe);
+    let mut command = Command::new(&daemon_exe);
     command
         .arg("server")
         .arg("daemon")
         .stdin(Stdio::null())
         .stdout(log_file.try_clone()?)
         .stderr(log_file);
+    if let Some(parent) = daemon_exe.parent() {
+        command.current_dir(parent);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -6838,6 +6886,7 @@ fn app_control_command_defers_background_refresh(command: &AppControlCommand) ->
     matches!(
         command,
         AppControlCommand::SetSearch { .. }
+            | AppControlCommand::SetClipboardContents { .. }
             | AppControlCommand::SetRightPanelMode { .. }
             | AppControlCommand::SetUiTheme { .. }
             | AppControlCommand::TriggerUpdateCheck
@@ -8317,6 +8366,28 @@ fn app_control_pointer_script(command: &AppControlPointerCommand) -> String {
               relatedTarget: relatedTarget || null,
             }};
           }};
+          const elementPath = (node) => {{
+            const path = [];
+            let current = node instanceof Element ? node : null;
+            while (current) {{
+              path.push(current);
+              current = current.parentElement;
+            }}
+            return path;
+          }};
+          const splitSharedPath = (prevNode, nextNode) => {{
+            const exited = elementPath(prevNode);
+            const entered = elementPath(nextNode);
+            while (
+              exited.length > 0
+              && entered.length > 0
+              && exited[exited.length - 1] === entered[entered.length - 1]
+            ) {{
+              exited.pop();
+              entered.pop();
+            }}
+            return {{ exited, entered }};
+          }};
           const dispatchPair = (target, mouseType, pointerType, init) => {{
             if (!target || typeof target.dispatchEvent !== 'function') {{
               return;
@@ -8339,13 +8410,18 @@ fn app_control_pointer_script(command: &AppControlPointerCommand) -> String {
             const next = resolveTarget(x, y);
             const prev = pointerState.target;
             const base = makeBase(x, y, 0, buttons, 0, null);
+            const diff = splitSharedPath(prev, next);
             if (prev && prev !== next) {{
               dispatchPair(prev, 'mouseout', 'pointerout', makeBase(x, y, 0, buttons, 0, next));
-              dispatchPair(prev, 'mouseleave', 'pointerleave', makeBase(x, y, 0, buttons, 0, next));
+              for (const node of diff.exited) {{
+                dispatchPair(node, 'mouseleave', 'pointerleave', makeBase(x, y, 0, buttons, 0, next));
+              }}
             }}
             if (next && prev !== next) {{
               dispatchPair(next, 'mouseover', 'pointerover', makeBase(x, y, 0, buttons, 0, prev));
-              dispatchPair(next, 'mouseenter', 'pointerenter', makeBase(x, y, 0, buttons, 0, prev));
+              for (const node of diff.entered.slice().reverse()) {{
+                dispatchPair(node, 'mouseenter', 'pointerenter', makeBase(x, y, 0, buttons, 0, prev));
+              }}
             }}
             dispatchPair(next, 'mousemove', 'pointermove', base);
             pointerState.target = next;
@@ -11706,53 +11782,196 @@ fn stage_local_clipboard_png(home: &PathBuf, png_bytes: &[u8]) -> Result<String>
     fs::write(&path, png_bytes)?;
     Ok(path.to_string_lossy().to_string())
 }
-fn read_native_clipboard_png() -> Result<Vec<u8>> {
-    #[cfg(target_os = "linux")]
-    {
-        if !gtk::is_initialized() {
-            gtk::init().map_err(|error| {
-                anyhow!("failed to initialize GTK for clipboard image paste: {error}")
-            })?;
-        }
-        let clipboard = gtk::Clipboard::get(&gdk::SELECTION_CLIPBOARD);
-        let pixbuf = clipboard
-            .wait_for_image()
-            .ok_or_else(|| anyhow!("clipboard does not currently contain an image"))?;
-        let png_bytes = pixbuf
-            .save_to_bufferv("png", &[])
-            .map_err(|error| anyhow!("failed to serialize clipboard image to PNG: {error}"))?;
-        if png_bytes.len() < 8 || &png_bytes[..8] != b"\x89PNG\r\n\x1a\n" {
-            return Err(anyhow!("clipboard does not currently contain a PNG image"));
-        }
-        return Ok(png_bytes);
-    }
-    #[allow(unreachable_code)]
-    Err(anyhow!(
-        "native clipboard image paste is not implemented on this platform yet"
-    ))
+fn create_native_clipboard() -> Result<NativeClipboard> {
+    NativeClipboard::new()
+        .map_err(|error| anyhow!("failed to initialize native clipboard access: {error}"))
 }
-fn read_native_clipboard_text() -> Result<String> {
-    #[cfg(target_os = "linux")]
-    {
-        if !gtk::is_initialized() {
-            gtk::init().map_err(|error| {
-                anyhow!("failed to initialize GTK for clipboard text paste: {error}")
-            })?;
+
+fn decode_png_rgba(png_bytes: &[u8]) -> Result<(Vec<u8>, usize, usize)> {
+    let decoder = png::Decoder::new(Cursor::new(png_bytes));
+    let mut reader = decoder
+        .read_info()
+        .map_err(|error| anyhow!("failed to decode clipboard PNG metadata: {error}"))?;
+    let mut buffer = vec![0; reader.output_buffer_size()];
+    let info = reader
+        .next_frame(&mut buffer)
+        .map_err(|error| anyhow!("failed to decode clipboard PNG pixels: {error}"))?;
+    let width = info.width as usize;
+    let height = info.height as usize;
+    let pixels = &buffer[..info.buffer_size()];
+    match (info.color_type, info.bit_depth) {
+        (png::ColorType::Rgba, png::BitDepth::Eight) => Ok((pixels.to_vec(), width, height)),
+        (png::ColorType::Rgb, png::BitDepth::Eight) => {
+            let mut rgba = Vec::with_capacity(width * height * 4);
+            for chunk in pixels.chunks_exact(3) {
+                rgba.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
+            }
+            Ok((rgba, width, height))
         }
-        let clipboard = gtk::Clipboard::get(&gdk::SELECTION_CLIPBOARD);
+        _ => Err(anyhow!("clipboard PNG must use 8-bit RGB or RGBA channels")),
+    }
+}
+
+fn encode_rgba_png(width: usize, height: usize, rgba_bytes: &[u8]) -> Result<Vec<u8>> {
+    if rgba_bytes.len() != width.saturating_mul(height).saturating_mul(4) {
+        return Err(anyhow!(
+            "clipboard image bytes did not match RGBA dimensions"
+        ));
+    }
+    let mut png_bytes = Vec::new();
+    let mut encoder = png::Encoder::new(&mut png_bytes, width as u32, height as u32);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder
+        .write_header()
+        .map_err(|error| anyhow!("failed to start clipboard PNG encoding: {error}"))?;
+    writer
+        .write_image_data(rgba_bytes)
+        .map_err(|error| anyhow!("failed to encode clipboard PNG bytes: {error}"))?;
+    drop(writer);
+    Ok(png_bytes)
+}
+
+fn with_native_clipboard<R>(
+    mut state: Signal<ShellState>,
+    operation: impl FnOnce(&mut NativeClipboard) -> Result<R>,
+) -> Result<R> {
+    state.with_mut(|shell| {
+        if let Some(owner) = shell.native_clipboard_owner.as_mut() {
+            let mut owner = owner.borrow_mut();
+            return operation(&mut owner.clipboard);
+        }
+        let mut clipboard = create_native_clipboard()?;
+        operation(&mut clipboard)
+    })
+}
+
+fn with_owned_native_clipboard<R>(
+    mut state: Signal<ShellState>,
+    kind: NativeClipboardOwnerKind,
+    operation: impl FnOnce(&mut NativeClipboard) -> Result<R>,
+) -> Result<R> {
+    state.with_mut(|shell| {
+        if shell.native_clipboard_owner.is_none() {
+            shell.native_clipboard_owner = Some(Rc::new(RefCell::new(NativeClipboardOwner {
+                clipboard: create_native_clipboard()?,
+                kind,
+                updated_at_ms: current_millis(),
+            })));
+        }
+        let owner = shell
+            .native_clipboard_owner
+            .as_mut()
+            .expect("native clipboard owner initialized");
+        let mut owner = owner.borrow_mut();
+        let result = operation(&mut owner.clipboard)?;
+        owner.kind = kind;
+        owner.updated_at_ms = current_millis();
+        Ok(result)
+    })
+}
+
+fn read_native_clipboard_png(state: Signal<ShellState>) -> Result<Vec<u8>> {
+    with_native_clipboard(state, |clipboard| {
+        #[cfg(target_os = "linux")]
+        let image = clipboard
+            .get()
+            .clipboard(LinuxClipboardKind::Clipboard)
+            .image()
+            .map_err(|error| anyhow!("clipboard does not currently contain an image: {error}"))?;
+        #[cfg(not(target_os = "linux"))]
+        let image = clipboard
+            .get_image()
+            .map_err(|error| anyhow!("clipboard does not currently contain an image: {error}"))?;
+        encode_rgba_png(image.width, image.height, image.bytes.as_ref())
+    })
+}
+
+fn read_native_clipboard_text(state: Signal<ShellState>) -> Result<String> {
+    with_native_clipboard(state, |clipboard| {
+        #[cfg(target_os = "linux")]
         let text = clipboard
-            .wait_for_text()
-            .map(|value| value.to_string())
-            .unwrap_or_default();
+            .get()
+            .clipboard(LinuxClipboardKind::Clipboard)
+            .text()
+            .map_err(|error| anyhow!("clipboard does not currently contain text: {error}"))?;
+        #[cfg(not(target_os = "linux"))]
+        let text = clipboard
+            .get_text()
+            .map_err(|error| anyhow!("clipboard does not currently contain text: {error}"))?;
+        let text = text.trim_end_matches('\0').to_string();
         if text.is_empty() {
             return Err(anyhow!("clipboard does not currently contain text"));
         }
-        return Ok(text);
+        Ok(text)
+    })
+}
+
+fn set_native_clipboard_contents(
+    state: Signal<ShellState>,
+    contents: &YgguiClipboardContents,
+) -> Result<&'static str> {
+    match contents {
+        YgguiClipboardContents::Text { text } => {
+            with_owned_native_clipboard(state, NativeClipboardOwnerKind::Text, |clipboard| {
+                #[cfg(target_os = "linux")]
+                {
+                    clipboard
+                        .set()
+                        .clipboard(LinuxClipboardKind::Clipboard)
+                        .exclude_from_history()
+                        .text(text.as_str())
+                        .map_err(|error| {
+                            anyhow!("failed to seed native clipboard text: {error}")
+                        })?;
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    clipboard.set_text(text.as_str()).map_err(|error| {
+                        anyhow!("failed to seed native clipboard text: {error}")
+                    })?;
+                }
+                Ok(())
+            })?;
+            Ok("text")
+        }
+        YgguiClipboardContents::PngBase64 { png_base64 } => {
+            let png_bytes = BASE64_STANDARD
+                .decode(png_base64)
+                .map_err(|error| anyhow!("invalid base64 clipboard PNG payload: {error}"))?;
+            let (rgba_bytes, width, height) = decode_png_rgba(&png_bytes)?;
+            with_owned_native_clipboard(
+                state,
+                NativeClipboardOwnerKind::Image,
+                move |clipboard| {
+                    let image = NativeClipboardImageData {
+                        width,
+                        height,
+                        bytes: Cow::Owned(rgba_bytes),
+                    };
+                    #[cfg(target_os = "linux")]
+                    {
+                        clipboard
+                            .set()
+                            .clipboard(LinuxClipboardKind::Clipboard)
+                            .exclude_from_history()
+                            .image(image)
+                            .map_err(|error| {
+                                anyhow!("failed to seed native clipboard image: {error}")
+                            })?;
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        clipboard.set_image(image).map_err(|error| {
+                            anyhow!("failed to seed native clipboard image: {error}")
+                        })?;
+                    }
+                    Ok(())
+                },
+            )?;
+            Ok("image")
+        }
     }
-    #[allow(unreachable_code)]
-    Err(anyhow!(
-        "native clipboard text paste is not implemented on this platform yet"
-    ))
 }
 fn stage_terminal_clipboard_image(
     state: Signal<ShellState>,
@@ -11799,7 +12018,7 @@ async fn stage_and_paste_terminal_clipboard_image(
             perf_home_dir(&shell.bootstrap.settings_path),
         )
     });
-    let png_bytes = read_native_clipboard_png()?;
+    let png_bytes = read_native_clipboard_png(state)?;
     let path = stage_terminal_clipboard_image(state, session_path, &png_bytes)?;
     terminal_write_with_local_runtime_retry_async(
         endpoint,
@@ -11826,7 +12045,7 @@ async fn paste_terminal_native_clipboard(
             perf_home_dir(&shell.bootstrap.settings_path),
         )
     });
-    match read_native_clipboard_png() {
+    match read_native_clipboard_png(state) {
         Ok(png_bytes) => {
             let path = stage_terminal_clipboard_image(state, session_path, &png_bytes)?;
             terminal_write_with_local_runtime_retry_async(
@@ -11839,7 +12058,7 @@ async fn paste_terminal_native_clipboard(
             Ok(NativeClipboardPaste::Image { path })
         }
         Err(_png_error) => {
-            let text = read_native_clipboard_text()?;
+            let text = read_native_clipboard_text(state)?;
             terminal_write_with_local_runtime_retry_async(
                 endpoint,
                 runtime_session_path,
@@ -14095,13 +14314,20 @@ fn queue_drop_current_drag_target(mut state: Signal<ShellState>) {
 fn browser_row_survives_pending_delete(row: &BrowserRow, pending: &PendingDeleteDialog) -> bool {
     match row.kind {
         BrowserRowKind::Separator => false,
-        BrowserRowKind::Session => !pending.session_paths.iter().any(|path| path == &row.full_path),
-        BrowserRowKind::Document => {
-            !pending.document_paths.iter().any(|path| path == &row.full_path)
-        }
+        BrowserRowKind::Session => !pending
+            .session_paths
+            .iter()
+            .any(|path| path == &row.full_path),
+        BrowserRowKind::Document => !pending
+            .document_paths
+            .iter()
+            .any(|path| path == &row.full_path),
         BrowserRowKind::Group => {
             row.group_kind != Some(WorkspaceGroupKind::Separator)
-                && !pending.group_paths.iter().any(|path| path == &row.full_path)
+                && !pending
+                    .group_paths
+                    .iter()
+                    .any(|path| path == &row.full_path)
         }
     }
 }
@@ -14121,8 +14347,7 @@ fn deletion_redirect_row(shell: &ShellState, pending: &PendingDeleteDialog) -> O
         .position(|row| row.full_path == active_path)
         .or_else(|| {
             shell.browser.selected_path().and_then(|selected_path| {
-                rows.iter()
-                    .position(|row| row.full_path == selected_path)
+                rows.iter().position(|row| row.full_path == selected_path)
             })
         });
     if let Some(active_index) = active_index {
@@ -15512,6 +15737,18 @@ fn describe_app_state_snapshot(
                 shell.titlebar_session_menu_open,
                 shell.titlebar_overflow_menu_open,
             ),
+            "titlebar_drag_request_count": shell.titlebar_drag_request_count,
+            "titlebar_drag_request_at_ms": shell.titlebar_drag_request_at_ms,
+            "titlebar_maximize_toggle_request_count": shell.titlebar_maximize_toggle_request_count,
+            "titlebar_maximize_toggle_request_at_ms": shell.titlebar_maximize_toggle_request_at_ms,
+            "clipboard_owner_kind": shell
+                .native_clipboard_owner
+                .as_ref()
+                .map(|owner| owner.borrow().kind),
+            "clipboard_owner_updated_at_ms": shell
+                .native_clipboard_owner
+                .as_ref()
+                .map(|owner| owner.borrow().updated_at_ms),
             "titlebar_new_menu_open": shell.titlebar_new_menu_open,
             "fullscreen": shell.fullscreen,
             "transparent_window": transparent_window,
@@ -18086,6 +18323,9 @@ async fn process_pending_app_control_requests(
     settings_path: &std::path::Path,
     desktop: dioxus::desktop::DesktopContext,
     mut state: Signal<ShellState>,
+    mut titlebar_autohide_hovered: Signal<bool>,
+    mut titlebar_autohide_lingering: Signal<bool>,
+    mut titlebar_autohide_linger_generation: Signal<u64>,
 ) -> Result<bool> {
     let home = perf_home_dir(settings_path);
     let Some((inflight_path, request)) = take_next_app_control_request(&home, std::process::id())?
@@ -18450,17 +18690,19 @@ async fn process_pending_app_control_requests(
             )
             .await
             {
-                Ok(output_path) => AppControlResponse {
+                Ok(capture) => AppControlResponse {
                     request_id: request.request_id.clone(),
                     handled_by_pid: std::process::id(),
                     completed_at_ms: current_millis() as u128,
-                    output_path: Some(output_path.display().to_string()),
+                    output_path: Some(capture.output_path.display().to_string()),
                     data: Some(json!({
                         "command": "capture_screenshot",
                         "target": target,
                         "window": describe_window(&desktop),
                         "active_view_mode": format!("{:?}", state.read().server.active_view_mode()),
                         "active_session_path": state.read().server.active_session_path(),
+                        "capture_backend": capture.backend,
+                        "capture_backend_attempts": capture.backend_attempts,
                         "dom": dom_snapshot,
                     })),
                     error: None,
@@ -18572,6 +18814,64 @@ async fn process_pending_app_control_requests(
                     "window": describe_window(&desktop),
                 })),
                 error: None,
+            }
+        }
+        AppControlCommand::SetWindowChromeHover { active } => {
+            if active {
+                titlebar_autohide_linger_generation.set(titlebar_autohide_linger_generation() + 1);
+                titlebar_autohide_hovered.set(true);
+                titlebar_autohide_lingering.set(false);
+            } else {
+                titlebar_autohide_hovered.set(false);
+                titlebar_autohide_lingering.set(false);
+                titlebar_autohide_linger_generation.set(titlebar_autohide_linger_generation() + 1);
+            }
+            sleep(Duration::from_millis(20)).await;
+            let dom_snapshot =
+                capture_dom_debug_snapshot_for_or_empty(active_session_path.as_deref()).await;
+            let mut state_snapshot = describe_app_state_snapshot(&state, &desktop);
+            let viewport = describe_viewport_snapshot(&state_snapshot, &dom_snapshot);
+            if let Some(map) = state_snapshot.as_object_mut() {
+                map.insert("dom".to_string(), dom_snapshot.clone());
+                map.insert("viewport".to_string(), viewport);
+            }
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(json!({
+                    "active": active,
+                    "window": describe_window(&desktop),
+                    "dom": dom_snapshot,
+                    "state": state_snapshot,
+                })),
+                error: None,
+            }
+        }
+        AppControlCommand::SetClipboardContents { contents } => {
+            match set_native_clipboard_contents(state, &contents) {
+                Ok(kind) => AppControlResponse {
+                    request_id: request.request_id.clone(),
+                    handled_by_pid: std::process::id(),
+                    completed_at_ms: current_millis() as u128,
+                    output_path: None,
+                    data: Some(json!({
+                        "accepted": true,
+                        "kind": kind,
+                    })),
+                    error: None,
+                },
+                Err(error) => AppControlResponse {
+                    request_id: request.request_id.clone(),
+                    handled_by_pid: std::process::id(),
+                    completed_at_ms: current_millis() as u128,
+                    output_path: None,
+                    data: Some(json!({
+                        "accepted": false,
+                    })),
+                    error: Some(error.to_string()),
+                },
             }
         }
         AppControlCommand::SetMaximized { enabled } => {
@@ -19584,25 +19884,25 @@ fn process_is_alive(pid: u32) -> bool {
 fn process_is_alive(pid: u32) -> bool {
     pid != 0
 }
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn process_start_ticks(pid: u32) -> Option<u64> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     parse_process_start_ticks_from_stat(&stat)
 }
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn process_start_ticks(_pid: u32) -> Option<u64> {
     None
 }
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn parse_process_start_ticks_from_stat(stat: &str) -> Option<u64> {
     let (_, rest) = stat.rsplit_once(") ")?;
     rest.split_whitespace().nth(19)?.parse::<u64>().ok()
 }
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn parse_process_start_ticks_from_stat(_stat: &str) -> Option<u64> {
     None
 }
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn process_has_gui_client_argv(pid: u32) -> bool {
     let payload = match fs::read(format!("/proc/{pid}/cmdline")) {
         Ok(payload) => payload,
@@ -19619,7 +19919,7 @@ fn process_has_gui_client_argv(pid: u32) -> bool {
         Path::new(arg0).file_name().and_then(|name| name.to_str()) == Some("yggterm")
     })
 }
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn process_has_gui_client_argv(_pid: u32) -> bool {
     true
 }
@@ -20104,6 +20404,11 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
     let trace_home = perf_home_dir(&bootstrap.settings_path);
     let linux_window_transparent = bootstrap.linux_window_transparent;
     let linux_window_profile_reason = bootstrap.linux_window_profile_reason.clone();
+    #[cfg(target_os = "macos")]
+    {
+        let process_name = NSString::from_str("Yggterm");
+        NSProcessInfo::processInfo().setProcessName(&process_name);
+    }
     append_trace_event(
         &trace_home,
         "ui",
@@ -20181,6 +20486,9 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
         .with_window_icon(Some(window_icon::load_yggterm_window_icon()))
         .with_transparent(false)
         .with_decorations(true)
+        .with_title_hidden(true)
+        .with_titlebar_transparent(true)
+        .with_fullsize_content_view(true)
         .with_resizable(true)
         .with_inner_size(LogicalSize::new(1460.0, 920.0))
         .with_min_inner_size(LogicalSize::new(1024.0, 720.0));
@@ -20616,6 +20924,9 @@ fn app() -> Element {
                                 &settings_path,
                                 desktop.clone(),
                                 state,
+                                titlebar_autohide_hovered,
+                                titlebar_autohide_lingering,
+                                titlebar_autohide_linger_generation,
                             )
                             .await
                             {
@@ -20690,6 +21001,9 @@ fn app() -> Element {
                         &settings_path,
                         desktop.clone(),
                         state,
+                        titlebar_autohide_hovered,
+                        titlebar_autohide_lingering,
+                        titlebar_autohide_linger_generation,
                     )
                     .await
                     {
@@ -20747,6 +21061,9 @@ fn app() -> Element {
                             &settings_path,
                             desktop.clone(),
                             state,
+                            titlebar_autohide_hovered,
+                            titlebar_autohide_lingering,
+                            titlebar_autohide_linger_generation,
                         )
                         .await
                         {
@@ -21989,7 +22306,13 @@ fn app() -> Element {
                             sync_active_terminal_input_policy(state);
                             },
                             on_restart_update: move || restart_into_pending_update(state),
-                            on_toggle_maximized: move || state.with_mut(|shell| shell.toggle_maximized()),
+                            on_request_window_drag: move || {
+                            state.with_mut(|shell| shell.note_titlebar_drag_request());
+                            },
+                            on_toggle_maximized: move || state.with_mut(|shell| {
+                            shell.note_titlebar_maximize_toggle_request();
+                            shell.toggle_maximized();
+                            }),
                             on_toggle_fullscreen: move || state.with_mut(|shell| shell.toggle_fullscreen()),
                                 on_toggle_always_on_top: move || state.with_mut(|shell| shell.toggle_always_on_top()),
                                 on_close_app: move || spawn_graceful_shutdown_and_close(state),
@@ -22453,6 +22776,7 @@ fn Titlebar(
     on_toggle_connect: EventHandler<()>,
     on_toggle_notifications: EventHandler<()>,
     on_restart_update: EventHandler<()>,
+    on_request_window_drag: EventHandler<()>,
     on_toggle_maximized: EventHandler<()>,
     on_toggle_fullscreen: EventHandler<()>,
     on_toggle_always_on_top: EventHandler<()>,
@@ -22523,6 +22847,10 @@ fn Titlebar(
         "{}, 0 0 0 1px {}",
         floating_panel_shadow, floating_panel_border
     );
+    let floating_panel_tab_box_shadow = format!(
+        "0 -1px 0 {}, 1px 0 0 {}, -1px 0 0 {}",
+        floating_panel_border, floating_panel_border, floating_panel_border
+    );
     let floating_panel_attached_box_shadow = format!(
         "{}, 1px 0 0 {}, -1px 0 0 {}, 0 1px 0 {}",
         floating_panel_shadow, floating_panel_border, floating_panel_border, floating_panel_border
@@ -22539,10 +22867,12 @@ fn Titlebar(
     let search_center_style =
         "position:relative; display:flex; align-items:center; width:100%; height:100%; min-width:0; overflow:visible;"
             .to_string();
+    let titlebar_search_field_shell_style =
+        search_field_shell_style(palette_is_dark(snapshot.palette));
     let search_shell_style = if search_dropdown_open {
         format!(
             "position:absolute; left:0; right:0; top:3px; z-index:221; display:flex; flex-direction:column; gap:6px; \
-             width:min(620px, 100%); min-width:280px; padding:0; border-radius:16px; \
+             width:min(620px, 100%); min-width:280px; padding:8px; border-radius:14px; \
              background:{}; box-shadow:{}; overflow:hidden; transition:background 120ms ease, box-shadow 120ms ease;",
             search_panel_background, search_panel_shadow
         )
@@ -22553,18 +22883,16 @@ fn Titlebar(
             .to_string()
     };
     let search_modal_style = if search_dropdown_open {
-        "display:flex; flex-direction:column; gap:8px; width:100%; min-width:0; padding:8px 10px 10px; box-sizing:border-box; overflow:hidden;"
+        "display:flex; flex-direction:column; gap:8px; width:100%; min-width:0; padding:0; box-sizing:border-box; overflow:hidden;"
             .to_string()
     } else {
         "display:flex; align-items:center; width:100%; min-width:0; height:100%; padding:0; gap:0; box-sizing:border-box; overflow:visible;"
             .to_string()
     };
     let search_field_shell_style = if search_dropdown_open {
-        "position:relative; display:flex; align-items:center; gap:8px; width:100%; min-width:0; height:26px; padding:0;"
-            .to_string()
+        format!("{} z-index:1;", titlebar_search_field_shell_style).to_string()
     } else {
-        "position:relative; display:flex; align-items:center; gap:8px; width:100%; min-width:0; height:26px;"
-            .to_string()
+        titlebar_search_field_shell_style
     };
     let search_dropdown_panel_style = if search_dropdown_open {
         format!(
@@ -22581,7 +22909,7 @@ fn Titlebar(
     };
     let search_field_style = if search_dropdown_open {
         format!(
-            "{} background:transparent; box-shadow:none; border-radius:0; padding:0 4px;",
+            "{}",
             search_input_style(snapshot.palette.text, palette_is_dark(snapshot.palette)),
         )
     } else {
@@ -22592,6 +22920,7 @@ fn Titlebar(
         TitlebarChrome {
             background: snapshot.palette.titlebar.to_string(),
             zoom_percent: zoom_percent_f32(snapshot.settings.ui_font_size, 14.0),
+            on_request_window_drag: on_request_window_drag,
             on_toggle_maximized: on_toggle_maximized,
             left: rsx! {
                 div {
@@ -22711,10 +23040,11 @@ fn Titlebar(
                                         "data-titlebar-new-button": "1",
                                         style: format!(
                                         "display:inline-flex; align-items:center; gap:6px; height:{}px; padding:0 12px 1px 12px; border:none; border-radius:11px 11px 0 0; \
-                                             background:{}; color:{}; font-size:11px; font-weight:800; cursor:pointer; box-shadow:none; white-space:nowrap; pointer-events:auto;",
+                                             background:{}; color:{}; font-size:11px; font-weight:800; cursor:pointer; box-shadow:{}; white-space:nowrap; pointer-events:auto;",
                                             titlebar_modal_tab_height,
                                             floating_panel_background,
                                             snapshot.palette.accent,
+                                            floating_panel_tab_box_shadow,
                                         ),
                                         onmousedown: |evt| evt.stop_propagation(),
                                         onclick: move |_| on_toggle_new_menu.call(()),

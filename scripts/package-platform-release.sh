@@ -25,12 +25,27 @@ BUILD_CMD=("${CARGO_CMD[@]}" build --release -p yggterm --bin yggterm --bin yggt
 BIN_PATH="${ROOT_DIR}/target/release/${BIN_NAME}"
 HEADLESS_BIN_PATH="${ROOT_DIR}/target/release/${HEADLESS_BIN_NAME}"
 MOCK_CLI_BIN_PATH="${ROOT_DIR}/target/release/${MOCK_CLI_BIN_NAME}"
+WEBVIEW2_LOADER_PATH=""
 if [[ -n "$TARGET_TRIPLE" ]]; then
   BUILD_CMD+=(--target "$TARGET_TRIPLE")
   BIN_PATH="${ROOT_DIR}/target/${TARGET_TRIPLE}/release/${BIN_NAME}"
   HEADLESS_BIN_PATH="${ROOT_DIR}/target/${TARGET_TRIPLE}/release/${HEADLESS_BIN_NAME}"
   MOCK_CLI_BIN_PATH="${ROOT_DIR}/target/${TARGET_TRIPLE}/release/${MOCK_CLI_BIN_NAME}"
 fi
+
+find_webview2_loader() {
+  local candidate=""
+  if [[ -n "$TARGET_TRIPLE" ]]; then
+    candidate="$(compgen -G "${ROOT_DIR}/target/${TARGET_TRIPLE}/release/build/webview2-com-sys*/out/x64/WebView2Loader.dll" | head -n 1 || true)"
+    if [[ -z "$candidate" ]]; then
+      candidate="$(compgen -G "${ROOT_DIR}/target/${TARGET_TRIPLE}/debug/build/webview2-com-sys*/out/x64/WebView2Loader.dll" | head -n 1 || true)"
+    fi
+  fi
+  if [[ -z "$candidate" ]]; then
+    candidate="$(compgen -G "${HOME}/.cargo/registry/src/*/webview2-com-sys-*/x64/WebView2Loader.dll" | head -n 1 || true)"
+  fi
+  printf '%s' "$candidate"
+}
 
 pushd "$ROOT_DIR" >/dev/null
 "${BUILD_CMD[@]}"
@@ -59,6 +74,17 @@ case "$MOCK_CLI_BIN_NAME" in
 esac
 cp "$MOCK_CLI_BIN_PATH" "${DIST_DIR}/${MOCK_CLI_OUT_BASENAME}"
 
+WEBVIEW2_OUT_BASENAME=""
+if [[ "$TARGET_LABEL" == windows-* ]]; then
+  WEBVIEW2_LOADER_PATH="$(find_webview2_loader)"
+  if [[ -z "$WEBVIEW2_LOADER_PATH" || ! -f "$WEBVIEW2_LOADER_PATH" ]]; then
+    echo "failed to locate WebView2Loader.dll for ${TARGET_LABEL}" >&2
+    exit 1
+  fi
+  WEBVIEW2_OUT_BASENAME="WebView2Loader-${TARGET_LABEL}.dll"
+  cp "$WEBVIEW2_LOADER_PATH" "${DIST_DIR}/${WEBVIEW2_OUT_BASENAME}"
+fi
+
 checksum_file() {
   local file="$1"
   local out="$2"
@@ -72,18 +98,33 @@ checksum_file() {
 checksum_file "${DIST_DIR}/${OUT_BASENAME}" "${DIST_DIR}/${OUT_BASENAME}.sha256"
 checksum_file "${DIST_DIR}/${HEADLESS_OUT_BASENAME}" "${DIST_DIR}/${HEADLESS_OUT_BASENAME}.sha256"
 checksum_file "${DIST_DIR}/${MOCK_CLI_OUT_BASENAME}" "${DIST_DIR}/${MOCK_CLI_OUT_BASENAME}.sha256"
+if [[ -n "$WEBVIEW2_OUT_BASENAME" ]]; then
+  checksum_file "${DIST_DIR}/${WEBVIEW2_OUT_BASENAME}" "${DIST_DIR}/${WEBVIEW2_OUT_BASENAME}.sha256"
+fi
 
-tar -C "$DIST_DIR" -czf "${DIST_DIR}/yggterm-${TARGET_LABEL}.tar.gz" \
-  "${OUT_BASENAME}" \
-  "${OUT_BASENAME}.sha256" \
-  "${HEADLESS_OUT_BASENAME}" \
-  "${HEADLESS_OUT_BASENAME}.sha256" \
-  "${MOCK_CLI_OUT_BASENAME}" \
+TAR_CONTENTS=(
+  "${OUT_BASENAME}"
+  "${OUT_BASENAME}.sha256"
+  "${HEADLESS_OUT_BASENAME}"
+  "${HEADLESS_OUT_BASENAME}.sha256"
+  "${MOCK_CLI_OUT_BASENAME}"
   "${MOCK_CLI_OUT_BASENAME}.sha256"
+)
+if [[ -n "$WEBVIEW2_OUT_BASENAME" ]]; then
+  TAR_CONTENTS+=(
+    "${WEBVIEW2_OUT_BASENAME}"
+    "${WEBVIEW2_OUT_BASENAME}.sha256"
+  )
+fi
+
+tar -C "$DIST_DIR" -czf "${DIST_DIR}/yggterm-${TARGET_LABEL}.tar.gz" "${TAR_CONTENTS[@]}"
 
 checksum_file "${DIST_DIR}/yggterm-${TARGET_LABEL}.tar.gz" "${DIST_DIR}/yggterm-${TARGET_LABEL}.tar.gz.sha256"
 
 echo "Release binary: ${DIST_DIR}/${OUT_BASENAME}"
 echo "Release headless binary: ${DIST_DIR}/${HEADLESS_OUT_BASENAME}"
 echo "Release mock cli: ${DIST_DIR}/${MOCK_CLI_OUT_BASENAME}"
+if [[ -n "$WEBVIEW2_OUT_BASENAME" ]]; then
+  echo "Release WebView2 loader: ${DIST_DIR}/${WEBVIEW2_OUT_BASENAME}"
+fi
 echo "Release archive: ${DIST_DIR}/yggterm-${TARGET_LABEL}.tar.gz"

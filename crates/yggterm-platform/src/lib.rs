@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -171,6 +171,118 @@ pub fn capture_macos_window_recording(
         .context("running macOS screencapture for window recording")?;
     if !status.success() {
         bail!("screencapture video capture exited with status {status}");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub fn capture_windows_window_screenshot(
+    output_path: &Path,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+) -> Result<()> {
+    if width == 0 || height == 0 {
+        bail!("cannot capture a Windows window screenshot with an empty rect");
+    }
+    let output_literal = output_path.display().to_string().replace('\'', "''");
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; \
+         Add-Type -AssemblyName System.Drawing; \
+         $bitmap = New-Object System.Drawing.Bitmap({width}, {height}); \
+         $graphics = [System.Drawing.Graphics]::FromImage($bitmap); \
+         try {{ \
+           $graphics.CopyFromScreen({x}, {y}, 0, 0, (New-Object System.Drawing.Size({width}, {height}))); \
+         }} finally {{ \
+           $graphics.Dispose(); \
+         }}; \
+         try {{ \
+           $bitmap.Save('{output_literal}', [System.Drawing.Imaging.ImageFormat]::Png); \
+         }} finally {{ \
+           $bitmap.Dispose(); \
+         }}"
+    );
+    let status = Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &script,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("running Windows PowerShell screenshot capture")?;
+    if !status.success() {
+        bail!("powershell screenshot capture exited with status {status}");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub fn capture_windows_hwnd_screenshot(
+    output_path: &Path,
+    hwnd: isize,
+    width: u32,
+    height: u32,
+) -> Result<()> {
+    if hwnd == 0 {
+        bail!("cannot capture a Windows HWND screenshot without a native window handle");
+    }
+    if width == 0 || height == 0 {
+        bail!("cannot capture a Windows HWND screenshot with an empty rect");
+    }
+    let output_literal = output_path.display().to_string().replace('\'', "''");
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; \
+         Add-Type -AssemblyName System.Drawing; \
+         Add-Type @\"\n\
+using System;\n\
+using System.Runtime.InteropServices;\n\
+public static class YggtermPrintWindowCapture {{\n\
+  [DllImport(\"user32.dll\")]\n\
+  public static extern bool PrintWindow(IntPtr hwnd, IntPtr hdcBlt, int nFlags);\n\
+}}\n\
+\"@; \
+         $bitmap = New-Object System.Drawing.Bitmap({width}, {height}, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb); \
+         $graphics = [System.Drawing.Graphics]::FromImage($bitmap); \
+         $hdc = $graphics.GetHdc(); \
+         try {{ \
+           if (-not [YggtermPrintWindowCapture]::PrintWindow([IntPtr]::new({hwnd}), $hdc, 2)) {{ \
+             throw 'PrintWindow returned false'; \
+           }} \
+         }} finally {{ \
+           $graphics.ReleaseHdc($hdc); \
+         }}; \
+         try {{ \
+           $bitmap.Save('{output_literal}', [System.Drawing.Imaging.ImageFormat]::Png); \
+         }} finally {{ \
+           $graphics.Dispose(); \
+           $bitmap.Dispose(); \
+         }}"
+    );
+    let status = Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &script,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("running Windows PrintWindow screenshot capture")?;
+    if !status.success() {
+        bail!("powershell PrintWindow screenshot capture exited with status {status}");
     }
     Ok(())
 }
