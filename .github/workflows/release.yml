@@ -98,6 +98,12 @@ jobs:
         shell: bash
         run: ./scripts/package-platform-release.sh "${{ matrix.label }}" "${{ matrix.target }}"
 
+      - name: Validate packaged Windows GUI subsystem
+        if: startsWith(matrix.label, 'windows-')
+        shell: powershell
+        run: |
+          ./scripts/verify_windows_gui_subsystem.ps1 -Path "./dist/yggterm-${{ matrix.label }}.exe"
+
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:

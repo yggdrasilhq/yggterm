@@ -18,18 +18,22 @@ use tao::platform::unix::WindowExtUnix;
 use tao::platform::windows::WindowExtWindows;
 #[cfg(target_os = "linux")]
 use webkit2gtk::{SnapshotOptions, SnapshotRegion, WebViewExt};
-#[cfg(target_os = "linux")]
-use wry::WebViewExtUnix;
-#[cfg(target_os = "windows")]
-use webview2_com::{Microsoft::Web::WebView2::Win32::COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG, wait_with_pump};
 #[cfg(target_os = "windows")]
 use webview2_com::CapturePreviewCompletedHandler;
 #[cfg(target_os = "windows")]
+use webview2_com::{
+    Microsoft::Web::WebView2::Win32::COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG, wait_with_pump,
+};
+#[cfg(target_os = "windows")]
 use windows::Win32::Foundation::HGLOBAL;
 #[cfg(target_os = "windows")]
-use windows::core::Result as WindowsResult;
+use windows::Win32::System::Com::{
+    STATFLAG_NONAME, STREAM_SEEK_SET, StructuredStorage::CreateStreamOnHGlobal,
+};
 #[cfg(target_os = "windows")]
-use windows::Win32::System::Com::{STATFLAG_NONAME, STREAM_SEEK_SET, StructuredStorage::CreateStreamOnHGlobal};
+use windows::core::Result as WindowsResult;
+#[cfg(target_os = "linux")]
+use wry::WebViewExtUnix;
 #[cfg(target_os = "windows")]
 use wry::WebViewExtWindows;
 #[cfg(target_os = "linux")]
@@ -40,8 +44,9 @@ use yggterm_platform::capture_windows_hwnd_screenshot;
 use yggterm_platform::capture_windows_window_screenshot;
 #[cfg(target_os = "macos")]
 use yggterm_platform::{
-    capture_macos_window_cg_screenshot, capture_macos_window_recording,
-    capture_macos_window_screencapture,
+    capture_macos_screen_rect_screencapture, capture_macos_window_cg_screenshot,
+    capture_macos_window_recording, capture_macos_window_screencapture,
+    capture_macos_window_view_cache_screenshot,
 };
 
 #[derive(Debug, Clone)]
@@ -77,10 +82,14 @@ pub async fn capture_visible_app_surface(
         fs::create_dir_all(parent)
             .with_context(|| format!("creating screenshot dir {}", parent.display()))?;
     }
-    let capture = platform_capture_visible_app_surface(desktop, output_path, target, dom_snapshot)
-        .await?;
-    let metadata = fs::metadata(&capture.output_path)
-        .with_context(|| format!("reading screenshot metadata {}", capture.output_path.display()))?;
+    let capture =
+        platform_capture_visible_app_surface(desktop, output_path, target, dom_snapshot).await?;
+    let metadata = fs::metadata(&capture.output_path).with_context(|| {
+        format!(
+            "reading screenshot metadata {}",
+            capture.output_path.display()
+        )
+    })?;
     if !metadata.is_file() || metadata.len() == 0 {
         anyhow::bail!("native screenshot capture produced no file output");
     }
@@ -205,10 +214,12 @@ fn capture_windows_webview_surface(desktop: &DesktopContext, output_path: &Path)
             .CapturePreview(
                 COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG,
                 &stream,
-                &CapturePreviewCompletedHandler::create(Box::new(move |error_code: WindowsResult<()>| {
-                    let _ = tx.send(error_code.map(|_| ()));
-                    Ok(())
-                })),
+                &CapturePreviewCompletedHandler::create(Box::new(
+                    move |error_code: WindowsResult<()>| {
+                        let _ = tx.send(error_code.map(|_| ()));
+                        Ok(())
+                    },
+                )),
             )
             .context("requesting WebView2 preview capture")?;
     }
@@ -251,8 +262,12 @@ fn capture_windows_webview_surface(desktop: &DesktopContext, output_path: &Path)
     if bytes.is_empty() {
         anyhow::bail!("WebView2 preview capture returned no image bytes");
     }
-    fs::write(output_path, &bytes)
-        .with_context(|| format!("writing Windows WebView2 screenshot {}", output_path.display()))?;
+    fs::write(output_path, &bytes).with_context(|| {
+        format!(
+            "writing Windows WebView2 screenshot {}",
+            output_path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -373,7 +388,10 @@ async fn platform_capture_visible_app_surface(
                 dom_snapshot.context("preview viewport capture requires a DOM snapshot")?,
             )?;
             crop_visible_surface_to_rect(&surface, rect, output_path)?;
-            Ok(SurfaceCapture::new(output_path, "linux_preview_viewport_crop"))
+            Ok(SurfaceCapture::new(
+                output_path,
+                "linux_preview_viewport_crop",
+            ))
         }
     }
 }
@@ -400,19 +418,15 @@ async fn platform_capture_visible_app_surface(
                 ));
             }
             Err(error) => {
-                backend_attempts.push(format!(
-                    "windows_webview2_capture_preview: {error:#}"
-                ));
+                backend_attempts.push(format!("windows_webview2_capture_preview: {error:#}"));
             }
         }
         let hwnd = desktop.window.hwnd();
         let size = desktop.outer_size();
         match capture_windows_hwnd_screenshot(output_path, hwnd, size.width, size.height) {
             Ok(()) => {
-                return Ok(
-                    SurfaceCapture::new(output_path, "windows_printwindow")
-                        .with_attempts(backend_attempts),
-                );
+                return Ok(SurfaceCapture::new(output_path, "windows_printwindow")
+                    .with_attempts(backend_attempts));
             }
             Err(error) => {
                 backend_attempts.push(format!("windows_printwindow: {error:#}"));
@@ -429,8 +443,7 @@ async fn platform_capture_visible_app_surface(
             size.height,
         )?;
         return Ok(
-            SurfaceCapture::new(output_path, "windows_screen_copy")
-                .with_attempts(backend_attempts),
+            SurfaceCapture::new(output_path, "windows_screen_copy").with_attempts(backend_attempts)
         );
     }
 
@@ -450,10 +463,50 @@ async fn platform_capture_visible_app_surface(
                 backend_attempts.push(format!("macos_cg_window_capture: {error:#}"));
             }
         }
-        capture_macos_window_screencapture(ns_window_ptr, output_path)?;
-        let mut capture = SurfaceCapture::new(output_path, "macos_screencapture_window");
-        capture.backend_attempts = backend_attempts;
-        return Ok(capture);
+        match capture_macos_window_view_cache_screenshot(ns_window_ptr, output_path) {
+            Ok(()) => {
+                let mut capture = SurfaceCapture::new(output_path, "macos_nsview_cache");
+                capture.backend_attempts = backend_attempts;
+                return Ok(capture);
+            }
+            Err(error) => {
+                backend_attempts.push(format!("macos_nsview_cache: {error:#}"));
+            }
+        }
+        match capture_macos_window_screencapture(ns_window_ptr, output_path) {
+            Ok(()) => {
+                let mut capture = SurfaceCapture::new(output_path, "macos_screencapture_window");
+                capture.backend_attempts = backend_attempts;
+                return Ok(capture);
+            }
+            Err(error) => {
+                backend_attempts.push(format!("macos_screencapture_window: {error:#}"));
+            }
+        }
+        let position = desktop
+            .outer_position()
+            .context("reading macOS window position for screenshot")?;
+        let size = desktop.outer_size();
+        match capture_macos_screen_rect_screencapture(
+            position.x,
+            position.y,
+            size.width,
+            size.height,
+            output_path,
+        ) {
+            Ok(()) => {
+                let mut capture = SurfaceCapture::new(output_path, "macos_screencapture_rect");
+                capture.backend_attempts = backend_attempts;
+                return Ok(capture);
+            }
+            Err(error) => {
+                backend_attempts.push(format!("macos_screencapture_rect: {error:#}"));
+            }
+        }
+        anyhow::bail!(
+            "macOS screenshot capture failed: {}",
+            backend_attempts.join(" | ")
+        );
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]

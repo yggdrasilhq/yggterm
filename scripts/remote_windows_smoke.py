@@ -30,6 +30,30 @@ from smoke_app_control_bootstrap import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def workspace_version() -> str | None:
+    cargo_toml = ROOT / "Cargo.toml"
+    try:
+        text = cargo_toml.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = re.search(
+        r'^\[workspace\.package\][\s\S]*?^version\s*=\s*"([^"]+)"',
+        text,
+        re.MULTILINE,
+    )
+    if not match:
+        return None
+    return str(match.group(1)).strip() or None
+
+
+def artifact_under_dist(path: Path) -> bool:
+    try:
+        path.resolve().relative_to((ROOT / "dist").resolve())
+        return True
+    except ValueError:
+        return False
+
+
 def default_artifact() -> Path:
     candidates = [
         ROOT / "dist" / "yggterm-windows-x86_64.zip",
@@ -385,8 +409,8 @@ def install_staged_windows_artifact(
         "if (Test-Path -LiteralPath $legacyShortcutDir) { Remove-Item -LiteralPath $legacyShortcutDir -Recurse -Force -ErrorAction SilentlyContinue }",
         "$ws = New-Object -ComObject WScript.Shell",
         "$sc = $ws.CreateShortcut($startMenuShortcut)",
-        "$sc.TargetPath = $launcher",
-        "$sc.WorkingDirectory = $installRoot",
+        "$sc.TargetPath = $installedExe",
+        "$sc.WorkingDirectory = $versionDir",
         "$sc.IconLocation = \"$installedExe,0\"",
         "$sc.Description = 'Remote-first terminal workspace'",
         "$sc.Save()",
@@ -417,8 +441,18 @@ def query_windows_install_integration(host: str) -> dict:
         "$appPathsKey = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\yggterm.exe'",
         "$uninstallKey = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Yggterm'",
         "$installStateJson = $null",
+        "$shortcutTargetPath = $null",
+        "$shortcutWorkingDirectory = $null",
+        "$shortcutIconLocation = $null",
+        "$appPathsDefault = $null",
+        "$installedExeSubsystem = $null",
         "if (Test-Path $installState) { try { $installStateJson = Get-Content $installState -Raw | ConvertFrom-Json } catch {} }",
-        "$result = @{ install_root = $installRoot; install_root_exists = (Test-Path $installRoot); install_state_path = $installState; install_state_exists = (Test-Path $installState); install_state = $installStateJson; launcher = $launcher; launcher_exists = (Test-Path $launcher); start_menu_shortcut = $startMenuShortcut; start_menu_shortcut_exists = (Test-Path $startMenuShortcut); legacy_start_menu_shortcut_exists = (Test-Path $legacyShortcut); app_paths_exists = (Test-Path $appPathsKey); uninstall_key_exists = (Test-Path $uninstallKey) }",
+        "if (Test-Path $startMenuShortcut) { $ws = New-Object -ComObject WScript.Shell; $sc = $ws.CreateShortcut($startMenuShortcut); $shortcutTargetPath = $sc.TargetPath; $shortcutWorkingDirectory = $sc.WorkingDirectory; $shortcutIconLocation = $sc.IconLocation }",
+        "if (Test-Path $appPathsKey) { try { $appPathsDefault = (Get-ItemProperty -Path $appPathsKey).'(default)' } catch {} }",
+        "$installedExePath = $null",
+        "if ($installStateJson -and $installStateJson.active_executable) { $installedExePath = [string]$installStateJson.active_executable }",
+        "if ($installedExePath -and (Test-Path $installedExePath)) { $fs = [System.IO.File]::Open($installedExePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite); try { $br = New-Object System.IO.BinaryReader($fs); $fs.Seek(0x3C, [System.IO.SeekOrigin]::Begin) | Out-Null; $peOffset = $br.ReadInt32(); $fs.Seek($peOffset + 0x5C, [System.IO.SeekOrigin]::Begin) | Out-Null; $installedExeSubsystem = [int]$br.ReadUInt16() } finally { $fs.Dispose() } }",
+        "$result = @{ install_root = $installRoot; install_root_exists = (Test-Path $installRoot); install_state_path = $installState; install_state_exists = (Test-Path $installState); install_state = $installStateJson; launcher = $launcher; launcher_exists = (Test-Path $launcher); start_menu_shortcut = $startMenuShortcut; start_menu_shortcut_exists = (Test-Path $startMenuShortcut); start_menu_shortcut_target = $shortcutTargetPath; start_menu_shortcut_working_directory = $shortcutWorkingDirectory; start_menu_shortcut_icon_location = $shortcutIconLocation; legacy_start_menu_shortcut_exists = (Test-Path $legacyShortcut); app_paths_exists = (Test-Path $appPathsKey); app_paths_default = $appPathsDefault; uninstall_key_exists = (Test-Path $uninstallKey); installed_exe_subsystem = $installedExeSubsystem }",
         "$result | ConvertTo-Json -Depth 8 -Compress",
     ]
     script = ";\n".join(statements) + "\n"
@@ -574,6 +608,15 @@ def list_windows_harness_processes(host: str, remote_root: str | None = None) ->
             continue
         owned.append(process)
     return owned
+
+
+def list_windows_installed_processes(host: str) -> list[dict]:
+    installed = []
+    for process in list_windows_yggterm_processes(host):
+        executable_path = str(process.get("executable_path") or "").strip().lower().replace("/", "\\")
+        if "\\appdata\\local\\yggterm\\versions\\" in executable_path:
+            installed.append(process)
+    return installed
 
 
 def kill_windows_processes(host: str, processes: list[dict]) -> list[dict]:
@@ -952,6 +995,7 @@ def main() -> int:
     launch_payload = None
     direct_spawn_pid = 0
     local_artifact_sha256 = None
+    expected_workspace_version = None
     artifact_hint = ""
     remote_version = None
     staged_support_files: list[str] = []
@@ -961,6 +1005,8 @@ def main() -> int:
     owned_processes_before_launch: list[dict] = []
     owned_processes_after_prelaunch_cleanup: list[dict] = []
     killed_processes_prelaunch: list[dict] = []
+    installed_processes_before_install: list[dict] = []
+    killed_installed_processes_preinstall: list[dict] = []
     owned_processes_before_close: list[dict] = []
     owned_processes_after_close: list[dict] = []
     killed_processes_postclose: list[dict] = []
@@ -999,6 +1045,8 @@ def main() -> int:
             if artifact.exists():
                 artifact_hint = artifact.name
                 local_artifact_sha256 = sha256_file(artifact)
+                if artifact_under_dist(artifact):
+                    expected_workspace_version = workspace_version()
                 stage_artifact(args.host, artifact, remote_root)
                 staged_support_files = stage_support_files(
                     args.host,
@@ -1013,6 +1061,13 @@ def main() -> int:
 
         remote_bin = resolve_remote_bin(args.host, remote_dir_name, args.remote_bin)
         if args.install:
+            installed_processes_before_install = list_windows_installed_processes(args.host)
+            if installed_processes_before_install:
+                killed_installed_processes_preinstall = kill_windows_processes(
+                    args.host,
+                    installed_processes_before_install,
+                )
+                time.sleep(0.75)
             install_summary = install_staged_windows_artifact(
                 args.host,
                 remote_root,
@@ -1039,16 +1094,38 @@ def main() -> int:
             remote_version = None
         if install_summary is not None and not remote_version:
             remote_version = str(install_summary.get("version") or "").strip() or None
+        if expected_workspace_version and remote_version and remote_version != expected_workspace_version:
+            raise RuntimeError(
+                "remote Windows smoke staged a stale artifact from dist/: "
+                f"workspace_version={expected_workspace_version!r} artifact_version={remote_version!r}"
+            )
         if args.install:
             install_integration = query_windows_install_integration(args.host)
             if not (
                 bool(install_integration.get("install_state_exists"))
-                and bool(install_integration.get("launcher_exists"))
                 and bool(install_integration.get("start_menu_shortcut_exists"))
                 and bool(install_integration.get("app_paths_exists"))
             ):
                 raise RuntimeError(
                     "Windows staged install did not produce the expected shell integration: "
+                    f"{install_integration!r}"
+                )
+            installed_exe = str((install_summary or {}).get("installed_exe") or "").strip()
+            shortcut_target = str(install_integration.get("start_menu_shortcut_target") or "").strip()
+            app_paths_default = str(install_integration.get("app_paths_default") or "").strip()
+            if installed_exe and shortcut_target.lower() != installed_exe.lower():
+                raise RuntimeError(
+                    "Windows Start Menu shortcut is not targeting the real GUI executable: "
+                    f"shortcut_target={shortcut_target!r} installed_exe={installed_exe!r}"
+                )
+            if installed_exe and app_paths_default.lower() != installed_exe.lower():
+                raise RuntimeError(
+                    "Windows App Paths entry is not targeting the installed GUI executable: "
+                    f"app_paths_default={app_paths_default!r} installed_exe={installed_exe!r}"
+                )
+            if int(install_integration.get("installed_exe_subsystem") or 0) != 2:
+                raise RuntimeError(
+                    "Windows installed yggterm.exe is not using the GUI subsystem: "
                     f"{install_integration!r}"
                 )
         remote_root_path = PureWindowsPath(remote_root)
@@ -1216,12 +1293,15 @@ def main() -> int:
             "remote_control_bin": remote_control_bin,
             "remote_version": remote_version,
             "local_artifact_sha256": local_artifact_sha256,
+            "workspace_version": expected_workspace_version,
             "staged_support_files": staged_support_files,
             "staged_companion_binaries": staged_companion_binaries,
             "install_summary": install_summary,
             "install_integration": install_integration,
             "owned_processes_before_launch": owned_processes_before_launch,
             "killed_processes_prelaunch": killed_processes_prelaunch,
+            "installed_processes_before_install": installed_processes_before_install,
+            "killed_installed_processes_preinstall": killed_installed_processes_preinstall,
             "owned_processes_after_prelaunch_cleanup": owned_processes_after_prelaunch_cleanup,
             "dismissed_error_dialogs_prelaunch": dismissed_error_dialogs_prelaunch,
             "dismissed_error_dialogs_prescreenshot": dismissed_error_dialogs_prescreenshot,
@@ -1253,12 +1333,15 @@ def main() -> int:
             "remote_control_bin": remote_control_bin or None,
             "remote_version": remote_version,
             "local_artifact_sha256": local_artifact_sha256,
+            "workspace_version": expected_workspace_version,
             "staged_support_files": staged_support_files,
             "staged_companion_binaries": staged_companion_binaries,
             "install_summary": install_summary,
             "install_integration": install_integration,
             "owned_processes_before_launch": owned_processes_before_launch,
             "killed_processes_prelaunch": killed_processes_prelaunch,
+            "installed_processes_before_install": installed_processes_before_install,
+            "killed_installed_processes_preinstall": killed_installed_processes_preinstall,
             "owned_processes_after_prelaunch_cleanup": owned_processes_after_prelaunch_cleanup,
             "dismissed_error_dialogs_prelaunch": dismissed_error_dialogs_prelaunch,
             "dismissed_error_dialogs_prescreenshot": dismissed_error_dialogs_prescreenshot,
