@@ -10360,6 +10360,23 @@ fn titlebar_inner_style(auto_hide_enabled: bool, revealed: bool) -> String {
         transition
     )
 }
+fn titlebar_autohide_content_offset_style(auto_hide_enabled: bool, revealed: bool) -> String {
+    let top_padding = if auto_hide_enabled && revealed {
+        TITLEBAR_HEIGHT_PX
+    } else {
+        0.0
+    };
+    let transition = if auto_hide_enabled && revealed {
+        emphasized_enter_transition(&["padding-top"])
+    } else {
+        emphasized_exit_transition(&["padding-top"])
+    };
+    format!(
+        "display:flex; flex:1; min-height:0; overflow:hidden; box-sizing:border-box; padding-top:{}px; \
+         will-change:padding-top; transition:{};",
+        top_padding, transition
+    )
+}
 fn preview_summary_metadata_value(session: &ManagedSessionView, label: &str) -> Option<String> {
     session
         .preview
@@ -22438,7 +22455,10 @@ fn app() -> Element {
                     }
                 }
                 div {
-                    style: "display: flex; flex: 1; min-height: 0; overflow: hidden;",
+                    style: titlebar_autohide_content_offset_style(
+                        titlebar_auto_hide_enabled,
+                        titlebar_revealed,
+                    ),
                     if !fullscreen {
                         Sidebar {
                         snapshot: sidebar_snapshot,
@@ -37218,6 +37238,15 @@ fn apply_linux_transparent_window_surface_style(
 ) {
 }
 #[cfg(target_os = "linux")]
+fn linux_native_window_shape_supported() -> bool {
+    matches!(std::env::var("GDK_BACKEND").ok().as_deref(), Some("x11"))
+        || std::env::var_os("WAYLAND_DISPLAY").is_none()
+}
+#[cfg(not(target_os = "linux"))]
+fn linux_native_window_shape_supported() -> bool {
+    false
+}
+#[cfg(target_os = "linux")]
 fn apply_linux_widget_corner_region(
     desktop: &dioxus::desktop::DesktopContext,
     region: Option<&cairo::Region>,
@@ -37254,7 +37283,7 @@ fn apply_linux_window_corner_shape(
     let Some(gdk_window) = gtk_window.window() else {
         return;
     };
-    if maximized || radius == 0 {
+    if maximized || radius == 0 || !linux_native_window_shape_supported() {
         let full_region =
             cairo::Region::create_rectangle(&cairo::RectangleInt::new(0, 0, width, height));
         apply_linux_widget_corner_region(desktop, None);
@@ -37295,7 +37324,7 @@ fn apply_linux_window_shape_reapply_sequence(
             let Some(gdk_window) = gtk_window.window() else {
                 return;
             };
-            if maximized || radius == 0 {
+            if maximized || radius == 0 || !linux_native_window_shape_supported() {
                 let full_region =
                     cairo::Region::create_rectangle(&cairo::RectangleInt::new(0, 0, width, height));
                 if gtk_window.has_window() {
@@ -38497,6 +38526,15 @@ mod tests {
         let always_visible = titlebar_wrapper_style(false, true);
         assert!(always_visible.contains("overflow:visible"));
         assert!(always_visible.contains("position:relative"));
+    }
+    #[test]
+    fn titlebar_autohide_content_offset_only_applies_while_revealed() {
+        let collapsed = titlebar_autohide_content_offset_style(true, false);
+        assert!(collapsed.contains("padding-top:0px"));
+        let revealed = titlebar_autohide_content_offset_style(true, true);
+        assert!(revealed.contains("padding-top:32px"));
+        let always_visible = titlebar_autohide_content_offset_style(false, true);
+        assert!(always_visible.contains("padding-top:0px"));
     }
     #[test]
     fn sidebar_resize_pointer_without_primary_button_keeps_drag_until_release() {
