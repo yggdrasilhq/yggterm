@@ -210,6 +210,13 @@ def assert_blur_expectation(state: dict, expectation: str) -> dict:
     live = bool(summary.get("live_blur_supported"))
     if expectation == "required" and not live:
         raise RuntimeError(f"expected live blur support but state reported otherwise: {summary!r}")
+    if expectation == "required":
+        transparent = summary.get("transparent_window")
+        backdrop = str(summary.get("shell_frame_backdrop_filter") or "").strip().lower()
+        if transparent is False:
+            raise RuntimeError(f"expected a transparent live-blur window but state reported otherwise: {summary!r}")
+        if backdrop in ("", "none"):
+            raise RuntimeError(f"expected a live backdrop blur but state reported otherwise: {summary!r}")
     if expectation == "forbidden" and live:
         raise RuntimeError(f"expected no live blur support but state reported otherwise: {summary!r}")
     return summary
