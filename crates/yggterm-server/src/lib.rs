@@ -31,7 +31,7 @@ pub use daemon::{
     snapshot, start_command_session, start_local_session, start_local_session_at,
     start_ssh_session_at, status, switch_agent_session_mode, sync_external_window, sync_theme,
     terminal_ensure, terminal_read, terminal_resize, terminal_snapshot, terminal_write,
-    toggle_preview_block,
+    toggle_preview_block, update_session_copy,
 };
 pub use host::{GhosttyHostKind, GhosttyHostSupport, GhosttyTerminalHostMode, detect_ghostty_host};
 pub use protocol::{
@@ -1574,19 +1574,21 @@ impl YggtermServer {
                     .count(),
             }));
         }
-        let mut restored_live_fingerprints = Vec::<(SessionKind, String, Option<String>)>::new();
+        let mut restored_live_keys = HashSet::<String>::new();
         for live in state.live_sessions {
             if !persisted_live_session_is_recoverable(&live) || is_legacy_demo_live_session(&live) {
                 continue;
             }
-            let fingerprint = (live.kind, live.ssh_target.clone(), live.prefix.clone());
-            if restored_live_fingerprints
-                .iter()
-                .any(|existing| existing == &fingerprint)
+            let dedupe_key = if let Some((machine_key, session_id)) =
+                parse_remote_scanned_session_path(&live.key)
             {
+                remote_scanned_session_path(&normalize_machine_key(machine_key), session_id)
+            } else {
+                live.key.clone()
+            };
+            if !restored_live_keys.insert(dedupe_key) {
                 continue;
             }
-            restored_live_fingerprints.push(fingerprint);
             self.restore_live_session(live);
         }
         self.active_view_mode = state.active_view_mode;
@@ -7568,12 +7570,40 @@ fn wait_for_existing_local_daemon_boot(_endpoint: &ServerEndpoint, _timeout: Dur
 fn prepare_endpoint_for_spawn(endpoint: &ServerEndpoint) -> anyhow::Result<()> {
     #[cfg(unix)]
     if let ServerEndpoint::UnixSocket(path) = endpoint
-        && path.exists()
-        && ping(endpoint).is_err()
+        && local_daemon_socket_should_be_removed_for_spawn(endpoint, path)
     {
         let _ = fs::remove_file(path);
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn should_remove_local_daemon_socket_for_spawn_state(
+    socket_exists: bool,
+    ping_failed: bool,
+    same_home_daemon_alive: bool,
+) -> bool {
+    socket_exists && ping_failed && !same_home_daemon_alive
+}
+
+#[cfg(unix)]
+pub fn local_daemon_socket_should_be_removed_for_spawn(
+    endpoint: &ServerEndpoint,
+    path: &Path,
+) -> bool {
+    let socket_exists = path.exists();
+    let ping_failed = ping(endpoint).is_err();
+    #[cfg(target_os = "linux")]
+    let same_home_daemon_alive = daemon_home_for_endpoint(endpoint)
+        .as_deref()
+        .is_some_and(|home| !local_daemon_pids_for_home(home).is_empty());
+    #[cfg(not(target_os = "linux"))]
+    let same_home_daemon_alive = false;
+    should_remove_local_daemon_socket_for_spawn_state(
+        socket_exists,
+        ping_failed,
+        same_home_daemon_alive,
+    )
 }
 
 fn reap_spawned_child_in_background(mut child: std::process::Child) {
@@ -12288,13 +12318,15 @@ mod tests {
         local_remote_bootstrap_executable_from_current, managed_session_from_snapshot,
         mirror_remote_machine_sessions, parse_recent_context_sections, parse_screen_session_ref,
         parse_stored_transcript, push_preview_block, remote_cache_key, remote_command_cache,
-        remote_direct_attach_launch_command, remote_resume_requires_missing_saved_session_failure,
+        remote_direct_attach_launch_command,
+        remote_resume_requires_missing_saved_session_failure,
         remote_resume_runtime_output_mismatches_managed_session,
         remote_resume_runtime_output_requires_restart, remote_resume_shell_command,
         remote_saved_codex_session_exists, remote_saved_session_can_reuse_existing_multiplexer,
         remote_saved_session_screen_is_attachable, remote_scan_roots_with_parents,
         remote_scanned_session_path, remote_snapshot_looks_like_codex,
         remote_snapshot_looks_like_shell_prompt, remote_ssh_launch_command,
+        should_remove_local_daemon_socket_for_spawn_state,
         remote_tmux_session_name, sanitize_recent_context_payload, screen_attach_shell_command,
         screen_resume_or_spawn_shell_command, session_metadata_value, should_fallback_to_python,
         stored_session_launch_command, strip_remote_payload_noise,
@@ -14983,6 +15015,190 @@ terminal_window_id: None,
     }
 
     #[test]
+    fn restore_persisted_state_preserves_multiple_local_live_sessions_of_same_kind() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.restore_persisted_state(
+            PersistedDaemonState {
+                active_session_path: Some("local::second-shell".to_string()),
+                active_view_mode: WorkspaceViewMode::Terminal,
+                ssh_targets: Vec::new(),
+                remote_machines: Vec::new(),
+                stored_sessions: Vec::new(),
+                live_sessions: vec![
+                    PersistedLiveSession {
+                        key: "local::first-shell".to_string(),
+                        id: "first-shell".to_string(),
+                        title: "First shell".to_string(),
+                        kind: SessionKind::Shell,
+                        ssh_target: "localhost".to_string(),
+                        prefix: None,
+                        cwd: Some("/tmp/one".to_string()),
+                    },
+                    PersistedLiveSession {
+                        key: "local::second-shell".to_string(),
+                        id: "second-shell".to_string(),
+                        title: "Second shell".to_string(),
+                        kind: SessionKind::Shell,
+                        ssh_target: "localhost".to_string(),
+                        prefix: None,
+                        cwd: Some("/tmp/two".to_string()),
+                    },
+                ],
+            },
+            None,
+        );
+
+        let live_sessions = server.live_sessions();
+        assert_eq!(live_sessions.len(), 2);
+        assert!(
+            live_sessions
+                .iter()
+                .any(|session| session.session_path == "local://first-shell"
+                    && session.title == "First shell")
+        );
+        assert!(
+            live_sessions
+                .iter()
+                .any(|session| session.session_path == "local://second-shell"
+                    && session.title == "Second shell")
+        );
+        assert_eq!(server.active_session_path(), Some("local::second-shell"));
+        assert!(server.sessions.contains_key("local::first-shell"));
+        assert!(server.sessions.contains_key("local::second-shell"));
+    }
+
+    #[test]
+    fn restore_persisted_state_preserves_multiple_remote_live_sessions_on_same_machine() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let first_path = remote_scanned_session_path("dev", "abc123");
+        let second_path = remote_scanned_session_path("dev", "def456");
+        server.restore_persisted_state(
+            PersistedDaemonState {
+                active_session_path: Some(second_path.clone()),
+                active_view_mode: WorkspaceViewMode::Terminal,
+                ssh_targets: vec![SshConnectTarget {
+                    label: "dev".to_string(),
+                    kind: SessionKind::SshShell,
+                    ssh_target: "dev".to_string(),
+                    prefix: None,
+                    cwd: Some("/srv/dev".to_string()),
+                }],
+                remote_machines: vec![RemoteMachineSnapshot {
+                    machine_key: "dev".to_string(),
+                    label: "dev".to_string(),
+                    ssh_target: "dev".to_string(),
+                    prefix: None,
+                    remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+                    remote_deploy_state: RemoteDeployState::Ready,
+                    health: RemoteMachineHealth::Healthy,
+                    sessions: vec![
+                        RemoteScannedSession {
+                            session_path: first_path.clone(),
+                            session_id: "abc123".to_string(),
+                            cwd: "/srv/dev/one".to_string(),
+                            started_at: "2026-04-23T10:00:00Z".to_string(),
+                            modified_epoch: 1,
+                            event_count: 8,
+                            user_message_count: 4,
+                            assistant_message_count: 4,
+                            title_hint: "First remote".to_string(),
+                            recent_context: "USER: one".to_string(),
+                            cached_precis: Some("first precis".to_string()),
+                            cached_summary: Some("first summary".to_string()),
+                            storage_path: "/home/pi/.codex/sessions/abc123.jsonl".to_string(),
+                        },
+                        RemoteScannedSession {
+                            session_path: second_path.clone(),
+                            session_id: "def456".to_string(),
+                            cwd: "/srv/dev/two".to_string(),
+                            started_at: "2026-04-23T10:05:00Z".to_string(),
+                            modified_epoch: 2,
+                            event_count: 9,
+                            user_message_count: 5,
+                            assistant_message_count: 4,
+                            title_hint: "Second remote".to_string(),
+                            recent_context: "USER: two".to_string(),
+                            cached_precis: Some("second precis".to_string()),
+                            cached_summary: Some("second summary".to_string()),
+                            storage_path: "/home/pi/.codex/sessions/def456.jsonl".to_string(),
+                        },
+                    ],
+                }],
+                stored_sessions: Vec::new(),
+                live_sessions: vec![
+                    PersistedLiveSession {
+                        key: first_path.clone(),
+                        id: "abc123".to_string(),
+                        title: "First remote".to_string(),
+                        kind: SessionKind::SshShell,
+                        ssh_target: "dev".to_string(),
+                        prefix: None,
+                        cwd: Some("/srv/dev/one".to_string()),
+                    },
+                    PersistedLiveSession {
+                        key: second_path.clone(),
+                        id: "def456".to_string(),
+                        title: "Second remote".to_string(),
+                        kind: SessionKind::SshShell,
+                        ssh_target: "dev".to_string(),
+                        prefix: None,
+                        cwd: Some("/srv/dev/two".to_string()),
+                    },
+                ],
+            },
+            None,
+        );
+
+        let live_sessions = server.live_sessions();
+        assert_eq!(live_sessions.len(), 2);
+        assert!(
+            live_sessions
+                .iter()
+                .any(|session| session.session_path == first_path && session.title == "First remote")
+        );
+        assert!(
+            live_sessions
+                .iter()
+                .any(|session| session.session_path == second_path && session.title == "Second remote")
+        );
+        assert_eq!(server.active_session_path(), Some(second_path.as_str()));
+        assert!(server.sessions.contains_key(&first_path));
+        assert!(server.sessions.contains_key(&second_path));
+    }
+
+    #[test]
     fn request_terminal_launch_promotes_stored_codex_session_into_live_sessions() {
         let tree = SessionNode {
             kind: SessionNodeKind::Group,
@@ -16049,5 +16265,22 @@ terminal_window_id: None,
         );
 
         let _ = fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_remove_local_daemon_socket_for_spawn_preserves_live_same_home_daemon() {
+        assert!(!should_remove_local_daemon_socket_for_spawn_state(
+            true, true, true
+        ));
+        assert!(should_remove_local_daemon_socket_for_spawn_state(
+            true, true, false
+        ));
+        assert!(!should_remove_local_daemon_socket_for_spawn_state(
+            true, false, false
+        ));
+        assert!(!should_remove_local_daemon_socket_for_spawn_state(
+            false, true, false
+        ));
     }
 }

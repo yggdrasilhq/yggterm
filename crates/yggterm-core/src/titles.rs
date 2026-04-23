@@ -1023,6 +1023,27 @@ mod tests {
     }
 
     #[test]
+    fn low_signal_copy_rejects_ansi_shell_prompt_text() {
+        assert!(crate::looks_like_low_signal_generated_copy(
+            "\u{1b}[32;1mpi@jojo\u{1b}[m:\u{1b}[34;1m~\u{1b}[m$"
+        ));
+    }
+
+    #[test]
+    fn low_signal_copy_rejects_plain_shell_prompt_text() {
+        assert!(crate::looks_like_low_signal_generated_copy(
+            "pi@jojo:~/gh/yggterm$"
+        ));
+    }
+
+    #[test]
+    fn low_signal_copy_rejects_shell_command_script_text() {
+        assert!(crate::looks_like_low_signal_generated_copy(
+            "Printf '\\033[. 1049h\\033[. 25lhc'; sleep 1; printf '\\033[. 25h\\033[. 1049l."
+        ));
+    }
+
+    #[test]
     fn fallback_title_detection_matches_hash_titles() {
         assert!(looks_like_generated_fallback_title("Q4fc63d"));
         assert!(looks_like_generated_fallback_title("25663dc"));
@@ -2423,6 +2444,12 @@ pub fn looks_like_low_signal_generated_copy(text: &str) -> bool {
     if lower.is_empty() {
         return true;
     }
+    if contains_terminal_control_bytes(text) || looks_like_shell_prompt_copy(text) {
+        return true;
+    }
+    if looks_like_shell_command_copy(text) {
+        return true;
+    }
     [
         "collaboration mode:",
         "filesystem sandboxing",
@@ -2458,6 +2485,109 @@ pub fn looks_like_low_signal_generated_copy(text: &str) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+}
+
+fn contains_terminal_control_bytes(text: &str) -> bool {
+    text.chars()
+        .any(|ch| ch == '\u{1b}' || (ch.is_control() && !matches!(ch, '\n' | '\r' | '\t')))
+}
+
+fn strip_terminal_control_bytes(text: &str) -> String {
+    text.chars()
+        .filter(|ch| *ch != '\u{1b}' && (!ch.is_control() || matches!(ch, '\n' | '\r' | '\t')))
+        .collect()
+}
+
+fn looks_like_shell_prompt_copy(text: &str) -> bool {
+    let sanitized = strip_terminal_control_bytes(text);
+    let lines = sanitized
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if lines.is_empty() || lines.len() > 2 {
+        return false;
+    }
+    let prompt = lines.last().copied().unwrap_or_default();
+    if prompt.len() > 96
+        || !["$", "#", "%", ">"]
+            .iter()
+            .any(|suffix| prompt.ends_with(suffix))
+    {
+        return false;
+    }
+    let has_prompt_markers = prompt.contains('@')
+        || prompt.contains(':')
+        || prompt.contains('~')
+        || prompt.contains('/')
+        || prompt.contains('\\');
+    let allowed = prompt.chars().all(|ch| {
+        ch.is_ascii_alphanumeric()
+            || matches!(
+                ch,
+                ' ' | '@' | ':' | '/' | '\\' | '.' | '_' | '~' | '-' | '[' | ']' | '(' | ')'
+                    | '{' | '}' | '+' | '$' | '#' | '%' | '>'
+            )
+    });
+    has_prompt_markers && allowed
+}
+
+fn looks_like_shell_command_copy(text: &str) -> bool {
+    let sanitized = strip_terminal_control_bytes(text);
+    let lines = sanitized
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return false;
+    }
+    let lower_lines = lines
+        .iter()
+        .map(|line| line.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let shell_verbs = [
+        "printf ",
+        "echo ",
+        "exec ",
+        "cd ",
+        "ssh ",
+        "cargo ",
+        "python ",
+        "python3 ",
+        "npm ",
+        "git ",
+        "tmux ",
+        "screen ",
+        "mkdir ",
+        "rm ",
+        "cp ",
+        "mv ",
+        "cat ",
+        "sed ",
+        "rg ",
+        "find ",
+        "ls ",
+        "export ",
+        "source ",
+    ];
+    let looks_like_command_line = |line: &str| {
+        let trimmed = line.trim_start_matches("$ ").trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        shell_verbs.iter().any(|verb| trimmed.starts_with(verb))
+            || (trimmed.contains("\\033") || trimmed.contains("\\x1b"))
+                && (trimmed.contains(';') || trimmed.contains("&&") || trimmed.contains("||"))
+    };
+    if lower_lines.iter().all(|line| looks_like_command_line(line)) {
+        return true;
+    }
+    lower_lines.iter().any(|line| {
+        let punctuation_heavy = line.contains(';') || line.contains("&&") || line.contains("||");
+        let escape_heavy = line.contains("\\033") || line.contains("\\x1b");
+        punctuation_heavy && escape_heavy && looks_like_command_line(line)
+    })
 }
 
 fn heuristic_precis_from_context(context: &str) -> Option<String> {

@@ -54,8 +54,8 @@ WEBKIT_CHILD_RSS_SETTLE_SECONDS = 0.9
 LAST_SEARCH_FOCUS_OVERLAY_CONTRACT: dict | None = None
 LAST_TITLEBAR_NEW_MENU_SHELL_CONTRACT: dict | None = None
 LAST_TITLEBAR_SESSION_SHELL_CONTRACT: dict | None = None
-POINTER_DRIVER = (ENV.get("YGGTERM_POINTER_DRIVER") or "xdotool").strip().lower()
-KEY_DRIVER = (ENV.get("YGGTERM_KEY_DRIVER") or POINTER_DRIVER or "xdotool").strip().lower()
+POINTER_DRIVER = (ENV.get("YGGTERM_POINTER_DRIVER") or "app").strip().lower()
+KEY_DRIVER = (ENV.get("YGGTERM_KEY_DRIVER") or POINTER_DRIVER or "app").strip().lower()
 AVOID_FOREGROUND = (ENV.get("YGGTERM_SMOKE_AVOID_FOREGROUND") or "").strip().lower() in (
     "1",
     "true",
@@ -123,6 +123,78 @@ def run_timed(*args: str, check: bool = True, timeout_seconds: float = 20.0) -> 
     response = run(*args, check=check, timeout_seconds=timeout_seconds)
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     return response, elapsed_ms
+
+
+def contains_terminal_control_bytes(text: str) -> bool:
+    return any(ch == "\x1b" or (ord(ch) < 32 and ch not in "\n\r\t") for ch in text)
+
+
+def looks_like_shell_command_copy(text: str) -> bool:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if not lines:
+        return False
+    shell_verbs = (
+        "printf ",
+        "echo ",
+        "exec ",
+        "cd ",
+        "ssh ",
+        "cargo ",
+        "python ",
+        "python3 ",
+        "npm ",
+        "git ",
+        "tmux ",
+        "screen ",
+        "mkdir ",
+        "rm ",
+        "cp ",
+        "mv ",
+        "cat ",
+        "sed ",
+        "rg ",
+        "find ",
+        "ls ",
+        "export ",
+        "source ",
+    )
+
+    def is_command_line(line: str) -> bool:
+        trimmed = line.removeprefix("$ ").strip().lower()
+        if not trimmed:
+            return False
+        return trimmed.startswith(shell_verbs) or (
+            ("\\033" in trimmed or "\\x1b" in trimmed)
+            and (";" in trimmed or "&&" in trimmed or "||" in trimmed)
+        )
+
+    if all(is_command_line(line) for line in lines):
+        return True
+    return any(
+        is_command_line(line)
+        and ("\\033" in line.lower() or "\\x1b" in line.lower())
+        and (";" in line or "&&" in line or "||" in line)
+        for line in lines
+    )
+
+
+def looks_like_shell_prompt_copy(text: str) -> bool:
+    sanitized = "".join(
+        ch for ch in text if ch != "\x1b" and (ord(ch) >= 32 or ch in "\n\r\t")
+    )
+    lines = [line.strip() for line in sanitized.splitlines() if line.strip()]
+    if not lines or len(lines) > 2:
+        return False
+    prompt = lines[-1]
+    if len(prompt) > 96 or not any(prompt.endswith(suffix) for suffix in ("$", "#", "%", ">")):
+        return False
+    if not any(marker in prompt for marker in ("@", ":", "~", "/", "\\")):
+        return False
+    return all(
+        ch.isalnum()
+        or ch in " @:/\\._~-[](){}+$#%>"
+        for ch in prompt
+    )
 
 
 def app_pointer_command(pid: int, action: str, **kwargs) -> dict:
@@ -269,13 +341,17 @@ def app_create_terminal(pid: int, *, title: str | None = None, cwd: str | None =
         "--pid",
         str(pid),
         "--timeout-ms",
-        "15000",
+        "40000",
     ]
     if title:
         args.extend(["--title", title])
     if cwd:
         args.extend(["--cwd", cwd])
-    return unwrap_data(run(*args))
+    payload = unwrap_data(run(*args))
+    session_path = str(payload.get("session_path") or payload.get("active_session_path") or "").strip()
+    if session_path and not payload.get("session_path"):
+        payload["session_path"] = session_path
+    return payload
 
 
 def app_remove_session(pid: int, session_path: str) -> dict:
@@ -3721,10 +3797,15 @@ def sidebar_row_rect(row: dict) -> dict:
     }
 
 
-def find_visible_sidebar_row_by_path(state: dict, row_path: str, *, kind: str | None = None) -> dict | None:
+def find_visible_sidebar_rows_by_path(
+    state: dict,
+    row_path: str,
+    *,
+    kind: str | None = None,
+) -> list[dict]:
     target_path = normalize_live_path(str(row_path or "").strip())
     if not target_path:
-        return None
+        return []
     matches = []
     for row in visible_sidebar_rows(state):
         row_path_value = normalize_live_path(str(row.get("path") or row.get("full_path") or "").strip())
@@ -3733,8 +3814,34 @@ def find_visible_sidebar_row_by_path(state: dict, row_path: str, *, kind: str | 
         if kind is not None and str(row.get("kind") or "").strip() != kind:
             continue
         matches.append(row)
+    return matches
+
+
+def find_visible_sidebar_row_by_path(state: dict, row_path: str, *, kind: str | None = None) -> dict | None:
+    matches = find_visible_sidebar_rows_by_path(state, row_path, kind=kind)
     if matches:
         return matches[-1]
+    return None
+
+
+def find_visible_live_sidebar_row_by_path(
+    state: dict,
+    row_path: str,
+    *,
+    kind: str | None = None,
+) -> dict | None:
+    target_path = normalize_live_path(str(row_path or "").strip())
+    if not target_path:
+        return None
+    for row in visible_sidebar_rows(state):
+        row_path_value = normalize_live_path(str(row.get("path") or row.get("full_path") or "").strip())
+        if row_path_value != target_path:
+            continue
+        if kind is not None and str(row.get("kind") or "").strip() != kind:
+            continue
+        if not bool(row.get("live_member")):
+            continue
+        return row
     return None
 
 
@@ -3755,6 +3862,26 @@ def wait_for_visible_sidebar_row(
         time.sleep(0.1)
     raise AssertionError(
         f"sidebar row did not become visible: path={row_path!r} kind={kind!r} state={last_state!r}"
+    )
+
+
+def wait_for_visible_live_sidebar_row(
+    pid: int,
+    row_path: str,
+    *,
+    kind: str | None = None,
+    timeout_seconds: float = 8.0,
+) -> dict:
+    deadline = time.time() + timeout_seconds
+    last_state = {}
+    while time.time() < deadline:
+        last_state = app_state(pid)
+        row = find_visible_live_sidebar_row_by_path(last_state, row_path, kind=kind)
+        if row is not None and rect_is_visible(sidebar_row_rect(row)):
+            return row
+        time.sleep(0.1)
+    raise AssertionError(
+        f"live sidebar row did not become visible: path={row_path!r} kind={kind!r} state={last_state!r}"
     )
 
 
@@ -3880,7 +4007,14 @@ def invoke_sidebar_context_menu_action(
 
 
 def create_terminal_via_sidebar_context_menu(pid: int, *, parent_path: str = "local") -> dict:
-    baseline = wait_for_app_idle(pid, timeout_seconds=20.0)
+    baseline = wait_for_window_focus(pid, timeout_seconds=8.0)
+    if shell_context_menu_row_path(baseline):
+        try:
+            xdotool_key_window(pid, "Escape")
+        except Exception:
+            pass
+        time.sleep(0.05)
+        baseline = app_state(pid)
     baseline_active_session_path = normalize_live_path(
         str(baseline.get("active_session_path") or "").strip()
     )
@@ -8607,161 +8741,325 @@ def assert_terminal_zoom_live_apply(pid: int, session: str, out_dir: Path) -> di
 
 
 def assert_context_menu_rename_session(pid: int) -> dict:
-    xdotool_key_window(pid, "Escape")
-    baseline_deadline = time.time() + 2.5
-    while time.time() < baseline_deadline:
-        baseline_state = app_state(pid)
-        if (
-            not str(((baseline_state.get("shell") or {}).get("tree_rename_path") or "")).strip()
-            and not rect_is_visible(dom_rect(baseline_state, "context_menu_rect"))
-        ):
-            break
-        time.sleep(0.02)
-    baseline = wait_for_window_focus(pid, timeout_seconds=4.0)
-    session_row = selected_visible_session_row(baseline)
-    target_path = str(session_row.get("path") or "").strip()
-    if not target_path:
-        raise AssertionError(f"selected session row missing path: {session_row!r}")
-    click_x = sidebar_row_click_x(baseline)
-    selected_deadline = time.time() + 2.5
-    while time.time() < selected_deadline:
-        xdotool_click_window(pid, click_x, rect_center_y(session_row))
-        time.sleep(0.12)
-        baseline = wait_for_window_focus(pid, timeout_seconds=4.0)
-        session_row = selected_visible_session_row(baseline)
-        if str(session_row.get("path") or "").strip() == target_path:
-            break
-    else:
-        raise AssertionError(
-            f"failed to re-anchor selected sidebar row before rename probe: "
-            f"target_path={target_path!r} selected_row={session_row!r}"
-        )
-    active_session = str(viewport_state(baseline).get("active_session_path") or "").strip()
-
-    opened = {}
-    open_click = None
-    for _attempt in range(3):
-        current = wait_for_window_focus(pid, timeout_seconds=3.0)
-        session_row = selected_visible_session_row(current)
-        click_x = sidebar_row_click_x(current)
-        open_click = xdotool_right_click_window(
-            pid,
-            click_x,
-            rect_center_y(session_row),
-        )
-        deadline = time.time() + 2.5
-        while time.time() < deadline:
-            opened = app_state(pid)
+    created_paths: list[str] = []
+    secondary_session = ""
+    target_path = ""
+    try:
+        xdotool_key_window(pid, "Escape")
+        baseline_deadline = time.time() + 2.5
+        while time.time() < baseline_deadline:
+            baseline_state = app_state(pid)
             if (
-                shell_context_menu_row_path(opened) == target_path
-                and rect_is_visible(dom_rect(opened, "context_menu_rename_session_rect"))
+                not str(((baseline_state.get("shell") or {}).get("tree_rename_path") or "")).strip()
+                and not rect_is_visible(dom_rect(baseline_state, "context_menu_rect"))
             ):
                 break
-            time.sleep(0.1)
-        if (
-            shell_context_menu_row_path(opened) == target_path
-            and rect_is_visible(dom_rect(opened, "context_menu_rename_session_rect"))
-        ):
-            break
-        xdotool_click_window(
+            time.sleep(0.02)
+
+        created = app_create_terminal(pid, title="Smoke Rename Baseline")
+        target_path = str(created.get("session_path") or "").strip()
+        if not target_path:
+            raise AssertionError(f"terminal create did not return an active session path: {created!r}")
+        created_paths.append(target_path)
+
+        baseline_deadline = time.time() + 12.0
+        baseline = {}
+        session_row = None
+        while time.time() < baseline_deadline:
+            baseline = app_state(pid)
+            session_row = find_visible_sidebar_row_by_path(baseline, target_path, kind="Session")
+            active_session = normalize_live_path(str(baseline.get("active_session_path") or ""))
+            active_title = str(baseline.get("active_title") or "").strip()
+            if (
+                active_session == normalize_live_path(target_path)
+                and session_row is not None
+                and rect_is_visible(sidebar_row_rect(session_row))
+                and active_title == "Smoke Rename Baseline"
+            ):
+                break
+            time.sleep(0.08)
+        else:
+            raise AssertionError(
+                f"created rename target never became the visible active session: "
+                f"target_path={target_path!r} state={baseline!r}"
+            )
+        click_x = sidebar_row_click_x(baseline)
+        selected_deadline = time.time() + 2.5
+        while time.time() < selected_deadline:
+            if bool(session_row.get("selected")):
+                break
+            xdotool_click_window(pid, click_x, rect_center_y(session_row))
+            time.sleep(0.12)
+            baseline = wait_for_window_focus(pid, timeout_seconds=4.0)
+            session_row = find_visible_sidebar_row_by_path(baseline, target_path, kind="Session")
+            if session_row is None:
+                raise AssertionError(f"rename target disappeared from the visible sidebar: {baseline!r}")
+        else:
+            raise AssertionError(
+                f"failed to select the created rename target before rename probe: target_path={target_path!r} "
+                f"row={session_row!r}"
+            )
+
+        opened = {}
+        open_click = None
+        for _attempt in range(3):
+            current = wait_for_window_focus(pid, timeout_seconds=3.0)
+            session_row = find_visible_sidebar_row_by_path(current, target_path, kind="Session")
+            if session_row is None:
+                raise AssertionError(f"rename target vanished before context menu probe: {current!r}")
+            click_x = sidebar_row_click_x(current)
+            open_click = xdotool_right_click_window(
+                pid,
+                click_x,
+                rect_center_y(session_row),
+            )
+            deadline = time.time() + 2.5
+            while time.time() < deadline:
+                opened = app_state(pid)
+                actions = opened.get("dom", {}).get("context_menu_action_rects") or []
+                rename_rect = next(
+                    (
+                        entry.get("rect")
+                        for entry in actions
+                        if str(entry.get("action") or "").strip() == "rename-session"
+                    ),
+                    None,
+                )
+                if not rect_is_visible(rename_rect):
+                    rename_rect = dom_rect(opened, "context_menu_rename_session_rect")
+                if shell_context_menu_row_path(opened) == target_path and rect_is_visible(rename_rect):
+                    break
+                time.sleep(0.1)
+            if (
+                shell_context_menu_row_path(opened) == target_path
+                and rect_is_visible(rename_rect)
+            ):
+                break
+            xdotool_click_window(
+                pid,
+                click_x,
+                rect_center_y(session_row),
+            )
+            time.sleep(0.15)
+        else:
+            raise AssertionError(f"context menu did not open on the created session row: {opened!r}")
+
+        if not rect_is_visible(rename_rect):
+            raise AssertionError(f"rename action rect missing after context menu open: {opened!r}")
+        rename_click = xdotool_click_window(
             pid,
-            click_x,
-            rect_center_y(session_row),
+            rect_center_x(rename_rect),
+            rect_center_y(rename_rect),
         )
-        time.sleep(0.15)
-    else:
-        raise AssertionError(f"context menu did not open on selected session row: {opened!r}")
+        deadline = time.time() + 2.5
+        renamed = {}
+        while time.time() < deadline:
+            renamed = app_state(pid)
+            if (
+                str(((renamed.get("shell") or {}).get("tree_rename_path") or "")).strip() == target_path
+                and rect_is_visible(dom_rect(renamed, "tree_rename_input_rect"))
+            ):
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError(f"context menu rename action did not enter rename mode: {renamed!r}")
 
-    rename_rect = dom_rect(opened, "context_menu_rename_session_rect")
-    dismiss_rect = dom_rect(opened, "main_surface_body_rect") or dom_rect(opened, "main_surface_rect")
-    if not rect_is_visible(dismiss_rect):
-        dismiss_rect = baseline.get("dom", {}).get("sidebar_rect") or {}
-    xdotool_click_window(
-        pid,
-        rect_center_x(dismiss_rect),
-        rect_center_y(dismiss_rect),
-    )
-    dismiss_deadline = time.time() + 2.0
-    while time.time() < dismiss_deadline:
-        current = app_state(pid)
-        if not rect_is_visible(dom_rect(current, "context_menu_rect")):
-            break
-        time.sleep(0.02)
-    else:
-        raise AssertionError(f"context menu did not dismiss cleanly before rename gesture: {current!r}")
-    rename_click = xdotool_double_click_window(
-        pid,
-        click_x,
-        rect_center_y(session_row),
-    )
-    deadline = time.time() + 2.5
-    renamed = {}
-    while time.time() < deadline:
-        renamed = app_state(pid)
-        if (
-            str(((renamed.get("shell") or {}).get("tree_rename_path") or "")).strip() == target_path
-            and rect_is_visible(dom_rect(renamed, "tree_rename_input_rect"))
+        focus_deadline = time.time() + 2.5
+        focus_trace: list[dict] = []
+        while time.time() < focus_deadline:
+            renamed = app_state(pid)
+            dom = renamed.get("dom") or {}
+            active_element = dom.get("active_element") or {}
+            focus_trace.append(
+                {
+                    "tree_rename_path": str(((renamed.get("shell") or {}).get("tree_rename_path") or "")).strip(),
+                    "tree_rename_input_focused_once": bool(
+                        ((renamed.get("shell") or {}).get("tree_rename_input_focused_once"))
+                    ),
+                    "tree_rename_input_focused": bool(dom.get("tree_rename_input_focused")),
+                    "tree_rename_input_rect": dom_rect(renamed, "tree_rename_input_rect"),
+                    "tree_rename_input_value": str(dom.get("tree_rename_input_value") or ""),
+                    "active_tag": str(active_element.get("tag_name") or ""),
+                    "active_class": str(active_element.get("class_name") or ""),
+                    "active_tree_rename_input": str(active_element.get("data_tree_rename_input") or ""),
+                    "helper_focused": bool((active_host_or_none(renamed) or {}).get("helper_textarea_focused")),
+                    "input_enabled": bool((active_host_or_none(renamed) or {}).get("input_enabled")),
+                }
+            )
+            if bool(dom.get("tree_rename_input_focused")):
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError(
+                "rename mode opened without focusing the rename input: "
+                f"trace={focus_trace!r} final={renamed!r}"
+            )
+
+        rename_target = "htop smoke proof"
+        typed_progress: list[dict] = []
+        typed_value = ""
+        for ch in rename_target:
+            xdotool_type_window(pid, ch)
+            typed_value += ch
+            current_value = ""
+            char_deadline = time.time() + 1.5
+            while time.time() < char_deadline:
+                renamed = app_state(pid)
+                current_value = str(dom_value(renamed, "tree_rename_input_value") or "")
+                if current_value == typed_value:
+                    typed_progress.append(
+                        {
+                            "typed": typed_value,
+                            "value": current_value,
+                        }
+                    )
+                    break
+                time.sleep(0.02)
+            else:
+                raise AssertionError(
+                    "rename input replaced the whole value while typing instead of appending the next character: "
+                    f"expected={typed_value!r} actual={current_value!r} trace={typed_progress!r} state={renamed!r}"
+                )
+
+        xdotool_key_window(pid, "Return")
+        committed = {}
+        commit_deadline = time.time() + 8.0
+        while time.time() < commit_deadline:
+            committed = app_state(pid)
+            row = find_visible_sidebar_row_by_path(committed, target_path, kind="Session")
+            active_title = str(committed.get("active_title") or "").strip()
+            if (
+                not str(((committed.get("shell") or {}).get("tree_rename_path") or "")).strip()
+                and row is not None
+                and str(row.get("label") or "").strip() == rename_target
+                and active_title == rename_target
+            ):
+                break
+            time.sleep(0.08)
+        else:
+            raise AssertionError(
+                f"rename never committed to the sidebar and active title: target={rename_target!r} state={committed!r}"
+            )
+        summary_before_switch = str(committed.get("active_summary") or "").strip()
+        if summary_before_switch and (
+            contains_terminal_control_bytes(summary_before_switch)
+            or looks_like_shell_prompt_copy(summary_before_switch)
+            or looks_like_shell_command_copy(summary_before_switch)
         ):
-            break
-        time.sleep(0.02)
-    else:
-        raise AssertionError(f"context menu rename action did not enter rename mode: {renamed!r}")
-    focus_deadline = time.time() + 2.5
-    focus_trace: list[dict] = []
-    while time.time() < focus_deadline:
-        renamed = app_state(pid)
-        dom = renamed.get("dom") or {}
-        active_element = dom.get("active_element") or {}
-        focus_trace.append(
-            {
-                "tree_rename_path": str(((renamed.get("shell") or {}).get("tree_rename_path") or "")).strip(),
-                "tree_rename_input_focused_once": bool(
-                    ((renamed.get("shell") or {}).get("tree_rename_input_focused_once"))
-                ),
-                "tree_rename_input_focused": bool(dom.get("tree_rename_input_focused")),
-                "tree_rename_input_rect": dom_rect(renamed, "tree_rename_input_rect"),
-                "active_tag": str(active_element.get("tag_name") or ""),
-                "active_class": str(active_element.get("class_name") or ""),
-                "active_tree_rename_input": str(active_element.get("data_tree_rename_input") or ""),
-                "helper_focused": bool((active_host_or_none(renamed) or {}).get("helper_textarea_focused")),
-                "input_enabled": bool((active_host_or_none(renamed) or {}).get("input_enabled")),
-            }
-        )
-        if bool(dom.get("tree_rename_input_focused")):
-            break
-        time.sleep(0.02)
-    else:
-        raise AssertionError(
-            "rename mode opened without focusing the rename input: "
-            f"trace={focus_trace!r} final={renamed!r}"
-        )
+            raise AssertionError(
+                "renamed session summary is still low-signal command/prompt copy after commit: "
+                f"summary={summary_before_switch!r} state={committed!r}"
+            )
 
-    xdotool_key_window(pid, "Escape")
-    deadline = time.time() + 2.5
-    cancelled = {}
-    while time.time() < deadline:
-        cancelled = app_state(pid)
-        if not str(((cancelled.get("shell") or {}).get("tree_rename_path") or "")).strip():
-            break
-        time.sleep(0.1)
-    else:
-        raise AssertionError(f"rename mode did not cancel cleanly: {cancelled!r}")
+        secondary = app_create_terminal(pid, title="Smoke Rename Secondary")
+        secondary_session = str(secondary.get("session_path") or "").strip()
+        if not secondary_session:
+            raise AssertionError(f"secondary terminal create did not return an active session path: {secondary!r}")
+        created_paths.append(secondary_session)
+        secondary_deadline = time.time() + 12.0
+        while time.time() < secondary_deadline:
+            secondary_state = app_state(pid)
+            if normalize_live_path(str(secondary_state.get("active_session_path") or "")) == normalize_live_path(
+                secondary_session
+            ):
+                break
+            time.sleep(0.08)
+        else:
+            raise AssertionError(
+                f"secondary session never became active after creation: session={secondary_session!r} "
+                f"state={secondary_state!r}"
+            )
 
-    if active_session:
-        try:
-            wait_for_session_focus(pid, active_session, timeout_seconds=10.0)
-        except AssertionError:
-            pass
-    return {
-        "target_path": target_path,
-        "active_session": active_session,
-        "open_click": open_click,
-        "menu_rect": dom_rect(opened, "context_menu_rect"),
-        "rename_rect": rename_rect,
-        "rename_click": rename_click,
-        "tree_rename_path": (renamed.get("shell") or {}).get("tree_rename_path"),
-        "tree_rename_input_rect": dom_rect(renamed, "tree_rename_input_rect"),
-    }
+        returned = {}
+        return_click = None
+        stability_deadline = time.time() + 8.0
+        while time.time() < stability_deadline:
+            current = wait_for_window_focus(pid, timeout_seconds=4.0)
+            returned = current
+            candidate_rows = [
+                row
+                for row in find_visible_sidebar_rows_by_path(current, target_path, kind="Session")
+                if rect_is_visible(sidebar_row_rect(row))
+            ]
+            row = next((row for row in candidate_rows if not bool(row.get("live_member"))), None)
+            if row is None and candidate_rows:
+                row = candidate_rows[-1]
+            if row is None:
+                time.sleep(0.08)
+                continue
+            click_x = sidebar_row_click_x(current)
+            return_click = xdotool_click_window(pid, click_x, rect_center_y(sidebar_row_rect(row)))
+            inner_deadline = time.time() + 1.2
+            while time.time() < inner_deadline:
+                returned = app_state(pid)
+                row = find_visible_sidebar_row_by_path(returned, target_path, kind="Session")
+                active_session = normalize_live_path(str(returned.get("active_session_path") or ""))
+                active_view_mode = str(
+                    ((returned.get("viewport") or {}).get("active_view_mode"))
+                    or returned.get("active_view_mode")
+                    or ""
+                ).strip()
+                active_title = str(returned.get("active_title") or "").strip()
+                active_summary = str(returned.get("active_summary") or "").strip()
+                if (
+                    active_session == normalize_live_path(target_path)
+                    and active_view_mode == "Terminal"
+                    and row is not None
+                    and str(row.get("label") or "").strip() == rename_target
+                    and active_title == rename_target
+                    and active_summary == summary_before_switch
+                ):
+                    break
+                time.sleep(0.08)
+            else:
+                continue
+            active_title = str(returned.get("active_title") or "").strip()
+            active_summary = str(returned.get("active_summary") or "").strip()
+            if (
+                row is not None
+                and str(row.get("label") or "").strip() == rename_target
+                and active_title == rename_target
+                and active_summary == summary_before_switch
+            ):
+                if active_summary and (
+                    contains_terminal_control_bytes(active_summary)
+                    or looks_like_shell_prompt_copy(active_summary)
+                    or looks_like_shell_command_copy(active_summary)
+                ):
+                    raise AssertionError(
+                        "renamed session summary regressed into low-signal command/prompt copy after returning: "
+                        f"summary={active_summary!r} state={returned!r}"
+                    )
+                break
+            time.sleep(0.08)
+        else:
+            raise AssertionError(
+                "manual session copy drifted after switching away and back: "
+                f"expected_title={rename_target!r} expected_summary={summary_before_switch!r} state={returned!r}"
+            )
+
+        return {
+            "target_path": target_path,
+            "rename_target": rename_target,
+            "open_click": open_click,
+            "menu_rect": dom_rect(opened, "context_menu_rect"),
+            "rename_rect": rename_rect,
+            "rename_click": rename_click,
+            "typed_progress": typed_progress,
+            "tree_rename_input_rect": dom_rect(renamed, "tree_rename_input_rect"),
+            "summary_before_switch": summary_before_switch,
+            "summary_after_return": str(returned.get("active_summary") or "").strip(),
+            "return_click": return_click,
+            "secondary_session": secondary_session,
+        }
+    finally:
+        for session_path in reversed(created_paths):
+            if not session_path:
+                continue
+            try:
+                app_remove_session(pid, session_path)
+            except Exception:
+                pass
 
 
 def assert_context_menu_delete_session(pid: int) -> dict:
@@ -8783,6 +9081,58 @@ def assert_context_menu_delete_session(pid: int) -> dict:
         "created": created,
         "deleted": deleted,
     }
+
+
+def assert_live_session_close_button(pid: int) -> dict:
+    created = app_create_terminal(pid, title="Smoke Close Button")
+    target_path = str(created.get("active_session_path") or "").strip()
+    if not target_path:
+        raise AssertionError(f"terminal create did not return an active session path: {created!r}")
+    try:
+        wait_for_interactive_session(pid, target_path, timeout_seconds=20.0)
+        live_row = wait_for_visible_live_sidebar_row(pid, target_path, kind="Session", timeout_seconds=8.0)
+        close_rect = live_row.get("live_close_rect") or {}
+        if not rect_is_visible(close_rect):
+            raise AssertionError(f"live session close rect is missing: {live_row!r}")
+        close_click = xdotool_click_window(
+            pid,
+            rect_center_x(close_rect),
+            rect_center_y(close_rect),
+        )
+        dialog_state = {}
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            dialog_state = app_state(pid)
+            if rect_is_visible(dom_rect(dialog_state, "delete_confirm_dialog_rect")):
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError(
+                f"live session close button did not open the delete confirmation dialog: {dialog_state!r}"
+            )
+        confirm_rect = dom_rect(dialog_state, "delete_confirm_action_rect")
+        if not rect_is_visible(confirm_rect):
+            raise AssertionError(f"delete confirmation action is missing after live close click: {dialog_state!r}")
+        confirm_click = xdotool_click_window(
+            pid,
+            rect_center_x(confirm_rect),
+            rect_center_y(confirm_rect),
+        )
+        settled = wait_for_sidebar_path_absent(pid, target_path, timeout_seconds=12.0)
+        return {
+            "target_path": target_path,
+            "close_rect": close_rect,
+            "close_click": close_click,
+            "delete_confirm_dialog_rect": dom_rect(dialog_state, "delete_confirm_dialog_rect"),
+            "delete_confirm_action_rect": confirm_rect,
+            "delete_confirm_click": confirm_click,
+            "post_delete_active_session_path": settled.get("active_session_path"),
+        }
+    finally:
+        try:
+            app_remove_session(pid, target_path)
+        except Exception:
+            pass
 
 
 def assert_focus_and_visibility(pid: int, state: dict) -> dict:
@@ -9034,6 +9384,129 @@ def assert_busy_icon_lifecycle(pid: int, session: str, *, sleep_seconds: int = 3
     }
 
 
+def assert_live_sessions_tree_contract(pid: int) -> dict:
+    deadline = time.time() + 8.0
+    state = {}
+    dom_rows = []
+    while time.time() < deadline:
+        state = app_state(pid)
+        dom_rows = ((state.get("dom") or {}).get("sidebar_visible_rows") or [])
+        if dom_rows:
+            break
+        time.sleep(0.1)
+    if not dom_rows:
+        raise AssertionError(f"sidebar dom rows are missing from app state: {state!r}")
+    snapshot = server_snapshot()
+
+    live_group_index = next(
+        (
+            index
+            for index, row in enumerate(dom_rows)
+            if str(row.get("path") or "") == "__live_sessions__"
+        ),
+        None,
+    )
+    live_group_children = []
+    if live_group_index is not None:
+        if live_group_index != 0:
+            raise AssertionError(
+                f"Live Sessions should be the first visible sidebar group when present: "
+                f"index={live_group_index} rows={dom_rows!r}"
+            )
+        for row in dom_rows[live_group_index + 1 :]:
+            if int(row.get("depth") or 0) <= 0:
+                break
+            live_group_children.append(row)
+    snapshot_live_sessions = {
+        normalize_live_path(str(entry.get("session_path") or "")): entry
+        for entry in (snapshot.get("live_sessions") or [])
+        if str(entry.get("session_path") or "").strip()
+    }
+    if snapshot_live_sessions and live_group_index is None:
+        raise AssertionError(
+            f"live sessions exist in the server snapshot but the sidebar omitted Live Sessions: "
+            f"{sorted(snapshot_live_sessions)!r}"
+        )
+    if live_group_index is not None and not live_group_children:
+        raise AssertionError("Live Sessions is visible but empty")
+    live_group_documents = [
+        row
+        for row in live_group_children
+        if str(row.get("kind") or "") == "Document"
+    ]
+    if live_group_documents:
+        raise AssertionError(
+            f"Live Sessions contains document rows instead of only live terminals: {live_group_documents!r}"
+        )
+    cached_live_rows = [
+        row
+        for row in live_group_children
+        if str(row.get("machine_health") or "").strip().lower() == "cached"
+    ]
+    if cached_live_rows:
+        raise AssertionError(
+            f"Live Sessions still contains cached rows instead of only actual live sessions: {cached_live_rows!r}"
+        )
+    live_close_missing = [
+        row
+        for row in live_group_children
+        if str(row.get("kind") or "").strip() == "Session"
+        and not rect_is_visible(row.get("live_close_rect") or {})
+    ]
+    if live_close_missing:
+        raise AssertionError(
+            f"live session rows are missing the close affordance: {live_close_missing!r}"
+        )
+    invalid_busy_live_rows = []
+    for row in live_group_children:
+        row_path = normalize_live_path(str(row.get("path") or ""))
+        session_entry = snapshot_live_sessions.get(row_path)
+        if session_entry is None:
+            continue
+        row_busy = bool(row.get("busy")) or str(row.get("icon_kind") or "") == "busy"
+        terminal_foreground_active = session_entry.get("terminal_foreground_active")
+        if row_busy and terminal_foreground_active is not True:
+            invalid_busy_live_rows.append(
+                {
+                    "row": row,
+                    "snapshot": {
+                        "launch_phase": session_entry.get("launch_phase"),
+                        "source": session_entry.get("source"),
+                        "status_line": session_entry.get("status_line"),
+                        "terminal_foreground_active": terminal_foreground_active,
+                    },
+                }
+            )
+    if invalid_busy_live_rows:
+        raise AssertionError(
+            "restored live-session rows are still showing busy without a real foreground process: "
+            f"{invalid_busy_live_rows!r}"
+        )
+    invalid_cached_ready_machine_rows = [
+        row
+        for row in dom_rows
+        if str(row.get("path") or "").startswith("__remote_machine__/")
+        and str(row.get("machine_health") or "").strip().lower() == "cached"
+        and str(row.get("remote_deploy_state") or "").strip() == "Ready"
+        and int(row.get("child_count") or 0) > 0
+    ]
+    if invalid_cached_ready_machine_rows:
+        raise AssertionError(
+            "remote machine rows are still painted as cached/warning even though a ready remote runtime and sessions exist: "
+            f"{invalid_cached_ready_machine_rows!r}"
+        )
+    return {
+        "live_group_present": live_group_index is not None,
+        "live_group_index": live_group_index,
+        "live_group_child_count": len(live_group_children),
+        "live_group_document_count": len(live_group_documents),
+        "live_close_count": len(live_group_children) - len(live_close_missing) - len(live_group_documents),
+        "invalid_busy_live_row_count": len(invalid_busy_live_rows),
+        "invalid_cached_ready_machine_row_count": len(invalid_cached_ready_machine_rows),
+        "snapshot_live_session_count": len(snapshot_live_sessions),
+    }
+
+
 def assert_sidebar_contract(pid: int, session: str) -> dict:
     state = app_state(pid)
     host = active_host(state)
@@ -9052,9 +9525,13 @@ def assert_sidebar_contract(pid: int, session: str) -> dict:
     )
     live_group_children = []
     if live_group_index is not None:
+        if live_group_index != 0:
+            raise AssertionError(
+                f"Live Sessions should be the first visible sidebar group when present: "
+                f"index={live_group_index} rows={dom_rows!r}"
+            )
         for row in dom_rows[live_group_index + 1 :]:
-            path = str(row.get("path") or "")
-            if path.startswith("__remote_machine__/") or path == "local":
+            if int(row.get("depth") or 0) <= 0:
                 break
             live_group_children.append(row)
     if live_group_index is not None and not live_group_children:
@@ -9076,6 +9553,16 @@ def assert_sidebar_contract(pid: int, session: str) -> dict:
     if cached_live_rows:
         raise AssertionError(
             f"Live Sessions still contains cached rows instead of only actual live sessions: {cached_live_rows!r}"
+        )
+    live_close_missing = [
+        row
+        for row in live_group_children
+        if str(row.get("kind") or "").strip() == "Session"
+        and not rect_is_visible(row.get("live_close_rect") or {})
+    ]
+    if live_close_missing:
+        raise AssertionError(
+            f"live session rows are missing the close affordance: {live_close_missing!r}"
         )
     snapshot_live_sessions = {
         normalize_live_path(str(entry.get("session_path") or "")): entry
@@ -9204,8 +9691,10 @@ def assert_sidebar_contract(pid: int, session: str) -> dict:
 
     return {
         "live_group_present": live_group_index is not None,
+        "live_group_index": live_group_index,
         "live_group_child_count": len(live_group_children),
         "live_group_document_count": len(live_group_documents),
+        "live_close_count": len(live_group_children) - len(live_close_missing) - len(live_group_documents),
         "browser_selected_row": browser_selected_row,
         "selected_busy": selected_busy,
         "selected_icon_kind": selected_icon_kind,
@@ -9266,6 +9755,33 @@ def assert_live_session_metadata_consistency(pid: int, session: str) -> dict:
         )
     return {
         "row_count": len(rows),
+        "active_title": active_title,
+        "active_summary": active_summary,
+    }
+
+
+def assert_active_session_copy_quality(pid: int) -> dict:
+    state = app_state(pid)
+    active_session_path = str(state.get("active_session_path") or "").strip()
+    active_title = str(state.get("active_title") or "").strip()
+    active_summary = str(state.get("active_summary") or "").strip()
+    if not active_session_path:
+        raise AssertionError(f"missing active session path for copy quality check: {state!r}")
+    if contains_terminal_control_bytes(active_title) or looks_like_shell_prompt_copy(active_title):
+        raise AssertionError(
+            f"active title degraded into terminal-control or prompt copy: title={active_title!r} state={state!r}"
+        )
+    if active_summary and (
+        contains_terminal_control_bytes(active_summary)
+        or looks_like_shell_prompt_copy(active_summary)
+        or looks_like_shell_command_copy(active_summary)
+    ):
+        raise AssertionError(
+            "active summary degraded into raw terminal prompt/control text instead of stable session copy: "
+            f"summary={active_summary!r} state={state!r}"
+        )
+    return {
+        "active_session_path": active_session_path,
         "active_title": active_title,
         "active_summary": active_summary,
     }
@@ -11223,6 +11739,28 @@ def main() -> int:
     disposable_codex_session: str | None = None
     disposable_codex_create: dict | None = None
     selected_checks = set(args.only_check)
+    late_phase_required_checks = {
+        "renderer",
+        "readability",
+        "cursor",
+        "cursor_glyph",
+        "cursor_focus_blur",
+        "cursor_mouse_hold",
+        "live_sessions_restore",
+        "selection",
+        "terminal_interaction_latency",
+        "clipboard_image",
+        "partial_input",
+        "scroll",
+        "hidden_cursor_tui",
+        "codex_session_tui_vitality",
+        "status_command",
+        "local_tree",
+        "sidebar_contract",
+        "live_session_metadata",
+        "local_runtime",
+        "hot_session_switch",
+    }
     no_session_setup_checks = {
         "background_blur",
         "client_memory_budget",
@@ -11235,6 +11773,7 @@ def main() -> int:
         "search_focus_overlay",
         "settings_terminal_reclaim",
         "theme_editor_contract",
+        "active_session_copy_quality",
         "titlebar_autohide_hover",
         "titlebar_centering",
         "titlebar_empty_lane_window_controls",
@@ -11242,6 +11781,10 @@ def main() -> int:
         "titlebar_new_menu_shell",
         "titlebar_overflow_menu",
         "titlebar_session_shell",
+        "context_menu_rename_session",
+        "live_session_close_button",
+        "live_session_metadata_consistency",
+        "live_sessions_tree_contract",
         "webkit_child_rss_soak",
     }
     needs_session_setup = not selected_checks or not selected_checks.issubset(
@@ -11251,10 +11794,14 @@ def main() -> int:
     initial_state = app_state(args.pid)
     initial_prompt_pixels = None
     if needs_session_setup:
-        if args.session_kind != "codex" and (
+        if (
+            args.session_kind != "codex"
+            and not (args.session_kind == "plain" and args.session == "local://remote-smoke")
+            and (
             args.reopen
             or (initial_state.get("active_session_path") != args.session)
             or (initial_state.get("active_view_mode") != "Terminal")
+            )
         ):
             app_open(args.pid, args.session, view="terminal")
         initial_settle = "interactive_only"
@@ -11323,9 +11870,10 @@ def main() -> int:
         run_check("focus", lambda: assert_focus_and_visibility(args.pid, state))
         run_check("geometry", lambda: assert_geometry(state))
         run_check("notification_health_initial", lambda: assert_no_problem_notifications(state, context="initial"))
-        titlebar_state, titlebar_centering = wait_for_titlebar_centering(args.pid)
-        state = titlebar_state
-        run_check("titlebar_centering", lambda: titlebar_centering)
+        if not selected_checks or "titlebar_centering" in selected_checks:
+            titlebar_state, titlebar_centering = wait_for_titlebar_centering(args.pid)
+            state = titlebar_state
+            run_check("titlebar_centering", lambda: titlebar_centering)
         run_check("terminal_viewport_inset", lambda: assert_terminal_viewport_inset(state))
         run_check("background_blur", lambda: assert_background_blur_contract(args.pid))
         run_check("sidebar_resize", lambda: assert_sidebar_resize_persists_to_settings(args.pid))
@@ -11337,11 +11885,14 @@ def main() -> int:
             "live_session_metadata_consistency",
             lambda: assert_live_session_metadata_consistency(args.pid, args.session),
         )
+        run_check("active_session_copy_quality", lambda: assert_active_session_copy_quality(args.pid))
         run_check("titlebar_overflow_menu", lambda: assert_titlebar_overflow_menu_contract(args.pid))
         run_check("settings_terminal_reclaim", lambda: assert_settings_terminal_reclaim_contract(args.pid))
         run_check("right_panel_animation", lambda: assert_right_panel_animation_contract(args.pid))
+        run_check("live_sessions_tree_contract", lambda: assert_live_sessions_tree_contract(args.pid))
         run_check("context_menu_rename_session", lambda: assert_context_menu_rename_session(args.pid))
         run_check("context_menu_delete_session", lambda: assert_context_menu_delete_session(args.pid))
+        run_check("live_session_close_button", lambda: assert_live_session_close_button(args.pid))
         run_check(
             "titlebar_empty_lane_window_controls",
             lambda: assert_titlebar_empty_lane_window_controls_contract(args.pid, out_dir),
@@ -11362,7 +11913,10 @@ def main() -> int:
         run_check("client_memory_budget", lambda: assert_client_memory_budget(args.pid))
         late_phase_session = args.session
         late_phase_session_reset: dict | None = None
-        if args.session:
+        late_phase_needed = bool(args.session) and (
+            not selected_checks or not late_phase_required_checks.isdisjoint(selected_checks)
+        )
+        if late_phase_needed:
             if args.session_kind == "plain":
                 try:
                     late_phase_session_reset = ensure_plain_shell_runtime(args.pid, args.session)
