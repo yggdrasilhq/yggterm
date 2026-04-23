@@ -97,7 +97,8 @@ use yggterm_server::{
     YGG_LOADING_NOTIFICATION_AFTER_MS, YggOperationPriority, YggRequestMeta, YggSurface, YggTarget,
     YggtermServer, app_control_requests_pending, cleanup_legacy_daemons,
     complete_app_control_request, connect_ssh_custom, fetch_remote_generation_context,
-    focus_live_with_view, local_headless_companion_executable_from_current,
+    focus_live_with_view, local_daemon_socket_should_be_removed_for_spawn,
+    local_headless_companion_executable_from_current,
     managed_cli_refresh_ttl_ms, open_remote_session_with_view, open_stored_session,
     open_stored_session_with_view, persist_remote_generated_copy, ping,
     refresh_local_managed_cli_now, refresh_managed_cli, refresh_preview, refresh_remote_machine,
@@ -107,6 +108,7 @@ use yggterm_server::{
     start_command_session, start_local_session_at, start_ssh_session_at, status,
     take_next_app_control_request, terminal_ensure, terminal_read, terminal_resize,
     terminal_snapshot, terminal_write, toggle_preview_block as daemon_toggle_preview_block,
+    update_session_copy as daemon_update_session_copy,
 };
 use yggui::{
     ChromePalette, DragDropPlacement, DragDropTarget, DragGhostCard, DragGhostPalette,
@@ -405,6 +407,7 @@ struct ShellState {
     last_dock_signature: Option<DockSignature>,
     last_terminal_debug: String,
     last_tree_debug: String,
+    session_title_overrides: BTreeMap<String, String>,
     generated_precis: BTreeMap<String, String>,
     generated_summaries: BTreeMap<String, String>,
     cached_hot_session_views: HashMap<String, ManagedSessionView>,
@@ -414,6 +417,7 @@ struct ShellState {
     precis_requests_in_flight: HashSet<String>,
     summary_requests_in_flight: HashSet<String>,
     active_copy_hydration_in_flight: HashSet<String>,
+    store_copy_hydrated_session_ids: HashSet<String>,
     passive_copy_suspended: bool,
     passive_copy_failures: HashSet<String>,
     copy_retry_after_ms: HashMap<String, u64>,
@@ -450,6 +454,7 @@ struct ShellState {
     suppress_tree_click_until_ms: u64,
     pending_delete: Option<PendingDeleteDialog>,
     tree_rename_path: Option<String>,
+    tree_rename_depth: Option<usize>,
     tree_rename_value: String,
     tree_rename_started_at_ms: u64,
     tree_rename_input_focused_once: bool,
@@ -1214,6 +1219,7 @@ impl ShellState {
             last_dock_signature: None,
             last_terminal_debug: "terminal debug idle".to_string(),
             last_tree_debug: "tree debug idle".to_string(),
+            session_title_overrides: BTreeMap::new(),
             generated_precis: BTreeMap::new(),
             generated_summaries: BTreeMap::new(),
             cached_hot_session_views: HashMap::new(),
@@ -1223,6 +1229,7 @@ impl ShellState {
             precis_requests_in_flight: HashSet::new(),
             summary_requests_in_flight: HashSet::new(),
             active_copy_hydration_in_flight: HashSet::new(),
+            store_copy_hydrated_session_ids: HashSet::new(),
             passive_copy_suspended: false,
             passive_copy_failures: HashSet::new(),
             copy_retry_after_ms: HashMap::new(),
@@ -1259,6 +1266,7 @@ impl ShellState {
             suppress_tree_click_until_ms: 0,
             pending_delete: None,
             tree_rename_path: None,
+            tree_rename_depth: None,
             tree_rename_input_focused_once: false,
             tree_rename_value: String::new(),
             tree_rename_started_at_ms: 0,
@@ -1605,6 +1613,7 @@ impl ShellState {
             &mut merged_rows,
             &sidebar_hot_sessions,
             self.server.remote_machines(),
+            &self.session_title_overrides,
             &self.generated_summaries,
         );
         let rows = filtered_sidebar_rows(&merged_rows, effective_search_query);
@@ -1878,6 +1887,7 @@ impl ShellState {
             &mut rows,
             &live_sessions,
             self.server.remote_machines(),
+            &self.session_title_overrides,
             &self.generated_summaries,
         );
         search_sidebar_matches(&rows, &self.search_query)
@@ -3184,6 +3194,7 @@ impl ShellState {
             .collect::<Vec<_>>();
         for (session_path, title_hint, precis, summary) in cached {
             if !title_hint.trim().is_empty() && !looks_like_generated_fallback_title(&title_hint) {
+                remember_session_title_override(self, &session_path, &title_hint);
                 self.server
                     .set_session_title_hint(&session_path, &title_hint);
             }
@@ -4157,6 +4168,38 @@ impl ShellState {
         }
         self.refresh_tree_debug("open_delete_dialog");
     }
+    fn open_delete_dialog_for_row(&mut self, row: &BrowserRow, hard_delete: bool) {
+        let mut pending = PendingDeleteDialog {
+            document_paths: Vec::new(),
+            group_paths: Vec::new(),
+            session_paths: Vec::new(),
+            ssh_machine_keys: Vec::new(),
+            labels: vec![row.label.clone()],
+            hard_delete,
+        };
+        match row.kind {
+            BrowserRowKind::Document => pending.document_paths.push(row.full_path.clone()),
+            BrowserRowKind::Group | BrowserRowKind::Separator => {
+                pending.group_paths.push(row.full_path.clone())
+            }
+            BrowserRowKind::Session => pending.session_paths.push(row.full_path.clone()),
+        }
+        if pending.document_paths.is_empty()
+            && pending.group_paths.is_empty()
+            && pending.session_paths.is_empty()
+            && pending.ssh_machine_keys.is_empty()
+        {
+            return;
+        }
+        self.pending_delete = Some(pending);
+        self.close_context_menu();
+        self.last_action = if hard_delete {
+            format!("deleting {}", row.label)
+        } else {
+            format!("confirm delete {}", row.label)
+        };
+        self.refresh_tree_debug("open_delete_dialog_for_row");
+    }
     fn cancel_delete_dialog(&mut self) {
         self.pending_delete = None;
         self.refresh_tree_debug("cancel_delete_dialog");
@@ -4167,6 +4210,7 @@ impl ShellState {
         }
         self.select_tree_row(row, TreeSelectionMode::Replace);
         self.tree_rename_path = Some(row.full_path.clone());
+        self.tree_rename_depth = Some(row.depth);
         self.tree_rename_value = row.label.clone();
         self.tree_rename_started_at_ms = current_millis();
         self.tree_rename_input_focused_once = false;
@@ -4183,6 +4227,7 @@ impl ShellState {
     }
     fn cancel_tree_rename(&mut self) {
         self.tree_rename_path = None;
+        self.tree_rename_depth = None;
         self.tree_rename_value.clear();
         self.tree_rename_started_at_ms = 0;
         self.tree_rename_input_focused_once = false;
@@ -5170,7 +5215,7 @@ fn spawn_title_generation_for_target(
             "ok": outcome.as_ref().is_ok_and(|result| result.is_ok()),
         }));
         let emit_completion = announce;
-        state.with_mut(|shell| match outcome {
+        let persist_request = state.with_mut(|shell| match outcome {
             Ok(Ok((Some(title), browser_tree))) => {
                 shell.title_requests_in_flight.remove(&session_path);
                 shell
@@ -5182,7 +5227,13 @@ fn spawn_title_generation_for_target(
                 if let Some(browser_tree) = browser_tree {
                     restore_browser_tree(shell, browser_tree, Some(&target.session_path));
                 }
+                remember_session_title_override(shell, &target.session_path, &title);
                 shell.server.set_session_title_hint(&target.session_path, &title);
+                let should_persist_live_hint = shell
+                    .server
+                    .live_sessions()
+                    .iter()
+                    .any(|session| session.session_path == target.session_path);
                 shell.last_action = if force {
                     "regenerated title".to_string()
                 } else {
@@ -5195,6 +5246,13 @@ fn spawn_title_generation_for_target(
                     format!("Session is now titled “{title}”."),
                     emit_completion,
                 );
+                should_persist_live_hint.then(|| {
+                    (
+                        shell.bootstrap.server_endpoint.clone(),
+                        target.session_path.clone(),
+                        Some(title.clone()),
+                    )
+                })
             }
             Ok(Ok((None, _))) => {
                 shell.title_requests_in_flight.remove(&session_path);
@@ -5222,6 +5280,7 @@ fn spawn_title_generation_for_target(
                 } else {
                     shell.clear_job_notification(&job_key);
                 }
+                None
             }
             Ok(Err(error)) => {
                 shell.title_requests_in_flight.remove(&session_path);
@@ -5250,6 +5309,7 @@ fn spawn_title_generation_for_target(
                 } else {
                     shell.clear_job_notification(&job_key);
                 }
+                None
             }
             Err(error) => {
                 shell.title_requests_in_flight.remove(&session_path);
@@ -5278,8 +5338,21 @@ fn spawn_title_generation_for_target(
                 } else {
                     shell.clear_job_notification(&job_key);
                 }
+                None
             }
         });
+        if let Some((endpoint, session_path, title)) = persist_request {
+            spawn_persist_session_copy_hints(
+                state,
+                endpoint,
+                session_path,
+                title,
+                None,
+                None,
+                false,
+                "Title",
+            );
+        }
         if schedule_active_retry {
             schedule_active_title_retry_after_failure(state, &session_path);
         }
@@ -5634,18 +5707,25 @@ fn spawn_summary_generation_for_target(
             "announce": announce,
             "ok": outcome.as_ref().is_ok_and(|result| result.is_ok()),
         }));
-        state.with_mut(|shell| {
+        let persist_request = state.with_mut(|shell| {
             shell.summary_requests_in_flight.remove(&session_path);
             match outcome {
                 Ok(Ok(Some(summary))) => {
                     shell
                         .generated_summaries
                         .insert(session_path.clone(), summary);
+                    let mut persisted_summary = None::<String>;
                     if let Some(summary) = shell.generated_summaries.get(&session_path).cloned() {
                         shell
                             .server
                             .set_session_summary_hint(&session_path, &summary);
+                        persisted_summary = Some(summary);
                     }
+                    let should_persist_live_hint = shell
+                        .server
+                        .live_sessions()
+                        .iter()
+                        .any(|session| session.session_path == session_path);
                     shell
                         .passive_copy_failures
                         .remove(&background_copy_retry_key("summary", &session_path));
@@ -5659,6 +5739,13 @@ fn spawn_summary_generation_for_target(
                         "Updated the preview summary from recent session context.",
                         announce,
                     );
+                    should_persist_live_hint.then(|| {
+                        (
+                            shell.bootstrap.server_endpoint.clone(),
+                            session_path.clone(),
+                            persisted_summary,
+                        )
+                    })
                 }
                 Ok(Ok(None)) => {
                     if !announce && !force {
@@ -5683,6 +5770,7 @@ fn spawn_summary_generation_for_target(
                     } else {
                         shell.clear_job_notification(&job_key);
                     }
+                    None
                 }
                 Ok(Err(error)) => {
                     if !announce && !force {
@@ -5708,6 +5796,7 @@ fn spawn_summary_generation_for_target(
                     } else {
                         shell.clear_job_notification(&job_key);
                     }
+                    None
                 }
                 Err(error) => {
                     if !announce && !force {
@@ -5733,9 +5822,22 @@ fn spawn_summary_generation_for_target(
                     } else {
                         shell.clear_job_notification(&job_key);
                     }
+                    None
                 }
             }
         });
+        if let Some((endpoint, session_path, summary)) = persist_request {
+            spawn_persist_session_copy_hints(
+                state,
+                endpoint,
+                session_path,
+                None,
+                None,
+                summary,
+                false,
+                "Summary",
+            );
+        }
         maybe_spawn_background_copy_generation(state);
     });
 }
@@ -6612,7 +6714,7 @@ fn restart_daemon(endpoint: &ServerEndpoint) -> Result<()> {
 fn prepare_current_endpoint_for_spawn(endpoint: &ServerEndpoint) -> Result<()> {
     #[cfg(unix)]
     if let ServerEndpoint::UnixSocket(path) = endpoint {
-        if server_socket_path_lexists(path) && ping(endpoint).is_err() {
+        if local_daemon_socket_should_be_removed_for_spawn(endpoint, path) {
             let _ = std::fs::remove_file(path);
         }
     }
@@ -7158,6 +7260,61 @@ fn maybe_spawn_background_live_session_snapshot(state: Signal<ShellState>) {
         );
     });
 }
+
+fn spawn_persist_session_copy_hints(
+    state: Signal<ShellState>,
+    endpoint: ServerEndpoint,
+    session_path: String,
+    title: Option<String>,
+    precis: Option<String>,
+    summary: Option<String>,
+    announce_failure: bool,
+    failure_label: &'static str,
+) {
+    if title.is_none() && precis.is_none() && summary.is_none() {
+        return;
+    }
+    let session_path_for_request = session_path.clone();
+    spawn(async move {
+        let outcome = task::spawn_blocking(move || -> Result<Option<String>> {
+            daemon_update_session_copy(
+                &endpoint,
+                &session_path_for_request,
+                title.as_deref(),
+                precis.as_deref(),
+                summary.as_deref(),
+            )
+        })
+        .await;
+        let error = match outcome {
+            Ok(Ok(_)) => None,
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(error) => Some(error.to_string()),
+        };
+        if let Some(error) = error {
+            warn!(
+                session_path=%session_path,
+                failure_label,
+                error=%error,
+                "failed to persist session copy hints to daemon"
+            );
+            if announce_failure {
+                let _ = safe_shell_mut(state, "persist_session_copy_hints_failure", |shell| {
+                    shell.last_action =
+                        format!("{} update failed for {}", failure_label, session_path);
+                    shell.push_notification(
+                        NotificationTone::Warning,
+                        format!("{failure_label} Update Deferred"),
+                        format!(
+                            "Saved locally, but the daemon could not persist it yet: {error}"
+                        ),
+                    );
+                });
+            }
+        }
+    });
+}
+
 fn spawn_background_managed_cli_refresh(state: Signal<ShellState>, scope_key: String) {
     let endpoint = state.read().bootstrap.server_endpoint.clone();
     let mut request_meta = if scope_key == "local" {
@@ -8151,6 +8308,7 @@ fn resolve_app_control_row(shell: &ShellState, session_path: &str) -> Option<Bro
         &mut merged_rows,
         &shell.server.live_sessions(),
         shell.server.remote_machines(),
+        &shell.session_title_overrides,
         &shell.generated_summaries,
     );
     filtered_sidebar_rows(&merged_rows, "")
@@ -8176,7 +8334,20 @@ fn synthesize_app_control_row(shell: &ShellState, session_path: &str) -> Option<
             session.session_path.clone(),
             session.id.clone(),
         )]);
-        let label = live_session_label_with_index(&remote_session_index, &session, &short_ids);
+        let normalized_path = normalize_live_session_path(session_path);
+        let label = shell
+            .session_title_overrides
+            .get(&normalized_path)
+            .cloned()
+            .or_else(|| {
+                shell
+                    .session_title_overrides
+                    .get(&session.session_path)
+                    .cloned()
+            })
+            .unwrap_or_else(|| {
+                live_session_label_with_index(&remote_session_index, &session, &short_ids)
+            });
         let detail_label = live_session_summary_with_index(&remote_session_index, &session);
         return Some(BrowserRow {
             kind: if session.kind == SessionKind::Document {
@@ -8184,7 +8355,7 @@ fn synthesize_app_control_row(shell: &ShellState, session_path: &str) -> Option<
             } else {
                 BrowserRowKind::Session
             },
-            full_path: normalize_live_session_path(session_path),
+            full_path: normalized_path,
             label: label.clone(),
             detail_label,
             document_kind: (session.kind == SessionKind::Document)
@@ -8276,6 +8447,16 @@ fn session_cwd_for_managed_session(session: &ManagedSessionView) -> Option<Strin
         .find(|entry| entry.label == "Path")
         .map(|entry| entry.value.clone())
         .or_else(|| session.ssh_target.clone())
+}
+fn remember_session_title_override(shell: &mut ShellState, session_path: &str, title: &str) {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        shell.session_title_overrides.remove(session_path);
+        return;
+    }
+    shell
+        .session_title_overrides
+        .insert(session_path.to_string(), title.to_string());
 }
 fn fallback_label_for_session_path(session_path: &str) -> String {
     Path::new(session_path)
@@ -9485,9 +9666,7 @@ fn restore_browser_tree(
     let expanded_paths = shell.browser.expanded_paths();
     let synthetic_expanded_paths = expanded_paths
         .iter()
-        .filter(|path| {
-            path.starts_with("__remote_machine__/") || path.starts_with("__remote_folder__/")
-        })
+        .filter(|path| path.starts_with("__"))
         .cloned()
         .collect::<Vec<_>>();
     shell.browser = SessionBrowserState::new(browser_tree);
@@ -9646,6 +9825,29 @@ fn schedule_active_title_autogen_retry_tick(
         }
     });
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActiveCopyRefreshPlan {
+    hydrate_copy: bool,
+    request_title_generation: bool,
+    request_summary_generation: bool,
+    schedule_background_scan: bool,
+}
+
+fn active_session_copy_refresh_plan(
+    source: SessionSource,
+    has_summary: bool,
+    should_request_title_generation: bool,
+    summary_stale: bool,
+) -> ActiveCopyRefreshPlan {
+    let allow_focus_time_generation = source != SessionSource::Stored;
+    let hydrate_copy = should_request_title_generation || !has_summary;
+    ActiveCopyRefreshPlan {
+        hydrate_copy,
+        request_title_generation: allow_focus_time_generation && should_request_title_generation,
+        request_summary_generation: allow_focus_time_generation && !has_summary,
+        schedule_background_scan: allow_focus_time_generation && (hydrate_copy || summary_stale),
+    }
+}
 fn maybe_request_copy_generation_for_session(
     mut state: Signal<ShellState>,
     session: ManagedSessionView,
@@ -9692,10 +9894,17 @@ fn maybe_request_copy_generation_for_session(
     {
         schedule_active_title_autogen_retry_tick(state, session.session_path.clone(), delay_ms);
     }
+    let refresh_plan =
+        active_session_copy_refresh_plan(
+            session.source,
+            has_summary,
+            should_request_title_generation,
+            summary_stale,
+        );
     let mut requested_background_scan = false;
-    if should_request_title_generation || !has_summary || summary_stale {
+    if refresh_plan.hydrate_copy {
         spawn_active_session_copy_hydration(state, session.clone());
-        if should_request_title_generation {
+        if refresh_plan.request_title_generation {
             state.with_mut(|shell| {
                 shell.title_autogen_retry_after_ms.insert(
                     session.session_path.clone(),
@@ -9712,14 +9921,40 @@ fn maybe_request_copy_generation_for_session(
             );
             queue_active_session_title_generation_silent(state, false);
         }
-        if !has_summary || summary_stale {
+        if refresh_plan.request_summary_generation {
             spawn_summary_generation(state, session, false, false);
         }
+    }
+    if refresh_plan.schedule_background_scan {
         requested_background_scan =
             state.with_mut(|shell| schedule_background_copy_scan_now(shell, now_ms));
     }
     if requested_background_scan {
         maybe_spawn_background_copy_generation(state);
+    }
+}
+fn session_needs_store_copy_hydration(
+    shell: &ShellState,
+    session: &ManagedSessionView,
+) -> bool {
+    supports_generated_session_copy(session)
+        && !shell
+            .store_copy_hydrated_session_ids
+            .contains(&session.id)
+        && (resolved_session_summary(shell, session).is_none()
+            || active_session_title_needs_generation(shell, session))
+}
+fn maybe_prime_live_session_store_copy(state: Signal<ShellState>) {
+    let sessions = {
+        let shell = state.read();
+        shell.server
+            .live_sessions()
+            .into_iter()
+            .filter(|session| session_needs_store_copy_hydration(&shell, session))
+            .collect::<Vec<_>>()
+    };
+    for session in sessions {
+        spawn_active_session_copy_hydration(state, session);
     }
 }
 fn schedule_background_copy_scan_now(shell: &mut ShellState, now_ms: u64) -> bool {
@@ -10089,30 +10324,43 @@ fn remote_generated_copy_from_machines(
     })
 }
 fn resolved_session_title(shell: &ShellState, session: &ManagedSessionView) -> Option<String> {
+    if let Some(title) = shell
+        .session_title_overrides
+        .get(&session.session_path)
+        .cloned()
+    {
+        return Some(title);
+    }
     let copy_target = copy_generation_target_for_session(&shell.server, session);
     let copy_cwd = copy_target
         .as_ref()
         .map(|target| target.cwd.trim())
         .unwrap_or_default();
-    let browser_row_title = shell
-        .browser
-        .rows()
-        .iter()
-        .find(|row| row.full_path == session.session_path)
-        .and_then(|row| {
-            row.session_title
-                .clone()
-                .or_else(|| (!row.label.trim().is_empty()).then(|| row.label.clone()))
-        })
+    let browser_row = browser_row_for_session_identity(shell, session);
+    let browser_row_session_title = browser_row
+        .and_then(|row| row.session_title.clone())
         .filter(|title| !title_is_low_signal_for_copy(title, copy_cwd));
-    if browser_row_title.is_some() {
-        return browser_row_title;
+    if browser_row_session_title.is_some() {
+        return browser_row_session_title;
     }
     let local_shell_abbreviated_title =
         matches!(
             (session.source, session.kind),
             (SessionSource::LiveLocal, SessionKind::Shell)
         ) && title_looks_like_abbreviated_shell_label(&session.title);
+    if !matches!(session.source, SessionSource::Stored)
+        && !session.title.trim().is_empty()
+        && !title_is_low_signal_for_copy(&session.title, copy_cwd)
+        && !local_shell_abbreviated_title
+    {
+        return Some(session.title.clone());
+    }
+    let browser_row_title = browser_row
+        .and_then(|row| (!row.label.trim().is_empty()).then(|| row.label.clone()))
+        .filter(|title| !title_is_low_signal_for_copy(title, copy_cwd));
+    if browser_row_title.is_some() {
+        return browser_row_title;
+    }
     if !session.title.trim().is_empty()
         && !title_is_low_signal_for_copy(&session.title, copy_cwd)
         && !local_shell_abbreviated_title
@@ -10138,6 +10386,16 @@ fn resolved_session_title(shell: &ShellState, session: &ManagedSessionView) -> O
     copy_target
         .as_ref()
         .and_then(humanized_title_for_copy_target)
+}
+fn browser_row_for_session_identity<'a>(
+    shell: &'a ShellState,
+    session: &ManagedSessionView,
+) -> Option<&'a BrowserRow> {
+    shell.browser.rows().iter().find_map(|row| {
+        (row.full_path == session.session_path
+            || row.session_id.as_deref() == Some(session.id.as_str()))
+        .then_some(row)
+    })
 }
 fn title_looks_like_abbreviated_shell_label(title: &str) -> bool {
     let trimmed = title.trim();
@@ -10185,14 +10443,8 @@ fn active_session_title_needs_generation(shell: &ShellState, session: &ManagedSe
     let fallback_row_title = shell
         .active_browser_selection_path_for_session()
         .as_deref()
-        .or(Some(session.session_path.as_str()))
-        .and_then(|path| {
-            shell
-                .browser
-                .rows()
-                .iter()
-                .find(|row| row.full_path == path)
-        })
+        .and_then(|path| shell.browser.rows().iter().find(|row| row.full_path == path))
+        .or_else(|| browser_row_for_session_identity(shell, session))
         .map(|row| row.label.trim().to_string())
         .unwrap_or_default();
     let resolved_title = resolved_session_title(shell, session);
@@ -11598,8 +11850,11 @@ fn remote_machine_for_session_path(
 }
 fn spawn_active_session_copy_hydration(mut state: Signal<ShellState>, session: ManagedSessionView) {
     let session_path = session.session_path.clone();
+    let session_id = session.id.clone();
     let already_in_flight = state.with_mut(|shell| {
-        if shell.active_copy_hydration_in_flight.contains(&session_path) {
+        if shell.active_copy_hydration_in_flight.contains(&session_path)
+            || shell.store_copy_hydrated_session_ids.contains(&session_id)
+        {
             true
         } else {
             shell
@@ -11612,8 +11867,6 @@ fn spawn_active_session_copy_hydration(mut state: Signal<ShellState>, session: M
         return;
     }
     let remote_cached = remote_generated_copy(&state.read().server, &session_path);
-    let generation_target = copy_generation_target_for_session(&state.read().server, &session);
-    let endpoint = state.read().bootstrap.server_endpoint.clone();
     let needs_local_lookup = is_local_stored_session_row(&BrowserRow {
         kind: BrowserRowKind::Session,
         full_path: session_path.clone(),
@@ -11631,7 +11884,6 @@ fn spawn_active_session_copy_hydration(mut state: Signal<ShellState>, session: M
     });
     spawn(async move {
         let path_for_task = session_path.clone();
-        let endpoint_for_task = endpoint.clone();
         let outcome = task::spawn_blocking(
             move || -> Result<(Option<String>, Option<String>, Option<String>)> {
                 let store = SessionStore::open_or_init()?;
@@ -11639,12 +11891,12 @@ fn spawn_active_session_copy_hydration(mut state: Signal<ShellState>, session: M
                     let store_title = store.resolve_title_for_session_id(&session.id)?;
                     let store_precis = store.resolve_precis_for_session_id(&session.id)?;
                     let store_summary = store.resolve_summary_for_session_id(&session.id)?;
-                    let mut resolved_title = if title.trim().is_empty() {
+                    let resolved_title = if title.trim().is_empty() {
                         store_title
                     } else {
                         store_title.or(Some(title))
                     };
-                    let mut resolved_precis = if precis
+                    let resolved_precis = if precis
                         .as_ref()
                         .is_some_and(|value| !value.trim().is_empty())
                     {
@@ -11652,7 +11904,7 @@ fn spawn_active_session_copy_hydration(mut state: Signal<ShellState>, session: M
                     } else {
                         store_precis
                     };
-                    let mut resolved_summary = if summary
+                    let resolved_summary = if summary
                         .as_ref()
                         .is_some_and(|value| !value.trim().is_empty())
                     {
@@ -11660,35 +11912,9 @@ fn spawn_active_session_copy_hydration(mut state: Signal<ShellState>, session: M
                     } else {
                         store_summary
                     };
-                    if let Some(target) = generation_target.as_ref() {
-                        if let Some(context) =
-                            generation_context_for_target(&endpoint_for_task, target)
-                        {
-                            let (generated_title, generated_precis, generated_summary) =
-                                generated_copy_from_context(target, &context);
-                            if resolved_title
-                                .as_deref()
-                                .is_none_or(looks_like_generated_fallback_title)
-                            {
-                                resolved_title = generated_title;
-                            }
-                            if resolved_precis
-                                .as_deref()
-                                .is_none_or(looks_like_low_signal_generated_copy)
-                            {
-                                resolved_precis = generated_precis;
-                            }
-                            if resolved_summary
-                                .as_deref()
-                                .is_none_or(looks_like_low_signal_generated_copy)
-                            {
-                                resolved_summary = generated_summary;
-                            }
-                        }
-                    }
                     return Ok((resolved_title, resolved_precis, resolved_summary));
                 }
-                let (mut title, mut precis, mut summary) = if !needs_local_lookup {
+                let (title, precis, summary) = if !needs_local_lookup {
                     (
                         store.resolve_title_for_session_id(&session.id)?,
                         store.resolve_precis_for_session_id(&session.id)?,
@@ -11701,43 +11927,30 @@ fn spawn_active_session_copy_hydration(mut state: Signal<ShellState>, session: M
                         store.resolve_summary_for_session_path(&path_for_task)?,
                     )
                 };
-                if let Some(target) = generation_target.as_ref() {
-                    if let Some(context) = generation_context_for_target(&endpoint_for_task, target)
-                    {
-                        let (generated_title, generated_precis, generated_summary) =
-                            generated_copy_from_context(target, &context);
-                        if title
-                            .as_deref()
-                            .is_none_or(looks_like_generated_fallback_title)
-                        {
-                            title = generated_title;
-                        }
-                        if precis
-                            .as_deref()
-                            .is_none_or(looks_like_low_signal_generated_copy)
-                        {
-                            precis = generated_precis;
-                        }
-                        if summary
-                            .as_deref()
-                            .is_none_or(looks_like_low_signal_generated_copy)
-                        {
-                            summary = generated_summary;
-                        }
-                    }
-                }
                 Ok((title, precis, summary))
             },
         )
         .await;
-        state.with_mut(|shell| {
+        let persist_request = state.with_mut(|shell| {
             shell
                 .active_copy_hydration_in_flight
                 .remove(&session_path);
+            shell
+                .store_copy_hydrated_session_ids
+                .insert(session_id.clone());
             let Ok(Ok((title, precis, summary))) = outcome else {
-                return;
+                return None;
             };
+            let should_persist_live_hint = shell
+                .server
+                .live_sessions()
+                .iter()
+                .any(|session| session.session_path == session_path);
+            let persisted_title = title.clone();
+            let persisted_precis = precis.clone();
+            let persisted_summary = summary.clone();
             if let Some(title) = title {
+                remember_session_title_override(shell, &session_path, &title);
                 shell.server.set_session_title_hint(&session_path, &title);
             }
             if let Some(precis) = precis {
@@ -11756,7 +11969,30 @@ fn spawn_active_session_copy_hydration(mut state: Signal<ShellState>, session: M
                         .set_session_summary_hint(&session_path, &summary);
                 }
             }
+            if should_persist_live_hint {
+                Some((
+                    shell.bootstrap.server_endpoint.clone(),
+                    session_path.clone(),
+                    persisted_title,
+                    persisted_precis,
+                    persisted_summary,
+                ))
+            } else {
+                None
+            }
         });
+        if let Some((endpoint, session_path, title, precis, summary)) = persist_request {
+            spawn_persist_session_copy_hints(
+                state,
+                endpoint,
+                session_path,
+                title,
+                precis,
+                summary,
+                false,
+                "Session copy",
+            );
+        }
     });
 }
 fn preview_context_from_session(session: &ManagedSessionView) -> Option<String> {
@@ -12396,11 +12632,6 @@ fn merged_sidebar_rows_uncached(
         }
     }
     let resort_ms = resort_started_at.elapsed().as_secs_f64() * 1000.0;
-    let push_remote_started_at = Instant::now();
-    for machine in machine_rows.into_values() {
-        push_remote_machine_rows(&mut rows, &machine, expanded_paths);
-    }
-    let push_remote_ms = push_remote_started_at.elapsed().as_secs_f64() * 1000.0;
     let local_tree_started_at = Instant::now();
     let stored_rows = inject_local_live_session_rows(
         stored_rows,
@@ -12408,9 +12639,6 @@ fn merged_sidebar_rows_uncached(
         &remote_session_index,
     );
     let local_tree_ms = local_tree_started_at.elapsed().as_secs_f64() * 1000.0;
-    let extend_stored_started_at = Instant::now();
-    rows.extend(stored_rows.iter().cloned());
-    let extend_stored_ms = extend_stored_started_at.elapsed().as_secs_f64() * 1000.0;
     let push_live_started_at = Instant::now();
     push_live_session_rows(
         &mut rows,
@@ -12419,6 +12647,14 @@ fn merged_sidebar_rows_uncached(
         expanded_paths,
     );
     let push_live_ms = push_live_started_at.elapsed().as_secs_f64() * 1000.0;
+    let push_remote_started_at = Instant::now();
+    for machine in machine_rows.into_values() {
+        push_remote_machine_rows(&mut rows, &machine, expanded_paths);
+    }
+    let push_remote_ms = push_remote_started_at.elapsed().as_secs_f64() * 1000.0;
+    let extend_stored_started_at = Instant::now();
+    rows.extend(stored_rows.iter().cloned());
+    let extend_stored_ms = extend_stored_started_at.elapsed().as_secs_f64() * 1000.0;
     if breakdown_enabled {
         maybe_record_sidebar_merge_breakdown(
             remote_session_count,
@@ -12878,12 +13114,17 @@ fn enrich_sidebar_rows_with_live_titles(
     rows: &mut [BrowserRow],
     live_sessions: &[ManagedSessionView],
     remote_machines: &[RemoteMachineSnapshot],
+    session_title_overrides: &BTreeMap<String, String>,
     generated_summaries: &BTreeMap<String, String>,
 ) {
     let mut title_by_path = HashMap::<String, String>::new();
     let mut summary_by_path = HashMap::<String, String>::new();
+    let mut authoritative_live_paths = HashSet::<String>::new();
     let remote_session_index = build_remote_session_index(remote_machines);
     for session in live_sessions {
+        if !matches!(session.source, SessionSource::Stored) {
+            authoritative_live_paths.insert(session.session_path.clone());
+        }
         let session_cwd = session_cwd_for_managed_session(session);
         let cwd = session_cwd.as_deref().unwrap_or_default();
         let summary = generated_summaries
@@ -12894,6 +13135,13 @@ fn enrich_sidebar_rows_with_live_titles(
             .unwrap_or_else(|| live_session_summary_with_index(&remote_session_index, session));
         if !summary.trim().is_empty() {
             summary_by_path.insert(session.session_path.clone(), summary);
+        }
+        if let Some(title_override) = session_title_overrides
+            .get(&session.session_path)
+            .filter(|title| !title.trim().is_empty())
+        {
+            title_by_path.insert(session.session_path.clone(), title_override.clone());
+            continue;
         }
         let direct_title = session.title.trim();
         if !direct_title.is_empty()
@@ -12927,12 +13175,17 @@ fn enrich_sidebar_rows_with_live_titles(
     for row in rows {
         let live_backed = title_by_path.contains_key(&row.full_path)
             || summary_by_path.contains_key(&row.full_path);
+        let authoritative_live = authoritative_live_paths.contains(&row.full_path);
+        let has_title_override = session_title_overrides
+            .get(&row.full_path)
+            .is_some_and(|title| !title.trim().is_empty());
         let row_cwd = row.session_cwd.clone().unwrap_or_default();
         let preserved_row_title = row
             .session_title
             .clone()
             .filter(|title| !title_is_low_signal_for_copy(title, &row_cwd));
-        if preserved_row_title.is_some() {
+        if preserved_row_title.is_some() && !has_title_override {
+            row.label = preserved_row_title.clone().unwrap_or_default();
             if let Some(summary) = summary_by_path.get(&row.full_path)
                 && (!summary.trim().is_empty())
                 && (live_backed || row.detail_label.trim().is_empty())
@@ -12969,7 +13222,8 @@ fn enrich_sidebar_rows_with_live_titles(
         }
         row.session_title = Some(title.clone());
         if matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document)
-            && (live_backed
+            && (authoritative_live
+                || live_backed
                 || row.label.trim().is_empty()
                 || looks_like_generated_fallback_title(&row.label)
                 || row
@@ -14085,30 +14339,47 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
             store.load_codex_tree(&settings)
         })
         .await;
-        state.with_mut(|shell| match outcome {
+        let persist_request = state.with_mut(|shell| match outcome {
             Ok(Ok(browser_tree)) => {
-                let expanded_paths = shell.browser.expanded_paths();
-                shell.browser = SessionBrowserState::new(browser_tree);
-                shell
-                    .browser
-                    .restore_ui_state(&expanded_paths, Some(&row.full_path));
-                shell.browser.select_path(row.full_path.clone());
+                let selected_hint = (!is_synthetic_sidebar_row(&row)
+                    && !is_hot_terminal_sidebar_path(&row.full_path))
+                .then_some(row.full_path.as_str());
+                restore_browser_tree(shell, browser_tree, selected_hint);
+                if is_hot_terminal_sidebar_path(&row.full_path) {
+                    shell.ensure_session_path_visible(&row.full_path);
+                } else if !is_synthetic_sidebar_row(&row) {
+                    shell.browser.select_path(row.full_path.clone());
+                }
                 shell.selected_tree_paths.clear();
                 shell.selected_tree_paths.insert(row.full_path.clone());
                 shell.selection_anchor = Some(row.full_path.clone());
+                let should_persist_live_hint = row.kind == BrowserRowKind::Session
+                    && shell
+                        .server
+                        .live_sessions()
+                        .iter()
+                        .any(|session| session.session_path == row.full_path);
                 if row.kind == BrowserRowKind::Session {
+                    remember_session_title_override(shell, &row.full_path, &trimmed);
                     shell
                         .server
                         .set_session_title_hint(&row.full_path, &trimmed);
                 }
                 shell.tree_rename_path = None;
+                shell.tree_rename_depth = None;
                 shell.tree_rename_value.clear();
                 shell.tree_rename_started_at_ms = 0;
                 shell.tree_rename_input_focused_once = false;
-                shell.sync_browser_settings();
                 shell.server_busy = false;
                 shell.last_action = format!("renamed {}", trimmed);
                 shell.refresh_tree_debug("commit_tree_rename");
+                should_persist_live_hint.then(|| {
+                    (
+                        shell.bootstrap.server_endpoint.clone(),
+                        row.full_path.clone(),
+                        Some(trimmed.clone()),
+                    )
+                })
             }
             Ok(Err(error)) => {
                 shell.server_busy = false;
@@ -14118,6 +14389,7 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
                     "Rename Failed",
                     error.to_string(),
                 );
+                None
             }
             Err(error) => {
                 shell.server_busy = false;
@@ -14127,8 +14399,21 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
                     "Rename Task Failed",
                     error.to_string(),
                 );
+                None
             }
         });
+        if let Some((endpoint, session_path, title)) = persist_request {
+            spawn_persist_session_copy_hints(
+                state,
+                endpoint,
+                session_path,
+                title,
+                None,
+                None,
+                true,
+                "Rename",
+            );
+        }
         sync_active_terminal_input_policy(state);
     });
 }
@@ -15773,6 +16058,7 @@ fn describe_app_state_snapshot(
             "selected_tree_paths": selected_tree_paths,
             "selection_anchor": shell.selection_anchor,
             "tree_rename_path": shell.tree_rename_path,
+            "tree_rename_depth": shell.tree_rename_depth,
             "tree_rename_input_focused_once": shell.tree_rename_input_focused_once,
             "context_menu_row": shell.context_menu_row.as_ref().map(|row| {
                 json!({
@@ -16215,6 +16501,7 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     const rect = row.getBoundingClientRect();
                     const icon = row.querySelector('[data-tree-icon]');
                     const indicator = row.querySelector('[data-machine-indicator="1"]');
+                    const liveClose = row.querySelector('[data-sidebar-live-session-close="1"]');
                     const indicatorStyle = indicator ? window.getComputedStyle(indicator) : null;
                     const centerPointRect =
                         rect.width > 0 && rect.height > 0
@@ -16228,10 +16515,13 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     return {
                         path: row.getAttribute('data-sidebar-row-path'),
                         kind: row.getAttribute('data-sidebar-row-kind'),
+                        label: String(row.getAttribute('data-sidebar-row-label') || '').trim(),
+                        depth: Number(row.getAttribute('data-sidebar-row-depth') || '0'),
                         detail_label: String(row.getAttribute('data-sidebar-row-detail') || '').trim(),
                         machine_health: String(row.getAttribute('data-machine-health') || '').trim() || null,
                         machine_indicator_color: indicatorStyle ? indicatorStyle.backgroundColor : null,
                         selected: row.getAttribute('data-selected') === 'true',
+                        live_member: row.getAttribute('data-sidebar-live-session-member') === 'true',
                         drop_target: row.getAttribute('data-drop-target'),
                         icon_text: String(icon?.textContent || '').trim(),
                         icon_kind: String(icon?.getAttribute('data-tree-icon-kind') || '').trim(),
@@ -16241,6 +16531,8 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                         width: Math.round(rect.width),
                         top: Math.round(rect.top),
                         height: Math.round(rect.height),
+                        live_close_rect: rectSummary(liveClose),
+                        live_close_hit_target: elementSummaryAtPoint(rectSummary(liveClose)),
                         hit_target: elementSummaryAtPoint(centerPointRect),
                     };
                 })
@@ -17555,7 +17847,7 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
     "#;
     for attempt in 0..2 {
         let mut eval = document::eval(&script);
-        match tokio::time::timeout(Duration::from_millis(1500), eval.recv::<Value>()).await {
+        match tokio::time::timeout(Duration::from_millis(2000), eval.recv::<Value>()).await {
             Ok(Ok(value)) => return value,
             Ok(Err(error)) => {
                 let reason = error.to_string();
@@ -17570,9 +17862,6 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                 });
             }
             Err(_) => {
-                if attempt == 0 {
-                    continue;
-                }
                 return json!({
                     "error": "dom_debug_snapshot_timeout",
                 });
@@ -17583,11 +17872,204 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
         "error": "dom_debug_snapshot_timeout",
     })
 }
+async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>) -> Value {
+    let _ = active_session_path;
+    let script = r#"
+        (() => {
+            const visibleNodes = (nodes) =>
+                nodes.filter((node) => node && node.getClientRects().length > 0);
+            const pickLast = (nodes) => nodes.length ? nodes[nodes.length - 1] : null;
+            const rectSummary = (node) => {
+                if (!node || typeof node.getBoundingClientRect !== 'function') {
+                    return null;
+                }
+                const rect = node.getBoundingClientRect();
+                if (!rect || rect.width <= 0 || rect.height <= 0) {
+                    return null;
+                }
+                return {
+                    left: Math.round(rect.left),
+                    top: Math.round(rect.top),
+                    width: Math.round(rect.width),
+                    height: Math.round(rect.height),
+                    right: Math.round(rect.right),
+                    bottom: Math.round(rect.bottom),
+                };
+            };
+            const elementSummaryAtPoint = (rect) => {
+                if (!rect) {
+                    return null;
+                }
+                const x = Math.round(rect.left + Math.max(1, rect.width / 2));
+                const y = Math.round(rect.top + Math.max(1, rect.height / 2));
+                const node = document.elementFromPoint(x, y);
+                if (!node) {
+                    return null;
+                }
+                return {
+                    tag: String(node.tagName || '').toLowerCase(),
+                    id: String(node.id || '').trim() || null,
+                    class_name: String(node.className || '').trim() || null,
+                    role: typeof node.getAttribute === 'function'
+                        ? String(node.getAttribute('role') || '').trim() || null
+                        : null,
+                    text: String(node.textContent || '').trim().slice(0, 80) || null,
+                    data_path: typeof node.getAttribute === 'function'
+                        ? String(node.getAttribute('data-sidebar-row-path') || '').trim() || null
+                        : null,
+                    data_kind: typeof node.getAttribute === 'function'
+                        ? String(node.getAttribute('data-sidebar-row-kind') || '').trim() || null
+                        : null,
+                };
+            };
+            const shellRoots = Array.from(document.querySelectorAll('#yggterm-shell-root'));
+            const rootNode =
+                pickLast(visibleNodes(shellRoots))
+                || pickLast(shellRoots)
+                || null;
+            const sidebarScroller = rootNode
+                ? rootNode.querySelector('[data-sidebar-scroll="1"]')
+                : document.querySelector('[data-sidebar-scroll="1"]');
+            const sidebars = rootNode
+                ? Array.from(rootNode.querySelectorAll('[data-sidebar="1"]'))
+                : Array.from(document.querySelectorAll('[data-sidebar="1"]'));
+            const sidebar =
+                pickLast(visibleNodes(sidebars))
+                || pickLast(sidebars)
+                || null;
+            const sidebarRows = rootNode
+                ? Array.from(rootNode.querySelectorAll('[data-sidebar-row-path]'))
+                : Array.from(document.querySelectorAll('[data-sidebar-row-path]'));
+            const visibleSidebarRows = sidebarRows
+                .map((row) => {
+                    if (!row || typeof row.getBoundingClientRect !== 'function') {
+                        return null;
+                    }
+                    const rect = row.getBoundingClientRect();
+                    if (!rect || rect.width <= 0 || rect.height <= 0) {
+                        return null;
+                    }
+                    const liveClose = row.querySelector('[data-sidebar-live-session-close="1"]');
+                    return {
+                        path: row.getAttribute('data-sidebar-row-path'),
+                        kind: row.getAttribute('data-sidebar-row-kind'),
+                        label: String(row.getAttribute('data-sidebar-row-label') || row.textContent || '').trim().slice(0, 140),
+                        depth: Number(row.getAttribute('data-sidebar-row-depth') || '0'),
+                        detail_label: String(row.getAttribute('data-sidebar-row-detail') || '').trim(),
+                        selected: row.getAttribute('data-selected') === 'true',
+                        live_member: row.getAttribute('data-sidebar-live-session-member') === 'true',
+                        left: Math.round(rect.left),
+                        top: Math.round(rect.top),
+                        width: Math.round(rect.width),
+                        height: Math.round(rect.height),
+                        live_close_rect: rectSummary(liveClose),
+                        live_close_hit_target: elementSummaryAtPoint(rectSummary(liveClose)),
+                        hit_target: elementSummaryAtPoint(rectSummary(row)),
+                    };
+                })
+                .filter(Boolean)
+                .slice(0, 24);
+            const sidebarRect = rectSummary(sidebar) || (() => {
+                if (!visibleSidebarRows.length) {
+                    return null;
+                }
+                const left = Math.min(...visibleSidebarRows.map((row) => Number(row.left || 0)));
+                const top = Math.min(...visibleSidebarRows.map((row) => Number(row.top || 0)));
+                const right = Math.max(
+                    ...visibleSidebarRows.map((row) => Number(row.left || 0) + Number(row.width || 0))
+                );
+                const bottom = Math.max(
+                    ...visibleSidebarRows.map((row) => Number(row.top || 0) + Number(row.height || 0))
+                );
+                return {
+                    left,
+                    top,
+                    width: Math.max(0, right - left),
+                    height: Math.max(0, bottom - top),
+                    right,
+                    bottom,
+                };
+            })();
+            const contextMenu = rootNode?.querySelector('[data-context-menu="1"]')
+                || document.querySelector('[data-context-menu="1"]')
+                || null;
+            const contextMenuRenameSession =
+                contextMenu?.querySelector('[data-context-menu-action="rename-session"]') || null;
+            const treeRenameInputs = rootNode
+                ? Array.from(rootNode.querySelectorAll('[data-tree-rename-input="1"]'))
+                : Array.from(document.querySelectorAll('[data-tree-rename-input="1"]'));
+            const treeRenameInput =
+                pickLast(visibleNodes(treeRenameInputs))
+                || pickLast(treeRenameInputs)
+                || null;
+            const mainSurfaces = rootNode
+                ? Array.from(rootNode.querySelectorAll('[data-main-surface="1"]'))
+                : Array.from(document.querySelectorAll('[data-main-surface="1"]'));
+            const mainSurface =
+                pickLast(visibleNodes(mainSurfaces))
+                || pickLast(mainSurfaces)
+                || null;
+            const mainSurfaceBody =
+                mainSurface?.querySelector('[data-yggterm-main-surface-body="1"]') || null;
+            const titlebar = rootNode?.querySelector('[data-titlebar-root="1"]')
+                || document.querySelector('[data-titlebar-root="1"]')
+                || null;
+            const titlebarSearchShell = titlebar?.querySelector('[data-titlebar-search-shell="1"]') || null;
+            const titlebarNewMenuShell = titlebar?.querySelector('[data-titlebar-new-menu-shell="1"]') || null;
+            const titlebarSessionShell = titlebar?.querySelector('[data-titlebar-session-shell="1"]') || null;
+            dioxus.send({
+                snapshot_mode: 'basic',
+                degraded_reason: 'dom_debug_snapshot_timeout',
+                shell_root_count: shellRoots.length,
+                sidebar_rect: sidebarRect,
+                sidebar_scroll_top: sidebarScroller ? Math.round(sidebarScroller.scrollTop) : null,
+                sidebar_visible_row_count: visibleSidebarRows.length,
+                sidebar_visible_rows: visibleSidebarRows,
+                context_menu_rect: rectSummary(contextMenu),
+                context_menu_rename_session_rect: rectSummary(contextMenuRenameSession),
+                tree_rename_input_rect: rectSummary(treeRenameInput),
+                tree_rename_input_hit_target: elementSummaryAtPoint(rectSummary(treeRenameInput)),
+                tree_rename_input_focused: treeRenameInputs.some((node) => node === document.activeElement),
+                tree_rename_input_value: treeRenameInput ? String(treeRenameInput.value || '') : '',
+                main_surface_rect: rectSummary(mainSurface),
+                main_surface_body_rect: rectSummary(mainSurfaceBody),
+                titlebar_rect: rectSummary(titlebar),
+                titlebar_search_shell_rect: rectSummary(titlebarSearchShell),
+                titlebar_new_menu_shell_rect: rectSummary(titlebarNewMenuShell),
+                titlebar_session_shell_rect: rectSummary(titlebarSessionShell),
+            });
+        })();
+    "#;
+    let mut eval = document::eval(script);
+    match tokio::time::timeout(Duration::from_millis(1000), eval.recv::<Value>()).await {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => json!({
+            "error": error.to_string(),
+        }),
+        Err(_) => json!({
+            "error": "dom_debug_snapshot_timeout",
+        }),
+    }
+}
 async fn capture_dom_debug_snapshot_for_or_empty(active_session_path: Option<&str>) -> Value {
     let snapshot = capture_dom_debug_snapshot_for(active_session_path).await;
-    if snapshot.get("error").and_then(Value::as_str) == Some("dom_debug_snapshot_timeout") {
+    if let Some(reason) = snapshot
+        .get("error")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+    {
+        let basic = capture_dom_debug_snapshot_basic_for(active_session_path).await;
+        if basic.get("error").is_none() {
+            let mut basic = basic;
+            if let Value::Object(object) = &mut basic {
+                object
+                    .entry("degraded_reason".to_string())
+                    .or_insert_with(|| Value::String(reason.clone()));
+            }
+            return basic;
+        }
         json!({
-            "error": "dom_debug_snapshot_timeout",
+            "error": reason,
             "terminal_host_count": 0,
             "terminal_hosts": [],
             "sidebar_visible_rows": [],
@@ -21510,6 +21992,25 @@ fn app() -> Element {
         };
         maybe_request_copy_generation_for_session(state, session);
     });
+    let live_store_copy_signature = {
+        let shell = state.read();
+        shell.server
+            .live_sessions()
+            .iter()
+            .map(|session| {
+                (
+                    session.id.clone(),
+                    session.session_path.clone(),
+                    session.title.clone(),
+                    preview_summary_metadata_value(session, "Summary"),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    use_effect(move || {
+        let _ = live_store_copy_signature;
+        maybe_prime_live_session_store_copy(state);
+    });
     let window_spawn_traced_for_preview_refresh = window_spawn_traced.clone();
     use_effect(move || {
         if !window_spawn_traced_for_preview_refresh.load(Ordering::SeqCst) {
@@ -21762,6 +22263,7 @@ fn app() -> Element {
     });
     use_effect(move || {
         let rename_path = state.read().tree_rename_path.clone();
+        let rename_depth = state.read().tree_rename_depth;
         match rename_path {
             Some(rename_path) => {
                 if *last_tree_rename_focus_path.read() == Some(rename_path.clone()) {
@@ -21773,6 +22275,9 @@ fn app() -> Element {
                         Ok(value) => value,
                         Err(_) => return,
                     };
+                    let depth_selector = rename_depth
+                        .map(|depth| format!(r#"[data-tree-rename-row-depth="{depth}"]"#))
+                        .unwrap_or_default();
                     for delay_ms in [0_u64, 40, 120, 240, 420, 700, 1000, 1400] {
                         if delay_ms > 0 {
                             sleep(Duration::from_millis(delay_ms)).await;
@@ -21782,9 +22287,14 @@ fn app() -> Element {
                                 const renamePath = {path_literal};
                                 const selector = '[data-tree-rename-input="1"][data-tree-rename-row-path='
                                     + JSON.stringify(renamePath)
-                                    + ']';
+                                    + ']{depth_selector}';
                                 const input = document.querySelector(selector);
                                 if (!input || !input.isConnected) {{
+                                    return;
+                                }}
+                                const focusedOnce =
+                                    String(input.getAttribute('data-tree-rename-focused-once') || '') === 'true';
+                                if (focusedOnce) {{
                                     return;
                                 }}
                                 const rect = input.getBoundingClientRect();
@@ -21810,6 +22320,7 @@ fn app() -> Element {
         }
     });
     let _ = *async_render_epoch.read();
+    let tree_rename_depth = state.read().tree_rename_depth;
     let snapshot: SharedSnapshot = Arc::new(state.read().snapshot());
     let inner = desktop.inner_size();
     let context_menu_window_size = (inner.width as f64, inner.height as f64);
@@ -22521,6 +23032,9 @@ fn app() -> Element {
                             }
                         },
                         on_delete_selected_items: move |hard_delete: bool| queue_delete_selected_items(state, hard_delete),
+                        on_delete_row: move |row: BrowserRow| {
+                            state.with_mut(|shell| shell.open_delete_dialog_for_row(&row, false));
+                        },
                         on_open_context_menu: move |(row, position): (BrowserRow, (f64, f64))| {
                             let focus_path = row.full_path.clone();
                             state.with_mut(|shell| {
@@ -22560,6 +23074,7 @@ fn app() -> Element {
                             state.with_mut(|shell| shell.cancel_tree_rename());
                             sync_active_terminal_input_policy(state);
                         },
+                        rename_depth: tree_rename_depth,
                     }
                     }
                     div {
@@ -23850,12 +24365,14 @@ fn ResizeHandle(style: String, direction: ResizeDirection) -> Element {
 #[component]
 fn Sidebar(
     snapshot: SharedSnapshot,
+    rename_depth: Option<usize>,
     on_prev_search_row: EventHandler<()>,
     on_next_search_row: EventHandler<()>,
     on_select_all_rows: EventHandler<()>,
     on_start_sidebar_resize: EventHandler<f64>,
     on_select_row: EventHandler<(BrowserRow, TreeSelectionMode)>,
     on_delete_selected_items: EventHandler<bool>,
+    on_delete_row: EventHandler<BrowserRow>,
     on_open_context_menu: EventHandler<(BrowserRow, (f64, f64))>,
     on_start_drag: EventHandler<(BrowserRow, (f64, f64))>,
     on_drag_hover: EventHandler<(BrowserRow, (f64, f64), DragDropPlacement)>,
@@ -23882,6 +24399,18 @@ fn Sidebar(
         "translateX(-14px)"
     };
     let drag_active = !snapshot.drag_paths.is_empty();
+    let visible_rows = snapshot
+        .rows
+        .iter()
+        .cloned()
+        .scan(false, |in_live_group, row| {
+            if row.depth == 0 {
+                *in_live_group = row.full_path == "__live_sessions__";
+            }
+            let live_group_member = *in_live_group && row.depth > 0;
+            Some((row, live_group_member))
+        })
+        .collect::<Vec<_>>();
     let sidebar_transition = if snapshot.sidebar_open {
         emphasized_enter_transition(&["width", "min-width", "max-width", "opacity", "transform"])
     } else {
@@ -24069,15 +24598,24 @@ fn Sidebar(
                 if snapshot.show_loading_tree && snapshot.rows.is_empty() {
                     SidebarLoadingState { palette: snapshot.palette }
                 } else {
-                    for row in snapshot.rows.iter().cloned() {
+                    for (row, live_group_member) in visible_rows.into_iter() {
                     {
                         let select_row = row.clone();
                         let context_row = row.clone();
+                        let delete_row = row.clone();
                         let visible_label = sidebar_row_visible_label(&row);
                         let icon_kind = tree_icon_kind(&row).to_string();
                         let busy_icon = sidebar_row_shows_busy_icon(&snapshot, &row);
+                        let sidebar_row_key = format!(
+                            "{}::{}::{}::{}",
+                            row.full_path,
+                            row.depth,
+                            row.session_id.as_deref().unwrap_or(""),
+                            if live_group_member { "live" } else { "tree" }
+                        );
                         rsx! {
                             SidebarRow {
+                                key: "{sidebar_row_key}",
                                 row: row.clone(),
                                 visible_label: visible_label.clone(),
                                 icon_kind: icon_kind.clone(),
@@ -24094,8 +24632,14 @@ fn Sidebar(
                                     .map(|target| target.placement),
                                 dragging: snapshot.drag_paths.iter().any(|path| path == &row.full_path),
                                 drag_active: !snapshot.drag_paths.is_empty(),
-                                renaming: snapshot.tree_rename_path.as_deref() == Some(row.full_path.as_str()),
+                                renaming: snapshot.tree_rename_path.as_deref() == Some(row.full_path.as_str())
+                                    && rename_depth.is_none_or(|depth| depth == row.depth),
+                                rename_focus_pending: snapshot.tree_rename_path.as_deref() == Some(row.full_path.as_str())
+                                    && rename_depth.is_none_or(|depth| depth == row.depth)
+                                    && !snapshot.tree_rename_input_focused_once,
+                                rename_focused_once: snapshot.tree_rename_input_focused_once,
                                 rename_value: snapshot.tree_rename_value.clone(),
+                                show_live_close: live_group_member && row.kind == BrowserRowKind::Session,
                                 palette: snapshot.palette,
                                 on_select: move |evt: MouseEvent| {
                                     let mode = if evt.modifiers().contains(Modifiers::SHIFT) {
@@ -24110,6 +24654,7 @@ fn Sidebar(
                                     on_select_row.call((select_row.clone(), mode));
                                 },
                                 on_open_context_menu: move |coords: (f64, f64)| on_open_context_menu.call((context_row.clone(), coords)),
+                                on_delete_row: move |_| on_delete_row.call(delete_row.clone()),
                                 on_begin_rename: {
                                     let row = row.clone();
                                     move |_| on_begin_rename.call(row.clone())
@@ -24482,10 +25027,14 @@ fn SidebarRow(
     dragging: bool,
     drag_active: bool,
     renaming: bool,
+    rename_focus_pending: bool,
+    rename_focused_once: bool,
     rename_value: String,
+    show_live_close: bool,
     palette: Palette,
     on_select: EventHandler<MouseEvent>,
     on_open_context_menu: EventHandler<(f64, f64)>,
+    on_delete_row: EventHandler<MouseEvent>,
     on_begin_rename: EventHandler<MouseEvent>,
     on_regenerate_title: EventHandler<MouseEvent>,
     on_update_rename: EventHandler<String>,
@@ -24516,6 +25065,7 @@ fn SidebarRow(
                 "data-sidebar-row-path": "{row.full_path}",
                 "data-sidebar-row-kind": "Separator",
                 "data-sidebar-row-label": "{row.label}",
+                "data-sidebar-row-depth": "{row.depth}",
                 tabindex: if selected { "0" } else { "-1" },
                 "data-selected": if selected { "true" } else { "false" },
                 "data-drop-target": match drop_target {
@@ -24606,6 +25156,8 @@ fn SidebarRow(
                     input {
                         "data-tree-rename-input": "1",
                         "data-tree-rename-row-path": "{row.full_path}",
+                        "data-tree-rename-row-depth": "{row.depth}",
+                        "data-tree-rename-focused-once": if rename_focused_once { "true" } else { "false" },
                         style: format!(
                             "width:140px; height:29px; border:none; border-radius:10px; background:rgba(255,255,255,0.92); \
                              color:{}; font-size:12px; font-weight:600; padding:0 10px; box-shadow: inset 0 0 0 1px rgba(204,214,224,0.9);",
@@ -24613,10 +25165,7 @@ fn SidebarRow(
                         ),
                         value: rename_value,
                         onmounted: move |evt| async move {
-                            for delay_ms in [0_u64, 40, 120, 260, 420] {
-                                if delay_ms > 0 {
-                                    sleep(Duration::from_millis(delay_ms)).await;
-                                }
+                            if rename_focus_pending {
                                 let _ = evt.set_focus(true).await;
                             }
                         },
@@ -24695,6 +25244,8 @@ fn SidebarRow(
             "data-sidebar-row-kind": "{row_kind_label}",
             "data-sidebar-row-label": "{visible_label}",
             "data-sidebar-row-detail": "{row.detail_label}",
+            "data-sidebar-row-depth": "{row.depth}",
+            "data-sidebar-live-session-member": if show_live_close { "true" } else { "false" },
             tabindex: if selected { "0" } else { "-1" },
             "data-machine-health": if let Some(health) = machine_health {
                 machine_health_attr_value(health)
@@ -24797,6 +25348,8 @@ fn SidebarRow(
                             input {
                                 "data-tree-rename-input": "1",
                                 "data-tree-rename-row-path": "{row.full_path}",
+                                "data-tree-rename-row-depth": "{row.depth}",
+                                "data-tree-rename-focused-once": if rename_focused_once { "true" } else { "false" },
                                 style: format!(
                                     "flex:1; min-width:0; height:29px; border:none; border-radius:10px; background:rgba(255,255,255,0.92); \
                                      color:{}; font-size:12px; font-weight:600; padding:0 10px; box-shadow: inset 0 0 0 1px rgba(204,214,224,0.9);",
@@ -24804,10 +25357,7 @@ fn SidebarRow(
                                 ),
                                 value: rename_value,
                                 onmounted: move |evt| async move {
-                                    for delay_ms in [0_u64, 40, 120, 260, 420] {
-                                        if delay_ms > 0 {
-                                            sleep(Duration::from_millis(delay_ms)).await;
-                                        }
+                                    if rename_focus_pending {
                                         let _ = evt.set_focus(true).await;
                                     }
                                 },
@@ -24862,7 +25412,29 @@ fn SidebarRow(
                         }
                     }
                 }
-                if row.kind == BrowserRowKind::Group {
+                if show_live_close {
+                    button {
+                        "data-sidebar-live-session-close": "1",
+                        title: "Close live session",
+                        style: format!(
+                            "display:inline-flex; align-items:center; justify-content:center; width:18px; min-width:18px; height:18px; \
+                             border:none; border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:700; \
+                             cursor:pointer; padding:0; box-shadow:none;",
+                            if selected { "rgba(255,255,255,0.82)" } else { "rgba(44, 53, 70, 0.08)" },
+                            if selected { palette.panel } else { palette.muted }
+                        ),
+                        onmousedown: |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                        },
+                        onclick: move |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                            on_delete_row.call(evt);
+                        },
+                        "×"
+                    }
+                } else if row.kind == BrowserRowKind::Group {
                     span {
                         style: format!("font-size:10.5px; color:{};", palette.muted),
                         "{row.descendant_sessions}"
@@ -40304,6 +40876,10 @@ mod tests {
             ]),
         );
         assert!(rows.iter().any(|row| row.full_path == "__live_sessions__"));
+        assert_eq!(
+            rows.first().map(|row| row.full_path.as_str()),
+            Some("__live_sessions__")
+        );
         assert!(rows.iter().any(|row| row.full_path
             == "local://019cf672-8d68-70a1-bd8b-68487c4fc63d"
             && row.depth == 1));
@@ -40381,6 +40957,10 @@ mod tests {
             &HashSet::from(["__live_sessions__".to_string()]),
         );
         assert!(rows.iter().any(|row| row.full_path == "__live_sessions__"));
+        assert_eq!(
+            rows.first().map(|row| row.full_path.as_str()),
+            Some("__live_sessions__")
+        );
         assert!(
             rows.iter()
                 .any(|row| row.full_path == stored_path && row.depth == 1)
@@ -40533,6 +41113,10 @@ mod tests {
             .iter()
             .find(|row| row.full_path == remote_path)
             .expect("promoted live row");
+        assert_eq!(
+            rows.first().map(|row| row.full_path.as_str()),
+            Some("__live_sessions__")
+        );
         assert_eq!(promoted.depth, 1);
         assert_eq!(promoted.host_label, "oc");
         let promoted_count = rows
@@ -40782,6 +41366,69 @@ mod tests {
         ));
     }
     #[test]
+    fn resolved_session_title_matches_browser_row_by_session_id_when_live_path_differs() {
+        let browser_tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: vec![SessionNode {
+                kind: SessionNodeKind::CodexSession,
+                name: "stored".to_string(),
+                title: Some("htop".to_string()),
+                document_kind: None,
+                group_kind: None,
+                path: PathBuf::from("/home/pi/.codex/sessions/example.jsonl"),
+                children: Vec::new(),
+                session_id: Some("live-shell-session".to_string()),
+                cwd: Some("/home/pi".to_string()),
+            }],
+            session_id: None,
+            cwd: None,
+        };
+        let shell = ShellState::new(test_shell_bootstrap_with_browser_tree(browser_tree));
+        let session = ManagedSessionView {
+            id: "live-shell-session".to_string(),
+            session_path: "local://live-shell-session".to_string(),
+            title: "local-shell".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "local-shell".to_string(),
+            source: yggterm_server::SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: true,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: vec![],
+            rendered_sections: vec![],
+            preview: yggterm_server::SessionPreview {
+                summary: vec![],
+                blocks: vec![],
+            },
+            metadata: vec![SessionMetadataEntry {
+                label: "Cwd",
+                value: "/home/pi".to_string(),
+            }],
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: true,
+        };
+        assert_eq!(resolved_session_title(&shell, &session).as_deref(), Some("htop"));
+        assert!(!active_session_title_needs_generation(&shell, &session));
+    }
+    #[test]
     fn supports_generated_session_copy_accepts_local_stored_session_paths() {
         let session = ManagedSessionView {
             id: "019d0000-1111-2222-3333-444444444444".to_string(),
@@ -40909,7 +41556,13 @@ mod tests {
             session_id: Some("ddf8f1ee-8e64-4201-ab3a-2b07424f9b77".to_string()),
             session_cwd: Some("/home/pi".to_string()),
         }];
-        enrich_sidebar_rows_with_live_titles(&mut rows, &live_sessions, &[], &BTreeMap::new());
+        enrich_sidebar_rows_with_live_titles(
+            &mut rows,
+            &live_sessions,
+            &[],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
         assert_eq!(rows[0].label, "Remove Them Entirely");
         assert_eq!(
             rows[0].session_title.as_deref(),
@@ -40969,7 +41622,13 @@ mod tests {
             session_id: Some("live-local-home".to_string()),
             session_cwd: Some("/home/pi".to_string()),
         }];
-        enrich_sidebar_rows_with_live_titles(&mut rows, &live_sessions, &[], &BTreeMap::new());
+        enrich_sidebar_rows_with_live_titles(
+            &mut rows,
+            &live_sessions,
+            &[],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
         assert_eq!(rows[0].label, "Pi Home Shell");
         assert_eq!(rows[0].session_title.as_deref(), Some("Pi Home Shell"));
         assert_eq!(
@@ -41033,7 +41692,13 @@ mod tests {
             session_id: Some("019cf82b-196b-7152-b4d2-e053f7286318".to_string()),
             session_cwd: Some("/home/pi/gh/yggterm".to_string()),
         }];
-        enrich_sidebar_rows_with_live_titles(&mut rows, &live_sessions, &[], &BTreeMap::new());
+        enrich_sidebar_rows_with_live_titles(
+            &mut rows,
+            &live_sessions,
+            &[],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
         assert_eq!(rows[0].label, "Investigate Why Terminal TUI Barebones");
         assert_eq!(
             rows[0].session_title.as_deref(),
@@ -41094,9 +41759,146 @@ mod tests {
             session_id: Some("manual-title".to_string()),
             session_cwd: Some("/home/pi".to_string()),
         }];
-        enrich_sidebar_rows_with_live_titles(&mut rows, &live_sessions, &[], &BTreeMap::new());
+        enrich_sidebar_rows_with_live_titles(
+            &mut rows,
+            &live_sessions,
+            &[],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
         assert_eq!(rows[0].label, "Patch To Upstream");
         assert_eq!(rows[0].session_title.as_deref(), Some("Patch To Upstream"));
+    }
+    #[test]
+    fn enrich_sidebar_rows_with_live_titles_preserves_explicit_live_session_title() {
+        let live_sessions = vec![ManagedSessionView {
+            id: "live-local-title".to_string(),
+            session_path: "local://live-local-title".to_string(),
+            title: "htop".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "local-shell".to_string(),
+            source: yggterm_server::SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: true,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: vec![],
+            rendered_sections: vec![],
+            preview: yggterm_server::SessionPreview {
+                summary: vec![],
+                blocks: vec![],
+            },
+            metadata: vec![SessionMetadataEntry {
+                label: "Cwd",
+                value: "/home/pi".to_string(),
+            }],
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: true,
+        }];
+        let mut rows = vec![BrowserRow {
+            kind: BrowserRowKind::Session,
+            full_path: "local://live-local-title".to_string(),
+            label: "Smoke Rename Baseline".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: Some("Smoke Rename Baseline".to_string()),
+            depth: 2,
+            host_label: "local-shell".to_string(),
+            descendant_sessions: 1,
+            expanded: true,
+            session_id: Some("live-local-title".to_string()),
+            session_cwd: Some("/home/pi".to_string()),
+        }];
+        enrich_sidebar_rows_with_live_titles(
+            &mut rows,
+            &live_sessions,
+            &[],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(rows[0].label, "Smoke Rename Baseline");
+        assert_eq!(rows[0].session_title.as_deref(), Some("Smoke Rename Baseline"));
+    }
+    #[test]
+    fn enrich_sidebar_rows_with_live_titles_prefers_title_override_for_live_session() {
+        let live_sessions = vec![ManagedSessionView {
+            id: "live-local-title".to_string(),
+            session_path: "local://live-local-title".to_string(),
+            title: "Smoke Rename Baseline".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "local-shell".to_string(),
+            source: yggterm_server::SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: true,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: vec![],
+            rendered_sections: vec![],
+            preview: yggterm_server::SessionPreview {
+                summary: vec![],
+                blocks: vec![],
+            },
+            metadata: vec![SessionMetadataEntry {
+                label: "Cwd",
+                value: "/home/pi".to_string(),
+            }],
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: true,
+        }];
+        let mut rows = vec![BrowserRow {
+            kind: BrowserRowKind::Session,
+            full_path: "local://live-local-title".to_string(),
+            label: "Smoke Rename Baseline".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: Some("Smoke Rename Baseline".to_string()),
+            depth: 2,
+            host_label: "local-shell".to_string(),
+            descendant_sessions: 1,
+            expanded: true,
+            session_id: Some("live-local-title".to_string()),
+            session_cwd: Some("/home/pi".to_string()),
+        }];
+        let mut title_overrides = BTreeMap::new();
+        title_overrides.insert(
+            "local://live-local-title".to_string(),
+            "htop smoke proof".to_string(),
+        );
+        enrich_sidebar_rows_with_live_titles(
+            &mut rows,
+            &live_sessions,
+            &[],
+            &title_overrides,
+            &BTreeMap::new(),
+        );
+        assert_eq!(rows[0].label, "htop smoke proof");
+        assert_eq!(rows[0].session_title.as_deref(), Some("htop smoke proof"));
     }
     #[test]
     fn merged_sidebar_rows_do_not_promote_live_documents_into_live_sessions() {
@@ -41923,7 +42725,13 @@ mod tests {
             ssh_prefix: None,
             stored_preview_hydrated: true,
         }];
-        enrich_sidebar_rows_with_live_titles(&mut rows, &live_sessions, &[], &BTreeMap::new());
+        enrich_sidebar_rows_with_live_titles(
+            &mut rows,
+            &live_sessions,
+            &[],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
         assert_eq!(
             rows[0].session_title.as_deref(),
             Some("Excel Shortcut Design")
@@ -47770,6 +48578,54 @@ Updated at   Branch  Conversation\n\
         assert_eq!(
             humanized_title_for_copy_target(&target).as_deref(),
             Some("Pi Home Shell")
+        );
+    }
+    #[test]
+    fn active_session_copy_refresh_plan_skips_focus_time_regeneration_for_stale_summary() {
+        assert_eq!(
+            active_session_copy_refresh_plan(SessionSource::LiveLocal, true, false, true),
+            ActiveCopyRefreshPlan {
+                hydrate_copy: false,
+                request_title_generation: false,
+                request_summary_generation: false,
+                schedule_background_scan: true,
+            }
+        );
+    }
+    #[test]
+    fn active_session_copy_refresh_plan_generates_missing_summary() {
+        assert_eq!(
+            active_session_copy_refresh_plan(SessionSource::LiveLocal, false, false, false),
+            ActiveCopyRefreshPlan {
+                hydrate_copy: true,
+                request_title_generation: false,
+                request_summary_generation: true,
+                schedule_background_scan: true,
+            }
+        );
+    }
+    #[test]
+    fn active_session_copy_refresh_plan_keeps_title_generation_when_needed() {
+        assert_eq!(
+            active_session_copy_refresh_plan(SessionSource::LiveLocal, true, true, false),
+            ActiveCopyRefreshPlan {
+                hydrate_copy: true,
+                request_title_generation: true,
+                request_summary_generation: false,
+                schedule_background_scan: true,
+            }
+        );
+    }
+    #[test]
+    fn active_session_copy_refresh_plan_stored_session_hydrates_without_regeneration() {
+        assert_eq!(
+            active_session_copy_refresh_plan(SessionSource::Stored, false, true, true),
+            ActiveCopyRefreshPlan {
+                hydrate_copy: true,
+                request_title_generation: false,
+                request_summary_generation: false,
+                schedule_background_scan: false,
+            }
         );
     }
 }
