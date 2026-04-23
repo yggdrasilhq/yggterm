@@ -135,7 +135,9 @@ impl SessionBrowserState {
         self.expanded_paths.extend(
             expanded_paths
                 .iter()
-                .filter(|path| is_level_one_group_path(&self.root, path))
+                .filter(|path| {
+                    is_level_one_group_path(&self.root, path) || is_virtual_group_path(path)
+                })
                 .cloned(),
         );
         self.rebuild_rows();
@@ -294,6 +296,10 @@ fn is_level_one_group_path(root: &SessionNode, path: &str) -> bool {
     root.children.iter().any(|child| {
         child.kind == SessionNodeKind::Group && child.path.display().to_string() == path
     })
+}
+
+fn is_virtual_group_path(path: &str) -> bool {
+    path.starts_with("__")
 }
 
 fn first_session_path(node: &SessionNode) -> Option<String> {
@@ -664,5 +670,45 @@ mod tests {
         assert_eq!(rows[0].kind, BrowserRowKind::Group);
         assert_eq!(rows[0].label, "local");
         assert_eq!(rows[0].full_path, "local");
+    }
+
+    #[test]
+    fn restore_ui_state_preserves_virtual_group_expansions() {
+        let root = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: vec![SessionNode {
+                kind: SessionNodeKind::Group,
+                name: "local".to_string(),
+                title: Some("local".to_string()),
+                document_kind: None,
+                group_kind: Some(WorkspaceGroupKind::Folder),
+                path: PathBuf::from("local"),
+                children: Vec::new(),
+                session_id: None,
+                cwd: None,
+            }],
+            session_id: None,
+            cwd: None,
+        };
+        let mut browser = SessionBrowserState::new(root);
+        browser.restore_ui_state(
+            &[
+                "__live_sessions__".to_string(),
+                "__remote_machine__/jojo".to_string(),
+            ],
+            None,
+        );
+        let expanded = browser.expanded_paths();
+        assert!(expanded.iter().any(|path| path == "__live_sessions__"));
+        assert!(
+            expanded
+                .iter()
+                .any(|path| path == "__remote_machine__/jojo")
+        );
     }
 }

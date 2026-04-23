@@ -3,8 +3,9 @@ use crate::{
     GhosttyHostSupport, ManagedSessionView, PersistedDaemonState, RemoteMachineSnapshot,
     RemoteRuntimeRegistry, ServerUiSnapshot, SessionKind, SnapshotSessionView, SshConnectTarget,
     TerminalManager, WorkspaceViewMode, YggtermServer, active_client_instance_records,
-    current_millis, fetch_remote_generation_context, persist_remote_generated_copy,
-    remote_resume_runtime_output_requires_restart, terminate_remote_codex_session,
+    current_millis, fetch_remote_generation_context, local_headless_companion_executable_from_current,
+    persist_remote_generated_copy, remote_resume_runtime_output_requires_restart,
+    terminate_remote_codex_session,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -42,15 +43,33 @@ const DUPLICATE_SAME_HOME_GRACE_MS: u64 = 2_000;
 const REMOTE_ATTACH_STARTUP_GRACE_MS: u64 = 900;
 
 #[cfg(target_os = "linux")]
-fn daemon_binary_is_legacy(current_exe: &str, argv0: &str, proc_exe_target: Option<&Path>) -> bool {
-    if argv0 != current_exe {
+fn daemon_expected_binary_paths(current_exe: &Path) -> Vec<PathBuf> {
+    let mut allowed = vec![current_exe.to_path_buf()];
+    if let Some(headless) = local_headless_companion_executable_from_current(current_exe) {
+        allowed.push(headless);
+    }
+    allowed
+}
+
+#[cfg(target_os = "linux")]
+fn daemon_binary_is_legacy(current_exe: &Path, argv0: &str, proc_exe_target: Option<&Path>) -> bool {
+    let allowed = daemon_expected_binary_paths(current_exe);
+    let argv_allowed = allowed
+        .iter()
+        .any(|candidate| argv0 == candidate.to_string_lossy());
+    if !argv_allowed {
         return true;
     }
     let Some(proc_exe_target) = proc_exe_target else {
         return false;
     };
     let target = proc_exe_target.to_string_lossy();
-    target.contains(" (deleted)") || target != current_exe
+    if target.contains(" (deleted)") {
+        return true;
+    }
+    !allowed
+        .iter()
+        .any(|candidate| target == candidate.to_string_lossy())
 }
 
 fn terminal_sidebar_snapshot_from_screen(text: &str) -> Option<(String, Vec<String>)> {
@@ -299,6 +318,12 @@ pub enum ServerRequest {
     },
     RefreshPreview {
         path: String,
+    },
+    UpdateSessionCopy {
+        path: String,
+        title: Option<String>,
+        precis: Option<String>,
+        summary: Option<String>,
     },
     RemoveSshTarget {
         machine_key: String,
@@ -987,6 +1012,24 @@ impl DaemonRuntime {
                 self.server.refresh_session_preview_from_source(&path)?;
                 self.persist()?;
                 self.snapshot_response(Some(format!("refreshed preview {path}")))
+            }
+            ServerRequest::UpdateSessionCopy {
+                path,
+                title,
+                precis,
+                summary,
+            } => {
+                if let Some(title) = title.as_deref() {
+                    self.server.set_session_title_hint(&path, title);
+                }
+                if let Some(precis) = precis.as_deref() {
+                    self.server.set_session_precis_hint(&path, precis);
+                }
+                if let Some(summary) = summary.as_deref() {
+                    self.server.set_session_summary_hint(&path, summary);
+                }
+                self.persist()?;
+                ServerResponse::Ack { message: None }
             }
             ServerRequest::RemoveSshTarget { machine_key } => {
                 let removed = self.server.remove_ssh_targets_for_machine(&machine_key);
@@ -1742,6 +1785,7 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::RefreshRemoteMachine { .. } => "refresh_remote_machine",
         ServerRequest::RefreshManagedCli { .. } => "refresh_managed_cli",
         ServerRequest::RefreshPreview { .. } => "refresh_preview",
+        ServerRequest::UpdateSessionCopy { .. } => "update_session_copy",
         ServerRequest::RemoveSshTarget { .. } => "remove_ssh_target",
         ServerRequest::RemoveSession { .. } => "remove_session",
         ServerRequest::StartLocalSession { .. } => "start_local_session",
@@ -1974,6 +2018,24 @@ pub fn refresh_preview(
         endpoint,
         &ServerRequest::RefreshPreview {
             path: path.to_string(),
+        },
+    )?)
+}
+
+pub fn update_session_copy(
+    endpoint: &ServerEndpoint,
+    path: &str,
+    title: Option<&str>,
+    precis: Option<&str>,
+    summary: Option<&str>,
+) -> Result<Option<String>> {
+    expect_ack(send_request(
+        endpoint,
+        &ServerRequest::UpdateSessionCopy {
+            path: path.to_string(),
+            title: title.map(ToOwned::to_owned),
+            precis: precis.map(ToOwned::to_owned),
+            summary: summary.map(ToOwned::to_owned),
         },
     )?)
 }
@@ -2664,7 +2726,6 @@ fn cleanup_legacy_linux_daemon_processes(
     endpoint: &ServerEndpoint,
     current_exe: &Path,
 ) -> Result<()> {
-    let current_exe = current_exe.to_string_lossy().to_string();
     let current_home = match endpoint {
         #[cfg(unix)]
         ServerEndpoint::UnixSocket(path) => path.parent().map(Path::to_path_buf),
@@ -2785,8 +2846,7 @@ fn cleanup_legacy_linux_daemon_processes(
             .and_then(|home| active_client_instance_records(home, &default_endpoint(home)).ok())
             .is_some_and(|records| !records.is_empty());
         let age_ms = linux_proc_pid_age_ms(pid).unwrap_or_default();
-        let is_legacy_binary =
-            daemon_binary_is_legacy(&current_exe, argv0, proc_exe_target.as_deref());
+        let is_legacy_binary = daemon_binary_is_legacy(current_exe, argv0, proc_exe_target.as_deref());
         let is_orphan_clientless = !has_clients
             && age_ms >= reap_after_ms
             && daemon_home.as_deref() != current_home.as_deref();
@@ -3051,16 +3111,21 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn daemon_binary_is_legacy_for_deleted_proc_exe_target() {
-        let current = "/home/pi/.yggterm/bin/yggterm";
+        let current = Path::new("/home/pi/.yggterm/bin/yggterm");
         assert!(daemon_binary_is_legacy(
             current,
-            current,
+            "/home/pi/.yggterm/bin/yggterm",
             Some(Path::new("/home/pi/.yggterm/bin/yggterm (deleted)")),
         ));
         assert!(!daemon_binary_is_legacy(
             current,
-            current,
+            "/home/pi/.yggterm/bin/yggterm",
             Some(Path::new("/home/pi/.yggterm/bin/yggterm")),
+        ));
+        assert!(!daemon_binary_is_legacy(
+            current,
+            "/home/pi/.yggterm/bin/yggterm-headless",
+            Some(Path::new("/home/pi/.yggterm/bin/yggterm-headless")),
         ));
         assert!(daemon_binary_is_legacy(
             current,
