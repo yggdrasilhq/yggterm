@@ -4,6 +4,14 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.28
+
+### Fixed
+
+- stop manual live-session renames from being overwritten by the next background snapshot, so the sidebar title, active title, and persisted title/summary stay stable after rename and after switching away to another live session and back
+- preserve multiple live shell sessions of the same kind during persisted-state restore instead of collapsing them by `(kind, host, prefix)`, so local and same-machine remote terminals stop disappearing out of the live tree during snapshot/restore churn
+- keep synthetic live-session group expansion state intact across tree restores, so rename and snapshot updates stop collapsing the `Live Sessions` section while the sidebar is being refreshed
+
 ## 2.1.27
 
 ### Fixed
