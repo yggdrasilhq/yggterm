@@ -538,6 +538,7 @@ enum CloseAppMode {
 const KEEP_DAEMON_RUNNING_AFTER_LAST_CLIENT: bool = true;
 const KDE_CLOSE_TERMINAL_DETACH_MS: u64 = 180;
 const KDE_CLOSE_FINAL_HIDE_MS: u64 = 60;
+const CLOSE_FORCE_EXIT_WATCHDOG_MS: u64 = 2_500;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RightPanelMode {
     Hidden,
@@ -6115,6 +6116,7 @@ fn spawn_graceful_shutdown_and_close(mut state: Signal<ShellState>) {
         shell.closing_app = true;
         shell.last_action = "closing yggterm".to_string();
     });
+    spawn_close_force_exit_watchdog();
     spawn(async move {
         if detach_terminal_before_close {
             window().set_decorations(true);
@@ -6130,6 +6132,31 @@ fn spawn_graceful_shutdown_and_close(mut state: Signal<ShellState>) {
             sleep(Duration::from_millis(KDE_CLOSE_FINAL_HIDE_MS)).await;
         }
         let _ = window().close();
+    });
+}
+fn spawn_close_force_exit_watchdog() {
+    let shutdown_context = BOOTSTRAP.get().map(|bootstrap| {
+        (
+            bootstrap.settings_path.clone(),
+            bootstrap.server_endpoint.clone(),
+        )
+    });
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(CLOSE_FORCE_EXIT_WATCHDOG_MS));
+        if let Some((settings_path, endpoint)) = shutdown_context {
+            append_trace_event(
+                &perf_home_dir(&settings_path),
+                "ui",
+                "shutdown",
+                "force_exit_after_close_timeout",
+                json!({
+                    "pid": std::process::id(),
+                    "timeout_ms": CLOSE_FORCE_EXIT_WATCHDOG_MS,
+                }),
+            );
+            let _ = maybe_shutdown_daemon_for_last_client(&settings_path, &endpoint);
+        }
+        std::process::exit(0);
     });
 }
 #[derive(Debug, Clone)]

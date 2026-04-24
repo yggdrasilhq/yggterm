@@ -60,6 +60,62 @@ const ENV_YGGTERM_WEBKIT_MEMORY_STRICT_THRESHOLD: &str = "YGGTERM_WEBKIT_MEMORY_
 const ENV_YGGTERM_WEBKIT_MEMORY_POLL_INTERVAL_SEC: &str = "YGGTERM_WEBKIT_MEMORY_POLL_INTERVAL_SEC";
 const ENV_MALLOC_ARENA_MAX: &str = "MALLOC_ARENA_MAX";
 
+fn app_control_client_for_pid(payload: &serde_json::Value, pid: u32) -> Option<serde_json::Value> {
+    payload
+        .get("clients")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|clients| {
+            clients
+                .iter()
+                .find(|entry| {
+                    entry.get("pid").and_then(serde_json::Value::as_u64) == Some(pid as u64)
+                })
+                .cloned()
+        })
+}
+
+fn app_control_state_visible_for_pid(payload: &serde_json::Value, pid: u32) -> bool {
+    let Some(data) = payload.get("data") else {
+        return false;
+    };
+    let visible = data
+        .get("window")
+        .and_then(|value| value.get("visible"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !visible {
+        return false;
+    }
+    let client_pid = data
+        .get("client_instance")
+        .and_then(|value| value.get("pid"))
+        .and_then(serde_json::Value::as_u64);
+    let handled_by_pid = payload
+        .get("handled_by_pid")
+        .and_then(serde_json::Value::as_u64);
+    client_pid == Some(pid as u64) || handled_by_pid == Some(pid as u64)
+}
+
+fn app_control_state_launch_summary(
+    payload: &serde_json::Value,
+    pid: u32,
+) -> Option<serde_json::Value> {
+    let data = payload.get("data")?;
+    let dom = data.get("dom").cloned().unwrap_or(serde_json::Value::Null);
+    Some(serde_json::json!({
+        "request_id": payload.get("request_id").cloned().unwrap_or(serde_json::Value::Null),
+        "handled_by_pid": payload.get("handled_by_pid").cloned().unwrap_or(serde_json::Value::Null),
+        "visible": app_control_state_visible_for_pid(payload, pid),
+        "window": data.get("window").cloned().unwrap_or(serde_json::Value::Null),
+        "client_instance": data.get("client_instance").cloned().unwrap_or(serde_json::Value::Null),
+        "dom": {
+            "shell_root_count": dom.get("shell_root_count").cloned().unwrap_or(serde_json::Value::Null),
+            "degraded_reason": dom.get("degraded_reason").cloned().unwrap_or(serde_json::Value::Null),
+            "error": dom.get("error").cloned().unwrap_or(serde_json::Value::Null),
+        },
+    }))
+}
+
 fn configure_linux_allocator_limits() -> Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -172,41 +228,77 @@ fn launch_app_background(
         .with_context(|| format!("spawning background yggterm from {}", current_exe.display()))?;
     let pid = child.id();
     let mut client = None::<serde_json::Value>;
+    let mut visibility = None::<serde_json::Value>;
+    let mut visibility_error = None::<String>;
     if wait_visible {
         let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms.max(100));
+        let state_timeout_ms = timeout_ms.clamp(250, 1_500);
+        let control_cwd = control_exe
+            .parent()
+            .or_else(|| current_exe.parent())
+            .unwrap_or(home_dir)
+            .to_path_buf();
         while std::time::Instant::now() <= deadline {
-            let output = Command::new(&control_exe)
-                .args(["server", "app", "clients"])
-                .env(ENV_YGGTERM_HOME, home_dir)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .current_dir(
-                    control_exe
-                        .parent()
-                        .unwrap_or_else(|| current_exe.parent().unwrap_or(home_dir)),
-                )
-                .output()
-                .with_context(|| format!("listing app clients via {}", control_exe.display()))?;
-            if output.status.success() {
-                if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-                    client = payload
-                        .get("clients")
-                        .and_then(serde_json::Value::as_array)
-                        .and_then(|clients| {
-                            clients
-                                .iter()
-                                .find(|entry| {
-                                    entry.get("pid").and_then(serde_json::Value::as_u64)
-                                        == Some(pid as u64)
-                                })
-                                .cloned()
-                        });
-                    if client.is_some() {
-                        break;
+            if client.is_none() {
+                let output = Command::new(&control_exe)
+                    .args(["server", "app", "clients"])
+                    .env(ENV_YGGTERM_HOME, home_dir)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .current_dir(&control_cwd)
+                    .output()
+                    .with_context(|| {
+                        format!("listing app clients via {}", control_exe.display())
+                    })?;
+                if output.status.success() {
+                    if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                    {
+                        client = app_control_client_for_pid(&payload, pid);
                     }
                 }
             }
-            std::thread::sleep(Duration::from_millis(40));
+            if client.is_some() {
+                let output = Command::new(&control_exe)
+                    .args(["server", "app", "state", "--pid"])
+                    .arg(pid.to_string())
+                    .arg("--timeout-ms")
+                    .arg(state_timeout_ms.to_string())
+                    .env(ENV_YGGTERM_HOME, home_dir)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .current_dir(&control_cwd)
+                    .output()
+                    .with_context(|| {
+                        format!("describing app state via {}", control_exe.display())
+                    })?;
+                if output.status.success() {
+                    match serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                        Ok(payload) => {
+                            if let Some(summary) = app_control_state_launch_summary(&payload, pid) {
+                                if app_control_state_visible_for_pid(&payload, pid) {
+                                    visibility_error = None;
+                                    visibility = Some(summary);
+                                    break;
+                                }
+                                visibility = Some(summary);
+                                visibility_error = Some(
+                                    "app-control state responded before the window became visible"
+                                        .to_string(),
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            visibility_error =
+                                Some(format!("failed to parse app-control state JSON: {error}"));
+                        }
+                    }
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    visibility_error = Some(if stderr.is_empty() { stdout } else { stderr });
+                }
+            }
+            std::thread::sleep(Duration::from_millis(80));
         }
     }
     println!(
@@ -214,8 +306,16 @@ fn launch_app_background(
         serde_json::to_string_pretty(&serde_json::json!({
             "pid": pid,
             "log_path": chosen_log_path,
+            "wait_visible": wait_visible,
             "registered": client.is_some(),
+            "visible": visibility
+                .as_ref()
+                .and_then(|value| value.get("visible"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
             "client": client,
+            "visibility": visibility,
+            "visibility_error": visibility_error,
         }))?
     );
     Ok(())
