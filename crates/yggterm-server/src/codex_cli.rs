@@ -9,7 +9,9 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
-use yggterm_core::{ENV_YGGTERM_HOME, PerfSpan, append_trace_event, resolve_yggterm_home};
+use yggterm_core::{
+    ENV_YGGTERM_HOME, PerfSpan, SessionStore, append_trace_event, resolve_yggterm_home,
+};
 use yggui_contract::UiTheme;
 
 const MANAGED_NPM_DIRNAME: &str = "npm";
@@ -685,6 +687,19 @@ mod tests {
             "local: deferred initial managed Codex install until first use"
         );
     }
+
+    #[test]
+    fn shell_join_extra_args_quotes_configured_codex_flags() {
+        assert_eq!(shell_join_extra_args(""), "");
+        assert_eq!(
+            shell_join_extra_args("-s danger-full-access --profile \"field test\""),
+            " '-s' 'danger-full-access' '--profile' 'field test'"
+        );
+        assert_eq!(
+            shell_join_extra_args("--message \"Avikalpa's laptop\""),
+            " '--message' 'Avikalpa'\\''s laptop'"
+        );
+    }
 }
 
 fn run_version_command(binary_path: &Path) -> Option<String> {
@@ -848,11 +863,12 @@ pub(crate) fn managed_cli_shell_command(
         parts.push(preamble);
     }
     parts.push(paths.shell_exports(tool));
+    let extra_args = configured_codex_extra_args(kind);
     let invocation = match action {
-        ManagedCliAction::Launch => tool.binary_name().to_string(),
+        ManagedCliAction::Launch => format!("{}{}", tool.binary_name(), extra_args),
         ManagedCliAction::ResumePicker { persistent } => {
             let prefix = if persistent { "exec " } else { "" };
-            format!("{prefix}{} resume", tool.binary_name())
+            format!("{prefix}{}{} resume", tool.binary_name(), extra_args)
         }
         ManagedCliAction::Resume {
             session_id,
@@ -861,14 +877,16 @@ pub(crate) fn managed_cli_shell_command(
             let prefix = if persistent { "exec " } else { "" };
             if matches!(kind, SessionKind::Codex) && has_cwd {
                 format!(
-                    "{prefix}{} resume -C \"$PWD\" {}",
+                    "{prefix}{}{} resume -C \"$PWD\" {}",
                     tool.binary_name(),
+                    extra_args,
                     shell_single_quote(session_id)
                 )
             } else {
                 format!(
-                    "{prefix}{} resume {}",
+                    "{prefix}{}{} resume {}",
                     tool.binary_name(),
+                    extra_args,
                     shell_single_quote(session_id)
                 )
             }
@@ -876,6 +894,43 @@ pub(crate) fn managed_cli_shell_command(
     };
     parts.push(invocation);
     Ok(parts.join(" && "))
+}
+
+fn configured_codex_extra_args(kind: SessionKind) -> String {
+    if !matches!(kind, SessionKind::Codex | SessionKind::CodexLiteLlm) {
+        return String::new();
+    }
+    let raw = SessionStore::open_or_init()
+        .and_then(|store| store.load_settings())
+        .ok()
+        .map(|settings| settings.codex_extra_args)
+        .unwrap_or_default();
+    shell_join_extra_args(&raw)
+}
+
+fn shell_join_extra_args(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let tokens = shlex::split(trimmed).unwrap_or_else(|| {
+        trimmed
+            .split_whitespace()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>()
+    });
+    if tokens.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " {}",
+            tokens
+                .iter()
+                .map(|arg| shell_single_quote(arg))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    }
 }
 
 pub(crate) fn best_effort_cwd_shell_prefix(cwd: Option<&str>) -> Option<String> {

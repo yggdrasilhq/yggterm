@@ -17,6 +17,20 @@ STAGE_DIR="${ROOT_DIR}/.yggterm-state/deb/${PKG_NAME}_${DEB_VERSION}_${ARCH}"
 
 mkdir -p "$DIST_DIR"
 
+checksum_file() {
+  local file="$1"
+  local out="$2"
+  local dir
+  local base
+  dir="$(dirname "$file")"
+  base="$(basename "$file")"
+  if command -v sha256sum >/dev/null 2>&1; then
+    (cd "$dir" && sha256sum "$base") > "$out"
+  else
+    (cd "$dir" && shasum -a 256 "$base") > "$out"
+  fi
+}
+
 pushd "$ROOT_DIR" >/dev/null
 "${CARGO_CMD[@]}" build --release -p yggterm --bin yggterm --bin yggterm-headless --bin yggterm-mock-cli --no-default-features
 popd >/dev/null
@@ -84,7 +98,7 @@ CONTROL
 
 OUT_DEB="${DIST_DIR}/${PKG_NAME}_${DEB_VERSION}_${ARCH}.deb"
 fakeroot dpkg-deb --build "$STAGE_DIR" "$OUT_DEB" >/dev/null
-sha256sum "$OUT_DEB" > "${OUT_DEB}.sha256"
+checksum_file "$OUT_DEB" "${OUT_DEB}.sha256"
 
 echo "Deb package: $OUT_DEB"
 echo "Deb checksum: ${OUT_DEB}.sha256"

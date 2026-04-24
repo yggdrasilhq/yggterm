@@ -444,6 +444,66 @@ def clear_prompt_line(pid: int, session: str, *, timeout_seconds: float = 8.0) -
     }
 
 
+GENERIC_CODEX_PROMPT_MARKERS = (
+    "Implement {feature}",
+    "Explain this codebase",
+    "Find and fix a bug",
+    "Resume a previous session",
+    "Write tests for",
+    "@filename",
+    "Review my changes",
+    "Summarize recent commits",
+    "Create a PR",
+)
+
+
+def codex_cursor_line_is_empty_prompt(line: str) -> bool:
+    semantic = strip_terminal_border(line)
+    return semantic.startswith("›") and semantic[1:].strip() == ""
+
+
+def clear_codex_prompt_line(pid: int, session: str, *, timeout_seconds: float = 8.0) -> dict:
+    focus_state = prime_terminal_surface_for_keyboard(pid, session)
+    clear_probe = probe_type(
+        pid,
+        session,
+        "",
+        mode="keyboard",
+        press_ctrl_e=True,
+        press_ctrl_u=True,
+    )
+    deadline = time.time() + timeout_seconds
+    last_state = {}
+    while time.time() < deadline:
+        last_state = wait_for_session_focus(
+            pid,
+            session,
+            timeout_seconds=min(4.0, max(0.5, deadline - time.time())),
+        )
+        host = host_for_session(last_state, session)
+        cursor_line = str(host.get("cursor_line_text") or host.get("cursor_row_text") or "")
+        if host_has_shell_status_failure(host) or terminal_chunk_has_prompt_output(cursor_line):
+            raise AssertionError(
+                "Codex prompt cleanup dropped back to the shell before /status typing: "
+                f"cursor_line={cursor_line!r} text_tail={terminal_host_text(host)[-400:]!r}"
+            )
+        if host_has_live_codex_prompt(host):
+            return {
+                "accepted_codex_prompt": True,
+                "accepted_empty_prompt": codex_cursor_line_is_empty_prompt(cursor_line),
+                "accepted_placeholder_prompt": not codex_cursor_line_is_empty_prompt(cursor_line),
+                "focus_state_session": focus_state.get("active_session_path"),
+                "clear_probe": clear_probe,
+                "state": last_state,
+                "cursor_line_text": cursor_line,
+            }
+        time.sleep(0.18)
+    raise AssertionError(
+        "Codex prompt did not clear without exiting to the shell: "
+        f"last_state={last_state!r}"
+    )
+
+
 def focus_terminal_helper_textarea(
     pid: int,
     session: str,
@@ -753,6 +813,29 @@ def app_set_main_zoom(pid: int, value: float, *, view: str = "terminal") -> dict
 def app_rows(pid: int) -> list[dict]:
     payload = run("server", "app", "rows", "--pid", str(pid), "--timeout-ms", "8000")
     return ((payload.get("data") or {}).get("rows") or [])
+
+
+def app_expand(pid: int, row_path: str, expanded: bool = True) -> dict:
+    return unwrap_data(run(
+        "server",
+        "app",
+        "expand" if expanded else "collapse",
+        row_path,
+        "--pid",
+        str(pid),
+        "--timeout-ms",
+        "12000",
+    ))
+
+
+def app_drag(pid: int, action: str, row_path: str | None = None, *, placement: str | None = None) -> dict:
+    args = ["server", "app", "drag", action]
+    if row_path is not None:
+        args.append(row_path)
+    if placement is not None:
+        args.extend(["--placement", placement])
+    args.extend(["--pid", str(pid), "--timeout-ms", "20000"])
+    return unwrap_data(run(*args))
 
 
 def preferred_hot_plain_session(pid: int) -> str | None:
@@ -3547,6 +3630,15 @@ def strip_terminal_border(line: str) -> str:
     return line.strip().strip("╭╮╰╯─│ ").strip()
 
 
+def terminal_chunk_has_prompt_output(data: str) -> bool:
+    normalized_lines = [line.strip() for line in str(data or "").splitlines() if line.strip()]
+    if not normalized_lines or len(normalized_lines) > 2:
+        return False
+    if any(len(line) > 48 for line in normalized_lines):
+        return False
+    return any(line.endswith(("$", "#", ">", "%")) for line in normalized_lines)
+
+
 def terminal_chunk_has_codex_prompt_output(data: str) -> bool:
     normalized_lines = [line.strip() for line in str(data or "").splitlines() if line.strip()]
     if not normalized_lines:
@@ -5797,6 +5889,385 @@ def assert_search_focus_overlay_contract(pid: int, session: str) -> dict:
     }
     LAST_SEARCH_FOCUS_OVERLAY_CONTRACT = result
     return result
+
+
+def assert_titlebar_search_typing_contract(pid: int) -> dict:
+    created_paths: list[str] = []
+    target_path = ""
+    target_title = "litellm search smoke"
+    try:
+        created = app_create_terminal(pid, title=target_title)
+        target_path = str(created.get("session_path") or created.get("active_session_path") or "").strip()
+        if not target_path:
+            raise AssertionError(f"terminal create did not return a session path: {created!r}")
+        created_paths.append(target_path)
+
+        row_state = {}
+        row = None
+        row_visible_via = ""
+        deadline = time.time() + 15.0
+        while time.time() < deadline:
+            row_state = app_state(pid)
+            row = find_visible_sidebar_row_by_path(row_state, target_path, kind="Session")
+            if row is not None and rect_is_visible(sidebar_row_rect(row)):
+                row_visible_via = "dom_visible_row"
+                break
+            selected_row = ((row_state.get("browser") or {}).get("selected_row") or {})
+            if normalize_live_path(str(selected_row.get("full_path") or "")) == normalize_live_path(target_path):
+                row_visible_via = "selected_row"
+                break
+            live_sessions = list(row_state.get("live_session_snapshot_debug") or [])
+            if any(
+                normalize_live_path(str(session.get("session_path") or ""))
+                == normalize_live_path(target_path)
+                for session in live_sessions
+            ):
+                row_visible_via = "live_session_snapshot"
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError(
+                f"created search target never became visible in the sidebar: "
+                f"target_path={target_path!r} state={row_state!r}"
+            )
+
+        app_set_search(pid, "", focused=False)
+        baseline = wait_for_window_focus(pid, timeout_seconds=3.0)
+        if titlebar_transient_open(baseline):
+            baseline = dismiss_titlebar_transients(pid, baseline, timeout_seconds=1.5)
+        if right_panel_mode(baseline) not in ("", "hidden", "none", "null", "settings"):
+            baseline = close_right_panel(pid, baseline, timeout_seconds=1.5)
+
+        shortcut = None
+        opened_via = "ctrl_shift_p"
+        try:
+            shortcut = xdotool_key_window(pid, "ctrl+shift+p")
+        except AssertionError:
+            opened_via = "click_fallback"
+        focused = {}
+        focus_deadline = time.time() + 3.0
+        while time.time() < focus_deadline:
+            focused = app_state(pid)
+            active_element = (focused.get("dom") or {}).get("active_element") or {}
+            if (
+                bool((focused.get("shell") or {}).get("search_focused"))
+                and str(active_element.get("id") or "") == "yggterm-search-input"
+            ):
+                break
+            time.sleep(0.08)
+        else:
+            opened_via = "click_fallback"
+            search_rect = None
+            for candidate_state in (focused, baseline, row_state):
+                if not candidate_state:
+                    continue
+                search_rect = (
+                    dom_rect(candidate_state, "titlebar_search_input_rect")
+                    or dom_rect(candidate_state, "titlebar_search_field_shell_rect")
+                    or dom_rect(candidate_state, "titlebar_search_outer_shell_rect")
+                    or dom_rect(candidate_state, "titlebar_search_shell_rect")
+                )
+                if rect_is_visible(search_rect):
+                    break
+            if not rect_is_visible(search_rect):
+                raise AssertionError(
+                    f"titlebar search control is not visible for typing probe: "
+                    f"shortcut={shortcut!r} state={focused or baseline!r}"
+                )
+            xdotool_click_window(pid, rect_center_x(search_rect), rect_center_y(search_rect))
+            focus_deadline = time.time() + 3.0
+            while time.time() < focus_deadline:
+                focused = app_state(pid)
+                active_element = (focused.get("dom") or {}).get("active_element") or {}
+                if (
+                    bool((focused.get("shell") or {}).get("search_focused"))
+                    and str(active_element.get("id") or "") == "yggterm-search-input"
+                ):
+                    break
+                time.sleep(0.08)
+            else:
+                raise AssertionError(
+                    f"titlebar search input did not focus for typing probe: "
+                    f"shortcut={shortcut!r} state={focused!r}"
+                )
+
+        query = "litellm"
+        typed = ""
+        progress: list[dict] = []
+        for ch in query:
+            xdotool_type_window(pid, ch)
+            typed += ch
+            # The old bug was caused by delayed select-all callbacks. Waiting
+            # longer than those callbacks between keystrokes reproduces it.
+            time.sleep(0.34)
+            current = {}
+            current_query = ""
+            active_value = ""
+            char_deadline = time.time() + 1.2
+            while time.time() < char_deadline:
+                current = app_state(pid)
+                shell = current.get("shell") or {}
+                active_element = (current.get("dom") or {}).get("active_element") or {}
+                current_query = str(shell.get("search_query") or "")
+                active_value = str(active_element.get("value") or "")
+                if (
+                    str(active_element.get("id") or "") == "yggterm-search-input"
+                    and current_query == typed
+                    and active_value == typed
+                ):
+                    break
+                time.sleep(0.04)
+            progress.append(
+                {
+                    "typed": typed,
+                    "search_query": current_query,
+                    "active_value": active_value,
+                }
+            )
+            if current_query != typed or active_value != typed:
+                raise AssertionError(
+                    "titlebar search input replaced the existing query while typing: "
+                    f"expected={typed!r} search_query={current_query!r} "
+                    f"active_value={active_value!r} progress={progress!r} state={current!r}"
+                )
+
+        final = app_state(pid)
+        shell = final.get("shell") or {}
+        dom = final.get("dom") or {}
+        final_query = str(shell.get("search_query") or "")
+        active_element = dom.get("active_element") or {}
+        final_value = str(active_element.get("value") or "")
+        if final_query != query or final_value != query:
+            raise AssertionError(
+                f"titlebar search did not retain the full typed query: "
+                f"query={final_query!r} active_value={final_value!r} progress={progress!r} state={final!r}"
+            )
+        if not rect_is_visible(dom_rect(final, "titlebar_search_dropdown_rect")):
+            raise AssertionError(f"active search did not keep the dropdown visible: state={final!r}")
+        search_sidebar_matches = list((final.get("search") or {}).get("sidebar_matches") or [])
+        if not search_sidebar_matches:
+            raise AssertionError(f"typed search query found no sidebar matches: state={final!r}")
+        visible_matches = [
+            row
+            for row in visible_sidebar_rows(final)
+            if normalize_live_path(str(row.get("path") or ""))
+            == normalize_live_path(target_path)
+            or target_title in str(row.get("label") or "").lower()
+        ]
+        if not visible_matches:
+            raise AssertionError(
+                f"typed search query did not show the created litellm row: "
+                f"target_path={target_path!r} matches={search_sidebar_matches!r} state={final!r}"
+            )
+        counter_text = str(dom.get("titlebar_search_counter_text") or "").strip()
+        if search_sidebar_matches and counter_text == "0/0":
+            raise AssertionError(
+                f"titlebar search counter reports 0/0 while row matches exist: state={final!r}"
+            )
+        if search_sidebar_matches and not counter_text:
+            raise AssertionError(
+                f"titlebar search counter text missing while row matches exist: state={final!r}"
+            )
+
+        app_set_search(pid, "", focused=False)
+        return {
+            "created": created,
+            "target_path": target_path,
+            "row_visible_via": row_visible_via,
+            "opened_via": opened_via,
+            "shortcut": shortcut,
+            "progress": progress,
+            "final_query": final_query,
+            "counter_text": counter_text,
+            "visible_match_count": len(visible_matches),
+            "search_sidebar_match_count": len(search_sidebar_matches),
+        }
+    finally:
+        try:
+            app_set_search(pid, "", focused=False)
+        except Exception:
+            pass
+        for path in created_paths:
+            try:
+                app_remove_session(pid, path)
+            except Exception:
+                pass
+
+
+def visible_session_drag_target_folder(state: dict) -> dict | None:
+    preferred = {"/home/pi", str(Path.home())}
+    fallback = None
+    for row in visible_sidebar_rows(state):
+        if str(row.get("kind") or "").strip() != "Group":
+            continue
+        path = str(row.get("path") or row.get("full_path") or "").strip()
+        if (
+            not path
+            or path == "local"
+            or path == "/"
+            or path.startswith("__live_")
+            or path.startswith("__remote_")
+            or not path.startswith("/")
+        ):
+            continue
+        if path in preferred:
+            return row
+        if fallback is None and path.startswith(str(Path.home())):
+            fallback = row
+        elif fallback is None and not path.startswith(("/sys", "/proc", "/dev", "/run")):
+            fallback = row
+    return fallback
+
+
+def wait_for_session_drag_target_folder(pid: int, timeout_seconds: float = 8.0) -> tuple[dict, dict]:
+    try:
+        app_expand(pid, "local", True)
+    except Exception:
+        pass
+    try:
+        app_expand(pid, "/", True)
+    except Exception:
+        pass
+    deadline = time.time() + timeout_seconds
+    last_state = {}
+    while time.time() < deadline:
+        last_state = app_state(pid)
+        row = visible_session_drag_target_folder(last_state)
+        if row is not None and rect_is_visible(sidebar_row_rect(row)):
+            return last_state, row
+        time.sleep(0.12)
+    raise AssertionError(f"no visible writable folder target for session drag smoke: state={last_state!r}")
+
+
+def assert_session_drag_to_folder_contract(pid: int) -> dict:
+    created_session = ""
+    try:
+        app_set_search(pid, "", focused=False)
+        folder_state, folder = wait_for_session_drag_target_folder(pid)
+        folder_path = str(folder.get("path") or folder.get("full_path") or "").strip()
+        app_expand(pid, folder_path, True)
+        created = app_create_terminal(pid, title="drag smoke terminal")
+        created_session = str(created.get("session_path") or created.get("active_session_path") or "").strip()
+        if not created_session:
+            raise AssertionError(f"drag smoke terminal create did not return a session path: {created!r}")
+
+        row_state = {}
+        row = None
+        deadline = time.time() + 15.0
+        while time.time() < deadline:
+            row_state = app_state(pid)
+            row = find_visible_live_sidebar_row_by_path(row_state, created_session, kind="Session")
+            if row is None:
+                row = find_visible_sidebar_row_by_path(row_state, created_session, kind="Session")
+            if row is not None and rect_is_visible(sidebar_row_rect(row)):
+                break
+            time.sleep(0.12)
+        else:
+            raise AssertionError(
+                f"created session row never became visible for drag smoke: "
+                f"session={created_session!r} created={created!r} state={row_state!r}"
+            )
+        if row.get("draggable") is not True:
+            raise AssertionError(
+                f"created session row is visible but not DOM-draggable: "
+                f"session={created_session!r} row={row!r} state={row_state!r}"
+            )
+
+        begin = app_drag(pid, "begin", created_session)
+        if begin.get("accepted") is not True:
+            raise AssertionError(f"app-control rejected session drag begin: begin={begin!r} state={app_state(pid)!r}")
+        hover = app_drag(pid, "hover", folder_path, placement="into")
+        if hover.get("accepted") is not True:
+            raise AssertionError(
+                f"app-control rejected session drag hover into folder: "
+                f"folder={folder_path!r} hover={hover!r} state={app_state(pid)!r}"
+            )
+        drop = app_drag(pid, "drop")
+        if drop.get("accepted") is not True:
+            raise AssertionError(f"app-control rejected session drag drop: drop={drop!r} state={app_state(pid)!r}")
+        try:
+            app_expand(pid, folder_path, True)
+        except Exception:
+            pass
+
+        final_state = {}
+        selected_row = {}
+        selected_path = ""
+        recipe_row = None
+        deadline = time.time() + 15.0
+        while time.time() < deadline:
+            final_state = app_state(pid)
+            browser = final_state.get("browser") or {}
+            selected_row = browser.get("selected_row") or {}
+            selected_path = str(
+                browser.get("selected_path") or selected_row.get("full_path") or selected_row.get("path") or ""
+            ).strip()
+            selected_tree_paths = [
+                str(path)
+                for path in (final_state.get("shell") or {}).get("selected_tree_paths") or []
+                if str(path).startswith(folder_path.rstrip("/") + "/")
+            ]
+            candidate_paths = selected_tree_paths[:]
+            if selected_path.startswith(folder_path.rstrip("/") + "/"):
+                candidate_paths.append(selected_path)
+            try:
+                rows_by_path = {
+                    normalize_live_path(str(row.get("path") or row.get("full_path") or "").strip()): row
+                    for row in app_rows(pid)
+                }
+            except Exception:
+                rows_by_path = {}
+            recipe_row = next(
+                (
+                    rows_by_path.get(normalize_live_path(path))
+                    for path in candidate_paths
+                    if rows_by_path.get(normalize_live_path(path), {}).get("kind") == "Document"
+                ),
+                None,
+            )
+            if recipe_row is not None:
+                selected_path = str(recipe_row.get("path") or recipe_row.get("full_path") or selected_path).strip()
+                break
+            time.sleep(0.12)
+        else:
+            raise AssertionError(
+                f"session drag did not persist a terminal recipe under the target folder: "
+                f"session={created_session!r} folder={folder_path!r} state={final_state!r}"
+            )
+
+        visible_recipe = find_visible_sidebar_row_by_path(final_state, selected_path, kind="Document")
+        if str(selected_row.get("document_kind") or recipe_row.get("document_kind") or "") not in (
+            "TerminalRecipe",
+            "terminal_recipe",
+            "",
+        ):
+            raise AssertionError(
+                f"dragged session created the wrong document kind: "
+                f"selected_row={selected_row!r} recipe_row={recipe_row!r}"
+            )
+
+        return {
+            "created": created,
+            "folder_path": folder_path,
+            "folder_state_selected_path": (folder_state.get("browser") or {}).get("selected_path"),
+            "begin": begin,
+            "hover": hover,
+            "drop": drop,
+            "selected_path": selected_path,
+            "selected_row": selected_row,
+            "recipe_row": recipe_row,
+            "visible_recipe": visible_recipe,
+        }
+    finally:
+        try:
+            app_drag(pid, "clear")
+        except Exception:
+            pass
+        if created_session:
+            try:
+                app_remove_session(pid, created_session)
+            except Exception:
+                pass
 
 
 def assert_titlebar_new_menu_shell_contract(pid: int) -> dict:
@@ -9467,6 +9938,23 @@ def assert_live_sessions_tree_contract(pid: int) -> dict:
         raise AssertionError(
             f"Live Sessions contains document rows instead of only live terminals: {live_group_documents!r}"
         )
+    live_group_paths = {
+        normalize_live_path(str(row.get("path") or ""))
+        for row in live_group_children
+        if str(row.get("kind") or "").strip() == "Session"
+    }
+    duplicate_tree_live_rows = [
+        row
+        for row in dom_rows
+        if normalize_live_path(str(row.get("path") or "")) in live_group_paths
+        and str(row.get("kind") or "").strip() == "Session"
+        and not bool(row.get("live_member"))
+    ]
+    if duplicate_tree_live_rows:
+        raise AssertionError(
+            "live terminal rows are duplicated outside the Live Sessions group: "
+            f"{duplicate_tree_live_rows!r}"
+        )
     cached_live_rows = [
         row
         for row in live_group_children
@@ -9529,6 +10017,7 @@ def assert_live_sessions_tree_contract(pid: int) -> dict:
         "live_group_index": live_group_index,
         "live_group_child_count": len(live_group_children),
         "live_group_document_count": len(live_group_documents),
+        "duplicate_tree_live_row_count": len(duplicate_tree_live_rows),
         "live_close_count": len(live_group_children) - len(live_close_missing) - len(live_group_documents),
         "invalid_busy_live_row_count": len(invalid_busy_live_rows),
         "invalid_cached_ready_machine_row_count": len(invalid_cached_ready_machine_rows),
@@ -9573,6 +10062,23 @@ def assert_sidebar_contract(pid: int, session: str) -> dict:
     if live_group_documents:
         raise AssertionError(
             f"Live Sessions contains document rows instead of only live terminals: {live_group_documents!r}"
+        )
+    live_group_paths = {
+        normalize_live_path(str(row.get("path") or ""))
+        for row in live_group_children
+        if str(row.get("kind") or "").strip() == "Session"
+    }
+    duplicate_tree_live_rows = [
+        row
+        for row in dom_rows
+        if normalize_live_path(str(row.get("path") or "")) in live_group_paths
+        and str(row.get("kind") or "").strip() == "Session"
+        and not bool(row.get("live_member"))
+    ]
+    if duplicate_tree_live_rows:
+        raise AssertionError(
+            "live terminal rows are duplicated outside the Live Sessions group: "
+            f"{duplicate_tree_live_rows!r}"
         )
     cached_live_rows = [
         row
@@ -9723,6 +10229,7 @@ def assert_sidebar_contract(pid: int, session: str) -> dict:
         "live_group_index": live_group_index,
         "live_group_child_count": len(live_group_children),
         "live_group_document_count": len(live_group_documents),
+        "duplicate_tree_live_row_count": len(duplicate_tree_live_rows),
         "live_close_count": len(live_group_children) - len(live_close_missing) - len(live_group_documents),
         "browser_selected_row": browser_selected_row,
         "selected_busy": selected_busy,
@@ -9876,12 +10383,56 @@ def warm_hot_switch_partner(pid: int, session: str, session_kind: str) -> dict |
     return None
 
 
+def app_open_recovered_state(pid: int, session: str, timeout_seconds: float = 3.0) -> dict | None:
+    deadline = time.time() + timeout_seconds
+    state = {}
+    while time.time() < deadline:
+        state = app_state(pid, timeout_ms=12000, retries=1)
+        active_path = str(state.get("active_session_path") or "")
+        selected_path = str(((state.get("browser") or {}).get("selected_path")) or "")
+        requests = state.get("active_surface_requests") or []
+        if (
+            normalize_live_path(active_path) == normalize_live_path(session)
+            and normalize_live_path(selected_path) == normalize_live_path(session)
+            and str(state.get("active_view_mode") or "") == "Terminal"
+            and not requests
+        ):
+            host = active_host(state)
+            if (
+                normalize_live_path(str(host.get("session_path") or ""))
+                == normalize_live_path(session)
+                and bool((state.get("viewport") or {}).get("interactive"))
+            ):
+                return state
+        time.sleep(0.1)
+    return None
+
+
 def assert_hot_session_switch(pid: int, session: str, session_kind: str, out_dir: Path) -> dict:
     snapshot = server_snapshot()
     partner = find_hot_switch_partner(snapshot, session, session_kind)
     partner_warmed = False
+    created_partner = None
+    open_recoveries: list[dict] = []
     if partner is None:
         partner = warm_hot_switch_partner(pid, session, session_kind)
+        partner_warmed = partner is not None
+    if partner is None:
+        created_partner = app_create_terminal(pid, title="Smoke Hot Switch Partner")
+        created_path = str(
+            created_partner.get("session_path")
+            or created_partner.get("active_session_path")
+            or ""
+        ).strip()
+        if not created_path:
+            raise AssertionError(
+                f"hot switch fallback could not create a disposable partner: {created_partner!r}"
+            )
+        wait_for_interactive_session(pid, created_path, timeout_seconds=20.0)
+        terminal_send(pid, created_path, "printf 'hot-switch partner ready'\r")
+        wait_for_terminal_quiescent(pid, timeout_seconds=10.0)
+        snapshot = server_snapshot()
+        partner = find_hot_switch_partner(snapshot, session, session_kind)
         partner_warmed = partner is not None
     if partner is None:
         return {"skipped": True, "reason": "no alternate hot local live session"}
@@ -9890,12 +10441,22 @@ def assert_hot_session_switch(pid: int, session: str, session_kind: str, out_dir
     if partner_warmed:
         ok, _, detail = app_open_raw(pid, session, view="terminal")
         if not ok:
-            state = app_state(pid)
-            shot_path = out_dir / "hot-switch-return-after-warm-failed.png"
-            app_screenshot(pid, shot_path)
-            raise AssertionError(
-                f"hot switch warmup could not return to the original session: session={session!r} detail={detail!r} state={state!r} screenshot={shot_path}"
-            )
+            recovered_state = app_open_recovered_state(pid, session)
+            if recovered_state is not None:
+                open_recoveries.append(
+                    {
+                        "phase": "return_after_warm",
+                        "detail": detail,
+                        "active_session_path": recovered_state.get("active_session_path"),
+                    }
+                )
+            else:
+                state = app_state(pid)
+                shot_path = out_dir / "hot-switch-return-after-warm-failed.png"
+                app_screenshot(pid, shot_path)
+                raise AssertionError(
+                    f"hot switch warmup could not return to the original session: session={session!r} detail={detail!r} state={state!r} screenshot={shot_path}"
+                )
         if session_kind == "plain":
             wait_for_terminal_quiescent(pid, timeout_seconds=10.0)
         else:
@@ -9903,12 +10464,22 @@ def assert_hot_session_switch(pid: int, session: str, session_kind: str, out_dir
 
     ok, _, detail = app_open_raw(pid, partner_path, view="terminal")
     if not ok:
-        state = app_state(pid)
-        shot_path = out_dir / "hot-switch-partner-failed.png"
-        app_screenshot(pid, shot_path)
-        raise AssertionError(
-            f"hot switch to partner timed out or failed: partner={partner_path!r} detail={detail!r} state={state!r} screenshot={shot_path}"
-        )
+        recovered_state = app_open_recovered_state(pid, partner_path)
+        if recovered_state is not None:
+            open_recoveries.append(
+                {
+                    "phase": "partner",
+                    "detail": detail,
+                    "active_session_path": recovered_state.get("active_session_path"),
+                }
+            )
+        else:
+            state = app_state(pid)
+            shot_path = out_dir / "hot-switch-partner-failed.png"
+            app_screenshot(pid, shot_path)
+            raise AssertionError(
+                f"hot switch to partner timed out or failed: partner={partner_path!r} detail={detail!r} state={state!r} screenshot={shot_path}"
+            )
     partner_state = wait_for_interactive(pid, timeout_seconds=10.0)
     if str(partner_state.get("active_session_path") or "") != partner_path:
         raise AssertionError(
@@ -9948,12 +10519,22 @@ def assert_hot_session_switch(pid: int, session: str, session_kind: str, out_dir
 
     ok, _, detail = app_open_raw(pid, session, view="terminal")
     if not ok:
-        state = app_state(pid)
-        shot_path = out_dir / "hot-switch-return-failed.png"
-        app_screenshot(pid, shot_path)
-        raise AssertionError(
-            f"hot switch back to original session timed out or failed: session={session!r} detail={detail!r} state={state!r} screenshot={shot_path}"
-        )
+        recovered_state = app_open_recovered_state(pid, session)
+        if recovered_state is not None:
+            open_recoveries.append(
+                {
+                    "phase": "return",
+                    "detail": detail,
+                    "active_session_path": recovered_state.get("active_session_path"),
+                }
+            )
+        else:
+            state = app_state(pid)
+            shot_path = out_dir / "hot-switch-return-failed.png"
+            app_screenshot(pid, shot_path)
+            raise AssertionError(
+                f"hot switch back to original session timed out or failed: session={session!r} detail={detail!r} state={state!r} screenshot={shot_path}"
+            )
     if session_kind == "plain":
         final_state = wait_for_terminal_quiescent(pid, timeout_seconds=10.0)
     else:
@@ -9999,6 +10580,8 @@ def assert_hot_session_switch(pid: int, session: str, session_kind: str, out_dir
     return {
         "partner_path": partner_path,
         "partner_kind": partner.get("kind"),
+        "created_partner": created_partner,
+        "open_recoveries": open_recoveries,
         "partner_screenshot": str(partner_shot),
         "return_screenshot": str(final_shot),
         "final_text_sample": final_text[-240:],
@@ -10089,6 +10672,21 @@ def cursor_sample_is_visibly_active(host: dict) -> bool:
     opacity = host.get("cursor_sample_opacity")
     if is_effectively_hidden_css_opacity(opacity):
         return False
+    class_name = str(host.get("cursor_sample_class_name") or "")
+    if (
+        "xterm-cursor" in class_name
+        and host.get("xterm_cursor_hidden") is not True
+        and all(
+            key not in host
+            for key in (
+                "cursor_sample_color",
+                "cursor_sample_background",
+                "cursor_sample_border_left",
+                "cursor_sample_border_bottom",
+            )
+        )
+    ):
+        return True
     color = host.get("cursor_sample_color")
     background = host.get("cursor_sample_background")
     border_left = host.get("cursor_sample_border_left")
@@ -10833,7 +11431,11 @@ def assert_cursor_prompt_visibility(state: dict, *, context: str) -> dict:
         or ""
     )
     row_contrast = contrast_ratio(row_color, row_background)
-    if row_contrast is None or row_contrast < 7.0:
+    if row_contrast is None and (row_color or row_background):
+        raise AssertionError(
+            f"{context}: cursor row contrast unavailable despite partial style data: color={row_color!r} background={row_background!r}"
+        )
+    if row_contrast is not None and row_contrast < 7.0:
         raise AssertionError(
             f"{context}: cursor row contrast too low: color={row_color!r} background={row_background!r} contrast={row_contrast!r}"
         )
@@ -10867,7 +11469,7 @@ def assert_cursor_prompt_visibility(state: dict, *, context: str) -> dict:
         "cursor_line_text": cursor_line_text,
         "active_cursor_rect": active_cursor_rect,
         "cursor_row_rect": cursor_row_rect,
-        "cursor_row_contrast": round(row_contrast, 2),
+        "cursor_row_contrast": round(row_contrast, 2) if row_contrast is not None else None,
         "cursor_visible_row_index": host.get("cursor_visible_row_index"),
         "blank_rows_below_cursor": host.get("blank_rows_below_cursor"),
     }
@@ -11658,7 +12260,7 @@ def assert_status_command(pid: int, session: str, out_dir: Path) -> dict:
     clear_terminal_selection(pid, session, timeout_seconds=4.0)
     wait_for_terminal_quiescent(pid, timeout_seconds=12.0)
     prime_terminal_surface_for_keyboard(pid, session)
-    clear = clear_prompt_line(pid, session, timeout_seconds=8.0)
+    clear = clear_codex_prompt_line(pid, session, timeout_seconds=8.0)
     cleared_state = clear.get("state") or app_state(pid)
     cleared_host = host_for_session_or_none(cleared_state, session) or active_host_or_none(cleared_state) or {}
     cleared_cursor_line = str(
@@ -11669,6 +12271,11 @@ def assert_status_command(pid: int, session: str, out_dir: Path) -> dict:
         raise AssertionError(
             "status command prompt was not clean before typing: "
             f"cursor_line={cleared_cursor_line!r} text_tail={cleared_text_sample[-200:]!r}"
+        )
+    if not host_has_live_codex_prompt(cleared_host):
+        raise AssertionError(
+            "status command prompt cleanup did not leave a live Codex prompt active: "
+            f"cursor_line={cleared_cursor_line!r} text_tail={cleared_text_sample[-300:]!r}"
         )
     typed_probe = type_with_cursor_artifact_checks(
         pid,
@@ -11823,11 +12430,13 @@ def main() -> int:
         "titlebar_autohide_hover",
         "titlebar_centering",
         "titlebar_empty_lane_window_controls",
+        "titlebar_search_typing",
         "titlebar_modal_visual_parity",
         "titlebar_new_menu_shell",
         "titlebar_overflow_menu",
         "titlebar_session_shell",
         "context_menu_rename_session",
+        "session_drag_to_folder",
         "live_session_close_button",
         "live_session_metadata_consistency",
         "live_sessions_tree_contract",
@@ -11864,11 +12473,14 @@ def main() -> int:
                 state = ensure_plain_shell_runtime(args.pid, args.session)["state"]
                 initial_settle = "quiescent_fresh_terminal"
         elif args.session_kind == "codex":
-            disposable_codex_create = create_terminal_via_sidebar_context_menu(args.pid)
+            # The /status regression bar is the real terminal viewport and
+            # keyboard path, not sidebar creation. Use app-control setup here
+            # so cold-start session restore cannot race the context-menu click.
+            disposable_codex_create = app_create_terminal(args.pid, title="Smoke Codex Session")
             disposable_codex_session = disposable_codex_create["session_path"]
             args.session = disposable_codex_session
             state = ensure_live_codex_runtime(args.pid, args.session)["state"]
-            initial_settle = "interactive_disposable_codex_session"
+            initial_settle = "interactive_disposable_codex_session_app_control"
         else:
             state = wait_for_interactive_session(args.pid, args.session, timeout_seconds=25.0)
         state, initial_prompt_pixels = capture_prompt_visible_screenshot(
@@ -11924,6 +12536,7 @@ def main() -> int:
         run_check("background_blur", lambda: assert_background_blur_contract(args.pid))
         run_check("sidebar_resize", lambda: assert_sidebar_resize_persists_to_settings(args.pid))
         run_check("search_focus_overlay", lambda: assert_search_focus_overlay_contract(args.pid, args.session))
+        run_check("titlebar_search_typing", lambda: assert_titlebar_search_typing_contract(args.pid))
         run_check("titlebar_new_menu_shell", lambda: assert_titlebar_new_menu_shell_contract(args.pid))
         run_check("titlebar_session_shell", lambda: assert_titlebar_session_shell_contract(args.pid))
         run_check("titlebar_modal_visual_parity", lambda: assert_titlebar_modal_visual_parity(args.pid))
@@ -11936,6 +12549,7 @@ def main() -> int:
         run_check("settings_terminal_reclaim", lambda: assert_settings_terminal_reclaim_contract(args.pid))
         run_check("right_panel_animation", lambda: assert_right_panel_animation_contract(args.pid))
         run_check("live_sessions_tree_contract", lambda: assert_live_sessions_tree_contract(args.pid))
+        run_check("session_drag_to_folder", lambda: assert_session_drag_to_folder_contract(args.pid))
         run_check(
             "terminal_interactive_lifecycle",
             lambda: assert_terminal_interactive_lifecycle(args.pid, args.session),

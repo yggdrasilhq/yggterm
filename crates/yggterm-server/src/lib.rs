@@ -68,9 +68,9 @@ use time::{OffsetDateTime, UtcOffset, macros::format_description};
 use tracing::warn;
 use uuid::Uuid;
 use yggterm_core::{
-    PerfSpan, SessionNode, SessionNodeKind, SessionStore, SessionTitleStore, TranscriptRole,
-    WorkspaceDocument, WorkspaceDocumentKind, append_trace_event, event_trace_path,
-    follow_trace_lines, generation_context_from_messages, looks_like_generated_fallback_title,
+    PerfSpan, SessionNode, SessionStore, SessionTitleStore, TranscriptRole, WorkspaceDocument,
+    WorkspaceDocumentKind, append_trace_event, event_trace_path, follow_trace_lines,
+    generation_context_from_messages, looks_like_generated_fallback_title,
     looks_like_low_signal_generated_copy, read_codex_session_identity_fields,
     read_codex_transcript_messages, read_codex_transcript_messages_limited, read_trace_tail,
     resolve_yggterm_home,
@@ -540,7 +540,7 @@ pub struct SessionPayloadStats {
 
 impl YggtermServer {
     pub fn new(
-        tree: &SessionNode,
+        _tree: &SessionNode,
         prefer_ghostty_backend: bool,
         ghostty_host: GhosttyHostSupport,
         theme: UiTheme,
@@ -549,7 +549,7 @@ impl YggtermServer {
         let backend = TerminalBackend::Xterm;
         sync_terminal_identity_env(theme);
 
-        let mut this = Self {
+        let this = Self {
             sessions: BTreeMap::new(),
             active_session_path: None,
             active_view_mode: WorkspaceViewMode::Rendered,
@@ -560,21 +560,6 @@ impl YggtermServer {
             remote_machines: Vec::new(),
             live_session_order: Vec::new(),
         };
-
-        if let Some(first_session) = first_session_leaf(tree) {
-            this.open_or_focus_session(
-                match first_session.kind {
-                    SessionNodeKind::CodexSession => SessionKind::Codex,
-                    SessionNodeKind::Document => SessionKind::Document,
-                    SessionNodeKind::Group => SessionKind::Codex,
-                },
-                &first_session.path,
-                Some(&first_session.session_id),
-                Some(&first_session.cwd),
-                Some(&first_session.title),
-                None,
-            );
-        }
 
         this
     }
@@ -9354,7 +9339,7 @@ fn wait_for_app_control_open_path_ready(
     let mut last_failure = None::<String>;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let describe_timeout_ms = remaining.as_millis().clamp(250, 1_000) as u64;
+        let describe_timeout_ms = remaining.as_millis().clamp(750, 4_000) as u64;
         match request_app_control(home, AppControlCommand::DescribeState, describe_timeout_ms) {
             Ok(response) => {
                 last_error = None;
@@ -11015,14 +11000,6 @@ fn managed_session_from_snapshot(session: SnapshotSessionView) -> ManagedSession
     }
 }
 
-struct StoredLeaf {
-    kind: SessionNodeKind,
-    path: String,
-    session_id: String,
-    cwd: String,
-    title: String,
-}
-
 #[derive(Debug, Clone)]
 struct StoredTranscript {
     started_at: String,
@@ -11042,29 +11019,6 @@ struct StoredFileSnapshot {
 enum StoredPreviewHydrationMode {
     Deferred,
     Eager,
-}
-
-fn first_session_leaf(node: &SessionNode) -> Option<StoredLeaf> {
-    if node.kind != SessionNodeKind::Group {
-        return Some(StoredLeaf {
-            kind: node.kind,
-            path: node.path.display().to_string(),
-            session_id: node.session_id.clone().unwrap_or_else(|| node.name.clone()),
-            cwd: node
-                .cwd
-                .clone()
-                .unwrap_or_else(|| session_preview_cwd(&node.path.display().to_string())),
-            title: node.title.clone().unwrap_or_else(|| node.name.clone()),
-        });
-    }
-
-    for child in &node.children {
-        if let Some(path) = first_session_leaf(child) {
-            return Some(path);
-        }
-    }
-
-    None
 }
 
 fn build_session(
@@ -12073,28 +12027,66 @@ fn legacy_agent_launch_command(
     let cwd_prefix = best_effort_cwd_shell_prefix(cwd)
         .map(|prefix| format!("{prefix} && "))
         .unwrap_or_default();
+    let extra_args = legacy_codex_extra_args();
     match (kind, session_id) {
         (SessionKind::Codex, Some(session_id)) => {
             if cwd_prefix.is_empty() {
-                format!("codex resume {}", shell_single_quote(session_id))
+                format!(
+                    "codex{extra_args} resume {}",
+                    shell_single_quote(session_id)
+                )
             } else {
                 format!(
-                    "{cwd_prefix}codex resume -C \"$PWD\" {}",
+                    "{cwd_prefix}codex{extra_args} resume -C \"$PWD\" {}",
                     shell_single_quote(session_id)
                 )
             }
         }
         (SessionKind::CodexLiteLlm, Some(session_id)) => {
             format!(
-                "{cwd_prefix}CODEX_HOME=\"$HOME/.codex-litellm\" codex-litellm resume {}",
+                "{cwd_prefix}CODEX_HOME=\"$HOME/.codex-litellm\" codex-litellm{extra_args} resume {}",
                 shell_single_quote(session_id)
             )
         }
-        (SessionKind::Codex, None) => format!("{cwd_prefix}codex"),
+        (SessionKind::Codex, None) => format!("{cwd_prefix}codex{extra_args}"),
         (SessionKind::CodexLiteLlm, None) => {
-            format!("{cwd_prefix}CODEX_HOME=\"$HOME/.codex-litellm\" codex-litellm")
+            format!("{cwd_prefix}CODEX_HOME=\"$HOME/.codex-litellm\" codex-litellm{extra_args}")
         }
         _ => String::new(),
+    }
+}
+
+fn legacy_codex_extra_args() -> String {
+    let raw = SessionStore::open_or_init()
+        .and_then(|store| store.load_settings())
+        .ok()
+        .map(|settings| settings.codex_extra_args)
+        .unwrap_or_default();
+    shell_join_extra_args(&raw)
+}
+
+fn shell_join_extra_args(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let tokens = shlex::split(trimmed).unwrap_or_else(|| {
+        trimmed
+            .split_whitespace()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>()
+    });
+    if tokens.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " {}",
+            tokens
+                .iter()
+                .map(|arg| shell_single_quote(arg))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
     }
 }
 
@@ -12544,8 +12536,8 @@ mod tests {
         PersistedDaemonState, PersistedLiveSession, PersistedStoredSession, PreviewTone,
         REMOTE_OUTPUT_SENTINEL, RemoteCommandCacheEntry, RemoteDeployState, RemoteMachineHealth,
         RemoteMachineSnapshot, RemotePreviewPayload, RemoteScannedSession, ServerEndpoint,
-        ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionNode, SessionNodeKind,
-        SessionPreview, SessionPreviewBlock, SessionSource, SnapshotPreview, SnapshotPreviewBlock,
+        ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionNode, SessionPreview,
+        SessionPreviewBlock, SessionSource, SnapshotPreview, SnapshotPreviewBlock,
         SnapshotRenderedSection, SnapshotSessionView, SshConnectTarget, StoredPreviewHydrationMode,
         TerminalBackend, TerminalLaunchPhase, UiTheme, WorkspaceViewMode, YggtermServer,
         active_client_instance_records, apply_remote_preview_payload,
@@ -12579,7 +12571,7 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use std::path::PathBuf;
-    use yggterm_core::TranscriptRole;
+    use yggterm_core::{SessionNodeKind, TranscriptRole};
 
     #[test]
     fn xdotool_key_for_char_maps_status_chars() {
@@ -13057,6 +13049,39 @@ mod tests {
         let command =
             windows_local_interactive_shell_launch_command(r"C:\Program Files\Shell\shell.exe");
         assert_eq!(command, r#"call "C:\Program Files\Shell\shell.exe""#);
+    }
+
+    #[test]
+    fn server_new_does_not_eagerly_open_first_stored_session() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: Some("root".to_string()),
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("root"),
+            children: vec![SessionNode {
+                kind: SessionNodeKind::CodexSession,
+                name: "old-session".to_string(),
+                title: Some("Old Session".to_string()),
+                document_kind: None,
+                group_kind: None,
+                path: PathBuf::from("/home/pi/.codex/sessions/old.jsonl"),
+                children: Vec::new(),
+                session_id: Some("old".to_string()),
+                cwd: Some("/home/pi".to_string()),
+            }],
+            session_id: None,
+            cwd: None,
+        };
+        let server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        assert_eq!(server.active_session_path(), None);
+        assert!(server.sessions.is_empty());
     }
 
     #[test]

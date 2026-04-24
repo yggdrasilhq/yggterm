@@ -16,6 +16,20 @@ fi
 
 mkdir -p "$DIST_DIR"
 
+checksum_file() {
+  local file="$1"
+  local out="$2"
+  local dir
+  local base
+  dir="$(dirname "$file")"
+  base="$(basename "$file")"
+  if command -v sha256sum >/dev/null 2>&1; then
+    (cd "$dir" && sha256sum "$base") > "$out"
+  else
+    (cd "$dir" && shasum -a 256 "$base") > "$out"
+  fi
+}
+
 pushd "$ROOT_DIR" >/dev/null
 GHOSTTY_DIR="${ROOT_DIR}/../ghostty" \
 GHOSTTY_LIB_DIR="$LIB_DIR" \
@@ -38,6 +52,6 @@ RUNEOF
 chmod +x "$PKG_DIR/run.sh"
 
 ( cd "$DIST_DIR" && tar -czf "yggterm-${TARGET_LABEL}-ghostty-ffi.tar.gz" "yggterm-${TARGET_LABEL}-ghostty-ffi" )
-sha256sum "$DIST_DIR/yggterm-${TARGET_LABEL}-ghostty-ffi.tar.gz" > "$DIST_DIR/yggterm-${TARGET_LABEL}-ghostty-ffi.tar.gz.sha256"
+checksum_file "$DIST_DIR/yggterm-${TARGET_LABEL}-ghostty-ffi.tar.gz" "$DIST_DIR/yggterm-${TARGET_LABEL}-ghostty-ffi.tar.gz.sha256"
 
 echo "FFI release archive: $DIST_DIR/yggterm-${TARGET_LABEL}-ghostty-ffi.tar.gz"
