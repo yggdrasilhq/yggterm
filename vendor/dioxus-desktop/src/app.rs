@@ -242,15 +242,14 @@ impl App {
     }
 
     pub fn handle_start_cause_init(&mut self) {
-        let virtual_dom = self
-            .unmounted_dom
-            .take()
-            .expect("Virtualdom should be set before initialization");
+        let Some(virtual_dom) = self.unmounted_dom.take() else {
+            return;
+        };
         #[allow(unused_mut)]
-        let mut cfg = self
-            .cfg
-            .take()
-            .expect("Config should be set before initialization");
+        let Some(mut cfg) = self.cfg.take() else {
+            self.unmounted_dom.set(Some(virtual_dom));
+            return;
+        };
 
         self.is_visible_before_start = cfg.window.window.visible;
         #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
