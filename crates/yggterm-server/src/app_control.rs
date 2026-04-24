@@ -12,6 +12,7 @@ const APP_CONTROL_REQUESTS_DIR: &str = "app-control-requests";
 const APP_CONTROL_RESPONSES_DIR: &str = "app-control-responses";
 const APP_CONTROL_CAPTURES_DIR: &str = "screenshots";
 const APP_CONTROL_RECORDINGS_DIR: &str = "recordings";
+const STALE_TARGETED_APP_CONTROL_REQUEST_MS: u128 = 30_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -453,9 +454,15 @@ pub fn take_next_app_control_request(
                 continue;
             }
         };
-        if request.preferred_pid.is_some_and(|preferred_pid| {
-            preferred_pid != worker_pid && process_is_alive(preferred_pid)
-        }) {
+        if let Some(preferred_pid) = request.preferred_pid
+            && preferred_pid != worker_pid
+        {
+            let request_age_ms = current_millis().saturating_sub(request.created_at_ms);
+            if !process_is_alive(preferred_pid)
+                || request_age_ms > STALE_TARGETED_APP_CONTROL_REQUEST_MS
+            {
+                let _ = fs::remove_file(&path);
+            }
             continue;
         }
         let file_name = path
@@ -674,4 +681,51 @@ pub fn current_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_home() -> PathBuf {
+        let home = std::env::temp_dir().join(format!("yggterm-app-control-{}", Uuid::new_v4()));
+        fs::create_dir_all(&home).unwrap();
+        home
+    }
+
+    #[test]
+    fn targeted_request_is_not_taken_by_wrong_worker_pid() {
+        let home = temp_home();
+        let request =
+            enqueue_app_control_request(&home, AppControlCommand::DescribeState, Some(0)).unwrap();
+
+        let taken = take_next_app_control_request(&home, std::process::id()).unwrap();
+        assert!(taken.is_none());
+        assert!(
+            !app_control_requests_dir(&home)
+                .join(format!("{}.json", request.request_id))
+                .exists()
+        );
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn targeted_request_is_taken_by_preferred_worker_pid() {
+        let home = temp_home();
+        let worker_pid = std::process::id();
+        let request =
+            enqueue_app_control_request(&home, AppControlCommand::DescribeState, Some(worker_pid))
+                .unwrap();
+
+        let taken = take_next_app_control_request(&home, worker_pid).unwrap();
+        let Some((inflight_path, taken_request)) = taken else {
+            panic!("expected preferred worker to take request");
+        };
+        assert_eq!(taken_request.request_id, request.request_id);
+        assert_eq!(taken_request.preferred_pid, Some(worker_pid));
+        assert!(inflight_path.exists());
+
+        let _ = fs::remove_dir_all(home);
+    }
 }
