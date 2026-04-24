@@ -3521,6 +3521,7 @@ def capture_prompt_visible_screenshot(
         try:
             last_state = wait_for_window_geometry_settle(
                 pid,
+                stable_polls=1,
                 timeout_seconds=min(3.0, max(1.0, deadline - time.time())),
             )
         except AssertionError as exc:
@@ -9384,6 +9385,34 @@ def assert_busy_icon_lifecycle(pid: int, session: str, *, sleep_seconds: int = 3
     }
 
 
+def host_has_plain_shell_prompt(host: dict) -> bool:
+    cursor_line_text = str(host.get("cursor_line_text") or host.get("cursor_row_text") or "")
+    if re.search(r"[$#]\s*$", cursor_line_text.strip()):
+        return True
+    text_sample = str(host.get("text_sample") or "")
+    return bool(re.search(r"(?m)(^|\n)[^\n]{0,120}[$#]\s*$", text_sample.rstrip()))
+
+
+def assert_terminal_interactive_lifecycle(pid: int, session: str) -> dict:
+    state = wait_for_interactive_session(pid, session, timeout_seconds=20.0)
+    focus = assert_focus_and_visibility(pid, state)
+    runtime_probe = assert_terminal_runtime_writable(
+        pid,
+        session,
+        context="terminal interactive lifecycle runtime probe",
+    )
+    busy = assert_busy_icon_lifecycle(pid, session)
+    live_tree = assert_live_sessions_tree_contract(pid)
+    return {
+        "focus": focus,
+        "runtime_probe": {
+            "accepted": bool((runtime_probe.get("data") or {}).get("accepted")),
+        },
+        "busy_icon_lifecycle": busy,
+        "live_sessions_tree": live_tree,
+    }
+
+
 def assert_live_sessions_tree_contract(pid: int) -> dict:
     deadline = time.time() + 8.0
     state = {}
@@ -11202,14 +11231,30 @@ def ensure_plain_shell_runtime(pid: int, session: str) -> dict:
         host = host_for_session_or_none(state, session)
         if host is None:
             return False
-        cursor_line_text = str(host.get("cursor_line_text") or host.get("cursor_row_text") or "")
-        return (
-            normalize_live_path(str(state.get("active_session_path") or "")) == normalize_live_path(session)
+        viewport = viewport_state(state)
+        active_path_matches = (
+            normalize_live_path(str(state.get("active_session_path") or ""))
+            == normalize_live_path(session)
+        )
+        if not (
+            active_path_matches
             and state.get("active_view_mode") == "Terminal"
             and host.get("input_enabled") is True
-            and host.get("xterm_buffer_kind") == "normal"
-            and host.get("xterm_cursor_hidden") is False
-            and "$" in cursor_line_text
+            and not visible_notifications(state)
+            and not ((viewport.get("active_terminal_surface") or {}).get("problem"))
+            and host_has_plain_shell_prompt(host)
+        ):
+            return False
+        buffer_kind = host.get("xterm_buffer_kind")
+        cursor_hidden = host.get("xterm_cursor_hidden")
+        if buffer_kind is not None or cursor_hidden is not None:
+            return buffer_kind == "normal" and cursor_hidden is False
+        return (
+            host.get("xterm_present") is True
+            and host.get("screen_present") is True
+            and host.get("rows_present") is True
+            and host.get("helper_textarea_focused") is True
+            and host.get("host_has_active_element") is True
         )
 
     def wait_for_plain_shell(deadline: float) -> dict | None:
@@ -11749,6 +11794,7 @@ def main() -> int:
         "live_sessions_restore",
         "selection",
         "terminal_interaction_latency",
+        "terminal_interactive_lifecycle",
         "clipboard_image",
         "partial_input",
         "scroll",
@@ -11890,6 +11936,10 @@ def main() -> int:
         run_check("settings_terminal_reclaim", lambda: assert_settings_terminal_reclaim_contract(args.pid))
         run_check("right_panel_animation", lambda: assert_right_panel_animation_contract(args.pid))
         run_check("live_sessions_tree_contract", lambda: assert_live_sessions_tree_contract(args.pid))
+        run_check(
+            "terminal_interactive_lifecycle",
+            lambda: assert_terminal_interactive_lifecycle(args.pid, args.session),
+        )
         run_check("context_menu_rename_session", lambda: assert_context_menu_rename_session(args.pid))
         run_check("context_menu_delete_session", lambda: assert_context_menu_delete_session(args.pid))
         run_check("live_session_close_button", lambda: assert_live_session_close_button(args.pid))
