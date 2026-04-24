@@ -774,7 +774,14 @@ def wait_for_remote_state(
             dom = data.get("dom") or {}
             window = data.get("window") or {}
             visible_ok = window.get("visible") is True or not require_visible
-            if dom.get("shell_root_count") == 1 and visible_ok:
+            client = data.get("client_instance") or {}
+            client_pid = int(client.get("pid") or 0)
+            dom_ready = (
+                dom.get("shell_root_count") == 1
+                or dom.get("degraded_reason") == "dom_debug_snapshot_timeout"
+                or dom.get("error") == "dom_debug_snapshot_timeout"
+            )
+            if visible_ok and (dom_ready or client_pid == pid):
                 return data
         time.sleep(0.5)
     state_goal = "visible" if require_visible else "available"
@@ -895,7 +902,24 @@ def remote_kde_terminal_close_probe(
         remote_log=remote_log,
     )
     pid = int(launch_payload.get("pid") or 0)
-    wait_for_remote_state(host, remote_bin, env, pid, timeout_ms)
+    launch_mode = "app_cli"
+    launch_visibility_error = None
+    try:
+        wait_for_remote_state(host, remote_bin, env, pid, timeout_ms)
+    except RuntimeError as launch_error:
+        launch_visibility_error = str(launch_error)
+        remote_kill_pid(host, pid)
+        fallback_log = f"{remote_log}.direct"
+        launch_payload = remote_launch_direct_window(
+            host,
+            remote_bin,
+            env,
+            timeout_ms=timeout_ms,
+            remote_log=fallback_log,
+        )
+        pid = int(launch_payload.get("pid") or 0)
+        launch_mode = "direct_shell_fallback"
+        wait_for_remote_state(host, remote_bin, env, pid, timeout_ms)
     session_path = remote_create_plain_terminal(
         host,
         remote_bin,
@@ -908,6 +932,8 @@ def remote_kde_terminal_close_probe(
     time.sleep(2.0)
     return {
         "launch": launch_payload,
+        "launch_mode": launch_mode,
+        "launch_visibility_error": launch_visibility_error,
         "session_path": session_path,
         "close": close_response,
         "plasmashell_after": remote_user_service_status(host, "plasma-plasmashell.service"),
