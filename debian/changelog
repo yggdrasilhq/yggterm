@@ -1,3 +1,13 @@
+yggterm (2.1.31-1) unstable; urgency=medium
+
+  * Keep live sessions promoted at the top of the sidebar with visible close affordances while avoiding duplicate local live rows.
+  * Fix inline rename and titlebar search typing so real keyboard entry no longer collapses to the last typed character.
+  * Keep titles and summaries stable on selection while preserving explicit regeneration.
+  * Persist folder-scoped new sessions and dragged live-session recipes under the chosen workspace folder.
+  * Add Codex Extra Args and harden the Linux second-X11 status, search, drag, rename, live-close, and hot-switch smoke proofs.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 24 Apr 2026 22:17:11 +0530
+
 yggterm (2.1.30-1) unstable; urgency=medium
 
   * Keep Windows direct-install desktop integration quiet and complete by passing normal C:\... paths to shortcut and GUI launcher creation.
