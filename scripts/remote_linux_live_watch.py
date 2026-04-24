@@ -7,6 +7,7 @@ from pathlib import Path
 from remote_linux_x11_smoke import (
     LINUX_SESSION_SNIPPET,
     remote_env_exports,
+    remote_problem_notifications,
     resolve_launch_target,
     scp_from,
     scp_to,
@@ -107,11 +108,19 @@ def launch_env_from_session(
 ) -> dict[str, str]:
     picked = session_info.get("picked_session") or {}
     leader_env = session_info.get("leader_env") or {}
+    desktop_env = session_info.get("desktop_env") or leader_env
     session_type = str(picked.get("Type") or "").strip()
     runtime_dir = str(
-        leader_env.get("XDG_RUNTIME_DIR") or session_info.get("runtime_dir") or ""
+        desktop_env.get("XDG_RUNTIME_DIR")
+        or leader_env.get("XDG_RUNTIME_DIR")
+        or session_info.get("runtime_dir")
+        or ""
     ).strip()
-    dbus_bus = str(leader_env.get("DBUS_SESSION_BUS_ADDRESS") or "").strip()
+    dbus_bus = str(
+        desktop_env.get("DBUS_SESSION_BUS_ADDRESS")
+        or leader_env.get("DBUS_SESSION_BUS_ADDRESS")
+        or ""
+    ).strip()
     if not dbus_bus and runtime_dir:
         dbus_bus = f"unix:path={runtime_dir}/bus"
     env = {
@@ -122,18 +131,35 @@ def launch_env_from_session(
         "NO_AT_BRIDGE": "1",
         "WEBKIT_DISABLE_COMPOSITING_MODE": "1",
     }
+    for desktop_key in (
+        "DESKTOP_SESSION",
+        "XDG_CURRENT_DESKTOP",
+        "XDG_SESSION_DESKTOP",
+        "KDE_FULL_SESSION",
+    ):
+        desktop_value = str(desktop_env.get(desktop_key) or "").strip()
+        if desktop_value:
+            env[desktop_key] = desktop_value
     if remote_home:
         env["YGGTERM_HOME"] = remote_home
     if backend == "x11":
         env["DISPLAY"] = str(
-            session_info.get("xwayland_display") or leader_env.get("DISPLAY") or ""
+            session_info.get("xwayland_display")
+            or desktop_env.get("DISPLAY")
+            or leader_env.get("DISPLAY")
+            or ""
         )
         env["XAUTHORITY"] = str(
-            session_info.get("xwayland_xauthority") or leader_env.get("XAUTHORITY") or ""
+            session_info.get("xwayland_xauthority")
+            or desktop_env.get("XAUTHORITY")
+            or leader_env.get("XAUTHORITY")
+            or ""
         )
         env["GDK_BACKEND"] = "x11"
     elif session_type == "wayland":
-        wayland_display = str(leader_env.get("WAYLAND_DISPLAY") or "").strip()
+        wayland_display = str(
+            desktop_env.get("WAYLAND_DISPLAY") or leader_env.get("WAYLAND_DISPLAY") or ""
+        ).strip()
         if not wayland_display:
             for candidate in session_info.get("wayland_sockets") or []:
                 rendered = str(candidate or "").strip()
@@ -142,17 +168,27 @@ def launch_env_from_session(
                     break
         env["WAYLAND_DISPLAY"] = wayland_display
         env["GDK_BACKEND"] = "wayland"
-        display_value = str(leader_env.get("DISPLAY") or session_info.get("xwayland_display") or "").strip()
+        display_value = str(
+            desktop_env.get("DISPLAY")
+            or leader_env.get("DISPLAY")
+            or session_info.get("xwayland_display")
+            or ""
+        ).strip()
         xauthority_value = str(
-            leader_env.get("XAUTHORITY") or session_info.get("xwayland_xauthority") or ""
+            desktop_env.get("XAUTHORITY")
+            or leader_env.get("XAUTHORITY")
+            or session_info.get("xwayland_xauthority")
+            or ""
         ).strip()
         if display_value:
             env["DISPLAY"] = display_value
         if xauthority_value:
             env["XAUTHORITY"] = xauthority_value
     else:
-        env["DISPLAY"] = str(leader_env.get("DISPLAY") or "")
-        env["XAUTHORITY"] = str(leader_env.get("XAUTHORITY") or "")
+        env["DISPLAY"] = str(desktop_env.get("DISPLAY") or leader_env.get("DISPLAY") or "")
+        env["XAUTHORITY"] = str(
+            desktop_env.get("XAUTHORITY") or leader_env.get("XAUTHORITY") or ""
+        )
     return env
 
 
@@ -172,6 +208,27 @@ def pid_sequence_summary(pid_samples: list[tuple[int, ...]]) -> dict[str, object
     }
 
 
+def remote_pid_alive(host: str, pid: int) -> bool:
+    return (
+        ssh_shell(host, f"kill -0 {pid} >/dev/null 2>&1", check=False).returncode == 0
+    )
+
+
+def wait_for_remote_pid_exit(
+    host: str,
+    pid: int,
+    *,
+    timeout_sec: float,
+    poll_sec: float = 0.25,
+) -> bool:
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        if not remote_pid_alive(host, pid):
+            return True
+        time.sleep(poll_sec)
+    return not remote_pid_alive(host, pid)
+
+
 def main() -> int:
     args = parse_args()
     timestamp = int(time.time())
@@ -188,13 +245,39 @@ def main() -> int:
         metadata["remote_bin"] = remote_bin
 
         remote_home = None if args.reuse_existing_home else f"{remote_dir}/home"
+        daemon_home = (
+            remote_home
+            if remote_home
+            else f"{str(session_info.get('home_dir') or '').rstrip('/')}/.yggterm"
+        )
+        daemon_log_path = f"{daemon_home}/daemon.log"
         remote_shot = f"{remote_dir}/watch-final.png"
         remote_frame_shot = f"{remote_dir}/watch-frame.png"
         if remote_home:
             ssh_shell(args.host, f"mkdir -p '{remote_home}'")
         env = launch_env_from_session(session_info, args.backend, remote_home)
         metadata["launch_env"] = env
+        metadata["daemon_log_path"] = daemon_log_path
         exports = remote_env_exports(env)
+        daemon_log_size_before_proc = ssh_shell(
+            args.host,
+            (
+                "python3 - <<'PY'\n"
+                "import os\n"
+                f"path = {daemon_log_path!r}\n"
+                "try:\n"
+                "    print(os.path.getsize(path))\n"
+                "except OSError:\n"
+                "    print(0)\n"
+                "PY"
+            ),
+            check=False,
+        )
+        try:
+            daemon_log_size_before = int(daemon_log_size_before_proc.stdout.strip() or "0")
+        except ValueError:
+            daemon_log_size_before = 0
+        metadata["daemon_log_size_before"] = daemon_log_size_before
 
         launch = ssh_shell(
             args.host,
@@ -292,6 +375,40 @@ def main() -> int:
             check=False,
         )
         metadata["journal_matches"] = journal_proc.stdout.strip().splitlines()
+        daemon_log_delta_proc = ssh_shell(
+            args.host,
+            (
+                "python3 - <<'PY'\n"
+                "import os\n"
+                f"path = {daemon_log_path!r}\n"
+                f"offset = {daemon_log_size_before}\n"
+                "try:\n"
+                "    with open(path, 'rb') as fh:\n"
+                "        fh.seek(max(0, offset))\n"
+                "        data = fh.read().decode('utf-8', 'ignore')\n"
+                "except OSError:\n"
+                "    data = ''\n"
+                "print(data)\n"
+                "PY"
+            ),
+            check=False,
+        )
+        daemon_log_delta = daemon_log_delta_proc.stdout
+        metadata["daemon_log_delta"] = daemon_log_delta
+        daemon_integration_markers = [
+            line
+            for line in daemon_log_delta.splitlines()
+            if any(
+                marker in line
+                for marker in (
+                    "gtk-update-icon-cache",
+                    "kbuildsycoca",
+                    "xdg-desktop-menu",
+                    "org.kde.plasmashell",
+                )
+            )
+        ]
+        metadata["daemon_integration_markers"] = daemon_integration_markers
         if samples:
             last_state = samples[-1].get("state")
             if isinstance(last_state, dict):
@@ -307,14 +424,55 @@ def main() -> int:
                     metadata["frame_capture_skipped"] = (
                         "spectacle_disabled_for_remote_ssh_watch; use app-control screenshot instead"
                     )
+        problem_notifications: list[dict[str, object]] = []
+        seen_problem_notifications: set[tuple[object, object, object]] = set()
+        for sample in samples:
+            state = sample.get("state")
+            if not isinstance(state, dict):
+                continue
+            for notification in remote_problem_notifications(state):
+                key = (
+                    notification.get("id"),
+                    notification.get("title"),
+                    notification.get("message"),
+                )
+                if key in seen_problem_notifications:
+                    continue
+                seen_problem_notifications.add(key)
+                problem_notifications.append(notification)
+        metadata["problem_notifications"] = problem_notifications
 
         summary_path = out_dir / "summary.json"
         summary_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-        ssh_shell(
+        cleanup: dict[str, object] = {}
+        close_proc = ssh_shell(
             args.host,
-            f"{exports}; '{remote_bin}' server app close --pid {pid} --timeout-ms {args.timeout_ms} >/dev/null 2>&1 || true",
+            f"{exports}; '{remote_bin}' server app close --pid {pid} --timeout-ms {args.timeout_ms}",
             check=False,
         )
+        cleanup["close_returncode"] = close_proc.returncode
+        if close_proc.stdout.strip():
+            cleanup["close_stdout"] = close_proc.stdout.strip()
+        if close_proc.stderr.strip():
+            cleanup["close_stderr"] = close_proc.stderr.strip()
+        exited = wait_for_remote_pid_exit(
+            args.host,
+            pid,
+            timeout_sec=max(2.0, min(8.0, args.timeout_ms / 1000.0)),
+        )
+        cleanup["owned_pid_exited_after_close"] = exited
+        if not exited:
+            ssh_shell(args.host, f"kill -TERM {pid} >/dev/null 2>&1 || true", check=False)
+            cleanup["sent_sigterm"] = True
+            exited = wait_for_remote_pid_exit(args.host, pid, timeout_sec=3.0)
+            cleanup["owned_pid_exited_after_sigterm"] = exited
+        if not exited:
+            ssh_shell(args.host, f"kill -KILL {pid} >/dev/null 2>&1 || true", check=False)
+            cleanup["sent_sigkill"] = True
+            exited = wait_for_remote_pid_exit(args.host, pid, timeout_sec=1.5)
+            cleanup["owned_pid_exited_after_sigkill"] = exited
+        cleanup["owned_pid_alive_after_cleanup"] = remote_pid_alive(args.host, pid)
+        metadata["cleanup"] = cleanup
         if not args.reuse_existing_home:
             ssh_shell(
                 args.host,
@@ -322,7 +480,12 @@ def main() -> int:
                 check=False,
             )
         if not args.keep_remote_dir:
-            ssh_shell(args.host, f"rm -rf '{remote_dir}'", check=False)
+            if cleanup["owned_pid_alive_after_cleanup"]:
+                cleanup["remote_dir_removed"] = False
+                cleanup["remote_dir_retained_reason"] = "owned_pid_still_alive"
+            else:
+                ssh_shell(args.host, f"rm -rf '{remote_dir}'", check=False)
+                cleanup["remote_dir_removed"] = True
         print(summary_path)
         app_control_failures = 0
         ready_seen = False
@@ -333,6 +496,8 @@ def main() -> int:
             if ready_seen:
                 app_control_failures += 1
         metadata["watch_summary"]["app_control_failures_after_ready"] = app_control_failures
+        metadata["watch_summary"]["app_control_ready_seen"] = ready_seen
+        metadata["watch_summary"]["app_control_never_ready"] = not ready_seen
         summary_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         watch_summary = metadata.get("watch_summary") or {}
         fd_growth = watch_summary.get("fd_growth")
@@ -340,6 +505,7 @@ def main() -> int:
         plasmashell_changes = int(
             ((watch_summary.get("plasmashell") or {}).get("changes") or 0)
         )
+        daemon_integration_side_effects = bool(metadata.get("daemon_integration_markers"))
         runaway_journal = any(
             "too many open files" in line.lower() or "main process exited" in line.lower()
             for line in metadata.get("journal_matches") or []
@@ -351,12 +517,19 @@ def main() -> int:
             and max_fd_count >= 192
         )
         owned_pid_missing = int(watch_summary.get("owned_pid_missing_samples") or 0) > 0
+        cleanup_problem = bool((metadata.get("cleanup") or {}).get("owned_pid_alive_after_cleanup"))
+        problem_notification_failure = bool(metadata.get("problem_notifications"))
+        app_control_never_ready = bool(watch_summary.get("app_control_never_ready"))
         return 0 if not (
             app_control_failures
+            or app_control_never_ready
             or runaway_journal
             or runaway_fd
+            or daemon_integration_side_effects
             or owned_pid_missing
             or plasmashell_changes
+            or cleanup_problem
+            or problem_notification_failure
         ) else 1
     finally:
         if args.keep_remote_dir:

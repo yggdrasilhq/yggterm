@@ -111,6 +111,20 @@ def _priority(item: dict[str, str]) -> tuple[int, int, int]:
 sessions.sort(key=_priority)
 picked = sessions[0] if sessions else None
 leader_env = proc_env(str(picked.get("Leader") or "")) if picked else {}
+plasmashell_pid = ""
+plasmashell_env: dict[str, str] = {}
+numeric_pids = sorted((pid for pid in os.listdir("/proc") if pid.isdigit()), key=int, reverse=True)
+for pid in numeric_pids:
+    cmdline = proc_cmdline(pid)
+    if not cmdline:
+        continue
+    argv0 = pathlib.Path(cmdline[0]).name
+    if argv0 == "plasmashell":
+        plasmashell_pid = pid
+        plasmashell_env = proc_env(pid)
+        break
+desktop_env = dict(leader_env)
+desktop_env.update(plasmashell_env)
 xwayland_display = ""
 xwayland_xauthority = ""
 for pid in os.listdir("/proc"):
@@ -153,6 +167,9 @@ print(
             "sessions": sessions,
             "picked_session": picked,
             "leader_env": leader_env,
+            "plasmashell_pid": plasmashell_pid,
+            "plasmashell_env": plasmashell_env,
+            "desktop_env": desktop_env,
             "python3": shutil.which("python3"),
             "xdotool": shutil.which("xdotool"),
             "imagemagick_import": shutil.which("import"),
@@ -364,13 +381,119 @@ def ssh_python_json(host: str, snippet: str) -> dict:
     return json.loads(text)
 
 
-def scp_to(host: str, local_path: Path, remote_path: str) -> None:
-    local_run([*scp_base(), str(local_path), f"{host}:{remote_path}"], check=True)
+def scp_to(host: str, local_path: Path, remote_path: str, *, timeout_seconds: float = 180.0) -> None:
+    local_run(
+        [*scp_base(), str(local_path), f"{host}:{remote_path}"],
+        check=True,
+        timeout_seconds=timeout_seconds,
+    )
 
 
-def scp_from(host: str, remote_path: str, local_path: Path) -> None:
+def scp_from(
+    host: str,
+    remote_path: str,
+    local_path: Path,
+    *,
+    timeout_seconds: float = 180.0,
+) -> None:
     local_path.parent.mkdir(parents=True, exist_ok=True)
-    local_run([*scp_base(), "-r", f"{host}:{remote_path}", str(local_path)], check=True)
+    local_run(
+        [*scp_base(), "-r", f"{host}:{remote_path}", str(local_path)],
+        check=True,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def maybe_stage_linux_companion_binaries(host: str, artifact: Path, remote_dir: str) -> dict[str, str]:
+    staged: dict[str, str] = {}
+    artifact_name = artifact.name
+    companion_specs = [
+        (
+            "yggterm-headless",
+            artifact_name.replace("yggterm-", "yggterm-headless-", 1)
+            if artifact_name.startswith("yggterm-")
+            else "yggterm-headless",
+        ),
+        (
+            "yggterm-mock-cli",
+            artifact_name.replace("yggterm-", "yggterm-mock-cli-", 1)
+            if artifact_name.startswith("yggterm-")
+            else "yggterm-mock-cli",
+        ),
+    ]
+    for remote_name, sibling_name in companion_specs:
+        sibling = artifact.with_name(sibling_name)
+        if not sibling.exists():
+            continue
+        remote_path = f"{remote_dir}/{remote_name}"
+        scp_to(host, sibling, remote_path)
+        ssh_shell(host, f"chmod +x {quote(remote_path)}")
+        staged[remote_name] = remote_path
+    return staged
+
+
+def remote_user_service_status(host: str, unit: str) -> dict:
+    proc = ssh_shell(
+        host,
+        f"systemctl --user show {quote(unit)} -p LoadState -p ActiveState -p SubState -p MainPID",
+        check=False,
+    )
+    props: dict[str, str] = {}
+    for line in (proc.stdout or "").splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        props[key.strip()] = value.strip()
+    load_state = str(props.get("LoadState") or "").strip()
+    active_state = str(props.get("ActiveState") or "").strip()
+    sub_state = str(props.get("SubState") or "").strip()
+    main_pid_text = str(props.get("MainPID") or "").strip()
+    try:
+        main_pid = int(main_pid_text or "0")
+    except ValueError:
+        main_pid = 0
+    available = bool(load_state) and load_state not in {"not-found", "masked"}
+    return {
+        "unit": unit,
+        "available": available,
+        "load_state": load_state,
+        "active": active_state == "active",
+        "active_state": active_state,
+        "sub_state": sub_state,
+        "pid": main_pid,
+        "returncode": proc.returncode,
+        "stderr": (proc.stderr or "").strip(),
+    }
+
+
+def remote_restart_user_service(host: str, unit: str) -> dict:
+    restart_proc = ssh_shell(
+        host,
+        f"systemctl --user restart {quote(unit)}",
+        check=False,
+        timeout_seconds=20.0,
+    )
+    time.sleep(2.0)
+    status = remote_user_service_status(host, unit)
+    status["restart_returncode"] = restart_proc.returncode
+    status["restart_stderr"] = (restart_proc.stderr or "").strip()
+    status["restart_stdout"] = (restart_proc.stdout or "").strip()
+    return status
+
+
+def detect_user_service_regression(before: dict, after: dict) -> str | None:
+    if not before.get("available"):
+        return None
+    before_active = bool(before.get("active"))
+    after_active = bool(after.get("active"))
+    before_pid = int(before.get("pid") or 0)
+    after_pid = int(after.get("pid") or 0)
+    unit = str(before.get("unit") or after.get("unit") or "service")
+    if before_active and not after_active:
+        return f"{unit} became inactive during smoke"
+    if before_active and before_pid > 0 and after_active and after_pid > 0 and before_pid != after_pid:
+        return f"{unit} pid changed during smoke ({before_pid} -> {after_pid})"
+    return None
 
 
 def remote_env_exports(env: dict[str, str]) -> str:
@@ -427,6 +550,7 @@ def resolve_launch_target(host: str, args: argparse.Namespace, remote_dir: str) 
         remote_bin = f"{remote_dir}/yggterm"
         scp_to(host, artifact, remote_bin)
         ssh_shell(host, f"chmod +x {quote(remote_bin)}")
+        maybe_stage_linux_companion_binaries(host, artifact, remote_dir)
         return remote_bin
     return autodetect_remote_bin(host)
 
@@ -458,7 +582,8 @@ def remote_notify(host: str, env: dict[str, str], title: str, body: str) -> None
     ssh_shell(
         host,
         f"{exports}; if command -v notify-send >/dev/null 2>&1; then "
-        f"notify-send {quote(title)} {quote(body)}; fi",
+        f"-h {quote('string:x-canonical-private-synchronous:yggterm-remote-smoke')} "
+        f"{quote(title)} {quote(body)}; fi",
         check=False,
     )
 
@@ -484,6 +609,30 @@ def remote_background_window(
             or f"failed to background pid {pid} on {host}"
         )
     return json.loads(text)
+
+
+def remote_ensure_local_daemon_ready(
+    host: str,
+    remote_bin: str,
+    env: dict[str, str],
+    *,
+    timeout_seconds: float = 20.0,
+) -> dict:
+    deadline = time.time() + timeout_seconds
+    exports = remote_env_exports(env)
+    last_error = ""
+    while time.time() < deadline:
+        proc = ssh_shell(
+            host,
+            f"{exports}; {quote(remote_bin)} server snapshot >/dev/null",
+            check=False,
+            timeout_seconds=timeout_seconds,
+        )
+        if proc.returncode == 0:
+            return {"ok": True, "stderr": "", "stdout": (proc.stdout or "").strip()}
+        last_error = (proc.stderr or proc.stdout or "").strip()
+        time.sleep(0.35)
+    return {"ok": False, "stderr": last_error}
 
 
 def remote_close_window(
@@ -661,6 +810,110 @@ def remote_create_plain_terminal(
     return session_path
 
 
+def remote_launch_visible_window(
+    host: str,
+    remote_bin: str,
+    env: dict[str, str],
+    *,
+    timeout_ms: int,
+    remote_log: str,
+) -> dict:
+    exports = remote_env_exports(env)
+    launch = ssh_shell(
+        host,
+        f"{exports}; {quote(remote_bin)} server app launch --wait-visible "
+        f"--allow-multi-window --skip-active-exec-handoff --timeout-ms {timeout_ms} "
+        f"--log {quote(remote_log)}",
+    )
+    payload = json.loads(launch.stdout.strip() or "{}")
+    pid = int(payload.get("pid") or 0)
+    if pid <= 0:
+        raise RuntimeError(
+            f"background app launch did not return a pid on {host}: {launch.stdout!r}"
+    )
+    return payload
+
+
+def remote_launch_direct_window(
+    host: str,
+    remote_bin: str,
+    env: dict[str, str],
+    *,
+    timeout_ms: int,
+    remote_log: str,
+) -> dict:
+    exports = remote_env_exports(env)
+    launch = ssh_shell(
+        host,
+        f"{exports}; nohup {quote(remote_bin)} > {quote(remote_log)} 2>&1 < /dev/null & echo $!",
+    )
+    pid = int((launch.stdout or "").strip() or 0)
+    if pid <= 0:
+        raise RuntimeError(
+            f"direct background app launch did not return a pid on {host}: {launch.stdout!r}"
+        )
+    registered = False
+    deadline = time.time() + max(timeout_ms / 1000.0, 1.0)
+    while time.time() < deadline:
+        inventory = remote_owned_clients(host)
+        if any(int(client.get("pid") or 0) == pid for client in inventory.get("clients") or []):
+            registered = True
+            break
+        time.sleep(0.25)
+    return {
+        "pid": pid,
+        "log_path": remote_log,
+        "registered": registered,
+        "launch_mode": "direct_shell",
+    }
+
+
+def remote_kill_pid(host: str, pid: int) -> None:
+    if pid <= 0:
+        return
+    ssh_shell(host, f"kill -TERM {pid} >/dev/null 2>&1 || true", check=False)
+    time.sleep(0.5)
+    alive = ssh_shell(host, f"kill -0 {pid} >/dev/null 2>&1", check=False).returncode == 0
+    if alive:
+        ssh_shell(host, f"kill -KILL {pid} >/dev/null 2>&1 || true", check=False)
+        time.sleep(0.2)
+
+
+def remote_kde_terminal_close_probe(
+    host: str,
+    remote_bin: str,
+    env: dict[str, str],
+    *,
+    timeout_ms: int,
+    remote_log: str,
+) -> dict:
+    launch_payload = remote_launch_visible_window(
+        host,
+        remote_bin,
+        env,
+        timeout_ms=timeout_ms,
+        remote_log=remote_log,
+    )
+    pid = int(launch_payload.get("pid") or 0)
+    wait_for_remote_state(host, remote_bin, env, pid, timeout_ms)
+    session_path = remote_create_plain_terminal(
+        host,
+        remote_bin,
+        env,
+        pid,
+        title="KDE Close Probe",
+    )
+    time.sleep(2.0)
+    close_response = remote_close_window(host, remote_bin, env, pid, timeout_ms)
+    time.sleep(2.0)
+    return {
+        "launch": launch_payload,
+        "session_path": session_path,
+        "close": close_response,
+        "plasmashell_after": remote_user_service_status(host, "plasma-plasmashell.service"),
+    }
+
+
 def main() -> int:
     args = parse_args()
     configure_remote_transport(args.proxy_jump, args.ssh_port)
@@ -676,11 +929,23 @@ def main() -> int:
     }
     metadata_path = out_dir / "summary.json"
     smoke_proc: subprocess.CompletedProcess | None = None
+    remote_dir: str | None = None
     try:
         cleanup_summary = remote_cleanup_owned_clients(args.host, args.timeout_ms)
         metadata["owned_clients_cleanup"] = cleanup_summary
         session_info = ssh_python_json(args.host, LINUX_SESSION_SNIPPET)
         metadata["session_info"] = session_info
+        plasmashell_before = remote_user_service_status(args.host, "plasma-plasmashell.service")
+        if plasmashell_before.get("available") and not plasmashell_before.get("active"):
+            plasmashell_before = remote_restart_user_service(args.host, "plasma-plasmashell.service")
+            metadata["plasmashell_restarted_before"] = plasmashell_before
+        metadata["plasmashell_before"] = plasmashell_before
+        desktop_notifications_enabled = not bool(plasmashell_before.get("available"))
+        metadata["desktop_notifications_enabled"] = desktop_notifications_enabled
+        if not desktop_notifications_enabled:
+            metadata["desktop_notifications_suppressed_reason"] = (
+                "suppressed notify-send because Plasma notifications are crashing on this host"
+            )
         if not session_info.get("python3"):
             raise RuntimeError(f"python3 is missing on {args.host}")
         remote_dir = args.remote_dir or (
@@ -693,9 +958,11 @@ def main() -> int:
 
         picked = session_info.get("picked_session") or {}
         leader_env = session_info.get("leader_env") or {}
+        desktop_env = session_info.get("desktop_env") or leader_env
         picked_type = str(picked.get("Type") or "").strip().lower()
         runtime_dir = str(
-            leader_env.get("XDG_RUNTIME_DIR")
+            desktop_env.get("XDG_RUNTIME_DIR")
+            or leader_env.get("XDG_RUNTIME_DIR")
             or session_info.get("runtime_dir")
             or ""
         ).strip()
@@ -728,11 +995,28 @@ def main() -> int:
             "YGGTERM_REMOTE_SMOKE_TAG": "1",
             "NO_AT_BRIDGE": "1",
         }
+        for desktop_key in (
+            "DESKTOP_SESSION",
+            "XDG_CURRENT_DESKTOP",
+            "XDG_SESSION_DESKTOP",
+            "KDE_FULL_SESSION",
+        ):
+            desktop_value = str(desktop_env.get(desktop_key) or "").strip()
+            if desktop_value:
+                launch_env[desktop_key] = desktop_value
         effective_backend = args.backend
         if effective_backend == "auto":
-            effective_backend = "wayland" if picked_type == "wayland" else "x11"
+            if picked_type == "wayland" and plasmashell_before.get("available"):
+                effective_backend = "x11"
+                metadata["effective_backend_reason"] = (
+                    "auto-fell back to X11 because native Wayland smoke is destabilizing Plasma on this host"
+                )
+            else:
+                effective_backend = "wayland" if picked_type == "wayland" else "x11"
         if effective_backend == "wayland":
-            wayland_display = str(leader_env.get("WAYLAND_DISPLAY") or "").strip()
+            wayland_display = str(
+                desktop_env.get("WAYLAND_DISPLAY") or leader_env.get("WAYLAND_DISPLAY") or ""
+            ).strip()
             if not wayland_display:
                 candidates = session_info.get("wayland_sockets") or []
                 if isinstance(candidates, list):
@@ -745,8 +1029,12 @@ def main() -> int:
                 raise RuntimeError(f"could not resolve WAYLAND_DISPLAY on {args.host}: {session_info!r}")
             launch_env["WAYLAND_DISPLAY"] = wayland_display
             launch_env["GDK_BACKEND"] = "wayland"
-            display_value = str(leader_env.get("DISPLAY") or "").strip()
-            xauthority_value = str(leader_env.get("XAUTHORITY") or "").strip()
+            display_value = str(
+                desktop_env.get("DISPLAY") or leader_env.get("DISPLAY") or ""
+            ).strip()
+            xauthority_value = str(
+                desktop_env.get("XAUTHORITY") or leader_env.get("XAUTHORITY") or ""
+            ).strip()
             if display_value:
                 launch_env["DISPLAY"] = display_value
             if xauthority_value:
@@ -754,11 +1042,13 @@ def main() -> int:
         else:
             x11_display = str(
                 session_info.get("xwayland_display")
+                or desktop_env.get("DISPLAY")
                 or leader_env.get("DISPLAY")
                 or ""
             ).strip()
             x11_xauthority = str(
                 session_info.get("xwayland_xauthority")
+                or desktop_env.get("XAUTHORITY")
                 or leader_env.get("XAUTHORITY")
                 or ""
             ).strip()
@@ -772,29 +1062,96 @@ def main() -> int:
             launch_env["WEBKIT_DISABLE_COMPOSITING_MODE"] = "1"
         metadata["effective_backend"] = effective_backend
         metadata["launch_env"] = launch_env
+        desktop_markers = " ".join(
+            str(desktop_env.get(key) or "")
+            for key in (
+                "DESKTOP_SESSION",
+                "XDG_CURRENT_DESKTOP",
+                "XDG_SESSION_DESKTOP",
+                "KDE_FULL_SESSION",
+            )
+        ).strip()
+        kde_desktop = bool(plasmashell_before.get("available")) or any(
+            marker in desktop_markers.lower() for marker in ("kde", "plasma")
+        )
+        metadata["desktop_markers"] = desktop_markers
+        metadata["kde_desktop"] = kde_desktop
 
         ssh_shell(args.host, f"mkdir -p {quote(remote_home)} {quote(remote_out)}")
         exports = remote_env_exports(launch_env)
-        remote_notify(
+        metadata["daemon_prewarm"] = remote_ensure_local_daemon_ready(
             args.host,
+            remote_bin,
             launch_env,
-            "Yggterm automated testing",
-            "Automated testing is starting. The Yggterm window will move to the background when possible.",
         )
-        launch = ssh_shell(
+        if not (metadata.get("daemon_prewarm") or {}).get("ok"):
+            raise RuntimeError(
+                "failed to prewarm the temp-home daemon before GUI launch: "
+                f"{(metadata.get('daemon_prewarm') or {}).get('stderr')!r}"
+            )
+        if kde_desktop and effective_backend == "x11" and plasmashell_before.get("available"):
+            probe_home = f"{remote_dir}/kde-close-probe-home"
+            probe_log = f"{remote_dir}/kde-close-probe.log"
+            probe_env = dict(launch_env)
+            probe_env["YGGTERM_HOME"] = probe_home
+            ssh_shell(args.host, f"mkdir -p {quote(probe_home)}")
+            metadata["kde_terminal_close_probe"] = remote_kde_terminal_close_probe(
+                args.host,
+                remote_bin,
+                probe_env,
+                timeout_ms=args.timeout_ms,
+                remote_log=probe_log,
+            )
+            probe_plasmashell_after = (
+                (metadata.get("kde_terminal_close_probe") or {}).get("plasmashell_after") or {}
+            )
+            if not probe_plasmashell_after.get("active"):
+                metadata["plasmashell_restarted_after_kde_terminal_close_probe"] = (
+                    remote_restart_user_service(args.host, "plasma-plasmashell.service")
+                )
+                raise RuntimeError(
+                    "kde terminal close probe crashed plasma-plasmashell.service"
+                )
+        if desktop_notifications_enabled:
+            remote_notify(
+                args.host,
+                launch_env,
+                "Yggterm automated testing",
+                "Automated testing is starting. The Yggterm window will move to the background when possible.",
+        )
+        launch_payload = remote_launch_visible_window(
             args.host,
-            f"{exports}; {quote(remote_bin)} server app launch --wait-visible "
-            f"--allow-multi-window --skip-active-exec-handoff --timeout-ms {args.timeout_ms} "
-            f"--log {quote(remote_log)}",
+            remote_bin,
+            launch_env,
+            timeout_ms=args.timeout_ms,
+            remote_log=remote_log,
         )
-        launch_payload = json.loads(launch.stdout.strip() or "{}")
         pid = int(launch_payload.get("pid") or 0)
-        if pid <= 0:
-            raise RuntimeError(f"background app launch did not return a pid on {args.host}: {launch.stdout!r}")
         metadata["launch_response"] = launch_payload
         metadata["pid"] = pid
-
-        initial_state = wait_for_remote_state(args.host, remote_bin, launch_env, pid, args.timeout_ms)
+        metadata["launch_mode"] = "app_cli"
+        try:
+            initial_state = wait_for_remote_state(
+                args.host, remote_bin, launch_env, pid, args.timeout_ms
+            )
+        except RuntimeError as launch_error:
+            metadata["launch_visibility_error"] = str(launch_error)
+            remote_kill_pid(args.host, pid)
+            fallback_log = f"{remote_dir}/client-direct.log"
+            fallback_launch = remote_launch_direct_window(
+                args.host,
+                remote_bin,
+                launch_env,
+                timeout_ms=args.timeout_ms,
+                remote_log=fallback_log,
+            )
+            pid = int(fallback_launch.get("pid") or 0)
+            metadata["launch_fallback_response"] = fallback_launch
+            metadata["launch_mode"] = "direct_shell_fallback"
+            metadata["pid"] = pid
+            initial_state = wait_for_remote_state(
+                args.host, remote_bin, launch_env, pid, args.timeout_ms
+            )
         initial_bad_notifications = remote_problem_notifications(initial_state)
         if initial_bad_notifications:
             raise RuntimeError(
@@ -812,13 +1169,6 @@ def main() -> int:
         metadata["requested_session"] = args.session
         metadata["resolved_session"] = smoke_session
         metadata["owned_clients_after_launch"] = remote_owned_clients(args.host)
-        metadata["background_response"] = remote_background_window(
-            args.host,
-            remote_bin,
-            launch_env,
-            pid,
-            args.timeout_ms,
-        )
 
         try:
             only_check_args = "".join(
@@ -856,16 +1206,44 @@ def main() -> int:
             raise RuntimeError(
                 f"bad daemon/socket notifications were observed during smoke: {metadata['final_problem_notifications']!r}"
             )
+        try:
+            metadata["background_response_after_smoke"] = remote_background_window(
+                args.host,
+                remote_bin,
+                launch_env,
+                pid,
+                args.timeout_ms,
+            )
+        except Exception as exc:
+            metadata["background_error_after_smoke"] = str(exc)
 
         pulled_dir = out_dir / "proof"
         pulled_dir.mkdir(parents=True, exist_ok=True)
-        scp_from(args.host, f"{remote_out}/.", pulled_dir)
+        metadata["local_proof_dir"] = str(pulled_dir)
+        metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        proof_pull_timeout = max(60.0, min(float(args.smoke_timeout_sec), 180.0))
+        try:
+            scp_from(
+                args.host,
+                f"{remote_out}/.",
+                pulled_dir,
+                timeout_seconds=proof_pull_timeout,
+            )
+        except Exception as exc:
+            metadata["proof_pull_error"] = str(exc)
         perf_remote = f"{remote_home}/perf-telemetry.jsonl"
         perf_proc = ssh_shell(args.host, f"test -f {quote(perf_remote)}", check=False)
         if perf_proc.returncode == 0:
-            scp_from(args.host, perf_remote, out_dir / "perf-telemetry.jsonl")
+            try:
+                scp_from(
+                    args.host,
+                    perf_remote,
+                    out_dir / "perf-telemetry.jsonl",
+                    timeout_seconds=60.0,
+                )
+            except Exception as exc:
+                metadata["perf_pull_error"] = str(exc)
 
-        metadata["local_proof_dir"] = str(pulled_dir)
         metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
         try:
@@ -884,20 +1262,64 @@ def main() -> int:
             check=False,
         )
         metadata["owned_clients_after_close"] = wait_for_remote_owned_clients_gone(args.host)
-        metadata["ok"] = (smoke_proc is not None and smoke_proc.returncode == 0) and not bool(
-            metadata.get("final_problem_notifications")
+        final_owned_clients = metadata["owned_clients_after_close"]
+        if int((final_owned_clients or {}).get("count") or 0) != 0:
+            metadata["owned_clients_cleanup_after_close"] = remote_cleanup_owned_clients(
+                args.host,
+                args.timeout_ms,
+            )
+            final_owned_clients = (metadata["owned_clients_cleanup_after_close"] or {}).get(
+                "after"
+            )
+        if int((final_owned_clients or {}).get("count") or 0) != 0:
+            metadata["owned_clients_cleanup_after_close_retry"] = remote_cleanup_owned_clients(
+                args.host,
+                args.timeout_ms,
+            )
+            final_owned_clients = (
+                metadata["owned_clients_cleanup_after_close_retry"] or {}
+            ).get("after")
+        metadata["owned_clients_final"] = final_owned_clients
+        plasmashell_after = remote_user_service_status(args.host, "plasma-plasmashell.service")
+        metadata["plasmashell_after"] = plasmashell_after
+        plasmashell_problem = detect_user_service_regression(
+            metadata.get("plasmashell_before") or {},
+            plasmashell_after,
         )
+        if plasmashell_problem:
+            metadata["plasmashell_problem"] = plasmashell_problem
+            if plasmashell_after.get("available") and not plasmashell_after.get("active"):
+                metadata["plasmashell_restarted_after"] = remote_restart_user_service(
+                    args.host,
+                    "plasma-plasmashell.service",
+                )
+        owned_clients_survived = int((final_owned_clients or {}).get("count") or 0) != 0
+        metadata["ok"] = (
+            (smoke_proc is not None and smoke_proc.returncode == 0)
+            and not bool(metadata.get("final_problem_notifications"))
+            and not bool(metadata.get("plasmashell_problem"))
+            and not owned_clients_survived
+        )
+        if metadata.get("plasmashell_problem") and not metadata.get("error"):
+            metadata["error"] = metadata["plasmashell_problem"]
+        if owned_clients_survived and not metadata.get("error"):
+            metadata["error"] = "owned Yggterm clients survived remote smoke cleanup"
         metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-        remote_notify(
-            args.host,
-            launch_env,
-            "Yggterm automated testing",
-            "Automated testing finished. The test window should be in the background or closed.",
-        )
+        if desktop_notifications_enabled:
+            remote_notify(
+                args.host,
+                launch_env,
+                "Yggterm automated testing",
+                "Automated testing finished. The test window should be in the background or closed.",
+            )
         if not args.keep_remote_dir:
             ssh_shell(args.host, f"rm -rf {quote(remote_dir)}", check=False)
         print(metadata_path)
-        return 0 if metadata.get("ok") else (smoke_proc.returncode if smoke_proc is not None else 1)
+        if metadata.get("ok"):
+            return 0
+        if smoke_proc is not None and smoke_proc.returncode not in (None, 0):
+            return smoke_proc.returncode
+        return 1
     except Exception as exc:
         metadata["ok"] = False
         metadata["error"] = str(exc)
@@ -908,7 +1330,7 @@ def main() -> int:
         print(metadata_path)
         return 1
     finally:
-        if args.keep_remote_dir:
+        if args.keep_remote_dir and remote_dir:
             (out_dir / "remote-dir.txt").write_text(f"{remote_dir}\n", encoding="utf-8")
 
 
