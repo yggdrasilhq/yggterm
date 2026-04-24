@@ -279,6 +279,26 @@ def quote(value: str) -> str:
     return shlex.quote(value)
 
 
+def remote_file_text_if_exists(host: str, path: str, max_bytes: int = 16384) -> str:
+    proc = ssh_shell(
+        host,
+        f"if test -f {quote(path)}; then tail -c {max_bytes} {quote(path)}; fi",
+        check=False,
+    )
+    return (proc.stdout or "").strip()
+
+
+def remote_panic_log(host: str, home: str) -> dict | None:
+    path = f"{home.rstrip('/')}/panic.log"
+    text = remote_file_text_if_exists(host, path)
+    if not text:
+        return None
+    return {
+        "path": path,
+        "tail": text,
+    }
+
+
 def configure_remote_transport(proxy_jump: str | None, ssh_port: int | None) -> None:
     if proxy_jump:
         os.environ["YGGTERM_REMOTE_PROXY_JUMP"] = proxy_jump
@@ -886,6 +906,26 @@ def remote_kill_pid(host: str, pid: int) -> None:
         time.sleep(0.2)
 
 
+def wait_for_remote_pid_gone(host: str, pid: int, timeout_seconds: float = 8.0) -> dict:
+    deadline = time.time() + timeout_seconds
+    checks = 0
+    while time.time() < deadline:
+        checks += 1
+        alive = ssh_shell(host, f"kill -0 {pid} >/dev/null 2>&1", check=False).returncode == 0
+        if not alive:
+            return {
+                "pid": pid,
+                "exited": True,
+                "checks": checks,
+            }
+        time.sleep(0.25)
+    return {
+        "pid": pid,
+        "exited": False,
+        "checks": checks,
+    }
+
+
 def remote_kde_terminal_close_probe(
     host: str,
     remote_bin: str,
@@ -929,13 +969,28 @@ def remote_kde_terminal_close_probe(
     )
     time.sleep(2.0)
     close_response = remote_close_window(host, remote_bin, env, pid, timeout_ms)
-    time.sleep(2.0)
+    close_exit = wait_for_remote_pid_gone(host, pid)
+    if not close_exit.get("exited"):
+        remote_kill_pid(host, pid)
+        after_kill = wait_for_remote_pid_gone(host, pid, timeout_seconds=3.0)
+        close_exit["killed_after_timeout"] = True
+        close_exit["after_kill"] = after_kill
+    exports = remote_env_exports(env)
+    shutdown_proc = ssh_shell(
+        host,
+        f"{exports}; {quote(remote_bin)} server shutdown >/dev/null 2>&1 || true",
+        check=False,
+    )
+    panic_log = remote_panic_log(host, env.get("YGGTERM_HOME", ""))
     return {
         "launch": launch_payload,
         "launch_mode": launch_mode,
         "launch_visibility_error": launch_visibility_error,
         "session_path": session_path,
         "close": close_response,
+        "close_exit": close_exit,
+        "shutdown_returncode": shutdown_proc.returncode,
+        "panic_log": panic_log,
         "plasmashell_after": remote_user_service_status(host, "plasma-plasmashell.service"),
     }
 
@@ -1128,6 +1183,19 @@ def main() -> int:
                 timeout_ms=args.timeout_ms,
                 remote_log=probe_log,
             )
+            probe_panic_log = (metadata.get("kde_terminal_close_probe") or {}).get("panic_log")
+            if probe_panic_log:
+                raise RuntimeError(
+                    "kde terminal close probe panicked before the main launcher smoke: "
+                    f"{probe_panic_log.get('path')}"
+                )
+            probe_close_exit = (
+                (metadata.get("kde_terminal_close_probe") or {}).get("close_exit") or {}
+            )
+            if not probe_close_exit.get("exited"):
+                raise RuntimeError(
+                    "kde terminal close probe did not exit after app-control close"
+                )
             probe_plasmashell_after = (
                 (metadata.get("kde_terminal_close_probe") or {}).get("plasmashell_after") or {}
             )
