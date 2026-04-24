@@ -48,9 +48,9 @@ if [ -f "\$STATE" ]; then
   target="\$(sed -n 's/.*"active_executable"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "\$STATE" | head -n1)"
 fi
 if [ -z "\$target" ] || [ ! -x "\$target" ]; then
-  latest_version="\$(find "\$ROOT/versions" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -V | tail -n1)"
-  if [ -n "\$latest_version" ] && [ -x "\$ROOT/versions/\$latest_version/yggterm" ]; then
-    target="\$ROOT/versions/\$latest_version/yggterm"
+  latest_dir="\$(ls -td "\$ROOT"/versions/* 2>/dev/null | head -n 1 || true)"
+  if [ -n "\$latest_dir" ] && [ -x "\$latest_dir/yggterm" ]; then
+    target="\$latest_dir/yggterm"
   fi
 fi
 if [ -z "\$target" ] || [ ! -x "\$target" ]; then
@@ -82,9 +82,9 @@ write_mock_cli_wrapper() {
 set -eu
 ROOT='${install_root}'
 target=""
-latest_version="\$(find "\$ROOT/versions" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -V | tail -n1)"
-if [ -n "\$latest_version" ] && [ -x "\$ROOT/versions/\$latest_version/yggterm-mock-cli" ]; then
-  target="\$ROOT/versions/\$latest_version/yggterm-mock-cli"
+latest_dir="\$(ls -td "\$ROOT"/versions/* 2>/dev/null | head -n 1 || true)"
+if [ -n "\$latest_dir" ] && [ -x "\$latest_dir/yggterm-mock-cli" ]; then
+  target="\$latest_dir/yggterm-mock-cli"
 fi
 if [ -z "\$target" ] || [ ! -x "\$target" ]; then
   target='${installed_mock_cli}'
