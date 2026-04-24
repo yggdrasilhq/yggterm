@@ -36,7 +36,16 @@ if [[ -z "$APP_VERSION" ]]; then
   APP_VERSION="0.0.0"
 fi
 
-BUILD_CMD=("${CARGO_CMD[@]}" build --release -p yggterm --bin yggterm --bin yggterm-headless --bin yggterm-mock-cli --no-default-features)
+HOST_TRIPLE="$(rustc "+${RUSTUP_TOOLCHAIN}" -vV | awk '/^host:/ { print $2 }')"
+BUILD_CMD=("${CARGO_CMD[@]}")
+if [[ -n "$TARGET_TRIPLE" && "$TARGET_TRIPLE" != "$HOST_TRIPLE" && "$TARGET_TRIPLE" == *-pc-windows-msvc ]] && command -v cargo-xwin >/dev/null 2>&1; then
+  BUILD_CMD+=("xwin" "build")
+elif [[ -n "$TARGET_TRIPLE" && "$TARGET_TRIPLE" != "$HOST_TRIPLE" ]] && command -v cargo-zigbuild >/dev/null 2>&1; then
+  BUILD_CMD+=("zigbuild")
+else
+  BUILD_CMD+=("build")
+fi
+BUILD_CMD+=(--release -p yggterm --bin yggterm --bin yggterm-headless --bin yggterm-mock-cli --no-default-features)
 BIN_PATH="${ROOT_DIR}/target/release/${BIN_NAME}"
 HEADLESS_BIN_PATH="${ROOT_DIR}/target/release/${HEADLESS_BIN_NAME}"
 MOCK_CLI_BIN_PATH="${ROOT_DIR}/target/release/${MOCK_CLI_BIN_NAME}"

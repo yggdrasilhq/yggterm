@@ -46,15 +46,22 @@ try {
 
   $sourceExe = Join-Path $tempDir "yggterm-$targetLabel.exe"
   $sourceHeadlessExe = Join-Path $tempDir "yggterm-headless-$targetLabel.exe"
+  $sourceMockCliExe = Join-Path $tempDir "yggterm-mock-cli-$targetLabel.exe"
   $sourceWebView2Loader = Join-Path $tempDir "WebView2Loader-$targetLabel.dll"
   if (-not (Test-Path $sourceWebView2Loader)) {
     $sourceWebView2Loader = Join-Path $tempDir "WebView2Loader.dll"
   }
   $installedExe = Join-Path $versionDir "yggterm.exe"
   $installedHeadlessExe = Join-Path $versionDir "yggterm-headless.exe"
+  $installedMockCliExe = Join-Path $versionDir "yggterm-mock-cli.exe"
   $installedWebView2Loader = Join-Path $versionDir "WebView2Loader.dll"
   Copy-Item $sourceExe $installedExe -Force
   Copy-Item $sourceHeadlessExe $installedHeadlessExe -Force
+  if (Test-Path $sourceMockCliExe) {
+    Copy-Item $sourceMockCliExe $installedMockCliExe -Force
+  } else {
+    throw "release archive is missing yggterm-mock-cli.exe"
+  }
   if (Test-Path $sourceWebView2Loader) {
     Copy-Item $sourceWebView2Loader $installedWebView2Loader -Force
   } else {

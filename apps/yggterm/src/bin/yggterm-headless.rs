@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use yggterm_core::{SessionStore, detect_install_context, refresh_desktop_integration};
+use yggterm_core::{SessionStore, detect_install_context};
 use yggterm_server::{
     AppControlRightPanelMode, AppControlViewMode, cleanup_legacy_daemons, default_endpoint,
     detect_ghostty_host, ensure_local_daemon_running, ping, run_app_control_background_window,
@@ -20,14 +20,19 @@ use yggterm_server::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BuiltinCliCommand {
     MainHelp,
+    Version,
     ServerHelp,
     ServerSnapshot,
 }
 
 fn classify_builtin_cli_command(args: &[String]) -> Option<BuiltinCliCommand> {
     match args {
+        [] => Some(BuiltinCliCommand::MainHelp),
         [arg] if matches!(arg.as_str(), "--help" | "-h" | "help") => {
             Some(BuiltinCliCommand::MainHelp)
+        }
+        [arg] if matches!(arg.as_str(), "--version" | "version") => {
+            Some(BuiltinCliCommand::Version)
         }
         [command] if command == "server" => Some(BuiltinCliCommand::ServerHelp),
         [command, arg]
@@ -47,6 +52,7 @@ fn print_main_help() {
         "usage:
   yggterm-headless
   yggterm-headless --help
+  yggterm-headless --version
   yggterm-headless server <subcommand>
 
 common server commands:
@@ -122,11 +128,10 @@ fn main() -> Result<()> {
 
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let current_exe = std::env::current_exe()?;
-    let install_context = detect_install_context(&current_exe)?;
+    let _install_context = detect_install_context(&current_exe)?;
     let store = SessionStore::open_or_init()?;
 
     if args.as_slice() == ["server", "daemon"] {
-        let _ = refresh_desktop_integration(&install_context);
         let endpoint = default_endpoint(store.home_dir());
         let _ = cleanup_legacy_daemons(&endpoint, &current_exe);
         let host = detect_ghostty_host();
@@ -219,6 +224,10 @@ fn main() -> Result<()> {
         match command {
             BuiltinCliCommand::MainHelp => {
                 print_main_help();
+                return Ok(());
+            }
+            BuiltinCliCommand::Version => {
+                println!("{}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
             BuiltinCliCommand::ServerHelp => {
@@ -648,7 +657,7 @@ fn main() -> Result<()> {
         );
     }
 
-    anyhow::bail!("yggterm-headless only supports server subcommands");
+    anyhow::bail!("this yggterm build only supports server subcommands");
 }
 
 #[cfg(test)]
