@@ -630,6 +630,22 @@ fn vbscript_escape(value: &str) -> String {
     value.replace('"', "\"\"")
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn windows_without_extended_path_prefix(value: &str) -> String {
+    if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    if let Some(rest) = value.strip_prefix(r"\\?\") {
+        return rest.to_string();
+    }
+    value.to_string()
+}
+
+#[cfg(target_os = "windows")]
+fn windows_shell_path_text(path: &Path) -> String {
+    windows_without_extended_path_prefix(path.as_os_str().to_string_lossy().as_ref())
+}
+
 #[cfg(target_os = "windows")]
 fn refresh_windows_gui_launcher(executable_path: &Path) -> Result<PathBuf> {
     let working_dir = executable_path
@@ -642,10 +658,12 @@ fn refresh_windows_gui_launcher(executable_path: &Path) -> Result<PathBuf> {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| working_dir.clone());
     let launcher_path = install_root.join("Yggterm.vbs");
+    let working_dir_text = windows_shell_path_text(&working_dir);
+    let executable_path_text = windows_shell_path_text(executable_path);
     let script = format!(
         "Set shell = CreateObject(\"WScript.Shell\")\r\nshell.CurrentDirectory = \"{}\"\r\nshell.Run \"\"\"{}\"\"\", 0, False\r\n",
-        vbscript_escape(working_dir.as_os_str().to_string_lossy().as_ref()),
-        vbscript_escape(executable_path.as_os_str().to_string_lossy().as_ref()),
+        vbscript_escape(&working_dir_text),
+        vbscript_escape(&executable_path_text),
     );
     write_if_changed(&launcher_path, script.as_bytes())?;
     Ok(launcher_path)
@@ -664,19 +682,13 @@ fn refresh_windows_integration(context: &InstallContext) -> Result<Vec<String>> 
     let shortcut_path = shortcut_dir.join("Yggterm.lnk");
     let legacy_shortcut_dir = shortcut_dir.join("Yggterm");
     let legacy_shortcut_path = legacy_shortcut_dir.join("Yggterm.lnk");
-    let target_path = context
-        .executable_path
-        .as_os_str()
-        .to_string_lossy()
-        .to_string();
+    let target_path = windows_shell_path_text(&context.executable_path);
     let launcher_path = refresh_windows_gui_launcher(&context.executable_path)?;
-    let working_dir = context
+    let working_dir_path = context
         .executable_path
         .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .as_os_str()
-        .to_string_lossy()
-        .to_string();
+        .unwrap_or_else(|| Path::new("."));
+    let working_dir = windows_shell_path_text(working_dir_path);
     let ps = format!(
         "if (Test-Path -LiteralPath '{}') {{ Remove-Item -LiteralPath '{}' -Force -ErrorAction SilentlyContinue }}; \
          if (Test-Path -LiteralPath '{}') {{ Remove-Item -LiteralPath '{}' -Recurse -Force -ErrorAction SilentlyContinue }}; \
@@ -1255,6 +1267,22 @@ fn refresh_kde_desktop_caches() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_path_text_strips_extended_length_prefixes() {
+        assert_eq!(
+            windows_without_extended_path_prefix(r"\\?\C:\Users\Admin\AppData\Local\Yggterm"),
+            r"C:\Users\Admin\AppData\Local\Yggterm"
+        );
+        assert_eq!(
+            windows_without_extended_path_prefix(r"\\?\UNC\server\share\Yggterm"),
+            r"\\server\share\Yggterm"
+        );
+        assert_eq!(
+            windows_without_extended_path_prefix(r"C:\Users\Admin\AppData\Local\Yggterm"),
+            r"C:\Users\Admin\AppData\Local\Yggterm"
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
