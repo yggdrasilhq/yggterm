@@ -117,6 +117,7 @@ pub struct AppSettings {
     pub litellm_endpoint: String,
     pub litellm_api_key: String,
     pub interface_llm_model: String,
+    pub codex_extra_args: String,
     pub default_agent_profile: AgentSessionProfile,
     pub in_app_notifications: bool,
     pub system_notifications: bool,
@@ -143,6 +144,7 @@ impl Default for AppSettings {
             litellm_endpoint: String::new(),
             litellm_api_key: String::new(),
             interface_llm_model: String::new(),
+            codex_extra_args: String::new(),
             default_agent_profile: AgentSessionProfile::Codex,
             in_app_notifications: true,
             system_notifications: false,
@@ -623,6 +625,10 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
         settings.interface_llm_model =
             serde_json::from_value(value.clone()).context("failed to parse interface_llm_model")?;
     }
+    if let Some(value) = object.get("codex_extra_args") {
+        settings.codex_extra_args =
+            serde_json::from_value(value.clone()).context("failed to parse codex_extra_args")?;
+    }
     if let Some(value) = object.get("default_agent_profile") {
         settings.default_agent_profile = serde_json::from_value(value.clone())
             .context("failed to parse default_agent_profile")?;
@@ -667,6 +673,7 @@ fn serialize_settings_value(settings: &AppSettings) -> Value {
         "litellm_endpoint": settings.litellm_endpoint,
         "litellm_api_key": settings.litellm_api_key,
         "interface_llm_model": settings.interface_llm_model,
+        "codex_extra_args": settings.codex_extra_args,
         "default_agent_profile": settings.default_agent_profile,
         "in_app_notifications": settings.in_app_notifications,
         "system_notifications": settings.system_notifications,
@@ -1282,6 +1289,14 @@ fn codex_browser_tree_to_session_node(node: &CodexBrowserTreeNode) -> SessionNod
 
     let mut children = Vec::new();
 
+    let mut nested_children = node
+        .children
+        .values()
+        .map(codex_browser_tree_to_session_node)
+        .collect::<Vec<_>>();
+    nested_children.sort_by(cmp_browser_child_node);
+    children.extend(nested_children);
+
     if let Some(project) = &node.project {
         children.extend(project.sessions.iter().map(|session| SessionNode {
             kind: SessionNodeKind::CodexSession,
@@ -1295,14 +1310,6 @@ fn codex_browser_tree_to_session_node(node: &CodexBrowserTreeNode) -> SessionNod
             cwd: Some(project.cwd.clone()),
         }));
     }
-
-    let mut nested_children = node
-        .children
-        .values()
-        .map(codex_browser_tree_to_session_node)
-        .collect::<Vec<_>>();
-    nested_children.sort_by(cmp_browser_child_node);
-    children.extend(nested_children);
 
     SessionNode {
         kind: SessionNodeKind::Group,
@@ -1457,6 +1464,65 @@ mod tests {
     }
 
     #[test]
+    fn workspace_documents_sort_before_raw_codex_sessions_inside_project_folder() {
+        let mut root = CodexBrowserTreeNode {
+            name: String::from("local [ok]"),
+            full_path: String::from("local"),
+            explicit_title: Some(String::from("local")),
+            document: None,
+            group_kind: Some(WorkspaceGroupKind::Folder),
+            project: None,
+            children: BTreeMap::new(),
+        };
+        insert_workspace_document(
+            &mut root,
+            &WorkspaceDocumentSummary {
+                id: "recipe-id".to_string(),
+                virtual_path: "/home/pi/0000-local-shell".to_string(),
+                title: "local-shell".to_string(),
+                kind: WorkspaceDocumentKind::TerminalRecipe,
+                updated_at: "2026-04-24T00:00:00Z".to_string(),
+            },
+        );
+        insert_codex_browser_project(
+            &mut root,
+            &CodexProjectBucket {
+                cwd: "/home/pi".to_string(),
+                sessions: vec![CodexSessionSummary {
+                    file_path: PathBuf::from("/home/pi/.codex/sessions/example.jsonl"),
+                    session_id: "stored-session-id".to_string(),
+                    cwd: "/home/pi".to_string(),
+                    generated_title: Some("Stored Codex".to_string()),
+                    modified_epoch_ms: 0,
+                }],
+            },
+        );
+        compress_codex_browser_tree(&mut root, false);
+
+        let mut browser = SessionBrowserState::new(codex_browser_tree_to_session_node(&root));
+        browser.ensure_visible_path("/home/pi/0000-local-shell");
+        let rows = browser.rows();
+        let recipe_ix = rows
+            .iter()
+            .position(|row| row.full_path == "/home/pi/0000-local-shell")
+            .expect("recipe row should be visible");
+        let session_ix = rows
+            .iter()
+            .position(|row| row.full_path == "/home/pi/.codex/sessions/example.jsonl")
+            .expect("stored session row should be visible");
+
+        assert_eq!(rows[recipe_ix].kind, BrowserRowKind::Document);
+        assert_eq!(
+            rows[recipe_ix].document_kind,
+            Some(WorkspaceDocumentKind::TerminalRecipe)
+        );
+        assert!(
+            recipe_ix < session_ix,
+            "workspace recipe should stay at the top of the project folder"
+        );
+    }
+
+    #[test]
     fn settings_upgrade_legacy_terminal_theme_into_both_modes() {
         let parsed = parse_settings_value(&serde_json::json!({
             "terminal_theme_name": "Aardvark Blue"
@@ -1482,6 +1548,28 @@ mod tests {
         assert_eq!(
             serialize_settings_value(&settings).get("auto_hide_titlebar"),
             Some(&serde_json::json!(true))
+        );
+    }
+
+    #[test]
+    fn settings_parse_codex_extra_args() {
+        let parsed = parse_settings_value(&serde_json::json!({
+            "codex_extra_args": "-s danger-full-access --profile \"field test\""
+        }))
+        .expect("settings should parse");
+        assert_eq!(
+            parsed.codex_extra_args,
+            "-s danger-full-access --profile \"field test\""
+        );
+    }
+
+    #[test]
+    fn settings_serialize_codex_extra_args() {
+        let mut settings = AppSettings::default();
+        settings.codex_extra_args = "-s danger-full-access".to_string();
+        assert_eq!(
+            serialize_settings_value(&settings).get("codex_extra_args"),
+            Some(&serde_json::json!("-s danger-full-access"))
         );
     }
 }

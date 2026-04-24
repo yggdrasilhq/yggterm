@@ -119,9 +119,9 @@ use yggui::{
     SideRailShell, THEME_EDITOR_SWATCHES, TOAST_CSS, TitlebarChrome, ToastCard,
     ToastItem as ToastNotification, ToastPalette, ToastTone as NotificationTone, ToastViewport,
     TreeDropPlacement as WorkspaceDropPlacement, TreeReorderItem, TreeReorderPlanItem,
-    WindowControlsStrip, append_theme_stop, build_tree_reorder_plan, clamp_theme_spec,
-    default_theme_editor_spec, dominant_accent, emphasized_enter_transition,
-    emphasized_exit_transition, gradient_css, preview_surface_css,
+    WindowControlsStrip, append_theme_stop, build_tree_reorder_plan, canonical_tree_leaf_name,
+    clamp_theme_spec, default_theme_editor_spec, dominant_accent, emphasized_enter_transition,
+    emphasized_exit_transition, gradient_css, join_tree_child_path, preview_surface_css,
     resolve_drag_drop_target as resolve_tree_drag_drop_target, resolve_tree_drop_placement,
     search_field_shell_style, search_input_style, shell_tint, standard_accelerate_transition,
     standard_decelerate_transition, standard_transition, tree_parent_path, tree_path_contains,
@@ -129,7 +129,7 @@ use yggui::{
 };
 use yggui_contract::{UiTheme, YgguiClipboardContents, YgguiThemeSpec};
 static BOOTSTRAP: OnceCell<ShellBootstrap> = OnceCell::new();
-static PASSIVE_COPY_SUSPENDED: AtomicBool = AtomicBool::new(false);
+static PASSIVE_COPY_SUSPENDED: AtomicBool = AtomicBool::new(true);
 static PREVIEW_BLOCK_CACHE: OnceCell<Mutex<PreviewBlockCache>> = OnceCell::new();
 static PREVIEW_CONTENT_CACHE: OnceCell<Mutex<PreviewContentCache>> = OnceCell::new();
 static PREVIEW_RUN_CACHE: OnceCell<Mutex<PreviewRunCache>> = OnceCell::new();
@@ -161,6 +161,7 @@ const PREVIEW_CONTENT_CACHE_LIMIT: usize = 256;
 const PREVIEW_RUN_CACHE_LIMIT: usize = 256;
 const SIDEBAR_MERGE_CACHE_LIMIT: usize = 128;
 const SIDEBAR_SEARCH_CACHE_LIMIT: usize = 256;
+const SIDEBAR_SEARCH_RENDER_LIMIT: usize = 120;
 const SIDE_RAIL_WIDTH: usize = 292;
 const SIDEBAR_MIN_WIDTH: f32 = 220.0;
 const SIDEBAR_MAX_WIDTH: f32 = 420.0;
@@ -670,8 +671,9 @@ fn limit_live_terminal_retention_for_platform(
     is_kde_plasma: bool,
     has_x11_display: bool,
     has_wayland_display: bool,
+    force_limit: bool,
 ) -> bool {
-    is_kde_plasma && (has_x11_display || has_wayland_display)
+    force_limit && is_kde_plasma && (has_x11_display || has_wayland_display)
 }
 
 fn snapshot_terminal_line_tail(lines: &[String], limit: usize) -> Vec<String> {
@@ -1189,7 +1191,7 @@ impl ShellState {
         let has_initial_server_snapshot = bootstrap.initial_server_snapshot.is_some();
         let needs_initial_server_sync =
             bootstrap.refresh_server_after_launch || !has_initial_server_snapshot;
-        PASSIVE_COPY_SUSPENDED.store(false, Ordering::Relaxed);
+        PASSIVE_COPY_SUSPENDED.store(true, Ordering::Relaxed);
         let initial_yggui_theme = clamp_theme_spec(&bootstrap.settings.yggui_theme);
         let mut state = Self {
             settings,
@@ -1254,7 +1256,7 @@ impl ShellState {
             summary_requests_in_flight: HashSet::new(),
             active_copy_hydration_in_flight: HashSet::new(),
             store_copy_hydrated_session_ids: HashSet::new(),
-            passive_copy_suspended: false,
+            passive_copy_suspended: true,
             passive_copy_failures: HashSet::new(),
             copy_retry_after_ms: HashMap::new(),
             title_autogen_retry_after_ms: HashMap::new(),
@@ -1651,7 +1653,7 @@ impl ShellState {
             &self.session_title_overrides,
             &self.generated_summaries,
         );
-        let rows = filtered_sidebar_rows(&merged_rows, effective_search_query);
+        let rows = sidebar_rows_for_render(&merged_rows, effective_search_query);
         let search_sidebar_matches = search_sidebar_matches(&merged_rows, effective_search_query);
         let active_title = active_session
             .as_ref()
@@ -2548,8 +2550,7 @@ impl ShellState {
                 }
                 if always_sync_selection
                     || was_initial_sync
-                    || self.selected_tree_paths.is_empty()
-                    || !self.active_session_sidebar_selection_is_consistent()
+                    || self.background_active_selection_sync_needed()
                 {
                     self.sync_active_session_selection();
                 }
@@ -2687,12 +2688,11 @@ impl ShellState {
                 if was_initial_sync {
                     self.seed_dynamic_top_level_expansions();
                 }
-                if self.selected_tree_paths.is_empty()
-                    || !self.active_session_sidebar_selection_is_consistent()
-                {
+                if self.background_active_selection_sync_needed() {
                     self.sync_active_session_selection();
                 }
-                self.ensure_active_session_visible();
+                self.ensure_active_session_expanded();
+                self.sync_browser_settings();
                 self.record_restore_issue_telemetry("apply_daemon_snapshot_result");
                 self.record_preview_issue_telemetry("apply_daemon_snapshot_result");
                 if let Some(message) = message {
@@ -3097,6 +3097,27 @@ impl ShellState {
             self.browser.select_path(selected_path);
         }
     }
+    fn background_active_selection_sync_needed(&self) -> bool {
+        if self.selected_tree_paths.is_empty() {
+            return true;
+        }
+        let Some(selected_row) = explicit_selected_sidebar_row(self) else {
+            return true;
+        };
+        let Some(expected_path) = self
+            .active_browser_selection_path_for_session()
+            .or_else(|| {
+                self.server
+                    .active_session()
+                    .map(|session| session.session_path.clone())
+            })
+            .or_else(|| self.server.active_session_path().map(str::to_string))
+        else {
+            return false;
+        };
+        selected_row.full_path == expected_path
+            && !self.active_session_sidebar_selection_is_consistent()
+    }
     fn active_session_sidebar_selection_is_consistent(&self) -> bool {
         let expected_browser_path = self.active_browser_selection_path_for_session();
         let expected_path = self
@@ -3269,6 +3290,12 @@ impl ShellState {
         );
         match row.kind {
             BrowserRowKind::Group => {
+                if !self.search_query.trim().is_empty() {
+                    self.search_query.clear();
+                    self.search_sidebar_match_index = None;
+                    self.search_content_match_index = None;
+                    self.search_focused = false;
+                }
                 if is_synthetic_sidebar_row(row) {
                     self.browser.toggle_virtual_group(&row.full_path);
                     self.update_synthetic_group_collapse_state(&row.full_path, !row.expanded);
@@ -3301,8 +3328,6 @@ impl ShellState {
     }
     fn update_litellm_endpoint(&mut self, value: String) {
         self.settings.litellm_endpoint = value;
-        PASSIVE_COPY_SUSPENDED.store(false, Ordering::Relaxed);
-        self.passive_copy_suspended = false;
         self.passive_copy_failures.clear();
         self.copy_retry_after_ms.clear();
         self.persist_settings();
@@ -3310,8 +3335,6 @@ impl ShellState {
     }
     fn update_litellm_api_key(&mut self, value: String) {
         self.settings.litellm_api_key = value;
-        PASSIVE_COPY_SUSPENDED.store(false, Ordering::Relaxed);
-        self.passive_copy_suspended = false;
         self.passive_copy_failures.clear();
         self.copy_retry_after_ms.clear();
         self.persist_settings();
@@ -3319,12 +3342,15 @@ impl ShellState {
     }
     fn update_interface_llm_model(&mut self, value: String) {
         self.settings.interface_llm_model = value;
-        PASSIVE_COPY_SUSPENDED.store(false, Ordering::Relaxed);
-        self.passive_copy_suspended = false;
         self.passive_copy_failures.clear();
         self.copy_retry_after_ms.clear();
         self.persist_settings();
         self.last_action = "updated interface llm".to_string();
+    }
+    fn update_codex_extra_args(&mut self, value: String) {
+        self.settings.codex_extra_args = value;
+        self.persist_settings();
+        self.last_action = "updated Codex extra args".to_string();
     }
     fn update_notification_delivery(&mut self, mode: NotificationDeliveryMode) {
         apply_notification_delivery_mode(&mut self.settings, mode);
@@ -3930,6 +3956,12 @@ impl ShellState {
         self.refresh_tree_debug("extend_tree_selection");
     }
     fn selected_workspace_rows(&self) -> Vec<BrowserRow> {
+        self.selected_tree_rows_matching(is_workspace_row)
+    }
+    fn selected_tree_drag_rows(&self) -> Vec<BrowserRow> {
+        self.selected_tree_rows_matching(is_tree_drag_source_row)
+    }
+    fn selected_tree_rows_matching(&self, predicate: fn(&BrowserRow) -> bool) -> Vec<BrowserRow> {
         let rows = merged_sidebar_rows(
             self.browser.rows(),
             self.server.remote_machines(),
@@ -3940,15 +3972,17 @@ impl ShellState {
         let selected = rows
             .into_iter()
             .filter(|row| self.selected_tree_paths.contains(&row.full_path))
-            .filter(is_workspace_row)
+            .filter(predicate)
             .collect::<Vec<_>>();
         selected
             .iter()
             .filter(|candidate| {
-                !selected.iter().any(|other| {
-                    other.full_path != candidate.full_path
-                        && workspace_path_contains(&other.full_path, &candidate.full_path)
-                })
+                candidate.kind == BrowserRowKind::Session
+                    || !selected.iter().any(|other| {
+                        other.full_path != candidate.full_path
+                            && other.kind != BrowserRowKind::Session
+                            && workspace_path_contains(&other.full_path, &candidate.full_path)
+                    })
             })
             .cloned()
             .collect()
@@ -4036,7 +4070,7 @@ impl ShellState {
     }
     fn begin_drag(&mut self, row: &BrowserRow, pointer: (f64, f64)) {
         self.pending_tree_drag = None;
-        if !is_workspace_row(row) {
+        if !is_tree_drag_source_row(row) {
             self.drag_paths.clear();
             self.drag_hover_target = None;
             self.drag_pointer = None;
@@ -4050,7 +4084,7 @@ impl ShellState {
             self.browser.select_path(row.full_path.clone());
         }
         self.drag_paths = self
-            .selected_workspace_rows()
+            .selected_tree_drag_rows()
             .into_iter()
             .map(|candidate| candidate.full_path)
             .collect();
@@ -4071,7 +4105,7 @@ impl ShellState {
         self.refresh_tree_debug("begin_drag");
     }
     fn arm_tree_drag(&mut self, row: &BrowserRow, pointer: (f64, f64)) {
-        if !is_workspace_row(row) {
+        if !is_tree_drag_source_row(row) {
             self.pending_tree_drag = None;
             return;
         }
@@ -9222,17 +9256,39 @@ fn spawn_start_group_session(mut state: Signal<ShellState>, row: BrowserRow, kin
     {
         return;
     }
-    let cwd = group_session_cwd(&row);
-    let title_hint = Some(group_session_title_hint(&row, kind));
     let pending = format!(
         "starting {} in {}",
         session_kind_action_label(kind),
         row.label
     );
+    let launch_context = state.with(|shell| group_session_launch_context(shell, &row, kind));
     state.with_mut(|shell| shell.close_context_menu());
-    spawn_server_snapshot_action(state, pending, move |endpoint| {
-        start_local_session_at(&endpoint, kind, cwd.as_deref(), title_hint.as_deref())
-    });
+    match launch_context {
+        TerminalLaunchContext::Local { cwd, title_hint } => {
+            spawn_server_snapshot_action(state, pending, move |endpoint| {
+                if let Some(cwd) = cwd.as_deref() {
+                    ensure_home_scoped_workspace_dir(cwd)?;
+                }
+                start_local_session_at(&endpoint, kind, cwd.as_deref(), title_hint.as_deref())
+            });
+        }
+        TerminalLaunchContext::Remote {
+            ssh_target,
+            prefix,
+            cwd,
+            title_hint,
+        } => {
+            spawn_server_snapshot_action(state, pending, move |endpoint| {
+                start_ssh_session_at(
+                    &endpoint,
+                    &ssh_target,
+                    prefix.as_deref(),
+                    cwd.as_deref(),
+                    title_hint.as_deref(),
+                )
+            });
+        }
+    }
 }
 fn current_new_session_context(
     shell: &ShellState,
@@ -9987,7 +10043,7 @@ struct ActiveCopyRefreshPlan {
 }
 
 fn active_session_copy_refresh_plan(
-    source: SessionSource,
+    _source: SessionSource,
     has_summary: bool,
     should_request_title_generation: bool,
     summary_stale: bool,
@@ -9995,7 +10051,7 @@ fn active_session_copy_refresh_plan(
 ) -> ActiveCopyRefreshPlan {
     let needs_copy = should_request_title_generation || !has_summary;
     let hydrate_copy = !store_copy_hydrated && needs_copy;
-    let allow_focus_time_generation = source != SessionSource::Stored && !hydrate_copy;
+    let allow_focus_time_generation = false;
     ActiveCopyRefreshPlan {
         hydrate_copy,
         request_title_generation: allow_focus_time_generation && should_request_title_generation,
@@ -10745,10 +10801,27 @@ fn titlebar_summary_text(
         .filter(|summary| !looks_like_low_signal_generated_copy(summary))
 }
 fn titlebar_search_dropdown_open(snapshot: &RenderSnapshot) -> bool {
-    (snapshot.command_mode_active || snapshot.search_focused)
-        && !snapshot.titlebar_new_menu_open
-        && !snapshot.titlebar_session_menu_open
-        && !snapshot.titlebar_overflow_menu_open
+    titlebar_search_dropdown_open_flags(
+        snapshot.command_mode_active,
+        snapshot.search_focused,
+        snapshot.search_active,
+        snapshot.titlebar_new_menu_open,
+        snapshot.titlebar_session_menu_open,
+        snapshot.titlebar_overflow_menu_open,
+    )
+}
+fn titlebar_search_dropdown_open_flags(
+    command_mode_active: bool,
+    search_focused: bool,
+    search_active: bool,
+    titlebar_new_menu_open: bool,
+    titlebar_session_menu_open: bool,
+    titlebar_overflow_menu_open: bool,
+) -> bool {
+    (command_mode_active || search_focused || search_active)
+        && !titlebar_new_menu_open
+        && !titlebar_session_menu_open
+        && !titlebar_overflow_menu_open
 }
 fn titlebar_autohide_pinned_flags(
     search_focused: bool,
@@ -11148,6 +11221,30 @@ fn is_preview_scaffold_line(line: &str) -> bool {
         || lower.contains("<turn_aborted>")
         || lower.contains("the user interrupted the previous turn on purpose")
         || lower.contains("any running unified exec processes were terminated")
+        || trimmed.starts_with("Open live terminal")
+        || trimmed.starts_with("Launch command prepared")
+        || trimmed.starts_with("Daemon PTY:")
+        || trimmed.starts_with("Daemon runtime:")
+        || trimmed.starts_with("Target:")
+        || trimmed.starts_with("Command:")
+        || trimmed.starts_with("$ exec ")
+        || trimmed.starts_with("Queue live shell session ")
+        || trimmed.starts_with("Preview mode renders")
+        || trimmed.starts_with("GUI selection asks")
+}
+fn preview_block_is_scaffold_only(block: &SessionPreviewBlock) -> bool {
+    let mut saw_line = false;
+    for line in &block.lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        saw_line = true;
+        if !is_preview_scaffold_line(trimmed) {
+            return false;
+        }
+    }
+    saw_line
 }
 fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlock> {
     if preview_should_hide_stale_placeholder_content(session) {
@@ -11226,7 +11323,14 @@ fn visible_preview_blocks(session: &ManagedSessionView) -> Vec<SessionPreviewBlo
         deduped.push(block);
     }
     let mut visible = deduped;
-    if visible.is_empty() {
+    if visible.is_empty()
+        && !session.preview.blocks.is_empty()
+        && !session
+            .preview
+            .blocks
+            .iter()
+            .all(preview_block_is_scaffold_only)
+    {
         visible = session.preview.blocks.clone();
     }
     if let Ok(mut cache) = preview_block_cache().lock() {
@@ -11812,6 +11916,14 @@ fn filtered_sidebar_rows(rows: &[BrowserRow], query: &str) -> Vec<BrowserRow> {
             }
         }
     }
+    filtered
+}
+fn sidebar_rows_for_render(rows: &[BrowserRow], query: &str) -> Vec<BrowserRow> {
+    let mut filtered = filtered_sidebar_rows(rows, query);
+    if search_terms(query).is_empty() || filtered.len() <= SIDEBAR_SEARCH_RENDER_LIMIT {
+        return filtered;
+    }
+    filtered.truncate(SIDEBAR_SEARCH_RENDER_LIMIT);
     filtered
 }
 fn search_expanded_paths(
@@ -13054,17 +13166,11 @@ fn local_live_session_group_paths(cwd: &str) -> Vec<String> {
 }
 fn synthetic_local_live_session_rows(
     sessions: &[&ManagedSessionView],
-    remote_session_index: &RemoteSessionIndex,
+    _remote_session_index: &RemoteSessionIndex,
 ) -> Vec<BrowserRow> {
     if sessions.is_empty() {
         return Vec::new();
     }
-    let short_ids = unique_session_short_ids_for_pairs(
-        &sessions
-            .iter()
-            .map(|session| (session.session_path.clone(), session.id.clone()))
-            .collect::<Vec<_>>(),
-    );
     let mut ordered_sessions = sessions.to_vec();
     ordered_sessions.sort_by(|a, b| {
         let a_cwd = metadata_value(a, "Cwd");
@@ -13098,28 +13204,6 @@ fn synthetic_local_live_session_rows(
                 session_cwd: (group_path != "local").then_some(group_path.clone()),
             });
         }
-        let label = live_session_label_with_index(remote_session_index, session, &short_ids);
-        let detail_label = live_session_summary_with_index(remote_session_index, session);
-        rows.push(BrowserRow {
-            kind: if session.kind == SessionKind::Document {
-                BrowserRowKind::Document
-            } else {
-                BrowserRowKind::Session
-            },
-            full_path: session.session_path.clone(),
-            label: label.clone(),
-            detail_label,
-            document_kind: (session.kind == SessionKind::Document)
-                .then_some(WorkspaceDocumentKind::Note),
-            group_kind: None,
-            session_title: Some(label),
-            depth: group_paths.len(),
-            host_label: session.host_label.clone(),
-            descendant_sessions: 1,
-            expanded: true,
-            session_id: Some(session.id.clone()),
-            session_cwd: (!cwd.trim().is_empty()).then_some(cwd),
-        });
     }
     rows
 }
@@ -13131,111 +13215,13 @@ fn inject_local_live_session_rows(
     if sessions.is_empty() {
         return stored_rows.to_vec();
     }
-    let existing_paths = stored_rows
+    let has_group_rows = stored_rows
         .iter()
-        .map(|row| row.full_path.clone())
-        .collect::<HashSet<_>>();
-    let short_ids = unique_session_short_ids_for_pairs(
-        &sessions
-            .iter()
-            .map(|session| (session.session_path.clone(), session.id.clone()))
-            .collect::<Vec<_>>(),
-    );
-    let mut rows_by_anchor = BTreeMap::<String, Vec<BrowserRow>>::new();
-    for session in sessions {
-        if existing_paths.contains(&session.session_path) {
-            continue;
-        }
-        let cwd = metadata_value(session, "Cwd");
-        let Some(anchor_path) = local_live_session_anchor_path(stored_rows, &cwd) else {
-            continue;
-        };
-        let label = live_session_label_with_index(remote_session_index, session, &short_ids);
-        let detail_label = live_session_summary_with_index(remote_session_index, session);
-        rows_by_anchor
-            .entry(anchor_path)
-            .or_default()
-            .push(BrowserRow {
-                kind: if session.kind == SessionKind::Document {
-                    BrowserRowKind::Document
-                } else {
-                    BrowserRowKind::Session
-                },
-                full_path: session.session_path.clone(),
-                label: label.clone(),
-                detail_label,
-                document_kind: (session.kind == SessionKind::Document)
-                    .then_some(WorkspaceDocumentKind::Note),
-                group_kind: None,
-                session_title: Some(label),
-                depth: 0,
-                host_label: session.host_label.clone(),
-                descendant_sessions: 1,
-                expanded: true,
-                session_id: Some(session.id.clone()),
-                session_cwd: (!cwd.trim().is_empty()).then_some(cwd),
-            });
+        .any(|row| row.kind == BrowserRowKind::Group);
+    if !has_group_rows {
+        return synthetic_local_live_session_rows(sessions, remote_session_index);
     }
-    if rows_by_anchor.is_empty() {
-        let has_group_rows = stored_rows
-            .iter()
-            .any(|row| row.kind == BrowserRowKind::Group);
-        if !has_group_rows {
-            return synthetic_local_live_session_rows(sessions, remote_session_index);
-        }
-        return stored_rows.to_vec();
-    }
-    let mut rows = Vec::with_capacity(
-        stored_rows.len() + rows_by_anchor.values().map(Vec::len).sum::<usize>(),
-    );
-    for row in stored_rows {
-        rows.push(row.clone());
-        if row.kind != BrowserRowKind::Group || !row.expanded {
-            continue;
-        }
-        let Some(extra_rows) = rows_by_anchor.get(&row.full_path) else {
-            continue;
-        };
-        let child_depth = row.depth + 1;
-        rows.extend(extra_rows.iter().cloned().map(|mut extra| {
-            extra.depth = child_depth;
-            extra
-        }));
-    }
-    rows
-}
-fn local_live_session_anchor_path(stored_rows: &[BrowserRow], cwd: &str) -> Option<String> {
-    let trimmed_cwd = cwd.trim();
-    let mut fallback_local = None::<String>;
-    let mut best_match = None::<(usize, usize, String)>;
-    for row in stored_rows {
-        if row.kind != BrowserRowKind::Group
-            || !row.expanded
-            || row.group_kind == Some(WorkspaceGroupKind::Separator)
-        {
-            continue;
-        }
-        if row.full_path == "local" {
-            fallback_local = Some(row.full_path.clone());
-        }
-        if trimmed_cwd.is_empty() {
-            continue;
-        }
-        if row.full_path == trimmed_cwd
-            || trimmed_cwd
-                .strip_prefix(row.full_path.as_str())
-                .is_some_and(|suffix| suffix.starts_with('/'))
-        {
-            let score = (row.depth, row.full_path.len(), row.full_path.clone());
-            if best_match
-                .as_ref()
-                .is_none_or(|best| score.0 > best.0 || (score.0 == best.0 && score.1 > best.1))
-            {
-                best_match = Some(score);
-            }
-        }
-    }
-    best_match.map(|(_, _, path)| path).or(fallback_local)
+    stored_rows.to_vec()
 }
 fn live_session_label_with_index(
     remote_session_index: &RemoteSessionIndex,
@@ -14365,6 +14351,7 @@ fn queue_new_group_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
             task::spawn_blocking(move || -> Result<(String, yggterm_core::SessionNode)> {
                 let store = SessionStore::open_or_init()?;
                 let virtual_path = new_group_virtual_path_for_row(&row_for_task);
+                let _ = ensure_home_scoped_workspace_dir(&virtual_path)?;
                 store.save_group_with_kind(
                     &virtual_path,
                     Some("New Folder"),
@@ -14384,6 +14371,16 @@ fn queue_new_group_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
                 shell.selected_tree_paths.clear();
                 shell.selected_tree_paths.insert(selected_path.clone());
                 shell.selection_anchor = Some(selected_path.clone());
+                shell.tree_rename_path = Some(selected_path.clone());
+                shell.tree_rename_depth = shell
+                    .browser
+                    .rows()
+                    .iter()
+                    .find(|row| row.full_path == selected_path)
+                    .map(|row| row.depth);
+                shell.tree_rename_value = "New Folder".to_string();
+                shell.tree_rename_started_at_ms = current_millis();
+                shell.tree_rename_input_focused_once = false;
                 shell.sync_browser_settings();
                 shell.server_busy = false;
                 shell.last_action = format!("added folder in {}", row.label);
@@ -14654,7 +14651,7 @@ fn queue_move_selected_items_to_group(
 ) {
     let (selected_rows, selected_source_paths, selected_final_paths, reorder_plan) = {
         let shell = state.read();
-        let selected_rows = shell.selected_workspace_rows();
+        let selected_rows = shell.selected_tree_drag_rows();
         let rows = merged_sidebar_rows(
             shell.browser.rows(),
             shell.server.remote_machines(),
@@ -14739,12 +14736,17 @@ fn queue_move_selected_items_to_group(
         shell.optimistic_drag_target = None;
     });
     let settings = state.read().settings.clone();
+    let selected_rows_for_task = selected_rows.clone();
     spawn(async move {
         let reorder_plan_for_task = reorder_plan.clone();
         let outcome = task::spawn_blocking(
             move || -> Result<(Vec<String>, yggterm_core::SessionNode)> {
                 let store = SessionStore::open_or_init()?;
-                let moved_paths = apply_workspace_reorder_plan(&store, &reorder_plan_for_task)?;
+                let moved_paths = apply_workspace_reorder_plan(
+                    &store,
+                    &reorder_plan_for_task,
+                    &selected_rows_for_task,
+                )?;
                 let browser_tree = store.load_codex_tree(&settings)?;
                 Ok((moved_paths, browser_tree))
             },
@@ -14766,6 +14768,9 @@ fn queue_move_selected_items_to_group(
                     &expanded_paths,
                     selected_final_paths.first().map(String::as_str),
                 );
+                if let Some(path) = selected_final_paths.first() {
+                    shell.browser.ensure_visible_path(path);
+                }
                 shell.selected_tree_paths = selected_final_paths.iter().cloned().collect();
                 if let Some(path) = selected_final_paths.first() {
                     shell.browser.select_path(path.clone());
@@ -15445,7 +15450,7 @@ fn direct_workspace_parent_path(row: &BrowserRow) -> Option<String> {
     }
 }
 fn browser_row_tree_item(row: &BrowserRow) -> Option<TreeReorderItem<BrowserRowKind>> {
-    if !is_workspace_row(row) && !is_drop_target_row(row) {
+    if !is_tree_drag_source_row(row) && !is_drop_target_row(row) {
         return None;
     }
     Some(TreeReorderItem {
@@ -15516,6 +15521,12 @@ fn build_workspace_reorder_plan(
     selected_rows: &[BrowserRow],
     placement: &WorkspaceDropPlacement,
 ) -> Option<Vec<WorkspaceReorderPlanItem>> {
+    if selected_rows
+        .iter()
+        .all(|row| row.kind == BrowserRowKind::Session)
+    {
+        return build_session_drop_plan(rows, selected_rows, placement);
+    }
     let items = rows
         .iter()
         .filter_map(browser_row_tree_item)
@@ -15531,9 +15542,70 @@ fn build_workspace_reorder_plan(
         &unique_workspace_leaf_suffix(),
     )
 }
+fn build_session_drop_plan(
+    rows: &[BrowserRow],
+    selected_rows: &[BrowserRow],
+    placement: &WorkspaceDropPlacement,
+) -> Option<Vec<WorkspaceReorderPlanItem>> {
+    if selected_rows.is_empty() {
+        return Some(Vec::new());
+    }
+    let items = rows
+        .iter()
+        .filter_map(browser_row_tree_item)
+        .collect::<Vec<_>>();
+    let target_parent = match placement {
+        WorkspaceDropPlacement::TopOfGroup(path) => path.clone(),
+        WorkspaceDropPlacement::AfterPath(path) => tree_parent_path(path)?,
+    };
+    let moved = selected_rows
+        .iter()
+        .map(|row| row.full_path.as_str())
+        .collect::<HashSet<_>>();
+    let target_siblings = items
+        .iter()
+        .filter(|item| item.parent_path.as_deref() == Some(target_parent.as_str()))
+        .filter(|item| !moved.contains(item.path.as_str()))
+        .collect::<Vec<_>>();
+    let insert_at = match placement {
+        WorkspaceDropPlacement::TopOfGroup(_) => 0,
+        WorkspaceDropPlacement::AfterPath(anchor) => {
+            target_siblings
+                .iter()
+                .take_while(|item| item.path != *anchor)
+                .count()
+                + usize::from(!moved.contains(anchor.as_str()))
+        }
+    };
+    let temp_token = unique_workspace_leaf_suffix();
+    Some(
+        selected_rows
+            .iter()
+            .enumerate()
+            .map(|(offset, row)| {
+                let leaf = canonical_tree_leaf_name(&row.full_path);
+                let final_path = join_tree_child_path(
+                    &target_parent,
+                    &format!("{:04}-{leaf}", insert_at + offset),
+                );
+                let temp_path = join_tree_child_path(
+                    &target_parent,
+                    &format!("__yggtmp-{temp_token}-{:04}-{leaf}", offset),
+                );
+                WorkspaceReorderPlanItem {
+                    kind: BrowserRowKind::Session,
+                    from_path: row.full_path.clone(),
+                    temp_path,
+                    final_path,
+                }
+            })
+            .collect(),
+    )
+}
 fn apply_workspace_reorder_plan(
     store: &SessionStore,
     plan: &[WorkspaceReorderPlanItem],
+    selected_rows: &[BrowserRow],
 ) -> Result<Vec<String>> {
     for item in plan {
         match item.kind {
@@ -15546,6 +15618,10 @@ fn apply_workspace_reorder_plan(
             BrowserRowKind::Session => {}
         }
     }
+    let selected_by_path = selected_rows
+        .iter()
+        .map(|row| (row.full_path.as_str(), row))
+        .collect::<HashMap<_, _>>();
     let mut moved_paths = Vec::new();
     for item in plan {
         match item.kind {
@@ -15557,10 +15633,30 @@ fn apply_workspace_reorder_plan(
                 let group = store.move_group(&item.temp_path, &item.final_path)?;
                 moved_paths.push(group.virtual_path);
             }
-            BrowserRowKind::Session => {}
+            BrowserRowKind::Session => {
+                let Some(row) = selected_by_path.get(item.from_path.as_str()).copied() else {
+                    continue;
+                };
+                let document = store.save_document_input(
+                    &item.final_path,
+                    WorkspaceDocumentInput {
+                        title: Some(row.label.clone()),
+                        kind: WorkspaceDocumentKind::TerminalRecipe,
+                        body: session_recipe_template(row),
+                        source_session_path: Some(row.full_path.clone()),
+                        source_session_kind: Some(inferred_session_kind_name(row).to_string()),
+                        source_session_cwd: row.session_cwd.clone(),
+                        replay_commands: initial_replay_commands_for_row(row),
+                    },
+                )?;
+                moved_paths.push(document.virtual_path);
+            }
         }
     }
     Ok(moved_paths)
+}
+fn is_tree_drag_source_row(row: &BrowserRow) -> bool {
+    is_workspace_row(row) || row.kind == BrowserRowKind::Session
 }
 fn is_workspace_row(row: &BrowserRow) -> bool {
     match row.kind {
@@ -15599,6 +15695,9 @@ fn valid_drop_target(drag_paths: &[String], target_row: &BrowserRow) -> bool {
         return false;
     };
     valid_tree_drop_target(drag_paths, &item)
+}
+fn context_menu_allows_rename(row: &BrowserRow) -> bool {
+    row.kind == BrowserRowKind::Session || is_workspace_row(row)
 }
 fn context_menu_placement(
     position: (f64, f64),
@@ -15657,6 +15756,35 @@ fn group_session_cwd(row: &BrowserRow) -> Option<String> {
     }
     Some(row.full_path.clone())
 }
+fn remote_folder_cwd(row: &BrowserRow) -> Option<String> {
+    let rest = row.full_path.strip_prefix("__remote_folder__/")?;
+    let (_, cwd) = rest.split_once('/')?;
+    Some(format!("/{cwd}"))
+}
+fn home_scoped_workspace_path(path: &str) -> Option<PathBuf> {
+    let trimmed = path.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with("__")
+        || trimmed.starts_with("remote-session://")
+        || trimmed.starts_with("ssh://")
+    {
+        return None;
+    }
+    let path = PathBuf::from(trimmed);
+    if !path.is_absolute() {
+        return None;
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    path.starts_with(home).then_some(path)
+}
+fn ensure_home_scoped_workspace_dir(path: &str) -> Result<bool> {
+    let Some(path) = home_scoped_workspace_path(path) else {
+        return Ok(false);
+    };
+    fs::create_dir_all(&path)
+        .with_context(|| format!("failed to create workspace cwd {}", path.display()))?;
+    Ok(true)
+}
 fn group_session_title_hint(row: &BrowserRow, kind: SessionKind) -> String {
     let suffix = match kind {
         SessionKind::Codex => "codex",
@@ -15666,6 +15794,30 @@ fn group_session_title_hint(row: &BrowserRow, kind: SessionKind) -> String {
         SessionKind::Document => "document",
     };
     format!("{} {}", row.label, suffix)
+}
+fn group_session_launch_context(
+    shell: &ShellState,
+    row: &BrowserRow,
+    kind: SessionKind,
+) -> TerminalLaunchContext {
+    let title_hint = Some(group_session_title_hint(row, kind));
+    if let Some(machine) = remote_machine_for_sidebar_row(shell, row) {
+        let cwd = row
+            .session_cwd
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| remote_folder_cwd(row));
+        return TerminalLaunchContext::Remote {
+            ssh_target: machine.ssh_target.clone(),
+            prefix: machine.prefix.clone(),
+            cwd,
+            title_hint,
+        };
+    }
+    TerminalLaunchContext::Local {
+        cwd: group_session_cwd(row),
+        title_hint,
+    }
 }
 fn document_parent_base(row: &BrowserRow) -> Option<String> {
     let normalize_legacy_parent = |path: String| {
@@ -15966,6 +16118,15 @@ fn current_selected_sidebar_row(shell: &ShellState) -> Option<BrowserRow> {
         &shell.selected_tree_paths,
         shell.selection_anchor.as_deref(),
         snapshot.selected_path.as_deref(),
+    )
+}
+fn explicit_selected_sidebar_row(shell: &ShellState) -> Option<BrowserRow> {
+    let snapshot = shell.snapshot();
+    selected_sidebar_row_from_rows(
+        &snapshot.rows,
+        &shell.selected_tree_paths,
+        shell.selection_anchor.as_deref(),
+        None,
     )
 }
 fn remote_machine_for_sidebar_row<'a>(
@@ -16466,6 +16627,7 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
                 "detail_label": row.detail_label,
                 "session_title": row.session_title,
                 "kind": format!("{:?}", row.kind),
+                "document_kind": row.document_kind.map(|document_kind| format!("{document_kind:?}")),
                 "group_kind": row.group_kind.map(|group_kind| format!("{group_kind:?}")),
                 "depth": row.depth,
                 "host_label": row.host_label,
@@ -16477,7 +16639,7 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
                 "busy": busy,
                 "icon_kind": if busy { Some("busy") } else { Some(tree_icon_kind(row)) },
                 "icon_text": if busy { None::<&str> } else { tree_icon_glyph(row) },
-                "draggable": is_workspace_row(row),
+                "draggable": is_tree_drag_source_row(row),
                 "drop_target_row": is_drop_target_row(row),
                 "machine_key": machine.as_ref().map(|machine| machine.machine_key.clone()),
                 "machine_health": machine.as_ref().map(|machine| {
@@ -16635,7 +16797,7 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                 || null;
             const titlebarSummary = titlebar?.querySelector('[data-titlebar-summary-body="1"]') || null;
             const titlebarSummaryMenu = titlebar?.querySelector('[data-titlebar-summary-menu="1"]') || null;
-            const titlebarSummaryRegenerateSummary = titlebarSummaryMenu?.querySelector('[data-titlebar-summary-action="summary"]') || null;
+            const titlebarSummaryRegenerateSummary = titlebarSummaryMenu?.querySelector('[data-titlebar-summary-action="copy"], [data-titlebar-summary-action="summary"]') || null;
             const titlebarNewMenuOuter = titlebar?.querySelector('[data-titlebar-new-menu="1"]') || null;
             const titlebarNewMenu = titlebarNewMenuOuter?.querySelector('[data-titlebar-new-menu-shell="1"]')
                 || titlebarNewMenuOuter
@@ -16658,6 +16820,7 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
             const titlebarSearchDropdown = titlebar?.querySelector('[data-titlebar-search-dropdown="1"]') || null;
             const titlebarSearchDropdownHeader = titlebarSearchDropdown?.querySelector('[data-titlebar-search-dropdown-header="1"]') || null;
             const titlebarSearchDropdownEntries = Array.from(titlebarSearchDropdown?.querySelectorAll('[data-titlebar-search-dropdown-entry="1"]') || []);
+            const titlebarSearchCounter = titlebar?.querySelector('[data-titlebar-search-counter="1"]') || null;
             const titlebarRightGroup = titlebar?.querySelector('[data-yggterm-titlebar-right="1"]') || null;
             const titlebarConnectButton = titlebar?.querySelector('[data-titlebar-connect-button="1"]') || null;
             const titlebarNotificationsButton = titlebar?.querySelector('[data-titlebar-notifications-button="1"]') || null;
@@ -16751,6 +16914,7 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                         machine_health: String(row.getAttribute('data-machine-health') || '').trim() || null,
                         machine_indicator_color: indicatorStyle ? indicatorStyle.backgroundColor : null,
                         selected: row.getAttribute('data-selected') === 'true',
+                        draggable: row.getAttribute('data-sidebar-row-draggable') === 'true',
                         live_member: row.getAttribute('data-sidebar-live-session-member') === 'true',
                         drop_target: row.getAttribute('data-drop-target'),
                         icon_text: String(icon?.textContent || '').trim(),
@@ -16971,7 +17135,17 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     : 4.5;
                 let minContrast = null;
                 const lowContrastSamples = [];
-                for (const node of Array.from(rowsLayer.querySelectorAll('div, span'))) {
+                let inspected = 0;
+                const candidateRows = Array.from(rowsLayer.children || [])
+                    .filter((node) => String(node.tagName || '').toLowerCase() === 'div')
+                    .slice(0, 120);
+                for (const row of candidateRows) {
+                    const rowSpans = Array.from(row.querySelectorAll('span')).slice(0, 16);
+                    for (const node of [row, ...rowSpans]) {
+                    inspected += 1;
+                    if (inspected > 512) {
+                        break;
+                    }
                     const text = String(node.textContent || '').replace(/\s+/g, ' ').trim();
                     const className = String(node.className || '');
                     if (className.includes('xterm-cursor')) {
@@ -17012,6 +17186,10 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                         break;
                     }
                 }
+                    if (inspected > 512 || lowContrastSamples.length >= 8) {
+                        break;
+                    }
+                }
                 return {
                     low_contrast_count: lowContrastSamples.length,
                     min_contrast: minContrast,
@@ -17033,7 +17211,7 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     : 4.5;
                 let minContrast = null;
                 const lowContrastSamples = [];
-                for (const node of rowBlocks) {
+                for (const node of rowBlocks.slice(0, 120)) {
                     const text = String(node.textContent || '').replace(/\s+/g, ' ').trim();
                     if (!text) {
                         continue;
@@ -17168,9 +17346,20 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                 const viewportStyle = viewport ? window.getComputedStyle(viewport) : null;
                 const rowsLayer = host.querySelector('.xterm-rows');
                 const rowsStyle = rowsLayer ? window.getComputedStyle(rowsLayer) : null;
-                const rowBlocks = rowsLayer ? Array.from(rowsLayer.querySelectorAll('div')) : [];
+                const directRowBlocks = rowsLayer
+                    ? Array.from(rowsLayer.children || [])
+                        .filter((node) => String(node.tagName || '').toLowerCase() === 'div')
+                    : [];
+                const rowBlocks = (
+                    directRowBlocks.length > 0
+                        ? directRowBlocks
+                        : rowsLayer
+                            ? Array.from(rowsLayer.querySelectorAll('div'))
+                            : []
+                ).slice(0, 160);
                 const visibleGlyphSpans = rowsLayer
-                    ? Array.from(rowsLayer.querySelectorAll('span'))
+                    ? rowBlocks.flatMap((row) => Array.from(row.querySelectorAll('span')).slice(0, 16))
+                        .slice(0, 512)
                         .filter((node) => !String(node.className || '').includes('xterm-cursor'))
                         .filter((node) => String(node.textContent || '').replace(/\s+/g, ' ').trim().length > 0)
                     : [];
@@ -17188,7 +17377,8 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                 const rowsRect = rowsLayer ? rowsLayer.getBoundingClientRect() : null;
                 const rowSampleRect = rowSample ? rowSample.getBoundingClientRect() : null;
                 const dimSampleCandidates = rowsLayer
-                    ? Array.from(rowsLayer.querySelectorAll('.xterm-dim, span[style*="opacity: 0"], span[style*="opacity:0"]'))
+                    ? rowBlocks.flatMap((row) => Array.from(row.querySelectorAll('.xterm-dim, span[style*="opacity: 0"], span[style*="opacity:0"]')).slice(0, 8))
+                        .slice(0, 128)
                         .filter((node) => !String(node.className || '').includes('xterm-cursor'))
                     : [];
                 const dimSample = dimSampleCandidates.find((node) => {
@@ -17944,6 +18134,8 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                 titlebar_search_dropdown_border_top_width: titlebarSearchDropdown ? String(window.getComputedStyle(titlebarSearchDropdown).borderTopWidth || '') : null,
                 titlebar_search_dropdown_header_rect: rectSummary(titlebarSearchDropdownHeader),
                 titlebar_search_dropdown_entry_rects: titlebarSearchDropdownEntries.slice(0, 8).map((node) => rectSummary(node)).filter(Boolean),
+                titlebar_search_counter_rect: rectSummary(titlebarSearchCounter),
+                titlebar_search_counter_text: String(titlebarSearchCounter?.textContent || '').trim(),
                 titlebar_new_button_rect: rectSummary(titlebarNewButton),
                 titlebar_new_button_count: titlebarNewButtons.length,
                 titlebar_new_button_visible_count: visibleNodes(titlebarNewButtons).length,
@@ -18192,6 +18384,7 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         depth: Number(row.getAttribute('data-sidebar-row-depth') || '0'),
                         detail_label: String(row.getAttribute('data-sidebar-row-detail') || '').trim(),
                         selected: row.getAttribute('data-selected') === 'true',
+                        draggable: row.getAttribute('data-sidebar-row-draggable') === 'true',
                         live_member: row.getAttribute('data-sidebar-live-session-member') === 'true',
                         left: Math.round(rect.left),
                         top: Math.round(rect.top),
@@ -18233,6 +18426,9 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                 || null;
             const contextMenuRenameSession =
                 contextMenu?.querySelector('[data-context-menu-action="rename-session"]') || null;
+            const contextMenuActions = Array.from(
+                contextMenu?.querySelectorAll('[data-context-menu-action]') || []
+            );
             const deleteConfirmOverlay = rootNode?.querySelector('[data-delete-confirm-overlay="1"]')
                 || document.querySelector('[data-delete-confirm-overlay="1"]')
                 || null;
@@ -18270,10 +18466,17 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                 || rootNode?.querySelector('[data-titlebar-root="1"]')
                 || document.querySelector('[data-titlebar-root="1"]')
                 || null;
+            const titlebarSearchOuterShell = titlebar?.querySelector('[data-yggterm-titlebar-search="1"]') || null;
             const titlebarSearchShell = titlebar?.querySelector('[data-titlebar-search-modal="1"]')
-                || titlebar?.querySelector('[data-yggterm-titlebar-search="1"]')
+                || titlebarSearchOuterShell
                 || titlebar?.querySelector('[data-titlebar-search-shell="1"]')
                 || null;
+            const titlebarSearchFieldShell = titlebar?.querySelector('[data-titlebar-search-field-shell="1"]') || null;
+            const titlebarSearchInput = titlebar?.querySelector('#yggterm-search-input') || null;
+            const titlebarSearchDropdown = titlebar?.querySelector('[data-titlebar-search-dropdown="1"]') || null;
+            const titlebarSearchDropdownHeader = titlebarSearchDropdown?.querySelector('[data-titlebar-search-dropdown-header="1"]') || null;
+            const titlebarSearchDropdownEntries = Array.from(titlebarSearchDropdown?.querySelectorAll('[data-titlebar-search-dropdown-entry="1"]') || []);
+            const titlebarSearchCounter = titlebar?.querySelector('[data-titlebar-search-counter="1"]') || null;
             const titlebarNewMenuShell = titlebar?.querySelector('[data-titlebar-new-menu-shell="1"]') || null;
             const titlebarSessionShell = titlebar?.querySelector('[data-titlebar-session-path]')
                 || titlebar?.querySelector('[data-titlebar-session-shell="1"]')
@@ -18408,6 +18611,7 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                             width: Number(cursorSampleRect.width.toFixed(2)),
                             height: Number(cursorSampleRect.height.toFixed(2)),
                         } : null),
+                        cursor_line_text: cursorLineText,
                         cursor_row_text: cursorLineText,
                         cursor_row_rect: rectSummary(cursorRowNode) || (cursorRowRect ? {
                             left: Number(cursorRowRect.left.toFixed(2)),
@@ -18460,6 +18664,10 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                 sidebar_visible_row_count: visibleSidebarRows.length,
                 sidebar_visible_rows: visibleSidebarRows,
                 context_menu_rect: rectSummary(contextMenu),
+                context_menu_action_rects: contextMenuActions.slice(0, 12).map((node) => ({
+                    action: String(node.getAttribute('data-context-menu-action') || ''),
+                    rect: rectSummary(node),
+                })).filter((entry) => Boolean(entry.rect)),
                 context_menu_rename_session_rect: rectSummary(contextMenuRenameSession),
                 delete_confirm_overlay_rect: rectSummary(deleteConfirmOverlay),
                 delete_confirm_dialog_rect: rectSummary(deleteConfirmDialog),
@@ -18471,6 +18679,7 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                     tag_name: String(activeElement.tagName || '').toLowerCase(),
                     id: String(activeElement.id || '').trim(),
                     class_name: String(activeElement.className || '').trim(),
+                    value: 'value' in activeElement ? String(activeElement.value || '') : '',
                     data_tree_rename_input: activeElement.getAttribute
                         ? String(activeElement.getAttribute('data-tree-rename-input') || '').trim()
                         : '',
@@ -18487,6 +18696,13 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                 titlebar_count: titlebars.length,
                 titlebar_rect: rectSummary(titlebar),
                 titlebar_search_shell_rect: rectSummary(titlebarSearchShell),
+                titlebar_search_outer_shell_rect: rectSummary(titlebarSearchOuterShell),
+                titlebar_search_field_shell_rect: rectSummary(titlebarSearchFieldShell),
+                titlebar_search_input_rect: rectSummary(titlebarSearchInput),
+                titlebar_search_dropdown_rect: rectSummary(titlebarSearchDropdown),
+                titlebar_search_dropdown_header_rect: rectSummary(titlebarSearchDropdownHeader),
+                titlebar_search_dropdown_entry_rects: titlebarSearchDropdownEntries.slice(0, 8).map((node) => rectSummary(node)).filter(Boolean),
+                titlebar_search_counter_text: String(titlebarSearchCounter?.textContent || '').trim(),
                 titlebar_new_menu_shell_rect: rectSummary(titlebarNewMenuShell),
                 titlebar_session_shell_rect: rectSummary(titlebarSessionShell),
                 titlebar_right_rect: rectSummary(titlebarRightGroup),
@@ -19992,7 +20208,7 @@ async fn process_pending_app_control_requests(
                 let maybe_row = state.with(|shell| resolve_app_control_row(shell, &row_path));
                 match maybe_row {
                     Some(row) => {
-                        if !is_workspace_row(&row) {
+                        if !is_tree_drag_source_row(&row) {
                             AppControlResponse {
                                 request_id: request.request_id.clone(),
                                 handled_by_pid: std::process::id(),
@@ -22745,6 +22961,7 @@ fn app() -> Element {
         let rename_path = state.read().tree_rename_path.clone();
         let rename_depth = state.read().tree_rename_depth;
         let rename_started_at_ms = state.read().tree_rename_started_at_ms;
+        let rename_initial_value = state.read().tree_rename_value.clone();
         match rename_path {
             Some(rename_path) => {
                 if *last_tree_rename_focus_path.read() == Some(rename_path.clone()) {
@@ -22767,6 +22984,10 @@ fn app() -> Element {
                         Ok(value) => value,
                         Err(_) => return,
                     };
+                    let initial_value_literal = match serde_json::to_string(&rename_initial_value) {
+                        Ok(value) => value,
+                        Err(_) => return,
+                    };
                     let depth_selector = rename_depth
                         .map(|depth| format!(r#"[data-tree-rename-row-depth="{depth}"]"#))
                         .unwrap_or_default();
@@ -22778,6 +22999,8 @@ fn app() -> Element {
                             r#"(function() {{
                                 const renamePath = {path_literal};
                                 const renameToken = {rename_token};
+                                const initialValue = {initial_value_literal};
+                                const renameStartedAtMs = Number({rename_started_at_ms});
                                 if (window.__yggtermTreeRenameSelectToken === renameToken) {{
                                     return;
                                 }}
@@ -22794,8 +23017,16 @@ fn app() -> Element {
                                 }}
                                 try {{
                                     input.focus({{ preventScroll: true }});
-                                    if (input.select) {{
+                                    const currentValue = String(input.value || '');
+                                    const shouldSelect =
+                                        currentValue === initialValue
+                                        && (Date.now() - renameStartedAtMs) <= 320
+                                        && document.activeElement === input;
+                                    if (shouldSelect && input.select) {{
                                         input.select();
+                                    }} else if (typeof input.setSelectionRange === 'function') {{
+                                        const valueLength = Number(input.value ? input.value.length : 0);
+                                        input.setSelectionRange(valueLength, valueLength);
                                     }}
                                     window.__yggtermTreeRenameSelectToken = renameToken;
                                     input.setAttribute('data-tree-rename-selected-token', renameToken);
@@ -23378,6 +23609,8 @@ fn app() -> Element {
                             },
                             on_refresh_summary: move |_| {
                             if let Some(session) = state.read().server.active_session().cloned() {
+                                queue_active_session_title_generation(state, true);
+                                spawn_precis_generation(state, session.clone(), true);
                                 spawn_summary_generation(state, session, true, true);
                             }
                             },
@@ -23648,6 +23881,7 @@ fn app() -> Element {
                             on_endpoint_change: move |value: String| state.with_mut(|shell| shell.update_litellm_endpoint(value)),
                             on_api_key_change: move |value: String| state.with_mut(|shell| shell.update_litellm_api_key(value)),
                             on_model_change: move |value: String| state.with_mut(|shell| shell.update_interface_llm_model(value)),
+                            on_codex_extra_args_change: move |value: String| state.with_mut(|shell| shell.update_codex_extra_args(value)),
                             on_focus_input: move |field_key: String| {
                                 focus_settings_field(state, &field_key);
                             },
@@ -23756,6 +23990,30 @@ fn app() -> Element {
                                 state.with_mut(|shell| shell.close_context_menu());
                                 queue_session_recipe_creation(state, row.clone());
                             }
+                        },
+                        on_regenerate_title: {
+                            let row = row.clone();
+                            move |_| spawn_selected_copy_regeneration(
+                                state,
+                                row.clone(),
+                                CopyRegenerationMode::Title,
+                            )
+                        },
+                        on_regenerate_summary: {
+                            let row = row.clone();
+                            move |_| spawn_selected_copy_regeneration(
+                                state,
+                                row.clone(),
+                                CopyRegenerationMode::Summary,
+                            )
+                        },
+                        on_regenerate_copy: {
+                            let row = row.clone();
+                            move |_| spawn_selected_copy_regeneration(
+                                state,
+                                row.clone(),
+                                CopyRegenerationMode::Copy,
+                            )
                         },
                         on_rename_session: {
                             let row = row.clone();
@@ -23921,6 +24179,18 @@ fn Titlebar(
         "/ Run a yggterm command"
     } else {
         "Search live sessions or type '/' for commands"
+    };
+    let search_content_controls_enabled = !snapshot.search_content_hits.is_empty();
+    let search_counter_label = if search_content_controls_enabled {
+        if let Some(ix) = snapshot.search_content_hit_index {
+            format!("{}/{}", ix + 1, snapshot.search_content_hits.len())
+        } else {
+            format!("0/{}", snapshot.search_content_hits.len())
+        }
+    } else if !snapshot.search_sidebar_matches.is_empty() {
+        format!("{} rows", snapshot.search_sidebar_matches.len())
+    } else {
+        "0 hits".to_string()
     };
     let search_dropdown_hint = if snapshot.search_active {
         if snapshot.search_sidebar_matches.is_empty() {
@@ -24319,8 +24589,8 @@ fn Titlebar(
                                                 "{active_title}"
                                             }
                                             button {
-                                                "data-titlebar-summary-action": "summary",
-                                                title: "Regenerate summary",
+                                                "data-titlebar-summary-action": "copy",
+                                                title: "Regenerate title and summary",
                                                 style: titlebar_modal_icon_button_style(snapshot.palette),
                                                 onmousedown: |evt| {
                                                     evt.prevent_default();
@@ -24422,25 +24692,24 @@ fn Titlebar(
                                             WorkspaceViewMode::Rendered | WorkspaceViewMode::Terminal
                                         )
                                     {
-                                        button {
-                                            title: "Previous search hit",
-                                            style: chip_style(snapshot.palette, false),
-                                            onclick: move |_| on_prev_search_content.call(()),
-                                            "↑"
-                                        }
-                                        button {
-                                            title: "Next search hit",
-                                            style: chip_style(snapshot.palette, false),
-                                            onclick: move |_| on_next_search_content.call(()),
-                                            "↓"
+                                        if search_content_controls_enabled {
+                                            button {
+                                                title: "Previous search hit",
+                                                style: chip_style(snapshot.palette, false),
+                                                onclick: move |_| on_prev_search_content.call(()),
+                                                "↑"
+                                            }
+                                            button {
+                                                title: "Next search hit",
+                                                style: chip_style(snapshot.palette, false),
+                                                onclick: move |_| on_next_search_content.call(()),
+                                                "↓"
+                                            }
                                         }
                                         div {
+                                            "data-titlebar-search-counter": "1",
                                             style: format!("font-size:11px; color:{}; min-width:62px; text-align:right;", snapshot.palette.muted),
-                                            if let Some(ix) = snapshot.search_content_hit_index {
-                                                {format!("{}/{}", ix + 1, snapshot.search_content_hits.len())}
-                                            } else {
-                                                "0/0"
-                                            }
+                                            "{search_counter_label}"
                                         }
                                     }
                                 }
@@ -25546,7 +25815,7 @@ fn SidebarRow(
     on_end_drag: EventHandler<()>,
 ) -> Element {
     let indent = row.depth * 12 + 12;
-    let draggable = is_workspace_row(&row);
+    let draggable = is_tree_drag_source_row(&row);
     let row_kind_label = format!("{:?}", row.kind);
     let drop_hovered = drop_target.is_some();
     let top_line = drop_target == Some(DragDropPlacement::Before);
@@ -25563,6 +25832,7 @@ fn SidebarRow(
                 "data-sidebar-row-kind": "Separator",
                 "data-sidebar-row-label": "{row.label}",
                 "data-sidebar-row-depth": "{row.depth}",
+                "data-sidebar-row-draggable": if draggable { "true" } else { "false" },
                 tabindex: if selected { "0" } else { "-1" },
                 "data-selected": if selected { "true" } else { "false" },
                 "data-drop-target": match drop_target {
@@ -25742,6 +26012,7 @@ fn SidebarRow(
             "data-sidebar-row-label": "{visible_label}",
             "data-sidebar-row-detail": "{row.detail_label}",
             "data-sidebar-row-depth": "{row.depth}",
+            "data-sidebar-row-draggable": if draggable { "true" } else { "false" },
             "data-sidebar-live-session-member": if show_live_close { "true" } else { "false" },
             tabindex: if selected { "0" } else { "-1" },
             "data-machine-health": if let Some(health) = machine_health {
@@ -33165,21 +33436,62 @@ fn focus_settings_field_by_key(field_key: &str) {
     clear_sidebar_keyboard_owner();
     let _ = document::eval(&focus_settings_field_by_key_script(field_key));
 }
-fn focus_search_input(select_all: bool) {
-    clear_sidebar_keyboard_owner();
-    let _ = document::eval(&format!(
+fn focus_search_input_script(select_all: bool) -> String {
+    format!(
         r#"
         (() => {{
           const selectAll = {select_all};
+          const claimFocus = () => {{
+            try {{
+              const claimUntil = Date.now() + 2200;
+              window.__yggtermUiFocusClaimUntilMs = Math.max(
+                Number(window.__yggtermUiFocusClaimUntilMs || 0),
+                claimUntil
+              );
+            }} catch (_error) {{}}
+          }};
+          const bindFocusClaim = (input) => {{
+            try {{
+              if (!input || input.getAttribute('data-yggterm-search-focus-claim-bound') === '1') {{
+                return;
+              }}
+              input.setAttribute('data-yggterm-search-focus-claim-bound', '1');
+              input.addEventListener('focus', claimFocus, true);
+              input.addEventListener('input', claimFocus, true);
+              input.addEventListener('keydown', claimFocus, true);
+              input.addEventListener('mousedown', claimFocus, true);
+              input.addEventListener('pointerdown', claimFocus, true);
+            }} catch (_error) {{}}
+          }};
+          claimFocus();
+          const startedAt = (window.performance && window.performance.now)
+            ? window.performance.now()
+            : Date.now();
+          let initialValue = null;
           const runFocus = () => {{
             const input = document.getElementById({SEARCH_INPUT_ID:?});
             if (!input || typeof input.focus !== 'function') {{
               return false;
             }}
+            bindFocusClaim(input);
+            claimFocus();
+            if (initialValue === null) {{
+              initialValue = String(input.value || '');
+            }}
             input.focus({{ preventScroll: true }});
             if (selectAll) {{
-              if (typeof input.select === 'function') {{
+              const now = (window.performance && window.performance.now)
+                ? window.performance.now()
+                : Date.now();
+              if (
+                typeof input.select === 'function'
+                && String(input.value || '') === initialValue
+                && now - startedAt < 320
+              ) {{
                 input.select();
+              }} else if (typeof input.setSelectionRange === 'function') {{
+                const valueLength = Number(input.value ? input.value.length : 0);
+                input.setSelectionRange(valueLength, valueLength);
               }}
             }} else if (typeof input.setSelectionRange === 'function') {{
               const valueLength = Number(input.value ? input.value.length : 0);
@@ -33197,7 +33509,11 @@ fn focus_search_input(select_all: bool) {
           window.setTimeout(runFocus, 220);
         }})();
         "#,
-    ));
+    )
+}
+fn focus_search_input(select_all: bool) {
+    clear_sidebar_keyboard_owner();
+    let _ = document::eval(&focus_search_input_script(select_all));
 }
 fn terminal_should_accept_input(
     active_view_mode: WorkspaceViewMode,
@@ -36154,6 +36470,7 @@ fn RightRail(
     on_endpoint_change: EventHandler<String>,
     on_api_key_change: EventHandler<String>,
     on_model_change: EventHandler<String>,
+    on_codex_extra_args_change: EventHandler<String>,
     on_focus_input: EventHandler<String>,
     on_blur_input: EventHandler<()>,
     on_set_ui_theme: EventHandler<UiTheme>,
@@ -36201,6 +36518,7 @@ fn RightRail(
                     on_endpoint_change,
                     on_api_key_change,
                     on_model_change,
+                    on_codex_extra_args_change,
                     on_focus_input,
                     on_blur_input,
                     on_set_ui_theme,
@@ -36269,6 +36587,7 @@ fn SettingsRailBody(
     on_endpoint_change: EventHandler<String>,
     on_api_key_change: EventHandler<String>,
     on_model_change: EventHandler<String>,
+    on_codex_extra_args_change: EventHandler<String>,
     on_focus_input: EventHandler<String>,
     on_blur_input: EventHandler<()>,
     on_set_ui_theme: EventHandler<UiTheme>,
@@ -36363,9 +36682,25 @@ fn SettingsRailBody(
                 secret: false,
                 autofocus: false,
                 palette: snapshot.palette,
+                on_focus_input: on_focus_input.clone(),
+                on_blur_input: on_blur_input.clone(),
+                on_change: on_model_change,
+            }
+            SettingsField {
+                field_key: "codex-extra-args".to_string(),
+                label: "Codex Extra Args".to_string(),
+                value: snapshot.settings.codex_extra_args.clone(),
+                placeholder: "-s danger-full-access".to_string(),
+                secret: false,
+                autofocus: false,
+                palette: snapshot.palette,
                 on_focus_input: on_focus_input,
                 on_blur_input: on_blur_input,
-                on_change: on_model_change,
+                on_change: on_codex_extra_args_change,
+            }
+            div {
+                style: format!("font-size:11px; line-height:1.45; color:{}; margin-top:-6px;", snapshot.palette.muted),
+                "Optional advanced CLI flags appended to new and resumed Codex sessions. Example: -s danger-full-access"
             }
             ThemeSettingsSection {
                 palette: snapshot.palette,
@@ -36670,6 +37005,9 @@ fn ContextMenuOverlay(
     on_move_selected_document_here: EventHandler<MouseEvent>,
     on_create_note: EventHandler<MouseEvent>,
     on_create_recipe: EventHandler<MouseEvent>,
+    on_regenerate_title: EventHandler<MouseEvent>,
+    on_regenerate_summary: EventHandler<MouseEvent>,
+    on_regenerate_copy: EventHandler<MouseEvent>,
     on_rename_session: EventHandler<MouseEvent>,
     on_refresh_remote_machine: EventHandler<MouseEvent>,
     on_remove_ssh_target: EventHandler<MouseEvent>,
@@ -36681,7 +37019,7 @@ fn ContextMenuOverlay(
     let drag_paths = if selected_tree_paths.is_empty() {
         selected_row
             .as_ref()
-            .filter(|selected| is_workspace_row(selected))
+            .filter(|selected| is_tree_drag_source_row(selected))
             .map(|selected| vec![selected.full_path.clone()])
             .unwrap_or_default()
     } else {
@@ -36693,6 +37031,8 @@ fn ContextMenuOverlay(
             row.kind,
             BrowserRowKind::Group | BrowserRowKind::Document | BrowserRowKind::Separator
         );
+    let can_rename = context_menu_allows_rename(&row);
+    let can_regenerate_copy = matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Group);
     let selected_count = drag_paths.len().max(1);
     let menu_title = if selected_count > 1 && drag_paths.iter().any(|path| path == &row.full_path) {
         format!("{selected_count} selected items")
@@ -36719,6 +37059,25 @@ fn ContextMenuOverlay(
                 div {
                     style: format!("padding:6px 12px 8px 12px; font-size:11px; font-weight:700; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.muted),
                     "{menu_title}"
+                }
+                if can_rename {
+                    button {
+                        "data-context-menu-action": "rename-session",
+                        class: "yggterm-menu-item",
+                        style: context_menu_action_style(palette, false),
+                        onmousedown: |evt| {
+                            evt.stop_propagation();
+                        },
+                        onclick: move |evt| {
+                            evt.stop_propagation();
+                            on_rename_session.call(evt);
+                        },
+                        if row.kind == BrowserRowKind::Session {
+                            "Rename Session"
+                        } else {
+                            "Rename"
+                        }
+                    }
                 }
                 if is_remote_machine_group_row(&row) {
                     button {
@@ -36838,7 +37197,7 @@ fn ContextMenuOverlay(
                     }
                 } else if row.kind == BrowserRowKind::Session {
                     button {
-                        "data-context-menu-action": "rename-session",
+                        "data-context-menu-action": "regenerate-copy",
                         class: "yggterm-menu-item",
                         style: context_menu_action_style(palette, false),
                         onmousedown: |evt| {
@@ -36846,9 +37205,9 @@ fn ContextMenuOverlay(
                         },
                         onclick: move |evt| {
                             evt.stop_propagation();
-                            on_rename_session.call(evt);
+                            on_regenerate_copy.call(evt);
                         },
-                        "Rename Session"
+                        "Regenerate Title/Summary"
                     }
                     button {
                         "data-context-menu-action": "new-paper",
@@ -36891,6 +37250,50 @@ fn ContextMenuOverlay(
                             on_delete_item.call(evt);
                         },
                         "Delete…"
+                    }
+                }
+                if can_regenerate_copy && row.kind != BrowserRowKind::Session {
+                    div {
+                        style: format!("height:1px; margin:6px 4px; background:{}; opacity:0.7;", palette.border),
+                    }
+                    button {
+                        "data-context-menu-action": "regenerate-copy",
+                        class: "yggterm-menu-item",
+                        style: context_menu_action_style(palette, false),
+                        onmousedown: |evt| {
+                            evt.stop_propagation();
+                        },
+                        onclick: move |evt| {
+                            evt.stop_propagation();
+                            on_regenerate_copy.call(evt);
+                        },
+                        "Regenerate Title/Summary"
+                    }
+                    button {
+                        "data-context-menu-action": "regenerate-title",
+                        class: "yggterm-menu-item",
+                        style: context_menu_action_style(palette, true),
+                        onmousedown: |evt| {
+                            evt.stop_propagation();
+                        },
+                        onclick: move |evt| {
+                            evt.stop_propagation();
+                            on_regenerate_title.call(evt);
+                        },
+                        "Regenerate Titles"
+                    }
+                    button {
+                        "data-context-menu-action": "regenerate-summary",
+                        class: "yggterm-menu-item",
+                        style: context_menu_action_style(palette, true),
+                        onmousedown: |evt| {
+                            evt.stop_propagation();
+                        },
+                        onclick: move |evt| {
+                            evt.stop_propagation();
+                            on_regenerate_summary.call(evt);
+                        },
+                        "Regenerate Summaries"
                     }
                 }
                 if is_workspace_row(&row) {
@@ -38352,6 +38755,7 @@ fn linux_limit_live_terminal_retention() -> bool {
         linux_session_looks_like_kde_plasma(),
         std::env::var_os("DISPLAY").is_some(),
         std::env::var_os("WAYLAND_DISPLAY").is_some(),
+        env_flag_truthy("YGGTERM_LIMIT_LIVE_TERMINAL_RETENTION"),
     )
 }
 #[cfg(not(target_os = "linux"))]
@@ -39635,6 +40039,15 @@ mod tests {
         ));
     }
     #[test]
+    fn titlebar_search_dropdown_stays_open_for_active_queries() {
+        assert!(titlebar_search_dropdown_open_flags(
+            false, false, true, false, false, false
+        ));
+        assert!(!titlebar_search_dropdown_open_flags(
+            false, false, true, true, false, false
+        ));
+    }
+    #[test]
     fn titlebar_autohide_visibility_requires_hover_or_pinned_state() {
         assert!(titlebar_autohide_revealed(false, false, false, false));
         assert!(!titlebar_autohide_revealed(true, false, false, false));
@@ -39658,19 +40071,33 @@ mod tests {
         );
     }
     #[test]
-    fn kde_limits_inactive_terminal_retention_across_display_backends() {
-        assert!(limit_live_terminal_retention_for_platform(
-            true, true, false
-        ));
-        assert!(limit_live_terminal_retention_for_platform(true, true, true));
-        assert!(limit_live_terminal_retention_for_platform(
-            true, false, true
+    fn kde_live_terminal_retention_is_unlimited_by_default() {
+        assert!(!limit_live_terminal_retention_for_platform(
+            true, true, false, false
         ));
         assert!(!limit_live_terminal_retention_for_platform(
-            true, false, false
+            true, true, true, false
         ));
         assert!(!limit_live_terminal_retention_for_platform(
-            false, true, false
+            true, false, true, false
+        ));
+    }
+    #[test]
+    fn kde_live_terminal_retention_can_be_limited_by_emergency_flag() {
+        assert!(limit_live_terminal_retention_for_platform(
+            true, true, false, true
+        ));
+        assert!(limit_live_terminal_retention_for_platform(
+            true, true, true, true
+        ));
+        assert!(limit_live_terminal_retention_for_platform(
+            true, false, true, true
+        ));
+        assert!(!limit_live_terminal_retention_for_platform(
+            true, false, false, true
+        ));
+        assert!(!limit_live_terminal_retention_for_platform(
+            false, true, false, true
         ));
     }
     #[test]
@@ -39828,6 +40255,26 @@ mod tests {
         assert!(
             script.contains("overlay.className = 'yggterm-term-focus-capture';"),
             "focus capture overlay should be attached inside the terminal host"
+        );
+    }
+    #[test]
+    fn focus_search_input_script_extends_global_ui_focus_claim() {
+        let script = focus_search_input_script(false);
+        assert!(
+            script.contains("window.__yggtermUiFocusClaimUntilMs"),
+            "search focus should set the global UI focus claim honored by terminal autofocus"
+        );
+        assert!(
+            script.contains("data-yggterm-search-focus-claim-bound"),
+            "search focus should bind durable claim extension listeners on the input"
+        );
+        assert!(
+            script.contains("input.addEventListener('input', claimFocus, true);"),
+            "typing in search should extend the focus claim while delayed terminal focus retries are still pending"
+        );
+        assert!(
+            script.contains("Date.now() + 2200"),
+            "search focus claim should outlast terminal delayed focus retries"
         );
     }
     #[test]
@@ -40258,6 +40705,57 @@ mod tests {
         assert!(is_workspace_row(&folder));
     }
     #[test]
+    fn context_menu_allows_rename_for_workspace_folders_and_sessions() {
+        let folder = BrowserRow {
+            kind: BrowserRowKind::Group,
+            full_path: "/home/pi/gh/notes/folder-a".to_string(),
+            label: "folder-a".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: Some(WorkspaceGroupKind::Folder),
+            session_title: None,
+            depth: 2,
+            host_label: String::new(),
+            descendant_sessions: 0,
+            expanded: true,
+            session_id: None,
+            session_cwd: None,
+        };
+        let session = BrowserRow {
+            kind: BrowserRowKind::Session,
+            full_path: "local://test".to_string(),
+            label: "test".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: Some("test".to_string()),
+            depth: 1,
+            host_label: "local".to_string(),
+            descendant_sessions: 1,
+            expanded: true,
+            session_id: Some("test".to_string()),
+            session_cwd: Some("/home/pi".to_string()),
+        };
+        let local_root = BrowserRow {
+            kind: BrowserRowKind::Group,
+            full_path: "local".to_string(),
+            label: "local".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: Some(WorkspaceGroupKind::Folder),
+            session_title: None,
+            depth: 0,
+            host_label: "local".to_string(),
+            descendant_sessions: 0,
+            expanded: true,
+            session_id: None,
+            session_cwd: None,
+        };
+        assert!(context_menu_allows_rename(&folder));
+        assert!(context_menu_allows_rename(&session));
+        assert!(!context_menu_allows_rename(&local_root));
+    }
+    #[test]
     fn pointer_drag_placement_uses_edges_for_separator_and_middle_for_folder() {
         let separator = BrowserRow {
             kind: BrowserRowKind::Separator,
@@ -40626,6 +41124,64 @@ mod tests {
             .expect("gg plan item");
         assert_eq!(gg_plan.final_path, "/home/pi/gh/notes/0001-untitled-gg");
     }
+
+    #[test]
+    fn reorder_plan_allows_session_rows_to_drop_into_workspace_folders() {
+        let folder = BrowserRow {
+            kind: BrowserRowKind::Group,
+            full_path: "/home/pi/gh/0000-notes".to_string(),
+            label: "notes".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: Some(WorkspaceGroupKind::Folder),
+            session_title: None,
+            depth: 3,
+            host_label: String::new(),
+            descendant_sessions: 0,
+            expanded: true,
+            session_id: None,
+            session_cwd: None,
+        };
+        let session = BrowserRow {
+            kind: BrowserRowKind::Session,
+            full_path: "local://local-shell".to_string(),
+            label: "local-shell".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: Some("local-shell".to_string()),
+            depth: 2,
+            host_label: String::new(),
+            descendant_sessions: 0,
+            expanded: false,
+            session_id: Some("local-shell".to_string()),
+            session_cwd: Some("/home/pi/gh/yggterm".to_string()),
+        };
+        let rows = vec![folder.clone(), session.clone()];
+        assert!(is_tree_drag_source_row(&session));
+
+        let placement = resolve_workspace_drop_placement(
+            &rows,
+            &DragDropTarget {
+                path: folder.full_path.clone(),
+                placement: DragDropPlacement::Into,
+            },
+        )
+        .expect("folder should accept session drops");
+        let plan = build_workspace_reorder_plan(&rows, std::slice::from_ref(&session), &placement)
+            .expect("session move should produce a plan");
+        assert_eq!(plan.len(), 1);
+        let session_plan = plan
+            .iter()
+            .find(|item| item.from_path == session.full_path)
+            .expect("session plan item");
+        assert_eq!(session_plan.kind, BrowserRowKind::Session);
+        assert_eq!(
+            session_plan.final_path,
+            "/home/pi/gh/0000-notes/0000-local-shell"
+        );
+    }
+
     #[test]
     fn creation_context_for_paper_resolves_to_parent_folder() {
         let folder = BrowserRow {
@@ -41367,7 +41923,7 @@ mod tests {
         );
     }
     #[test]
-    fn merged_sidebar_rows_include_local_live_sessions_group_and_rows() {
+    fn merged_sidebar_rows_promote_local_live_sessions_without_tree_duplicates() {
         let rows = merged_sidebar_rows(
             &[
                 BrowserRow {
@@ -41469,18 +42025,12 @@ mod tests {
         assert!(rows.iter().any(|row| row.full_path
             == "local://019cf672-8d68-70a1-bd8b-68487c4fc63d"
             && row.depth == 1));
-        let local_tree_row = rows
-            .iter()
-            .find(|row| {
-                row.full_path == "local://019cf672-8d68-70a1-bd8b-68487c4fc63d" && row.depth == 3
-            })
-            .expect("local tree live session row");
-        assert_eq!(local_tree_row.label, "/home/pi/gh/yggterm");
+        assert!(rows.iter().any(|row| row.full_path == "/home/pi/gh"));
         assert_eq!(
             rows.iter()
                 .filter(|row| row.full_path == "local://019cf672-8d68-70a1-bd8b-68487c4fc63d")
                 .count(),
-            2
+            1
         );
     }
     #[test]
@@ -41614,18 +42164,12 @@ mod tests {
         let live_group_session_row = &rows[1];
         assert_eq!(live_group_session_row.label, "Tree Smoke");
         assert_eq!(live_group_session_row.depth, 1);
-        let session_row = rows
-            .iter()
-            .find(|row| {
-                row.full_path == "local://019cf672-8d68-70a1-bd8b-68487c4fc63d" && row.depth == 4
-            })
-            .expect("synthetic local live session row");
         assert_eq!(
-            session_row.full_path,
-            "local://019cf672-8d68-70a1-bd8b-68487c4fc63d"
+            rows.iter()
+                .filter(|row| row.full_path == "local://019cf672-8d68-70a1-bd8b-68487c4fc63d")
+                .count(),
+            1
         );
-        assert_eq!(session_row.label, "Tree Smoke");
-        assert_eq!(session_row.depth, 4);
     }
     #[test]
     fn merged_sidebar_rows_keep_local_root_visible_when_everything_is_empty() {
@@ -42862,6 +43406,62 @@ mod tests {
         );
     }
     #[test]
+    fn remote_folder_new_session_context_uses_remote_cwd() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://test"));
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: None,
+            active_session: None,
+            active_view_mode: WorkspaceViewMode::Rendered,
+            remote_machines: vec![RemoteMachineSnapshot {
+                machine_key: "dev".to_string(),
+                label: "dev".to_string(),
+                ssh_target: "pi@dev".to_string(),
+                prefix: Some("cd /srv".to_string()),
+                remote_binary_expr: None,
+                remote_deploy_state: RemoteDeployState::Ready,
+                health: RemoteMachineHealth::Healthy,
+                sessions: Vec::new(),
+            }],
+            ssh_targets: Vec::new(),
+            live_sessions: Vec::new(),
+        });
+        let row = BrowserRow {
+            kind: BrowserRowKind::Group,
+            full_path: "__remote_folder__/dev/home/pi/gh/yggterm".to_string(),
+            label: "yggterm".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: None,
+            depth: 3,
+            host_label: "dev".to_string(),
+            descendant_sessions: 1,
+            expanded: true,
+            session_id: None,
+            session_cwd: None,
+        };
+        match group_session_launch_context(&shell, &row, SessionKind::Shell) {
+            TerminalLaunchContext::Remote {
+                ssh_target,
+                prefix,
+                cwd,
+                title_hint,
+            } => {
+                assert_eq!(ssh_target, "pi@dev");
+                assert_eq!(prefix.as_deref(), Some("cd /srv"));
+                assert_eq!(cwd.as_deref(), Some("/home/pi/gh/yggterm"));
+                assert_eq!(title_hint.as_deref(), Some("yggterm shell"));
+            }
+            other => panic!("expected remote launch context, got {other:?}"),
+        }
+    }
+    #[test]
+    fn home_scoped_workspace_path_rejects_synthetic_and_relative_paths() {
+        assert!(home_scoped_workspace_path("__remote_folder__/dev/home/pi").is_none());
+        assert!(home_scoped_workspace_path("workspace/folder").is_none());
+        assert!(home_scoped_workspace_path("remote-session://dev/1").is_none());
+    }
+    #[test]
     fn search_terms_support_quoted_phrases() {
         assert_eq!(
             search_terms(r#"excel "shortcut design" legal"#),
@@ -42972,6 +43572,31 @@ mod tests {
                 "remote-session://oc/1",
             ]
         );
+    }
+    #[test]
+    fn sidebar_search_render_rows_are_capped_but_match_count_stays_full() {
+        let rows = (0..(SIDEBAR_SEARCH_RENDER_LIMIT + 11))
+            .map(|ix| BrowserRow {
+                kind: BrowserRowKind::Session,
+                full_path: format!("local://litellm-{ix}"),
+                label: format!("litellm search result {ix}"),
+                detail_label: String::new(),
+                document_kind: None,
+                group_kind: None,
+                session_title: Some(format!("litellm search result {ix}")),
+                depth: 0,
+                host_label: String::new(),
+                descendant_sessions: 0,
+                expanded: true,
+                session_id: Some(format!("litellm-{ix}")),
+                session_cwd: Some("/home/pi".to_string()),
+            })
+            .collect::<Vec<_>>();
+        let rendered = sidebar_rows_for_render(&rows, "litellm");
+        let matches = search_sidebar_matches(&rows, "litellm");
+        assert_eq!(rendered.len(), SIDEBAR_SEARCH_RENDER_LIMIT);
+        assert_eq!(matches.len(), SIDEBAR_SEARCH_RENDER_LIMIT + 11);
+        assert_eq!(rendered[0].full_path, "local://litellm-0");
     }
     #[test]
     fn search_sidebar_matches_hash_and_path_terms() {
@@ -43637,6 +44262,56 @@ mod tests {
         assert!(!preview_text_looks_like_loading_placeholder(
             "Nov 23, 2025 01:17PM UTC+0530\nWho are you?"
         ));
+    }
+    #[test]
+    fn launcher_scaffold_preview_blocks_stay_hidden() {
+        let session = ManagedSessionView {
+            id: "local".to_string(),
+            session_path: "local://active".to_string(),
+            title: "New Folder codex".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "local-shell".to_string(),
+            source: yggterm_server::SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::BridgePending,
+            remote_deploy_state: yggterm_server::RemoteDeployState::NotRequired,
+            launch_command: "/bin/bash".to_string(),
+            status_line: "xterm.js · waiting for terminal host".to_string(),
+            terminal_lines: Vec::new(),
+            rendered_sections: Vec::new(),
+            preview: yggterm_server::SessionPreview {
+                summary: Vec::new(),
+                blocks: vec![yggterm_server::SessionPreviewBlock {
+                    role: "assistant",
+                    timestamp: "server:launch".to_string(),
+                    tone: yggterm_server::PreviewTone::Assistant,
+                    folded: false,
+                    lines: vec![
+                        "Open live terminal jojo".to_string(),
+                        "Launch command prepared: exec '/bin/bash' -i".to_string(),
+                        "Daemon PTY: request main viewport terminal stream".to_string(),
+                        "Target: /home/pi".to_string(),
+                        "Command: /bin/bash".to_string(),
+                    ],
+                }],
+            },
+            metadata: Vec::new(),
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+        assert!(visible_preview_blocks(&session).is_empty());
+        assert!(!preview_summary_text(&session).contains("Launch command prepared"));
     }
     #[test]
     fn remote_preview_needs_refresh_for_loading_metadata() {
@@ -45504,6 +46179,44 @@ Waiting for the remote terminal to paint...\n";
         bootstrap.browser_tree = browser_tree;
         bootstrap
     }
+    fn test_live_shell_session(session_path: &str) -> ManagedSessionView {
+        ManagedSessionView {
+            id: "fresh-shell-id".to_string(),
+            session_path: session_path.to_string(),
+            title: "Fresh Shell".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "local-shell".to_string(),
+            source: SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: vec!["pi@dev:~/gh/yggterm$".to_string()],
+            rendered_sections: Vec::new(),
+            preview: SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: vec![SessionMetadataEntry {
+                label: "Cwd",
+                value: "/home/pi/gh/yggterm".to_string(),
+            }],
+            terminal_process_id: Some(42),
+            terminal_foreground_active: Some(false),
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        }
+    }
     fn test_browser_tree_with_local_group_sessions() -> SessionNode {
         SessionNode {
             kind: SessionNodeKind::Group,
@@ -45913,50 +46626,37 @@ Waiting for the remote terminal to paint...\n";
             document_kind: None,
             group_kind: None,
             path: PathBuf::from("/"),
-            children: vec![
-                SessionNode {
+            children: vec![SessionNode {
+                kind: SessionNodeKind::Group,
+                name: "local".to_string(),
+                title: None,
+                document_kind: None,
+                group_kind: None,
+                path: PathBuf::from("local"),
+                children: vec![SessionNode {
                     kind: SessionNodeKind::Group,
-                    name: "local".to_string(),
+                    name: "/home/pi".to_string(),
                     title: None,
                     document_kind: None,
                     group_kind: None,
-                    path: PathBuf::from("local"),
+                    path: PathBuf::from("/home/pi"),
                     children: vec![SessionNode {
                         kind: SessionNodeKind::Group,
-                        name: "/home/pi".to_string(),
+                        name: "/home/pi/gh".to_string(),
                         title: None,
                         document_kind: None,
                         group_kind: None,
-                        path: PathBuf::from("/home/pi"),
-                        children: vec![SessionNode {
-                            kind: SessionNodeKind::Group,
-                            name: "/home/pi/gh".to_string(),
-                            title: None,
-                            document_kind: None,
-                            group_kind: None,
-                            path: PathBuf::from("/home/pi/gh"),
-                            children: Vec::new(),
-                            session_id: None,
-                            cwd: Some("/home/pi/gh".to_string()),
-                        }],
+                        path: PathBuf::from("/home/pi/gh"),
+                        children: Vec::new(),
                         session_id: None,
-                        cwd: Some("/home/pi".to_string()),
+                        cwd: Some("/home/pi/gh".to_string()),
                     }],
                     session_id: None,
-                    cwd: None,
-                },
-                SessionNode {
-                    kind: SessionNodeKind::CodexSession,
-                    name: "stale".to_string(),
-                    title: Some("stale".to_string()),
-                    document_kind: None,
-                    group_kind: None,
-                    path: PathBuf::from(stale_path),
-                    children: Vec::new(),
-                    session_id: Some("stale-session".to_string()),
-                    cwd: Some("/home/pi/.codex/sessions".to_string()),
-                },
-            ],
+                    cwd: Some("/home/pi".to_string()),
+                }],
+                session_id: None,
+                cwd: None,
+            }],
             session_id: None,
             cwd: None,
         });
@@ -46033,6 +46733,77 @@ Waiting for the remote terminal to paint...\n";
         assert_eq!(
             shell.selected_tree_paths,
             HashSet::from([active_session_path.to_string()])
+        );
+    }
+
+    #[test]
+    fn background_daemon_snapshot_preserves_visible_non_active_tree_selection() {
+        let active_session_path = "local://fresh-shell";
+        let recipe_path = "/home/pi/0000-fresh-shell";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_browser_tree(SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: vec![SessionNode {
+                kind: SessionNodeKind::Group,
+                name: "home/pi".to_string(),
+                title: Some("home/pi".to_string()),
+                document_kind: None,
+                group_kind: Some(WorkspaceGroupKind::Folder),
+                path: PathBuf::from("/home/pi"),
+                children: vec![SessionNode {
+                    kind: SessionNodeKind::Document,
+                    name: "local-shell".to_string(),
+                    title: Some("local-shell".to_string()),
+                    document_kind: Some(WorkspaceDocumentKind::TerminalRecipe),
+                    group_kind: None,
+                    path: PathBuf::from(recipe_path),
+                    children: Vec::new(),
+                    session_id: Some("recipe-id".to_string()),
+                    cwd: Some(recipe_path.to_string()),
+                }],
+                session_id: None,
+                cwd: Some("/home/pi".to_string()),
+            }],
+            session_id: None,
+            cwd: None,
+        }));
+        let live_session = test_live_shell_session(active_session_path);
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(active_session_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(live_session.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![snapshot_session_view_for_ui(live_session.clone())],
+        });
+        shell.needs_initial_server_sync = false;
+        shell.browser.ensure_visible_path(recipe_path);
+        shell.selected_tree_paths.clear();
+        shell.selected_tree_paths.insert(recipe_path.to_string());
+        shell.selection_anchor = Some(recipe_path.to_string());
+        shell.browser.select_path(recipe_path.to_string());
+
+        shell.apply_daemon_snapshot_result(Ok((
+            ServerUiSnapshot {
+                active_session_path: Some(active_session_path.to_string()),
+                active_session: Some(snapshot_session_view_for_ui(live_session)),
+                active_view_mode: WorkspaceViewMode::Terminal,
+                remote_machines: Vec::new(),
+                ssh_targets: Vec::new(),
+                live_sessions: Vec::new(),
+            },
+            Some("snapshot applied".to_string()),
+        )));
+
+        assert_eq!(shell.selection_anchor.as_deref(), Some(recipe_path));
+        assert_eq!(shell.browser.selected_path(), Some(recipe_path));
+        assert_eq!(
+            shell.selected_tree_paths,
+            HashSet::from([recipe_path.to_string()])
         );
     }
 
@@ -49360,7 +50131,7 @@ Updated at   Branch  Conversation\n\
                 hydrate_copy: false,
                 request_title_generation: false,
                 request_summary_generation: false,
-                schedule_background_scan: true,
+                schedule_background_scan: false,
             }
         );
     }
@@ -49377,26 +50148,26 @@ Updated at   Branch  Conversation\n\
         );
     }
     #[test]
-    fn active_session_copy_refresh_plan_generates_missing_summary_after_hydration() {
+    fn active_session_copy_refresh_plan_does_not_generate_missing_summary_on_focus() {
         assert_eq!(
             active_session_copy_refresh_plan(SessionSource::LiveLocal, false, false, false, true),
             ActiveCopyRefreshPlan {
                 hydrate_copy: false,
                 request_title_generation: false,
-                request_summary_generation: true,
-                schedule_background_scan: true,
+                request_summary_generation: false,
+                schedule_background_scan: false,
             }
         );
     }
     #[test]
-    fn active_session_copy_refresh_plan_keeps_title_generation_when_needed() {
+    fn active_session_copy_refresh_plan_does_not_generate_title_on_focus() {
         assert_eq!(
             active_session_copy_refresh_plan(SessionSource::LiveLocal, true, true, false, true),
             ActiveCopyRefreshPlan {
                 hydrate_copy: false,
-                request_title_generation: true,
+                request_title_generation: false,
                 request_summary_generation: false,
-                schedule_background_scan: true,
+                schedule_background_scan: false,
             }
         );
     }

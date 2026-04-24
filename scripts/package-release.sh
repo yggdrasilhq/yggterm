@@ -12,6 +12,20 @@ CARGO_CMD=(cargo "+${RUSTUP_TOOLCHAIN}")
 
 mkdir -p "$DIST_DIR"
 
+checksum_file() {
+  local file="$1"
+  local out="$2"
+  local dir
+  local base
+  dir="$(dirname "$file")"
+  base="$(basename "$file")"
+  if command -v sha256sum >/dev/null 2>&1; then
+    (cd "$dir" && sha256sum "$base") > "$out"
+  else
+    (cd "$dir" && shasum -a 256 "$base") > "$out"
+  fi
+}
+
 pushd "$ROOT_DIR" >/dev/null
 "${CARGO_CMD[@]}" build --release -p yggterm --bin yggterm --bin yggterm-headless --bin yggterm-mock-cli --no-default-features
 popd >/dev/null
@@ -19,9 +33,9 @@ popd >/dev/null
 cp "$BIN_PATH" "$DIST_DIR/yggterm-${TARGET_LABEL}"
 cp "$HEADLESS_BIN_PATH" "$DIST_DIR/yggterm-headless-${TARGET_LABEL}"
 cp "$MOCK_CLI_BIN_PATH" "$DIST_DIR/yggterm-mock-cli-${TARGET_LABEL}"
-sha256sum "$DIST_DIR/yggterm-${TARGET_LABEL}" > "$DIST_DIR/yggterm-${TARGET_LABEL}.sha256"
-sha256sum "$DIST_DIR/yggterm-headless-${TARGET_LABEL}" > "$DIST_DIR/yggterm-headless-${TARGET_LABEL}.sha256"
-sha256sum "$DIST_DIR/yggterm-mock-cli-${TARGET_LABEL}" > "$DIST_DIR/yggterm-mock-cli-${TARGET_LABEL}.sha256"
+checksum_file "$DIST_DIR/yggterm-${TARGET_LABEL}" "$DIST_DIR/yggterm-${TARGET_LABEL}.sha256"
+checksum_file "$DIST_DIR/yggterm-headless-${TARGET_LABEL}" "$DIST_DIR/yggterm-headless-${TARGET_LABEL}.sha256"
+checksum_file "$DIST_DIR/yggterm-mock-cli-${TARGET_LABEL}" "$DIST_DIR/yggterm-mock-cli-${TARGET_LABEL}.sha256"
 
 tar -C "$DIST_DIR" -czf "$DIST_DIR/yggterm-${TARGET_LABEL}.tar.gz" \
   "yggterm-${TARGET_LABEL}" \
@@ -31,7 +45,7 @@ tar -C "$DIST_DIR" -czf "$DIST_DIR/yggterm-${TARGET_LABEL}.tar.gz" \
   "yggterm-mock-cli-${TARGET_LABEL}" \
   "yggterm-mock-cli-${TARGET_LABEL}.sha256"
 
-sha256sum "$DIST_DIR/yggterm-${TARGET_LABEL}.tar.gz" > "$DIST_DIR/yggterm-${TARGET_LABEL}.tar.gz.sha256"
+checksum_file "$DIST_DIR/yggterm-${TARGET_LABEL}.tar.gz" "$DIST_DIR/yggterm-${TARGET_LABEL}.tar.gz.sha256"
 
 echo "Release binary: $DIST_DIR/yggterm-${TARGET_LABEL}"
 echo "Release headless binary: $DIST_DIR/yggterm-headless-${TARGET_LABEL}"
