@@ -231,10 +231,14 @@ fi
 checksum_file() {
   local file="$1"
   local out="$2"
+  local dir
+  local base
+  dir="$(dirname "$file")"
+  base="$(basename "$file")"
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$file" > "$out"
+    (cd "$dir" && sha256sum "$base") > "$out"
   else
-    shasum -a 256 "$file" > "$out"
+    (cd "$dir" && shasum -a 256 "$base") > "$out"
   fi
 }
 
