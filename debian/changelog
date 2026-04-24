@@ -1,3 +1,11 @@
+yggterm (2.1.32-1) unstable; urgency=medium
+
+  * Harden KDE/Xwayland app-owned launches by requiring wait-visible proof from app-control state.
+  * Keep KDE close probes isolated by requiring the probe GUI to exit and rejecting panic logs or direct-shell fallback.
+  * Tolerate duplicate Dioxus desktop init delivery to avoid the KDE close-path virtualdom panic.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sat, 25 Apr 2026 00:40:21 +0530
+
 yggterm (2.1.31-1) unstable; urgency=medium
 
   * Keep live sessions promoted at the top of the sidebar with visible close affordances while avoiding duplicate local live rows.
