@@ -20,6 +20,7 @@ from remote_windows_live_app import (
     strip_windows_ssh_noise,
 )
 from smoke_app_control_bootstrap import (
+    active_terminal_host,
     assert_active_terminal_host_ready,
     assert_sidebar_rows_present,
     assert_blur_expectation,
@@ -558,6 +559,47 @@ def wait_for_terminal_ready_state(
         f"remote Windows terminal never became ready for pid {app_pid} within {wait_seconds:.1f}s: "
         f"{last_error} state={last_state!r}"
     )
+
+
+WINDOWS_LOCAL_SHELL_FAILURE_MARKERS = (
+    "not recognized as an internal or external command",
+    "operable program or batch file",
+)
+
+
+def assert_windows_local_shell_text_healthy(state: dict, session_path: str) -> dict:
+    host = active_terminal_host(state)
+    if not isinstance(host, dict):
+        raise RuntimeError(f"Windows terminal proof state did not expose an active host: {state!r}")
+    if str(host.get("session_path") or "").strip() != session_path:
+        raise RuntimeError(
+            "Windows terminal proof state active host drifted away from the created session: "
+            f"expected={session_path!r} host={host!r}"
+        )
+    haystack = "\n".join(
+        str(host.get(key) or "")
+        for key in (
+            "text_sample",
+            "cursor_line_text",
+            "cursor_row_text",
+            "resume_overlay_text",
+            "resume_overlay_excerpt",
+        )
+    )
+    if not haystack.strip():
+        raise RuntimeError(f"Windows terminal proof did not expose readable terminal text: {host!r}")
+    lowered = haystack.lower()
+    bad_markers = [marker for marker in WINDOWS_LOCAL_SHELL_FAILURE_MARKERS if marker in lowered]
+    if bad_markers:
+        raise RuntimeError(
+            "Windows local shell launched into an error screen instead of an interactive prompt: "
+            f"markers={bad_markers!r} text={haystack[-500:]!r}"
+        )
+    return {
+        "text_tail": haystack[-500:],
+        "cursor_row_text": host.get("cursor_row_text"),
+        "cursor_line_text": host.get("cursor_line_text"),
+    }
 
 
 def windows_session_info(host: str) -> dict:
@@ -1351,6 +1393,7 @@ def main() -> int:
 
         screenshot_response = None
         screenshot_error = None
+        terminal_text = None
         try:
             try:
                 dismissed_error_dialogs_prescreenshot = dismiss_windows_error_dialogs(args.host)
@@ -1383,6 +1426,12 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             screenshot_error = str(exc)
             screenshot_quality = None
+        if screenshot_error:
+            raise RuntimeError(f"Windows proof screenshot failed: {screenshot_error}")
+        terminal_text = assert_windows_local_shell_text_healthy(
+            (screenshot_response or {}).get("data") or {},
+            str(created_terminal.get("active_session_path") or "").strip(),
+        )
 
         proof_summary = {
             "bin": remote_bin,
@@ -1402,6 +1451,7 @@ def main() -> int:
             "titlebar_right_controls": titlebar,
             "created_terminal": created_terminal,
             "terminal": terminal,
+            "terminal_text": terminal_text,
             "state_path": str(state_path),
             "rows_path": str(rows_path),
             "screenshot_path": str(screenshot_path) if screenshot_path.exists() else None,

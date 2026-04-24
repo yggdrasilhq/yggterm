@@ -67,7 +67,6 @@ use std::time::{Duration, Instant, SystemTime};
 use time::{OffsetDateTime, UtcOffset, macros::format_description};
 use tracing::warn;
 use uuid::Uuid;
-use yggterm_platform::configure_background_service_command;
 use yggterm_core::{
     PerfSpan, SessionNode, SessionNodeKind, SessionStore, SessionTitleStore, TranscriptRole,
     WorkspaceDocument, WorkspaceDocumentKind, append_trace_event, event_trace_path,
@@ -76,6 +75,7 @@ use yggterm_core::{
     read_codex_transcript_messages, read_codex_transcript_messages_limited, read_trace_tail,
     resolve_yggterm_home,
 };
+use yggterm_platform::configure_background_service_command;
 use yggui_contract::{UiTheme, YgguiClipboardContents};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2679,9 +2679,96 @@ impl YggtermServer {
                 self.cached_remote_launch_for_target(&ssh_target, ssh_prefix.as_deref()),
             ))
         });
+        let resolved_live_ssh_launch = self.sessions.get(&path).and_then(|session| {
+            if !live_session_uses_remote_runtime(session) {
+                return None;
+            }
+            let ssh_target = session.ssh_target.clone()?;
+            let ssh_prefix = session.ssh_prefix.clone();
+            if self
+                .cached_remote_launch_for_target(&ssh_target, ssh_prefix.as_deref())
+                .is_some()
+            {
+                return None;
+            }
+            match resolve_remote_yggterm_binary(&ssh_target, ssh_prefix.as_deref()) {
+                Ok((remote_binary, remote_deploy_state)) => {
+                    Some((ssh_target, ssh_prefix, remote_binary, remote_deploy_state))
+                }
+                Err(error) => {
+                    if let Ok(home) = resolve_yggterm_home() {
+                        append_trace_event(
+                            &home,
+                            "server",
+                            "remote_runtime",
+                            "launch_binary_resolve_error",
+                            serde_json::json!({
+                                "session_path": session.session_path,
+                                "ssh_target": ssh_target,
+                                "error": error.to_string(),
+                            }),
+                        );
+                    }
+                    None
+                }
+            }
+        });
+        let missing_remote_live_session = self.sessions.get(&path).and_then(|session| {
+            if !live_session_uses_remote_runtime(session)
+                || !is_remote_scanned_live_session_path(&session.session_path)
+            {
+                return None;
+            }
+            let ssh_target = session.ssh_target.clone()?;
+            let ssh_prefix = session.ssh_prefix.clone();
+            let session_id = session.id.clone();
+            match fetch_remote_saved_codex_session_exists(
+                &ssh_target,
+                ssh_prefix.as_deref(),
+                &session_id,
+            ) {
+                Ok(true) => None,
+                Ok(false) => Some((session.session_path.clone(), ssh_target, session_id)),
+                Err(error) => {
+                    if let Ok(home) = resolve_yggterm_home() {
+                        append_trace_event(
+                            &home,
+                            "server",
+                            "remote_runtime",
+                            "saved_session_exists_probe_error",
+                            serde_json::json!({
+                                "session_path": session.session_path,
+                                "ssh_target": ssh_target,
+                                "error": error.to_string(),
+                            }),
+                        );
+                    }
+                    None
+                }
+            }
+        });
+        if let Some((stale_path, ssh_target, session_id)) = missing_remote_live_session {
+            let _ = self.remove_live_session(&stale_path);
+            if let Ok(home) = resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "server",
+                    "remote_runtime",
+                    "missing_saved_session_removed",
+                    serde_json::json!({
+                        "session_path": stale_path,
+                        "ssh_target": ssh_target,
+                        "session_id": session_id,
+                    }),
+                );
+            }
+            return;
+        }
         let Some(session) = self.sessions.get_mut(&path) else {
             return;
         };
+        let mut promote_active_remote_launch =
+            None::<(String, Option<String>, String, RemoteDeployState)>;
         if session.kind == SessionKind::Document {
             if let Some((launch_command, _cwd)) = recipe_terminal_spec(session) {
                 self.active_view_mode = WorkspaceViewMode::Terminal;
@@ -2843,29 +2930,48 @@ impl YggtermServer {
                     } else {
                         session.ssh_prefix.clone()
                     };
-                    let (remote_binary, remote_deploy_state) = cached_launch.unwrap_or_else(|| {
-                        let fallback_state = match session.remote_deploy_state {
-                            RemoteDeployState::Ready => RemoteDeployState::Ready,
-                            RemoteDeployState::CopyingBinary => RemoteDeployState::CopyingBinary,
-                            RemoteDeployState::Planned | RemoteDeployState::NotRequired => {
-                                RemoteDeployState::Planned
-                            }
+                    let resolved_launch = resolved_live_ssh_launch.as_ref().and_then(
+                        |(resolved_target, resolved_prefix, remote_binary, remote_deploy_state)| {
+                            (resolved_target == &ssh_target && *resolved_prefix == ssh_prefix)
+                                .then(|| (remote_binary.clone(), remote_deploy_state.clone()))
+                        },
+                    );
+                    let (remote_binary, remote_deploy_state) =
+                        if let Some(resolved_launch) = resolved_launch {
+                            promote_active_remote_launch = Some((
+                                ssh_target.clone(),
+                                ssh_prefix.clone(),
+                                resolved_launch.0.clone(),
+                                resolved_launch.1.clone(),
+                            ));
+                            resolved_launch
+                        } else {
+                            cached_launch.unwrap_or_else(|| {
+                                let fallback_state = match session.remote_deploy_state {
+                                    RemoteDeployState::Ready => RemoteDeployState::Ready,
+                                    RemoteDeployState::CopyingBinary => {
+                                        RemoteDeployState::CopyingBinary
+                                    }
+                                    RemoteDeployState::Planned | RemoteDeployState::NotRequired => {
+                                        RemoteDeployState::Planned
+                                    }
+                                };
+                                if let Ok(home) = resolve_yggterm_home() {
+                                    append_trace_event(
+                                        &home,
+                                        "server",
+                                        "remote_runtime",
+                                        "launch_binary_cache_miss",
+                                        serde_json::json!({
+                                            "session_path": session.session_path,
+                                            "ssh_target": ssh_target,
+                                            "fallback_state": format!("{:?}", fallback_state),
+                                        }),
+                                    );
+                                }
+                                (preferred_remote_binary_fallback(), fallback_state)
+                            })
                         };
-                        if let Ok(home) = resolve_yggterm_home() {
-                            append_trace_event(
-                                &home,
-                                "server",
-                                "remote_runtime",
-                                "launch_binary_cache_miss",
-                                serde_json::json!({
-                                    "session_path": session.session_path,
-                                    "ssh_target": ssh_target,
-                                    "fallback_state": format!("{:?}", fallback_state),
-                                }),
-                            );
-                        }
-                        (preferred_remote_binary_fallback(), fallback_state)
-                    });
                     session.remote_deploy_state = remote_deploy_state;
                     session.launch_command =
                         if is_remote_scanned_live_session_path(&session.session_path) {
@@ -2938,6 +3044,24 @@ impl YggtermServer {
         if promote_active_stored_session {
             self.live_session_order.retain(|existing| existing != &path);
             self.live_session_order.insert(0, path.clone());
+        }
+        if let Some((ssh_target, ssh_prefix, remote_binary_expr, remote_deploy_state)) =
+            promote_active_remote_launch
+        {
+            let machine_key = machine_key_from_ssh_target(&ssh_target);
+            let target = SshConnectTarget {
+                label: ssh_target.clone(),
+                kind: SessionKind::SshShell,
+                ssh_target,
+                prefix: ssh_prefix,
+                cwd: None,
+            };
+            self.promote_remote_machine_health(
+                &machine_key,
+                Some(&target),
+                Some(remote_binary_expr),
+                Some(remote_deploy_state),
+            );
         }
         if let Ok(home) = resolve_yggterm_home() {
             append_trace_event(
@@ -5666,6 +5790,22 @@ pub fn fetch_remote_preview_head_payload(
     Ok(payload)
 }
 
+fn fetch_remote_saved_codex_session_exists(
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+    session_id: &str,
+) -> anyhow::Result<bool> {
+    let output = run_remote_yggterm_command(
+        ssh_target,
+        exec_prefix,
+        &["server", "remote", "codex-session-exists", session_id],
+        None,
+    )?;
+    let response: RemoteSavedCodexSessionExistsResponse =
+        serde_json::from_str(&output).context("invalid remote saved-session response")?;
+    Ok(response.exists)
+}
+
 pub fn apply_remote_preview_payload_for_path(
     server: &mut YggtermServer,
     session_path: &str,
@@ -6778,7 +6918,7 @@ fn should_fallback_to_python(error: &anyhow::Error) -> bool {
         || message.contains("cannot execute")
         || message.contains("Exec format error")
         || message.contains("failed to upload yggterm binary")
-        || message.contains("yggterm-headless only supports server subcommands")
+        || message.contains("supports server subcommands")
         || message.contains("remote yggterm command failed")
 }
 
@@ -6914,26 +7054,24 @@ fn preferred_remote_binary_fallback() -> String {
     "$HOME/.yggterm/bin/yggterm".to_string()
 }
 
-fn bootstrap_remote_yggterm(ssh_target: &str, exec_prefix: Option<&str>) -> anyhow::Result<String> {
-    let current_exe = std::env::current_exe().ok();
-    let exe_path = local_remote_bootstrap_executable().with_context(|| {
-        let current = current_exe
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "<unknown>".to_string());
-        format!(
-            "resolving local yggterm headless remote executable near {current}; build yggterm-headless or install a release bundle that includes it"
-        )
-    })?;
-    let payload = fs::read(&exe_path)
-        .with_context(|| format!("reading local yggterm binary {}", exe_path.display()))?;
+fn remote_bootstrap_install_command(remote_path: &str) -> String {
+    format!(
+        "mkdir -p \"$HOME/.yggterm/bin\" && cat > \"{remote_path}.tmp\" && chmod +x \"{remote_path}.tmp\" && mv \"{remote_path}.tmp\" \"{remote_path}\" && printf \"%s\" \"{remote_path}\""
+    )
+}
+
+fn upload_remote_bootstrap_payload(
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+    local_path: &Path,
+    remote_path: &str,
+) -> anyhow::Result<String> {
+    let payload = fs::read(local_path)
+        .with_context(|| format!("reading local yggterm binary {}", local_path.display()))?;
+    let install_cmd = remote_bootstrap_install_command(remote_path);
     let mut cmd = Command::new("ssh");
     cmd.arg("-o").arg("ConnectTimeout=10");
     cmd.arg("-o").arg("BatchMode=yes");
-    let remote_path = "$HOME/.yggterm/bin/yggterm";
-    let install_cmd = format!(
-        "mkdir -p \"$HOME/.yggterm/bin\" && cat > \"$HOME/.yggterm/bin/yggterm.tmp\" && chmod +x \"$HOME/.yggterm/bin/yggterm.tmp\" && mv \"$HOME/.yggterm/bin/yggterm.tmp\" \"{remote_path}\" && printf \"%s\" \"{remote_path}\""
-    );
     let remote = remote_shell_command(exec_prefix, &install_cmd);
     cmd.arg(ssh_target).arg(remote);
     cmd.stdin(Stdio::piped())
@@ -6960,11 +7098,44 @@ fn bootstrap_remote_yggterm(ssh_target: &str, exec_prefix: Option<&str>) -> anyh
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+fn bootstrap_remote_yggterm(ssh_target: &str, exec_prefix: Option<&str>) -> anyhow::Result<String> {
+    let current_exe = std::env::current_exe().ok();
+    let headless_exe = local_remote_bootstrap_executable().with_context(|| {
+        let current = current_exe
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        format!(
+            "resolving local yggterm headless remote executable near {current}; build yggterm-headless or install a release bundle that includes it"
+        )
+    })?;
+    let mock_cli_exe = local_mock_cli_companion_executable();
+    let remote_path = "$HOME/.yggterm/bin/yggterm";
+    let headless_path = "$HOME/.yggterm/bin/yggterm-headless";
+    let mock_cli_path = "$HOME/.yggterm/bin/yggterm-mock-cli";
+
+    let installed_remote_path =
+        upload_remote_bootstrap_payload(ssh_target, exec_prefix, &headless_exe, remote_path)?;
+    upload_remote_bootstrap_payload(ssh_target, exec_prefix, &headless_exe, headless_path)?;
+    if let Some(mock_cli_exe) = mock_cli_exe {
+        upload_remote_bootstrap_payload(ssh_target, exec_prefix, &mock_cli_exe, mock_cli_path)?;
+    }
+    Ok(installed_remote_path)
+}
+
 fn headless_bootstrap_file_names(current_ext: &str) -> Vec<&'static str> {
     if current_ext.eq_ignore_ascii_case("exe") {
         vec!["yggterm-headless.exe", "yggterm-headless-bin.exe"]
     } else {
         vec!["yggterm-headless", "yggterm-headless-bin"]
+    }
+}
+
+fn mock_cli_bootstrap_file_names(current_ext: &str) -> Vec<&'static str> {
+    if current_ext.eq_ignore_ascii_case("exe") {
+        vec!["yggterm-mock-cli.exe"]
+    } else {
+        vec!["yggterm-mock-cli"]
     }
 }
 
@@ -6981,21 +7152,20 @@ fn is_headless_bootstrap_path(path: &Path) -> bool {
     )
 }
 
-fn local_remote_bootstrap_executable_from_current(current: &Path) -> Option<PathBuf> {
-    if current.is_file() && is_headless_bootstrap_path(current) {
-        return Some(current.to_path_buf());
-    }
-    let current_ext = current
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or_default();
-    let names = headless_bootstrap_file_names(current_ext);
+fn is_mock_cli_bootstrap_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    matches!(name, "yggterm-mock-cli" | "yggterm-mock-cli.exe")
+}
+
+fn local_bootstrap_executable_from_current(current: &Path, names: &[&str]) -> Option<PathBuf> {
     let mut candidates = Vec::new();
-    for name in &names {
+    for name in names {
         candidates.push(current.with_file_name(name));
     }
     if let Some(profile_dir) = current.parent() {
-        for name in &names {
+        for name in names {
             candidates.push(profile_dir.join(name));
         }
         if let Some(target_dir) = profile_dir.parent() {
@@ -7009,7 +7179,7 @@ fn local_remote_bootstrap_executable_from_current(current: &Path) -> Option<Path
                 }
             }
             for profile in profiles {
-                for name in &names {
+                for name in names {
                     candidates.push(target_dir.join(&profile).join(name));
                 }
             }
@@ -7024,6 +7194,17 @@ fn local_remote_bootstrap_executable_from_current(current: &Path) -> Option<Path
     None
 }
 
+fn local_remote_bootstrap_executable_from_current(current: &Path) -> Option<PathBuf> {
+    if current.is_file() && is_headless_bootstrap_path(current) {
+        return Some(current.to_path_buf());
+    }
+    let current_ext = current
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default();
+    local_bootstrap_executable_from_current(current, &headless_bootstrap_file_names(current_ext))
+}
+
 fn local_remote_bootstrap_executable() -> Option<PathBuf> {
     let current = std::env::current_exe().ok()?;
     local_remote_bootstrap_executable_from_current(&current)
@@ -7036,6 +7217,22 @@ pub fn local_headless_companion_executable_from_current(current: &Path) -> Optio
 pub fn local_headless_companion_executable() -> Option<PathBuf> {
     let current = std::env::current_exe().ok()?;
     local_headless_companion_executable_from_current(&current)
+}
+
+fn local_mock_cli_companion_executable_from_current(current: &Path) -> Option<PathBuf> {
+    if current.is_file() && is_mock_cli_bootstrap_path(current) {
+        return Some(current.to_path_buf());
+    }
+    let current_ext = current
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default();
+    local_bootstrap_executable_from_current(current, &mock_cli_bootstrap_file_names(current_ext))
+}
+
+fn local_mock_cli_companion_executable() -> Option<PathBuf> {
+    let current = std::env::current_exe().ok()?;
+    local_mock_cli_companion_executable_from_current(&current)
 }
 
 fn resolve_remote_yggterm_binary(
@@ -7421,6 +7618,12 @@ pub fn run_remote_resume_codex(
 
 pub fn ensure_local_daemon_running(endpoint: &ServerEndpoint) -> anyhow::Result<()> {
     let current_exe = std::env::current_exe().context("resolving current yggterm executable")?;
+    if ping(endpoint).is_ok() {
+        return Ok(());
+    }
+    if wait_for_existing_local_daemon_boot(endpoint, Duration::from_millis(3_000)) {
+        return Ok(());
+    }
     cleanup_legacy_daemons(endpoint, &current_exe)?;
     clear_stale_local_daemon_socket_when_no_daemon(endpoint);
     if ping(endpoint).is_ok() {
@@ -11215,12 +11418,12 @@ fn build_live_session(
     ghostty_bridge_enabled: bool,
 ) -> ManagedSessionView {
     let started_at = format_display_datetime(OffsetDateTime::now_utc());
-    let shell_program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+    let shell_program = local_interactive_shell_program();
     let default_cwd = target.cwd.clone().unwrap_or_else(|| local_default_cwd());
     let (launch_command, session_path, source_value, target_value, prefix_value, deploy_state) =
         match kind {
             SessionKind::Shell => (
-                format!("exec {} -i", shell_single_quote(&shell_program)),
+                local_interactive_shell_launch_command(&shell_program),
                 format!("local://{uuid}"),
                 "local-shell".to_string(),
                 default_cwd.clone(),
@@ -11826,6 +12029,42 @@ fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn windows_cmd_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn windows_local_interactive_shell_launch_command(shell_program: &str) -> String {
+    let shell_program = shell_program.trim();
+    let shell_program = if shell_program.is_empty() {
+        "cmd.exe"
+    } else {
+        shell_program
+    };
+    if shell_program.chars().any(char::is_whitespace) {
+        format!("call {}", windows_cmd_quote(shell_program))
+    } else {
+        shell_program.to_string()
+    }
+}
+
+fn local_interactive_shell_program() -> String {
+    if cfg!(windows) {
+        return std::env::var("COMSPEC")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "cmd.exe".to_string());
+    }
+    std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
+}
+
+fn local_interactive_shell_launch_command(shell_program: &str) -> String {
+    if cfg!(windows) {
+        return windows_local_interactive_shell_launch_command(shell_program);
+    }
+    format!("exec {} -i", shell_single_quote(shell_program))
+}
+
 fn legacy_agent_launch_command(
     kind: SessionKind,
     cwd: Option<&str>,
@@ -12315,10 +12554,11 @@ mod tests {
         clear_stale_local_daemon_socket_when_no_daemon, client_instances_dir, current_millis_u64,
         dedupe_remote_scanned_sessions, legacy_agent_launch_command,
         legacy_remote_tmux_session_name, load_remote_machine_sessions_from_mirror,
+        local_mock_cli_companion_executable_from_current,
         local_remote_bootstrap_executable_from_current, managed_session_from_snapshot,
         mirror_remote_machine_sessions, parse_recent_context_sections, parse_screen_session_ref,
-        parse_stored_transcript, push_preview_block, remote_cache_key, remote_command_cache,
-        remote_direct_attach_launch_command,
+        parse_stored_transcript, push_preview_block, remote_bootstrap_install_command,
+        remote_cache_key, remote_command_cache, remote_direct_attach_launch_command,
         remote_resume_requires_missing_saved_session_failure,
         remote_resume_runtime_output_mismatches_managed_session,
         remote_resume_runtime_output_requires_restart, remote_resume_shell_command,
@@ -12326,11 +12566,11 @@ mod tests {
         remote_saved_session_screen_is_attachable, remote_scan_roots_with_parents,
         remote_scanned_session_path, remote_snapshot_looks_like_codex,
         remote_snapshot_looks_like_shell_prompt, remote_ssh_launch_command,
-        should_remove_local_daemon_socket_for_spawn_state,
         remote_tmux_session_name, sanitize_recent_context_payload, screen_attach_shell_command,
         screen_resume_or_spawn_shell_command, session_metadata_value, should_fallback_to_python,
-        stored_session_launch_command, strip_remote_payload_noise,
-        synthesize_remote_scanned_session_view, upsert_session_metadata,
+        should_remove_local_daemon_socket_for_spawn_state, stored_session_launch_command,
+        strip_remote_payload_noise, synthesize_remote_scanned_session_view,
+        upsert_session_metadata, windows_local_interactive_shell_launch_command,
     };
     use crate::SessionRenderedSection;
     #[cfg(unix)]
@@ -12803,6 +13043,20 @@ mod tests {
         assert!(
             command.contains("codex resume -C \"$PWD\" '019caa6f-b32c-7a73-b4d3-db83225663dc'")
         );
+    }
+
+    #[test]
+    fn windows_local_shell_launch_command_does_not_quote_standard_comspec() {
+        let command =
+            windows_local_interactive_shell_launch_command(r"C:\Windows\system32\cmd.exe");
+        assert_eq!(command, r"C:\Windows\system32\cmd.exe");
+    }
+
+    #[test]
+    fn windows_local_shell_launch_command_wraps_paths_with_spaces_for_cmd_c() {
+        let command =
+            windows_local_interactive_shell_launch_command(r"C:\Program Files\Shell\shell.exe");
+        assert_eq!(command, r#"call "C:\Program Files\Shell\shell.exe""#);
     }
 
     #[test]
@@ -13655,6 +13909,29 @@ terminal_window_id: None,
     }
 
     #[test]
+    fn local_mock_cli_companion_executable_uses_adjacent_mock_cli_binary() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-bootstrap-mock-{}-{}",
+            std::process::id(),
+            current_millis_u64()
+        ));
+        let profile = root.join("target/debug");
+        fs::create_dir_all(&profile)?;
+        let current = profile.join("yggterm");
+        let mock_cli = profile.join("yggterm-mock-cli");
+        fs::write(&current, b"gui")?;
+        fs::write(&mock_cli, b"mock")?;
+
+        assert_eq!(
+            local_mock_cli_companion_executable_from_current(&current),
+            Some(mock_cli.clone())
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
     fn local_remote_bootstrap_executable_uses_adjacent_bundle_headless_binary() -> Result<()> {
         let root = std::env::temp_dir().join(format!(
             "yggterm-bootstrap-bundle-{}-{}",
@@ -13700,6 +13977,17 @@ terminal_window_id: None,
 
         let _ = fs::remove_dir_all(&root);
         Ok(())
+    }
+
+    #[test]
+    fn remote_bootstrap_install_command_installs_one_payload_atomically() {
+        let command = remote_bootstrap_install_command("$HOME/.yggterm/bin/yggterm");
+        assert!(command.contains("cat > \"$HOME/.yggterm/bin/yggterm.tmp\""));
+        assert!(!command.contains("yggterm-headless.tmp"));
+        assert!(
+            command
+                .contains("mv \"$HOME/.yggterm/bin/yggterm.tmp\" \"$HOME/.yggterm/bin/yggterm\"")
+        );
     }
 
     #[test]
@@ -15184,14 +15472,15 @@ terminal_window_id: None,
         let live_sessions = server.live_sessions();
         assert_eq!(live_sessions.len(), 2);
         assert!(
-            live_sessions
-                .iter()
-                .any(|session| session.session_path == first_path && session.title == "First remote")
+            live_sessions.iter().any(
+                |session| session.session_path == first_path && session.title == "First remote"
+            )
         );
         assert!(
             live_sessions
                 .iter()
-                .any(|session| session.session_path == second_path && session.title == "Second remote")
+                .any(|session| session.session_path == second_path
+                    && session.title == "Second remote")
         );
         assert_eq!(server.active_session_path(), Some(second_path.as_str()));
         assert!(server.sessions.contains_key(&first_path));

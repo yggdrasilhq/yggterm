@@ -2525,8 +2525,25 @@ fn looks_like_shell_prompt_copy(text: &str) -> bool {
         ch.is_ascii_alphanumeric()
             || matches!(
                 ch,
-                ' ' | '@' | ':' | '/' | '\\' | '.' | '_' | '~' | '-' | '[' | ']' | '(' | ')'
-                    | '{' | '}' | '+' | '$' | '#' | '%' | '>'
+                ' ' | '@'
+                    | ':'
+                    | '/'
+                    | '\\'
+                    | '.'
+                    | '_'
+                    | '~'
+                    | '-'
+                    | '['
+                    | ']'
+                    | '('
+                    | ')'
+                    | '{'
+                    | '}'
+                    | '+'
+                    | '$'
+                    | '#'
+                    | '%'
+                    | '>'
             )
     });
     has_prompt_markers && allowed
@@ -2547,29 +2564,9 @@ fn looks_like_shell_command_copy(text: &str) -> bool {
         .map(|line| line.to_ascii_lowercase())
         .collect::<Vec<_>>();
     let shell_verbs = [
-        "printf ",
-        "echo ",
-        "exec ",
-        "cd ",
-        "ssh ",
-        "cargo ",
-        "python ",
-        "python3 ",
-        "npm ",
-        "git ",
-        "tmux ",
-        "screen ",
-        "mkdir ",
-        "rm ",
-        "cp ",
-        "mv ",
-        "cat ",
-        "sed ",
-        "rg ",
-        "find ",
-        "ls ",
-        "export ",
-        "source ",
+        "printf ", "echo ", "exec ", "cd ", "ssh ", "cargo ", "python ", "python3 ", "npm ",
+        "git ", "tmux ", "screen ", "mkdir ", "rm ", "cp ", "mv ", "cat ", "sed ", "rg ", "find ",
+        "ls ", "export ", "source ",
     ];
     let looks_like_command_line = |line: &str| {
         let trimmed = line.trim_start_matches("$ ").trim();

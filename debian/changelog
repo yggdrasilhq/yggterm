@@ -1,3 +1,13 @@
+yggterm (2.1.29-1) unstable; urgency=medium
+
+  * Keep local terminal startup and typing off slow cleanup/background paths by fast-pinging the current daemon before legacy socket cleanup, removing GUI-startup cleanup work, and preserving background copy cooldowns.
+  * Stop stale PID-targeted app-control requests from being handled by later GUI clients, so smoke/watch cleanup requests cannot poison the next launch.
+  * Keep KDE live-session retention bounded on X11 and Wayland while preserving the promoted Live Sessions group and close affordances.
+  * Make direct-install packaging more complete across platforms, including the Windows mock CLI companion and portable POSIX launcher fallbacks.
+  * Harden Linux live-watch proof so no successful app-control state sample is a failure.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 24 Apr 2026 12:58:45 +0530
+
 yggterm (2.1.15-1) unstable; urgency=medium
 
   * Restore local live sessions under both the local tree and Live Sessions so prompt-ready local shells stop leaving an empty promoted group after restore.

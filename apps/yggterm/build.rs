@@ -58,5 +58,9 @@ fn main() {
     resource.set("InternalName", "yggterm");
     resource.set("OriginalFilename", "yggterm.exe");
     resource.set("CompanyName", "Yggdrasil HQ");
-    resource.compile().expect("compile Windows resources");
+    if let Err(error) = resource.compile() {
+        println!(
+            "cargo:warning=skipping Windows resource metadata/icon because resource compilation failed: {error}"
+        );
+    }
 }

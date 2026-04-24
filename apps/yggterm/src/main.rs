@@ -20,7 +20,7 @@ use yggterm_platform::configure_gui_entry_process;
 use yggterm_server::{
     AppControlPreviewLayout, AppControlRightPanelMode, AppControlViewMode, PersistedDaemonState,
     ProbeTerminalViewportInputMode, SessionKind, YggtermServer, active_client_instance_records,
-    cleanup_legacy_daemons, default_endpoint, detect_ghostty_host, ensure_local_daemon_running,
+    default_endpoint, detect_ghostty_host, ensure_local_daemon_running,
     local_headless_companion_executable_from_current, ping, run_app_control_background_window,
     run_app_control_close_window, run_app_control_create_terminal, run_app_control_describe_rows,
     run_app_control_describe_state, run_app_control_drag, run_app_control_dump_state,
@@ -161,9 +161,6 @@ fn launch_app_background(
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
         .env(ENV_YGGTERM_HOME, home_dir);
-    if let Some(parent) = current_exe.parent() {
-        command.current_dir(parent);
-    }
     if allow_multi_window {
         command.env("YGGTERM_ALLOW_MULTI_WINDOW", "1");
     }
@@ -1154,9 +1151,6 @@ fn main() -> Result<()> {
     let prefer_ghostty_backend = settings.prefer_ghostty_backend;
     let endpoint = default_endpoint(store.home_dir());
     install_signal_shutdown(store.home_dir().to_path_buf(), endpoint.clone());
-    let cleanup_span = PerfSpan::start(&startup_home, "startup", "cleanup_legacy_daemons");
-    let _ = cleanup_legacy_daemons(&endpoint, &current_exe);
-    cleanup_span.finish(serde_json::json!({}));
     warm_daemon_start(endpoint.clone(), Some(startup_home.clone()));
     start_daemon_watchdog(endpoint.clone(), Some(startup_home.clone()));
     let linux_window_profile = detect_linux_window_profile();
@@ -1175,16 +1169,17 @@ fn main() -> Result<()> {
     let host = detect_ghostty_host();
     host_span.finish(serde_json::json!({ "detail": host.detail }));
     let initial_server_sync_span = PerfSpan::start(&startup_home, "startup", "warm_server_sync");
-    let initial_server_snapshot = load_initial_server_snapshot_fast(
+    let initial_server_snapshot_load = load_initial_server_snapshot_fast(
         &store,
         &browser_tree,
         prefer_ghostty_backend,
         &host,
         theme,
     );
+    let initial_server_snapshot = initial_server_snapshot_load.snapshot;
     initial_server_sync_span.finish(serde_json::json!({
-        "loaded": initial_server_snapshot.is_some(),
         "mode": "cached_snapshot_only",
+        "detail": initial_server_snapshot_load.detail,
     }));
     let server_daemon_detail = if initial_server_snapshot.is_some() {
         "warming server in background".to_string()
@@ -1368,26 +1363,71 @@ fn configure_linux_webkit_memory_policy() {
 #[cfg(not(target_os = "linux"))]
 fn configure_linux_webkit_memory_policy() {}
 
+struct InitialServerSnapshotLoad {
+    snapshot: Option<yggterm_server::ServerUiSnapshot>,
+    detail: serde_json::Value,
+}
+
 fn load_initial_server_snapshot_fast(
     store: &SessionStore,
     browser_tree: &SessionNode,
     prefer_ghostty_backend: bool,
     host: &yggterm_server::GhosttyHostSupport,
     theme: UiTheme,
-) -> Option<yggterm_server::ServerUiSnapshot> {
+) -> InitialServerSnapshotLoad {
     if std::env::var(DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT_ENV)
         .ok()
         .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
     {
-        return None;
+        return InitialServerSnapshotLoad {
+            snapshot: None,
+            detail: serde_json::json!({
+                "loaded": false,
+                "reason": "debug_disabled",
+                "state_path": store.home_dir().join("server-state.json").display().to_string(),
+            }),
+        };
     }
     let state_path = store.home_dir().join("server-state.json");
-    let saved = fs::read_to_string(&state_path)
-        .ok()
-        .and_then(|json| serde_json::from_str::<PersistedDaemonState>(&json).ok())?;
+    let saved_json = match fs::read_to_string(&state_path) {
+        Ok(json) => json,
+        Err(error) => {
+            return InitialServerSnapshotLoad {
+                snapshot: None,
+                detail: serde_json::json!({
+                    "loaded": false,
+                    "reason": "read_failed",
+                    "state_path": state_path.display().to_string(),
+                    "error": error.to_string(),
+                }),
+            };
+        }
+    };
+    let saved = match serde_json::from_str::<PersistedDaemonState>(&saved_json) {
+        Ok(saved) => saved,
+        Err(error) => {
+            return InitialServerSnapshotLoad {
+                snapshot: None,
+                detail: serde_json::json!({
+                    "loaded": false,
+                    "reason": "parse_failed",
+                    "state_path": state_path.display().to_string(),
+                    "error": error.to_string(),
+                    "json_size": saved_json.len(),
+                }),
+            };
+        }
+    };
     let mut server = YggtermServer::new(browser_tree, prefer_ghostty_backend, host.clone(), theme);
     server.restore_persisted_state_with_launch_policy(saved, Some(store), false);
-    Some(server.snapshot())
+    InitialServerSnapshotLoad {
+        snapshot: Some(server.snapshot()),
+        detail: serde_json::json!({
+            "loaded": true,
+            "reason": "restored",
+            "state_path": state_path.display().to_string(),
+        }),
+    }
 }
 
 fn install_signal_shutdown(home_dir: std::path::PathBuf, endpoint: yggterm_server::ServerEndpoint) {

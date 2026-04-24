@@ -3,9 +3,9 @@ use crate::{
     GhosttyHostSupport, ManagedSessionView, PersistedDaemonState, RemoteMachineSnapshot,
     RemoteRuntimeRegistry, ServerUiSnapshot, SessionKind, SnapshotSessionView, SshConnectTarget,
     TerminalManager, WorkspaceViewMode, YggtermServer, active_client_instance_records,
-    current_millis, fetch_remote_generation_context, local_headless_companion_executable_from_current,
-    persist_remote_generated_copy, remote_resume_runtime_output_requires_restart,
-    terminate_remote_codex_session,
+    current_millis, fetch_remote_generation_context,
+    local_headless_companion_executable_from_current, persist_remote_generated_copy,
+    remote_resume_runtime_output_requires_restart, terminate_remote_codex_session,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -16,7 +16,9 @@ use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::MutexGuard;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
@@ -42,6 +44,10 @@ const DEFAULT_ORPHAN_DAEMON_REAP_AFTER_MS: u64 = 180_000;
 const DUPLICATE_SAME_HOME_GRACE_MS: u64 = 2_000;
 const REMOTE_ATTACH_STARTUP_GRACE_MS: u64 = 900;
 
+fn startup_prewarm_should_run(active_path: &str) -> bool {
+    !active_path.starts_with("live::")
+}
+
 #[cfg(target_os = "linux")]
 fn daemon_expected_binary_paths(current_exe: &Path) -> Vec<PathBuf> {
     let mut allowed = vec![current_exe.to_path_buf()];
@@ -52,7 +58,11 @@ fn daemon_expected_binary_paths(current_exe: &Path) -> Vec<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
-fn daemon_binary_is_legacy(current_exe: &Path, argv0: &str, proc_exe_target: Option<&Path>) -> bool {
+fn daemon_binary_is_legacy(
+    current_exe: &Path,
+    argv0: &str,
+    proc_exe_target: Option<&Path>,
+) -> bool {
     let allowed = daemon_expected_binary_paths(current_exe);
     let argv_allowed = allowed
         .iter()
@@ -70,6 +80,14 @@ fn daemon_binary_is_legacy(current_exe: &Path, argv0: &str, proc_exe_target: Opt
     !allowed
         .iter()
         .any(|candidate| target == candidate.to_string_lossy())
+}
+
+#[cfg(target_os = "linux")]
+fn legacy_daemon_reap_applies_to_home(
+    current_home: Option<&Path>,
+    daemon_home: Option<&Path>,
+) -> bool {
+    current_home.is_some() && daemon_home == current_home
 }
 
 fn terminal_sidebar_snapshot_from_screen(text: &str) -> Option<(String, Vec<String>)> {
@@ -1351,7 +1369,7 @@ fn trim_terminal_buffers(
     runtime: &Arc<Mutex<DaemonRuntime>>,
     idle_trim_after_ms: u64,
 ) -> Result<TerminalTrimTick> {
-    let runtime = runtime.lock().expect("daemon runtime lock poisoned");
+    let runtime = lock_daemon_runtime(runtime, "trim_terminal_buffers");
     let before = runtime.terminals.stats();
     let trim = runtime
         .terminals
@@ -1648,7 +1666,7 @@ fn build_background_copy_updates(
 
 fn run_background_copy_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usize> {
     let (store, settings, local_root, live_sessions, remote_machines, ssh_targets, perf_home) = {
-        let runtime = runtime.lock().expect("daemon runtime lock poisoned");
+        let runtime = lock_daemon_runtime(runtime, "run_background_copy_chore_read");
         let settings = runtime.store.load_settings().unwrap_or_default();
         let local_root = runtime.store.load_codex_tree(&settings)?;
         (
@@ -1680,7 +1698,7 @@ fn run_background_copy_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usiz
         return Ok(0);
     }
 
-    let mut runtime = runtime.lock().expect("daemon runtime lock poisoned");
+    let mut runtime = lock_daemon_runtime(runtime, "run_background_copy_chore_apply");
     for update in &updates {
         if let Some(title) = update.title.as_deref() {
             runtime
@@ -2316,7 +2334,7 @@ fn spawn_active_terminal_prewarm(
 ) {
     std::thread::spawn(move || {
         let active_path = {
-            let runtime = runtime.lock().expect("daemon runtime lock poisoned");
+            let runtime = lock_daemon_runtime(&runtime, "startup_prewarm_active_path");
             if runtime.server.active_view_mode() == WorkspaceViewMode::Terminal
                 && runtime.server.active_session_supports_terminal()
             {
@@ -2328,6 +2346,19 @@ fn spawn_active_terminal_prewarm(
         let Some(active_path) = active_path else {
             return;
         };
+        if !startup_prewarm_should_run(&active_path) {
+            append_trace_event(
+                &home_dir,
+                "daemon",
+                "startup_prewarm",
+                "skip",
+                serde_json::json!({
+                    "path": active_path,
+                    "reason": "runtime_owned_live_session",
+                }),
+            );
+            return;
+        }
         append_trace_event(
             &home_dir,
             "daemon",
@@ -2336,7 +2367,7 @@ fn spawn_active_terminal_prewarm(
             serde_json::json!({ "path": active_path }),
         );
         let outcome = {
-            let mut runtime = runtime.lock().expect("daemon runtime lock poisoned");
+            let mut runtime = lock_daemon_runtime(&runtime, "startup_prewarm_ensure");
             runtime.ensure_terminal_for_active()
         };
         match outcome {
@@ -2373,9 +2404,18 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
     let idle_shutdown_ms = daemon_idle_shutdown_ms();
     let terminal_idle_trim_after_ms = daemon_terminal_idle_trim_after_ms();
     let home_dir = {
-        let runtime = runtime.lock().expect("daemon runtime lock poisoned");
+        let runtime = lock_daemon_runtime(&runtime, "run_daemon_home_dir");
         runtime.store.home_dir().to_path_buf()
     };
+    append_trace_event(
+        &home_dir,
+        "daemon",
+        "lifecycle",
+        "run_begin",
+        serde_json::json!({
+            "endpoint": format!("{endpoint:?}"),
+        }),
+    );
     match RemoteRuntimeRegistry::open(&home_dir) {
         Ok(registry) => append_trace_event(
             &home_dir,
@@ -2427,7 +2467,8 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                 match trim_terminal_buffers(&runtime, terminal_idle_trim_after_ms) {
                     Ok(summary) if summary.trimmed_sessions > 0 => {
                         let home_dir = {
-                            let runtime = runtime.lock().expect("daemon runtime lock poisoned");
+                            let runtime =
+                                lock_daemon_runtime(&runtime, "trim_terminal_buffers_home_dir");
                             runtime.store.home_dir().to_path_buf()
                         };
                         append_trace_event(
@@ -2476,7 +2517,7 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
             .set_nonblocking(true)
             .context("setting daemon unix listener nonblocking")?;
         let host = {
-            let runtime = runtime.lock().expect("daemon runtime lock poisoned");
+            let runtime = lock_daemon_runtime(&runtime, "run_daemon_unix_host");
             runtime.support.kind.as_str().to_string()
         };
         info!(path=%path.display(), host=%host, "yggterm server daemon listening");
@@ -2514,6 +2555,16 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                 Err(error) => return Err(error).context("accepting daemon client"),
             }
         }
+        append_trace_event(
+            &home_dir,
+            "daemon",
+            "lifecycle",
+            "run_end",
+            serde_json::json!({
+                "endpoint": format!("{endpoint:?}"),
+                "transport": "unix",
+            }),
+        );
         return Ok(());
     }
 
@@ -2532,7 +2583,7 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                 .set_nonblocking(true)
                 .context("setting daemon tcp listener nonblocking")?;
             let host_kind = {
-                let runtime = runtime.lock().expect("daemon runtime lock poisoned");
+                let runtime = lock_daemon_runtime(&runtime, "run_daemon_tcp_host");
                 runtime.support.kind.as_str().to_string()
             };
             info!(host=%host, port, host_kind=%host_kind, "yggterm server daemon listening");
@@ -2586,7 +2637,80 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                     Err(error) => return Err(error).context("accepting daemon client"),
                 }
             }
+            append_trace_event(
+                &home_dir,
+                "daemon",
+                "lifecycle",
+                "run_end",
+                serde_json::json!({
+                    "endpoint": format!("{endpoint:?}"),
+                    "transport": "tcp",
+                }),
+            );
             Ok(())
+        }
+    }
+}
+
+fn lock_daemon_runtime<'a>(
+    runtime: &'a Arc<Mutex<DaemonRuntime>>,
+    label: &'static str,
+) -> MutexGuard<'a, DaemonRuntime> {
+    match runtime.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            let guard = poisoned.into_inner();
+            append_trace_event(
+                guard.store.home_dir(),
+                "daemon",
+                "lifecycle",
+                "runtime_lock_poisoned",
+                serde_json::json!({
+                    "label": label,
+                }),
+            );
+            warn!(label, "daemon runtime lock poisoned; recovering");
+            guard
+        }
+    }
+}
+
+fn daemon_request_response(
+    runtime: &Arc<Mutex<DaemonRuntime>>,
+    request: ServerRequest,
+) -> ServerResponse {
+    let request_name = server_request_name(&request);
+    let mut runtime = lock_daemon_runtime(runtime, "handle_request");
+    let home_dir = runtime.store.home_dir().to_path_buf();
+    match panic::catch_unwind(AssertUnwindSafe(|| runtime.handle_request(request))) {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => ServerResponse::Error {
+            message: error.to_string(),
+        },
+        Err(payload) => {
+            let panic_message = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| {
+                    payload
+                        .downcast_ref::<&str>()
+                        .map(|value| (*value).to_string())
+                })
+                .unwrap_or_else(|| "unknown panic payload".to_string());
+            append_trace_event(
+                &home_dir,
+                "daemon",
+                "request",
+                "panic",
+                serde_json::json!({
+                    "request": request_name,
+                    "panic": panic_message,
+                }),
+            );
+            warn!(request = request_name, panic = %panic_message, "daemon request panicked");
+            ServerResponse::Error {
+                message: format!("daemon request {request_name} panicked: {panic_message}"),
+            }
         }
     }
 }
@@ -2601,6 +2725,7 @@ fn cleanup_legacy_unix_daemons(endpoint: &ServerEndpoint) -> Result<()> {
     };
     let entries = fs::read_dir(home_dir)
         .with_context(|| format!("reading daemon socket dir {}", home_dir.display()))?;
+    let mut shutdown_paths = Vec::new();
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
@@ -2617,6 +2742,7 @@ fn cleanup_legacy_unix_daemons(endpoint: &ServerEndpoint) -> Result<()> {
                 let _ = stream.write_all(br#"{"kind":"shutdown"}"#);
                 let _ = stream.write_all(b"\n");
                 let _ = stream.flush();
+                shutdown_paths.push(path);
             }
             Err(_) => {
                 let _ = fs::remove_file(&path);
@@ -2627,16 +2753,21 @@ fn cleanup_legacy_unix_daemons(endpoint: &ServerEndpoint) -> Result<()> {
         if removed_stale {
             continue;
         }
+    }
 
-        for _ in 0..10 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            if !path.exists() {
-                break;
-            }
+    if shutdown_paths.is_empty() {
+        return Ok(());
+    }
+
+    for _ in 0..3 {
+        shutdown_paths.retain(|path| path.exists());
+        if shutdown_paths.is_empty() {
+            return Ok(());
         }
-        if path.exists() {
-            let _ = fs::remove_file(&path);
-        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    for path in shutdown_paths {
+        let _ = fs::remove_file(path);
     }
     Ok(())
 }
@@ -2846,7 +2977,9 @@ fn cleanup_legacy_linux_daemon_processes(
             .and_then(|home| active_client_instance_records(home, &default_endpoint(home)).ok())
             .is_some_and(|records| !records.is_empty());
         let age_ms = linux_proc_pid_age_ms(pid).unwrap_or_default();
-        let is_legacy_binary = daemon_binary_is_legacy(current_exe, argv0, proc_exe_target.as_deref());
+        let is_legacy_binary =
+            legacy_daemon_reap_applies_to_home(current_home.as_deref(), daemon_home.as_deref())
+                && daemon_binary_is_legacy(current_exe, argv0, proc_exe_target.as_deref());
         let is_orphan_clientless = !has_clients
             && age_ms >= reap_after_ms
             && daemon_home.as_deref() != current_home.as_deref();
@@ -2954,15 +3087,7 @@ fn handle_unix_stream(
     let request = read_request(stream.try_clone().context("cloning unix stream")?)?;
     mark_daemon_activity(last_activity_ms.as_ref());
     let should_shutdown = matches!(request, ServerRequest::Shutdown);
-    let response = match {
-        let mut runtime = runtime.lock().expect("daemon runtime lock poisoned");
-        runtime.handle_request(request)
-    } {
-        Ok(response) => response,
-        Err(error) => ServerResponse::Error {
-            message: error.to_string(),
-        },
-    };
+    let response = daemon_request_response(&runtime, request);
     write_response(&mut stream, &response)?;
     trim_process_heap_if_supported();
     Ok(should_shutdown)
@@ -2976,15 +3101,7 @@ fn handle_tcp_stream(
     let request = read_request(stream.try_clone().context("cloning tcp stream")?)?;
     mark_daemon_activity(last_activity_ms.as_ref());
     let should_shutdown = matches!(request, ServerRequest::Shutdown);
-    let response = match {
-        let mut runtime = runtime.lock().expect("daemon runtime lock poisoned");
-        runtime.handle_request(request)
-    } {
-        Ok(response) => response,
-        Err(error) => ServerResponse::Error {
-            message: error.to_string(),
-        },
-    };
+    let response = daemon_request_response(&runtime, request);
     write_response(&mut stream, &response)?;
     trim_process_heap_if_supported();
     Ok(should_shutdown)
@@ -3001,15 +3118,17 @@ fn trim_process_heap_if_supported() {
 fn trim_process_heap_if_supported() {}
 
 fn send_request(endpoint: &ServerEndpoint, request: &ServerRequest) -> Result<ServerResponse> {
+    let mut request_bytes =
+        serde_json::to_vec(request).context("serializing daemon request payload")?;
+    request_bytes.push(b'\n');
     match endpoint {
         #[cfg(unix)]
         ServerEndpoint::UnixSocket(path) => {
             let mut stream = std::os::unix::net::UnixStream::connect(path)
                 .with_context(|| format!("connecting to {}", path.display()))?;
-            serde_json::to_writer(&mut stream, request).context("serializing daemon request")?;
             stream
-                .write_all(b"\n")
-                .context("writing daemon request terminator")?;
+                .write_all(&request_bytes)
+                .context("writing daemon request")?;
             stream.flush().context("flushing daemon request")?;
             let mut reader = BufReader::new(stream);
             let mut line = String::new();
@@ -3029,10 +3148,9 @@ fn send_request(endpoint: &ServerEndpoint, request: &ServerRequest) -> Result<Se
         ServerEndpoint::Tcp { host, port } => {
             let mut stream = std::net::TcpStream::connect((host.as_str(), *port))
                 .with_context(|| format!("connecting to {}:{}", host, port))?;
-            serde_json::to_writer(&mut stream, request).context("serializing daemon request")?;
             stream
-                .write_all(b"\n")
-                .context("writing daemon request terminator")?;
+                .write_all(&request_bytes)
+                .context("writing daemon request")?;
             stream.flush().context("flushing daemon request")?;
             let mut reader = BufReader::new(stream);
             let mut line = String::new();
@@ -3059,6 +3177,8 @@ mod tests {
     use std::path::Path;
 
     use super::collect_remote_copy_candidates;
+    #[cfg(target_os = "linux")]
+    use super::legacy_daemon_reap_applies_to_home;
     #[cfg(target_os = "linux")]
     use super::linux_yggterm_home_from_environ_bytes;
     use super::load_persisted_state;
@@ -3134,6 +3254,29 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_daemon_reap_only_applies_within_same_home() {
+        let current_home = Path::new("/home/pi/.yggterm");
+        let other_home = Path::new("/tmp/yggterm-other-home");
+        assert!(legacy_daemon_reap_applies_to_home(
+            Some(current_home),
+            Some(current_home)
+        ));
+        assert!(!legacy_daemon_reap_applies_to_home(
+            Some(current_home),
+            Some(other_home)
+        ));
+        assert!(!legacy_daemon_reap_applies_to_home(
+            Some(current_home),
+            None
+        ));
+        assert!(!legacy_daemon_reap_applies_to_home(
+            None,
+            Some(current_home)
+        ));
+    }
+
     #[test]
     fn write_persisted_state_creates_parent_and_round_trips() {
         let root = std::env::temp_dir().join(format!(
@@ -3166,6 +3309,15 @@ mod tests {
         assert_eq!(loaded.active_session_path, expected.active_session_path);
         assert_eq!(loaded.live_sessions, expected.live_sessions);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn startup_prewarm_skips_runtime_owned_live_sessions() {
+        assert!(!super::startup_prewarm_should_run(
+            "live::fc99adfa-d0b1-4e50-a27d-cbb3a1602b4b"
+        ));
+        assert!(super::startup_prewarm_should_run("local://shell"));
+        assert!(super::startup_prewarm_should_run("codex://session"));
     }
 
     #[test]
