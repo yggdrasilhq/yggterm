@@ -725,6 +725,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         .unwrap_or("");
     let cursor_line_text = host
         .get("cursor_line_text")
+        .or_else(|| host.get("cursor_row_text"))
         .and_then(Value::as_str)
         .map(str::trim)
         .unwrap_or("");
@@ -1480,6 +1481,25 @@ mod tests {
             "cursor_line_text": "› Implement {feature}",
             "input_enabled": true,
             "helper_textarea_focused": true,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": 0.0, "top": 0.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(terminal_host_problem_for_app_control(&host), None);
+    }
+
+    #[test]
+    fn terminal_host_problem_accepts_basic_snapshot_codex_prompt_row_text() {
+        let host = json!({
+            "text_sample": "pi@jojo:~$ codex\n╭───────────────────────────────────────────╮\n│ >_ OpenAI Codex (v0.124.0)                │\n│                                           │\n│ model:     gpt-5.4 low   /model to change │\n│ directory: ~                              │\n╰───────────────────────────────────────────╯\n\n› Summarize recent commits\n\n  gpt-5.4 low · ~",
+            "cursor_row_text": "› Summarize recent commits",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "cursor_sample_rect": {"left": 325.0, "top": 256.0, "width": 8.0, "height": 18.0},
             "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
             "host_content_width": 840.0,
             "host_content_height": 830.0,
