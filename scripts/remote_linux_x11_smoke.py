@@ -180,6 +180,10 @@ print(
 )
 """
 
+
+def write_json(path: Path, payload) -> None:
+    path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+
 OWNED_CLIENTS_SNIPPET = r"""
 import json
 import os
@@ -269,10 +273,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir")
     parser.add_argument("--remote-dir")
     parser.add_argument("--timeout-ms", type=int, default=20000)
-    parser.add_argument("--smoke-timeout-sec", type=int, default=420)
+    parser.add_argument("--smoke-timeout-sec", type=int)
     parser.add_argument("--only-check", action="append", default=[])
     parser.add_argument("--keep-remote-dir", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.smoke_timeout_sec is None:
+        if args.only_check:
+            args.smoke_timeout_sec = max(420, 120 + 40 * len(args.only_check))
+        else:
+            args.smoke_timeout_sec = 900
+    return args
 
 
 def quote(value: str) -> str:
@@ -1259,7 +1269,7 @@ def main() -> int:
             raise RuntimeError(
                 f"bad daemon/socket notifications were already visible right after launch: {initial_bad_notifications!r}"
             )
-        (out_dir / "initial-state.json").write_text(json.dumps(initial_state, indent=2), encoding="utf-8")
+        write_json(out_dir / "initial-state.json", initial_state)
         smoke_session = args.session
         if args.session_kind == "plain" and smoke_session == "local://remote-smoke":
             smoke_session = remote_create_plain_terminal(
@@ -1322,7 +1332,7 @@ def main() -> int:
         pulled_dir = out_dir / "proof"
         pulled_dir.mkdir(parents=True, exist_ok=True)
         metadata["local_proof_dir"] = str(pulled_dir)
-        metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        write_json(metadata_path, metadata)
         proof_pull_timeout = max(60.0, min(float(args.smoke_timeout_sec), 180.0))
         try:
             scp_from(
@@ -1346,7 +1356,7 @@ def main() -> int:
             except Exception as exc:
                 metadata["perf_pull_error"] = str(exc)
 
-        metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        write_json(metadata_path, metadata)
 
         try:
             metadata["close_response"] = remote_close_window(
@@ -1406,7 +1416,7 @@ def main() -> int:
             metadata["error"] = metadata["plasmashell_problem"]
         if owned_clients_survived and not metadata.get("error"):
             metadata["error"] = "owned Yggterm clients survived remote smoke cleanup"
-        metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        write_json(metadata_path, metadata)
         if desktop_notifications_enabled:
             remote_notify(
                 args.host,
@@ -1426,7 +1436,7 @@ def main() -> int:
         metadata["ok"] = False
         metadata["error"] = str(exc)
         try:
-            metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+            write_json(metadata_path, metadata)
         except Exception:
             pass
         print(metadata_path)

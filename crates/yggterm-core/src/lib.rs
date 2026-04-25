@@ -1444,10 +1444,7 @@ mod tests {
         };
 
         let mut browser = SessionBrowserState::new(root);
-        browser.restore_ui_state(
-            &["/workspace/machine-a/nested".to_string()],
-            Some("/workspace/machine-a/nested/session-1"),
-        );
+        browser.restore_ui_state(&["/workspace/machine-a/nested".to_string()], None);
 
         assert!(
             browser

@@ -218,9 +218,8 @@ const LIVE_SESSION_SNAPSHOT_IDLE_POLL_MS: u64 = 1_500;
 const LIVE_SESSION_SNAPSHOT_NUDGE_INTERVAL_MS: u64 = 250;
 const LIVE_SESSION_SNAPSHOT_NUDGE_POLLS: usize = 24;
 // Inline tree rename focuses asynchronously after context-menu and sidebar
-// interactions. Keep unchanged blur commits suppressed long enough for the
-// delayed focus retries to settle before we treat a blur as intentional.
-const TREE_RENAME_BLUR_COMMIT_GRACE_MS: u64 = 1600;
+// interactions. Treat Enter as the commit action so transient WebView focus
+// churn during controlled input updates cannot commit a half-typed label.
 const TERMINAL_BUSY_HINT_MS: u64 = 2_000;
 const TITLEBAR_HEIGHT_PX: f64 = 32.0;
 const TITLEBAR_RESPONSIVE_CSS: &str = r#"
@@ -1442,31 +1441,16 @@ impl ShellState {
         for session in live_sessions.iter_mut() {
             self.overlay_live_terminal_sidebar_sample(session);
         }
-        let session_for_busy_hint = |session_path: &str| {
-            live_sessions
-                .iter()
-                .chain(self.server.active_session().into_iter())
-                .find(|session| {
-                    normalize_live_session_path(&session.session_path)
-                        == normalize_live_session_path(session_path)
-                        || session.session_path == session_path
-                })
-        };
         let optimistic_busy_paths = self
             .terminal_busy_hint_until_ms
             .iter()
-            .filter(|(session_path, deadline_ms)| {
+            .filter(|(_session_path, deadline_ms)| {
                 if current_millis() > **deadline_ms {
                     return false;
                 }
-                let Some(session) = session_for_busy_hint(session_path) else {
-                    return true;
-                };
-                if session.terminal_foreground_active == Some(false)
-                    && session_is_idle_for_sidebar_icon(session)
-                {
-                    return false;
-                }
+                // This hint is set immediately after terminal input. The live
+                // session snapshot may still contain the pre-command prompt, so
+                // do not let stale idle text cancel the short optimistic state.
                 true
             })
             .map(|(session_path, _)| session_path.clone())
@@ -2558,6 +2542,7 @@ impl ShellState {
                 if always_sync_selection {
                     self.ensure_active_session_visible();
                 }
+                self.preserve_tree_rename_selection();
                 self.sync_browser_settings();
                 self.refresh_search_state(telemetry_label);
                 self.record_restore_issue_telemetry(telemetry_label);
@@ -2639,6 +2624,7 @@ impl ShellState {
                 }
                 self.sync_active_session_selection();
                 self.ensure_active_session_visible();
+                self.preserve_tree_rename_selection();
                 self.sync_browser_settings();
                 self.refresh_search_state("apply_interactive_snapshot_result");
                 self.record_restore_issue_telemetry("apply_interactive_snapshot_result");
@@ -2693,6 +2679,7 @@ impl ShellState {
                     self.sync_active_session_selection();
                 }
                 self.ensure_active_session_expanded();
+                self.preserve_tree_rename_selection();
                 self.sync_browser_settings();
                 self.record_restore_issue_telemetry("apply_daemon_snapshot_result");
                 self.record_preview_issue_telemetry("apply_daemon_snapshot_result");
@@ -3088,6 +3075,9 @@ impl ShellState {
         }
     }
     fn sync_active_session_selection(&mut self) {
+        if self.preserve_tree_rename_selection() {
+            return;
+        }
         if let Some(active) = self.server.active_session().cloned() {
             let selected_path = self
                 .active_browser_selection_path_for_session()
@@ -3098,7 +3088,30 @@ impl ShellState {
             self.browser.select_path(selected_path);
         }
     }
+    fn preserve_tree_rename_selection(&mut self) -> bool {
+        let Some(rename_path) = self.tree_rename_path.clone() else {
+            return false;
+        };
+        self.browser.ensure_visible_path(&rename_path);
+        if let Some(rename_depth) = self
+            .browser
+            .rows()
+            .iter()
+            .find(|row| row.full_path == rename_path)
+            .map(|row| row.depth)
+        {
+            self.tree_rename_depth = Some(rename_depth);
+            self.browser.select_path(rename_path.clone());
+        }
+        self.selected_tree_paths.clear();
+        self.selected_tree_paths.insert(rename_path.clone());
+        self.selection_anchor = Some(rename_path);
+        true
+    }
     fn background_active_selection_sync_needed(&self) -> bool {
+        if self.tree_rename_path.is_some() {
+            return false;
+        }
         if self.selected_tree_paths.is_empty() {
             return true;
         }
@@ -6601,6 +6614,71 @@ fn daemon_endpoint_key(endpoint: &ServerEndpoint) -> String {
     }
 }
 #[cfg(unix)]
+fn normalize_daemon_socket_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+#[cfg(unix)]
+fn socket_symlink_chain_stays_in_home(path: &Path, home: &Path) -> bool {
+    let home = normalize_daemon_socket_path_lexically(home);
+    let mut current = normalize_daemon_socket_path_lexically(path);
+    for _ in 0..8 {
+        let Ok(target) = fs::read_link(&current) else {
+            return true;
+        };
+        let resolved = if target.is_absolute() {
+            target
+        } else {
+            current.parent().unwrap_or(home.as_path()).join(target)
+        };
+        current = normalize_daemon_socket_path_lexically(&resolved);
+        if !current.starts_with(&home) {
+            return false;
+        }
+    }
+    false
+}
+#[cfg(unix)]
+fn clear_current_endpoint_link_escaping_home(endpoint: &ServerEndpoint) {
+    let ServerEndpoint::UnixSocket(path) = endpoint else {
+        return;
+    };
+    let Some(home) = path.parent() else {
+        return;
+    };
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    let dangling = metadata.file_type().is_symlink() && fs::metadata(path).is_err();
+    let escaping =
+        metadata.file_type().is_symlink() && !socket_symlink_chain_stays_in_home(path, home);
+    if !dangling && !escaping {
+        return;
+    }
+    trace_daemon_step(
+        endpoint,
+        "remove_cross_home_socket_link",
+        json!({
+            "current_path": path.display().to_string(),
+            "home": home.display().to_string(),
+            "dangling": dangling,
+            "escaping": escaping,
+        }),
+    );
+    let _ = fs::remove_file(path);
+}
+#[cfg(not(unix))]
+fn clear_current_endpoint_link_escaping_home(_endpoint: &ServerEndpoint) {}
+#[cfg(unix)]
 fn parse_versioned_server_socket_name(path: &Path) -> Option<(u64, u64, u64)> {
     let file_name = path.file_name()?.to_str()?;
     let version = file_name
@@ -6648,7 +6726,21 @@ fn maybe_alias_current_endpoint_to_reachable_versioned_socket(
     let ServerEndpoint::UnixSocket(current_path) = endpoint else {
         return Ok(None);
     };
+    let Some(home) = current_path.parent() else {
+        return Ok(None);
+    };
     for candidate in reachable_versioned_server_socket_candidates(current_path) {
+        if !socket_symlink_chain_stays_in_home(&candidate, home) {
+            trace_daemon_step(
+                endpoint,
+                "skip_cross_home_versioned_socket_candidate",
+                json!({
+                    "candidate_path": candidate.display().to_string(),
+                    "home": home.display().to_string(),
+                }),
+            );
+            continue;
+        }
         let candidate_endpoint = ServerEndpoint::UnixSocket(candidate.clone());
         if ping(&candidate_endpoint).is_err() {
             continue;
@@ -6777,6 +6869,7 @@ fn ensure_daemon_running(endpoint: &ServerEndpoint) -> Result<()> {
         "current_exe",
         json!({ "path": current_exe.display().to_string() }),
     );
+    clear_current_endpoint_link_escaping_home(endpoint);
     if ping(endpoint).is_ok() {
         note_recent_daemon_start(endpoint);
         trace_daemon_step(endpoint, "ping_ok_existing_before_cleanup", json!({}));
@@ -6929,6 +7022,7 @@ fn restart_daemon(endpoint: &ServerEndpoint) -> Result<()> {
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("daemon did not become reachable")))
 }
 fn prepare_current_endpoint_for_spawn(endpoint: &ServerEndpoint) -> Result<()> {
+    clear_current_endpoint_link_escaping_home(endpoint);
     #[cfg(unix)]
     if let ServerEndpoint::UnixSocket(path) = endpoint {
         if local_daemon_socket_should_be_removed_for_spawn(endpoint, path) {
@@ -8806,6 +8900,24 @@ fn app_control_pointer_script(command: &AppControlPointerCommand) -> String {
               }} catch (_error) {{}}
             }}
           }};
+          const titlebarClickFallback = (target) => {{
+            if (!target || typeof Element === 'undefined') {{
+              return false;
+            }}
+            const element = target instanceof Element ? target : null;
+            const actionable = element ? element.closest(
+              '[data-titlebar-session-button="1"], [data-titlebar-summary-action="copy"], [data-titlebar-summary-action="summary"]'
+            ) : null;
+            if (!actionable || typeof actionable.click !== 'function') {{
+              return false;
+            }}
+            try {{
+              actionable.click();
+              return true;
+            }} catch (_error) {{
+              return false;
+            }}
+          }};
           const transition = (x, y, buttons) => {{
             const next = resolveTarget(x, y);
             const prev = pointerState.target;
@@ -8859,7 +8971,10 @@ fn app_control_pointer_script(command: &AppControlPointerCommand) -> String {
             const info = press(x, y, buttonName);
             window.setTimeout(() => {{
               const target = release(x, y, buttonName, clicks);
-              dispatchPair(target, 'click', 'pointerup', makeBase(x, y, info.button, 0, clicks, null));
+              const usedTitlebarFallback = titlebarClickFallback(target);
+              if (!usedTitlebarFallback) {{
+                dispatchPair(target, 'click', 'pointerup', makeBase(x, y, info.button, 0, clicks, null));
+              }}
               if (info.button === 2) {{
                 try {{
                   target.dispatchEvent(new MouseEvent('contextmenu', makeBase(x, y, info.button, 0, clicks, null)));
@@ -8948,7 +9063,18 @@ fn app_control_key_script(command: &AppControlKeyCommand) -> String {
             }}
             return document.querySelector('.xterm-helper-textarea');
           }};
+          const treeRenameInput = () => {{
+            const input = document.querySelector('[data-tree-rename-input="1"]');
+            if (input && input.isConnected) {{
+              return input;
+            }}
+            return null;
+          }};
           const activeTarget = () => {{
+            const renameInput = treeRenameInput();
+            if (renameInput) {{
+              return renameInput;
+            }}
             const active = document.activeElement;
             if (active && active !== document.body && active !== document.documentElement) {{
               return active;
@@ -13593,6 +13719,7 @@ fn remote_scanned_session_from_live(
         recent_context,
         cached_precis: None,
         cached_summary: None,
+        live_runtime: false,
         storage_path,
     }
 }
@@ -14517,15 +14644,14 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
         sync_active_terminal_input_policy(state);
         return;
     }
-    let ignore_unchanged_blur_commit = {
+    let unchanged_rename = {
         let shell = state.read();
         shell.tree_rename_path.as_deref() == Some(row.full_path.as_str())
             && trimmed == row.label.trim()
-            && (!shell.tree_rename_input_focused_once
-                || current_millis().saturating_sub(shell.tree_rename_started_at_ms)
-                    <= TREE_RENAME_BLUR_COMMIT_GRACE_MS)
     };
-    if ignore_unchanged_blur_commit {
+    if unchanged_rename {
+        state.with_mut(|shell| shell.cancel_tree_rename());
+        sync_active_terminal_input_policy(state);
         return;
     }
     state.with_mut(|shell| {
@@ -16647,6 +16773,11 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
         "rows": snapshot.rows.iter().map(|row| {
             let machine = remote_machine_for_sidebar_row(&shell, row);
             let busy = sidebar_row_shows_busy_icon(&snapshot, row);
+            let live_member = snapshot.live_sessions.iter().any(|session| {
+                normalize_live_session_path(&session.session_path)
+                    == normalize_live_session_path(&row.full_path)
+                    || session.session_path == row.full_path
+            });
             json!({
                 "path": row.full_path,
                 "full_path": row.full_path,
@@ -16666,6 +16797,7 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
                 "busy": busy,
                 "icon_kind": if busy { Some("busy") } else { Some(tree_icon_kind(row)) },
                 "icon_text": if busy { None::<&str> } else { tree_icon_glyph(row) },
+                "live_member": live_member,
                 "draggable": is_tree_drag_source_row(row),
                 "drop_target_row": is_drop_target_row(row),
                 "machine_key": machine.as_ref().map(|machine| machine.machine_key.clone()),
@@ -18485,6 +18617,64 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                 || null;
             const mainSurfaceBody =
                 mainSurface?.querySelector('[data-yggterm-main-surface-body="1"]') || null;
+            const previewScrollers = rootNode
+                ? Array.from(rootNode.querySelectorAll('[data-preview-scroll="1"]'))
+                : Array.from(document.querySelectorAll('[data-preview-scroll="1"]'));
+            const previewScroller =
+                pickLast(visibleNodes(previewScrollers))
+                || pickLast(previewScrollers)
+                || null;
+            const previewViewportRect = rectSummary(previewScroller);
+            const previewViewportTop = previewViewportRect ? previewViewportRect.top : -120;
+            const previewViewportBottom = previewViewportRect
+                ? previewViewportRect.bottom
+                : (window.innerHeight + 120);
+            const previewVisibleBlocks = Array.from((previewScroller || document).querySelectorAll('[id^="preview-block-"]'))
+                .map((block) => {
+                    const rect = block.getBoundingClientRect();
+                    return {
+                        id: block.id,
+                        top: Math.round(rect.top),
+                        height: Math.round(rect.height),
+                    };
+                })
+                .filter((block) => block.height > 0 && block.top < previewViewportBottom && block.top + block.height > previewViewportTop);
+            const previewEntries = Array.from((previewScroller || document).querySelectorAll('[data-preview-entry="1"]'));
+            const previewVisibleEntries = previewEntries
+                .map((entry) => {
+                    const rect = entry.getBoundingClientRect();
+                    return {
+                        block_id: entry.id || null,
+                        tone: entry.getAttribute('data-preview-tone'),
+                        block_ix: Number(entry.getAttribute('data-preview-block-ix') || '-1'),
+                        left: Math.round(rect.left),
+                        top: Math.round(rect.top),
+                        width: Math.round(rect.width),
+                        height: Math.round(rect.height),
+                        timestamp: String(entry.getAttribute('data-preview-raw-timestamp') || '').trim(),
+                        text: String(entry.innerText || '').trim().slice(0, 480),
+                    };
+                })
+                .filter((entry) => entry.height > 0 && entry.top < previewViewportBottom && entry.top + entry.height > previewViewportTop);
+            const previewRenderedSections = Array.from((previewScroller || document).querySelectorAll('[data-preview-rendered-section="1"]'))
+                .map((section) => {
+                    const rect = section.getBoundingClientRect();
+                    return {
+                        title: String(section.getAttribute('data-preview-rendered-section-title') || '').trim(),
+                        top: Math.round(rect.top),
+                        height: Math.round(rect.height),
+                        lines: Array.from(section.querySelectorAll('[data-preview-rendered-line="1"]'))
+                            .map((node) => String(node.textContent || '').trim())
+                            .filter(Boolean)
+                            .slice(0, 8),
+                    };
+                })
+                .filter((section) => section.height > 0 && section.top < previewViewportBottom && section.top + section.height > previewViewportTop);
+            const previewFallbackContext = (previewScroller || document).querySelector('[data-preview-fallback-context="1"]');
+            const previewTimestampLabels = Array.from((previewScroller || document).querySelectorAll('[data-preview-timestamp="1"] div:first-child'))
+                .map((node) => String(node.textContent || '').trim())
+                .filter(Boolean)
+                .slice(0, 16);
             const titlebars = rootNode
                 ? Array.from(rootNode.querySelectorAll('[data-yggterm-titlebar="1"]'))
                 : Array.from(document.querySelectorAll('[data-yggterm-titlebar="1"]'));
@@ -18686,6 +18876,16 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                 shell_frame_border_radius: shellFrame ? String(window.getComputedStyle(shellFrame).borderRadius || '') : null,
                 terminal_host_count: terminalHosts.length,
                 terminal_hosts: terminalHosts,
+                preview_scroll_count: previewScrollers.length,
+                preview_text_sample: String(previewScroller?.innerText || "").slice(0, 240),
+                preview_viewport_rect: previewViewportRect,
+                preview_visible_block_count: previewVisibleBlocks.length,
+                preview_visible_block_ids: previewVisibleBlocks.slice(0, 24).map((block) => block.id),
+                preview_visible_entries: previewVisibleEntries.slice(0, 24),
+                preview_rendered_sections: previewRenderedSections.slice(0, 12),
+                preview_fallback_context_visible: Boolean(previewFallbackContext),
+                preview_fallback_context_text: String(previewFallbackContext?.innerText || "").trim().slice(0, 480),
+                preview_timestamp_labels: previewTimestampLabels,
                 sidebar_rect: sidebarRect,
                 sidebar_scroll_top: sidebarScroller ? Math.round(sidebarScroller.scrollTop) : null,
                 sidebar_visible_row_count: visibleSidebarRows.length,
@@ -20389,8 +20589,10 @@ async fn process_pending_app_control_requests(
             machine_key,
             cwd,
             title_hint,
+            session_kind,
         } => {
             let endpoint = state.read().bootstrap.server_endpoint.clone();
+            let requested_kind = session_kind.unwrap_or(SessionKind::Shell);
             match machine_key.clone().map(|key| {
                 state
                     .with(|shell| resolve_app_control_remote_machine(shell, &key))
@@ -20407,6 +20609,18 @@ async fn process_pending_app_control_requests(
                         machine_key.unwrap_or_default()
                     )),
                 },
+                Some(Some((_machine_key, _machine))) if requested_kind != SessionKind::Shell => {
+                    AppControlResponse {
+                        request_id: request.request_id.clone(),
+                        handled_by_pid: std::process::id(),
+                        completed_at_ms: current_millis() as u128,
+                        output_path: None,
+                        data: None,
+                        error: Some(
+                            "app-control remote terminal creation only supports shell".to_string(),
+                        ),
+                    }
+                }
                 Some(Some((machine_key, machine))) => {
                     let cwd_for_task = cwd.clone();
                     let title_hint_for_task = title_hint.clone();
@@ -20444,6 +20658,7 @@ async fn process_pending_app_control_requests(
                                     "machine_key": machine_key,
                                     "cwd": cwd,
                                     "title_hint": title_hint,
+                                    "session_kind": requested_kind,
                                     "active_session_path": created_path,
                                     "message": message,
                                 })),
@@ -20470,7 +20685,7 @@ async fn process_pending_app_control_requests(
                             ensure_daemon_running(&endpoint)?;
                             start_local_session_at(
                                 &endpoint,
-                                SessionKind::Shell,
+                                requested_kind,
                                 cwd_for_task.as_deref(),
                                 title_hint_for_task.as_deref(),
                             )
@@ -20496,6 +20711,7 @@ async fn process_pending_app_control_requests(
                                     "machine_key": Value::Null,
                                     "cwd": cwd,
                                     "title_hint": title_hint,
+                                    "session_kind": requested_kind,
                                     "active_session_path": created_path,
                                     "message": message,
                                 })),
@@ -20584,6 +20800,24 @@ async fn process_pending_app_control_requests(
             }
         }
         AppControlCommand::ReclaimTerminalFocus { session_path } => {
+            let should_sync_policy = state.with_mut(|shell| {
+                let is_active_terminal = shell.server.active_view_mode()
+                    == WorkspaceViewMode::Terminal
+                    && shell.server.active_session_path() == Some(session_path.as_str());
+                if is_active_terminal {
+                    shell.dismiss_titlebar_transients();
+                    shell.terminal_input_override_active = true;
+                    if shell.search_focused {
+                        shell.set_search_focus(false);
+                    }
+                }
+                is_active_terminal
+            });
+            if should_sync_policy {
+                let _ = document::eval(&blur_terminal_focus_blocking_inputs_script());
+                clear_sidebar_keyboard_owner();
+                sync_active_terminal_input_policy(state);
+            }
             let reclaim_script = terminal_reclaim_focus_script_for_session(&session_path);
             let _ = document::eval(&format!(
                 r#"
@@ -23412,6 +23646,11 @@ fn app() -> Element {
                         "data-titlebar-revealed": if titlebar_revealed { "true" } else { "false" },
                         "data-titlebar-hover-active": if titlebar_autohide_hovered() { "true" } else { "false" },
                         style: titlebar_wrapper_style(titlebar_auto_hide_enabled, titlebar_revealed),
+                        onclick: |evt| evt.stop_propagation(),
+                        oncontextmenu: |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                        },
                         onmouseenter: move |_| {
                             if titlebar_auto_hide_enabled {
                                 titlebar_autohide_linger_generation
@@ -24534,7 +24773,9 @@ fn Titlebar(
                                 evt.prevent_default();
                                 evt.stop_propagation();
                             },
-                            onclick: |evt| evt.stop_propagation(),
+                            onclick: |evt| {
+                                evt.stop_propagation();
+                            },
                             ondoubleclick: |evt| evt.stop_propagation(),
                             button {
                                 "data-titlebar-session-button": "1",
@@ -24562,8 +24803,14 @@ fn Titlebar(
                                     "none",
                                     if snapshot.titlebar_session_menu_open { 241 } else { 211 }
                                 ),
-                                onmousedown: |evt| evt.stop_propagation(),
-                                onclick: move |_| on_toggle_session_menu.call(()),
+                                onmousedown: |evt| {
+                                    evt.prevent_default();
+                                    evt.stop_propagation();
+                                },
+                                onclick: move |evt| {
+                                    evt.stop_propagation();
+                                    on_toggle_session_menu.call(());
+                                },
                                 span {
                                     "data-titlebar-title": "1",
                                     style: "min-width:0; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; text-align:left;",
@@ -25627,6 +25874,7 @@ fn terminal_lines_are_bootstrap_scaffold(lines: &[String]) -> bool {
                 || line.starts_with("Daemon PTY: ")
         })
 }
+#[cfg(test)]
 fn session_is_idle_for_sidebar_icon(session: &ManagedSessionView) -> bool {
     let sample = session_sample_text_for_sidebar_icon(session);
     terminal_chunk_looks_idle_for_sidebar_icon(&sample)
@@ -25958,35 +26206,33 @@ fn SidebarRow(
                     ),
                 }
                 if renaming {
-                    input {
-                        "data-tree-rename-input": "1",
-                        "data-tree-rename-row-path": "{row.full_path}",
-                        "data-tree-rename-row-depth": "{row.depth}",
-                        "data-tree-rename-focused-once": if rename_focused_once { "true" } else { "false" },
-                        style: format!(
-                            "width:140px; height:29px; border:none; border-radius:10px; background:rgba(255,255,255,0.92); \
-                             color:{}; font-size:12px; font-weight:600; padding:0 10px; box-shadow: inset 0 0 0 1px rgba(204,214,224,0.9);",
-                            palette.text
-                        ),
-                        value: rename_value,
-                        onmounted: move |evt| async move {
-                            if rename_focus_pending {
+                        input {
+                            "data-tree-rename-input": "1",
+                            "data-tree-rename-row-path": "{row.full_path}",
+                            "data-tree-rename-row-depth": "{row.depth}",
+                            "data-tree-rename-focused-once": if rename_focused_once { "true" } else { "false" },
+                            "data-tree-rename-focus-pending": if rename_focus_pending { "true" } else { "false" },
+                            style: format!(
+                                "width:140px; height:29px; border:none; border-radius:10px; background:rgba(255,255,255,0.92); \
+                                 color:{}; font-size:12px; font-weight:600; padding:0 10px; box-shadow: inset 0 0 0 1px rgba(204,214,224,0.9);",
+                                palette.text
+                            ),
+                            value: rename_value,
+                            onmounted: move |evt| async move {
                                 let _ = evt.set_focus(true).await;
-                            }
-                        },
-                        oninput: move |evt| on_update_rename.call(evt.value()),
-                        onfocus: move |_| on_focus_rename.call(()),
-                        onkeydown: move |evt| {
-                            if evt.key() == Key::Enter {
+                            },
+                            oninput: move |evt| on_update_rename.call(evt.value()),
+                            onfocus: move |_| on_focus_rename.call(()),
+                            onkeydown: move |evt| {
+                                if evt.key() == Key::Enter {
                                 on_commit_rename.call(());
-                            } else if evt.key() == Key::Escape {
-                                on_cancel_rename.call(());
-                            }
-                        },
-                        onblur: move |_| on_commit_rename.call(()),
-                        onclick: |evt| evt.stop_propagation(),
-                        onmousedown: |evt| evt.stop_propagation(),
-                        oncontextmenu: |evt| {
+                                } else if evt.key() == Key::Escape {
+                                    on_cancel_rename.call(());
+                                }
+                            },
+                            onclick: |evt| evt.stop_propagation(),
+                            onmousedown: |evt| evt.stop_propagation(),
+                            oncontextmenu: |evt| {
                             evt.prevent_default();
                             evt.stop_propagation();
                         },
@@ -26156,6 +26402,7 @@ fn SidebarRow(
                                 "data-tree-rename-row-path": "{row.full_path}",
                                 "data-tree-rename-row-depth": "{row.depth}",
                                 "data-tree-rename-focused-once": if rename_focused_once { "true" } else { "false" },
+                                "data-tree-rename-focus-pending": if rename_focus_pending { "true" } else { "false" },
                                 style: format!(
                                     "flex:1; min-width:0; height:29px; border:none; border-radius:10px; background:rgba(255,255,255,0.92); \
                                      color:{}; font-size:12px; font-weight:600; padding:0 10px; box-shadow: inset 0 0 0 1px rgba(204,214,224,0.9);",
@@ -26163,9 +26410,7 @@ fn SidebarRow(
                                 ),
                                 value: rename_value,
                                 onmounted: move |evt| async move {
-                                    if rename_focus_pending {
-                                        let _ = evt.set_focus(true).await;
-                                    }
+                                    let _ = evt.set_focus(true).await;
                                 },
                                 oninput: move |evt| on_update_rename.call(evt.value()),
                                 onfocus: move |_| on_focus_rename.call(()),
@@ -26176,7 +26421,6 @@ fn SidebarRow(
                                         on_cancel_rename.call(());
                                     }
                                 },
-                                onblur: move |_| on_commit_rename.call(()),
                                 onclick: |evt| evt.stop_propagation(),
                                 onmousedown: |evt| evt.stop_propagation(),
                                 oncontextmenu: |evt| {
@@ -33266,15 +33510,8 @@ fn dismiss_titlebar_transients_and_resync_active_terminal(mut state: Signal<Shel
     clear_sidebar_keyboard_owner();
     sync_active_terminal_input_policy(state);
 }
-fn reclaim_active_terminal_input_from_viewport_click(mut state: Signal<ShellState>) {
-    state.with_mut(|shell| {
-        shell.dismiss_titlebar_transients();
-        shell.terminal_input_override_active = true;
-        if shell.search_focused {
-            shell.set_search_focus(false);
-        }
-    });
-    let _ = document::eval(&format!(
+fn blur_terminal_focus_blocking_inputs_script() -> String {
+    format!(
         "(function() {{
             const active = document.activeElement;
             const input = document.getElementById({SEARCH_INPUT_ID:?});
@@ -33288,7 +33525,17 @@ fn reclaim_active_terminal_input_from_viewport_click(mut state: Signal<ShellStat
                 active.blur();
             }}
         }})();"
-    ));
+    )
+}
+fn reclaim_active_terminal_input_from_viewport_click(mut state: Signal<ShellState>) {
+    state.with_mut(|shell| {
+        shell.dismiss_titlebar_transients();
+        shell.terminal_input_override_active = true;
+        if shell.search_focused {
+            shell.set_search_focus(false);
+        }
+    });
+    let _ = document::eval(&blur_terminal_focus_blocking_inputs_script());
     clear_sidebar_keyboard_owner();
     let snapshot = state.read().snapshot();
     if snapshot.active_view_mode != WorkspaceViewMode::Terminal {
@@ -36135,6 +36382,16 @@ fn terminal_reclaim_focus_script_for_session(session_path: &str) -> String {
         r#"
         (() => {{
           const sessionPath = {session_path:?};
+          try {{
+            window.__yggtermActiveTerminalSessionPath = sessionPath;
+          }} catch (_error) {{}}
+          for (const host of Array.from(document.querySelectorAll('[id^="yggterm-terminal-"][data-terminal-session-path]'))) {{
+            try {{
+              const isActiveHost =
+                String(host.getAttribute('data-terminal-session-path') || '') === sessionPath;
+              host.setAttribute('data-active-session-host', isActiveHost ? 'true' : 'false');
+            }} catch (_error) {{}}
+          }}
           const uiOwnsFocus = () => {{
             try {{
               const active = document.activeElement;
@@ -39714,6 +39971,10 @@ mod tests {
     #[test]
     fn terminal_reclaim_focus_script_uses_runtime_focus_helper() {
         let script = terminal_reclaim_focus_script_for_session("local://shell");
+        assert!(script.contains("window.__yggtermActiveTerminalSessionPath = sessionPath;"));
+        assert!(script.contains(
+            "host.setAttribute('data-active-session-host', isActiveHost ? 'true' : 'false');"
+        ));
         assert!(script.contains("if (typeof entry.focusTerminal === \"function\") {"));
         assert!(script.contains("entry.focusTerminal();"));
         assert!(script.contains("window.requestAnimationFrame(() => focusEntry(entry));"));
@@ -39721,6 +39982,14 @@ mod tests {
         assert!(script.contains("window.setTimeout(() => focusEntry(entry), 360);"));
         assert!(script.contains("window.setTimeout(() => focusEntry(entry), 760);"));
         assert!(script.contains("window.setTimeout(() => focusEntry(entry), 980);"));
+    }
+
+    #[test]
+    fn terminal_focus_blocking_blur_script_releases_search_and_settings_fields() {
+        let script = blur_terminal_focus_blocking_inputs_script();
+        assert!(script.contains(SEARCH_INPUT_ID));
+        assert!(script.contains("active.getAttribute('data-settings-field-key')"));
+        assert!(script.contains("active.blur();"));
     }
 
     #[test]
@@ -40577,6 +40846,34 @@ mod tests {
         assert!(script.contains("const target = helperTextarea || host;"));
         assert!(script.contains("target.dispatchEvent(new KeyboardEvent('keydown', keyInit));"));
     }
+
+    #[test]
+    fn app_control_pointer_script_uses_native_click_for_titlebar_buttons() {
+        let script = app_control_pointer_script(&AppControlPointerCommand::Click {
+            x: 24.0,
+            y: 12.0,
+            button: Default::default(),
+            count: 1,
+        });
+        assert!(script.contains("const titlebarClickFallback = (target) =>"));
+        assert!(script.contains("[data-titlebar-session-button=\"1\"]"));
+        assert!(script.contains("[data-titlebar-summary-action=\"copy\"]"));
+        assert!(script.contains("const usedTitlebarFallback = titlebarClickFallback(target);"));
+        assert!(script.contains("if (!usedTitlebarFallback) {"));
+    }
+
+    #[test]
+    fn app_control_key_script_prefers_active_tree_rename_input() {
+        let script = app_control_key_script(&AppControlKeyCommand::Type {
+            text: "htop".to_string(),
+        });
+        assert!(script.contains("const treeRenameInput = () =>"));
+        assert!(script.contains("[data-tree-rename-input=\"1\"]"));
+        assert!(script.contains("const renameInput = treeRenameInput();"));
+        assert!(script.contains("if (renameInput) {"));
+        assert!(script.contains("return renameInput;"));
+    }
+
     #[test]
     fn terminal_eval_script_keeps_dim_rows_explicitly_visible() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
@@ -41130,6 +41427,45 @@ mod tests {
         assert!(!fs::symlink_metadata(&current).is_ok());
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_current_endpoint_for_spawn_removes_cross_home_socket_chain() {
+        let base = std::env::temp_dir().join(format!(
+            "yggterm-cross-home-shell-socket-{}-{}",
+            std::process::id(),
+            current_millis()
+        ));
+        let source_home = base.join("source");
+        let copied_home = base.join("copy");
+        fs::create_dir_all(&source_home).expect("create source home");
+        fs::create_dir_all(&copied_home).expect("create copied home");
+        let source_socket = source_home.join("server-2-1-33.sock");
+        fs::write(&source_socket, b"not a real socket").expect("write source socket placeholder");
+        let copied_legacy = copied_home.join("server-2-1-32.sock");
+        std::os::unix::fs::symlink(&source_socket, &copied_legacy)
+            .expect("link copied legacy socket outside copied home");
+        let copied_current = copied_home.join("server-2-1-33.sock");
+        std::os::unix::fs::symlink(&copied_legacy, &copied_current)
+            .expect("link copied current socket to copied legacy");
+        let endpoint = ServerEndpoint::UnixSocket(copied_current.clone());
+
+        prepare_current_endpoint_for_spawn(&endpoint).expect("prepare current endpoint");
+
+        assert!(
+            !fs::symlink_metadata(&copied_current).is_ok(),
+            "current endpoint must be removed when its symlink chain escapes the copied home"
+        );
+        assert!(
+            fs::symlink_metadata(&copied_legacy).is_ok(),
+            "legacy links are left for candidate filtering and normal cleanup"
+        );
+        assert!(
+            !socket_symlink_chain_stays_in_home(&copied_legacy, &copied_home),
+            "versioned candidate filter must reject copied legacy links resolving outside the home"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
     #[test]
     fn reorder_plan_keeps_position_when_anchor_is_dragged_row_boundary() {
         let gg = BrowserRow {
@@ -41522,6 +41858,7 @@ mod tests {
                     recent_context: "USER: test\nASSISTANT: reply".to_string(),
                     cached_precis: None,
                     cached_summary: None,
+                    live_runtime: false,
                     storage_path: "/home/pi/.codex/sessions/a.jsonl".to_string(),
                 }],
             }],
@@ -41572,6 +41909,7 @@ mod tests {
                         recent_context: "USER: test\nASSISTANT: reply".to_string(),
                         cached_precis: None,
                         cached_summary: None,
+                        live_runtime: false,
                         storage_path: "/home/pi/.codex/sessions/a.jsonl".to_string(),
                     },
                     RemoteScannedSession {
@@ -41587,6 +41925,7 @@ mod tests {
                         recent_context: "USER: test2\nASSISTANT: reply2".to_string(),
                         cached_precis: None,
                         cached_summary: None,
+                        live_runtime: false,
                         storage_path: "/home/pi/.codex/sessions/b.jsonl".to_string(),
                     },
                 ],
@@ -41634,6 +41973,7 @@ mod tests {
                         recent_context: "USER: older".to_string(),
                         cached_precis: None,
                         cached_summary: None,
+                        live_runtime: false,
                         storage_path: "older".to_string(),
                     },
                     RemoteScannedSession {
@@ -41649,6 +41989,7 @@ mod tests {
                         recent_context: "USER: newer".to_string(),
                         cached_precis: None,
                         cached_summary: None,
+                        live_runtime: false,
                         storage_path: "newer".to_string(),
                     },
                 ],
@@ -41690,6 +42031,7 @@ mod tests {
                     recent_context: "USER: test\nASSISTANT: reply".to_string(),
                     cached_precis: None,
                     cached_summary: None,
+                    live_runtime: false,
                     storage_path: "/home/pi/.codex/sessions/a.jsonl".to_string(),
                 }],
             }],
@@ -41844,6 +42186,7 @@ mod tests {
                         recent_context: "USER: one".to_string(),
                         cached_precis: None,
                         cached_summary: None,
+                        live_runtime: false,
                         storage_path: "a".to_string(),
                     },
                     RemoteScannedSession {
@@ -41859,6 +42202,7 @@ mod tests {
                         recent_context: "USER: two".to_string(),
                         cached_precis: None,
                         cached_summary: None,
+                        live_runtime: false,
                         storage_path: "b".to_string(),
                     },
                 ],
@@ -41902,6 +42246,7 @@ mod tests {
                     recent_context: "USER: one".to_string(),
                     cached_precis: None,
                     cached_summary: None,
+                    live_runtime: false,
                     storage_path: "a".to_string(),
                 }],
             }],
@@ -42283,6 +42628,7 @@ mod tests {
                     recent_context: String::new(),
                     cached_precis: None,
                     cached_summary: None,
+                    live_runtime: false,
                     storage_path: "/home/pi/.codex/sessions/foo.jsonl".to_string(),
                 }],
             }],
@@ -42370,6 +42716,7 @@ mod tests {
                     recent_context: String::new(),
                     cached_precis: None,
                     cached_summary: None,
+                    live_runtime: false,
                     storage_path: "/home/pi/.codex/sessions/foo.jsonl".to_string(),
                 }],
             }],
@@ -42464,6 +42811,7 @@ mod tests {
                 recent_context: "USER: debug startup\nASSISTANT: found daemon race".to_string(),
                 cached_precis: None,
                 cached_summary: None,
+                live_runtime: false,
                 storage_path: "/home/pi/.codex/sessions/foo.jsonl".to_string(),
             }],
         }];
@@ -43198,6 +43546,7 @@ mod tests {
                     recent_context: "USER: one".to_string(),
                     cached_precis: None,
                     cached_summary: None,
+                    live_runtime: false,
                     storage_path: "a".to_string(),
                 }],
             }],
@@ -43337,6 +43686,7 @@ mod tests {
                         recent_context: "USER: one".to_string(),
                         cached_precis: None,
                         cached_summary: None,
+                        live_runtime: false,
                         storage_path: "a".to_string(),
                     },
                     RemoteScannedSession {
@@ -43352,6 +43702,7 @@ mod tests {
                         recent_context: "USER: two".to_string(),
                         cached_precis: None,
                         cached_summary: None,
+                        live_runtime: false,
                         storage_path: "b".to_string(),
                     },
                 ],
@@ -43397,6 +43748,7 @@ mod tests {
                 recent_context: "USER: one".to_string(),
                 cached_precis: None,
                 cached_summary: None,
+                live_runtime: false,
                 storage_path: "a".to_string(),
             }],
         };
@@ -43461,6 +43813,7 @@ mod tests {
                     recent_context: String::new(),
                     cached_precis: None,
                     cached_summary: None,
+                    live_runtime: false,
                     storage_path: "a".to_string(),
                 }],
             }],
@@ -43775,6 +44128,7 @@ mod tests {
                 recent_context: "USER: design excel shortcuts".to_string(),
                 cached_precis: None,
                 cached_summary: None,
+                live_runtime: false,
                 storage_path: "a".to_string(),
             }],
         }];
@@ -44205,6 +44559,7 @@ mod tests {
                 recent_context: String::new(),
                 cached_precis: None,
                 cached_summary: None,
+                live_runtime: false,
                 storage_path: "/tmp/remote-dev-123.jsonl".to_string(),
             }],
         }];
@@ -45495,6 +45850,53 @@ Waiting for the remote terminal to paint...\n";
             Some("interactive")
         );
     }
+
+    #[test]
+    fn describe_viewport_snapshot_accepts_basic_preview_snapshot() {
+        let snapshot = json!({
+            "active_session_path": "codex://preview",
+            "active_view_mode": "Rendered",
+            "shell": {
+                "terminal_attach_in_flight": [],
+                "notifications": []
+            },
+            "active_surface_requests": []
+        });
+        let dom = json!({
+            "degraded_reason": "dom_debug_snapshot_timeout",
+            "preview_scroll_count": 1,
+            "preview_text_sample": "This Codex session stays attached to the daemon.",
+            "preview_viewport_rect": {
+                "left": 308,
+                "top": 16,
+                "width": 852,
+                "height": 904
+            },
+            "preview_visible_block_count": 1,
+            "preview_visible_block_ids": ["preview-block-0"],
+            "preview_visible_entries": [{
+                "text": "This Codex session stays attached to the daemon."
+            }],
+            "preview_rendered_sections": [],
+            "preview_fallback_context_visible": false,
+            "preview_fallback_context_text": "",
+            "preview_timestamp_labels": [],
+            "terminal_hosts": []
+        });
+        let viewport = describe_viewport_snapshot(&snapshot, &dom);
+        assert_eq!(viewport.get("ready").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            viewport.get("interactive").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            viewport
+                .get("terminal_settled_kind")
+                .and_then(Value::as_str),
+            Some("preview")
+        );
+    }
+
     #[test]
     fn terminal_open_attempt_failure_reason_uses_surface_problem_first() {
         let viewport = json!({
@@ -45645,7 +46047,9 @@ Waiting for the remote terminal to paint...\n";
             },
             settings_path: PathBuf::from("/tmp/yggterm-test-settings.json"),
             server_endpoint: ServerEndpoint::UnixSocket(PathBuf::from("/tmp/yggterm-test.sock")),
-            initial_server_snapshot: None,
+            initial_server_snapshot: Some(test_server_snapshot_for_active_session(
+                active_session_path,
+            )),
             theme: UiTheme::ZedLight,
             ghostty_bridge_enabled: false,
             ghostty_embedded_surface_supported: false,
@@ -46191,6 +46595,79 @@ Waiting for the remote terminal to paint...\n";
         assert_eq!(sample.pss_kb, 98765);
         assert_eq!(sample.anonymous_kb, 54321);
     }
+    fn test_snapshot_session_view(
+        active_session_path: &str,
+    ) -> yggterm_server::SnapshotSessionView {
+        let kind = if active_session_path.starts_with("codex://") {
+            SessionKind::Codex
+        } else {
+            SessionKind::Shell
+        };
+        let source = if active_session_path.starts_with("local://")
+            || active_session_path.starts_with("codex://")
+            || active_session_path.starts_with("codex-litellm://")
+        {
+            SessionSource::LiveLocal
+        } else {
+            SessionSource::LiveSsh
+        };
+        yggterm_server::SnapshotSessionView {
+            id: "test-session".to_string(),
+            session_path: active_session_path.to_string(),
+            title: "test".to_string(),
+            kind,
+            host_label: "test-host".to_string(),
+            source,
+            backend: TerminalBackend::Xterm,
+            bridge_available: true,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: if source == SessionSource::LiveSsh {
+                RemoteDeployState::Ready
+            } else {
+                RemoteDeployState::NotRequired
+            },
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: vec!["test shell ready".to_string()],
+            rendered_sections: Vec::new(),
+            preview: yggterm_server::SnapshotPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: vec![yggterm_server::SnapshotMetadataEntry {
+                label: "Cwd".to_string(),
+                value: "/home/pi".to_string(),
+            }],
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: if source == SessionSource::LiveSsh {
+                Some("oc".to_string())
+            } else {
+                None
+            },
+            ssh_prefix: None,
+        }
+    }
+
+    fn test_server_snapshot_for_active_session(active_session_path: &str) -> ServerUiSnapshot {
+        let session = test_snapshot_session_view(active_session_path);
+        ServerUiSnapshot {
+            active_session_path: Some(active_session_path.to_string()),
+            active_session: Some(session.clone()),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![session],
+        }
+    }
+
     fn test_shell_bootstrap_with_active_session(active_session_path: &str) -> ShellBootstrap {
         let active_tree = SessionNode {
             kind: SessionNodeKind::CodexSession,
@@ -46232,7 +46709,9 @@ Waiting for the remote terminal to paint...\n";
             },
             settings_path: PathBuf::from("/tmp/yggterm-test-settings.json"),
             server_endpoint: ServerEndpoint::UnixSocket(PathBuf::from("/tmp/yggterm-test.sock")),
-            initial_server_snapshot: None,
+            initial_server_snapshot: Some(test_server_snapshot_for_active_session(
+                active_session_path,
+            )),
             theme: UiTheme::ZedLight,
             ghostty_bridge_enabled: false,
             ghostty_embedded_surface_supported: false,
@@ -46429,6 +46908,7 @@ Waiting for the remote terminal to paint...\n";
                         recent_context: "USER: alpha".to_string(),
                         cached_precis: None,
                         cached_summary: None,
+                        live_runtime: false,
                         storage_path: "/home/pi/.codex/sessions/a.jsonl".to_string(),
                     },
                     RemoteScannedSession {
@@ -46444,6 +46924,7 @@ Waiting for the remote terminal to paint...\n";
                         recent_context: "USER: beta".to_string(),
                         cached_precis: None,
                         cached_summary: None,
+                        live_runtime: false,
                         storage_path: "/home/pi/.codex/sessions/b.jsonl".to_string(),
                     },
                 ],
@@ -46877,6 +47358,97 @@ Waiting for the remote terminal to paint...\n";
         assert_eq!(
             shell.selected_tree_paths,
             HashSet::from([recipe_path.to_string()])
+        );
+    }
+
+    #[test]
+    fn background_daemon_snapshot_preserves_active_tree_rename_selection() {
+        let active_session_path = "local://fresh-shell";
+        let rename_path = "/home/pi/folder-rename-target";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_browser_tree(SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: vec![SessionNode {
+                kind: SessionNodeKind::Group,
+                name: "home/pi".to_string(),
+                title: Some("home/pi".to_string()),
+                document_kind: None,
+                group_kind: Some(WorkspaceGroupKind::Folder),
+                path: PathBuf::from("/home/pi"),
+                children: vec![
+                    SessionNode {
+                        kind: SessionNodeKind::Group,
+                        name: "folder-rename-target".to_string(),
+                        title: Some("New Folder".to_string()),
+                        document_kind: None,
+                        group_kind: Some(WorkspaceGroupKind::Folder),
+                        path: PathBuf::from(rename_path),
+                        children: Vec::new(),
+                        session_id: None,
+                        cwd: Some(rename_path.to_string()),
+                    },
+                    SessionNode {
+                        kind: SessionNodeKind::Group,
+                        name: "git".to_string(),
+                        title: Some("git".to_string()),
+                        document_kind: None,
+                        group_kind: Some(WorkspaceGroupKind::Folder),
+                        path: PathBuf::from("/home/pi/git"),
+                        children: Vec::new(),
+                        session_id: None,
+                        cwd: Some("/home/pi/git".to_string()),
+                    },
+                ],
+                session_id: None,
+                cwd: Some("/home/pi".to_string()),
+            }],
+            session_id: None,
+            cwd: None,
+        }));
+        let live_session = test_live_shell_session(active_session_path);
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(active_session_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(live_session.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![snapshot_session_view_for_ui(live_session.clone())],
+        });
+        shell.needs_initial_server_sync = false;
+        shell.browser.ensure_visible_path(rename_path);
+        shell.tree_rename_path = Some(rename_path.to_string());
+        shell.tree_rename_depth = Some(2);
+        shell.tree_rename_value = "mvp-".to_string();
+        shell.tree_rename_started_at_ms = current_millis();
+        shell.tree_rename_input_focused_once = true;
+        shell.selected_tree_paths.clear();
+        shell.selected_tree_paths.insert(rename_path.to_string());
+        shell.selection_anchor = Some(rename_path.to_string());
+        shell.browser.select_path(rename_path.to_string());
+
+        shell.apply_daemon_snapshot_result(Ok((
+            ServerUiSnapshot {
+                active_session_path: Some(active_session_path.to_string()),
+                active_session: Some(snapshot_session_view_for_ui(live_session)),
+                active_view_mode: WorkspaceViewMode::Terminal,
+                remote_machines: Vec::new(),
+                ssh_targets: Vec::new(),
+                live_sessions: Vec::new(),
+            },
+            Some("snapshot applied".to_string()),
+        )));
+
+        assert_eq!(shell.tree_rename_path.as_deref(), Some(rename_path));
+        assert_eq!(shell.tree_rename_value, "mvp-");
+        assert_eq!(shell.selection_anchor.as_deref(), Some(rename_path));
+        assert_eq!(shell.browser.selected_path(), Some(rename_path));
+        assert_eq!(
+            shell.selected_tree_paths,
+            HashSet::from([rename_path.to_string()])
         );
     }
 

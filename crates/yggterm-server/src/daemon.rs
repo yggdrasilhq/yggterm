@@ -262,6 +262,8 @@ pub struct ServerRuntimeStatus {
     #[serde(default)]
     pub terminal_session_count: usize,
     #[serde(default)]
+    pub terminal_session_keys: Vec<String>,
+    #[serde(default)]
     pub terminal_retained_chunks: usize,
     #[serde(default)]
     pub terminal_retained_bytes: usize,
@@ -542,6 +544,7 @@ impl DaemonRuntime {
             restored_live_sessions: self.restored_live_sessions,
             restored_remote_machines: self.restored_remote_machines,
             terminal_session_count: terminal_stats.session_count,
+            terminal_session_keys: self.terminals.session_keys(),
             terminal_retained_chunks: terminal_stats.retained_chunks,
             terminal_retained_bytes: terminal_stats.retained_bytes,
             terminal_session_buffer_limit_bytes: crate::terminal::MAX_BUFFER_BYTES,
@@ -3381,6 +3384,7 @@ mod tests {
                     recent_context: "USER: one".to_string(),
                     cached_precis: None,
                     cached_summary: None,
+                    live_runtime: false,
                     storage_path: "/home/pi/.codex/sessions/one.jsonl".to_string(),
                 },
                 RemoteScannedSession {
@@ -3396,6 +3400,7 @@ mod tests {
                     recent_context: String::new(),
                     cached_precis: Some("precis".to_string()),
                     cached_summary: Some("summary".to_string()),
+                    live_runtime: false,
                     storage_path: "/home/pi/.codex/sessions/two.jsonl".to_string(),
                 },
             ],
@@ -3440,6 +3445,7 @@ mod tests {
                         recent_context: String::new(),
                         cached_precis: None,
                         cached_summary: None,
+                        live_runtime: false,
                         storage_path: "/home/pi/.codex/sessions/one.jsonl".to_string(),
                     },
                     RemoteScannedSession {
@@ -3455,6 +3461,7 @@ mod tests {
                         recent_context: String::new(),
                         cached_precis: None,
                         cached_summary: None,
+                        live_runtime: false,
                         storage_path: "/home/pi/.codex/sessions/two.jsonl".to_string(),
                     },
                 ],
@@ -3480,6 +3487,7 @@ mod tests {
                     recent_context: String::new(),
                     cached_precis: None,
                     cached_summary: None,
+                    live_runtime: false,
                     storage_path: "/root/.codex/sessions/three.jsonl".to_string(),
                 }],
             },

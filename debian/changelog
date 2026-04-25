@@ -1,3 +1,14 @@
+yggterm (2.1.34-1) unstable; urgency=medium
+
+  * Clear copied-profile daemon socket symlink chains before shell startup ping/alias.
+  * Keep stale remote-scanned Codex sessions as rendered previews unless remote runtime is live.
+  * Preserve inline rename focus across background snapshots and commit renames only on Enter.
+  * Restore terminal input focus after search/settings/titlebar/live-close/hot-switch paths.
+  * Refresh stale managed Codex CLI installs and suppress npm update/audit/fund noise.
+  * Expand KDE/Linux smoke proof for the user-log MVP issues, Codex status typing, cleanup, and Plasma PID stability.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sat, 25 Apr 2026 16:59:36 +0530
+
 yggterm (2.1.33-1) unstable; urgency=medium
 
   * Reject stale post-update daemons whose server version does not match the launched app.

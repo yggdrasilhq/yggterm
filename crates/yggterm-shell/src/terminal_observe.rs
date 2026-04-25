@@ -1324,14 +1324,7 @@ pub(crate) fn terminal_chunk_is_low_signal_terminal_noise(data: &str) -> bool {
 pub(crate) fn terminal_chunk_is_transport_error(data: &str) -> bool {
     let stripped = strip_terminal_control_sequences(data);
     let normalized = stripped.to_ascii_lowercase();
-    if (normalized.contains("shared connection to ")
-        && (normalized.contains(" closed")
-            || normalized.contains("refused")
-            || normalized.contains("timed out")))
-        || (normalized.contains("connection to ")
-            && (normalized.contains(" closed")
-                || normalized.contains("refused")
-                || normalized.contains("timed out")))
+    if normalized.contains("[yggterm] terminal reader stopped")
         || normalized.contains("terminal session not found")
     {
         return true;
@@ -1450,7 +1443,8 @@ pub(crate) fn strip_terminal_control_sequences(data: &str) -> String {
 mod tests {
     use super::{
         WorkspaceViewMode, terminal_bootstrap_activation_epoch,
-        terminal_chunk_has_codex_prompt_output, terminal_host_problem_for_app_control,
+        terminal_chunk_has_codex_prompt_output, terminal_chunk_is_transport_error,
+        terminal_host_problem_for_app_control,
     };
     use serde_json::json;
 
@@ -1690,6 +1684,22 @@ mod tests {
                 "active terminal host helper textarea is visibly mounted instead of visually hidden"
             )
         );
+    }
+
+    #[test]
+    fn transport_error_detector_ignores_saved_transcript_connection_text() {
+        let data = "\
+The recovered notes explain why a previous SSH connection to dev timed out during a clone.
+That sentence is part of the saved Codex transcript, not the live terminal transport.
+The prompt stayed usable after the restore.
+";
+        assert!(!terminal_chunk_is_transport_error(data));
+    }
+
+    #[test]
+    fn transport_error_detector_keeps_line_shaped_shared_connection_failure() {
+        let data = "Shared connection to 192.168.0.133 closed.\r\n";
+        assert!(terminal_chunk_is_transport_error(data));
     }
 
     #[test]
