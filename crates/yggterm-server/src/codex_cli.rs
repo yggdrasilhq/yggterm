@@ -181,6 +181,10 @@ impl ManagedCliPaths {
                 "export npm_config_prefix={}",
                 shell_single_quote(&self.prefix.display().to_string())
             ),
+            "export NPM_CONFIG_UPDATE_NOTIFIER=false".to_string(),
+            "export npm_config_update_notifier=false".to_string(),
+            "export npm_config_audit=false".to_string(),
+            "export npm_config_fund=false".to_string(),
             format!(
                 "export PATH={}:\"$PATH\"",
                 shell_single_quote(&self.bin_dir.display().to_string())
@@ -395,6 +399,20 @@ fn managed_cli_deferred_install_detail(tool: ManagedCliTool, probe: &ToolProbe) 
             tool.display_name(),
         )
     }
+}
+
+fn managed_cli_explicit_refresh_needed(
+    tool: ManagedCliTool,
+    probe: &ToolProbe,
+    refresh_state: &ManagedCliRefreshState,
+    now_ms: u64,
+    ttl_ms: u64,
+) -> bool {
+    if probe.source != Some(ManagedCliBinarySource::Managed) {
+        return true;
+    }
+    managed_cli_refresh_skip_remaining_ms(&[(tool, probe.clone())], refresh_state, now_ms, ttl_ms)
+        .is_none()
 }
 
 fn persist_managed_cli_refresh_state(
@@ -657,6 +675,69 @@ mod tests {
             true,
             &managed_present
         ));
+    }
+
+    #[test]
+    fn explicit_managed_cli_ensure_refreshes_system_or_stale_managed_tools() {
+        let now_ms = 10_000u64;
+        let ttl_ms = managed_cli_refresh_ttl_ms();
+        let state = ManagedCliRefreshState {
+            last_successful_refresh_ms: Some(now_ms.saturating_sub(1_000)),
+            managed_versions: BTreeMap::from([("codex".to_string(), "1.2.3".to_string())]),
+        };
+        let system_probe = ToolProbe {
+            version: Some("1.2.3".to_string()),
+            source: Some(ManagedCliBinarySource::System),
+            available: true,
+        };
+        let fresh_managed_probe = ToolProbe {
+            version: Some("1.2.3".to_string()),
+            source: Some(ManagedCliBinarySource::Managed),
+            available: true,
+        };
+        let stale_managed_probe = ToolProbe {
+            version: Some("1.2.2".to_string()),
+            source: Some(ManagedCliBinarySource::Managed),
+            available: true,
+        };
+
+        assert!(managed_cli_explicit_refresh_needed(
+            ManagedCliTool::Codex,
+            &system_probe,
+            &state,
+            now_ms,
+            ttl_ms,
+        ));
+        assert!(!managed_cli_explicit_refresh_needed(
+            ManagedCliTool::Codex,
+            &fresh_managed_probe,
+            &state,
+            now_ms,
+            ttl_ms,
+        ));
+        assert!(managed_cli_explicit_refresh_needed(
+            ManagedCliTool::Codex,
+            &stale_managed_probe,
+            &state,
+            now_ms,
+            ttl_ms,
+        ));
+    }
+
+    #[test]
+    fn managed_cli_shell_exports_prefer_managed_bin_and_suppress_npm_noise() {
+        let paths = ManagedCliPaths {
+            home: PathBuf::from("/tmp/yggterm-home"),
+            prefix: PathBuf::from("/tmp/yggterm-home/npm"),
+            bin_dir: PathBuf::from("/tmp/yggterm-home/npm/bin"),
+            cache_dir: PathBuf::from("/tmp/yggterm-home/npm-cache"),
+        };
+        let exports = paths.shell_exports(ManagedCliTool::Codex);
+        assert!(exports.contains("export NPM_CONFIG_UPDATE_NOTIFIER=false"));
+        assert!(exports.contains("export npm_config_update_notifier=false"));
+        assert!(exports.contains("export npm_config_audit=false"));
+        assert!(exports.contains("export npm_config_fund=false"));
+        assert!(exports.contains("export PATH='/tmp/yggterm-home/npm/bin':\"$PATH\""));
     }
 
     #[test]
@@ -960,6 +1041,7 @@ pub(crate) fn best_effort_cwd_shell_prefix(cwd: Option<&str>) -> Option<String> 
 pub(crate) fn ensure_local_managed_cli(tool: ManagedCliTool) -> Result<ManagedCliToolStatus> {
     let paths = ManagedCliPaths::resolve()?;
     let now_ms = current_time_ms();
+    let ttl_ms = managed_cli_refresh_ttl_ms();
     append_trace_event(
         &paths.home,
         "server",
@@ -968,6 +1050,60 @@ pub(crate) fn ensure_local_managed_cli(tool: ManagedCliTool) -> Result<ManagedCl
         serde_json::json!({ "tool": tool.binary_name() }),
     );
     let before = probe_tool(&paths, tool);
+    let refresh_state = load_managed_cli_refresh_state(&paths.home);
+    let npm_available = npm_binary().is_some();
+    if npm_available
+        && managed_cli_explicit_refresh_needed(tool, &before, &refresh_state, now_ms, ttl_ms)
+    {
+        install_latest(&paths, &[tool], false)?;
+        let after = probe_tool(&paths, tool);
+        if !after.available {
+            anyhow::bail!(
+                "{} did not become available after the managed install finished",
+                tool.display_name()
+            );
+        }
+        let status = tool_status(
+            tool,
+            before,
+            after,
+            "installed",
+            format!(
+                "Installed or refreshed a Yggterm-managed {} toolchain under {}.",
+                tool.display_name(),
+                paths.prefix.display()
+            ),
+        );
+        if let Err(error) = persist_managed_cli_refresh_state(
+            &paths.home,
+            &[(tool, probe_tool(&paths, tool))],
+            now_ms,
+        ) {
+            append_trace_event(
+                &paths.home,
+                "server",
+                "managed_cli",
+                "ensure_state_write_error",
+                serde_json::json!({
+                    "tool": tool.binary_name(),
+                    "error": error.to_string(),
+                }),
+            );
+        }
+        append_trace_event(
+            &paths.home,
+            "server",
+            "managed_cli",
+            "ensure_end",
+            serde_json::json!({
+                "tool": tool.binary_name(),
+                "action": status.action.clone(),
+                "available": status.available,
+                "changed": status.changed,
+            }),
+        );
+        return Ok(status);
+    }
     if before.available {
         let detail = match before.source {
             Some(ManagedCliBinarySource::Managed) => {

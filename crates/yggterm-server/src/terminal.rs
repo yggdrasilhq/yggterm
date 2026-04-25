@@ -142,6 +142,12 @@ impl TerminalManager {
             .map(|session| session.screen_snapshot())
     }
 
+    pub fn session_keys(&self) -> Vec<String> {
+        let mut keys = self.sessions.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        keys
+    }
+
     pub fn read(&self, key: &str, cursor: u64) -> Result<TerminalReadResult> {
         let session = self
             .sessions
