@@ -7603,7 +7603,7 @@ pub fn run_remote_resume_codex(
 
 pub fn ensure_local_daemon_running(endpoint: &ServerEndpoint) -> anyhow::Result<()> {
     let current_exe = std::env::current_exe().context("resolving current yggterm executable")?;
-    if ping(endpoint).is_ok() {
+    if reachable_local_daemon_is_current(endpoint, "initial_status") {
         return Ok(());
     }
     if wait_for_existing_local_daemon_boot(endpoint, Duration::from_millis(3_000)) {
@@ -7611,14 +7611,14 @@ pub fn ensure_local_daemon_running(endpoint: &ServerEndpoint) -> anyhow::Result<
     }
     cleanup_legacy_daemons(endpoint, &current_exe)?;
     clear_stale_local_daemon_socket_when_no_daemon(endpoint);
-    if ping(endpoint).is_ok() {
+    if reachable_local_daemon_is_current(endpoint, "after_legacy_cleanup") {
         return Ok(());
     }
     if wait_for_existing_local_daemon_boot(endpoint, Duration::from_millis(3_000)) {
         return Ok(());
     }
     let _spawn_lock = acquire_daemon_spawn_lock(endpoint)?;
-    if ping(endpoint).is_ok() {
+    if reachable_local_daemon_is_current(endpoint, "under_spawn_lock") {
         return Ok(());
     }
     if wait_for_existing_local_daemon_boot(endpoint, Duration::from_millis(3_000)) {
@@ -7627,6 +7627,62 @@ pub fn ensure_local_daemon_running(endpoint: &ServerEndpoint) -> anyhow::Result<
     prepare_endpoint_for_spawn(endpoint)?;
     spawn_local_daemon_process(&current_exe)?;
     wait_for_local_daemon(endpoint)
+}
+
+fn reachable_local_daemon_is_current(endpoint: &ServerEndpoint, stage: &'static str) -> bool {
+    let Ok(runtime_status) = status(endpoint) else {
+        return false;
+    };
+    if runtime_status.server_version == daemon::SERVER_PROTOCOL_VERSION {
+        return true;
+    }
+    handle_mismatched_local_daemon(endpoint, &runtime_status, stage);
+    false
+}
+
+fn handle_mismatched_local_daemon(
+    endpoint: &ServerEndpoint,
+    runtime_status: &ServerRuntimeStatus,
+    stage: &'static str,
+) {
+    warn!(
+        stage,
+        current_version = daemon::SERVER_PROTOCOL_VERSION,
+        stale_version = runtime_status.server_version.as_str(),
+        stale_build_id = runtime_status.server_build_id,
+        "ignoring stale yggterm daemon for current app version"
+    );
+    if let Some(home) = daemon_trace_home_for_endpoint(endpoint) {
+        append_trace_event(
+            &home,
+            "server",
+            "daemon_lifecycle",
+            "stale_daemon_version_detected",
+            json!({
+                "stage": stage,
+                "current_version": daemon::SERVER_PROTOCOL_VERSION,
+                "stale_version": runtime_status.server_version,
+                "stale_build_id": runtime_status.server_build_id,
+            }),
+        );
+    }
+    let stale_version = runtime_status.server_version.clone();
+    let _ = shutdown(endpoint);
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(100));
+        match status(endpoint) {
+            Ok(status) if status.server_version == stale_version => {}
+            _ => return,
+        }
+    }
+}
+
+fn daemon_trace_home_for_endpoint(endpoint: &ServerEndpoint) -> Option<PathBuf> {
+    match endpoint {
+        #[cfg(unix)]
+        ServerEndpoint::UnixSocket(path) => path.parent().map(Path::to_path_buf),
+        ServerEndpoint::Tcp { .. } => resolve_yggterm_home().ok(),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -7732,7 +7788,7 @@ fn wait_for_existing_local_daemon_boot(endpoint: &ServerEndpoint, timeout: Durat
     let deadline = Instant::now() + timeout;
     let mut saw_candidate = false;
     loop {
-        if ping(endpoint).is_ok() {
+        if reachable_local_daemon_is_current(endpoint, "existing_daemon_boot_wait") {
             return true;
         }
         let pids = local_daemon_pids_for_home(&home);
@@ -7838,7 +7894,7 @@ fn spawn_local_daemon_process(current_exe: &Path) -> anyhow::Result<()> {
 fn wait_for_local_daemon(endpoint: &ServerEndpoint) -> anyhow::Result<()> {
     for _ in 0..100 {
         std::thread::sleep(Duration::from_millis(150));
-        if ping(endpoint).is_ok() {
+        if reachable_local_daemon_is_current(endpoint, "spawned_daemon_wait") {
             return Ok(());
         }
     }

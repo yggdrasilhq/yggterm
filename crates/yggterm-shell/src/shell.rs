@@ -21781,7 +21781,18 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         let mut event_loop = EventLoopBuilder::<DesktopUserWindowEvent>::with_user_event();
-        event_loop.with_app_id(YGGTERM_DESKTOP_APP_ID);
+        let app_id = linux_desktop_app_id();
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "startup",
+            "linux_desktop_app_id",
+            json!({
+                "pid": std::process::id(),
+                "app_id": app_id,
+            }),
+        );
+        event_loop.with_app_id(&app_id);
         config = config.with_event_loop(event_loop.build());
     }
     if linux_window_transparent {
@@ -38572,7 +38583,7 @@ fn palette(theme: UiTheme) -> Palette {
 fn shell_live_blur_supported() -> bool {
     #[cfg(target_os = "linux")]
     {
-        std::env::var_os("WAYLAND_DISPLAY").is_some()
+        env_flag_truthy("YGGTERM_ENABLE_LIVE_BLUR")
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -38767,6 +38778,41 @@ fn linux_force_native_decorations() -> bool {
 #[cfg(not(target_os = "linux"))]
 fn linux_force_native_decorations() -> bool {
     false
+}
+#[cfg(target_os = "linux")]
+fn linux_desktop_app_id() -> String {
+    if let Some(suffix) = std::env::var("YGGTERM_DESKTOP_APP_ID_SUFFIX")
+        .ok()
+        .map(|value| linux_app_id_component(&value))
+        .filter(|value| !value.is_empty())
+    {
+        return format!("{YGGTERM_DESKTOP_APP_ID}.{suffix}");
+    }
+    if env_flag_truthy("YGGTERM_ALLOW_MULTI_WINDOW")
+        || env_flag_truthy("YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF")
+        || env_flag_truthy("YGGTERM_REMOTE_SMOKE_TAG")
+    {
+        let seed =
+            std::env::var("YGGTERM_HOME").unwrap_or_else(|_| format!("pid-{}", std::process::id()));
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        seed.hash(&mut hasher);
+        return format!(
+            "{YGGTERM_DESKTOP_APP_ID}.{}",
+            linux_app_id_component(&format!("multi{:x}", hasher.finish()))
+        );
+    }
+    YGGTERM_DESKTOP_APP_ID.to_string()
+}
+#[cfg(target_os = "linux")]
+fn linux_app_id_component(value: &str) -> String {
+    let mut output = String::from("i");
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            output.push(ch.to_ascii_lowercase());
+        }
+    }
+    output.truncate(63);
+    output
 }
 #[cfg(target_os = "linux")]
 fn linux_close_requires_terminal_detach() -> bool {
