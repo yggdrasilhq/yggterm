@@ -1,3 +1,12 @@
+yggterm (2.1.33-1) unstable; urgency=medium
+
+  * Reject stale post-update daemons whose server version does not match the launched app.
+  * Keep old daemons from aliasing future versioned sockets back to themselves.
+  * Use isolated GTK application ids for Linux smoke/multi-window launches so KDE app-control proof does not collide with the user's live Yggterm.
+  * Default Linux shells to opaque chrome unless live blur/transparency is explicitly enabled.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sat, 25 Apr 2026 11:01:10 +0530
+
 yggterm (2.1.32-1) unstable; urgency=medium
 
   * Harden KDE/Xwayland app-owned launches by requiring wait-visible proof from app-control state.
