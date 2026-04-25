@@ -140,6 +140,14 @@ impl SessionBrowserState {
                 })
                 .cloned(),
         );
+        if let Some(path) = selected_path
+            && !path.contains("://")
+            && !path.starts_with("__")
+        {
+            for ancestor in Path::new(path).ancestors().skip(1) {
+                self.expanded_paths.insert(ancestor.display().to_string());
+            }
+        }
         self.rebuild_rows();
         if let Some(path) = selected_path {
             self.select_path(path.to_string());
@@ -710,5 +718,68 @@ mod tests {
                 .iter()
                 .any(|path| path == "__remote_machine__/jojo")
         );
+    }
+
+    #[test]
+    fn restore_ui_state_expands_ancestors_for_selected_deep_path() {
+        let selected = "/home/pi/folder-rename-target";
+        let root = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("local"),
+            children: vec![SessionNode {
+                kind: SessionNodeKind::Group,
+                name: "/".to_string(),
+                title: Some("/".to_string()),
+                document_kind: None,
+                group_kind: Some(WorkspaceGroupKind::Folder),
+                path: PathBuf::from("/"),
+                session_id: None,
+                cwd: None,
+                children: vec![SessionNode {
+                    kind: SessionNodeKind::Group,
+                    name: "home".to_string(),
+                    title: Some("home".to_string()),
+                    document_kind: None,
+                    group_kind: Some(WorkspaceGroupKind::Folder),
+                    path: PathBuf::from("/home"),
+                    session_id: None,
+                    cwd: None,
+                    children: vec![SessionNode {
+                        kind: SessionNodeKind::Group,
+                        name: "pi".to_string(),
+                        title: Some("pi".to_string()),
+                        document_kind: None,
+                        group_kind: Some(WorkspaceGroupKind::Folder),
+                        path: PathBuf::from("/home/pi"),
+                        session_id: None,
+                        cwd: None,
+                        children: vec![SessionNode {
+                            kind: SessionNodeKind::Group,
+                            name: "New Folder".to_string(),
+                            title: Some("New Folder".to_string()),
+                            document_kind: None,
+                            group_kind: Some(WorkspaceGroupKind::Folder),
+                            path: PathBuf::from(selected),
+                            children: Vec::new(),
+                            session_id: None,
+                            cwd: None,
+                        }],
+                    }],
+                }],
+            }],
+            session_id: None,
+            cwd: None,
+        };
+        let mut browser = SessionBrowserState::new(root);
+        browser.restore_ui_state(&[], Some(selected));
+        let expanded = browser.expanded_paths();
+        assert!(expanded.iter().any(|path| path == "/"));
+        assert!(expanded.iter().any(|path| path == "/home"));
+        assert!(expanded.iter().any(|path| path == "/home/pi"));
+        assert!(browser.rows().iter().any(|row| row.full_path == selected));
     }
 }
