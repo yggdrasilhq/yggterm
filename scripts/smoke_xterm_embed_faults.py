@@ -332,7 +332,13 @@ def terminal_paste_image(pid: int, session: str) -> dict:
     )
 
 
-def app_create_terminal(pid: int, *, title: str | None = None, cwd: str | None = None) -> dict:
+def app_create_terminal(
+    pid: int,
+    *,
+    title: str | None = None,
+    cwd: str | None = None,
+    kind: str | None = None,
+) -> dict:
     args = [
         "server",
         "app",
@@ -347,6 +353,8 @@ def app_create_terminal(pid: int, *, title: str | None = None, cwd: str | None =
         args.extend(["--title", title])
     if cwd:
         args.extend(["--cwd", cwd])
+    if kind:
+        args.extend(["--kind", kind])
     payload = unwrap_data(run(*args))
     session_path = str(payload.get("session_path") or payload.get("active_session_path") or "").strip()
     if session_path and not payload.get("session_path"):
@@ -2482,6 +2490,24 @@ def find_snapshot_session(snapshot: dict, session: str) -> dict | None:
     return None
 
 
+def snapshot_metadata_value(session_entry: dict | None, label: str) -> str:
+    if not isinstance(session_entry, dict):
+        return ""
+    target = label.strip().lower()
+    for item in session_entry.get("metadata") or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("label") or "").strip().lower() == target:
+            return str(item.get("value") or "").strip()
+    preview = session_entry.get("preview") or {}
+    for item in preview.get("summary") or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("label") or "").strip().lower() == target:
+            return str(item.get("value") or "").strip()
+    return str(session_entry.get(label) or session_entry.get(label.lower()) or "").strip()
+
+
 def assert_observability_budget() -> dict:
     home = current_yggterm_home()
     budgets = [
@@ -3662,6 +3688,8 @@ def host_has_live_codex_prompt(host: dict) -> bool:
     )
     if any(marker in host_text for marker in transcript_only_markers):
         return False
+    if "Update available!" in host_text and "Press enter to continue" in host_text:
+        return False
     return terminal_chunk_has_codex_prompt_output(cursor_line_text) or terminal_chunk_has_codex_prompt_output(
         text_sample
     )
@@ -3703,10 +3731,15 @@ def detect_codex_startup_failure(host: dict) -> dict | None:
         or "failed to start: mcp startup failed" in lowered
         or "handshaking with mcp server failed" in lowered
         or ("mcp client for " in lowered and "failed to start" in lowered)
+        or ("update available!" in lowered and "press enter to continue" in lowered)
     ):
         return None
     return {
-        "kind": "codex_apps_startup_failed" if "codex_apps" in lowered else "codex_mcp_startup_failed",
+        "kind": (
+            "codex_update_prompt_blocking"
+            if "update available!" in lowered
+            else "codex_apps_startup_failed" if "codex_apps" in lowered else "codex_mcp_startup_failed"
+        ),
         "text_tail": recent[-1200:],
     }
 
@@ -3848,6 +3881,34 @@ def dom_rect(state: dict, key: str) -> dict:
 
 def dom_value(state: dict, key: str):
     return (state.get("dom") or {}).get(key)
+
+
+def tree_rename_input_value(state: dict) -> str:
+    dom = state.get("dom") or {}
+    if "tree_rename_input_value" in dom:
+        return str(dom.get("tree_rename_input_value") or "")
+    shell = state.get("shell") or {}
+    if str(shell.get("tree_rename_path") or "").strip():
+        return str(shell.get("tree_rename_value") or "")
+    return ""
+
+
+def tree_rename_observation(state: dict) -> dict:
+    dom = state.get("dom") or {}
+    shell = state.get("shell") or {}
+    active = dom.get("active_element") or {}
+    if not isinstance(active, dict):
+        active = {}
+    return {
+        "value": tree_rename_input_value(state),
+        "dom_value": dom.get("tree_rename_input_value"),
+        "shell_value": shell.get("tree_rename_value"),
+        "tree_rename_path": shell.get("tree_rename_path"),
+        "focused": bool(dom.get("tree_rename_input_focused")),
+        "degraded_reason": dom.get("degraded_reason"),
+        "snapshot_mode": dom.get("snapshot_mode"),
+        "active_element": active,
+    }
 
 
 def shell_theme_spec(state: dict, key: str) -> dict:
@@ -6263,6 +6324,273 @@ def assert_session_drag_to_folder_contract(pid: int) -> dict:
             app_drag(pid, "clear")
         except Exception:
             pass
+        if created_session:
+            try:
+                app_remove_session(pid, created_session)
+            except Exception:
+                pass
+
+
+def assert_folder_create_rename_collapse_contract(pid: int) -> dict:
+    created_session = ""
+    app_set_search(pid, "", focused=False)
+    folder_state, parent = wait_for_session_drag_target_folder(pid)
+    parent_path = str(parent.get("path") or parent.get("full_path") or "").strip()
+    if not parent_path:
+        raise AssertionError(f"folder create smoke could not resolve parent path: {parent!r}")
+    try:
+        app_expand(pid, parent_path, True)
+    except Exception:
+        pass
+
+    action = invoke_sidebar_context_menu_action(pid, parent_path, "add-folder", row_kind="Group")
+    created_path = ""
+    focused_trace: list[dict] = []
+    created = {}
+    deadline = time.time() + 8.0
+    while time.time() < deadline:
+        created = app_state(pid)
+        created_path = str(((created.get("shell") or {}).get("tree_rename_path") or "")).strip()
+        focused_trace.append(
+            {
+                "tree_rename_path": created_path,
+                "tree_rename_input_focused": bool((created.get("dom") or {}).get("tree_rename_input_focused")),
+                "tree_rename_input_value": str((created.get("dom") or {}).get("tree_rename_input_value") or ""),
+                "tree_rename_input_rect": dom_rect(created, "tree_rename_input_rect"),
+                "server_busy": bool((created.get("shell") or {}).get("server_busy")),
+            }
+        )
+        if (
+            created_path.startswith(parent_path.rstrip("/") + "/")
+            and rect_is_visible(dom_rect(created, "tree_rename_input_rect"))
+            and bool((created.get("dom") or {}).get("tree_rename_input_focused"))
+        ):
+            break
+        time.sleep(0.04)
+    else:
+        raise AssertionError(
+            "Add Folder did not create a child folder in immediate focused rename mode: "
+            f"parent={parent_path!r} trace={focused_trace!r} state={created!r}"
+        )
+
+    rename_target = f"mvp-proof-{int(time.time() * 1000) % 1000000}"
+    typed_progress: list[dict] = []
+    typed_value = ""
+    for ch in rename_target:
+        xdotool_type_window(pid, ch)
+        typed_value += ch
+        current_value = ""
+        char_deadline = time.time() + 1.5
+        while time.time() < char_deadline:
+            current = app_state(pid)
+            current_value = tree_rename_input_value(current)
+            if current_value == typed_value:
+                observed = tree_rename_observation(current)
+                observed["typed"] = typed_value
+                typed_progress.append(observed)
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError(
+                "new-folder rename input replaced or appended the wrong value while typing: "
+                f"expected={typed_value!r} actual={current_value!r} trace={typed_progress!r} "
+                f"last={tree_rename_observation(current)!r}"
+            )
+
+    xdotool_key_window(pid, "Return")
+    committed = {}
+    committed_row = None
+    deadline = time.time() + 10.0
+    while time.time() < deadline:
+        committed = app_state(pid)
+        committed_row = find_visible_sidebar_row_by_path(committed, created_path, kind="Group")
+        if (
+            not str(((committed.get("shell") or {}).get("tree_rename_path") or "")).strip()
+            and committed_row is not None
+            and str(committed_row.get("label") or "").strip() == rename_target
+        ):
+            break
+        time.sleep(0.08)
+    else:
+        raise AssertionError(
+            "new-folder rename did not commit to the sidebar row: "
+            f"path={created_path!r} label={rename_target!r} state={committed!r}"
+        )
+
+    parent_collapsed = app_expand(pid, parent_path, False)
+    parent_collapsed_state = {}
+    deadline = time.time() + 6.0
+    while time.time() < deadline:
+        parent_collapsed_state = app_state(pid)
+        if find_visible_sidebar_row_by_path(parent_collapsed_state, created_path, kind="Group") is None:
+            break
+        time.sleep(0.08)
+    else:
+        raise AssertionError(
+            "collapsing the parent folder did not hide the newly-created child folder: "
+            f"parent={parent_path!r} child={created_path!r} state={parent_collapsed_state!r}"
+        )
+    parent_expanded = app_expand(pid, parent_path, True)
+    parent_expanded_state = {}
+    parent_expanded_row = None
+    deadline = time.time() + 6.0
+    while time.time() < deadline:
+        parent_expanded_state = app_state(pid)
+        parent_expanded_row = find_visible_sidebar_row_by_path(parent_expanded_state, created_path, kind="Group")
+        if parent_expanded_row is not None and rect_is_visible(sidebar_row_rect(parent_expanded_row)):
+            break
+        time.sleep(0.08)
+    else:
+        raise AssertionError(
+            "re-expanding the parent folder did not show the newly-created child folder: "
+            f"parent={parent_path!r} child={created_path!r} state={parent_expanded_state!r}"
+        )
+
+    created_terminal = create_terminal_via_sidebar_context_menu(pid, parent_path=created_path)
+    created_session = str(created_terminal.get("session_path") or "").strip()
+    if not created_session:
+        raise AssertionError(f"folder-context new terminal did not return a session path: {created_terminal!r}")
+
+    snapshot = server_snapshot()
+    session_entry = find_snapshot_session(snapshot, created_session)
+    cwd = snapshot_metadata_value(session_entry, "Cwd")
+    if cwd != created_path:
+        raise AssertionError(
+            "folder-context new terminal started outside the selected folder: "
+            f"expected_cwd={created_path!r} actual_cwd={cwd!r} session={session_entry!r}"
+        )
+
+    expanded = app_expand(pid, created_path, True)
+    expanded_state = app_state(pid)
+    live_row_while_expanded = find_visible_sidebar_row_by_path(expanded_state, created_session, kind="Session")
+    collapsed = app_expand(pid, created_path, False)
+    collapsed_state = app_state(pid)
+    collapsed_paths = set(str(path) for path in ((collapsed_state.get("browser") or {}).get("expanded_paths") or []))
+    if created_path in collapsed_paths:
+        raise AssertionError(
+            f"collapsing the created folder did not update expanded path state: state={collapsed_state!r}"
+        )
+    expanded_again = app_expand(pid, created_path, True)
+    expanded_again_state = app_state(pid)
+    expanded_again_paths = set(str(path) for path in ((expanded_again_state.get("browser") or {}).get("expanded_paths") or []))
+    if created_path not in expanded_again_paths:
+        raise AssertionError(
+            "re-expanding the created folder did not restore row expansion state: "
+            f"state={expanded_again_state!r}"
+        )
+    cleanup = None
+    try:
+        cleanup = app_remove_session(pid, created_session)
+    except Exception:
+        cleanup = {"skipped": True, "reason": "session cleanup failed"}
+
+    return {
+        "parent_path": parent_path,
+        "created_path": created_path,
+        "rename_target": rename_target,
+        "add_folder_action": action,
+        "typed_progress": typed_progress,
+        "parent_collapsed": parent_collapsed,
+        "parent_expanded": parent_expanded,
+        "parent_expanded_child_row": parent_expanded_row,
+        "created_terminal": created_terminal,
+        "created_session": created_session,
+        "session_cwd": cwd,
+        "expanded": expanded,
+        "collapsed": collapsed,
+        "expanded_again": expanded_again,
+        "live_row_visible_while_expanded": bool(live_row_while_expanded),
+        "session_cleanup": cleanup,
+    }
+
+
+def assert_titlebar_copy_regeneration_contract(pid: int) -> dict:
+    created_session = ""
+    try:
+        created = app_create_terminal(pid, title="Regeneration Button Baseline")
+        created_session = str(created.get("session_path") or "").strip()
+        if not created_session:
+            raise AssertionError(f"titlebar copy regen setup did not create a session: {created!r}")
+        wait_for_session_focus(pid, created_session, timeout_seconds=12.0)
+        ensure_plain_shell_runtime(pid, created_session)
+        terminal_send(
+            pid,
+            created_session,
+            "printf 'yggterm title summary regeneration smoke proof'; printf '\\n'\r",
+        )
+        wait_for_terminal_quiescent(pid, timeout_seconds=10.0)
+        baseline = app_state(pid)
+        baseline_title = str(baseline.get("active_title") or "").strip()
+        baseline_summary = str(baseline.get("active_summary") or "").strip()
+
+        if right_panel_mode(baseline) not in ("", "hidden", "none", "null"):
+            baseline = close_right_panel(pid, baseline, timeout_seconds=1.5)
+        app_set_search(pid, "", focused=False)
+        baseline = wait_for_window_focus(pid, timeout_seconds=3.0)
+        regen_click = invoke_sidebar_context_menu_action(
+            pid,
+            created_session,
+            "regenerate-copy",
+            row_kind="Session",
+        )
+        queued = {}
+        deadline = time.time() + 4.0
+        while time.time() < deadline:
+            queued = app_state(pid)
+            last_action = str(((queued.get("shell") or {}).get("last_action") or "")).lower()
+            visible = visible_notifications(queued)
+            if (
+                "generating title" in last_action
+                or "regenerating title" in last_action
+                or "queued copy regeneration" in last_action
+                or any("generating" in str(item).lower() or "regenerating" in str(item).lower() for item in visible)
+            ):
+                break
+            time.sleep(0.08)
+        else:
+            raise AssertionError(
+                "clicking titlebar Regenerate Title/Summary did not queue any visible work: "
+                f"baseline_title={baseline_title!r} baseline_summary={baseline_summary!r} state={queued!r}"
+            )
+
+        changed = {}
+        deadline = time.time() + 30.0
+        while time.time() < deadline:
+            changed = app_state(pid)
+            active_title = str(changed.get("active_title") or "").strip()
+            active_summary = str(changed.get("active_summary") or "").strip()
+            if (
+                active_title
+                and (active_title != baseline_title or active_summary != baseline_summary)
+                and not contains_terminal_control_bytes(active_title)
+                and not contains_terminal_control_bytes(active_summary)
+            ):
+                break
+            time.sleep(0.2)
+        else:
+            raise AssertionError(
+                "titlebar copy regeneration queued but did not update title or summary: "
+                f"baseline_title={baseline_title!r} baseline_summary={baseline_summary!r} state={changed!r}"
+            )
+
+        final_title = str(changed.get("active_title") or "").strip()
+        final_summary = str(changed.get("active_summary") or "").strip()
+        if looks_like_shell_prompt_copy(final_title) or looks_like_shell_prompt_copy(final_summary):
+            raise AssertionError(
+                "titlebar copy regeneration produced prompt-shaped copy instead of session copy: "
+                f"title={final_title!r} summary={final_summary!r}"
+            )
+        return {
+            "created": created,
+            "session_path": created_session,
+            "baseline_title": baseline_title,
+            "baseline_summary": baseline_summary,
+            "regen_click": regen_click,
+            "queued_last_action": (queued.get("shell") or {}).get("last_action"),
+            "final_title": final_title,
+            "final_summary": final_summary,
+        }
+    finally:
         if created_session:
             try:
                 app_remove_session(pid, created_session)
@@ -9377,12 +9705,12 @@ def assert_context_menu_rename_session(pid: int) -> dict:
             char_deadline = time.time() + 1.5
             while time.time() < char_deadline:
                 renamed = app_state(pid)
-                current_value = str(dom_value(renamed, "tree_rename_input_value") or "")
+                current_value = tree_rename_input_value(renamed)
                 if current_value == typed_value:
                     typed_progress.append(
                         {
                             "typed": typed_value,
-                            "value": current_value,
+                            **tree_rename_observation(renamed),
                         }
                     )
                     break
@@ -9785,6 +10113,8 @@ def assert_local_tree_placement(pid: int, session: str) -> dict:
     ]
     if not matches:
         raise AssertionError(f"session is missing from app rows: {session}")
+    live_parent_matches: list[tuple[int, dict, dict]] = []
+    tree_parent_matches: list[tuple[int, dict, dict]] = []
     for index, row in matches:
         if int(row.get("depth") or 0) <= 0:
             continue
@@ -9792,17 +10122,42 @@ def assert_local_tree_placement(pid: int, session: str) -> dict:
         while cursor >= 0:
             parent = rows[cursor]
             if int(parent.get("depth") or 0) < int(row.get("depth") or 0):
-                if str(parent.get("full_path") or "") != "__live_sessions__":
-                    return {
-                        "row_index": index,
-                        "depth": row.get("depth"),
-                        "parent_path": parent.get("full_path"),
-                        "parent_label": parent.get("label"),
-                    }
+                if str(parent.get("full_path") or "") == "__live_sessions__":
+                    live_parent_matches.append((index, row, parent))
+                else:
+                    tree_parent_matches.append((index, row, parent))
                 break
             cursor -= 1
+    if len(live_parent_matches) > 1:
+        raise AssertionError(f"session is duplicated inside Live Sessions: {live_parent_matches!r}")
+    if live_parent_matches and tree_parent_matches:
+        raise AssertionError(
+            "live local session is duplicated under both Live Sessions and the stored local tree: "
+            f"live={live_parent_matches!r} tree={tree_parent_matches!r}"
+        )
+    if tree_parent_matches:
+        index, row, parent = tree_parent_matches[0]
+        return {
+            "placement": "stored_tree",
+            "row_index": index,
+            "depth": row.get("depth"),
+            "parent_path": parent.get("full_path"),
+            "parent_label": parent.get("label"),
+        }
+    if live_parent_matches:
+        index, row, parent = live_parent_matches[0]
+        if not bool(row.get("live_member")):
+            raise AssertionError(f"session is under Live Sessions but not marked as a live member: {row!r}")
+        return {
+            "placement": "live_sessions_only",
+            "row_index": index,
+            "depth": row.get("depth"),
+            "parent_path": parent.get("full_path"),
+            "parent_label": parent.get("label"),
+            "live_member": row.get("live_member"),
+        }
     raise AssertionError(
-        f"session only appears under Live Sessions instead of the local tree: {matches!r}"
+        f"session appears in app rows but not under a visible parent: {matches!r}"
     )
 
 
@@ -9819,28 +10174,68 @@ def sidebar_dom_row(state: dict, session: str) -> dict | None:
     )
 
 
-def assert_busy_icon_lifecycle(pid: int, session: str, *, sleep_seconds: int = 3) -> dict:
+def assert_busy_icon_lifecycle(pid: int, session: str, *, sleep_seconds: int = 8) -> dict:
+    def row_from_app_rows() -> dict | None:
+        normalized = normalize_live_path(session)
+        for candidate in app_rows(pid):
+            path = normalize_live_path(str(candidate.get("path") or candidate.get("full_path") or ""))
+            if path == normalized:
+                return candidate
+        return None
+
+    app_set_search(pid, "", focused=False)
+    try:
+        app_expand(pid, "__live_sessions__", True)
+    except Exception:
+        pass
+    wait_for_session_focus(pid, session, timeout_seconds=8.0)
+    visible_before = {}
+    visible_deadline = time.time() + 4.0
+    while time.time() < visible_deadline:
+        visible_before = app_state(pid)
+        if sidebar_dom_row(visible_before, session):
+            break
+        try:
+            app_open(pid, session, "terminal")
+        except Exception:
+            pass
+        time.sleep(0.12)
+
     launch = unwrap_data(terminal_send(pid, session, f"sleep {sleep_seconds}\r"))
     if not bool(launch.get("accepted")):
         raise AssertionError(f"terminal send rejected busy lifecycle probe: {launch}")
 
     busy_row = None
-    busy_deadline = time.time() + 4.0
+    observed_rows: list[dict] = []
+    busy_deadline = time.time() + max(6.0, sleep_seconds - 1.0)
     while time.time() < busy_deadline:
-        state = app_state(pid)
-        row = sidebar_dom_row(state, session)
+        row = row_from_app_rows()
+        if row:
+            observed_rows.append(
+                {
+                    "path": row.get("path") or row.get("full_path"),
+                    "busy": row.get("busy"),
+                    "icon_kind": row.get("icon_kind"),
+                    "icon_text": row.get("icon_text"),
+                    "selected": row.get("selected"),
+                }
+            )
         if row and str(row.get("icon_kind") or "") == "busy":
             busy_row = row
             break
         time.sleep(0.2)
     if busy_row is None:
-        raise AssertionError("local terminal never entered the busy icon state during a foreground command")
+        final_state = app_state(pid)
+        raise AssertionError(
+            "local terminal never entered the busy icon state during a foreground command: "
+            f"visible_before={visible_before!r} observed_rows={observed_rows!r} "
+            f"visible_paths={[row.get('path') for row in visible_sidebar_rows(final_state)]!r}"
+        )
 
     idle_row = None
-    idle_deadline = time.time() + max(10.0, sleep_seconds + 8.0)
+    idle_deadline = time.time() + max(16.0, sleep_seconds + 10.0)
     while time.time() < idle_deadline:
-        state = app_state(pid)
-        row = sidebar_dom_row(state, session)
+        row = row_from_app_rows()
         if row and not bool(row.get("busy")) and str(row.get("icon_kind") or "") == "plain-terminal":
             idle_row = row
             break
@@ -10026,7 +10421,12 @@ def assert_live_sessions_tree_contract(pid: int) -> dict:
 
 
 def assert_sidebar_contract(pid: int, session: str) -> dict:
-    state = app_state(pid)
+    # Earlier tree checks can leave a folder, preview, or transient chrome surface selected.
+    # This contract is specifically about the active local terminal row, so restore that
+    # terminal before sampling row icon and busy-state semantics.
+    state = ensure_plain_shell_runtime(pid, session)["state"]
+    terminal_reclaim_focus(pid, session)
+    state = wait_for_visible_cursor_session(pid, session, timeout_seconds=10.0)
     host = active_host(state)
     snapshot = server_snapshot()
     dom_rows = ((state.get("dom") or {}).get("sidebar_visible_rows") or [])
@@ -12436,7 +12836,9 @@ def main() -> int:
         "titlebar_overflow_menu",
         "titlebar_session_shell",
         "context_menu_rename_session",
+        "folder_create_rename_collapse",
         "session_drag_to_folder",
+        "titlebar_copy_regeneration",
         "live_session_close_button",
         "live_session_metadata_consistency",
         "live_sessions_tree_contract",
@@ -12476,10 +12878,14 @@ def main() -> int:
             # The /status regression bar is the real terminal viewport and
             # keyboard path, not sidebar creation. Use app-control setup here
             # so cold-start session restore cannot race the context-menu click.
-            disposable_codex_create = app_create_terminal(args.pid, title="Smoke Codex Session")
+            disposable_codex_create = app_create_terminal(
+                args.pid,
+                title="Smoke Codex Session",
+                kind="codex",
+            )
             disposable_codex_session = disposable_codex_create["session_path"]
             args.session = disposable_codex_session
-            state = ensure_live_codex_runtime(args.pid, args.session)["state"]
+            state = wait_for_live_codex_prompt(args.pid, session=args.session, timeout_seconds=45.0)
             initial_settle = "interactive_disposable_codex_session_app_control"
         else:
             state = wait_for_interactive_session(args.pid, args.session, timeout_seconds=25.0)
@@ -12550,6 +12956,11 @@ def main() -> int:
         run_check("right_panel_animation", lambda: assert_right_panel_animation_contract(args.pid))
         run_check("live_sessions_tree_contract", lambda: assert_live_sessions_tree_contract(args.pid))
         run_check("session_drag_to_folder", lambda: assert_session_drag_to_folder_contract(args.pid))
+        run_check(
+            "folder_create_rename_collapse",
+            lambda: assert_folder_create_rename_collapse_contract(args.pid),
+        )
+        run_check("titlebar_copy_regeneration", lambda: assert_titlebar_copy_regeneration_contract(args.pid))
         run_check(
             "terminal_interactive_lifecycle",
             lambda: assert_terminal_interactive_lifecycle(args.pid, args.session),
