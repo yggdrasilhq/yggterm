@@ -1,3 +1,12 @@
+yggterm (2.1.35-1) unstable; urgency=medium
+
+  * Disable passive title/precis/summary generation by default so row selection does not spend LLM budget.
+  * Expose copy-generation counters and in-flight paths through app-control for release proofs.
+  * Preserve inline rename and titlebar search observability under KDE DOM snapshot timeouts.
+  * Add focused Linux/KDE smoke coverage for selection copy budget and session/view contract stability.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sun, 26 Apr 2026 00:30:58 +0530
+
 yggterm (2.1.34-1) unstable; urgency=medium
 
   * Clear copied-profile daemon socket symlink chains before shell startup ping/alias.

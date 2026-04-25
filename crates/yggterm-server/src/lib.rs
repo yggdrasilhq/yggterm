@@ -470,6 +470,197 @@ pub struct ServerUiSnapshot {
     pub live_sessions: Vec<SnapshotSessionView>,
 }
 
+pub fn validate_server_ui_snapshot(snapshot: &ServerUiSnapshot) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut live_paths = HashSet::<&str>::new();
+    for live in &snapshot.live_sessions {
+        if live.session_path.trim().is_empty() {
+            violations.push("live session has an empty session_path".to_string());
+        }
+        if live.id.trim().is_empty() {
+            violations.push(format!(
+                "live session has an empty id: {}",
+                live.session_path
+            ));
+        }
+        if !live_paths.insert(live.session_path.as_str()) {
+            violations.push(format!(
+                "live session path appears more than once: {}",
+                live.session_path
+            ));
+        }
+        if !matches!(
+            live.source,
+            SessionSource::LiveLocal | SessionSource::LiveSsh
+        ) {
+            violations.push(format!(
+                "live_sessions contains non-live source {:?}: {}",
+                live.source, live.session_path
+            ));
+        }
+        if live.kind == SessionKind::Document {
+            violations.push(format!(
+                "live_sessions contains a document node: {}",
+                live.session_path
+            ));
+        }
+        if parse_remote_scanned_session_path(&live.session_path).is_some() {
+            if live.source != SessionSource::LiveSsh {
+                violations.push(format!(
+                    "remote scanned live session must use LiveSsh source: {}",
+                    live.session_path
+                ));
+            }
+            if snapshot_remote_live_runtime(&snapshot.remote_machines, &live.session_path)
+                .is_some_and(|live_runtime| !live_runtime)
+            {
+                violations.push(format!(
+                    "remote scanned live session is not marked live by the remote scan: {}",
+                    live.session_path
+                ));
+            }
+        }
+    }
+
+    match (
+        snapshot.active_session_path.as_deref(),
+        snapshot.active_session.as_ref(),
+    ) {
+        (Some(path), Some(active)) => {
+            if active.session_path != path {
+                violations.push(format!(
+                    "active_session_path does not match active_session.session_path: {path} != {}",
+                    active.session_path
+                ));
+            }
+            if matches!(
+                active.source,
+                SessionSource::LiveLocal | SessionSource::LiveSsh
+            ) && !live_paths.contains(active.session_path.as_str())
+            {
+                violations.push(format!(
+                    "active live session is missing from live_sessions: {}",
+                    active.session_path
+                ));
+            }
+            if active.source == SessionSource::Stored
+                && live_paths.contains(active.session_path.as_str())
+            {
+                violations.push(format!(
+                    "active stored session shares a path with a live session: {}",
+                    active.session_path
+                ));
+            }
+            if snapshot.active_view_mode == WorkspaceViewMode::Terminal {
+                if !snapshot_session_supports_terminal_view(active) {
+                    violations.push(format!(
+                        "terminal view is active for a non-terminal session {:?}/{:?}: {}",
+                        active.kind, active.source, active.session_path
+                    ));
+                }
+                if parse_remote_scanned_session_path(&active.session_path).is_some() {
+                    if active.source != SessionSource::LiveSsh {
+                        violations.push(format!(
+                            "remote scanned terminal session is not backed by LiveSsh: {}",
+                            active.session_path
+                        ));
+                    }
+                    if snapshot_remote_live_runtime(&snapshot.remote_machines, &active.session_path)
+                        .is_some_and(|live_runtime| !live_runtime)
+                    {
+                        violations.push(format!(
+                            "remote scanned terminal session is not marked live by the remote scan: {}",
+                            active.session_path
+                        ));
+                    }
+                }
+            }
+        }
+        (Some(path), None) => violations.push(format!(
+            "active_session_path is set without an active_session: {path}"
+        )),
+        (None, Some(active)) => violations.push(format!(
+            "active_session is set without active_session_path: {}",
+            active.session_path
+        )),
+        (None, None) => {}
+    }
+
+    if snapshot.active_view_mode == WorkspaceViewMode::Terminal && snapshot.active_session.is_none()
+    {
+        violations.push("terminal view is active without an active session".to_string());
+    }
+
+    violations
+}
+
+fn snapshot_session_supports_terminal_view(session: &SnapshotSessionView) -> bool {
+    match session.kind {
+        SessionKind::Document => snapshot_document_has_terminal_recipe(session),
+        SessionKind::Codex
+        | SessionKind::CodexLiteLlm
+        | SessionKind::Shell
+        | SessionKind::SshShell => matches!(
+            session.source,
+            SessionSource::LiveLocal | SessionSource::LiveSsh
+        ),
+    }
+}
+
+fn snapshot_document_has_terminal_recipe(session: &SnapshotSessionView) -> bool {
+    session
+        .metadata
+        .iter()
+        .any(|entry| entry.label == "Kind" && entry.value.eq_ignore_ascii_case("terminal recipe"))
+        || session
+            .rendered_sections
+            .iter()
+            .any(|section| section.title == "Replay Commands" && !section.lines.is_empty())
+}
+
+fn snapshot_remote_live_runtime(
+    remote_machines: &[RemoteMachineSnapshot],
+    session_path: &str,
+) -> Option<bool> {
+    let (raw_machine_key, session_id) = parse_remote_scanned_session_path(session_path)?;
+    let machine_key = normalize_machine_key(raw_machine_key);
+    remote_machines
+        .iter()
+        .find(|machine| machine.machine_key == machine_key)
+        .and_then(|machine| {
+            machine.sessions.iter().find(|session| {
+                session.session_path == session_path || session.session_id == session_id
+            })
+        })
+        .map(|session| session.live_runtime)
+}
+
+fn managed_session_supports_terminal_view(session: &ManagedSessionView) -> bool {
+    match session.kind {
+        SessionKind::Document => recipe_terminal_spec(session).is_some(),
+        SessionKind::Codex
+        | SessionKind::CodexLiteLlm
+        | SessionKind::Shell
+        | SessionKind::SshShell => matches!(
+            session.source,
+            SessionSource::LiveLocal | SessionSource::LiveSsh
+        ),
+    }
+}
+
+fn snapshot_active_view_mode_for_session(
+    requested: WorkspaceViewMode,
+    active_session: Option<&ManagedSessionView>,
+) -> WorkspaceViewMode {
+    if requested != WorkspaceViewMode::Terminal {
+        return requested;
+    }
+    active_session
+        .filter(|session| managed_session_supports_terminal_view(session))
+        .map(|_| WorkspaceViewMode::Terminal)
+        .unwrap_or(WorkspaceViewMode::Rendered)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedStoredSession {
     pub path: String,
@@ -1223,14 +1414,24 @@ impl YggtermServer {
                     .then(|| path.to_string())
                 })
             });
-        ServerUiSnapshot {
+        let active_view_mode =
+            snapshot_active_view_mode_for_session(self.active_view_mode, active_session.as_ref());
+        let snapshot = ServerUiSnapshot {
             active_session_path,
             active_session: active_session.map(snapshot_session_view),
-            active_view_mode: self.active_view_mode,
+            active_view_mode,
             remote_machines: self.remote_machines.clone(),
             ssh_targets: self.ssh_targets.clone(),
             live_sessions,
+        };
+        let invariant_violations = validate_server_ui_snapshot(&snapshot);
+        if !invariant_violations.is_empty() {
+            warn!(
+                violations = ?invariant_violations,
+                "server UI snapshot violates the session/view contract"
+            );
         }
+        snapshot
     }
 
     pub fn payload_stats(&self) -> SessionPayloadStats {
@@ -9427,6 +9628,12 @@ fn app_control_open_path_ready(
     session_path: &str,
     view_mode: Option<&AppControlViewMode>,
 ) -> bool {
+    if app_control_session_view_contract_violations(data)
+        .next()
+        .is_some()
+    {
+        return false;
+    }
     if data
         .get("browser")
         .and_then(|value| value.get("selected_path"))
@@ -9546,6 +9753,18 @@ fn app_control_open_path_ready(
     }
 }
 
+fn app_control_session_view_contract_violations<'a>(
+    data: &'a Value,
+) -> impl Iterator<Item = &'a str> {
+    data.get("session_view_contract_violations")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|violation| !violation.is_empty())
+}
+
 fn app_control_open_path_request_in_flight(
     data: &Value,
     session_path: &str,
@@ -9608,6 +9827,9 @@ fn app_control_open_path_failure(
     session_path: &str,
     view_mode: Option<&AppControlViewMode>,
 ) -> Option<String> {
+    if let Some(violation) = app_control_session_view_contract_violations(data).next() {
+        return Some(format!("session/view contract violation: {violation}"));
+    }
     let viewport = data.get("viewport").and_then(Value::as_object)?;
     if viewport.get("active_session_path").and_then(Value::as_str) != Some(session_path) {
         return None;
@@ -13011,7 +13233,8 @@ mod tests {
         screen_resume_or_spawn_shell_command, session_metadata_value, should_fallback_to_python,
         should_remove_local_daemon_socket_for_spawn_state, stored_session_launch_command,
         strip_remote_payload_noise, synthesize_remote_scanned_session_view,
-        upsert_session_metadata, windows_local_interactive_shell_launch_command,
+        upsert_session_metadata, validate_server_ui_snapshot,
+        windows_local_interactive_shell_launch_command,
     };
     use crate::SessionRenderedSection;
     #[cfg(unix)]
@@ -13024,6 +13247,231 @@ mod tests {
     use yggterm_core::{SessionNodeKind, TranscriptRole};
 
     static CODEX_HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn snapshot_session(path: &str, source: SessionSource) -> SnapshotSessionView {
+        SnapshotSessionView {
+            id: path
+                .rsplit('/')
+                .next()
+                .filter(|value| !value.is_empty())
+                .unwrap_or(path)
+                .to_string(),
+            session_path: path.to_string(),
+            title: "Test Session".to_string(),
+            kind: SessionKind::Codex,
+            host_label: "test".to_string(),
+            source,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: "codex".to_string(),
+            status_line: "test".to_string(),
+            terminal_lines: Vec::new(),
+            rendered_sections: Vec::new(),
+            preview: SnapshotPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: Vec::new(),
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+        }
+    }
+
+    fn snapshot_with_active(
+        active_session_path: Option<String>,
+        active_session: Option<SnapshotSessionView>,
+        active_view_mode: WorkspaceViewMode,
+        live_sessions: Vec<SnapshotSessionView>,
+        remote_machines: Vec<RemoteMachineSnapshot>,
+    ) -> ServerUiSnapshot {
+        ServerUiSnapshot {
+            active_session_path,
+            active_session,
+            active_view_mode,
+            remote_machines,
+            ssh_targets: Vec::new(),
+            live_sessions,
+        }
+    }
+
+    fn remote_machine_with_scanned_session(
+        machine_key: &str,
+        session_id: &str,
+        live_runtime: bool,
+    ) -> RemoteMachineSnapshot {
+        let session_path = remote_scanned_session_path(machine_key, session_id);
+        RemoteMachineSnapshot {
+            machine_key: machine_key.to_string(),
+            label: machine_key.to_string(),
+            ssh_target: machine_key.to_string(),
+            prefix: None,
+            remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+            remote_deploy_state: RemoteDeployState::Ready,
+            health: RemoteMachineHealth::Healthy,
+            sessions: vec![RemoteScannedSession {
+                session_path,
+                session_id: session_id.to_string(),
+                cwd: "/home/pi/gh/yggterm".to_string(),
+                started_at: "2026-04-25T00:00:00Z".to_string(),
+                modified_epoch: 1,
+                event_count: 8,
+                user_message_count: 4,
+                assistant_message_count: 4,
+                title_hint: "Remote Test".to_string(),
+                recent_context: "USER: test".to_string(),
+                cached_precis: Some("precis".to_string()),
+                cached_summary: Some("summary".to_string()),
+                live_runtime,
+                storage_path: "/home/pi/.codex/sessions/test.jsonl".to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn snapshot_contract_rejects_stale_remote_preview_in_terminal_mode() {
+        let path = remote_scanned_session_path("dev", "abc123");
+        let snapshot = snapshot_with_active(
+            Some(path.clone()),
+            Some(snapshot_session(&path, SessionSource::Stored)),
+            WorkspaceViewMode::Terminal,
+            Vec::new(),
+            vec![remote_machine_with_scanned_session("dev", "abc123", false)],
+        );
+
+        let violations = validate_server_ui_snapshot(&snapshot);
+
+        assert!(
+            violations.iter().any(|violation| violation
+                .contains("remote scanned terminal session is not backed by LiveSsh")),
+            "{violations:#?}"
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("not marked live by the remote scan")),
+            "{violations:#?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_contract_accepts_live_remote_terminal() {
+        let path = remote_scanned_session_path("dev", "abc123");
+        let mut active = snapshot_session(&path, SessionSource::LiveSsh);
+        active.ssh_target = Some("dev".to_string());
+        let snapshot = snapshot_with_active(
+            Some(path.clone()),
+            Some(active.clone()),
+            WorkspaceViewMode::Terminal,
+            vec![active],
+            vec![remote_machine_with_scanned_session("dev", "abc123", true)],
+        );
+
+        let violations = validate_server_ui_snapshot(&snapshot);
+
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[test]
+    fn snapshot_contract_rejects_non_live_source_in_live_sessions() {
+        let path = "/home/pi/.codex/sessions/stored.jsonl";
+        let stored = snapshot_session(path, SessionSource::Stored);
+        let snapshot = snapshot_with_active(
+            Some(path.to_string()),
+            Some(stored.clone()),
+            WorkspaceViewMode::Rendered,
+            vec![stored],
+            Vec::new(),
+        );
+
+        let violations = validate_server_ui_snapshot(&snapshot);
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("live_sessions contains non-live source")),
+            "{violations:#?}"
+        );
+        assert!(
+            violations.iter().any(|violation| violation
+                .contains("active stored session shares a path with a live session")),
+            "{violations:#?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_contract_rejects_active_path_without_active_session() {
+        let snapshot = snapshot_with_active(
+            Some("local://missing".to_string()),
+            None,
+            WorkspaceViewMode::Terminal,
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let violations = validate_server_ui_snapshot(&snapshot);
+
+        assert!(
+            violations.iter().any(|violation| violation
+                .contains("active_session_path is set without an active_session")),
+            "{violations:#?}"
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation
+                    .contains("terminal view is active without an active session")),
+            "{violations:#?}"
+        );
+    }
+
+    #[test]
+    fn server_snapshot_normalizes_stored_session_terminal_view_to_rendered() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let path = "/home/pi/.codex/sessions/stored.jsonl";
+        server.open_or_focus_session(
+            SessionKind::Codex,
+            path,
+            Some("stored"),
+            Some("/home/pi"),
+            Some("Stored Codex"),
+            None,
+        );
+        server.active_view_mode = WorkspaceViewMode::Terminal;
+
+        let snapshot = server.snapshot();
+        let violations = validate_server_ui_snapshot(&snapshot);
+
+        assert_eq!(snapshot.active_view_mode, WorkspaceViewMode::Rendered);
+        assert_eq!(snapshot.active_session_path.as_deref(), Some(path));
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
 
     #[test]
     fn xdotool_key_for_char_maps_status_chars() {
@@ -13293,6 +13741,52 @@ mod tests {
             "local://test",
             Some(&super::AppControlViewMode::Terminal),
         ));
+    }
+
+    #[test]
+    fn app_control_open_path_ready_rejects_session_view_contract_violations() {
+        let state = json!({
+            "session_view_contract_violations": [
+                "remote scanned terminal session is not backed by LiveSsh: remote-session://dev/test"
+            ],
+            "browser": {
+                "selected_path": "remote-session://dev/test"
+            },
+            "active_surface_requests": [],
+            "viewport": {
+                "active_session_path": "remote-session://dev/test",
+                "active_view_mode": "Terminal",
+                "ready": true,
+                "interactive": true,
+                "terminal_settled_kind": "interactive",
+                "active_terminal_surface": {
+                    "problem": null
+                },
+                "terminal_hosts": [{
+                    "xterm_present": true,
+                    "screen_present": true,
+                    "viewport_present": true,
+                    "resume_overlay_visible": false,
+                    "text_sample": "pi@dev:~$"
+                }]
+            }
+        });
+        assert!(!app_control_open_path_ready(
+            &state,
+            "remote-session://dev/test",
+            Some(&super::AppControlViewMode::Terminal),
+        ));
+        assert_eq!(
+            super::app_control_open_path_failure(
+                &state,
+                "remote-session://dev/test",
+                Some(&super::AppControlViewMode::Terminal),
+            ),
+            Some(
+                "session/view contract violation: remote scanned terminal session is not backed by LiveSsh: remote-session://dev/test"
+                    .to_string()
+            )
+        );
     }
 
     #[test]

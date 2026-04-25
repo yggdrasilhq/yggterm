@@ -111,7 +111,7 @@ use yggterm_server::{
     start_command_session, start_local_session_at, start_ssh_session_at, status,
     take_next_app_control_request, terminal_ensure, terminal_read, terminal_resize,
     terminal_snapshot, terminal_write, toggle_preview_block as daemon_toggle_preview_block,
-    update_session_copy as daemon_update_session_copy,
+    update_session_copy as daemon_update_session_copy, validate_server_ui_snapshot,
 };
 use yggui::{
     ChromePalette, DragDropPlacement, DragDropTarget, DragGhostCard, DragGhostPalette,
@@ -208,6 +208,7 @@ const BACKGROUND_COPY_RETRY_MS: u64 = 300_000;
 const BACKGROUND_COPY_CONTINUE_MS: u64 = 15_000;
 const BACKGROUND_COPY_IDLE_MS: u64 = 120_000;
 const ACTIVE_TITLE_AUTOGEN_RETRY_MS: u64 = 15_000;
+const PASSIVE_COPY_GENERATION_ENV: &str = "YGGTERM_ENABLE_PASSIVE_COPY_GENERATION";
 const BACKGROUND_REFRESH_NOTICE_MS: u64 = 12_000;
 const BACKGROUND_REFRESH_STARTUP_DEFER_MS: u64 = 20_000;
 const BACKGROUND_REFRESH_INTERACTIVE_DEFER_MS: u64 = 15_000;
@@ -421,6 +422,8 @@ struct ShellState {
     summary_requests_in_flight: HashSet<String>,
     active_copy_hydration_in_flight: HashSet<String>,
     store_copy_hydrated_session_ids: HashSet<String>,
+    copy_generation_start_count: u64,
+    copy_generation_last_started: Option<String>,
     passive_copy_suspended: bool,
     passive_copy_failures: HashSet<String>,
     copy_retry_after_ms: HashMap<String, u64>,
@@ -567,6 +570,13 @@ struct PendingDeleteDialog {
     ssh_machine_keys: Vec<String>,
     labels: Vec<String>,
     hard_delete: bool,
+    live_session_close: bool,
+}
+#[derive(Clone, PartialEq, Eq)]
+struct DeleteConfirmDialogText {
+    title: String,
+    copy: &'static str,
+    action_label: String,
 }
 #[derive(Clone, Debug)]
 struct PreviewSyncFailure {
@@ -1002,6 +1012,24 @@ enum BackgroundCopyJob {
 fn background_copy_retry_key(prefix: &str, session_path: &str) -> String {
     format!("{prefix}:{session_path}")
 }
+fn env_copy_generation_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+fn implicit_copy_generation_enabled() -> bool {
+    let value = std::env::var(PASSIVE_COPY_GENERATION_ENV).ok();
+    env_copy_generation_enabled(value.as_deref())
+}
+fn copy_generation_start_allowed(force: bool, announce: bool, implicit_enabled: bool) -> bool {
+    force || announce || implicit_enabled
+}
+fn implicit_copy_generation_start_allowed(force: bool, announce: bool) -> bool {
+    copy_generation_start_allowed(force, announce, implicit_copy_generation_enabled())
+}
 fn background_copy_retry_ready(shell: &ShellState, prefix: &str, session_path: &str) -> bool {
     let key = background_copy_retry_key(prefix, session_path);
     !PASSIVE_COPY_SUSPENDED.load(Ordering::Relaxed)
@@ -1191,7 +1219,8 @@ impl ShellState {
         let has_initial_server_snapshot = bootstrap.initial_server_snapshot.is_some();
         let needs_initial_server_sync =
             bootstrap.refresh_server_after_launch || !has_initial_server_snapshot;
-        PASSIVE_COPY_SUSPENDED.store(true, Ordering::Relaxed);
+        let passive_copy_suspended = !implicit_copy_generation_enabled();
+        PASSIVE_COPY_SUSPENDED.store(passive_copy_suspended, Ordering::Relaxed);
         let initial_yggui_theme = clamp_theme_spec(&bootstrap.settings.yggui_theme);
         let mut state = Self {
             settings,
@@ -1256,7 +1285,9 @@ impl ShellState {
             summary_requests_in_flight: HashSet::new(),
             active_copy_hydration_in_flight: HashSet::new(),
             store_copy_hydrated_session_ids: HashSet::new(),
-            passive_copy_suspended: true,
+            copy_generation_start_count: 0,
+            copy_generation_last_started: None,
+            passive_copy_suspended,
             passive_copy_failures: HashSet::new(),
             copy_retry_after_ms: HashMap::new(),
             title_autogen_retry_after_ms: HashMap::new(),
@@ -2843,6 +2874,11 @@ impl ShellState {
             self.next_background_copy_scan_after_ms = current_millis();
         }
     }
+    fn reset_passive_copy_generation_gate(&mut self) {
+        let suspended = !implicit_copy_generation_enabled();
+        self.passive_copy_suspended = suspended;
+        PASSIVE_COPY_SUSPENDED.store(suspended, Ordering::Relaxed);
+    }
     fn bump_terminal_mount_epoch_for_session(&mut self, session_path: &str) -> u64 {
         let epoch = self
             .terminal_mount_epochs
@@ -3344,6 +3380,7 @@ impl ShellState {
         self.settings.litellm_endpoint = value;
         self.passive_copy_failures.clear();
         self.copy_retry_after_ms.clear();
+        self.reset_passive_copy_generation_gate();
         self.persist_settings();
         self.last_action = "updated LiteLLM endpoint".to_string();
     }
@@ -3351,6 +3388,7 @@ impl ShellState {
         self.settings.litellm_api_key = value;
         self.passive_copy_failures.clear();
         self.copy_retry_after_ms.clear();
+        self.reset_passive_copy_generation_gate();
         self.persist_settings();
         self.last_action = "updated LiteLLM API key".to_string();
     }
@@ -3358,6 +3396,7 @@ impl ShellState {
         self.settings.interface_llm_model = value;
         self.passive_copy_failures.clear();
         self.copy_retry_after_ms.clear();
+        self.reset_passive_copy_generation_gate();
         self.persist_settings();
         self.last_action = "updated interface llm".to_string();
     }
@@ -4229,6 +4268,12 @@ impl ShellState {
         labels.extend(session_labels);
         let (ssh_machine_keys, ssh_labels) = self.selected_saved_ssh_target_machine_keys();
         labels.extend(ssh_labels);
+        let live_session_close = !hard_delete
+            && !session_paths.is_empty()
+            && document_paths.is_empty()
+            && group_paths.is_empty()
+            && ssh_machine_keys.is_empty()
+            && selected_paths_are_live_sessions(&session_paths, &self.server.live_sessions());
         if document_paths.is_empty()
             && group_paths.is_empty()
             && session_paths.is_empty()
@@ -4243,6 +4288,7 @@ impl ShellState {
             ssh_machine_keys,
             labels,
             hard_delete,
+            live_session_close,
         });
         self.close_context_menu();
         self.last_action = if hard_delete {
@@ -4270,6 +4316,7 @@ impl ShellState {
             ssh_machine_keys: Vec::new(),
             labels: vec![row.label.clone()],
             hard_delete,
+            live_session_close: false,
         };
         match row.kind {
             BrowserRowKind::Document => pending.document_paths.push(row.full_path.clone()),
@@ -4285,6 +4332,15 @@ impl ShellState {
         {
             return;
         }
+        pending.live_session_close = !hard_delete
+            && !pending.session_paths.is_empty()
+            && pending.document_paths.is_empty()
+            && pending.group_paths.is_empty()
+            && pending.ssh_machine_keys.is_empty()
+            && selected_paths_are_live_sessions(
+                &pending.session_paths,
+                &self.server.live_sessions(),
+            );
         self.pending_delete = Some(pending);
         self.close_context_menu();
         self.last_action = if hard_delete {
@@ -5206,6 +5262,15 @@ fn spawn_title_generation_for_target(
 ) {
     let session_path = target.session_path.clone();
     let session_title = target.title.clone();
+    if !implicit_copy_generation_start_allowed(force, announce) {
+        info!(
+            session_path=%session_path,
+            force,
+            announce,
+            "skipping implicit title generation while passive copy generation is disabled"
+        );
+        return;
+    }
     let Some((settings, perf_home, endpoint)) =
         safe_shell_read(state, "title_generation_start_read", |shell| {
             (
@@ -5226,6 +5291,8 @@ fn spawn_title_generation_for_target(
             false
         } else {
             shell.title_requests_in_flight.insert(session_path.clone());
+            shell.copy_generation_start_count = shell.copy_generation_start_count.saturating_add(1);
+            shell.copy_generation_last_started = Some(format!("title:{session_path}"));
             true
         }
     })
@@ -5479,6 +5546,15 @@ fn spawn_precis_generation_for_target(
 ) {
     let session_path = target.session_path.clone();
     let session_title = target.title.clone();
+    if !implicit_copy_generation_start_allowed(force, announce) {
+        info!(
+            session_path=%session_path,
+            force,
+            announce,
+            "skipping implicit precis generation while passive copy generation is disabled"
+        );
+        return;
+    }
     let Some((settings, perf_home, endpoint)) =
         safe_shell_read(state, "precis_generation_start_read", |shell| {
             (
@@ -5501,6 +5577,8 @@ fn spawn_precis_generation_for_target(
                 shell.generated_precis.remove(&session_path);
             }
             shell.precis_requests_in_flight.insert(session_path.clone());
+            shell.copy_generation_start_count = shell.copy_generation_start_count.saturating_add(1);
+            shell.copy_generation_last_started = Some(format!("precis:{session_path}"));
             true
         }
     })
@@ -5711,6 +5789,15 @@ fn spawn_summary_generation_for_target(
 ) {
     let session_path = target.session_path.clone();
     let session_title = target.title.clone();
+    if !implicit_copy_generation_start_allowed(force, announce) {
+        info!(
+            session_path=%session_path,
+            force,
+            announce,
+            "skipping implicit summary generation while passive copy generation is disabled"
+        );
+        return;
+    }
     let Some((settings, perf_home, endpoint)) =
         safe_shell_read(state, "summary_generation_start_read", |shell| {
             (
@@ -5735,6 +5822,8 @@ fn spawn_summary_generation_for_target(
             shell
                 .summary_requests_in_flight
                 .insert(session_path.clone());
+            shell.copy_generation_start_count = shell.copy_generation_start_count.saturating_add(1);
+            shell.copy_generation_last_started = Some(format!("summary:{session_path}"));
             true
         }
     })
@@ -10611,6 +10700,9 @@ fn next_background_copy_job(
     None
 }
 fn maybe_spawn_background_copy_generation(state: Signal<ShellState>) {
+    if !implicit_copy_generation_enabled() {
+        return;
+    }
     let scan = {
         let shell = state.read();
         let now = current_millis();
@@ -14161,6 +14253,7 @@ fn queue_remove_saved_ssh_target(mut state: Signal<ShellState>, row: BrowserRow)
             ssh_machine_keys: vec![machine_key],
             labels: vec![row.label.clone()],
             hard_delete: false,
+            live_session_close: false,
         });
         shell.close_context_menu();
         shell.last_action = "confirm delete".to_string();
@@ -15124,6 +15217,12 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
         {
             return;
         }
+        let live_session_close = !hard_delete
+            && !session_paths.is_empty()
+            && document_paths.is_empty()
+            && group_paths.is_empty()
+            && ssh_machine_keys.is_empty()
+            && selected_paths_are_live_sessions(&session_paths, &shell.server.live_sessions());
         let pending = PendingDeleteDialog {
             document_paths,
             group_paths,
@@ -15131,6 +15230,7 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
             ssh_machine_keys,
             labels,
             hard_delete,
+            live_session_close,
         };
         if !hard_delete {
             shell.pending_delete = Some(pending);
@@ -16396,6 +16496,28 @@ fn resolve_app_control_remote_machine(
         .find(|machine| machine.machine_key == normalized)
         .cloned()
 }
+fn render_snapshot_session_view_contract_violations(
+    shell: &ShellState,
+    snapshot: &RenderSnapshot,
+) -> Vec<String> {
+    let contract_snapshot = ServerUiSnapshot {
+        active_session_path: snapshot.active_session_path.clone(),
+        active_session: snapshot
+            .active_session
+            .clone()
+            .map(snapshot_session_view_for_ui),
+        active_view_mode: snapshot.active_view_mode,
+        remote_machines: shell.server.remote_machines().to_vec(),
+        ssh_targets: shell.server.ssh_targets().to_vec(),
+        live_sessions: snapshot
+            .live_sessions
+            .iter()
+            .cloned()
+            .map(snapshot_session_view_for_ui)
+            .collect(),
+    };
+    validate_server_ui_snapshot(&contract_snapshot)
+}
 fn describe_app_state_snapshot(
     state: &Signal<ShellState>,
     desktop: &dioxus::desktop::DesktopContext,
@@ -16457,6 +16579,30 @@ fn describe_app_state_snapshot(
         .cloned()
         .collect::<Vec<_>>();
     selected_tree_paths.sort();
+    let mut title_requests_in_flight = shell
+        .title_requests_in_flight
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    title_requests_in_flight.sort();
+    let mut precis_requests_in_flight = shell
+        .precis_requests_in_flight
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    precis_requests_in_flight.sort();
+    let mut summary_requests_in_flight = shell
+        .summary_requests_in_flight
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    summary_requests_in_flight.sort();
+    let mut active_copy_hydration_in_flight = shell
+        .active_copy_hydration_in_flight
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    active_copy_hydration_in_flight.sort();
     let notification_now_ms = current_millis();
     let visible_notifications = shell
         .notifications
@@ -16507,6 +16653,8 @@ fn describe_app_state_snapshot(
             })
         })
         .collect::<Vec<_>>();
+    let session_view_contract_violations =
+        render_snapshot_session_view_contract_violations(&shell, &snapshot);
     let update_call_to_action = shell.update_call_to_action();
     let transparent_window = BOOTSTRAP
         .get()
@@ -16533,6 +16681,7 @@ fn describe_app_state_snapshot(
         "active_title": snapshot.active_title.clone(),
         "active_precis": snapshot.active_precis.clone(),
         "active_summary": snapshot.active_summary.clone(),
+        "session_view_contract_violations": session_view_contract_violations,
         "live_session_snapshot_debug": live_session_snapshot_debug,
         "settings": settings_snapshot,
         "browser": {
@@ -16603,6 +16752,7 @@ fn describe_app_state_snapshot(
             "selection_anchor": shell.selection_anchor,
             "tree_rename_path": shell.tree_rename_path,
             "tree_rename_depth": shell.tree_rename_depth,
+            "tree_rename_value": shell.tree_rename_value,
             "tree_rename_input_focused_once": shell.tree_rename_input_focused_once,
             "context_menu_row": shell.context_menu_row.as_ref().map(|row| {
                 json!({
@@ -16718,8 +16868,21 @@ fn describe_app_state_snapshot(
         },
         "generation": {
             "title_requests_in_flight": shell.title_requests_in_flight.len(),
+            "title_requests_in_flight_paths": title_requests_in_flight,
             "precis_requests_in_flight": shell.precis_requests_in_flight.len(),
+            "precis_requests_in_flight_paths": precis_requests_in_flight,
             "summary_requests_in_flight": shell.summary_requests_in_flight.len(),
+            "summary_requests_in_flight_paths": summary_requests_in_flight,
+            "copy_generation_start_count": shell.copy_generation_start_count,
+            "copy_generation_last_started": shell.copy_generation_last_started.clone(),
+            "implicit_copy_generation_enabled": implicit_copy_generation_enabled(),
+            "passive_copy_suspended_global": PASSIVE_COPY_SUSPENDED.load(Ordering::Relaxed),
+            "passive_copy_suspended": shell.passive_copy_suspended,
+            "background_copy_scan_in_flight": shell.background_copy_scan_in_flight,
+            "next_background_copy_scan_after_ms": shell.next_background_copy_scan_after_ms,
+            "active_copy_hydration_in_flight": active_copy_hydration_in_flight.len(),
+            "active_copy_hydration_in_flight_paths": active_copy_hydration_in_flight,
+            "store_copy_hydrated_session_count": shell.store_copy_hydrated_session_ids.len(),
             "rows_with_labels": shell.browser.rows().iter().filter(|row| !row.label.trim().is_empty()).count(),
             "generated_precis": shell.generated_precis.len(),
             "generated_summaries": shell.generated_summaries.len(),
@@ -18958,6 +19121,166 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
         }),
     }
 }
+
+async fn capture_dom_debug_snapshot_action_fallback_for(
+    active_session_path: Option<&str>,
+) -> Value {
+    let _ = active_session_path;
+    let script = r#"
+        (() => {
+            const visibleNodes = (nodes) =>
+                nodes.filter((node) => node && node.getClientRects().length > 0);
+            const pickLast = (nodes) => nodes.length ? nodes[nodes.length - 1] : null;
+            const rectSummary = (node) => {
+                if (!node || typeof node.getBoundingClientRect !== 'function') {
+                    return null;
+                }
+                const rect = node.getBoundingClientRect();
+                if (!rect || rect.width <= 0 || rect.height <= 0) {
+                    return null;
+                }
+                return {
+                    left: Math.round(rect.left),
+                    top: Math.round(rect.top),
+                    width: Math.round(rect.width),
+                    height: Math.round(rect.height),
+                    right: Math.round(rect.right),
+                    bottom: Math.round(rect.bottom),
+                };
+            };
+            const shellRoots = Array.from(document.querySelectorAll('#yggterm-shell-root'));
+            const rootNode =
+                pickLast(visibleNodes(shellRoots))
+                || pickLast(shellRoots)
+                || null;
+            const scope = rootNode || document;
+            const contextMenu =
+                scope.querySelector('[data-context-menu="1"]')
+                || document.querySelector('[data-context-menu="1"]')
+                || null;
+            const contextMenuRenameSession =
+                contextMenu?.querySelector('[data-context-menu-action="rename-session"]') || null;
+            const contextMenuActions = Array.from(
+                contextMenu?.querySelectorAll('[data-context-menu-action]') || []
+            );
+            const deleteConfirmOverlay =
+                scope.querySelector('[data-delete-confirm-overlay="1"]')
+                || document.querySelector('[data-delete-confirm-overlay="1"]')
+                || null;
+            const deleteConfirmDialog =
+                deleteConfirmOverlay?.querySelector('[data-delete-confirm-dialog="1"]') || null;
+            const deleteConfirmTitle =
+                deleteConfirmOverlay?.querySelector('[data-delete-confirm-title="1"]') || null;
+            const deleteConfirmCopy =
+                deleteConfirmOverlay?.querySelector('[data-delete-confirm-copy="1"]') || null;
+            const deleteConfirmCancel =
+                deleteConfirmOverlay?.querySelector('[data-delete-confirm-cancel="1"]') || null;
+            const deleteConfirmAction =
+                deleteConfirmOverlay?.querySelector('[data-delete-confirm-action="1"]') || null;
+            const treeRenameInputs = Array.from(
+                scope.querySelectorAll('[data-tree-rename-input="1"]')
+            );
+            const treeRenameInput =
+                pickLast(visibleNodes(treeRenameInputs))
+                || pickLast(treeRenameInputs)
+                || null;
+            const titlebarSearchInput =
+                scope.querySelector('#yggterm-search-input')
+                || document.querySelector('#yggterm-search-input')
+                || null;
+            const titlebarSearchFieldShell =
+                scope.querySelector('[data-titlebar-search-field-shell="1"]')
+                || document.querySelector('[data-titlebar-search-field-shell="1"]')
+                || null;
+            const titlebarSearchOuterShell =
+                scope.querySelector('[data-yggterm-titlebar-search="1"]')
+                || document.querySelector('[data-yggterm-titlebar-search="1"]')
+                || null;
+            const titlebarSearchShell =
+                scope.querySelector('[data-titlebar-search-modal="1"]')
+                || titlebarSearchOuterShell
+                || scope.querySelector('[data-titlebar-search-shell="1"]')
+                || document.querySelector('[data-titlebar-search-modal="1"]')
+                || document.querySelector('[data-titlebar-search-shell="1"]')
+                || null;
+            const titlebarSearchDropdown =
+                scope.querySelector('[data-titlebar-search-dropdown="1"]')
+                || document.querySelector('[data-titlebar-search-dropdown="1"]')
+                || null;
+            const titlebarSearchCounter =
+                scope.querySelector('[data-titlebar-search-counter="1"]')
+                || document.querySelector('[data-titlebar-search-counter="1"]')
+                || null;
+            const activeElement = document.activeElement;
+            const activeTerminalHost = activeElement && activeElement.closest
+                ? activeElement.closest('[data-terminal-session-path]')
+                : null;
+            const titlebarSearchActive = Boolean(
+                titlebarSearchInput
+                && (
+                    activeElement === titlebarSearchInput
+                    || String(titlebarSearchInput.value || '').length > 0
+                    || rectSummary(titlebarSearchDropdown)
+                )
+            );
+            dioxus.send({
+                snapshot_mode: 'action-fallback',
+                degraded_reason: 'dom_debug_snapshot_timeout',
+                shell_root_count: shellRoots.length,
+                shell_root_rect: rectSummary(rootNode),
+                terminal_host_count: 0,
+                terminal_hosts: [],
+                sidebar_visible_row_count: 0,
+                sidebar_visible_rows: [],
+                context_menu_rect: rectSummary(contextMenu),
+                context_menu_action_rects: contextMenuActions.slice(0, 12).map((node) => ({
+                    action: String(node.getAttribute('data-context-menu-action') || ''),
+                    rect: rectSummary(node),
+                })).filter((entry) => Boolean(entry.rect)),
+                context_menu_rename_session_rect: rectSummary(contextMenuRenameSession),
+                delete_confirm_overlay_rect: rectSummary(deleteConfirmOverlay),
+                delete_confirm_dialog_rect: rectSummary(deleteConfirmDialog),
+                delete_confirm_title_text: String(deleteConfirmTitle?.innerText || '').trim().slice(0, 240),
+                delete_confirm_copy_text: String(deleteConfirmCopy?.innerText || '').trim().slice(0, 480),
+                delete_confirm_cancel_rect: rectSummary(deleteConfirmCancel),
+                delete_confirm_action_rect: rectSummary(deleteConfirmAction),
+                tree_rename_input_rect: rectSummary(treeRenameInput),
+                tree_rename_input_focused: treeRenameInputs.some((node) => node === activeElement),
+                tree_rename_input_value: treeRenameInput ? String(treeRenameInput.value || '') : '',
+                titlebar_search_active: titlebarSearchActive,
+                titlebar_search_shell_rect: rectSummary(titlebarSearchShell),
+                titlebar_search_outer_shell_rect: rectSummary(titlebarSearchOuterShell),
+                titlebar_search_field_shell_rect: rectSummary(titlebarSearchFieldShell),
+                titlebar_search_input_rect: rectSummary(titlebarSearchInput),
+                titlebar_search_dropdown_rect: rectSummary(titlebarSearchDropdown),
+                titlebar_search_counter_text: String(titlebarSearchCounter?.textContent || '').trim(),
+                active_element: activeElement ? {
+                    tag_name: String(activeElement.tagName || '').toLowerCase(),
+                    id: String(activeElement.id || '').trim(),
+                    class_name: String(activeElement.className || '').trim(),
+                    value: 'value' in activeElement ? String(activeElement.value || '') : '',
+                    data_tree_rename_input: activeElement.getAttribute
+                        ? String(activeElement.getAttribute('data-tree-rename-input') || '').trim()
+                        : '',
+                    within_terminal_host_id: activeTerminalHost
+                        ? String(activeTerminalHost.id || '').trim()
+                        : '',
+                } : null,
+            });
+        })();
+    "#;
+    let mut eval = document::eval(script);
+    match tokio::time::timeout(Duration::from_millis(500), eval.recv::<Value>()).await {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => json!({
+            "error": error.to_string(),
+        }),
+        Err(_) => json!({
+            "error": "dom_debug_snapshot_timeout",
+        }),
+    }
+}
+
 async fn capture_dom_debug_snapshot_for_or_empty(active_session_path: Option<&str>) -> Value {
     let snapshot = capture_dom_debug_snapshot_for(active_session_path).await;
     if let Some(reason) = snapshot
@@ -18974,6 +19297,34 @@ async fn capture_dom_debug_snapshot_for_or_empty(active_session_path: Option<&st
                     .or_insert_with(|| Value::String(reason.clone()));
             }
             return basic;
+        }
+        let action_fallback =
+            capture_dom_debug_snapshot_action_fallback_for(active_session_path).await;
+        let action_fallback_is_actionable = action_fallback.get("error").is_none()
+            && (action_fallback
+                .get("tree_rename_input_rect")
+                .and_then(Value::as_object)
+                .is_some()
+                || action_fallback
+                    .get("context_menu_action_rects")
+                    .and_then(Value::as_array)
+                    .is_some_and(|actions| !actions.is_empty())
+                || action_fallback
+                    .get("delete_confirm_dialog_rect")
+                    .and_then(Value::as_object)
+                    .is_some()
+                || action_fallback
+                    .get("titlebar_search_active")
+                    .and_then(Value::as_bool)
+                    == Some(true));
+        if action_fallback_is_actionable {
+            let mut action_fallback = action_fallback;
+            if let Value::Object(object) = &mut action_fallback {
+                object
+                    .entry("degraded_reason".to_string())
+                    .or_insert_with(|| Value::String(reason.clone()));
+            }
+            return action_fallback;
         }
         json!({
             "error": reason,
@@ -23272,7 +23623,6 @@ fn app() -> Element {
                                 const renamePath = {path_literal};
                                 const renameToken = {rename_token};
                                 const initialValue = {initial_value_literal};
-                                const renameStartedAtMs = Number({rename_started_at_ms});
                                 if (window.__yggtermTreeRenameSelectToken === renameToken) {{
                                     return;
                                 }}
@@ -23292,7 +23642,6 @@ fn app() -> Element {
                                     const currentValue = String(input.value || '');
                                     const shouldSelect =
                                         currentValue === initialValue
-                                        && (Date.now() - renameStartedAtMs) <= 320
                                         && document.activeElement === input;
                                     if (shouldSelect && input.select) {{
                                         input.select();
@@ -37613,6 +37962,74 @@ fn ContextMenuOverlay(
         }
     }
 }
+fn selected_paths_are_live_sessions(
+    session_paths: &[String],
+    live_sessions: &[ManagedSessionView],
+) -> bool {
+    if session_paths.is_empty() {
+        return false;
+    }
+    let live_paths = live_sessions
+        .iter()
+        .map(|session| session.session_path.as_str())
+        .collect::<HashSet<_>>();
+    session_paths
+        .iter()
+        .all(|path| live_paths.contains(path.as_str()))
+}
+fn delete_confirm_dialog_text(pending: &PendingDeleteDialog) -> DeleteConfirmDialogText {
+    let item_count = pending.document_paths.len()
+        + pending.group_paths.len()
+        + pending.session_paths.len()
+        + pending.ssh_machine_keys.len();
+    let deleting_ssh_targets = !pending.ssh_machine_keys.is_empty()
+        && pending.document_paths.is_empty()
+        && pending.group_paths.is_empty()
+        && pending.session_paths.is_empty();
+    let deleting_sessions = !pending.session_paths.is_empty()
+        && pending.document_paths.is_empty()
+        && pending.group_paths.is_empty()
+        && pending.ssh_machine_keys.is_empty();
+    if pending.hard_delete {
+        return DeleteConfirmDialogText {
+            title: "Delete Permanently?".to_string(),
+            copy: if deleting_ssh_targets {
+                "This will permanently remove the selected SSH targets from the sidebar."
+            } else if deleting_sessions {
+                "This will permanently remove stored session files when available and close live terminal runtimes for those sessions."
+            } else {
+                "This will permanently remove the selected items from the workspace tree."
+            },
+            action_label: "Delete Permanently".to_string(),
+        };
+    }
+    if pending.live_session_close {
+        return DeleteConfirmDialogText {
+            title: if item_count == 1 {
+                "Close Live Session?".to_string()
+            } else {
+                "Close Live Sessions?".to_string()
+            },
+            copy: "This kills the server-owned terminal runtime and removes it from Live Sessions. Stored session metadata and transcripts remain.",
+            action_label: if item_count == 1 {
+                "Close Session".to_string()
+            } else {
+                "Close Sessions".to_string()
+            },
+        };
+    }
+    DeleteConfirmDialogText {
+        title: "Delete Selected Items?".to_string(),
+        copy: if deleting_ssh_targets {
+            "This will remove the selected SSH targets from the sidebar. Hold Shift while pressing Delete to skip this dialog."
+        } else if deleting_sessions {
+            "This will remove the selected session rows from the sidebar. Hold Shift while pressing Delete to permanently remove stored session files when available."
+        } else {
+            "This will remove the selected items from the workspace tree. Hold Shift while pressing Delete to skip this dialog."
+        },
+        action_label: "Delete".to_string(),
+    }
+}
 #[component]
 fn DeleteConfirmOverlay(
     pending: PendingDeleteDialog,
@@ -37625,14 +38042,7 @@ fn DeleteConfirmOverlay(
         + pending.session_paths.len()
         + pending.ssh_machine_keys.len();
     let preview = pending.labels.iter().take(4).cloned().collect::<Vec<_>>();
-    let deleting_ssh_targets = !pending.ssh_machine_keys.is_empty()
-        && pending.document_paths.is_empty()
-        && pending.group_paths.is_empty()
-        && pending.session_paths.is_empty();
-    let deleting_sessions = !pending.session_paths.is_empty()
-        && pending.document_paths.is_empty()
-        && pending.group_paths.is_empty()
-        && pending.ssh_machine_keys.is_empty();
+    let dialog_text = delete_confirm_dialog_text(&pending);
     let overlay_blur = overlay_backdrop_style("blur(18px) saturate(130%)");
     rsx! {
         div {
@@ -37664,28 +38074,12 @@ fn DeleteConfirmOverlay(
                             "font-size:18px; font-weight:700; letter-spacing:-0.01em; color:{};",
                             palette.text
                         ),
-                        if pending.hard_delete { "Delete Permanently?" } else { "Delete Selected Items?" }
+                        "{dialog_text.title}"
                     }
                     div {
                         "data-delete-confirm-copy": "1",
                         style: format!("font-size:12px; line-height:1.6; color:{};", palette.muted),
-                        if pending.hard_delete {
-                            if deleting_ssh_targets {
-                                "This will permanently remove the selected SSH targets from the sidebar."
-                            } else if deleting_sessions {
-                                "This will permanently remove stored session files when available and remove live sessions from the sidebar/runtime."
-                            } else {
-                                "This will permanently remove the selected items from the workspace tree."
-                            }
-                        } else {
-                            if deleting_ssh_targets {
-                                "This will remove the selected SSH targets from the sidebar. Hold Shift while pressing Delete to skip this dialog."
-                            } else if deleting_sessions {
-                                "This will remove the selected live sessions from the sidebar/runtime. Hold Shift while pressing Delete to permanently remove stored session files when available."
-                            } else {
-                                "This will remove the selected items from the workspace tree. Hold Shift while pressing Delete to skip this dialog."
-                            }
-                        }
+                        "{dialog_text.copy}"
                     }
                 }
                 div {
@@ -37715,7 +38109,7 @@ fn DeleteConfirmOverlay(
                         "data-delete-confirm-action": "1",
                         style: delete_confirm_button_style(palette, pending.hard_delete),
                         onclick: move |evt| on_confirm.call(evt),
-                        if pending.hard_delete { "Delete Permanently" } else { "Delete" }
+                        "{dialog_text.action_label}"
                     }
                 }
             }
@@ -39861,6 +40255,48 @@ mod tests {
             normalize_app_control_main_zoom_value(20.0, WorkspaceViewMode::Terminal),
             20.0
         );
+    }
+    #[test]
+    fn live_session_close_dialog_uses_close_copy_not_delete_copy() {
+        let pending = PendingDeleteDialog {
+            document_paths: Vec::new(),
+            group_paths: Vec::new(),
+            session_paths: vec!["local://abc123".to_string()],
+            ssh_machine_keys: Vec::new(),
+            labels: vec!["Local Shell".to_string()],
+            hard_delete: false,
+            live_session_close: true,
+        };
+
+        let text = delete_confirm_dialog_text(&pending);
+
+        assert_eq!(text.title, "Close Live Session?");
+        assert_eq!(text.action_label, "Close Session");
+        assert!(text.copy.contains("server-owned terminal runtime"));
+        assert!(
+            text.copy
+                .contains("Stored session metadata and transcripts remain")
+        );
+        assert!(!text.copy.contains("permanently remove"));
+    }
+    #[test]
+    fn selected_session_delete_dialog_does_not_claim_live_runtime_close() {
+        let pending = PendingDeleteDialog {
+            document_paths: Vec::new(),
+            group_paths: Vec::new(),
+            session_paths: vec!["/home/pi/.codex/sessions/stored.jsonl".to_string()],
+            ssh_machine_keys: Vec::new(),
+            labels: vec!["Stored Codex".to_string()],
+            hard_delete: false,
+            live_session_close: false,
+        };
+
+        let text = delete_confirm_dialog_text(&pending);
+
+        assert_eq!(text.title, "Delete Selected Items?");
+        assert_eq!(text.action_label, "Delete");
+        assert!(text.copy.contains("selected session rows"));
+        assert!(!text.copy.contains("server-owned terminal runtime"));
     }
     #[test]
     fn interface_zoom_clamps_to_fifty_percent_floor() {
@@ -50767,6 +51203,17 @@ Updated at   Branch  Conversation\n\
             humanized_title_for_copy_target(&target).as_deref(),
             Some("Pi Home Shell")
         );
+    }
+    #[test]
+    fn copy_generation_start_policy_blocks_implicit_selection_work() {
+        assert!(!copy_generation_start_allowed(false, false, false));
+        assert!(copy_generation_start_allowed(true, false, false));
+        assert!(copy_generation_start_allowed(false, true, false));
+        assert!(copy_generation_start_allowed(false, false, true));
+        assert!(env_copy_generation_enabled(Some("true")));
+        assert!(env_copy_generation_enabled(Some("1")));
+        assert!(!env_copy_generation_enabled(Some("false")));
+        assert!(!env_copy_generation_enabled(None));
     }
     #[test]
     fn active_session_copy_refresh_plan_skips_focus_time_regeneration_for_stale_summary() {
