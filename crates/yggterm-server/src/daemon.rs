@@ -187,7 +187,7 @@ fn refresh_legacy_server_socket_aliases(current: &Path) {
         let Some(candidate_version) = parse_versioned_server_socket_name(&candidate) else {
             continue;
         };
-        if candidate_version == current_version {
+        if !versioned_socket_alias_is_legacy(current_version, candidate_version) {
             continue;
         }
         if ping(&ServerEndpoint::UnixSocket(candidate.clone())).is_ok() {
@@ -196,6 +196,14 @@ fn refresh_legacy_server_socket_aliases(current: &Path) {
         let _ = fs::remove_file(&candidate);
         let _ = std::os::unix::fs::symlink(current, &candidate);
     }
+}
+
+#[cfg(unix)]
+fn versioned_socket_alias_is_legacy(
+    current_version: (u64, u64, u64),
+    candidate_version: (u64, u64, u64),
+) -> bool {
+    candidate_version < current_version
 }
 
 #[cfg(unix)]
@@ -3188,7 +3196,7 @@ mod tests {
     #[cfg(unix)]
     use super::{
         daemon_binary_is_legacy, parse_versioned_server_socket_name,
-        versioned_server_socket_alias_candidates,
+        versioned_server_socket_alias_candidates, versioned_socket_alias_is_legacy,
     };
     use crate::{
         PersistedDaemonState, PersistedLiveSession, RemoteDeployState, RemoteMachineHealth,
@@ -3226,6 +3234,15 @@ mod tests {
 
         assert!(candidates.contains(&sockets_dir.join("server-2-1-4.sock")));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn versioned_socket_alias_policy_only_targets_older_versions() {
+        let current = (2, 1, 32);
+        assert!(versioned_socket_alias_is_legacy(current, (2, 1, 31)));
+        assert!(!versioned_socket_alias_is_legacy(current, current));
+        assert!(!versioned_socket_alias_is_legacy(current, (2, 1, 33)));
     }
 
     #[cfg(target_os = "linux")]
