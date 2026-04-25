@@ -4237,7 +4237,10 @@ def delete_session_via_context_menu(
         copy_text = str(((deleted.get("dom") or {}).get("delete_confirm_copy_text") or "")).strip().lower()
         if dialog_visible and (
             normalize_live_path(session_path) in pending_paths
-            or (title_text == "Delete Selected Items?" and "live sessions" in copy_text)
+            or (
+                title_text in {"Close Live Session?", "Close Live Sessions?"}
+                and "server-owned terminal runtime" in copy_text
+            )
         ):
             break
         time.sleep(0.05)
@@ -4741,6 +4744,20 @@ def assert_no_problem_notifications(state: dict, *, context: str) -> dict:
     return {"context": context, "bad_notification_count": 0}
 
 
+def session_view_contract_violations(state: dict) -> list[str]:
+    violations = state.get("session_view_contract_violations") or []
+    if not isinstance(violations, list):
+        return [str(violations)]
+    return [str(violation).strip() for violation in violations if str(violation).strip()]
+
+
+def assert_no_session_view_contract_violations(state: dict, *, context: str) -> dict:
+    violations = session_view_contract_violations(state)
+    if violations:
+        raise AssertionError(f"{context}: session/view contract violations observed: {violations!r}")
+    return {"context": context, "violation_count": 0}
+
+
 def wait_for_interactive(pid: int, timeout_seconds: float = 20.0) -> dict:
     deadline = time.time() + timeout_seconds
     last_state = {}
@@ -5149,6 +5166,13 @@ def wait_for_terminal_quiescent(pid: int, timeout_seconds: float = 12.0, stable_
             last_state = state
             last_sig = sig
     raise AssertionError(f"terminal did not become quiescent: {last_state!r}")
+
+
+def wait_for_terminal_type_sample(pid: int, timeout_seconds: float = 8.0) -> dict:
+    try:
+        return wait_for_terminal_quiescent(pid, timeout_seconds=timeout_seconds)
+    except AssertionError:
+        return wait_for_interactive(pid, timeout_seconds=min(timeout_seconds, 4.0))
 
 
 def wait_for_terminal_restore(pid: int, timeout_seconds: float = 12.0) -> dict:
@@ -9913,20 +9937,37 @@ def assert_live_session_close_button(pid: int) -> dict:
         confirm_rect = dom_rect(dialog_state, "delete_confirm_action_rect")
         if not rect_is_visible(confirm_rect):
             raise AssertionError(f"delete confirmation action is missing after live close click: {dialog_state!r}")
+        title_text = str(((dialog_state.get("dom") or {}).get("delete_confirm_title_text") or "")).strip()
+        copy_text = str(((dialog_state.get("dom") or {}).get("delete_confirm_copy_text") or "")).strip()
+        if title_text == "Delete Selected Items?":
+            raise AssertionError(f"live close dialog still uses delete wording: {dialog_state!r}")
+        if title_text not in {"Close Live Session?", "Close Live Sessions?"}:
+            raise AssertionError(f"live close dialog title is not explicit: {dialog_state!r}")
+        if "server-owned terminal runtime" not in copy_text:
+            raise AssertionError(f"live close dialog copy does not describe runtime kill semantics: {dialog_state!r}")
+        if "Stored session metadata and transcripts remain" not in copy_text:
+            raise AssertionError(f"live close dialog copy does not protect stored metadata semantics: {dialog_state!r}")
         confirm_click = xdotool_click_window(
             pid,
             rect_center_x(confirm_rect),
             rect_center_y(confirm_rect),
         )
         settled = wait_for_sidebar_path_absent(pid, target_path, timeout_seconds=12.0)
+        contract_check = assert_no_session_view_contract_violations(
+            settled,
+            context="after live session close",
+        )
         return {
             "target_path": target_path,
             "close_rect": close_rect,
             "close_click": close_click,
             "delete_confirm_dialog_rect": dom_rect(dialog_state, "delete_confirm_dialog_rect"),
             "delete_confirm_action_rect": confirm_rect,
+            "delete_confirm_title_text": title_text,
+            "delete_confirm_copy_text": copy_text,
             "delete_confirm_click": confirm_click,
             "post_delete_active_session_path": settled.get("active_session_path"),
+            "session_view_contract": contract_check,
         }
     finally:
         try:
@@ -10720,6 +10761,70 @@ def assert_active_session_copy_quality(pid: int) -> dict:
         "active_session_path": active_session_path,
         "active_title": active_title,
         "active_summary": active_summary,
+    }
+
+
+def assert_selection_copy_generation_budget(pid: int) -> dict:
+    before_state = app_state(pid)
+    before_generation = before_state.get("generation") or {}
+    if "copy_generation_start_count" not in before_generation:
+        raise AssertionError(f"app state is missing copy generation counter: {before_state!r}")
+    if before_generation.get("implicit_copy_generation_enabled") is True:
+        raise AssertionError(
+            "passive copy generation is enabled during a no-budget selection smoke; "
+            f"generation={before_generation!r}"
+        )
+    target = str(before_state.get("active_session_path") or "").strip()
+    if not target:
+        for row in app_rows(pid):
+            candidate = str(row.get("path") or row.get("full_path") or "").strip()
+            if candidate and not candidate.startswith("__") and row.get("kind") == "Session":
+                target = candidate
+                break
+    if not target:
+        raise AssertionError(f"no selectable session row for copy generation budget check: {before_state!r}")
+    before_count = int(before_generation.get("copy_generation_start_count") or 0)
+    view = "terminal" if before_state.get("active_view_mode") == "Terminal" else "preview"
+    open_result = app_open(pid, target, view=view)
+    time.sleep(1.25)
+    after_state = app_state(pid)
+    after_generation = after_state.get("generation") or {}
+    after_count = int(after_generation.get("copy_generation_start_count") or 0)
+    in_flight = {
+        key: after_generation.get(key)
+        for key in (
+            "title_requests_in_flight_paths",
+            "precis_requests_in_flight_paths",
+            "summary_requests_in_flight_paths",
+        )
+        if after_generation.get(key)
+    }
+    if after_count != before_count or in_flight:
+        raise AssertionError(
+            "select/open started copy generation even though passive generation is disabled: "
+            f"target={target!r} before={before_generation!r} after={after_generation!r}"
+        )
+    notification_titles = [
+        str(item.get("title") or "").strip().lower()
+        for item in ((after_state.get("shell") or {}).get("notifications") or [])
+        if isinstance(item, dict)
+    ]
+    forbidden = ("generating title", "generating summary", "generating precis", "background cache")
+    if any(any(marker in title for marker in forbidden) for title in notification_titles):
+        raise AssertionError(
+            "selection produced a copy-generation notification: "
+            f"target={target!r} notifications={notification_titles!r}"
+        )
+    return {
+        "target": target,
+        "view": view,
+        "open_result": open_result.get("data") or open_result,
+        "before_count": before_count,
+        "after_count": after_count,
+        "implicit_copy_generation_enabled": after_generation.get("implicit_copy_generation_enabled"),
+        "passive_copy_suspended": after_generation.get("passive_copy_suspended"),
+        "passive_copy_suspended_global": after_generation.get("passive_copy_suspended_global"),
+        "active_copy_hydration_in_flight": after_generation.get("active_copy_hydration_in_flight"),
     }
 
 
@@ -11902,7 +12007,7 @@ def type_with_cursor_artifact_checks(
             deadline = time.time() + 4.0
             while True:
                 time.sleep(0.18)
-                candidate_state = wait_for_terminal_quiescent(pid, timeout_seconds=8.0)
+                candidate_state = wait_for_terminal_type_sample(pid, timeout_seconds=8.0)
                 candidate_host = active_host(candidate_state)
                 cursor_line_text = str(candidate_host.get("cursor_line_text") or candidate_host.get("cursor_row_text") or "")
                 text_sample = str(candidate_host.get("text_sample") or "")
@@ -11924,7 +12029,7 @@ def type_with_cursor_artifact_checks(
                 deadline = time.time() + 4.0
                 while True:
                     time.sleep(0.18)
-                    candidate_state = wait_for_terminal_quiescent(pid, timeout_seconds=8.0)
+                    candidate_state = wait_for_terminal_type_sample(pid, timeout_seconds=8.0)
                     candidate_host = active_host(candidate_state)
                     cursor_line_text = str(candidate_host.get("cursor_line_text") or candidate_host.get("cursor_row_text") or "")
                     text_sample = str(candidate_host.get("text_sample") or "")
@@ -12822,8 +12927,10 @@ def main() -> int:
         "managed_cli_refresh_ttl",
         "maximize_roundtrip_layout",
         "notification_health_initial",
+        "session_view_contract_initial",
         "right_panel_animation",
         "search_focus_overlay",
+        "selection_copy_generation_budget",
         "settings_terminal_reclaim",
         "theme_editor_contract",
         "active_session_copy_quality",
@@ -12934,6 +13041,10 @@ def main() -> int:
         run_check("focus", lambda: assert_focus_and_visibility(args.pid, state))
         run_check("geometry", lambda: assert_geometry(state))
         run_check("notification_health_initial", lambda: assert_no_problem_notifications(state, context="initial"))
+        run_check(
+            "session_view_contract_initial",
+            lambda: assert_no_session_view_contract_violations(state, context="initial"),
+        )
         if not selected_checks or "titlebar_centering" in selected_checks:
             titlebar_state, titlebar_centering = wait_for_titlebar_centering(args.pid)
             state = titlebar_state
@@ -12951,6 +13062,7 @@ def main() -> int:
             lambda: assert_live_session_metadata_consistency(args.pid, args.session),
         )
         run_check("active_session_copy_quality", lambda: assert_active_session_copy_quality(args.pid))
+        run_check("selection_copy_generation_budget", lambda: assert_selection_copy_generation_budget(args.pid))
         run_check("titlebar_overflow_menu", lambda: assert_titlebar_overflow_menu_contract(args.pid))
         run_check("settings_terminal_reclaim", lambda: assert_settings_terminal_reclaim_contract(args.pid))
         run_check("right_panel_animation", lambda: assert_right_panel_animation_contract(args.pid))
