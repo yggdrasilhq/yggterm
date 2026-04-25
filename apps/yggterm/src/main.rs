@@ -1366,12 +1366,12 @@ fn detect_linux_window_profile() -> LinuxWindowProfile {
             };
         }
         return LinuxWindowProfile {
-            transparent: wayland_session && !xrpd_session,
+            transparent: false,
             xrpd_session,
             reason: if xrpd_session {
                 "xrdp_opaque_profile"
             } else if wayland_session {
-                "wayland_transparent_profile"
+                "wayland_opaque_default"
             } else {
                 "x11_opaque_profile"
             },

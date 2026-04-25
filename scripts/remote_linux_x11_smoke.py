@@ -848,7 +848,7 @@ def remote_launch_visible_window(
     exports = remote_env_exports(env)
     launch = ssh_shell(
         host,
-        f"{exports}; {quote(remote_bin)} server app launch --wait-visible "
+        f"{exports}; {quote(remote_bin)} server app launch "
         f"--allow-multi-window --skip-active-exec-handoff --timeout-ms {timeout_ms} "
         f"--log {quote(remote_log)}",
     )
@@ -1076,6 +1076,14 @@ def main() -> int:
             "YGGTERM_REMOTE_SMOKE_TAG": "1",
             "NO_AT_BRIDGE": "1",
         }
+        picked_session_id = str(picked.get("session_id") or picked.get("Name") or "").strip()
+        if picked_session_id:
+            launch_env["XDG_SESSION_ID"] = picked_session_id
+        if picked_type:
+            launch_env["XDG_SESSION_TYPE"] = picked_type
+        picked_class = str(picked.get("Class") or "").strip()
+        if picked_class:
+            launch_env["XDG_SESSION_CLASS"] = picked_class
         for desktop_key in (
             "DESKTOP_SESSION",
             "XDG_CURRENT_DESKTOP",
