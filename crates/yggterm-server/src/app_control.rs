@@ -8,6 +8,8 @@ use uuid::Uuid;
 use yggterm_core::UiTheme;
 use yggui_contract::YgguiClipboardContents;
 
+use crate::SessionKind;
+
 const APP_CONTROL_REQUESTS_DIR: &str = "app-control-requests";
 const APP_CONTROL_RESPONSES_DIR: &str = "app-control-responses";
 const APP_CONTROL_CAPTURES_DIR: &str = "screenshots";
@@ -219,6 +221,8 @@ pub enum AppControlCommand {
         cwd: Option<String>,
         #[serde(default)]
         title_hint: Option<String>,
+        #[serde(default)]
+        session_kind: Option<SessionKind>,
     },
     SendTerminalInput {
         session_path: String,

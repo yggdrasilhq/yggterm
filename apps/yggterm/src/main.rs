@@ -1044,7 +1044,20 @@ fn main() -> Result<()> {
                                 None
                             }
                         });
-                        run_app_control_create_terminal(machine_key, cwd, title_hint, timeout_ms)
+                        let kind = args.windows(2).find_map(|window| {
+                            if window[0] == "--kind" {
+                                Some(window[1].as_str())
+                            } else {
+                                None
+                            }
+                        });
+                        run_app_control_create_terminal(
+                            machine_key,
+                            cwd,
+                            title_hint,
+                            kind,
+                            timeout_ms,
+                        )
                     }
                     "send" => {
                         let session_path = cli_positional_args(&args, 4)
