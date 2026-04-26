@@ -596,9 +596,12 @@ PY""",
     if check.stdout.strip() == "ok":
         return "python3"
     venv_dir = f"{remote_dir}/venv"
+    tmp_dir = f"{remote_dir}/tmp"
     ssh_shell(
         host,
-        f"python3 -m venv {quote(venv_dir)} && {quote(venv_dir)}/bin/python -m pip install --quiet --upgrade pip Pillow",
+        f"mkdir -p {quote(tmp_dir)} && "
+        f"TMPDIR={quote(tmp_dir)} python3 -m venv {quote(venv_dir)} && "
+        f"TMPDIR={quote(tmp_dir)} {quote(venv_dir)}/bin/python -m pip install --quiet --upgrade pip Pillow",
     )
     return f"{venv_dir}/bin/python"
 
@@ -916,6 +919,75 @@ def remote_kill_pid(host: str, pid: int) -> None:
         time.sleep(0.2)
 
 
+def remote_kill_yggterm_processes_for_home(host: str, yggterm_home: str) -> dict:
+    if not yggterm_home:
+        return {"home": yggterm_home, "pids": [], "killed": []}
+    snippet = f"""
+import json
+import os
+import pathlib
+import signal
+import time
+
+home = {json.dumps(yggterm_home)}
+needle = ("YGGTERM_HOME=" + home).encode()
+pids = []
+for name in os.listdir("/proc"):
+    if not name.isdigit():
+        continue
+    pid = int(name)
+    if pid == os.getpid():
+        continue
+    proc_dir = pathlib.Path("/proc") / name
+    try:
+        env = proc_dir.joinpath("environ").read_bytes().split(b"\\0")
+        if needle not in env:
+            continue
+        cmdline = [
+            part.decode("utf-8", "ignore")
+            for part in proc_dir.joinpath("cmdline").read_bytes().split(b"\\0")
+            if part
+        ]
+    except Exception:
+        continue
+    exe = pathlib.Path(cmdline[0]).name if cmdline else ""
+    if exe.startswith("yggterm"):
+        pids.append(pid)
+
+for sig in (signal.SIGTERM, signal.SIGKILL):
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            pass
+    time.sleep(0.35 if sig == signal.SIGTERM else 0.1)
+
+alive = []
+for pid in pids:
+    try:
+        os.kill(pid, 0)
+        alive.append(pid)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        alive.append(pid)
+
+print(json.dumps({{"home": home, "pids": pids, "alive_after_kill": alive}}))
+"""
+    proc = local_run([*ssh_base(), host, "python3", "-"], input_text=snippet, check=False)
+    if proc.returncode != 0:
+        return {
+            "home": yggterm_home,
+            "pids": [],
+            "alive_after_kill": [],
+            "error": proc.stderr.strip() or proc.stdout.strip(),
+        }
+    text = proc.stdout.strip()
+    return json.loads(text) if text else {"home": yggterm_home, "pids": [], "alive_after_kill": []}
+
+
 def wait_for_remote_pid_gone(host: str, pid: int, timeout_seconds: float = 8.0) -> dict:
     deadline = time.time() + timeout_seconds
     checks = 0
@@ -944,32 +1016,54 @@ def remote_kde_terminal_close_probe(
     timeout_ms: int,
     remote_log: str,
 ) -> dict:
-    launch_payload = remote_launch_visible_window(
-        host,
-        remote_bin,
-        env,
-        timeout_ms=timeout_ms,
-        remote_log=remote_log,
-    )
-    pid = int(launch_payload.get("pid") or 0)
     launch_mode = "app_cli"
     launch_visibility_error = None
-    try:
-        wait_for_remote_state(host, remote_bin, env, pid, timeout_ms)
-    except RuntimeError as launch_error:
+    app_cli_cleanup = None
+    direct_fallback_cleanup = None
+
+    def launch_direct_fallback(launch_error: Exception) -> tuple[dict, int]:
+        nonlocal launch_mode, launch_visibility_error, app_cli_cleanup, direct_fallback_cleanup
         launch_visibility_error = str(launch_error)
-        remote_kill_pid(host, pid)
+        app_cli_cleanup = remote_kill_yggterm_processes_for_home(
+            host,
+            env.get("YGGTERM_HOME", ""),
+        )
         fallback_log = f"{remote_log}.direct"
-        launch_payload = remote_launch_direct_window(
+        fallback_payload = remote_launch_direct_window(
             host,
             remote_bin,
             env,
             timeout_ms=timeout_ms,
             remote_log=fallback_log,
         )
-        pid = int(launch_payload.get("pid") or 0)
         launch_mode = "direct_shell_fallback"
-        wait_for_remote_state(host, remote_bin, env, pid, timeout_ms)
+        fallback_pid = int(fallback_payload.get("pid") or 0)
+        try:
+            wait_for_remote_state(host, remote_bin, env, fallback_pid, timeout_ms)
+        except RuntimeError:
+            direct_fallback_cleanup = remote_kill_yggterm_processes_for_home(
+                host,
+                env.get("YGGTERM_HOME", ""),
+            )
+            raise
+        return fallback_payload, fallback_pid
+
+    try:
+        launch_payload = remote_launch_visible_window(
+            host,
+            remote_bin,
+            env,
+            timeout_ms=timeout_ms,
+            remote_log=remote_log,
+        )
+        pid = int(launch_payload.get("pid") or 0)
+        try:
+            wait_for_remote_state(host, remote_bin, env, pid, timeout_ms)
+        except RuntimeError as launch_error:
+            remote_kill_pid(host, pid)
+            launch_payload, pid = launch_direct_fallback(launch_error)
+    except RuntimeError as launch_error:
+        launch_payload, pid = launch_direct_fallback(launch_error)
     session_path = remote_create_plain_terminal(
         host,
         remote_bin,
@@ -996,6 +1090,8 @@ def remote_kde_terminal_close_probe(
         "launch": launch_payload,
         "launch_mode": launch_mode,
         "launch_visibility_error": launch_visibility_error,
+        "app_cli_cleanup_after_launch_failure": app_cli_cleanup,
+        "direct_fallback_cleanup_after_launch_failure": direct_fallback_cleanup,
         "session_path": session_path,
         "close": close_response,
         "close_exit": close_exit,
@@ -1103,6 +1199,12 @@ def main() -> int:
             desktop_value = str(desktop_env.get(desktop_key) or "").strip()
             if desktop_value:
                 launch_env[desktop_key] = desktop_value
+        screenshot_wayland_display = str(
+            desktop_env.get("WAYLAND_DISPLAY") or leader_env.get("WAYLAND_DISPLAY") or ""
+        ).strip()
+        if screenshot_wayland_display:
+            launch_env["YGGTERM_SCREENSHOT_WAYLAND_DISPLAY"] = screenshot_wayland_display
+            launch_env["YGGTERM_ROOT_SCREENSHOT_FOCUS"] = "1"
         effective_backend = args.backend
         if effective_backend == "auto":
             if picked_type == "wayland" and plasmashell_before.get("available"):
