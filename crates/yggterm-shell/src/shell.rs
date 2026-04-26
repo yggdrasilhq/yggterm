@@ -106,7 +106,7 @@ use yggterm_server::{
     open_stored_session_with_view, persist_remote_generated_copy, ping,
     refresh_local_managed_cli_now, refresh_managed_cli, refresh_preview, refresh_remote_machine,
     remove_session, remove_ssh_target, request_terminal_launch, set_all_preview_blocks_folded,
-    set_view_mode as daemon_set_view_mode, shutdown as daemon_shutdown,
+    set_session_keep_alive, set_view_mode as daemon_set_view_mode, shutdown as daemon_shutdown,
     snapshot as daemon_snapshot, snapshot_session_view_for_ui, stage_remote_clipboard_png,
     start_command_session, start_local_session_at, start_ssh_session_at, status,
     take_next_app_control_request, terminal_ensure, terminal_read, terminal_resize,
@@ -228,11 +228,11 @@ const LIVE_SESSION_SNAPSHOT_TRIGGER_DEBOUNCE_MS: u64 = 360;
 const LIVE_SESSION_SNAPSHOT_BUSY_POLL_MS: u64 = 2_500;
 const LIVE_SESSION_SNAPSHOT_IDLE_POLL_MS: u64 = 60_000;
 const LIVE_SESSION_SNAPSHOT_NUDGE_INTERVAL_MS: u64 = 250;
-const LIVE_SESSION_SNAPSHOT_NUDGE_POLLS: usize = 24;
+const LIVE_SESSION_SNAPSHOT_NUDGE_POLLS: usize = 3;
 // Inline tree rename focuses asynchronously after context-menu and sidebar
 // interactions. Treat Enter as the commit action so transient WebView focus
 // churn during controlled input updates cannot commit a half-typed label.
-const TERMINAL_BUSY_HINT_MS: u64 = 2_000;
+const TERMINAL_BUSY_HINT_MS: u64 = 120;
 const TITLEBAR_HEIGHT_PX: f64 = 32.0;
 const TITLEBAR_RESPONSIVE_CSS: &str = r#"
 [data-yggterm-titlebar-right] .yggterm-titlebar-overflow-trigger {
@@ -465,6 +465,7 @@ struct ShellState {
     managed_cli_refresh_completed: HashMap<String, u64>,
     managed_cli_refresh_retry_after_ms: HashMap<String, u64>,
     live_session_snapshot_refresh_in_flight: bool,
+    live_session_snapshot_nudge_in_flight: bool,
     next_live_session_snapshot_after_ms: u64,
     drag_paths: Vec<String>,
     drag_hover_target: Option<DragDropTarget>,
@@ -1330,6 +1331,7 @@ impl ShellState {
             managed_cli_refresh_completed: HashMap::new(),
             managed_cli_refresh_retry_after_ms: HashMap::new(),
             live_session_snapshot_refresh_in_flight: false,
+            live_session_snapshot_nudge_in_flight: false,
             next_live_session_snapshot_after_ms: 0,
             drag_paths: Vec::new(),
             drag_hover_target: None,
@@ -7209,9 +7211,49 @@ fn prepare_current_endpoint_for_spawn(endpoint: &ServerEndpoint) -> Result<()> {
     }
     Ok(())
 }
-fn reap_spawned_child_in_background(mut child: std::process::Child) {
+fn spawned_child_exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
+}
+fn reap_spawned_child_in_background(
+    mut child: std::process::Child,
+    endpoint: ServerEndpoint,
+    daemon_exe: PathBuf,
+) {
+    let child_pid = child.id();
     thread::spawn(move || {
-        let _ = child.wait();
+        let wait_result = child.wait();
+        match wait_result {
+            Ok(status) => trace_daemon_step(
+                &endpoint,
+                "spawned_daemon_exit",
+                json!({
+                    "pid": child_pid,
+                    "daemon_exe": daemon_exe.display().to_string(),
+                    "success": status.success(),
+                    "code": status.code(),
+                    "signal": spawned_child_exit_signal(&status),
+                    "status": status.to_string(),
+                }),
+            ),
+            Err(error) => trace_daemon_step(
+                &endpoint,
+                "spawned_daemon_wait_error",
+                json!({
+                    "pid": child_pid,
+                    "daemon_exe": daemon_exe.display().to_string(),
+                    "error": error.to_string(),
+                }),
+            ),
+        }
     });
 }
 fn spawn_daemon_process(endpoint: &ServerEndpoint) -> Result<()> {
@@ -7243,7 +7285,15 @@ fn spawn_daemon_process(endpoint: &ServerEndpoint) -> Result<()> {
         }
     }
     let child = command.spawn()?;
-    reap_spawned_child_in_background(child);
+    trace_daemon_step(
+        endpoint,
+        "spawned_daemon_child",
+        json!({
+            "pid": child.id(),
+            "daemon_exe": daemon_exe.display().to_string(),
+        }),
+    );
+    reap_spawned_child_in_background(child, endpoint.clone(), daemon_exe);
     Ok(())
 }
 fn wait_for_daemon(endpoint: &ServerEndpoint) -> Result<()> {
@@ -7496,6 +7546,7 @@ fn app_control_command_defers_background_refresh(command: &AppControlCommand) ->
             | AppControlCommand::ProbeTerminalViewportInput { .. }
             | AppControlCommand::ProbeTerminalViewportScroll { .. }
             | AppControlCommand::RemoveSession { .. }
+            | AppControlCommand::SetSessionKeepAlive { .. }
             | AppControlCommand::SetRowExpanded { .. }
             | AppControlCommand::Drag { .. }
     )
@@ -7658,18 +7709,45 @@ fn schedule_live_session_snapshot_refresh(shell: &mut ShellState, debounce_ms: u
     }
 }
 fn spawn_live_session_snapshot_nudge(state: Signal<ShellState>) {
+    let should_spawn = safe_shell_mut(state, "live_session_snapshot_nudge_begin", |shell| {
+        if !shell_has_live_session_snapshot_refresh_target(shell) {
+            return false;
+        }
+        shell.next_live_session_snapshot_after_ms = current_millis();
+        if shell.live_session_snapshot_nudge_in_flight {
+            return false;
+        }
+        shell.live_session_snapshot_nudge_in_flight = true;
+        true
+    })
+    .ok()
+    .unwrap_or(false);
+    maybe_spawn_background_live_session_snapshot(state);
+    if !should_spawn {
+        return;
+    }
     spawn(async move {
-        for _ in 0..LIVE_SESSION_SNAPSHOT_NUDGE_POLLS {
+        for _ in 1..LIVE_SESSION_SNAPSHOT_NUDGE_POLLS {
+            sleep(Duration::from_millis(
+                LIVE_SESSION_SNAPSHOT_NUDGE_INTERVAL_MS,
+            ))
+            .await;
             let _ = safe_shell_mut(state, "live_session_snapshot_nudge_schedule", |shell| {
                 if shell_has_live_session_snapshot_refresh_target(shell) {
                     shell.next_live_session_snapshot_after_ms = current_millis();
                 }
             });
             maybe_spawn_background_live_session_snapshot(state);
-            sleep(Duration::from_millis(
-                LIVE_SESSION_SNAPSHOT_NUDGE_INTERVAL_MS,
-            ))
-            .await;
+        }
+        let should_flush = safe_shell_mut(state, "live_session_snapshot_nudge_end", |shell| {
+            shell.live_session_snapshot_nudge_in_flight = false;
+            shell_has_live_session_snapshot_refresh_target(shell)
+                && current_millis() >= shell.next_live_session_snapshot_after_ms
+        })
+        .ok()
+        .unwrap_or(false);
+        if should_flush {
+            maybe_spawn_background_live_session_snapshot(state);
         }
     });
 }
@@ -11461,9 +11539,11 @@ fn sidebar_merge_cache_key(
         session.host_label.hash(&mut hasher);
         session.ssh_target.hash(&mut hasher);
         session.ssh_prefix.hash(&mut hasher);
-        metadata_value(session, "Path").hash(&mut hasher);
-        metadata_value(session, "Target").hash(&mut hasher);
-        metadata_value(session, "Cwd").hash(&mut hasher);
+        for entry in &session.metadata {
+            entry.label.hash(&mut hasher);
+            entry.value.hash(&mut hasher);
+            0xf0_u8.hash(&mut hasher);
+        }
         0xfa_u8.hash(&mut hasher);
     }
     let mut expanded = expanded_paths.iter().collect::<Vec<_>>();
@@ -13493,7 +13573,10 @@ fn push_live_session_rows(
     for session in sessions {
         let cwd = metadata_value(session, "Cwd");
         let label = live_session_label_with_index(remote_session_index, session, &short_ids);
-        let detail_label = live_session_summary_with_index(remote_session_index, session);
+        let detail_label = {
+            let summary = live_session_summary_with_index(remote_session_index, session);
+            live_session_detail_label(summary, live_session_keep_alive(session))
+        };
         let full_path = if session.kind == SessionKind::Document {
             session
                 .metadata
@@ -13662,6 +13745,32 @@ fn live_session_summary_with_index(
         })
         .unwrap_or_default()
 }
+fn live_session_keep_alive(session: &ManagedSessionView) -> bool {
+    metadata_value(session, "Runtime Persistence") == "keep-alive"
+}
+fn live_session_detail_label(summary: String, keep_alive: bool) -> String {
+    if !keep_alive {
+        return summary;
+    }
+    let summary = summary
+        .trim()
+        .strip_prefix("Kept alive")
+        .unwrap_or_else(|| summary.trim())
+        .trim_start_matches('·')
+        .trim();
+    if summary.is_empty() {
+        "Kept alive".to_string()
+    } else {
+        format!("Kept alive · {summary}")
+    }
+}
+fn live_session_enriched_detail_label(
+    row_path: &str,
+    summary: String,
+    kept_alive_paths: &HashSet<String>,
+) -> String {
+    live_session_detail_label(summary, kept_alive_paths.contains(row_path))
+}
 fn live_session_default_summary(session: &ManagedSessionView) -> Option<String> {
     let cwd = session_cwd_for_managed_session(session)
         .map(|value| value.trim().to_string())
@@ -13725,10 +13834,14 @@ fn enrich_sidebar_rows_with_live_titles(
     let mut title_by_path = HashMap::<String, String>::new();
     let mut summary_by_path = HashMap::<String, String>::new();
     let mut authoritative_live_paths = HashSet::<String>::new();
+    let mut kept_alive_paths = HashSet::<String>::new();
     let remote_session_index = build_remote_session_index(remote_machines);
     for session in live_sessions {
         if !matches!(session.source, SessionSource::Stored) {
             authoritative_live_paths.insert(session.session_path.clone());
+        }
+        if live_session_keep_alive(session) {
+            kept_alive_paths.insert(session.session_path.clone());
         }
         let session_cwd = session_cwd_for_managed_session(session);
         let cwd = session_cwd.as_deref().unwrap_or_default();
@@ -13795,7 +13908,13 @@ fn enrich_sidebar_rows_with_live_titles(
                 && (!summary.trim().is_empty())
                 && (live_backed || row.detail_label.trim().is_empty())
             {
-                row.detail_label = summary.clone();
+                row.detail_label = live_session_enriched_detail_label(
+                    &row.full_path,
+                    summary.clone(),
+                    &kept_alive_paths,
+                );
+            } else if kept_alive_paths.contains(&row.full_path) {
+                row.detail_label = live_session_detail_label(row.detail_label.clone(), true);
             }
             continue;
         }
@@ -13804,7 +13923,13 @@ fn enrich_sidebar_rows_with_live_titles(
                 && (!summary.trim().is_empty())
                 && (live_backed || row.detail_label.trim().is_empty())
             {
-                row.detail_label = summary.clone();
+                row.detail_label = live_session_enriched_detail_label(
+                    &row.full_path,
+                    summary.clone(),
+                    &kept_alive_paths,
+                );
+            } else if kept_alive_paths.contains(&row.full_path) {
+                row.detail_label = live_session_detail_label(row.detail_label.clone(), true);
             }
             continue;
         };
@@ -13842,7 +13967,13 @@ fn enrich_sidebar_rows_with_live_titles(
             && (!summary.trim().is_empty())
             && (live_backed || row.detail_label.trim().is_empty())
         {
-            row.detail_label = summary.clone();
+            row.detail_label = live_session_enriched_detail_label(
+                &row.full_path,
+                summary.clone(),
+                &kept_alive_paths,
+            );
+        } else if kept_alive_paths.contains(&row.full_path) {
+            row.detail_label = live_session_detail_label(row.detail_label.clone(), true);
         }
     }
 }
@@ -16805,6 +16936,7 @@ fn describe_app_state_snapshot(
                 "terminal_foreground_active": session.terminal_foreground_active,
                 "source": format!("{:?}", session.source),
                 "launch_phase": format!("{:?}", session.launch_phase),
+                "keep_alive": live_session_keep_alive(session),
                 "status_line": session.status_line,
             })
         })
@@ -16971,6 +17103,7 @@ fn describe_app_state_snapshot(
                 .cloned()
                 .collect::<Vec<_>>(),
             "live_session_snapshot_refresh_in_flight": shell.live_session_snapshot_refresh_in_flight,
+            "live_session_snapshot_nudge_in_flight": shell.live_session_snapshot_nudge_in_flight,
             "next_live_session_snapshot_after_ms": shell.next_live_session_snapshot_after_ms,
             "background_refresh_after_ms": shell.background_refresh_after_ms,
             "terminal_busy_hint_until_ms": shell.terminal_busy_hint_until_ms,
@@ -17375,8 +17508,10 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     const icon = row.querySelector('[data-tree-icon]');
                     const indicator = row.querySelector('[data-machine-indicator="1"]');
                     const liveClose = row.querySelector('[data-sidebar-live-session-close="1"]');
+                    const keepAlive = row.querySelector('[data-sidebar-live-session-keep-alive="1"]');
                     const indicatorStyle = indicator ? window.getComputedStyle(indicator) : null;
                     const liveCloseStyle = liveClose ? window.getComputedStyle(liveClose) : null;
+                    const keepAliveStyle = keepAlive ? window.getComputedStyle(keepAlive) : null;
                     const centerPointRect =
                         rect.width > 0 && rect.height > 0
                             ? {
@@ -17412,6 +17547,9 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                         live_close_background_color: liveCloseStyle ? liveCloseStyle.backgroundColor : null,
                         live_close_rect: rectSummary(liveClose),
                         live_close_hit_target: elementSummaryAtPoint(rectSummary(liveClose)),
+                        live_keep_alive: Boolean(keepAlive),
+                        live_keep_alive_color: keepAliveStyle ? keepAliveStyle.backgroundColor : null,
+                        live_keep_alive_rect: rectSummary(keepAlive),
                         hit_target: elementSummaryAtPoint(centerPointRect),
                     };
                 })
@@ -18865,7 +19003,9 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         return null;
                     }
                     const liveClose = row.querySelector('[data-sidebar-live-session-close="1"]');
+                    const keepAlive = row.querySelector('[data-sidebar-live-session-keep-alive="1"]');
                     const liveCloseStyle = liveClose ? window.getComputedStyle(liveClose) : null;
+                    const keepAliveStyle = keepAlive ? window.getComputedStyle(keepAlive) : null;
                     const treeIcon = row.querySelector('[data-tree-icon="1"]');
                     const rowStyle = window.getComputedStyle(row);
                     const iconKind = treeIcon
@@ -18893,6 +19033,9 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         live_close_background_color: liveCloseStyle ? liveCloseStyle.backgroundColor : null,
                         live_close_rect: rectSummary(liveClose),
                         live_close_hit_target: elementSummaryAtPoint(rectSummary(liveClose)),
+                        live_keep_alive: Boolean(keepAlive),
+                        live_keep_alive_color: keepAliveStyle ? keepAliveStyle.backgroundColor : null,
+                        live_keep_alive_rect: rectSummary(keepAlive),
                         hit_target: elementSummaryAtPoint(rectSummary(row)),
                     };
                 })
@@ -21300,7 +21443,7 @@ async fn process_pending_app_control_requests(
             .await
             {
                 Ok(()) => {
-                    if data.contains(['\r', '\n']) {
+                    if terminal_input_should_show_stateless_busy_hint(&data) {
                         let _ = safe_shell_mut(
                             state,
                             "app_control_send_terminal_input_schedule_live_snapshot_refresh",
@@ -21657,6 +21800,54 @@ async fn process_pending_app_control_requests(
                     data: Some(json!({
                         "accepted": false,
                         "session_path": session_path,
+                    })),
+                    error: Some(error.to_string()),
+                },
+            }
+        }
+        AppControlCommand::SetSessionKeepAlive {
+            session_path,
+            keep_alive,
+        } => {
+            let endpoint = state.read().bootstrap.server_endpoint.clone();
+            let session_path_for_task = session_path.clone();
+            let outcome: Result<(ServerUiSnapshot, Option<String>)> =
+                run_dedicated_interactive_request_io(
+                    "app_control_set_session_keep_alive",
+                    &home,
+                    move || set_session_keep_alive(&endpoint, &session_path_for_task, keep_alive),
+                )
+                .await;
+            match outcome {
+                Ok((snapshot, message)) => {
+                    let active_session_path = snapshot.active_session_path.clone();
+                    state.with_mut(|shell| {
+                        shell.apply_interactive_snapshot_result(Ok((snapshot, message.clone())));
+                    });
+                    AppControlResponse {
+                        request_id: request.request_id.clone(),
+                        handled_by_pid: std::process::id(),
+                        completed_at_ms: current_millis() as u128,
+                        output_path: None,
+                        data: Some(json!({
+                            "accepted": true,
+                            "session_path": session_path,
+                            "keep_alive": keep_alive,
+                            "active_session_path": active_session_path,
+                            "message": message,
+                        })),
+                        error: None,
+                    }
+                }
+                Err(error) => AppControlResponse {
+                    request_id: request.request_id.clone(),
+                    handled_by_pid: std::process::id(),
+                    completed_at_ms: current_millis() as u128,
+                    output_path: None,
+                    data: Some(json!({
+                        "accepted": false,
+                        "session_path": session_path,
+                        "keep_alive": keep_alive,
                     })),
                     error: Some(error.to_string()),
                 },
@@ -23624,18 +23815,28 @@ fn app() -> Element {
         }
     });
     use_effect(move || {
-        let (active_path, active_visible, show_loading_tree, suppress_autoscroll) = {
+        let (scroll_path, show_loading_tree, suppress_autoscroll) = {
             let shell = state.read();
             let active_path = shell.server.active_session_path().map(ToOwned::to_owned);
             let snapshot = shell.snapshot();
-            let active_visible = active_path
+            let selected_path = shell
+                .selection_anchor
                 .as_ref()
-                .is_some_and(|path| snapshot.rows.iter().any(|row| row.full_path == *path));
+                .filter(|path| snapshot.rows.iter().any(|row| row.full_path == **path))
+                .cloned()
+                .or_else(|| {
+                    shell
+                        .browser
+                        .selected_path()
+                        .filter(|path| snapshot.rows.iter().any(|row| row.full_path == *path))
+                        .map(ToOwned::to_owned)
+                });
+            let active_visible_path =
+                active_path.filter(|path| snapshot.rows.iter().any(|row| row.full_path == *path));
             let suppress_autoscroll = shell.tree_rename_path.is_some()
                 || current_millis() < shell.suppress_sidebar_autoscroll_until_ms;
             (
-                active_path,
-                active_visible,
+                selected_path.or(active_visible_path),
                 snapshot.show_loading_tree,
                 suppress_autoscroll,
             )
@@ -23644,22 +23845,19 @@ fn app() -> Element {
             set_signal_if_changed(last_sidebar_autoscroll_path, None);
             return;
         }
-        let Some(active_path) = active_path else {
+        let Some(scroll_path) = scroll_path else {
             set_signal_if_changed(last_sidebar_autoscroll_path, None);
             return;
         };
         if suppress_autoscroll {
-            set_signal_if_changed(last_sidebar_autoscroll_path, Some(active_path));
+            set_signal_if_changed(last_sidebar_autoscroll_path, Some(scroll_path));
             return;
         }
-        if !active_visible {
+        if *last_sidebar_autoscroll_path.read() == Some(scroll_path.clone()) {
             return;
         }
-        if *last_sidebar_autoscroll_path.read() == Some(active_path.clone()) {
-            return;
-        }
-        last_sidebar_autoscroll_path.set(Some(active_path.clone()));
-        let row_id = sidebar_row_dom_id(&active_path);
+        last_sidebar_autoscroll_path.set(Some(scroll_path.clone()));
+        let row_id = sidebar_row_dom_id(&scroll_path);
         let _ = document::eval(&format!(
             "(function() {{
                 const rowId = {row_id:?};
@@ -24915,6 +25113,23 @@ fn app() -> Element {
                         on_remove_ssh_target: {
                             let row = row.clone();
                             move |_| queue_remove_saved_ssh_target(state, row.clone())
+                        },
+                        on_set_keep_alive: {
+                            let row = row.clone();
+                            move |keep_alive| {
+                                let path = row.full_path.clone();
+                                spawn_server_snapshot_action(
+                                    state,
+                                    if keep_alive {
+                                        format!("keeping {} alive", row.label)
+                                    } else {
+                                        format!("stopping keep-alive for {}", row.label)
+                                    },
+                                    move |endpoint| {
+                                        set_session_keep_alive(&endpoint, &path, keep_alive)
+                                    },
+                                );
+                            }
                         },
                         on_delete_item: {
                             let row = row.clone();
@@ -26513,6 +26728,29 @@ fn sidebar_row_has_optimistic_busy_hint(snapshot: &RenderSnapshot, row: &Browser
         normalize_live_session_path(session_path) == row_path || session_path == &row.full_path
     })
 }
+fn terminal_input_busy_hint_decision(data: &str, mut pending_line_has_text: bool) -> (bool, bool) {
+    let mut should_hint = false;
+    for ch in data.chars() {
+        match ch {
+            '\r' | '\n' => {
+                should_hint |= pending_line_has_text;
+                pending_line_has_text = false;
+            }
+            '\u{3}' | '\u{15}' => {
+                pending_line_has_text = false;
+            }
+            '\u{8}' | '\u{7f}' => {}
+            ch if !ch.is_control() && !ch.is_whitespace() => {
+                pending_line_has_text = true;
+            }
+            _ => {}
+        }
+    }
+    (should_hint, pending_line_has_text)
+}
+fn terminal_input_should_show_stateless_busy_hint(data: &str) -> bool {
+    terminal_input_busy_hint_decision(data, false).0
+}
 fn sidebar_row_shows_busy_icon(snapshot: &RenderSnapshot, row: &BrowserRow) -> bool {
     if matches!(row.kind, BrowserRowKind::Group | BrowserRowKind::Separator) {
         return false;
@@ -26910,6 +27148,7 @@ fn SidebarRow(
         palette.muted
     };
     let machine_health = machine_health_from_label(&row.label);
+    let row_kept_alive = show_live_close && row.detail_label.starts_with("Kept alive");
     let label_color = if row.kind == BrowserRowKind::Group && row.depth == 0 && row.expanded {
         palette.accent
     } else if selected {
@@ -27102,10 +27341,17 @@ fn SidebarRow(
                         }
                     }
                 }
+                if row_kept_alive {
+                    span {
+                        "data-sidebar-live-session-keep-alive": "1",
+                        title: "Keep alive",
+                        style: "display:inline-flex; width:7px; min-width:7px; height:7px; border-radius:999px; background:#22c55e; box-shadow:0 0 0 1.5px rgba(255,255,255,0.86);",
+                    }
+                }
                 if show_live_close {
                     button {
                         "data-sidebar-live-session-close": "1",
-                        title: "Close live session",
+                        title: "Close terminal",
                         style: format!(
                             "display:inline-flex; align-items:center; justify-content:center; width:18px; min-width:18px; height:18px; \
                              border:none; border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:800; \
@@ -30375,6 +30621,7 @@ fn TerminalCanvas(
             let mut last_host_health_text_tail = String::new();
             let mut last_host_health_rows = 0_u16;
             let mut last_host_health_blank_rows_below_cursor = 0_u16;
+            let mut pending_terminal_input_has_text = false;
             loop {
                 if !bootstrap_owner_still_current(state) {
                     release_bootstrap_lease(
@@ -30755,7 +31002,13 @@ fn TerminalCanvas(
                                     read_poll_ms = TERMINAL_INPUT_ECHO_READ_POLL_MS;
                                     next_read_deadline = tokio::time::Instant::now()
                                         + Duration::from_millis(TERMINAL_INPUT_ECHO_READ_DELAY_MS);
-                                    if data.contains(['\r', '\n']) {
+                                    let (show_busy_hint, next_pending_input_has_text) =
+                                        terminal_input_busy_hint_decision(
+                                            &data,
+                                            pending_terminal_input_has_text,
+                                        );
+                                    pending_terminal_input_has_text = next_pending_input_has_text;
+                                    if show_busy_hint {
                                         let _ = safe_shell_mut(
                                             state,
                                             "terminal_input_schedule_live_snapshot_refresh_immediate",
@@ -37988,6 +38241,7 @@ fn ContextMenuOverlay(
     on_rename_session: EventHandler<MouseEvent>,
     on_refresh_remote_machine: EventHandler<MouseEvent>,
     on_remove_ssh_target: EventHandler<MouseEvent>,
+    on_set_keep_alive: EventHandler<bool>,
     on_delete_item: EventHandler<MouseEvent>,
 ) -> Element {
     let placement = context_menu_placement(position, window_size, (224.0, 420.0));
@@ -38010,6 +38264,9 @@ fn ContextMenuOverlay(
         );
     let can_rename = context_menu_allows_rename(&row);
     let can_regenerate_copy = matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Group);
+    let is_live_runtime_row =
+        row.kind == BrowserRowKind::Session && is_hot_terminal_sidebar_path(&row.full_path);
+    let keep_alive_active = row.detail_label.starts_with("Kept alive");
     let selected_count = drag_paths.len().max(1);
     let menu_title = if selected_count > 1 && drag_paths.iter().any(|path| path == &row.full_path) {
         format!("{selected_count} selected items")
@@ -38173,6 +38430,25 @@ fn ContextMenuOverlay(
                         "Add Separator"
                     }
                 } else if row.kind == BrowserRowKind::Session {
+                    if is_live_runtime_row {
+                        button {
+                            "data-context-menu-action": if keep_alive_active { "stop-keep-alive" } else { "keep-alive" },
+                            class: "yggterm-menu-item",
+                            style: context_menu_action_style(palette, false),
+                            onmousedown: |evt| {
+                                evt.stop_propagation();
+                            },
+                            onclick: move |evt| {
+                                evt.stop_propagation();
+                                on_set_keep_alive.call(!keep_alive_active);
+                            },
+                            if keep_alive_active {
+                                "Stop Keeping Alive"
+                            } else {
+                                "Keep Alive"
+                            }
+                        }
+                    }
                     button {
                         "data-context-menu-action": "regenerate-copy",
                         class: "yggterm-menu-item",
@@ -38226,7 +38502,11 @@ fn ContextMenuOverlay(
                             evt.stop_propagation();
                             on_delete_item.call(evt);
                         },
-                        "Delete…"
+                        if is_live_runtime_row {
+                            "Close Terminal…"
+                        } else {
+                            "Delete…"
+                        }
                     }
                 }
                 if can_regenerate_copy && row.kind != BrowserRowKind::Session {
@@ -38339,15 +38619,15 @@ fn delete_confirm_dialog_text(pending: &PendingDeleteDialog) -> DeleteConfirmDia
     if pending.live_session_close {
         return DeleteConfirmDialogText {
             title: if item_count == 1 {
-                "Close Live Session?".to_string()
+                "Close Terminal?".to_string()
             } else {
-                "Close Live Sessions?".to_string()
+                "Close Terminals?".to_string()
             },
-            copy: "This kills the server-owned terminal runtime and removes it from Live Sessions. Stored session metadata and transcripts remain.",
+            copy: "This kills the server-owned terminal runtime and removes it from the live runtime area. Stored session metadata and transcripts remain.",
             action_label: if item_count == 1 {
-                "Close Session".to_string()
+                "Close Terminal".to_string()
             } else {
-                "Close Sessions".to_string()
+                "Close Terminals".to_string()
             },
         };
     }
@@ -40669,8 +40949,8 @@ mod tests {
 
         let text = delete_confirm_dialog_text(&pending);
 
-        assert_eq!(text.title, "Close Live Session?");
-        assert_eq!(text.action_label, "Close Session");
+        assert_eq!(text.title, "Close Terminal?");
+        assert_eq!(text.action_label, "Close Terminal");
         assert!(text.copy.contains("server-owned terminal runtime"));
         assert!(
             text.copy
@@ -43099,6 +43379,60 @@ mod tests {
         );
     }
     #[test]
+    fn merged_sidebar_rows_cache_tracks_live_session_metadata_changes() {
+        let expanded_paths = HashSet::from(["__live_sessions__".to_string()]);
+        let mut session = ManagedSessionView {
+            id: "session-1".to_string(),
+            session_path: "local://session-1".to_string(),
+            title: "Local Shell".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "local".to_string(),
+            source: yggterm_server::SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: yggterm_server::RemoteDeployState::NotRequired,
+            launch_command: "/bin/bash".to_string(),
+            status_line: String::new(),
+            terminal_lines: Vec::new(),
+            rendered_sections: Vec::new(),
+            preview: yggterm_server::SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: Vec::new(),
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: true,
+        };
+        let rows = merged_sidebar_rows(&[], &[], &[], &[session.clone()], &expanded_paths);
+        let live_row = rows
+            .iter()
+            .find(|row| row.full_path == "local://session-1")
+            .expect("live row");
+        assert!(!live_row.detail_label.starts_with("Kept alive"));
+
+        session.metadata.push(SessionMetadataEntry {
+            label: "Runtime Persistence",
+            value: "keep-alive".to_string(),
+        });
+        let rows = merged_sidebar_rows(&[], &[], &[], &[session], &expanded_paths);
+        let live_row = rows
+            .iter()
+            .find(|row| row.full_path == "local://session-1")
+            .expect("live row after metadata change");
+        assert!(live_row.detail_label.starts_with("Kept alive"));
+    }
+    #[test]
     fn remote_folder_rows_show_descendant_session_counts() {
         let expanded_paths = HashSet::from([
             "__remote_machine__/jojo".to_string(),
@@ -44147,6 +44481,82 @@ mod tests {
             "Local shell rooted at /home/pi.".to_string()
         );
     }
+
+    #[test]
+    fn enrich_sidebar_rows_with_live_titles_preserves_keep_alive_detail() {
+        let live_sessions = vec![ManagedSessionView {
+            id: "live-local-home".to_string(),
+            session_path: "local://home".to_string(),
+            title: "Home Shell".to_string(),
+            kind: SessionKind::Shell,
+            host_label: "localhost".to_string(),
+            source: yggterm_server::SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: true,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::NotRequired,
+            launch_command: "/bin/bash".to_string(),
+            status_line: String::new(),
+            terminal_lines: vec![],
+            rendered_sections: vec![],
+            preview: yggterm_server::SessionPreview {
+                summary: vec![SessionMetadataEntry {
+                    label: "Summary",
+                    value: "Local shell rooted at /home/pi.".to_string(),
+                }],
+                blocks: vec![],
+            },
+            metadata: vec![
+                SessionMetadataEntry {
+                    label: "Cwd",
+                    value: "/home/pi".to_string(),
+                },
+                SessionMetadataEntry {
+                    label: "Runtime Persistence",
+                    value: "keep-alive".to_string(),
+                },
+            ],
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: true,
+        }];
+        let mut rows = vec![BrowserRow {
+            kind: BrowserRowKind::Session,
+            full_path: "local://home".to_string(),
+            label: "Home Shell".to_string(),
+            detail_label: "Kept alive".to_string(),
+            document_kind: None,
+            group_kind: None,
+            session_title: Some("Home Shell".to_string()),
+            depth: 1,
+            host_label: "localhost".to_string(),
+            descendant_sessions: 1,
+            expanded: true,
+            session_id: Some("live-local-home".to_string()),
+            session_cwd: Some("/home/pi".to_string()),
+        }];
+        enrich_sidebar_rows_with_live_titles(
+            &mut rows,
+            &live_sessions,
+            &[],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            rows[0].detail_label,
+            "Kept alive · Local shell rooted at /home/pi."
+        );
+    }
+
     #[test]
     fn enrich_sidebar_rows_with_live_titles_overrides_generic_live_row_labels() {
         let live_sessions = vec![ManagedSessionView {
@@ -45130,6 +45540,23 @@ mod tests {
             tree_icon_glyph(&test_sidebar_row("/home/pi/.codex/sessions/example.jsonl")),
             Some("✦")
         );
+    }
+    #[test]
+    fn terminal_busy_hint_ignores_blank_enter_but_accepts_commands() {
+        assert!(!terminal_input_should_show_stateless_busy_hint("\r"));
+        assert!(!terminal_input_should_show_stateless_busy_hint("   \r"));
+        assert!(terminal_input_should_show_stateless_busy_hint("sleep 1\r"));
+
+        let (show_after_text, pending) = terminal_input_busy_hint_decision("htop", false);
+        assert!(!show_after_text);
+        assert!(pending);
+        let (show_after_enter, pending) = terminal_input_busy_hint_decision("\r", pending);
+        assert!(show_after_enter);
+        assert!(!pending);
+
+        let (show_after_ctrl_u, pending) = terminal_input_busy_hint_decision("\u{15}\r", true);
+        assert!(!show_after_ctrl_u);
+        assert!(!pending);
     }
     #[test]
     fn preferred_open_mode_for_stored_codex_session_row_forces_terminal() {

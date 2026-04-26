@@ -253,6 +253,8 @@ The intent is simple: organizing the tree should naturally create the right plac
 
 Virtual folders and separators are stored under `~/.yggterm/workspace.db`, so they load quickly and do not depend on walking a large on-disk workspace before the UI becomes useful.
 
+Live terminals are runtime attachments, not automatic workspace clutter. Creating a terminal from a folder starts it in that folder and shows it under `Live Sessions`; it becomes restart-restored only after you explicitly mark it `Keep Alive`. Closing a live terminal kills the daemon-owned PTY, while stored transcripts and workspace items remain unless you choose a hard delete action.
+
 The SSH connect rail is guided on purpose:
 
 - type `user@ip`, `user@host`, or a shortcut from your `~/.ssh/config` such as `dev`
