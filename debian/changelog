@@ -1,3 +1,13 @@
+yggterm (2.1.39-1) unstable; urgency=medium
+
+  * Avoid global Plasma shell refreshes during Linux direct-install self-update.
+  * Restart updated KDE clients through the safe detach/hide close path.
+  * Preserve sidebar expanded state and scroll context after inline session rename commits.
+  * Restore visible live-session close glyph contrast and expose close text/color to app-control.
+  * Reject malformed generated titles and extend title/summary regeneration smoke quality gates.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sun, 26 Apr 2026 18:28:44 +0530
+
 yggterm (2.1.38-1) unstable; urgency=medium
 
   * Fix KDE inline session rename selection, overwrite, Ctrl+A ownership, Enter commit, and click-away commit.

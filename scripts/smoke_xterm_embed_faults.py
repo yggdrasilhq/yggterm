@@ -197,6 +197,68 @@ def looks_like_shell_prompt_copy(text: str) -> bool:
     )
 
 
+def looks_like_low_signal_generated_title(text: str) -> bool:
+    words = [
+        re.sub(r"[^a-z0-9]", "", word.lower())
+        for word in str(text or "").strip().split()
+    ]
+    words = [word for word in words if word]
+    if not words:
+        return True
+    noise = {
+        "the",
+        "a",
+        "an",
+        "to",
+        "for",
+        "of",
+        "with",
+        "into",
+        "from",
+        "and",
+        "or",
+        "you",
+        "can",
+        "may",
+        "not",
+        "asked",
+        "again",
+        "next",
+        "also",
+        "continue",
+        "now",
+        "please",
+        "need",
+        "needs",
+        "help",
+    }
+    lower = str(text or "").strip().lower()
+    return (
+        words[0] in {"how", "why", "what", "when", "where", "who"}
+        or words[-1] in {"the", "a", "an", "to", "for", "of", "with", "into", "from", "and", "or"}
+        or lower.startswith(("please ", "can you ", "need to ", "help "))
+        or "asked you" in lower
+        or (len(words) >= 3 and sum(1 for word in words if word in noise) * 2 >= len(words))
+    )
+
+
+def looks_like_low_signal_generated_summary(text: str) -> bool:
+    stripped = str(text or "").strip()
+    lower = stripped.lower()
+    if len(stripped) < 36:
+        return True
+    return any(
+        needle in lower
+        for needle in (
+            "target:",
+            "command:",
+            "approval policy",
+            "collaboration mode",
+            "how use skills discovery the",
+        )
+    )
+
+
 def app_pointer_command(pid: int, action: str, **kwargs) -> dict:
     args = [
         "server",
@@ -6832,6 +6894,16 @@ def assert_titlebar_copy_regeneration_contract(pid: int) -> dict:
                 "titlebar copy regeneration produced prompt-shaped copy instead of session copy: "
                 f"title={final_title!r} summary={final_summary!r}"
             )
+        if looks_like_low_signal_generated_title(final_title):
+            raise AssertionError(
+                "titlebar copy regeneration accepted a low-signal or malformed title: "
+                f"title={final_title!r} summary={final_summary!r}"
+            )
+        if looks_like_low_signal_generated_summary(final_summary):
+            raise AssertionError(
+                "titlebar copy regeneration accepted a low-signal summary: "
+                f"title={final_title!r} summary={final_summary!r}"
+            )
         return {
             "created": created,
             "session_path": created_session,
@@ -10452,6 +10524,26 @@ def assert_context_menu_delete_session(pid: int) -> dict:
     }
 
 
+def assert_live_close_affordance_visible(row: dict, context: str) -> dict:
+    text = str(row.get("live_close_text") or "").strip()
+    foreground = str(row.get("live_close_color") or "").strip()
+    background = str(row.get("live_close_background_color") or "").strip()
+    ratio = contrast_ratio(foreground, background)
+    if text not in {"×", "x", "X"}:
+        raise AssertionError(f"{context} has no visible close glyph: row={row!r}")
+    if ratio is not None and ratio < 3.0:
+        raise AssertionError(
+            f"{context} close glyph contrast is too low: "
+            f"text={text!r} color={foreground!r} background={background!r} contrast={ratio:.2f} row={row!r}"
+        )
+    return {
+        "text": text,
+        "color": foreground,
+        "background": background,
+        "contrast": round(ratio, 2) if ratio is not None else None,
+    }
+
+
 def assert_live_session_close_button(pid: int) -> dict:
     created = app_create_terminal(pid, title="Smoke Close Button")
     target_path = str(created.get("active_session_path") or "").strip()
@@ -10463,6 +10555,7 @@ def assert_live_session_close_button(pid: int) -> dict:
         close_rect = live_row.get("live_close_rect") or {}
         if not rect_is_visible(close_rect):
             raise AssertionError(f"live session close rect is missing: {live_row!r}")
+        close_visibility = assert_live_close_affordance_visible(live_row, "live close button")
         close_click = xdotool_click_window(
             pid,
             rect_center_x(close_rect),
@@ -10505,6 +10598,7 @@ def assert_live_session_close_button(pid: int) -> dict:
         return {
             "target_path": target_path,
             "close_rect": close_rect,
+            "close_visibility": close_visibility,
             "close_click": close_click,
             "delete_confirm_dialog_rect": dom_rect(dialog_state, "delete_confirm_dialog_rect"),
             "delete_confirm_action_rect": confirm_rect,
@@ -10961,6 +11055,23 @@ def assert_live_sessions_tree_contract(pid: int) -> dict:
         raise AssertionError(
             f"live session rows are missing the close affordance: {live_close_missing!r}"
         )
+    live_close_low_visibility = []
+    live_close_visibility = []
+    for row in live_group_children:
+        if str(row.get("kind") or "").strip() != "Session":
+            continue
+        if not rect_is_visible(row.get("live_close_rect") or {}):
+            continue
+        try:
+            live_close_visibility.append(
+                assert_live_close_affordance_visible(row, "live sessions tree")
+            )
+        except AssertionError as exc:
+            live_close_low_visibility.append({"row": row, "error": str(exc)})
+    if live_close_low_visibility:
+        raise AssertionError(
+            f"live session close affordances are present but not visibly readable: {live_close_low_visibility!r}"
+        )
     invalid_busy_live_rows = []
     for row in live_group_children:
         row_path = normalize_live_path(str(row.get("path") or ""))
@@ -11006,6 +11117,7 @@ def assert_live_sessions_tree_contract(pid: int) -> dict:
         "live_group_document_count": len(live_group_documents),
         "duplicate_tree_live_row_count": len(duplicate_tree_live_rows),
         "live_close_count": len(live_group_children) - len(live_close_missing) - len(live_group_documents),
+        "live_close_visibility": live_close_visibility,
         "invalid_busy_live_row_count": len(invalid_busy_live_rows),
         "invalid_cached_ready_machine_row_count": len(invalid_cached_ready_machine_rows),
         "snapshot_live_session_count": len(snapshot_live_sessions),
@@ -11096,6 +11208,20 @@ def assert_sidebar_contract(pid: int, session: str) -> dict:
     if live_close_missing:
         raise AssertionError(
             f"live session rows are missing the close affordance: {live_close_missing!r}"
+        )
+    live_close_low_visibility = []
+    for row in live_group_children:
+        if str(row.get("kind") or "").strip() != "Session":
+            continue
+        if not rect_is_visible(row.get("live_close_rect") or {}):
+            continue
+        try:
+            assert_live_close_affordance_visible(row, "sidebar contract")
+        except AssertionError as exc:
+            live_close_low_visibility.append({"row": row, "error": str(exc)})
+    if live_close_low_visibility:
+        raise AssertionError(
+            f"live session close affordances are present but not visibly readable: {live_close_low_visibility!r}"
         )
     snapshot_live_sessions = {
         normalize_live_path(str(entry.get("session_path") or "")): entry
