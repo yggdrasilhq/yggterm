@@ -627,6 +627,19 @@ def app_open(pid: int, session: str, view: str = "terminal") -> dict:
     )
 
 
+def app_open_default(pid: int, session: str) -> dict:
+    return run(
+        "server",
+        "app",
+        "open",
+        "--pid",
+        str(pid),
+        session,
+        "--timeout-ms",
+        "30000",
+    )
+
+
 def app_open_raw(
     pid: int,
     session: str,
@@ -10711,6 +10724,7 @@ def assert_sidebar_contract(pid: int, session: str) -> dict:
         raise AssertionError(
             f"Codex session rows lost their dedicated icon contract: {invalid_codex_icons!r}"
         )
+    cursor_contract = assert_sidebar_cursor_contract(pid, state=state)
 
     failed_notifications = [
         notification
@@ -10737,7 +10751,128 @@ def assert_sidebar_contract(pid: int, session: str) -> dict:
         "invalid_cached_ready_machine_row_count": len(invalid_cached_ready_machine_rows),
         "invalid_codex_icon_count": len(invalid_codex_icons),
         "generic_session_icon_count": len(inconsistent_generic_session_icons),
+        "cursor_contract": cursor_contract,
         "failed_notification_count": len(failed_notifications),
+    }
+
+
+def assert_sidebar_cursor_contract(pid: int, *, state: dict | None = None) -> dict:
+    state = state or app_state(pid)
+    dom_rows = visible_sidebar_rows(state)
+    if not dom_rows:
+        raise AssertionError(f"sidebar dom rows are missing from app state: {state!r}")
+    inspected = [
+        row
+        for row in dom_rows
+        if str(row.get("kind") or "").strip() in ("Session", "Document", "Group", "Separator")
+    ]
+    missing_cursor = [
+        row
+        for row in inspected
+        if str(row.get("cursor") or "").strip() == ""
+    ]
+    if missing_cursor:
+        raise AssertionError(
+            "sidebar rows no longer expose computed cursor style to app-control: "
+            f"{missing_cursor[:8]!r}"
+        )
+    drag_hand_rows = [
+        row
+        for row in inspected
+        if bool(row.get("draggable"))
+        and str(row.get("cursor") or "").strip().lower() in ("grab", "grabbing")
+    ]
+    if drag_hand_rows:
+        raise AssertionError(
+            "sidebar rows advertise drag as the primary action instead of normal click/open: "
+            f"{drag_hand_rows[:8]!r}"
+        )
+    return {
+        "checked_rows": len(inspected),
+        "draggable_rows": len([row for row in inspected if bool(row.get("draggable"))]),
+        "sample": [
+            {
+                "path": row.get("path"),
+                "label": row.get("label"),
+                "kind": row.get("kind"),
+                "draggable": row.get("draggable"),
+                "cursor": row.get("cursor"),
+            }
+            for row in inspected[:8]
+        ],
+    }
+
+
+def assert_stored_codex_session_open_contract(pid: int) -> dict:
+    before_state = app_state(pid)
+    before_generation = before_state.get("generation") or {}
+    before_count = int(before_generation.get("copy_generation_start_count") or 0)
+    stored_rows = [
+        row
+        for row in app_rows(pid)
+        if str(row.get("kind") or "") == "Session"
+        and "/.codex/sessions/" in str(row.get("path") or row.get("full_path") or "")
+    ]
+    if not stored_rows:
+        raise AssertionError("no stored Codex session row is available for open-contract proof")
+    stored_rows.sort(
+        key=lambda row: (
+            0 if bool(row.get("selected")) else 1,
+            str(row.get("path") or row.get("full_path") or ""),
+        )
+    )
+    target_row = stored_rows[0]
+    target = str(target_row.get("path") or target_row.get("full_path") or "").strip()
+    open_result = app_open_default(pid, target)
+    opened_state = ((open_result.get("data") or {}).get("state") or {})
+    if not opened_state:
+        opened_state = app_state(pid)
+    if opened_state.get("active_session_path") != target:
+        raise AssertionError(
+            "stored Codex row did not become the active session after default open: "
+            f"target={target!r} state={opened_state!r}"
+        )
+    if opened_state.get("active_view_mode") != "Terminal":
+        raise AssertionError(
+            "stored Codex row default-opened outside Terminal mode: "
+            f"target={target!r} state={opened_state!r}"
+        )
+    viewport = viewport_state(opened_state)
+    host = active_host_or_none(opened_state) or host_for_session_or_none(opened_state, target)
+    terminal_attempt = viewport.get("terminal_open_attempt") or {}
+    terminal_ready = bool(host) or (
+        terminal_attempt.get("state") == "ready"
+        and terminal_attempt.get("session_path") == target
+        and not terminal_attempt.get("latched_failure_reason")
+    )
+    if not terminal_ready:
+        raise AssertionError(
+            "stored Codex row reached Terminal mode without a ready terminal host/attempt: "
+            f"target={target!r} viewport={viewport!r}"
+        )
+    last_action = str((opened_state.get("shell") or {}).get("last_action") or "")
+    if "in preview" in last_action.lower():
+        raise AssertionError(
+            "stored Codex row still routed through the preview/live-focus path: "
+            f"target={target!r} last_action={last_action!r}"
+        )
+    cursor_contract = assert_sidebar_cursor_contract(pid, state=opened_state)
+    after_generation = opened_state.get("generation") or {}
+    after_count = int(after_generation.get("copy_generation_start_count") or 0)
+    if after_count != before_count:
+        raise AssertionError(
+            "stored Codex row default-open triggered copy generation: "
+            f"target={target!r} before={before_generation!r} after={after_generation!r}"
+        )
+    return {
+        "target": target,
+        "label": target_row.get("label"),
+        "open_result": open_result.get("data") or open_result,
+        "active_view_mode": opened_state.get("active_view_mode"),
+        "terminal_attempt": terminal_attempt,
+        "host_present": bool(host),
+        "cursor_contract": cursor_contract,
+        "copy_generation_start_count": after_count,
     }
 
 
@@ -12985,6 +13120,8 @@ def main() -> int:
         "maximize_roundtrip_layout",
         "notification_health_initial",
         "session_view_contract_initial",
+        "sidebar_cursor_contract",
+        "stored_codex_session_open",
         "right_panel_animation",
         "search_focus_overlay",
         "selection_copy_generation_budget",
@@ -13123,6 +13260,9 @@ def main() -> int:
         run_check("titlebar_overflow_menu", lambda: assert_titlebar_overflow_menu_contract(args.pid))
         run_check("settings_terminal_reclaim", lambda: assert_settings_terminal_reclaim_contract(args.pid))
         run_check("right_panel_animation", lambda: assert_right_panel_animation_contract(args.pid))
+        run_check("sidebar_cursor_contract", lambda: assert_sidebar_cursor_contract(args.pid))
+        if "stored_codex_session_open" in selected_checks:
+            run_check("stored_codex_session_open", lambda: assert_stored_codex_session_open_contract(args.pid))
         run_check("live_sessions_tree_contract", lambda: assert_live_sessions_tree_contract(args.pid))
         run_check("session_drag_to_folder", lambda: assert_session_drag_to_folder_contract(args.pid))
         run_check(

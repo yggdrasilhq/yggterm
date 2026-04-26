@@ -8197,7 +8197,7 @@ fn spawn_open_session_row(state: Signal<ShellState>, row: BrowserRow) {
 }
 
 fn preferred_open_mode_for_row(shell: &ShellState, row: &BrowserRow) -> WorkspaceViewMode {
-    if is_live_sidebar_row(row) && row_supports_terminal(shell, row) {
+    if row.kind == BrowserRowKind::Session && row_supports_terminal(shell, row) {
         WorkspaceViewMode::Terminal
     } else {
         shell.server.active_view_mode()
@@ -9677,8 +9677,6 @@ fn is_live_sidebar_row(row: &BrowserRow) -> bool {
         || row.full_path.starts_with("local://")
         || row.full_path.starts_with("codex://")
         || row.full_path.starts_with("codex-litellm://")
-        || is_codex_storage_session_path(&row.full_path)
-        || is_codex_litellm_storage_session_path(&row.full_path)
 }
 
 fn session_is_hot_terminal_row(shell: &ShellState, row: &BrowserRow) -> bool {
@@ -17239,6 +17237,7 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
             const visibleSidebarRows = sidebarRows
                 .map((row) => {
                     const rect = row.getBoundingClientRect();
+                    const rowStyle = window.getComputedStyle(row);
                     const icon = row.querySelector('[data-tree-icon]');
                     const indicator = row.querySelector('[data-machine-indicator="1"]');
                     const liveClose = row.querySelector('[data-sidebar-live-session-close="1"]');
@@ -17262,6 +17261,7 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                         machine_indicator_color: indicatorStyle ? indicatorStyle.backgroundColor : null,
                         selected: row.getAttribute('data-selected') === 'true',
                         draggable: row.getAttribute('data-sidebar-row-draggable') === 'true',
+                        cursor: String(rowStyle.cursor || '').trim(),
                         live_member: row.getAttribute('data-sidebar-live-session-member') === 'true',
                         drop_target: row.getAttribute('data-drop-target'),
                         icon_text: String(icon?.textContent || '').trim(),
@@ -18721,6 +18721,7 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                     }
                     const liveClose = row.querySelector('[data-sidebar-live-session-close="1"]');
                     const treeIcon = row.querySelector('[data-tree-icon="1"]');
+                    const rowStyle = window.getComputedStyle(row);
                     const iconKind = treeIcon
                         ? String(treeIcon.getAttribute('data-tree-icon-kind') || '').trim()
                         : '';
@@ -18732,6 +18733,7 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         detail_label: String(row.getAttribute('data-sidebar-row-detail') || '').trim(),
                         selected: row.getAttribute('data-selected') === 'true',
                         draggable: row.getAttribute('data-sidebar-row-draggable') === 'true',
+                        cursor: String(rowStyle.cursor || '').trim(),
                         live_member: row.getAttribute('data-sidebar-live-session-member') === 'true',
                         left: Math.round(rect.left),
                         top: Math.round(rect.top),
@@ -22540,7 +22542,6 @@ fn app() -> Element {
         use_hook(|| Arc::new(AtomicBool::new(false))).clone();
     let mut window_epoch = use_signal(|| 0_u64);
     let async_render_epoch = use_signal(|| 0_u64);
-    let mut last_open_recovery_path = use_signal(|| None::<String>);
     let mut last_startup_terminal_restore_path = use_signal(|| None::<String>);
     let mut last_startup_terminal_recovery_path = use_signal(|| None::<String>);
     let mut last_terminal_mount_key = use_signal(|| None::<String>);
@@ -23513,36 +23514,6 @@ fn app() -> Element {
                 }}
             }})();"
         ));
-    });
-    use_effect(move || {
-        let (selected_row, active_session_path, server_busy) = {
-            let shell = state.read();
-            (
-                current_selected_sidebar_row(&shell),
-                shell
-                    .server
-                    .active_session_path()
-                    .map(|path| path.to_string()),
-                shell.server_busy,
-            )
-        };
-        let Some(row) = selected_row else {
-            set_signal_if_changed(last_open_recovery_path, None);
-            return;
-        };
-        if active_session_path.is_some() || server_busy {
-            set_signal_if_changed(last_open_recovery_path, None);
-            return;
-        }
-        if !matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document) {
-            set_signal_if_changed(last_open_recovery_path, None);
-            return;
-        }
-        if *last_open_recovery_path.read() == Some(row.full_path.clone()) {
-            return;
-        }
-        last_open_recovery_path.set(Some(row.full_path.clone()));
-        spawn_open_session_row(state, row);
     });
     use_effect(move || {
         if *dock_pulse_started.read() {
@@ -26535,7 +26506,7 @@ fn SidebarRow(
                      box-sizing:border-box; min-width:0; overflow:hidden; user-select:none; -webkit-user-select:none; \
                      transition: transform 140ms ease, background 140ms ease, opacity 140ms ease, box-shadow 140ms ease; \
                      transform:translateY(0px); box-shadow:{}; position:relative;",
-                    if dragging { "grabbing" } else if draggable { "grab" } else { "default" },
+                    if dragging { "grabbing" } else { "pointer" },
                     indent
                     , if dragging { "0.58" } else { "1" },
                     if selected || fill_target { palette.accent_soft } else { "transparent" },
@@ -26722,7 +26693,7 @@ fn SidebarRow(
                 if fill_target { "rgba(95, 168, 255, 0.14)" } else { background },
                 indent,
                 if dragging { "0.58" } else { "1" },
-                if dragging { "grabbing" } else if draggable { "grab" } else { "default" },
+                if dragging { "grabbing" } else { "pointer" },
                 if top_line && drag_active {
                     format!("inset 0 2px 0 {}", palette.accent)
                 } else if bottom_line && drag_active {
@@ -44872,8 +44843,8 @@ mod tests {
         );
     }
     #[test]
-    fn preferred_open_mode_for_live_stored_codex_row_forces_terminal() {
-        let session_path = "/home/pi/.codex/sessions/example.jsonl";
+    fn preferred_open_mode_for_stored_codex_session_row_forces_terminal() {
+        let session_path = "/home/pi/.codex/sessions/2026/04/24/example.jsonl";
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
         shell.server.set_view_mode(WorkspaceViewMode::Rendered);
 
@@ -50426,11 +50397,14 @@ Waiting for the remote terminal to paint...\n";
     }
 
     #[test]
-    fn is_live_sidebar_row_accepts_stored_codex_session_paths() {
-        let codex_row = test_sidebar_row("/home/pi/.codex/sessions/example.jsonl");
-        let litellm_row = test_sidebar_row("/home/pi/.codex-litellm/sessions/example.jsonl");
-        assert!(is_live_sidebar_row(&codex_row));
-        assert!(is_live_sidebar_row(&litellm_row));
+    fn is_live_sidebar_row_rejects_stored_codex_session_paths() {
+        let codex_row = test_sidebar_row("/home/pi/.codex/sessions/2026/04/24/example.jsonl");
+        let litellm_row =
+            test_sidebar_row("/home/pi/.codex-litellm/sessions/2026/04/24/example.jsonl");
+        assert!(!is_live_sidebar_row(&codex_row));
+        assert!(!is_live_sidebar_row(&litellm_row));
+        assert!(is_live_sidebar_row(&test_sidebar_row("codex://abc")));
+        assert!(is_live_sidebar_row(&test_sidebar_row("local://abc")));
     }
     #[test]
     fn shell_snapshot_retains_all_live_hot_terminal_sessions() {
