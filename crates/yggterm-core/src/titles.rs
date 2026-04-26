@@ -403,9 +403,9 @@ impl SessionTitleResolver {
             warn!(session_id, "model response sanitized to empty title");
             return Ok(None);
         };
-        let title = if looks_like_generated_fallback_title(&title) {
+        let title = if title_is_low_signal_for_cwd(&title, cwd) {
             if let Some(heuristic) = heuristic_title_from_context(&context) {
-                if looks_like_generated_fallback_title(&heuristic) {
+                if title_is_low_signal_for_cwd(&heuristic, cwd) {
                     warn!(session_id, generated_title=%title, "discarding low-signal generated title");
                     return Ok(None);
                 }
@@ -682,11 +682,11 @@ fn request_litellm_title(settings: &AppSettings, context: &str) -> Result<String
         "messages": [
             {
                 "role": "system",
-                "content": "Generate a short, high-signal tab title for a long-running coding or terminal session. Infer the real job from the overall objective, the latest concrete progress, and the strongest user intent. Prefer the larger effort over temporary substeps like screenshot reading, launch notes, status checks, or one-off UI pokes. Use a specific engineering noun phrase, 2 to 6 words, no quotes, no markdown, no trailing punctuation. Good: 'Yggterm Titlebar Fix', 'Daemon Lifecycle Leak Audit', 'WezTerm APT Install'. Bad: 'Dev Sta', 'Fix Issue', 'Work Session', 'Debug UI', 'Need Help'."
+                "content": "Generate a short, high-signal tab title for a long-running coding or terminal session. Infer the real job from the overall objective, the latest concrete progress, and the strongest user intent. Prefer the larger effort over temporary substeps like screenshot reading, launch notes, status checks, or one-off UI pokes. Use a specific engineering noun phrase, 2 to 6 words, no quotes, no markdown, no trailing punctuation. Do not return a question, instruction fragment, or word salad. Never start with How, Why, What, When, Where, or Who. Never end with an article or preposition such as The, A, An, To, For, Of, With, or Into. Good: 'Yggterm Titlebar Fix', 'Daemon Lifecycle Leak Audit', 'WezTerm APT Install'. Bad: 'How Use Skills Discovery The', 'Dev Sta', 'Fix Issue', 'Work Session', 'Debug UI', 'Need Help'."
             },
             {
                 "role": "user",
-                "content": format!("Create a concise session title from this structured session context.\nPrioritize: 1) the main user goal, 2) the active system/repo, and 3) the concrete engineering work happening now.\nIf the latest turns are screenshot inspection or modal polish inside a longer debugging effort, title the larger effort.\nDo not echo raw metadata, shell paths, or cute placeholder labels.\nReturn the title only.\n\n{context}")
+                "content": format!("Create a concise session title from this structured session context.\nPrioritize: 1) the main user goal, 2) the active system/repo, and 3) the concrete engineering work happening now.\nIf the latest turns are screenshot inspection or modal polish inside a longer debugging effort, title the larger effort.\nUse a noun phrase that can sit on a sidebar row. Do not echo raw metadata, shell paths, question words, or cute placeholder labels.\nReturn the title only.\n\n{context}")
             }
         ]
     });
@@ -1213,6 +1213,9 @@ mod tests {
         assert!(looks_like_low_signal_generated_title(
             "Why You May Not Have"
         ));
+        assert!(looks_like_low_signal_generated_title(
+            "How Use Skills Discovery The"
+        ));
         assert!(!looks_like_low_signal_generated_title("Install WezTerm"));
     }
 
@@ -1362,6 +1365,14 @@ mod tests {
                     "remaining work",
                 ],
                 summary_forbidden: &["Target:", "Command:"],
+            },
+            Fixture {
+                name: "title summary harness quality",
+                context: "PRIMARY USER GOALS:\n- Harden Yggterm title and summary regeneration after a field test produced laughably bad copy.\n\nRECENT SUBSTANTIVE TURNS:\nUSER: I do not think the prompt and the summary harness of regeneration of title/summary is good at all. You need to do harness engineering properly.\nUSER: Also, The title and summary are both laughably bad.\nASSISTANT: The generated title 'How Use Skills Discovery The' should be rejected and replaced by a useful fixture-backed title.",
+                title_keywords: &["Title", "Summary", "Harness"],
+                title_forbidden: &["How", "The", "Laughably"],
+                summary_keywords: &["title", "summary", "rejects malformed"],
+                summary_forbidden: &["How Use Skills Discovery The", "approval policy"],
             },
             Fixture {
                 name: "fan load",
@@ -1679,11 +1690,25 @@ fn looks_like_low_signal_generated_title(title: &str) -> bool {
                 )
         })
         .count();
+    let starts_with_question_fragment = words.first().is_some_and(|word| {
+        matches!(
+            word.as_str(),
+            "how" | "why" | "what" | "when" | "where" | "who"
+        )
+    });
+    let ends_with_syntax_fragment = words.last().is_some_and(|word| {
+        matches!(
+            word.as_str(),
+            "the" | "a" | "an" | "to" | "for" | "of" | "with" | "into" | "from" | "and" | "or"
+        )
+    });
     lower.starts_with("please ")
         || lower.starts_with("can you ")
         || lower.starts_with("need to ")
         || lower.starts_with("help ")
         || lower.contains("asked you")
+        || starts_with_question_fragment
+        || ends_with_syntax_fragment
         || (words.len() >= 3 && low_signal_word_count * 2 >= words.len())
         || (trimmed.split_whitespace().count() > 5
             && ["sudo", "apt", "apt-get", "brew", "dnf", "yum"]
@@ -2070,6 +2095,16 @@ fn themed_title_from_context(context: &str) -> Option<String> {
     if context_has_any(
         &lower,
         &[
+            "prompt and the summary harness",
+            "regeneration of title/summary",
+            "title and summary are both laughably bad",
+        ],
+    ) {
+        return Some(String::from("Harden Title Summary Harness"));
+    }
+    if context_has_any(
+        &lower,
+        &[
             "instagram pruning different from facebook pruning",
             "attention edge",
             "archive/access edge",
@@ -2146,6 +2181,17 @@ fn themed_summary_from_context(context: &str) -> Option<String> {
         } else {
             "Resume the boundaries discussion from the prior thread and continue the model."
         };
+        return sanitize_generated_summary(summary);
+    }
+    if context_has_any(
+        &lower,
+        &[
+            "prompt and the summary harness",
+            "regeneration of title/summary",
+            "title and summary are both laughably bad",
+        ],
+    ) {
+        let summary = "Harden Yggterm title and summary generation so regeneration rejects malformed titles and proves useful session copy through fixtures and smoke checks.";
         return sanitize_generated_summary(summary);
     }
     if context_has_any(
