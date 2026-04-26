@@ -294,6 +294,61 @@ def remote_cpu_sample(host: str, label: str, pid: int, home: str, duration_sec: 
     return linux_smoke.ssh_python_json(host, snippet)
 
 
+def remote_launch_visible_state_with_fallback(
+    host: str,
+    remote_bin: str,
+    env: dict[str, str],
+    *,
+    timeout_ms: int,
+    remote_log: str,
+) -> tuple[dict, int, dict, dict]:
+    launch_info: dict[str, object] = {
+        "mode": "app_cli",
+        "visibility_error": None,
+        "app_cli_cleanup": None,
+        "fallback_response": None,
+    }
+    pid = 0
+    try:
+        launch_payload = linux_smoke.remote_launch_visible_window(
+            host,
+            remote_bin,
+            env,
+            timeout_ms=timeout_ms,
+            remote_log=remote_log,
+        )
+        pid = int(launch_payload.get("pid") or 0)
+        state = linux_smoke.wait_for_remote_state(
+            host, remote_bin, env, pid, timeout_ms, timeout_seconds=30.0
+        )
+        launch_info["response"] = launch_payload
+        return launch_payload, pid, state, launch_info
+    except RuntimeError as exc:
+        launch_info["visibility_error"] = str(exc)
+        if pid:
+            linux_smoke.remote_kill_pid(host, pid)
+        launch_info["app_cli_cleanup"] = linux_smoke.remote_kill_yggterm_processes_for_home(
+            host,
+            env.get("YGGTERM_HOME", ""),
+        )
+
+    fallback_log = f"{remote_log}.direct"
+    fallback_payload = linux_smoke.remote_launch_direct_window(
+        host,
+        remote_bin,
+        env,
+        timeout_ms=timeout_ms,
+        remote_log=fallback_log,
+    )
+    fallback_pid = int(fallback_payload.get("pid") or 0)
+    state = linux_smoke.wait_for_remote_state(
+        host, remote_bin, env, fallback_pid, timeout_ms, timeout_seconds=30.0
+    )
+    launch_info["mode"] = "direct_shell_fallback"
+    launch_info["fallback_response"] = fallback_payload
+    return fallback_payload, fallback_pid, state, launch_info
+
+
 def main() -> int:
     args = parse_args()
     linux_smoke.configure_remote_transport(args.proxy_jump, args.ssh_port)
@@ -333,7 +388,7 @@ def main() -> int:
         summary["daemon_prewarm"] = linux_smoke.remote_ensure_local_daemon_ready(
             args.host, remote_bin, launch_env, timeout_seconds=20.0
         )
-        launch = linux_smoke.remote_launch_visible_window(
+        launch, pid, state, launch_info = remote_launch_visible_state_with_fallback(
             args.host,
             remote_bin,
             launch_env,
@@ -341,10 +396,8 @@ def main() -> int:
             remote_log=f"{remote_dir}/client.log",
         )
         summary["launch"] = launch
-        pid = int(launch.get("pid") or 0)
-        state = linux_smoke.wait_for_remote_state(
-            args.host, remote_bin, launch_env, pid, args.timeout_ms, timeout_seconds=30.0
-        )
+        summary["launch_info"] = launch_info
+        summary["pid"] = pid
         time.sleep(args.settle_sec)
         summary["state_after_launch"] = state_summary(state)
         summary["cpu_after_launch_idle_visible"] = remote_cpu_sample(
@@ -416,6 +469,10 @@ def main() -> int:
                 failures.append({"sample": key, "total_cpu_percent": total, "max_cpu": max_cpu})
         summary["failures"] = failures
         summary["ok"] = not failures
+    except Exception as exc:
+        summary["error"] = str(exc)
+        summary["failures"] = [{"error": str(exc)}]
+        summary["ok"] = False
     finally:
         if pid and remote_bin:
             try:

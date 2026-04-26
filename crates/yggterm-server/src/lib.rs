@@ -253,6 +253,9 @@ fn local_live_session_kind_is_recoverable(kind: SessionKind) -> bool {
 }
 
 fn persisted_live_session_is_recoverable(live: &PersistedLiveSession) -> bool {
+    if is_local_codex_storage_session_path(&live.key) {
+        return false;
+    }
     if parse_remote_scanned_session_path(&live.key).is_some() {
         return !is_loopback_ssh_target(&live.ssh_target);
     }
@@ -263,6 +266,11 @@ fn persisted_live_session_is_recoverable(live: &PersistedLiveSession) -> bool {
 }
 
 fn managed_live_session_is_recoverable(key: &str, session: &ManagedSessionView) -> bool {
+    if is_local_codex_storage_session_path(key)
+        || is_local_codex_storage_session_path(&session.session_path)
+    {
+        return false;
+    }
     if parse_remote_scanned_session_path(key).is_some() {
         return session
             .ssh_target
@@ -277,6 +285,19 @@ fn managed_live_session_is_recoverable(key: &str, session: &ManagedSessionView) 
             .ssh_target
             .as_deref()
             .is_some_and(|target| !is_loopback_ssh_target(target))
+}
+
+fn is_local_codex_storage_session_path(path: &str) -> bool {
+    path.contains("/.codex/sessions/") || path.contains("/.codex-litellm/sessions/")
+}
+
+fn managed_session_is_promoted_live_session(key: &str, session: &ManagedSessionView) -> bool {
+    matches!(
+        session.source,
+        SessionSource::LiveLocal | SessionSource::LiveSsh
+    ) && session.kind != SessionKind::Document
+        && !is_local_codex_storage_session_path(key)
+        && !is_local_codex_storage_session_path(&session.session_path)
 }
 
 fn active_session_snapshot_gap_is_recoverable(path: &str) -> bool {
@@ -498,6 +519,12 @@ pub fn validate_server_ui_snapshot(snapshot: &ServerUiSnapshot) -> Vec<String> {
                 live.source, live.session_path
             ));
         }
+        if is_local_codex_storage_session_path(&live.session_path) {
+            violations.push(format!(
+                "live_sessions contains a stored Codex transcript path: {}",
+                live.session_path
+            ));
+        }
         if live.kind == SessionKind::Document {
             violations.push(format!(
                 "live_sessions contains a document node: {}",
@@ -537,6 +564,7 @@ pub fn validate_server_ui_snapshot(snapshot: &ServerUiSnapshot) -> Vec<String> {
                 active.source,
                 SessionSource::LiveLocal | SessionSource::LiveSsh
             ) && !live_paths.contains(active.session_path.as_str())
+                && !is_local_codex_storage_session_path(&active.session_path)
             {
                 violations.push(format!(
                     "active live session is missing from live_sessions: {}",
@@ -1368,7 +1396,12 @@ impl YggtermServer {
         let sessions = self
             .live_session_order
             .iter()
-            .filter_map(|key| self.sessions.get(key).cloned())
+            .filter_map(|key| {
+                self.sessions
+                    .get(key)
+                    .filter(|session| managed_session_is_promoted_live_session(key, session))
+                    .cloned()
+            })
             .collect::<Vec<_>>();
         sessions
     }
@@ -1376,7 +1409,11 @@ impl YggtermServer {
     pub fn live_session_views(&self) -> Vec<&ManagedSessionView> {
         self.live_session_order
             .iter()
-            .filter_map(|key| self.sessions.get(key))
+            .filter_map(|key| {
+                self.sessions
+                    .get(key)
+                    .filter(|session| managed_session_is_promoted_live_session(key, session))
+            })
             .collect()
     }
 
@@ -1384,7 +1421,11 @@ impl YggtermServer {
         let live_sessions = self
             .live_session_order
             .iter()
-            .filter_map(|key| self.sessions.get(key))
+            .filter_map(|key| {
+                self.sessions
+                    .get(key)
+                    .filter(|session| managed_session_is_promoted_live_session(key, session))
+            })
             .map(snapshot_live_session_view)
             .collect::<Vec<_>>();
         let active_session = self.active_session().cloned().or_else(|| {
@@ -3458,9 +3499,12 @@ impl YggtermServer {
 
     fn first_available_live_session_path(&self) -> Option<String> {
         self.live_session_order.iter().find_map(|candidate| {
-            self.resolve_session_storage_key(candidate)
-                .and_then(|key| self.sessions.get(key))
-                .map(|session| session.session_path.clone())
+            self.resolve_session_storage_key(candidate).and_then(|key| {
+                self.sessions
+                    .get(key)
+                    .filter(|session| managed_session_is_promoted_live_session(key, session))
+                    .map(|session| session.session_path.clone())
+            })
         })
     }
 
@@ -13431,6 +13475,45 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_contract_rejects_stored_codex_paths_in_live_sessions() {
+        let path = "/home/pi/.codex/sessions/stored.jsonl";
+        let live = snapshot_session(path, SessionSource::LiveLocal);
+        let snapshot = snapshot_with_active(
+            Some(path.to_string()),
+            Some(live.clone()),
+            WorkspaceViewMode::Terminal,
+            vec![live],
+            Vec::new(),
+        );
+
+        let violations = validate_server_ui_snapshot(&snapshot);
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("stored Codex transcript path")),
+            "{violations:#?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_contract_accepts_active_stored_codex_terminal_outside_live_sessions() {
+        let path = "/home/pi/.codex/sessions/stored.jsonl";
+        let live = snapshot_session(path, SessionSource::LiveLocal);
+        let snapshot = snapshot_with_active(
+            Some(path.to_string()),
+            Some(live),
+            WorkspaceViewMode::Terminal,
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let violations = validate_server_ui_snapshot(&snapshot);
+
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[test]
     fn snapshot_contract_rejects_active_path_without_active_session() {
         let snapshot = snapshot_with_active(
             Some("local://missing".to_string()),
@@ -16654,7 +16737,7 @@ terminal_window_id: None,
     }
 
     #[test]
-    fn request_terminal_launch_promotes_stored_codex_session_into_live_sessions() {
+    fn request_terminal_launch_keeps_stored_codex_transcript_out_of_live_sessions() {
         let tree = SessionNode {
             kind: SessionNodeKind::Group,
             name: "sessions".to_string(),
@@ -16672,7 +16755,7 @@ terminal_window_id: None,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
         );
-        let path = "/tmp/stored-codex-session.jsonl";
+        let path = "/home/pi/.codex/sessions/stored-codex-session.jsonl";
         server.open_or_focus_session(
             SessionKind::Codex,
             path,
@@ -16692,10 +16775,7 @@ terminal_window_id: None,
         server.request_terminal_launch_for_path(path);
 
         let live_sessions = server.live_sessions();
-        assert_eq!(live_sessions.len(), 1);
-        assert_eq!(live_sessions[0].session_path, path);
-        assert_eq!(live_sessions[0].kind, SessionKind::Codex);
-        assert_eq!(live_sessions[0].source, SessionSource::LiveLocal);
+        assert!(live_sessions.is_empty());
         assert_eq!(server.active_session_path(), Some(path));
         assert_eq!(
             server.active_session().map(|session| session.source),

@@ -1357,6 +1357,48 @@ struct LinuxWindowProfile {
     reason: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinuxWindowProfileInput {
+    transparent_opt_in: bool,
+    wayland_display_present: bool,
+    display_present: bool,
+    gdk_backend_x11: bool,
+    xrpd_session: bool,
+}
+
+fn linux_window_profile_from_input(input: LinuxWindowProfileInput) -> LinuxWindowProfile {
+    if input.transparent_opt_in {
+        return LinuxWindowProfile {
+            transparent: true,
+            xrpd_session: input.xrpd_session,
+            reason: "explicit_opt_in",
+        };
+    }
+    if input.xrpd_session {
+        return LinuxWindowProfile {
+            transparent: false,
+            xrpd_session: true,
+            reason: "xrdp_opaque_profile",
+        };
+    }
+    if input.gdk_backend_x11 || (input.display_present && !input.wayland_display_present) {
+        return LinuxWindowProfile {
+            transparent: false,
+            xrpd_session: false,
+            reason: "x11_native_shape_profile",
+        };
+    }
+    LinuxWindowProfile {
+        transparent: false,
+        xrpd_session: false,
+        reason: if input.wayland_display_present {
+            "wayland_opaque_default"
+        } else {
+            "linux_opaque_default"
+        },
+    }
+}
+
 fn detect_linux_window_profile() -> LinuxWindowProfile {
     #[cfg(target_os = "linux")]
     {
@@ -1368,27 +1410,20 @@ fn detect_linux_window_profile() -> LinuxWindowProfile {
                     "1" | "true" | "yes" | "on"
                 )
             });
-        let wayland_session = std::env::var_os("WAYLAND_DISPLAY").is_some();
+        let wayland_display_present = std::env::var_os("WAYLAND_DISPLAY").is_some();
+        let display_present = std::env::var_os("DISPLAY").is_some();
+        let gdk_backend_x11 = std::env::var("GDK_BACKEND")
+            .ok()
+            .is_some_and(|value| value.split(',').any(|part| part.trim() == "x11"));
         let xrpd_session = std::env::var_os("XRDP_SESSION").is_some()
             || std::env::var_os("XRDP_SOCKET_PATH").is_some();
-        if transparent_opt_in {
-            return LinuxWindowProfile {
-                transparent: true,
-                xrpd_session,
-                reason: "explicit_opt_in",
-            };
-        }
-        return LinuxWindowProfile {
-            transparent: false,
+        return linux_window_profile_from_input(LinuxWindowProfileInput {
+            transparent_opt_in,
+            wayland_display_present,
+            display_present,
+            gdk_backend_x11,
             xrpd_session,
-            reason: if xrpd_session {
-                "xrdp_opaque_profile"
-            } else if wayland_session {
-                "wayland_opaque_default"
-            } else {
-                "x11_opaque_profile"
-            },
-        };
+        });
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -2182,8 +2217,9 @@ fn run_server_smoke() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BuiltinCliCommand, SignalClientScope, classify_builtin_cli_command,
-        compatible_signal_client_count, record_matches_executable, signal_client_instances_dir,
+        BuiltinCliCommand, LinuxWindowProfileInput, SignalClientScope,
+        classify_builtin_cli_command, compatible_signal_client_count,
+        linux_window_profile_from_input, record_matches_executable, signal_client_instances_dir,
         signal_client_scope_matches, signal_parse_process_start_ticks_from_stat,
         signal_process_start_ticks,
     };
@@ -2208,6 +2244,58 @@ mod tests {
             classify_builtin_cli_command(&["server".to_string(), "--help".to_string()]),
             Some(BuiltinCliCommand::ServerHelp)
         );
+    }
+
+    #[test]
+    fn linux_x11_window_profile_uses_native_shape_corners() {
+        let profile = linux_window_profile_from_input(LinuxWindowProfileInput {
+            transparent_opt_in: false,
+            wayland_display_present: false,
+            display_present: true,
+            gdk_backend_x11: false,
+            xrpd_session: false,
+        });
+        assert!(!profile.transparent);
+        assert_eq!(profile.reason, "x11_native_shape_profile");
+    }
+
+    #[test]
+    fn linux_gdk_x11_window_profile_overrides_wayland_env() {
+        let profile = linux_window_profile_from_input(LinuxWindowProfileInput {
+            transparent_opt_in: false,
+            wayland_display_present: true,
+            display_present: true,
+            gdk_backend_x11: true,
+            xrpd_session: false,
+        });
+        assert!(!profile.transparent);
+        assert_eq!(profile.reason, "x11_native_shape_profile");
+    }
+
+    #[test]
+    fn linux_xrdp_window_profile_stays_opaque() {
+        let profile = linux_window_profile_from_input(LinuxWindowProfileInput {
+            transparent_opt_in: false,
+            wayland_display_present: false,
+            display_present: true,
+            gdk_backend_x11: true,
+            xrpd_session: true,
+        });
+        assert!(!profile.transparent);
+        assert_eq!(profile.reason, "xrdp_opaque_profile");
+    }
+
+    #[test]
+    fn linux_wayland_window_profile_stays_opaque_by_default() {
+        let profile = linux_window_profile_from_input(LinuxWindowProfileInput {
+            transparent_opt_in: false,
+            wayland_display_present: true,
+            display_present: true,
+            gdk_backend_x11: false,
+            xrpd_session: false,
+        });
+        assert!(!profile.transparent);
+        assert_eq!(profile.reason, "wayland_opaque_default");
     }
 
     #[cfg(unix)]

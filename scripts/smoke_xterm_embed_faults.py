@@ -11469,6 +11469,12 @@ def assert_stored_codex_session_open_contract(pid: int) -> dict:
             "stored Codex row still routed through the preview/live-focus path: "
             f"target={target!r} last_action={last_action!r}"
         )
+    placement = assert_local_tree_placement(pid, target)
+    if placement.get("placement") != "stored_tree":
+        raise AssertionError(
+            "stored Codex row was promoted into Live Sessions instead of staying in its tree: "
+            f"target={target!r} placement={placement!r}"
+        )
     cursor_contract = assert_sidebar_cursor_contract(pid, state=opened_state)
     after_generation = opened_state.get("generation") or {}
     after_count = int(after_generation.get("copy_generation_start_count") or 0)
@@ -11482,6 +11488,7 @@ def assert_stored_codex_session_open_contract(pid: int) -> dict:
         "label": target_row.get("label"),
         "open_result": open_result.get("data") or open_result,
         "active_view_mode": opened_state.get("active_view_mode"),
+        "sidebar_placement": placement,
         "terminal_attempt": terminal_attempt,
         "host_present": bool(host),
         "cursor_contract": cursor_contract,
