@@ -405,6 +405,7 @@ fn should_repair_linux_launcher(context: &InstallContext) -> bool {
         || desktop_text.contains("/tmp/yggterm-")
         || !desktop_text.contains("Icon=")
         || !desktop_text.contains("yggterm.svg")
+        || desktop_text.contains("NoDisplay=true")
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -457,7 +458,7 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
     let desktop_exec_path = launcher_path.as_deref().unwrap_or(&context.executable_path);
     let desktop_icon_path = desktop_exec_escape(&installed_icons.direct_svg_path);
     let desktop_contents = format!(
-        "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Yggterm\nComment=Remote-first terminal workspace\nExec={}\nTryExec={}\nIcon={}\nTerminal=false\nNoDisplay=true\nCategories=System;TerminalEmulator;Development;\nStartupNotify=true\nStartupWMClass={}\nX-Desktop-File-Install-Version=0.27\n",
+        "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Yggterm\nComment=Remote-first terminal workspace\nExec={}\nTryExec={}\nIcon={}\nTerminal=false\nNoDisplay=false\nCategories=System;TerminalEmulator;Development;\nStartupNotify=true\nStartupWMClass={}\nX-Desktop-File-Install-Version=0.27\n",
         desktop_exec_escape(desktop_exec_path),
         desktop_exec_escape(desktop_exec_path),
         desktop_icon_path,
@@ -465,7 +466,7 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
     );
     write_if_changed(&desktop_path, desktop_contents.as_bytes())?;
     let legacy_desktop_contents = format!(
-        "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Yggterm\nComment=Remote-first terminal workspace\nExec={}\nTryExec={}\nIcon={}\nTerminal=false\nNoDisplay=false\nCategories=System;TerminalEmulator;Development;\nStartupNotify=true\nStartupWMClass={}\nX-Desktop-File-Install-Version=0.27\n",
+        "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Yggterm\nComment=Remote-first terminal workspace\nExec={}\nTryExec={}\nIcon={}\nTerminal=false\nNoDisplay=true\nCategories=System;TerminalEmulator;Development;\nStartupNotify=true\nStartupWMClass={}\nX-Desktop-File-Install-Version=0.27\n",
         desktop_exec_escape(desktop_exec_path),
         desktop_exec_escape(desktop_exec_path),
         desktop_icon_path,
