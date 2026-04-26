@@ -682,12 +682,30 @@ def app_screenshot(pid: int, path: Path, *, crop_state: dict | None = None) -> d
     if path.exists() and effective_crop_state and screenshot_crop_needs_root_recrop(path, effective_crop_state):
         repair_app_screenshot_from_root(path, effective_crop_state)
     if path.exists() and effective_crop_state:
-        assert_shell_corner_rounding(
+        corner_rounding = assert_shell_corner_rounding(
             pid,
             path,
             effective_crop_state,
             context=f"app screenshot {path.name}",
         )
+        if corner_rounding is not None:
+            proof_path = path.with_name(f"{path.stem}.corner.json")
+            corner_rounding = {
+                **corner_rounding,
+                "corner_proof_path": str(proof_path),
+            }
+            try:
+                with proof_path.open("w") as fh:
+                    json.dump(corner_rounding, fh, indent=2)
+            except OSError:
+                pass
+            if not isinstance(payload, dict):
+                payload = {}
+            data = payload.get("data")
+            if not isinstance(data, dict):
+                data = {}
+            data["shell_corner_rounding"] = corner_rounding
+            payload["data"] = data
     return payload
 
 
@@ -2744,14 +2762,47 @@ def rgba_distance(left: tuple[int, int, int, int], right: tuple[int, int, int, i
 
 def capture_root_screenshot(display: str, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
+    import_proc = subprocess.run(
         ["import", "-display", display, "-window", "root", str(path)],
         cwd=ROOT,
         text=True,
         capture_output=True,
         env=ENV,
         timeout=20.0,
-        check=True,
+    )
+    if import_proc.returncode == 0 and path.exists():
+        return
+    wayland_display = str(
+        ENV.get("YGGTERM_SCREENSHOT_WAYLAND_DISPLAY") or ENV.get("WAYLAND_DISPLAY") or ""
+    ).strip()
+    if wayland_display:
+        spectacle_env = ENV.copy()
+        spectacle_env["WAYLAND_DISPLAY"] = wayland_display
+        spectacle_env.setdefault("QT_QPA_PLATFORM", "wayland")
+        spectacle_proc = subprocess.run(
+            ["spectacle", "-b", "-f", "-o", str(path)],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            env=spectacle_env,
+            timeout=30.0,
+        )
+        if spectacle_proc.returncode == 0 and path.exists():
+            return
+        raise subprocess.CalledProcessError(
+            spectacle_proc.returncode,
+            spectacle_proc.args,
+            output=spectacle_proc.stdout,
+            stderr=(
+                f"ImageMagick import failed: {import_proc.stderr.strip()}\n"
+                f"Spectacle fallback failed: {spectacle_proc.stderr.strip()}"
+            ),
+        )
+    raise subprocess.CalledProcessError(
+        import_proc.returncode,
+        import_proc.args,
+        output=import_proc.stdout,
+        stderr=import_proc.stderr,
     )
 
 
@@ -3032,6 +3083,12 @@ def assert_shell_corner_rounding(pid: int, screenshot_path: Path, state: dict | 
     if not display:
         return None
     def capture_signature(path: Path) -> tuple[dict | None, list[dict]]:
+        if str(ENV.get("YGGTERM_ROOT_SCREENSHOT_FOCUS") or "").strip() == "1":
+            try:
+                run("server", "app", "focus", "--pid", str(pid), "--timeout-ms", "8000")
+                time.sleep(0.35)
+            except AssertionError:
+                pass
         capture_root_screenshot(display, path)
         signature = shell_corner_signature(path, state)
         if signature is None:
@@ -13169,7 +13226,13 @@ def main() -> int:
         final_state = app_state(args.pid)
         with (out_dir / "final-state.json").open("w") as fh:
             json.dump(final_state, fh, indent=2)
-        app_screenshot(args.pid, out_dir / "final.png")
+        final_screenshot = app_screenshot(args.pid, out_dir / "final.png")
+        if isinstance(final_screenshot, dict):
+            final_screenshot_data = final_screenshot.get("data")
+            if isinstance(final_screenshot_data, dict):
+                final_corner_rounding = final_screenshot_data.get("shell_corner_rounding")
+                if isinstance(final_corner_rounding, dict):
+                    summary["checks"]["final_screenshot_corner_rounding"] = final_corner_rounding
         if disposable_codex_session:
             summary["checks"]["disposable_codex_session_deleted"] = delete_session_via_context_menu(
                 args.pid, disposable_codex_session

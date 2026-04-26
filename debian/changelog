@@ -1,3 +1,12 @@
+yggterm (2.1.36-1) unstable; urgency=medium
+
+  * Restore rounded KDE/X11 shell corners while keeping the Linux opaque window profile.
+  * Reduce desktop idle CPU by backing off app-control, live-session, background refresh, terminal-read, and WebKit memory polling loops.
+  * Move overlong Linux daemon sockets to a short per-home runtime socket when YGGTERM_HOME would exceed Unix socket path limits.
+  * Add Linux idle CPU smoke coverage and persisted root-window corner pixel proof.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sun, 26 Apr 2026 12:22:35 +0530
+
 yggterm (2.1.35-1) unstable; urgency=medium
 
   * Disable passive title/precis/summary generation by default so row selection does not spend LLM budget.
