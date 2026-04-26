@@ -14,6 +14,8 @@ use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
 use std::panic::{self, AssertUnwindSafe};
@@ -27,7 +29,7 @@ use time::OffsetDateTime;
 use tracing::{info, warn};
 use yggterm_core::{
     AppSettings, PerfSpan, SessionNode, SessionNodeKind, SessionStore, append_trace_event,
-    looks_like_generated_fallback_title,
+    looks_like_generated_fallback_title, resolve_yggterm_home,
 };
 use yggui_contract::UiTheme;
 
@@ -44,8 +46,35 @@ const DEFAULT_ORPHAN_DAEMON_REAP_AFTER_MS: u64 = 180_000;
 const DUPLICATE_SAME_HOME_GRACE_MS: u64 = 2_000;
 const REMOTE_ATTACH_STARTUP_GRACE_MS: u64 = 900;
 
-fn startup_prewarm_should_run(active_path: &str) -> bool {
-    !active_path.starts_with("live::")
+fn daemon_env_flag_truthy(name: &str) -> bool {
+    std::env::var(name).ok().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn startup_prewarm_enabled() -> bool {
+    daemon_env_flag_truthy("YGGTERM_ENABLE_STARTUP_TERMINAL_PREWARM")
+}
+
+fn startup_prewarm_skip_reason_with_flag(active_path: &str, enabled: bool) -> Option<&'static str> {
+    if !enabled {
+        return Some("disabled_default");
+    }
+    if active_path.starts_with("live::") {
+        return Some("runtime_owned_live_session");
+    }
+    None
+}
+
+fn startup_prewarm_skip_reason(active_path: &str) -> Option<&'static str> {
+    startup_prewarm_skip_reason_with_flag(active_path, startup_prewarm_enabled())
+}
+
+fn daemon_request_trace_enabled(request_name: &str) -> bool {
+    request_name != "terminal_read" || daemon_env_flag_truthy("YGGTERM_TRACE_TERMINAL_READS")
 }
 
 #[cfg(target_os = "linux")]
@@ -209,6 +238,78 @@ fn versioned_socket_alias_is_legacy(
 #[cfg(unix)]
 fn server_socket_path_lexists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
+}
+
+#[cfg(unix)]
+const MAX_UNIX_SOCKET_PATH_BYTES: usize = 100;
+
+#[cfg(unix)]
+fn unix_socket_path_fits_platform(path: &Path) -> bool {
+    path.as_os_str().as_bytes().len() < MAX_UNIX_SOCKET_PATH_BYTES
+}
+
+#[cfg(unix)]
+fn stable_socket_home_hash(home_dir: &Path) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in home_dir.as_os_str().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+#[cfg(unix)]
+fn runtime_socket_base_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let uid = unsafe { libc::geteuid() };
+            std::env::temp_dir().join(format!("yggterm-{uid}"))
+        })
+        .join("yggterm")
+}
+
+#[cfg(unix)]
+fn short_unix_socket_path_for_home(home_dir: &Path, socket_name: &str) -> PathBuf {
+    let hash = stable_socket_home_hash(home_dir);
+    let scoped = PathBuf::from(format!("h-{hash:016x}")).join(socket_name);
+    let runtime_candidate = runtime_socket_base_dir().join(&scoped);
+    if unix_socket_path_fits_platform(&runtime_candidate) {
+        return runtime_candidate;
+    }
+    let temp_candidate = std::env::temp_dir()
+        .join(format!("yggterm-{}", unsafe { libc::geteuid() }))
+        .join(scoped);
+    if unix_socket_path_fits_platform(&temp_candidate) {
+        return temp_candidate;
+    }
+    std::env::temp_dir().join(format!(
+        "yg-{hash:016x}-{}.sock",
+        SERVER_PROTOCOL_VERSION.replace('.', "-")
+    ))
+}
+
+#[cfg(unix)]
+fn unix_socket_path_uses_runtime_fallback(path: &Path) -> bool {
+    path.parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        == Some("yggterm")
+}
+
+#[cfg(unix)]
+fn daemon_logical_home_for_endpoint(endpoint: &ServerEndpoint) -> Option<PathBuf> {
+    match endpoint {
+        ServerEndpoint::UnixSocket(path) if unix_socket_path_uses_runtime_fallback(path) => {
+            resolve_yggterm_home()
+                .ok()
+                .or_else(|| path.parent().map(Path::to_path_buf))
+        }
+        ServerEndpoint::UnixSocket(path) => path.parent().map(Path::to_path_buf),
+        ServerEndpoint::Tcp { .. } => resolve_yggterm_home().ok(),
+    }
 }
 
 fn uses_runtime_owned_terminal_path(path: &str) -> bool {
@@ -885,13 +986,16 @@ impl DaemonRuntime {
 
     fn handle_request(&mut self, request: ServerRequest) -> Result<ServerResponse> {
         let request_name = server_request_name(&request);
-        append_trace_event(
-            self.store.home_dir(),
-            "daemon",
-            "request",
-            "begin",
-            serde_json::json!({ "request": request_name }),
-        );
+        let trace_request = daemon_request_trace_enabled(request_name);
+        if trace_request {
+            append_trace_event(
+                self.store.home_dir(),
+                "daemon",
+                "request",
+                "begin",
+                serde_json::json!({ "request": request_name }),
+            );
+        }
         let response = match request {
             ServerRequest::Ping => ServerResponse::Pong,
             ServerRequest::Status => ServerResponse::Status(self.status()),
@@ -1365,13 +1469,15 @@ impl DaemonRuntime {
                 }
             }
         };
-        append_trace_event(
-            self.store.home_dir(),
-            "daemon",
-            "request",
-            "end",
-            serde_json::json!({ "request": request_name }),
-        );
+        if trace_request {
+            append_trace_event(
+                self.store.home_dir(),
+                "daemon",
+                "request",
+                "end",
+                serde_json::json!({ "request": request_name }),
+            );
+        }
         Ok(response)
     }
 }
@@ -1853,10 +1959,14 @@ fn current_build_id() -> u64 {
 pub fn default_endpoint(home_dir: &Path) -> ServerEndpoint {
     #[cfg(unix)]
     {
-        ServerEndpoint::UnixSocket(home_dir.join(format!(
-            "server-{}.sock",
-            SERVER_PROTOCOL_VERSION.replace('.', "-")
-        )))
+        let socket_name = format!("server-{}.sock", SERVER_PROTOCOL_VERSION.replace('.', "-"));
+        let home_socket = home_dir.join(&socket_name);
+        let socket_path = if unix_socket_path_fits_platform(&home_socket) {
+            home_socket
+        } else {
+            short_unix_socket_path_for_home(home_dir, &socket_name)
+        };
+        ServerEndpoint::UnixSocket(socket_path)
     }
 
     #[cfg(not(unix))]
@@ -2357,7 +2467,7 @@ fn spawn_active_terminal_prewarm(
         let Some(active_path) = active_path else {
             return;
         };
-        if !startup_prewarm_should_run(&active_path) {
+        if let Some(reason) = startup_prewarm_skip_reason(&active_path) {
             append_trace_event(
                 &home_dir,
                 "daemon",
@@ -2365,7 +2475,7 @@ fn spawn_active_terminal_prewarm(
                 "skip",
                 serde_json::json!({
                     "path": active_path,
-                    "reason": "runtime_owned_live_session",
+                    "reason": reason,
                 }),
             );
             return;
@@ -2734,8 +2844,14 @@ fn cleanup_legacy_unix_daemons(endpoint: &ServerEndpoint) -> Result<()> {
     let Some(home_dir) = current_path.parent() else {
         return Ok(());
     };
-    let entries = fs::read_dir(home_dir)
-        .with_context(|| format!("reading daemon socket dir {}", home_dir.display()))?;
+    let entries = match fs::read_dir(home_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading daemon socket dir {}", home_dir.display()));
+        }
+    };
     let mut shutdown_paths = Vec::new();
     for entry in entries {
         let entry = entry?;
@@ -2868,11 +2984,7 @@ fn cleanup_legacy_linux_daemon_processes(
     endpoint: &ServerEndpoint,
     current_exe: &Path,
 ) -> Result<()> {
-    let current_home = match endpoint {
-        #[cfg(unix)]
-        ServerEndpoint::UnixSocket(path) => path.parent().map(Path::to_path_buf),
-        ServerEndpoint::Tcp { .. } => None,
-    };
+    let current_home = daemon_logical_home_for_endpoint(endpoint);
     let reap_after_ms = daemon_orphan_reap_after_ms();
     let current_socket_inode = match endpoint {
         #[cfg(unix)]
@@ -3198,7 +3310,8 @@ mod tests {
     use super::write_persisted_state;
     #[cfg(unix)]
     use super::{
-        daemon_binary_is_legacy, parse_versioned_server_socket_name,
+        cleanup_legacy_unix_daemons, daemon_binary_is_legacy, default_endpoint,
+        parse_versioned_server_socket_name, unix_socket_path_fits_platform,
         versioned_server_socket_alias_candidates, versioned_socket_alias_is_legacy,
     };
     use crate::{
@@ -3215,6 +3328,69 @@ mod tests {
             parse_versioned_server_socket_name(Path::new("/tmp/server.sock")),
             None
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_endpoint_keeps_short_home_socket_in_home() {
+        let home = Path::new("/tmp/yggterm-short-home");
+        let endpoint = default_endpoint(home);
+        let super::ServerEndpoint::UnixSocket(path) = endpoint else {
+            panic!("unix builds should use a unix socket endpoint")
+        };
+        assert!(path.starts_with(home));
+        assert!(unix_socket_path_fits_platform(&path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_endpoint_uses_runtime_socket_for_long_home() {
+        let home = std::env::temp_dir()
+            .join("yggterm-long-home")
+            .join("nested")
+            .join("path")
+            .join("that")
+            .join("would")
+            .join("overflow")
+            .join("linux")
+            .join("sun-path")
+            .join("when")
+            .join("the")
+            .join("versioned")
+            .join("server")
+            .join("socket")
+            .join("is")
+            .join("inside")
+            .join("the")
+            .join("home");
+        let endpoint = default_endpoint(&home);
+        let super::ServerEndpoint::UnixSocket(path) = endpoint else {
+            panic!("unix builds should use a unix socket endpoint")
+        };
+        assert!(!path.starts_with(&home));
+        assert!(unix_socket_path_fits_platform(&path));
+        assert_eq!(
+            parse_versioned_server_socket_name(&path),
+            parse_versioned_server_socket_name(Path::new(&format!(
+                "/tmp/server-{}.sock",
+                super::SERVER_PROTOCOL_VERSION.replace('.', "-")
+            )))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_legacy_unix_daemons_ignores_missing_socket_dir() {
+        let endpoint = super::ServerEndpoint::UnixSocket(
+            std::env::temp_dir()
+                .join(format!(
+                    "yggterm-missing-socket-dir-{}-{}",
+                    std::process::id(),
+                    super::current_millis()
+                ))
+                .join("server-2-1-35.sock"),
+        );
+        cleanup_legacy_unix_daemons(&endpoint).expect("missing socket dir should be harmless");
     }
 
     #[cfg(unix)]
@@ -3332,12 +3508,30 @@ mod tests {
     }
 
     #[test]
-    fn startup_prewarm_skips_runtime_owned_live_sessions() {
-        assert!(!super::startup_prewarm_should_run(
-            "live::fc99adfa-d0b1-4e50-a27d-cbb3a1602b4b"
-        ));
-        assert!(super::startup_prewarm_should_run("local://shell"));
-        assert!(super::startup_prewarm_should_run("codex://session"));
+    fn startup_prewarm_is_disabled_by_default_and_still_filters_runtime_owned_paths() {
+        assert_eq!(
+            super::startup_prewarm_skip_reason_with_flag("local://shell", false),
+            Some("disabled_default")
+        );
+        assert_eq!(
+            super::startup_prewarm_skip_reason_with_flag("codex://session", false),
+            Some("disabled_default")
+        );
+        assert_eq!(
+            super::startup_prewarm_skip_reason_with_flag(
+                "live::fc99adfa-d0b1-4e50-a27d-cbb3a1602b4b",
+                true,
+            ),
+            Some("runtime_owned_live_session")
+        );
+        assert_eq!(
+            super::startup_prewarm_skip_reason_with_flag("local://shell", true),
+            None
+        );
+        assert_eq!(
+            super::startup_prewarm_skip_reason_with_flag("codex://session", true),
+            None
+        );
     }
 
     #[test]
