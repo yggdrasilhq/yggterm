@@ -621,6 +621,56 @@ def remote_notify(host: str, env: dict[str, str], title: str, body: str) -> None
     )
 
 
+def remote_seed_stored_codex_fixture(host: str, codex_home: str) -> dict[str, str]:
+    session_dir = f"{codex_home.rstrip('/')}/sessions/2026/04/26"
+    session_file = f"{session_dir}/rollout-yggterm-smoke-stored-codex.jsonl"
+    first_line = json.dumps(
+        {
+            "id": "yggterm-smoke-stored-codex",
+            "cwd": "/",
+            "type": "session_meta",
+        },
+        separators=(",", ":"),
+    )
+    ssh_shell(
+        host,
+        f"mkdir -p {quote(session_dir)} && printf '%s\\n' {quote(first_line)} > {quote(session_file)}",
+    )
+    return {
+        "codex_home": codex_home,
+        "session_file": session_file,
+    }
+
+
+def summarize_state_for_metadata(state: dict) -> dict:
+    browser = state.get("browser") or {}
+    viewport = state.get("viewport") or {}
+    shell = state.get("shell") or {}
+    return {
+        "active_session_path": state.get("active_session_path"),
+        "active_view_mode": state.get("active_view_mode"),
+        "selected_path": browser.get("selected_path"),
+        "viewport_reason": viewport.get("reason"),
+        "terminal_open_attempt": viewport.get("terminal_open_attempt"),
+        "active_surface_requests": state.get("active_surface_requests") or [],
+        "last_action": shell.get("last_action"),
+    }
+
+
+def state_has_auto_opened_session(state: dict, session_path: str) -> bool:
+    if state.get("active_session_path") == session_path:
+        return True
+    viewport = state.get("viewport") or {}
+    attempt = viewport.get("terminal_open_attempt") or {}
+    if attempt.get("session_path") == session_path:
+        return True
+    for request in state.get("active_surface_requests") or []:
+        target = request.get("target") or {}
+        if target.get("session_path") == session_path:
+            return True
+    return False
+
+
 def remote_background_window(
     host: str,
     remote_bin: str,
@@ -1182,6 +1232,13 @@ def main() -> int:
             "YGGTERM_REMOTE_SMOKE_TAG": "1",
             "NO_AT_BRIDGE": "1",
         }
+        if "stored_codex_session_open" in args.only_check:
+            remote_codex_home = f"{remote_dir}/.codex"
+            launch_env["YGGTERM_CODEX_HOME"] = remote_codex_home
+            metadata["stored_codex_fixture"] = remote_seed_stored_codex_fixture(
+                args.host,
+                remote_codex_home,
+            )
         picked_session_id = str(picked.get("session_id") or picked.get("Name") or "").strip()
         if picked_session_id:
             launch_env["XDG_SESSION_ID"] = picked_session_id
@@ -1372,6 +1429,24 @@ def main() -> int:
                 f"bad daemon/socket notifications were already visible right after launch: {initial_bad_notifications!r}"
             )
         write_json(out_dir / "initial-state.json", initial_state)
+        stored_fixture = metadata.get("stored_codex_fixture")
+        if isinstance(stored_fixture, dict):
+            stored_session_file = str(stored_fixture.get("session_file") or "").strip()
+            time.sleep(1.0)
+            idle_state = wait_for_remote_state(
+                args.host,
+                remote_bin,
+                launch_env,
+                pid,
+                args.timeout_ms,
+                timeout_seconds=20.0,
+                require_visible=False,
+            )
+            metadata["stored_codex_fixture_idle_state"] = summarize_state_for_metadata(idle_state)
+            if stored_session_file and state_has_auto_opened_session(idle_state, stored_session_file):
+                raise RuntimeError(
+                    "stored Codex fixture auto-opened on cold start before explicit user/app-control open"
+                )
         smoke_session = args.session
         if args.session_kind == "plain" and smoke_session == "local://remote-smoke":
             smoke_session = remote_create_plain_terminal(

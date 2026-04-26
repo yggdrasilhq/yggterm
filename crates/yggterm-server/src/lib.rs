@@ -9692,85 +9692,84 @@ fn app_control_open_path_ready(
                     .unwrap_or(true)
         });
     if !ready {
-        if !matches!(view_mode, Some(AppControlViewMode::Terminal)) || !terminal_open_attempt_ready
-        {
+        if matches!(view_mode, Some(AppControlViewMode::Preview)) || !terminal_open_attempt_ready {
             return false;
         }
     }
+    let terminal_ready = || -> bool {
+        if active_view_mode != "Terminal" {
+            return false;
+        }
+        if viewport
+            .get("active_terminal_surface")
+            .and_then(|value| value.get("problem"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some_and(app_control_terminal_surface_problem_is_fatal)
+        {
+            return false;
+        }
+        let first_host = viewport
+            .get("active_terminal_hosts")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .or_else(|| {
+                viewport
+                    .get("terminal_hosts")
+                    .and_then(Value::as_array)
+                    .and_then(|items| items.first())
+            });
+        let Some(first_host) = first_host else {
+            return false;
+        };
+        if !ready && !terminal_open_attempt_ready {
+            let interactive = viewport.get("interactive").and_then(Value::as_bool) == Some(true);
+            let settled_interactive = viewport
+                .get("terminal_settled_kind")
+                .and_then(Value::as_str)
+                == Some("interactive");
+            if !interactive || !settled_interactive {
+                return false;
+            }
+        }
+        let cols = first_host.get("cols").and_then(Value::as_u64).unwrap_or(0);
+        let rows = first_host.get("rows").and_then(Value::as_u64).unwrap_or(0);
+        (cols >= 20 && rows >= 4) || app_control_terminal_host_visibly_painted(first_host)
+    };
+    let preview_ready = || -> bool {
+        if active_view_mode != "Rendered" {
+            return false;
+        }
+        let preview = viewport
+            .get("preview")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let visible_block_count = preview
+            .get("visible_block_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let rendered_sections = preview
+            .get("rendered_sections")
+            .and_then(Value::as_array)
+            .map(|items| !items.is_empty())
+            .unwrap_or(false);
+        let text_sample = preview
+            .get("text_sample")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        let placeholder = preview
+            .get("placeholder")
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| preview_text_looks_like_loading_placeholder(text_sample));
+        visible_block_count > 0 || rendered_sections || (!text_sample.is_empty() && !placeholder)
+    };
     match view_mode {
-        Some(AppControlViewMode::Terminal) => {
-            if active_view_mode != "Terminal" {
-                return false;
-            }
-            if viewport
-                .get("active_terminal_surface")
-                .and_then(|value| value.get("problem"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .is_some_and(app_control_terminal_surface_problem_is_fatal)
-            {
-                return false;
-            }
-            let first_host = viewport
-                .get("active_terminal_hosts")
-                .and_then(Value::as_array)
-                .and_then(|items| items.first())
-                .or_else(|| {
-                    viewport
-                        .get("terminal_hosts")
-                        .and_then(Value::as_array)
-                        .and_then(|items| items.first())
-                });
-            let Some(first_host) = first_host else {
-                return false;
-            };
-            if !ready && !terminal_open_attempt_ready {
-                let interactive =
-                    viewport.get("interactive").and_then(Value::as_bool) == Some(true);
-                let settled_interactive = viewport
-                    .get("terminal_settled_kind")
-                    .and_then(Value::as_str)
-                    == Some("interactive");
-                if !interactive || !settled_interactive {
-                    return false;
-                }
-            }
-            let cols = first_host.get("cols").and_then(Value::as_u64).unwrap_or(0);
-            let rows = first_host.get("rows").and_then(Value::as_u64).unwrap_or(0);
-            (cols >= 20 && rows >= 4) || app_control_terminal_host_visibly_painted(first_host)
-        }
-        Some(AppControlViewMode::Preview) | None => {
-            if active_view_mode != "Rendered" {
-                return false;
-            }
-            let preview = viewport
-                .get("preview")
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default();
-            let visible_block_count = preview
-                .get("visible_block_count")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let rendered_sections = preview
-                .get("rendered_sections")
-                .and_then(Value::as_array)
-                .map(|items| !items.is_empty())
-                .unwrap_or(false);
-            let text_sample = preview
-                .get("text_sample")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .unwrap_or("");
-            let placeholder = preview
-                .get("placeholder")
-                .and_then(Value::as_bool)
-                .unwrap_or_else(|| preview_text_looks_like_loading_placeholder(text_sample));
-            visible_block_count > 0
-                || rendered_sections
-                || (!text_sample.is_empty() && !placeholder)
-        }
+        Some(AppControlViewMode::Terminal) => terminal_ready(),
+        Some(AppControlViewMode::Preview) => preview_ready(),
+        None => terminal_ready() || preview_ready(),
     }
 }
 
@@ -9799,7 +9798,8 @@ fn app_control_open_path_request_in_flight(
     };
     let expected_surface = match view_mode {
         Some(AppControlViewMode::Terminal) => Some("Terminal"),
-        Some(AppControlViewMode::Preview) | None => Some("Preview"),
+        Some(AppControlViewMode::Preview) => Some("Preview"),
+        None => None,
     };
     requests.iter().any(|request| {
         let surface_matches = expected_surface
@@ -9856,7 +9856,7 @@ fn app_control_open_path_failure(
         return None;
     }
     match view_mode {
-        Some(AppControlViewMode::Terminal) => {
+        Some(AppControlViewMode::Terminal) | None => {
             if viewport.get("active_view_mode").and_then(Value::as_str) != Some("Terminal") {
                 return None;
             }
@@ -13667,6 +13667,40 @@ mod tests {
     }
 
     #[test]
+    fn app_control_open_path_ready_accepts_default_open_terminal_mode() {
+        let state = json!({
+            "browser": {
+                "selected_path": "/home/pi/.codex/sessions/2026/04/24/example.jsonl"
+            },
+            "active_surface_requests": [],
+            "viewport": {
+                "active_session_path": "/home/pi/.codex/sessions/2026/04/24/example.jsonl",
+                "active_view_mode": "Terminal",
+                "ready": true,
+                "interactive": true,
+                "terminal_settled_kind": "interactive",
+                "active_terminal_surface": {
+                    "problem": null
+                },
+                "terminal_hosts": [{
+                    "cols": 106,
+                    "rows": 50,
+                    "xterm_present": true,
+                    "screen_present": true,
+                    "viewport_present": true,
+                    "resume_overlay_visible": false,
+                    "text_sample": "› Explain this codebase"
+                }]
+            }
+        });
+        assert!(app_control_open_path_ready(
+            &state,
+            "/home/pi/.codex/sessions/2026/04/24/example.jsonl",
+            None,
+        ));
+    }
+
+    #[test]
     fn app_control_open_path_ready_accepts_ready_visible_terminal_without_terminal_focus() {
         let state = json!({
             "browser": {
@@ -13844,6 +13878,45 @@ mod tests {
             &state,
             "local://test",
             Some(&super::AppControlViewMode::Terminal),
+        ));
+    }
+
+    #[test]
+    fn app_control_open_path_ready_rejects_default_open_when_terminal_request_is_in_flight() {
+        let state = json!({
+            "browser": {
+                "selected_path": "/home/pi/.codex/sessions/example.jsonl"
+            },
+            "active_surface_requests": [{
+                "surface": "Terminal",
+                "target": {
+                    "session_path": "/home/pi/.codex/sessions/example.jsonl"
+                }
+            }],
+            "viewport": {
+                "active_session_path": "/home/pi/.codex/sessions/example.jsonl",
+                "active_view_mode": "Terminal",
+                "ready": true,
+                "interactive": true,
+                "terminal_settled_kind": "interactive",
+                "active_terminal_surface": {
+                    "problem": null
+                },
+                "terminal_hosts": [{
+                    "cols": 106,
+                    "rows": 50,
+                    "xterm_present": true,
+                    "screen_present": true,
+                    "viewport_present": true,
+                    "resume_overlay_visible": false,
+                    "text_sample": "› Explain this codebase"
+                }]
+            }
+        });
+        assert!(!app_control_open_path_ready(
+            &state,
+            "/home/pi/.codex/sessions/example.jsonl",
+            None,
         ));
     }
 
