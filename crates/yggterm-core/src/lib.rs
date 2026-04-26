@@ -59,6 +59,7 @@ pub use workspace::{
 };
 
 pub const ENV_YGGTERM_HOME: &str = "YGGTERM_HOME";
+pub const ENV_YGGTERM_CODEX_HOME: &str = "YGGTERM_CODEX_HOME";
 pub const DEFAULT_HOME_DIRNAME: &str = ".yggterm";
 pub const DEFAULT_CODEX_HOME_DIRNAME: &str = ".codex";
 pub const SESSIONS_DIRNAME: &str = "sessions";
@@ -693,11 +694,18 @@ pub fn resolve_yggterm_home() -> Result<PathBuf> {
     Ok(home_dir.join(DEFAULT_HOME_DIRNAME))
 }
 
-pub fn resolve_codex_sessions_root() -> Result<PathBuf> {
+pub fn resolve_codex_home() -> Result<PathBuf> {
+    if let Some(value) = std::env::var_os(ENV_YGGTERM_CODEX_HOME) {
+        let p = PathBuf::from(value);
+        return Ok(expand_tilde(p));
+    }
+
     let home_dir = dirs::home_dir().context("unable to resolve home directory")?;
-    Ok(home_dir
-        .join(DEFAULT_CODEX_HOME_DIRNAME)
-        .join(SESSIONS_DIRNAME))
+    Ok(home_dir.join(DEFAULT_CODEX_HOME_DIRNAME))
+}
+
+pub fn resolve_codex_sessions_root() -> Result<PathBuf> {
+    Ok(resolve_codex_home()?.join(SESSIONS_DIRNAME))
 }
 
 fn expand_tilde(path: PathBuf) -> PathBuf {
