@@ -1,3 +1,12 @@
+yggterm (2.1.37-1) unstable; urgency=medium
+
+  * Stop cold-start sidebar selection from auto-opening the first stored Codex transcript.
+  * Open stored Codex transcript rows through the terminal path by default when they support a PTY.
+  * Expose sidebar row cursor styles in app-control and use a pointer cursor for idle rows.
+  * Add Linux/KDE smoke coverage for stored Codex open, no hidden copy generation, no startup auto-open, and Plasma PID stability.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sun, 26 Apr 2026 13:46:58 +0530
+
 yggterm (2.1.36-1) unstable; urgency=medium
 
   * Restore rounded KDE/X11 shell corners while keeping the Linux opaque window profile.
