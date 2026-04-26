@@ -9,8 +9,8 @@ license = "Apache-2.0"
 anyhow.workspace = true
 arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 base64 = "0.22"
-dioxus = { version = "0.7.3", features = ["desktop"] }
-dioxus-desktop = "0.7.3"
+dioxus = { version = "=0.7.3", features = ["desktop"] }
+dioxus-desktop = "=0.7.3"
 include_dir = "0.7"
 keyboard-types = "0.7"
 libc = "0.2"

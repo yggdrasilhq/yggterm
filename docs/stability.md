@@ -15,6 +15,8 @@ The fix is not a larger feature. The fix is to make invalid state impossible or 
 - Passive title/precis/summary generation is disabled by default. Selection may hydrate already-cached copy, but it must not start LLM work. The app-control `generation.copy_generation_start_count` counter is the proof surface for this contract.
 - Title, precis, and summary are display copy only. They are never identity and never decide which runtime receives input.
 - Live Sessions are daemon-owned runtimes. Closing one kills that runtime and removes it from the Live Sessions group. It must not imply stored transcript deletion unless the user requested a hard delete.
+- Fresh live terminals are runtime-only by default. They are restored across app/daemon restart only after the user explicitly marks them `Keep Alive`; clearing keep-alive must remove them from persisted live-session state without killing the currently running terminal.
+- Daemon cleanup is home-scoped. An app may reap same-home duplicate, legacy, or orphan daemons, but it must not signal a daemon from another `YGGTERM_HOME`, and it must not reap a legacy daemon that still has registered GUI clients.
 - Stored sessions and remote scanned sessions open as preview unless an explicit terminal launch/resume action promotes them to a live runtime.
 - Remote scanned sessions may appear in Terminal mode only when the remote scan says the runtime is live and the active session source is `LiveSsh`.
 - A retained terminal host may stay mounted only if its session identity still matches a live session or a deliberate recovery state.
@@ -40,11 +42,12 @@ Titlebar search has the same proof requirement. When `shell.search_query` is non
 
 ## Stability Gates
 
-1. Model gate: server and shell unit tests cover the invariants above, live-close semantics, and the no-implicit-copy-generation policy.
-2. Local terminal gate: second-X11 typing smoke proves local shell input reaches an interactive terminal quickly without retry/disconnect toasts.
-3. Remote session gate: switching between stored preview, live remote terminal, and retained live terminal keeps row, active path, and terminal text aligned.
-4. Cross-platform gate: Windows and macOS smoke runs prove install, launch, local terminal creation, close, and update paths still work.
-5. Release gate: every field-test release includes the `.deb`, checksums, curated release notes, and proof paths for Linux/KDE, Windows, and macOS.
+1. Model gate: server and shell unit tests cover the invariants above, live-close semantics, explicit keep-alive persistence, and the no-implicit-copy-generation policy.
+2. Local terminal gate: second-X11 typing smoke proves local shell input reaches an interactive terminal quickly without retry/disconnect toasts, and blank Enter does not leave a stale live-row spinner behind.
+3. KDE lifecycle gate: update/restart and app-owned smoke launch keep `plasmashell` stable, leave no stale temp-home automation clients behind, and show `linux_daemon_sweep` skipping cross-home daemons.
+4. Remote session gate: switching between stored preview, live remote terminal, and retained live terminal keeps row, active path, and terminal text aligned.
+5. Cross-platform gate: Windows and macOS smoke runs prove install, launch, local terminal creation, close, and update paths still work.
+6. Release gate: every field-test release includes the `.deb`, checksums, curated release notes, and proof paths for Linux/KDE, Windows, and macOS.
 
 ## Pass Plan
 

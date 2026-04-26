@@ -36,11 +36,11 @@ use yggterm_server::{
     run_app_control_set_fullscreen, run_app_control_set_main_zoom, run_app_control_set_maximized,
     run_app_control_set_preview_layout, run_app_control_set_right_panel_mode,
     run_app_control_set_row_expanded, run_app_control_set_search,
-    run_app_control_set_theme_editor_open, run_app_control_set_ui_theme,
-    run_app_control_set_window_chrome_hover, run_app_control_trigger_update_check, run_attach,
-    run_daemon, run_screenrecord_capture, run_screenshot_capture, run_trace_bundle,
-    run_trace_follow, run_trace_tail, shutdown, snapshot, start_local_session, status,
-    try_run_remote_server_command,
+    run_app_control_set_session_keep_alive, run_app_control_set_theme_editor_open,
+    run_app_control_set_ui_theme, run_app_control_set_window_chrome_hover,
+    run_app_control_trigger_update_check, run_attach, run_daemon, run_screenrecord_capture,
+    run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, snapshot,
+    start_local_session, status, try_run_remote_server_command,
 };
 use yggterm_shell::{ShellBootstrap, launch_shell, start_daemon_watchdog, warm_daemon_start};
 use yggui_contract::UiTheme;
@@ -1096,6 +1096,20 @@ fn main() -> Result<()> {
                             .next()
                             .context("missing session path for server app terminal paste-image")?;
                         run_app_control_paste_terminal_clipboard_image(session_path, timeout_ms)
+                    }
+                    "keep" | "keep-alive" => {
+                        let session_path = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
+                            .context("missing session path for server app terminal keep")?;
+                        run_app_control_set_session_keep_alive(session_path, true, timeout_ms)
+                    }
+                    "unkeep" | "stop-keep-alive" => {
+                        let session_path = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
+                            .context("missing session path for server app terminal unkeep")?;
+                        run_app_control_set_session_keep_alive(session_path, false, timeout_ms)
                     }
                     "probe-type" => {
                         let session_path = cli_positional_args(&args, 4)
