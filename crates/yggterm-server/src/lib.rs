@@ -8098,14 +8098,35 @@ fn handle_mismatched_local_daemon(
 fn daemon_trace_home_for_endpoint(endpoint: &ServerEndpoint) -> Option<PathBuf> {
     match endpoint {
         #[cfg(unix)]
+        ServerEndpoint::UnixSocket(path) if unix_socket_path_uses_runtime_fallback(path) => {
+            resolve_yggterm_home()
+                .ok()
+                .or_else(|| path.parent().map(Path::to_path_buf))
+        }
+        #[cfg(unix)]
         ServerEndpoint::UnixSocket(path) => path.parent().map(Path::to_path_buf),
         ServerEndpoint::Tcp { .. } => resolve_yggterm_home().ok(),
     }
 }
 
 #[cfg(unix)]
+fn unix_socket_path_uses_runtime_fallback(path: &Path) -> bool {
+    path.parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        == Some("yggterm")
+}
+
+#[cfg(unix)]
 fn daemon_home_for_endpoint(endpoint: &ServerEndpoint) -> Option<PathBuf> {
     match endpoint {
+        #[cfg(unix)]
+        ServerEndpoint::UnixSocket(path) if unix_socket_path_uses_runtime_fallback(path) => {
+            resolve_yggterm_home()
+                .ok()
+                .or_else(|| path.parent().map(Path::to_path_buf))
+        }
         #[cfg(unix)]
         ServerEndpoint::UnixSocket(path) => path.parent().map(Path::to_path_buf),
         ServerEndpoint::Tcp { .. } => None,

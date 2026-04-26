@@ -150,6 +150,7 @@ static APP_ROOT_WINDOW_FOCUS_REQUESTED: AtomicBool = AtomicBool::new(false);
 static APP_ROOT_RENDER_COUNT: AtomicU64 = AtomicU64::new(0);
 static NEXT_TERMINAL_BOOTSTRAP_OWNER_ID: AtomicU64 = AtomicU64::new(1);
 static ALLOCATOR_TRIM_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static LAST_ALLOCATOR_TRIM_CHECK_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_ALLOCATOR_TRIM_MS: AtomicU64 = AtomicU64::new(0);
 static RENDER_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
 static APP_INSTANCE_ID_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -174,6 +175,7 @@ const SNAPSHOT_PREVIEW_BLOCK_LIMIT: usize = 2;
 const SNAPSHOT_PREVIEW_BLOCK_LINE_LIMIT: usize = 6;
 const DEFERRED_STARTUP_SYNC_MS: u64 = 8_000;
 const ALLOCATOR_TRIM_MIN_INTERVAL_MS: u64 = 10_000;
+const ALLOCATOR_TRIM_CHECK_MIN_INTERVAL_MS: u64 = 60_000;
 const ALLOCATOR_TRIM_STARTUP_DELAY_MS: u64 = 3_500;
 const ALLOCATOR_TRIM_STARTUP_RETRY_COUNT: usize = 18;
 const ALLOCATOR_TRIM_STARTUP_RETRY_INTERVAL_MS: u64 = 5_000;
@@ -184,6 +186,7 @@ const XTERM_CSS: &str = include_str!("../../../assets/xterm/xterm.css");
 const XTERM_JS: &str = include_str!("../../../assets/xterm/xterm.js");
 const XTERM_FIT_JS: &str = include_str!("../../../assets/xterm/addon-fit.js");
 const XTERM_CANVAS_JS: &str = include_str!("../../../assets/xterm/addon-canvas.js");
+const XTERM_CANVAS_RENDERER_ENV: &str = "YGGTERM_ENABLE_XTERM_CANVAS";
 const PREVIEW_BLOCK_WINDOW: usize = 24;
 const PREVIEW_SAFE_FULL_RENDER_BLOCK_LIMIT: usize = 600;
 const PREVIEW_VIRTUAL_OVERSCAN_FACTOR: f64 = 0.85;
@@ -200,6 +203,14 @@ const REMOTE_TERMINAL_ATTACH_CONFIRMATION_MIN_MS: u64 = 1_500;
 const REMOTE_TERMINAL_ATTACH_CONNECTED_GRACE_MS: u64 = 280;
 const STARTUP_TERMINAL_RESTORE_RECOVERY_MS: u64 = 5_000;
 const RECENT_DAEMON_START_GRACE_MS: u64 = 3_000;
+const TERMINAL_REMOTE_RESUME_READ_POLL_MS: u64 = 45;
+const TERMINAL_LOCAL_INITIAL_READ_POLL_MS: u64 = 120;
+const TERMINAL_ACTIVE_OUTPUT_READ_POLL_MS: u64 = 60;
+const TERMINAL_REMOTE_IDLE_READ_POLL_MAX_MS: u64 = 220;
+const TERMINAL_LOCAL_IDLE_READ_POLL_MAX_MS: u64 = 3_000;
+const TERMINAL_IDLE_READ_BACKOFF_STEP_MS: u64 = 100;
+const TERMINAL_INPUT_ECHO_READ_POLL_MS: u64 = 45;
+const TERMINAL_INPUT_ECHO_READ_DELAY_MS: u64 = 12;
 static XTERM_ASSETS_BOOTSTRAPPED: OnceCell<()> = OnceCell::new();
 const TREE_LOADING_DOT_CSS: &str = "@keyframes yggterm-tree-loading-dot { 0%, 80%, 100% { opacity: 0.28; transform: translateY(0px); } 40% { opacity: 1; transform: translateY(-1px); } }";
 const TREE_SPINNER_CSS: &str = "@keyframes yggterm-tree-spinner { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }";
@@ -212,10 +223,10 @@ const PASSIVE_COPY_GENERATION_ENV: &str = "YGGTERM_ENABLE_PASSIVE_COPY_GENERATIO
 const BACKGROUND_REFRESH_NOTICE_MS: u64 = 12_000;
 const BACKGROUND_REFRESH_STARTUP_DEFER_MS: u64 = 20_000;
 const BACKGROUND_REFRESH_INTERACTIVE_DEFER_MS: u64 = 15_000;
-const BACKGROUND_REFRESH_POLL_MS: u64 = 1_000;
+const BACKGROUND_REFRESH_POLL_MS: u64 = 15_000;
 const LIVE_SESSION_SNAPSHOT_TRIGGER_DEBOUNCE_MS: u64 = 360;
-const LIVE_SESSION_SNAPSHOT_BUSY_POLL_MS: u64 = 700;
-const LIVE_SESSION_SNAPSHOT_IDLE_POLL_MS: u64 = 1_500;
+const LIVE_SESSION_SNAPSHOT_BUSY_POLL_MS: u64 = 2_500;
+const LIVE_SESSION_SNAPSHOT_IDLE_POLL_MS: u64 = 60_000;
 const LIVE_SESSION_SNAPSHOT_NUDGE_INTERVAL_MS: u64 = 250;
 const LIVE_SESSION_SNAPSHOT_NUDGE_POLLS: usize = 24;
 // Inline tree rename focuses asynchronously after context-menu and sidebar
@@ -251,8 +262,12 @@ const PREVIEW_ZOOM_BASE: f32 = 10.0;
 const TERMINAL_ZOOM_BASE: f32 = 14.0;
 const PREVIEW_HEADER_SEARCH_HIT_ID: &str = "__preview_header__";
 const DEBUG_REQUEST_DELAY_ENV: &str = "YGGTERM_DEBUG_REQUEST_DELAY_MS";
-const SCREENSHOT_REQUEST_POLL_MS: u64 = 250;
+const APP_CONTROL_ACTIVE_POLL_MS: u64 = 100;
+const APP_CONTROL_IDLE_POLL_MS: u64 = 1_000;
 const APP_CONTROL_DRAIN_STUCK_MS: u64 = 2_500;
+const BACKGROUND_REFRESH_WAIT_POLL_MS: u64 = 1_000;
+const DOCK_PULSE_ACTIVE_MS: u64 = 350;
+const DOCK_PULSE_IDLE_MS: u64 = 5_000;
 const SELF_UPDATE_JOB_KEY: &str = "self-update";
 const UPDATE_RESTART_STALE_AFTER_MS: u64 = 2 * 24 * 60 * 60 * 1000;
 const TITLEBAR_AUTOHIDE_SENSOR_HEIGHT_PX: f64 = 6.0;
@@ -7442,6 +7457,16 @@ fn allocator_trim_can_run(shell: &ShellState) -> bool {
 #[cfg(target_os = "linux")]
 fn maybe_spawn_process_allocator_trim(perf_home: PathBuf, reason: &'static str) -> bool {
     let now_ms = current_millis();
+    let last_check_ms = LAST_ALLOCATOR_TRIM_CHECK_MS.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(last_check_ms) < ALLOCATOR_TRIM_CHECK_MIN_INTERVAL_MS {
+        return false;
+    }
+    if LAST_ALLOCATOR_TRIM_CHECK_MS
+        .compare_exchange(last_check_ms, now_ms, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return false;
+    }
     if now_ms.saturating_sub(LAST_ALLOCATOR_TRIM_MS.load(Ordering::Relaxed))
         < ALLOCATOR_TRIM_MIN_INTERVAL_MS
     {
@@ -22717,11 +22742,16 @@ fn app() -> Element {
                     }),
                 );
                 loop {
-                    if app_control_requests_pending(&trace_home) {
+                    let pending = app_control_requests_pending(&trace_home);
+                    if pending {
                         wake_app_control();
                         schedule_ui_update();
                     }
-                    thread::sleep(Duration::from_millis(SCREENSHOT_REQUEST_POLL_MS));
+                    thread::sleep(Duration::from_millis(if pending {
+                        APP_CONTROL_ACTIVE_POLL_MS
+                    } else {
+                        APP_CONTROL_IDLE_POLL_MS
+                    }));
                 }
             });
         }
@@ -22778,7 +22808,7 @@ fn app() -> Element {
                         }
                     }
                     if !window_spawn_traced.load(Ordering::SeqCst) {
-                        sleep(Duration::from_millis(SCREENSHOT_REQUEST_POLL_MS)).await;
+                        sleep(Duration::from_millis(APP_CONTROL_IDLE_POLL_MS)).await;
                         continue;
                     }
                     if !app_control_drain_in_flight.load(Ordering::SeqCst) && pending_requests {
@@ -22837,7 +22867,12 @@ fn app() -> Element {
                             schedule_ui_update();
                         }
                     }
-                    sleep(Duration::from_millis(SCREENSHOT_REQUEST_POLL_MS as u64)).await;
+                    sleep(Duration::from_millis(if pending_requests {
+                        APP_CONTROL_ACTIVE_POLL_MS
+                    } else {
+                        APP_CONTROL_IDLE_POLL_MS
+                    }))
+                    .await;
                 }
             });
         }
@@ -23243,7 +23278,10 @@ fn app() -> Element {
                     })
                     .unwrap_or_default();
                 if defer_ms > 0 {
-                    sleep(Duration::from_millis(defer_ms.min(250))).await;
+                    sleep(Duration::from_millis(
+                        defer_ms.min(BACKGROUND_REFRESH_WAIT_POLL_MS),
+                    ))
+                    .await;
                     continue;
                 }
                 if safe_shell_read(state, "background_refresh_scheduler_gate", |shell| {
@@ -23253,7 +23291,7 @@ fn app() -> Element {
                 })
                 .unwrap_or(false)
                 {
-                    sleep(Duration::from_millis(250)).await;
+                    sleep(Duration::from_millis(BACKGROUND_REFRESH_WAIT_POLL_MS)).await;
                     continue;
                 }
                 maybe_spawn_missing_remote_machine_refreshes(state);
@@ -23525,7 +23563,14 @@ fn app() -> Element {
                 if should_pulse {
                     window_epoch.with_mut(|epoch| *epoch += 1);
                 }
-                let _ = task::spawn_blocking(|| thread::sleep(Duration::from_millis(350))).await;
+                let sleep_ms = if should_pulse {
+                    DOCK_PULSE_ACTIVE_MS
+                } else {
+                    DOCK_PULSE_IDLE_MS
+                };
+                let _ =
+                    task::spawn_blocking(move || thread::sleep(Duration::from_millis(sleep_ms)))
+                        .await;
             }
         });
     });
@@ -23689,6 +23734,9 @@ fn app() -> Element {
     } else {
         UNMAXIMIZED_SHELL_RADIUS_PX
     };
+    let effective_shell_radius =
+        shell_effective_radius(shell_radius, maximized, linux_transparent_window);
+    let shell_root_background = shell_root_background(snapshot.palette, linux_transparent_window);
     let linux_native_decorations = linux_force_native_decorations();
     let shape_desktop = desktop.clone();
     use_effect(move || {
@@ -23699,10 +23747,14 @@ fn app() -> Element {
         apply_linux_transparent_window_surface_style(
             &shape_desktop,
             linux_transparent_window,
-            shell_radius,
+            effective_shell_radius,
         );
-        apply_linux_window_corner_shape(&shape_desktop, shell_radius, maximized);
-        apply_linux_window_shape_reapply_sequence(&shape_desktop, shell_radius, maximized);
+        apply_linux_window_corner_shape(&shape_desktop, effective_shell_radius, maximized);
+        apply_linux_window_shape_reapply_sequence(
+            &shape_desktop,
+            effective_shell_radius,
+            maximized,
+        );
     });
     let shell_document_css =
         "html, body, #main { margin:0; width:100%; height:100%; background:transparent !important; overflow:hidden; } \
@@ -23717,11 +23769,12 @@ fn app() -> Element {
             id: "yggterm-shell-root",
             tabindex: "0",
             style: format!(
-                "position:relative; width:100vw; height:100vh; overflow:hidden; background:transparent; box-shadow:none; box-sizing:border-box; \
+                "position:relative; width:100vw; height:100vh; overflow:hidden; background:{}; box-shadow:none; box-sizing:border-box; \
                  border-radius:{}px; clip-path:inset(0 round {}px); -webkit-clip-path:inset(0 round {}px);",
-                shell_radius,
-                shell_radius,
-                shell_radius,
+                shell_root_background,
+                effective_shell_radius,
+                effective_shell_radius,
+                effective_shell_radius,
             ),
             onclick: move |_| {
                 let active_terminal_session = state.with_mut(|shell| {
@@ -23979,7 +24032,7 @@ fn app() -> Element {
                 "data-yggterm-shell": "1",
                 style: shell_style(
                     snapshot.palette,
-                    shell_radius,
+                    effective_shell_radius,
                     &snapshot.shell_tint,
                     &snapshot.shell_gradient,
                     maximized,
@@ -28335,19 +28388,17 @@ fn terminal_resume_context_fallback(
     Some((title, summary))
 }
 fn terminal_session_still_active(shell: &ShellState, session_path: &str, host_id: &str) -> bool {
-    shell.terminal_attach_in_flight.contains(session_path)
-        || (shell.terminal_session_is_retained_live(session_path)
-            && shell.terminal_session_host_id(session_path).as_deref() == Some(host_id))
-        || (shell.server.active_session_path() == Some(session_path)
-            && shell.active_terminal_host_id.as_deref() == Some(host_id))
+    shell.server.active_view_mode() == WorkspaceViewMode::Terminal
+        && shell.server.active_session_path() == Some(session_path)
+        && (shell.active_terminal_host_id.as_deref() == Some(host_id)
+            || shell.terminal_attach_in_flight.contains(session_path))
 }
 fn terminal_session_should_bootstrap_host(
-    shell: &ShellState,
+    _shell: &ShellState,
     active_session_path: Option<&str>,
     session_path: &str,
 ) -> bool {
     active_session_path == Some(session_path)
-        || shell.terminal_session_should_render_retained(session_path)
 }
 fn next_terminal_bootstrap_owner_id() -> u64 {
     NEXT_TERMINAL_BOOTSTRAP_OWNER_ID.fetch_add(1, Ordering::Relaxed)
@@ -30053,9 +30104,9 @@ fn TerminalCanvas(
             let mut terminal_paint_seen = !is_remote_resume_session;
             let mut cursor = 0u64;
             let mut read_poll_ms = if is_remote_resume_session {
-                45_u64
+                TERMINAL_REMOTE_RESUME_READ_POLL_MS
             } else {
-                120_u64
+                TERMINAL_LOCAL_INITIAL_READ_POLL_MS
             };
             let mut next_read_deadline =
                 tokio::time::Instant::now() + Duration::from_millis(read_poll_ms);
@@ -30452,7 +30503,7 @@ fn TerminalCanvas(
                                             );
                                         }
                                         cursor = 0;
-                                        read_poll_ms = 60;
+                                        read_poll_ms = TERMINAL_ACTIVE_OUTPUT_READ_POLL_MS;
                                     } else {
                                         safe_push_notification(
                                             state,
@@ -30461,30 +30512,35 @@ fn TerminalCanvas(
                                             write_error.to_string(),
                                         );
                                     }
-                                } else if data.contains(['\r', '\n']) {
-                                    let _ = safe_shell_mut(
-                                        state,
-                                        "terminal_input_schedule_live_snapshot_refresh_immediate",
-                                        |shell| {
-                                            let now_ms = current_millis();
-                                            shell.next_live_session_snapshot_after_ms = now_ms;
-                                            shell
-                                                .terminal_busy_hint_until_ms
-                                                .insert(session_path.clone(), now_ms.saturating_add(TERMINAL_BUSY_HINT_MS));
-                                        },
-                                    );
-                                    spawn_live_session_snapshot_nudge(state);
                                 } else {
-                                    let _ = safe_shell_mut(
-                                        state,
-                                        "terminal_input_schedule_live_snapshot_refresh",
-                                        |shell| {
-                                            schedule_live_session_snapshot_refresh(
-                                                shell,
-                                                LIVE_SESSION_SNAPSHOT_TRIGGER_DEBOUNCE_MS,
-                                            );
-                                        },
-                                    );
+                                    read_poll_ms = TERMINAL_INPUT_ECHO_READ_POLL_MS;
+                                    next_read_deadline = tokio::time::Instant::now()
+                                        + Duration::from_millis(TERMINAL_INPUT_ECHO_READ_DELAY_MS);
+                                    if data.contains(['\r', '\n']) {
+                                        let _ = safe_shell_mut(
+                                            state,
+                                            "terminal_input_schedule_live_snapshot_refresh_immediate",
+                                            |shell| {
+                                                let now_ms = current_millis();
+                                                shell.next_live_session_snapshot_after_ms = now_ms;
+                                                shell
+                                                    .terminal_busy_hint_until_ms
+                                                    .insert(session_path.clone(), now_ms.saturating_add(TERMINAL_BUSY_HINT_MS));
+                                            },
+                                        );
+                                        spawn_live_session_snapshot_nudge(state);
+                                    } else {
+                                        let _ = safe_shell_mut(
+                                            state,
+                                            "terminal_input_schedule_live_snapshot_refresh",
+                                            |shell| {
+                                                schedule_live_session_snapshot_refresh(
+                                                    shell,
+                                                    LIVE_SESSION_SNAPSHOT_TRIGGER_DEBOUNCE_MS,
+                                                );
+                                            },
+                                        );
+                                    }
                                 }
                             }
                             Ok(TerminalJsEvent::HostHealth {
@@ -31061,12 +31117,18 @@ fn TerminalCanvas(
                                 cursor = next_cursor;
                                 read_poll_ms = if chunks.is_empty() {
                                     if is_remote_resume_session && !traced_attach_ready {
-                                        45
+                                        TERMINAL_REMOTE_RESUME_READ_POLL_MS
                                     } else {
-                                        (read_poll_ms + 20).min(220)
+                                        let idle_poll_max_ms = if is_remote_resume_session {
+                                            TERMINAL_REMOTE_IDLE_READ_POLL_MAX_MS
+                                        } else {
+                                            TERMINAL_LOCAL_IDLE_READ_POLL_MAX_MS
+                                        };
+                                        (read_poll_ms + TERMINAL_IDLE_READ_BACKOFF_STEP_MS)
+                                            .min(idle_poll_max_ms)
                                     }
                                 } else {
-                                    60
+                                    TERMINAL_ACTIVE_OUTPUT_READ_POLL_MS
                                 };
                                 let (
                                     batched_output,
@@ -31490,8 +31552,9 @@ fn TerminalCanvas(
                                         || saw_visible_output
                                         || local_retained_surface_ready)
                                 };
+                                let first_attach_ready = attach_ready && !traced_attach_ready;
                                 if attach_ready {
-                                    if !traced_attach_ready {
+                                    if first_attach_ready {
                                         append_trace_event(
                                             &trace_home,
                                             "ui",
@@ -31523,7 +31586,7 @@ fn TerminalCanvas(
                                                 ),
                                         );
                                     }
-                                    if !is_remote_resume_session {
+                                    if !is_remote_resume_session && first_attach_ready {
                                         let (should_accept_input_now, should_focus_now) = safe_shell_read(
                                             state,
                                             "terminal_attach_local_ready_input_gate",
@@ -33015,30 +33078,46 @@ where
     F: FnOnce() -> Result<T> + Send + 'static,
 {
     let queued_at_ms = current_millis();
-    let (tx, rx) = oneshot::channel();
-    let worker_name = format!("yggterm-{label}-{queued_at_ms}");
-    thread::Builder::new()
-        .name(worker_name.clone())
-        .spawn(move || {
-            let started_at_ms = current_millis();
-            let result = work();
-            let _ = tx.send((started_at_ms, result));
-        })
-        .with_context(|| format!("spawning dedicated terminal worker {worker_name}"))?;
-    let (started_at_ms, result) = rx
-        .await
-        .map_err(|error| anyhow!("waiting for dedicated terminal worker {label}: {error}"))?;
-    append_trace_event(
-        trace_home,
-        "ui",
-        "terminal_io",
-        "dispatch",
-        json!({
-            "label": label,
-            "queue_delay_ms": started_at_ms.saturating_sub(queued_at_ms),
-        }),
-    );
+    let label_for_error = label.to_string();
+    let (started_at_ms, result) = task::spawn_blocking(move || {
+        let started_at_ms = current_millis();
+        let result = work();
+        (started_at_ms, result)
+    })
+    .await
+    .map_err(|error| anyhow!("joining terminal worker {label_for_error}: {error}"))?;
+    if terminal_io_trace_enabled(label) {
+        append_trace_event(
+            trace_home,
+            "ui",
+            "terminal_io",
+            "dispatch",
+            json!({
+                "label": label,
+                "queue_delay_ms": started_at_ms.saturating_sub(queued_at_ms),
+            }),
+        );
+    }
     result
+}
+fn terminal_io_trace_enabled(label: &str) -> bool {
+    label != "terminal_read" || trace_env_flag_truthy("YGGTERM_TRACE_TERMINAL_READS")
+}
+fn trace_env_flag_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .is_some_and(|value| env_value_truthy(&value))
+}
+fn terminal_xterm_canvas_renderer_enabled() -> bool {
+    std::env::var(XTERM_CANVAS_RENDERER_ENV)
+        .ok()
+        .is_some_and(|value| env_value_truthy(&value))
+}
+fn env_value_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 async fn run_dedicated_interactive_request_io<T, F>(
     label: &str,
@@ -34235,6 +34314,19 @@ fn terminal_eval_script(
     theme: &TerminalTheme,
     initial_input_enabled: bool,
 ) -> String {
+    terminal_eval_script_with_canvas_renderer(
+        host_id,
+        theme,
+        initial_input_enabled,
+        terminal_xterm_canvas_renderer_enabled(),
+    )
+}
+fn terminal_eval_script_with_canvas_renderer(
+    host_id: &str,
+    theme: &TerminalTheme,
+    initial_input_enabled: bool,
+    canvas_renderer_enabled: bool,
+) -> String {
     let css = serde_json::to_string(XTERM_CSS).expect("serialize xterm css");
     let xterm = serde_json::to_string(XTERM_JS).expect("serialize xterm js");
     let fit_bundle = serde_json::to_string(XTERM_FIT_JS).expect("serialize xterm fit addon");
@@ -34272,6 +34364,8 @@ fn terminal_eval_script(
         serde_json::to_string(&theme.bright_white).expect("serialize terminal bright white");
     let initial_input_enabled =
         serde_json::to_string(&initial_input_enabled).expect("serialize initial input enabled");
+    let canvas_renderer_enabled =
+        serde_json::to_string(&canvas_renderer_enabled).expect("serialize canvas renderer flag");
     let font_family =
         serde_json::to_string(TERMINAL_FONT_FAMILY).expect("serialize terminal font family");
     let font_weight = serde_json::to_string(&terminal_font_weight(theme))
@@ -34493,10 +34587,10 @@ fn terminal_eval_script(
                 brightWhite: {bright_white},
             }},
         }});
-        // Canvas renderer is still under investigation. Keep the diagnostics and
-        // asset bootstrap around, but do not enable it by default until the live
-        // resize path stops pinning the layers at 300x150.
-        const canvasRendererEnabled = false;
+        // Canvas renderer is still under investigation. Keep it runtime-gated
+        // so jojo/KDE CPU probes can compare it against the DOM renderer
+        // without changing the default path for every user.
+        const canvasRendererEnabled = {canvas_renderer_enabled};
         let preferredCanvasRenderer = false;
         const fitAddon = new window.FitAddon.FitAddon();
         term.loadAddon(fitAddon);
@@ -35607,7 +35701,7 @@ fn terminal_eval_script(
                 return;
             }}
             focusTerminal();
-        }}, 250);
+        }}, 1000);
         const setInputEnabled = (enabled, focus) => {{
             const requestedEnabled = Boolean(enabled);
             const canOwnActiveInput = !requestedEnabled || hostOwnsActiveTerminalInput();
@@ -39255,6 +39349,47 @@ fn overlay_backdrop_style(default_style: &'static str) -> &'static str {
         "none"
     }
 }
+fn shell_effective_radius_for_platform(
+    radius: u8,
+    maximized: bool,
+    transparent_window: bool,
+    native_shape_supported: bool,
+) -> u8 {
+    if maximized {
+        return 0;
+    }
+    if cfg!(target_os = "linux") && !transparent_window && !native_shape_supported {
+        return 0;
+    }
+    radius
+}
+fn shell_effective_radius(radius: u8, maximized: bool, transparent_window: bool) -> u8 {
+    shell_effective_radius_for_platform(
+        radius,
+        maximized,
+        transparent_window,
+        linux_native_window_shape_supported(),
+    )
+}
+fn shell_root_background(palette: Palette, transparent_window: bool) -> &'static str {
+    if transparent_window {
+        "transparent"
+    } else if shell_uses_opaque_linux_paint(transparent_window) {
+        shell_opaque_fill(palette)
+    } else {
+        palette.shell
+    }
+}
+fn shell_uses_opaque_linux_paint(transparent_window: bool) -> bool {
+    cfg!(target_os = "linux") && !transparent_window
+}
+fn shell_opaque_fill(palette: Palette) -> &'static str {
+    if palette_is_dark(palette) {
+        "#272e34"
+    } else {
+        "#f3f7fa"
+    }
+}
 fn shell_style(
     palette: Palette,
     radius: u8,
@@ -39264,10 +39399,18 @@ fn shell_style(
     transparent_window: bool,
 ) -> String {
     let backdrop = shell_backdrop_style(maximized, transparent_window);
-    let effective_shell_fill = if transparent_window && shell_live_blur_supported() && !maximized {
+    let opaque_linux_paint = shell_uses_opaque_linux_paint(transparent_window);
+    let effective_shell_fill = if opaque_linux_paint {
+        shell_opaque_fill(palette).to_string()
+    } else if transparent_window && shell_live_blur_supported() && !maximized {
         shell_tint.to_string()
     } else {
         palette.shell.to_string()
+    };
+    let effective_shell_gradient = if opaque_linux_paint {
+        "none"
+    } else {
+        shell_gradient
     };
     let native_window_flush_shell = cfg!(any(target_os = "linux", target_os = "macos"));
     let frame_inset = if maximized || native_window_flush_shell {
@@ -39303,7 +39446,7 @@ fn shell_style(
         frame_inset,
         effective_radius,
         effective_shell_fill,
-        shell_gradient,
+        effective_shell_gradient,
         box_shadow,
         backdrop,
         backdrop,
@@ -39488,18 +39631,33 @@ fn linux_limit_live_terminal_retention() -> bool {
 }
 #[cfg(target_os = "linux")]
 fn linux_native_window_shape_supported() -> bool {
-    if env_flag_truthy("YGGTERM_DISABLE_NATIVE_WINDOW_SHAPE")
-        || linux_session_looks_like_kde_plasma()
-        || linux_force_native_decorations()
-    {
-        return false;
-    }
-    matches!(std::env::var("GDK_BACKEND").ok().as_deref(), Some("x11"))
-        || std::env::var_os("WAYLAND_DISPLAY").is_none()
+    let gdk_backend = std::env::var("GDK_BACKEND").ok();
+    linux_native_window_shape_supported_for_platform(
+        env_flag_truthy("YGGTERM_DISABLE_NATIVE_WINDOW_SHAPE"),
+        linux_force_native_decorations(),
+        gdk_backend.as_deref(),
+        std::env::var_os("WAYLAND_DISPLAY").is_some(),
+    )
 }
 #[cfg(not(target_os = "linux"))]
 fn linux_native_window_shape_supported() -> bool {
     false
+}
+#[cfg(target_os = "linux")]
+fn linux_native_window_shape_supported_for_platform(
+    disabled_by_env: bool,
+    native_decorations_forced: bool,
+    gdk_backend: Option<&str>,
+    wayland_display_present: bool,
+) -> bool {
+    if disabled_by_env || native_decorations_forced {
+        return false;
+    }
+    match gdk_backend {
+        Some("x11") => true,
+        Some("wayland") => false,
+        _ => !wayland_display_present,
+    }
 }
 #[cfg(target_os = "linux")]
 fn apply_linux_widget_corner_region(
@@ -40393,6 +40551,7 @@ mod tests {
         assert!(script.contains("window.setTimeout(() => focusTerminal(), 32);"));
         assert!(script.contains("window.setTimeout(() => focusTerminal(), 96);"));
         assert!(script.contains("window.setTimeout(() => focusTerminal(), 220);"));
+        assert!(script.contains("}, 1000);"));
         assert!(script.contains("setInputEnabled(inputEnabled, programmaticFocusEnabled);"));
         assert!(script.contains("if (inputEnabled && programmaticFocusEnabled) {"));
         assert!(script.contains("focusTerminal,"));
@@ -41185,6 +41344,27 @@ mod tests {
     }
 
     #[test]
+    fn terminal_eval_script_runtime_gates_canvas_renderer() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let disabled =
+            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, false);
+        let enabled =
+            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true);
+        assert!(disabled.contains("const canvasRendererEnabled = false;"));
+        assert!(enabled.contains("const canvasRendererEnabled = true;"));
+    }
+
+    #[test]
+    fn env_value_truthy_accepts_expected_opt_in_values() {
+        for value in ["1", "true", "yes", "on", " TRUE "] {
+            assert!(env_value_truthy(value), "{value:?} should opt in");
+        }
+        for value in ["0", "false", "no", "off", "", "enabled"] {
+            assert!(!env_value_truthy(value), "{value:?} should not opt in");
+        }
+    }
+
+    #[test]
     fn terminal_minimum_contrast_ratio_matches_vscode_default() {
         let light = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let dark = terminal_theme(UiTheme::ZedDark, palette(UiTheme::ZedDark), 13.0, "");
@@ -41412,6 +41592,71 @@ mod tests {
         assert_eq!(style.padding, "0px");
         assert_eq!(style.shell_radius, "0px");
         assert_eq!(style.host_radius, "0px");
+    }
+    #[test]
+    fn opaque_linux_shell_drops_radius_when_native_shape_is_unavailable() {
+        assert_eq!(
+            shell_effective_radius_for_platform(10, false, false, false),
+            if cfg!(target_os = "linux") { 0 } else { 10 }
+        );
+        assert_eq!(
+            shell_effective_radius_for_platform(10, false, true, false),
+            10
+        );
+        assert_eq!(
+            shell_effective_radius_for_platform(10, true, false, true),
+            0
+        );
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_native_window_shape_supports_x11_without_special_casing_kde() {
+        assert!(linux_native_window_shape_supported_for_platform(
+            false,
+            false,
+            Some("x11"),
+            true
+        ));
+        assert!(!linux_native_window_shape_supported_for_platform(
+            true,
+            false,
+            Some("x11"),
+            true
+        ));
+        assert!(!linux_native_window_shape_supported_for_platform(
+            false,
+            true,
+            Some("x11"),
+            true
+        ));
+        assert!(!linux_native_window_shape_supported_for_platform(
+            false,
+            false,
+            Some("wayland"),
+            true
+        ));
+    }
+    #[test]
+    fn opaque_shell_root_uses_filled_background_to_avoid_native_corner_artifacts() {
+        let light = palette(UiTheme::ZedLight);
+        let expected = if cfg!(target_os = "linux") {
+            "#f3f7fa"
+        } else {
+            light.shell
+        };
+        assert_eq!(shell_root_background(light, false), expected);
+        assert_eq!(shell_root_background(light, true), "transparent");
+    }
+    #[test]
+    fn opaque_linux_shell_style_uses_flat_paint_for_software_compositor() {
+        let light = palette(UiTheme::ZedLight);
+        let style = shell_style(light, 0, light.shell, light.gradient, false, false);
+        if cfg!(target_os = "linux") {
+            assert!(style.contains("background-color:#f3f7fa;"));
+            assert!(style.contains("background-image:none;"));
+        } else {
+            assert!(style.contains(light.gradient));
+        }
     }
     #[test]
     fn active_request_session_target_path_prefers_explicit_session_path() {
@@ -46866,7 +47111,7 @@ Waiting for the remote terminal to paint...\n";
         ));
     }
     #[test]
-    fn inactive_retained_session_bootstraps_while_retained_for_hot_switch() {
+    fn inactive_retained_session_does_not_bootstrap_hidden_runtime() {
         let active_session_path = "codex://active";
         let inactive_session_path = "local://inactive";
         let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
@@ -46953,10 +47198,21 @@ Waiting for the remote terminal to paint...\n";
             live_sessions: vec![snapshot_session_view_for_ui(inactive_session)],
         });
         shell.retain_terminal_session_path(inactive_session_path);
-        assert!(terminal_session_should_bootstrap_host(
+        assert!(!terminal_session_should_bootstrap_host(
             &shell,
             Some(active_session_path),
             inactive_session_path
+        ));
+        shell.active_terminal_host_id = Some("host-active".to_string());
+        assert!(!terminal_session_still_active(
+            &shell,
+            inactive_session_path,
+            "host-inactive"
+        ));
+        assert!(terminal_session_still_active(
+            &shell,
+            active_session_path,
+            "host-active"
         ));
     }
     #[test]
