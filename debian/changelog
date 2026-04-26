@@ -1,3 +1,12 @@
+yggterm (2.1.40-1) unstable; urgency=medium
+
+  * Keep stored local Codex transcript paths out of the promoted Live Sessions group.
+  * Reject stored Codex transcript paths in server/app-control live-session contracts.
+  * Extend Linux/KDE smoke proof for stored-tree placement, copy-generation budget, close affordances, and Plasma PID stability.
+  * Repair direct-install KDE desktop metadata so the canonical dev.yggterm.Yggterm desktop entry is visible and the legacy yggterm entry is hidden.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sun, 26 Apr 2026 20:23:20 +0530
+
 yggterm (2.1.39-1) unstable; urgency=medium
 
   * Avoid global Plasma shell refreshes during Linux direct-install self-update.
