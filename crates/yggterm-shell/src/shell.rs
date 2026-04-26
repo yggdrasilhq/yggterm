@@ -221,7 +221,7 @@ const BACKGROUND_COPY_IDLE_MS: u64 = 120_000;
 const ACTIVE_TITLE_AUTOGEN_RETRY_MS: u64 = 15_000;
 const PASSIVE_COPY_GENERATION_ENV: &str = "YGGTERM_ENABLE_PASSIVE_COPY_GENERATION";
 const BACKGROUND_REFRESH_NOTICE_MS: u64 = 12_000;
-const BACKGROUND_REFRESH_STARTUP_DEFER_MS: u64 = 20_000;
+const BACKGROUND_REFRESH_STARTUP_DEFER_MS: u64 = 120_000;
 const BACKGROUND_REFRESH_INTERACTIVE_DEFER_MS: u64 = 15_000;
 const BACKGROUND_REFRESH_POLL_MS: u64 = 15_000;
 const LIVE_SESSION_SNAPSHOT_TRIGGER_DEBOUNCE_MS: u64 = 360;
@@ -1485,6 +1485,7 @@ impl ShellState {
         let live_session_views = self.server.live_session_views();
         let mut live_sessions = live_session_views
             .iter()
+            .filter(|session| is_promoted_live_session(session))
             .map(|session| snapshot_live_sidebar_session_view(session))
             .collect::<Vec<_>>();
         for session in live_sessions.iter_mut() {
@@ -9730,8 +9731,6 @@ fn is_hot_terminal_sidebar_path(path: &str) -> bool {
         || path.starts_with("remote-session://")
         || path.starts_with("codex://")
         || path.starts_with("codex-litellm://")
-        || is_codex_storage_session_path(path)
-        || is_codex_litellm_storage_session_path(path)
 }
 
 fn merge_hot_sidebar_sessions(
@@ -13710,7 +13709,11 @@ fn is_local_tree_live_session(session: &ManagedSessionView) -> bool {
     is_local_live_session_path(&session.session_path) && session.kind != SessionKind::Document
 }
 fn is_promoted_live_session(session: &ManagedSessionView) -> bool {
-    session.kind != SessionKind::Document && is_hot_terminal_sidebar_path(&session.session_path)
+    matches!(
+        session.source,
+        SessionSource::LiveLocal | SessionSource::LiveSsh
+    ) && session.kind != SessionKind::Document
+        && is_hot_terminal_sidebar_path(&session.session_path)
 }
 fn enrich_sidebar_rows_with_live_titles(
     rows: &mut [BrowserRow],
@@ -39961,7 +39964,9 @@ fn apply_linux_window_shape_reapply_sequence(
     use gtk::prelude::*;
 
     let gtk_window = desktop.gtk_window();
-    for delay_ms in [0_u64, 24, 72, 180] {
+    for delay_ms in [
+        0_u64, 24, 72, 180, 400, 900, 1_600, 2_800, 4_500, 7_000, 10_000, 14_000,
+    ] {
         let gtk_window = gtk_window.clone();
         gtk::glib::timeout_add_local_once(Duration::from_millis(delay_ms), move || {
             let allocation = gtk_window.allocation();
@@ -43389,7 +43394,7 @@ mod tests {
         );
     }
     #[test]
-    fn merged_sidebar_rows_promote_retained_stored_codex_sessions_into_live_group() {
+    fn merged_sidebar_rows_keep_retained_stored_codex_sessions_out_of_live_group() {
         let stored_path = "/home/pi/.codex/sessions/example.jsonl".to_string();
         let rows = merged_sidebar_rows(
             &[BrowserRow {
@@ -43447,10 +43452,9 @@ mod tests {
             }],
             &HashSet::from(["__live_sessions__".to_string()]),
         );
-        assert!(rows.iter().any(|row| row.full_path == "__live_sessions__"));
-        assert_eq!(
-            rows.first().map(|row| row.full_path.as_str()),
-            Some("__live_sessions__")
+        assert!(
+            !rows.iter().any(|row| row.full_path == "__live_sessions__"),
+            "stored Codex transcript rows must not be promoted into Live Sessions: {rows:?}"
         );
         assert!(
             rows.iter()
@@ -50688,11 +50692,13 @@ Waiting for the remote terminal to paint...\n";
             test_sidebar_row("/home/pi/.codex-litellm/sessions/2026/04/24/example.jsonl");
         assert!(!is_live_sidebar_row(&codex_row));
         assert!(!is_live_sidebar_row(&litellm_row));
+        assert!(!is_hot_terminal_sidebar_path(&codex_row.full_path));
+        assert!(!is_hot_terminal_sidebar_path(&litellm_row.full_path));
         assert!(is_live_sidebar_row(&test_sidebar_row("codex://abc")));
         assert!(is_live_sidebar_row(&test_sidebar_row("local://abc")));
     }
     #[test]
-    fn shell_snapshot_retains_all_live_hot_terminal_sessions() {
+    fn shell_snapshot_keeps_retained_stored_codex_sessions_out_of_live_retention() {
         let active_path = "local://fresh-shell";
         let codex_path = "/home/pi/.codex/sessions/example.jsonl";
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(active_path));
@@ -50787,7 +50793,10 @@ Waiting for the remote terminal to paint...\n";
             .map(|session| session.session_path.as_str())
             .collect::<HashSet<_>>();
         assert!(retained_paths.contains(active_path));
-        assert!(retained_paths.contains(codex_path));
+        assert!(
+            !retained_paths.contains(codex_path),
+            "stored Codex transcript paths are not promoted live-retention rows"
+        );
     }
     #[test]
     fn shell_snapshot_retains_active_stored_terminal_session_in_terminal_view() {

@@ -45,6 +45,7 @@ const DEFAULT_ORPHAN_DAEMON_REAP_AFTER_MS: u64 = 180_000;
 #[cfg(target_os = "linux")]
 const DUPLICATE_SAME_HOME_GRACE_MS: u64 = 2_000;
 const REMOTE_ATTACH_STARTUP_GRACE_MS: u64 = 900;
+const ENV_YGGTERM_ENABLE_BACKGROUND_COPY_CHORE: &str = "YGGTERM_ENABLE_BACKGROUND_COPY_CHORE";
 
 fn daemon_env_flag_truthy(name: &str) -> bool {
     std::env::var(name).ok().is_some_and(|value| {
@@ -1839,6 +1840,23 @@ fn run_background_copy_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usiz
     Ok(updates.len())
 }
 
+fn daemon_background_copy_chore_enabled_from_env(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn daemon_background_copy_chore_enabled() -> bool {
+    daemon_background_copy_chore_enabled_from_env(
+        std::env::var(ENV_YGGTERM_ENABLE_BACKGROUND_COPY_CHORE)
+            .ok()
+            .as_deref(),
+    )
+}
+
 fn daemon_idle_shutdown_ms() -> u64 {
     std::env::var("YGGTERM_DAEMON_IDLE_SHUTDOWN_MS")
         .ok()
@@ -2554,7 +2572,7 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
     if let Ok(current_exe) = std::env::current_exe() {
         let _ = cleanup_legacy_linux_daemon_processes(endpoint, &current_exe);
     }
-    {
+    if daemon_background_copy_chore_enabled() {
         let runtime = runtime.clone();
         let last_activity_ms = last_activity_ms.clone();
         std::thread::spawn(move || {
@@ -2579,6 +2597,16 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                 }
             }
         });
+    } else {
+        append_trace_event(
+            &home_dir,
+            "daemon",
+            "background_copy",
+            "disabled",
+            serde_json::json!({
+                "env": ENV_YGGTERM_ENABLE_BACKGROUND_COPY_CHORE,
+            }),
+        );
     }
     {
         let runtime = runtime.clone();
@@ -3295,7 +3323,9 @@ fn send_request(endpoint: &ServerEndpoint, request: &ServerRequest) -> Result<Se
 
 #[cfg(test)]
 mod tests {
-    use super::terminal_sidebar_snapshot_from_screen;
+    use super::{
+        daemon_background_copy_chore_enabled_from_env, terminal_sidebar_snapshot_from_screen,
+    };
     use std::fs;
     use std::path::Path;
 
@@ -3318,6 +3348,18 @@ mod tests {
         PersistedDaemonState, PersistedLiveSession, RemoteDeployState, RemoteMachineHealth,
         RemoteMachineSnapshot, RemoteScannedSession, remote_scanned_session_path,
     };
+
+    #[test]
+    fn daemon_background_copy_chore_is_explicit_opt_in() {
+        assert!(!daemon_background_copy_chore_enabled_from_env(None));
+        assert!(!daemon_background_copy_chore_enabled_from_env(Some("")));
+        assert!(!daemon_background_copy_chore_enabled_from_env(Some(
+            "false"
+        )));
+        assert!(daemon_background_copy_chore_enabled_from_env(Some("1")));
+        assert!(daemon_background_copy_chore_enabled_from_env(Some("true")));
+        assert!(daemon_background_copy_chore_enabled_from_env(Some(" YES ")));
+    }
 
     #[cfg(unix)]
     #[test]
