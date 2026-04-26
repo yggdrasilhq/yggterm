@@ -1235,29 +1235,15 @@ fn shell_single_quote(input: &str) -> String {
 
 #[cfg(target_os = "linux")]
 fn refresh_kde_desktop_caches() {
-    if let Some(cache_dir) = dirs::cache_dir() {
-        let _ = fs::remove_file(cache_dir.join("icon-cache.kcache"));
-        if let Ok(entries) = fs::read_dir(&cache_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if name.starts_with("ksycoca") {
-                    let _ = fs::remove_file(entry.path());
-                }
-            }
-        }
-    }
-
+    // Keep desktop integration passive. Directly poking plasmashell over
+    // D-Bus has caused compositor-visible crashes during in-app self-update
+    // on KDE; kbuildsycoca is enough for launcher/menu metadata to converge
+    // without restarting the shell.
     let _ = std::process::Command::new("kbuildsycoca6")
         .arg("--noincremental")
         .status();
     let _ = std::process::Command::new("kbuildsycoca5")
         .arg("--noincremental")
-        .status();
-    let _ = std::process::Command::new("qdbus6")
-        .arg("org.kde.plasmashell")
-        .arg("/PlasmaShell")
-        .arg("org.kde.PlasmaShell.refreshCurrentShell")
         .status();
 }
 
