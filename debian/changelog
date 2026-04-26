@@ -1,3 +1,14 @@
+yggterm (2.1.41-1) unstable; urgency=medium
+
+  * Scope stale-daemon cleanup to the matching YGGTERM_HOME and active-client state.
+  * Add daemon child-exit and cleanup-decision trace events for KDE restart proof.
+  * Keep Live Sessions at the top while making fresh live terminals runtime-only unless explicitly kept alive.
+  * Preserve sidebar scroll/visual bookmark state and kept-alive labels during rename/title refreshes.
+  * Reduce terminal spinner and live-session snapshot polling after Enter/input events.
+  * Pin the Dioxus desktop dependency edge to the vendored KDE-patched 0.7.3 build.
+
+ -- Yggdrasil HQ <avi@gour.top>  Mon, 27 Apr 2026 01:04:12 +0530
+
 yggterm (2.1.40-1) unstable; urgency=medium
 
   * Keep stored local Codex transcript paths out of the promoted Live Sessions group.

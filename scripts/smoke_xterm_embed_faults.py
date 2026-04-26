@@ -438,6 +438,20 @@ def app_remove_session(pid: int, session_path: str) -> dict:
     ))
 
 
+def app_set_session_keep_alive(pid: int, session_path: str, keep_alive: bool) -> dict:
+    return unwrap_data(run(
+        "server",
+        "app",
+        "terminal",
+        "keep" if keep_alive else "unkeep",
+        "--pid",
+        str(pid),
+        session_path,
+        "--timeout-ms",
+        "15000",
+    ))
+
+
 def terminal_reclaim_focus(pid: int, session: str) -> dict:
     return run(
         "server",
@@ -4474,7 +4488,7 @@ def delete_session_via_context_menu(
         if dialog_visible and (
             normalize_live_path(session_path) in pending_paths
             or (
-                title_text in {"Close Live Session?", "Close Live Sessions?"}
+                title_text in {"Close Terminal?", "Close Terminals?"}
                 and "server-owned terminal runtime" in copy_text
             )
         ):
@@ -10579,7 +10593,7 @@ def assert_live_session_close_button(pid: int) -> dict:
         copy_text = str(((dialog_state.get("dom") or {}).get("delete_confirm_copy_text") or "")).strip()
         if title_text == "Delete Selected Items?":
             raise AssertionError(f"live close dialog still uses delete wording: {dialog_state!r}")
-        if title_text not in {"Close Live Session?", "Close Live Sessions?"}:
+        if title_text not in {"Close Terminal?", "Close Terminals?"}:
             raise AssertionError(f"live close dialog title is not explicit: {dialog_state!r}")
         if "server-owned terminal runtime" not in copy_text:
             raise AssertionError(f"live close dialog copy does not describe runtime kill semantics: {dialog_state!r}")
@@ -10607,6 +10621,97 @@ def assert_live_session_close_button(pid: int) -> dict:
             "delete_confirm_click": confirm_click,
             "post_delete_active_session_path": settled.get("active_session_path"),
             "session_view_contract": contract_check,
+        }
+    finally:
+        try:
+            app_remove_session(pid, target_path)
+        except Exception:
+            pass
+
+
+def wait_for_live_keep_alive_state(
+    pid: int,
+    session_path: str,
+    expected: bool,
+    *,
+    timeout_seconds: float = 8.0,
+) -> tuple[dict, dict]:
+    deadline = time.time() + timeout_seconds
+    last_state = {}
+    last_row = {}
+    while time.time() < deadline:
+        last_state = app_state(pid)
+        row = find_visible_live_sidebar_row_by_path(last_state, session_path, kind="Session")
+        if row is not None:
+            last_row = row
+            if bool(row.get("live_keep_alive")) == expected:
+                return last_state, row
+        time.sleep(0.1)
+    raise AssertionError(
+        "live session keep-alive marker did not settle to the expected state: "
+        f"session={session_path!r} expected={expected!r} row={last_row!r} state={last_state!r}"
+    )
+
+
+def assert_live_session_keep_alive_toggle(pid: int) -> dict:
+    created = app_create_terminal(pid, title="Smoke Keep Alive")
+    target_path = str(created.get("active_session_path") or "").strip()
+    if not target_path:
+        raise AssertionError(f"terminal create did not return an active session path: {created!r}")
+    try:
+        wait_for_interactive_session(pid, target_path, timeout_seconds=20.0)
+        initial_state, initial_row = wait_for_live_keep_alive_state(
+            pid,
+            target_path,
+            False,
+            timeout_seconds=8.0,
+        )
+        keep = app_set_session_keep_alive(pid, target_path, True)
+        kept_state, kept_row = wait_for_live_keep_alive_state(
+            pid,
+            target_path,
+            True,
+            timeout_seconds=8.0,
+        )
+        keep_rect = kept_row.get("live_keep_alive_rect") or {}
+        if not rect_is_visible(keep_rect):
+            raise AssertionError(f"kept live session did not expose a visible keep-alive dot: {kept_row!r}")
+        keep_color = str(kept_row.get("live_keep_alive_color") or "").strip()
+        if not keep_color:
+            raise AssertionError(f"kept live session keep-alive dot has no computed color: {kept_row!r}")
+        live_debug = kept_state.get("live_session_snapshot_debug") or []
+        debug_entry = next(
+            (
+                entry
+                for entry in live_debug
+                if normalize_live_path(str(entry.get("path") or ""))
+                == normalize_live_path(target_path)
+            ),
+            {},
+        )
+        if debug_entry and debug_entry.get("keep_alive") is not True:
+            raise AssertionError(
+                f"app-control debug did not report keep_alive=true for the kept session: {debug_entry!r}"
+            )
+        unkeep = app_set_session_keep_alive(pid, target_path, False)
+        unkept_state, unkept_row = wait_for_live_keep_alive_state(
+            pid,
+            target_path,
+            False,
+            timeout_seconds=8.0,
+        )
+        return {
+            "target_path": target_path,
+            "initial_live_keep_alive": bool(initial_row.get("live_keep_alive")),
+            "initial_sidebar_scroll_top": (initial_state.get("dom") or {}).get("sidebar_scroll_top"),
+            "keep": keep,
+            "kept_live_keep_alive": bool(kept_row.get("live_keep_alive")),
+            "kept_live_keep_alive_rect": keep_rect,
+            "kept_live_keep_alive_color": keep_color,
+            "debug_keep_alive": debug_entry.get("keep_alive"),
+            "unkeep": unkeep,
+            "unkept_live_keep_alive": bool(unkept_row.get("live_keep_alive")),
+            "unkept_sidebar_scroll_top": (unkept_state.get("dom") or {}).get("sidebar_scroll_top"),
         }
     finally:
         try:
@@ -10931,6 +11036,51 @@ def assert_busy_icon_lifecycle(pid: int, session: str, *, sleep_seconds: int = 8
     }
 
 
+def assert_blank_enter_does_not_leave_busy_spinner(pid: int, session: str) -> dict:
+    def row_from_app_rows() -> dict | None:
+        normalized = normalize_live_path(session)
+        for candidate in app_rows(pid):
+            path = normalize_live_path(str(candidate.get("path") or candidate.get("full_path") or ""))
+            if path == normalized:
+                return candidate
+        return None
+
+    app_set_search(pid, "", focused=False)
+    try:
+        app_expand(pid, "__live_sessions__", True)
+    except Exception:
+        pass
+    wait_for_session_focus(pid, session, timeout_seconds=8.0)
+    clear_prompt_line(pid, session, timeout_seconds=8.0)
+    before = row_from_app_rows() or {}
+    if bool(before.get("busy")) or str(before.get("icon_kind") or "") == "busy":
+        raise AssertionError(f"blank-enter spinner proof started from a busy row: {before!r}")
+
+    probe = probe_type(pid, session, "", mode="keyboard", press_enter=True)
+    samples: list[dict] = []
+    deadline = time.time() + 0.95
+    while time.time() < deadline:
+        row = row_from_app_rows() or {}
+        sample = {
+            "busy": bool(row.get("busy")),
+            "icon_kind": str(row.get("icon_kind") or ""),
+            "icon_text": str(row.get("icon_text") or ""),
+        }
+        samples.append(sample)
+        if sample["busy"] or sample["icon_kind"] == "busy":
+            raise AssertionError(
+                "blank Enter still showed the live-session busy spinner: "
+                f"probe={probe!r} samples={samples!r}"
+            )
+        time.sleep(0.1)
+
+    return {
+        "probe": probe,
+        "sample_count": len(samples),
+        "samples": samples,
+    }
+
+
 def host_has_plain_shell_prompt(host: dict) -> bool:
     cursor_line_text = str(host.get("cursor_line_text") or host.get("cursor_row_text") or "")
     if re.search(r"[$#]\s*$", cursor_line_text.strip()):
@@ -10947,6 +11097,7 @@ def assert_terminal_interactive_lifecycle(pid: int, session: str) -> dict:
         session,
         context="terminal interactive lifecycle runtime probe",
     )
+    blank_enter = assert_blank_enter_does_not_leave_busy_spinner(pid, session)
     busy = assert_busy_icon_lifecycle(pid, session)
     live_tree = assert_live_sessions_tree_contract(pid)
     return {
@@ -10954,6 +11105,7 @@ def assert_terminal_interactive_lifecycle(pid: int, session: str) -> dict:
         "runtime_probe": {
             "accepted": bool((runtime_probe.get("data") or {}).get("accepted")),
         },
+        "blank_enter_spinner": blank_enter,
         "busy_icon_lifecycle": busy,
         "live_sessions_tree": live_tree,
     }
@@ -13761,6 +13913,7 @@ def main() -> int:
         "session_drag_to_folder",
         "titlebar_copy_regeneration",
         "live_session_close_button",
+        "live_session_keep_alive_toggle",
         "live_session_metadata_consistency",
         "live_sessions_tree_contract",
         "webkit_child_rss_soak",
@@ -13898,6 +14051,7 @@ def main() -> int:
         run_check("context_menu_rename_session", lambda: assert_context_menu_rename_session(args.pid))
         run_check("context_menu_delete_session", lambda: assert_context_menu_delete_session(args.pid))
         run_check("live_session_close_button", lambda: assert_live_session_close_button(args.pid))
+        run_check("live_session_keep_alive_toggle", lambda: assert_live_session_keep_alive_toggle(args.pid))
         run_check(
             "titlebar_empty_lane_window_controls",
             lambda: assert_titlebar_empty_lane_window_controls_contract(args.pid, out_dir),
