@@ -473,6 +473,7 @@ struct ShellState {
     drag_pointer: Option<(f64, f64)>,
     pending_tree_drag: Option<PendingTreeDrag>,
     suppress_tree_click_until_ms: u64,
+    suppress_sidebar_autoscroll_until_ms: u64,
     pending_delete: Option<PendingDeleteDialog>,
     tree_rename_path: Option<String>,
     tree_rename_depth: Option<usize>,
@@ -556,6 +557,7 @@ const KEEP_DAEMON_RUNNING_AFTER_LAST_CLIENT: bool = true;
 const KDE_CLOSE_TERMINAL_DETACH_MS: u64 = 180;
 const KDE_CLOSE_FINAL_HIDE_MS: u64 = 60;
 const CLOSE_FORCE_EXIT_WATCHDOG_MS: u64 = 2_500;
+const SIDEBAR_RENAME_AUTOSCROLL_SUPPRESS_MS: u64 = 4_000;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RightPanelMode {
     Hidden,
@@ -1336,6 +1338,7 @@ impl ShellState {
             drag_pointer: None,
             pending_tree_drag: None,
             suppress_tree_click_until_ms: 0,
+            suppress_sidebar_autoscroll_until_ms: 0,
             pending_delete: None,
             tree_rename_path: None,
             tree_rename_depth: None,
@@ -4307,6 +4310,10 @@ impl ShellState {
             false
         }
     }
+    fn suppress_sidebar_autoscroll_for_rename(&mut self) {
+        self.suppress_sidebar_autoscroll_until_ms =
+            current_millis().saturating_add(SIDEBAR_RENAME_AUTOSCROLL_SUPPRESS_MS);
+    }
     fn open_delete_dialog(&mut self, hard_delete: bool) {
         let (document_paths, group_paths, mut labels) = self.selected_workspace_delete_paths();
         let (session_paths, session_labels) = self.selected_session_delete_paths();
@@ -4409,6 +4416,7 @@ impl ShellState {
         self.tree_rename_value = row.label.clone();
         self.tree_rename_started_at_ms = current_millis();
         self.tree_rename_input_focused_once = false;
+        self.suppress_sidebar_autoscroll_for_rename();
         self.close_context_menu();
         self.refresh_tree_debug("begin_tree_rename");
     }
@@ -4418,6 +4426,7 @@ impl ShellState {
     }
     fn update_tree_rename_value(&mut self, value: String) {
         self.tree_rename_value = value;
+        self.suppress_sidebar_autoscroll_for_rename();
         self.refresh_tree_debug("update_tree_rename");
     }
     fn cancel_tree_rename(&mut self) {
@@ -4426,6 +4435,7 @@ impl ShellState {
         self.tree_rename_value.clear();
         self.tree_rename_started_at_ms = 0;
         self.tree_rename_input_focused_once = false;
+        self.suppress_sidebar_autoscroll_for_rename();
         self.refresh_tree_debug("cancel_tree_rename");
     }
     fn refresh_tree_debug(&mut self, source: &str) {
@@ -6211,10 +6221,10 @@ fn restart_into_pending_update(mut state: Signal<ShellState>) {
         let next_exe = update.executable.clone();
         let next_version = update.version.clone();
         let launched = task::spawn_blocking(move || Command::new(&next_exe).spawn()).await;
+        let mut close_after_launch = false;
         state.with_mut(|shell| match launched {
             Ok(Ok(_)) => {
-                SUPPRESS_DAEMON_SHUTDOWN_ON_EXIT.store(true, Ordering::SeqCst);
-                window().close();
+                close_after_launch = true;
             }
             Ok(Err(error)) => {
                 shell.pending_update_restart = None;
@@ -6235,6 +6245,9 @@ fn restart_into_pending_update(mut state: Signal<ShellState>) {
                 );
             }
         });
+        if close_after_launch {
+            close_window_after_update_restart(state);
+        }
         if state
             .read()
             .pending_update_restart
@@ -6246,6 +6259,36 @@ fn restart_into_pending_update(mut state: Signal<ShellState>) {
                 shell.pending_update_restart = None;
             });
         }
+    });
+}
+fn close_window_after_update_restart(mut state: Signal<ShellState>) {
+    let detach_terminal_before_close = {
+        let shell = state.read();
+        linux_close_requires_terminal_detach()
+            && shell.server.active_session_path().is_some()
+            && shell.server.active_view_mode() == WorkspaceViewMode::Terminal
+    };
+    SUPPRESS_DAEMON_SHUTDOWN_ON_EXIT.store(true, Ordering::SeqCst);
+    INTENTIONAL_CLIENT_SHUTDOWN.store(true, Ordering::SeqCst);
+    state.with_mut(|shell| {
+        shell.closing_app = true;
+        shell.last_action = "restarting yggterm".to_string();
+    });
+    spawn(async move {
+        if detach_terminal_before_close {
+            window().set_decorations(true);
+        }
+        let detach_delay_ms = if detach_terminal_before_close {
+            KDE_CLOSE_TERMINAL_DETACH_MS
+        } else {
+            80
+        };
+        sleep(Duration::from_millis(detach_delay_ms)).await;
+        if detach_terminal_before_close {
+            window().set_visible(false);
+            sleep(Duration::from_millis(KDE_CLOSE_FINAL_HIDE_MS)).await;
+        }
+        let _ = window().close();
     });
 }
 fn spawn_graceful_shutdown_and_close(mut state: Signal<ShellState>) {
@@ -10204,6 +10247,30 @@ fn restore_browser_tree(
     shell.browser.set_filter_query(String::new());
     shell.ensure_active_session_visible();
     shell.record_restore_issue_telemetry("restore_browser_tree");
+    shell.sync_browser_settings();
+}
+fn restore_browser_tree_preserving_sidebar_view(
+    shell: &mut ShellState,
+    browser_tree: SessionNode,
+    selected_hint: Option<&str>,
+) {
+    let selected_path = shell.browser.selected_path().map(str::to_string);
+    let expanded_paths = shell.browser.expanded_paths();
+    let synthetic_expanded_paths = expanded_paths
+        .iter()
+        .filter(|path| path.starts_with("__"))
+        .cloned()
+        .collect::<Vec<_>>();
+    shell.browser = SessionBrowserState::new(browser_tree);
+    shell.browser.restore_ui_state_preserving_expanded_paths(
+        &expanded_paths,
+        selected_path.as_deref().or(selected_hint),
+    );
+    shell
+        .browser
+        .ensure_expanded_paths(synthetic_expanded_paths);
+    shell.browser.set_filter_query(String::new());
+    shell.record_restore_issue_telemetry("restore_browser_tree_preserving_sidebar_view");
     shell.sync_browser_settings();
 }
 fn remote_preview_needs_refresh(session: &ManagedSessionView) -> bool {
@@ -14831,6 +14898,7 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
     state.with_mut(|shell| {
         shell.server_busy = true;
         shell.last_action = format!("renaming {}", row.label);
+        shell.suppress_sidebar_autoscroll_for_rename();
         shell.tree_rename_path = None;
         shell.tree_rename_depth = None;
         shell.tree_rename_value.clear();
@@ -14904,9 +14972,11 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
                 let selected_hint = (!is_synthetic_sidebar_row(&row)
                     && !is_hot_terminal_sidebar_path(&row.full_path))
                 .then_some(row.full_path.as_str());
-                restore_browser_tree(shell, browser_tree, selected_hint);
+                restore_browser_tree_preserving_sidebar_view(shell, browser_tree, selected_hint);
                 if is_hot_terminal_sidebar_path(&row.full_path) {
-                    shell.ensure_session_path_visible(&row.full_path);
+                    shell
+                        .browser
+                        .ensure_expanded_paths(["__live_sessions__".to_string()]);
                 } else if !is_synthetic_sidebar_row(&row) {
                     shell.browser.select_path(row.full_path.clone());
                 }
@@ -14927,6 +14997,7 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
                 }
                 shell.server_busy = false;
                 shell.last_action = format!("renamed {}", trimmed);
+                shell.suppress_sidebar_autoscroll_for_rename();
                 shell.refresh_tree_debug("commit_tree_rename");
                 should_persist_live_hint.then(|| {
                     (
@@ -17302,6 +17373,7 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     const indicator = row.querySelector('[data-machine-indicator="1"]');
                     const liveClose = row.querySelector('[data-sidebar-live-session-close="1"]');
                     const indicatorStyle = indicator ? window.getComputedStyle(indicator) : null;
+                    const liveCloseStyle = liveClose ? window.getComputedStyle(liveClose) : null;
                     const centerPointRect =
                         rect.width > 0 && rect.height > 0
                             ? {
@@ -17332,6 +17404,9 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                         width: Math.round(rect.width),
                         top: Math.round(rect.top),
                         height: Math.round(rect.height),
+                        live_close_text: String(liveClose?.textContent || '').trim(),
+                        live_close_color: liveCloseStyle ? liveCloseStyle.color : null,
+                        live_close_background_color: liveCloseStyle ? liveCloseStyle.backgroundColor : null,
                         live_close_rect: rectSummary(liveClose),
                         live_close_hit_target: elementSummaryAtPoint(rectSummary(liveClose)),
                         hit_target: elementSummaryAtPoint(centerPointRect),
@@ -18787,6 +18862,7 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         return null;
                     }
                     const liveClose = row.querySelector('[data-sidebar-live-session-close="1"]');
+                    const liveCloseStyle = liveClose ? window.getComputedStyle(liveClose) : null;
                     const treeIcon = row.querySelector('[data-tree-icon="1"]');
                     const rowStyle = window.getComputedStyle(row);
                     const iconKind = treeIcon
@@ -18809,6 +18885,9 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         icon_kind: iconKind,
                         icon_text: treeIcon ? String(treeIcon.textContent || '').trim() : '',
                         busy: iconKind === 'busy',
+                        live_close_text: String(liveClose?.textContent || '').trim(),
+                        live_close_color: liveCloseStyle ? liveCloseStyle.color : null,
+                        live_close_background_color: liveCloseStyle ? liveCloseStyle.backgroundColor : null,
                         live_close_rect: rectSummary(liveClose),
                         live_close_hit_target: elementSummaryAtPoint(rectSummary(liveClose)),
                         hit_target: elementSummaryAtPoint(rectSummary(row)),
@@ -23542,14 +23621,21 @@ fn app() -> Element {
         }
     });
     use_effect(move || {
-        let (active_path, active_visible, show_loading_tree) = {
+        let (active_path, active_visible, show_loading_tree, suppress_autoscroll) = {
             let shell = state.read();
             let active_path = shell.server.active_session_path().map(ToOwned::to_owned);
             let snapshot = shell.snapshot();
             let active_visible = active_path
                 .as_ref()
                 .is_some_and(|path| snapshot.rows.iter().any(|row| row.full_path == *path));
-            (active_path, active_visible, snapshot.show_loading_tree)
+            let suppress_autoscroll = shell.tree_rename_path.is_some()
+                || current_millis() < shell.suppress_sidebar_autoscroll_until_ms;
+            (
+                active_path,
+                active_visible,
+                snapshot.show_loading_tree,
+                suppress_autoscroll,
+            )
         };
         if show_loading_tree {
             set_signal_if_changed(last_sidebar_autoscroll_path, None);
@@ -23559,6 +23645,10 @@ fn app() -> Element {
             set_signal_if_changed(last_sidebar_autoscroll_path, None);
             return;
         };
+        if suppress_autoscroll {
+            set_signal_if_changed(last_sidebar_autoscroll_path, Some(active_path));
+            return;
+        }
         if !active_visible {
             return;
         }
@@ -27015,10 +27105,11 @@ fn SidebarRow(
                         title: "Close live session",
                         style: format!(
                             "display:inline-flex; align-items:center; justify-content:center; width:18px; min-width:18px; height:18px; \
-                             border:none; border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:700; \
-                             cursor:pointer; padding:0; box-shadow:none;",
-                            if selected { "rgba(255,255,255,0.82)" } else { "rgba(44, 53, 70, 0.08)" },
-                            if selected { palette.panel } else { palette.muted }
+                             border:none; border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:800; \
+                             line-height:1; cursor:pointer; padding:0; box-shadow:{};",
+                            if selected { "rgba(255,255,255,0.94)" } else { "rgba(44, 53, 70, 0.08)" },
+                            if selected { palette.text } else { palette.muted },
+                            if selected { "inset 0 0 0 1px rgba(16,24,40,0.10)" } else { "none" }
                         ),
                         onmousedown: |evt| {
                             evt.prevent_default();
