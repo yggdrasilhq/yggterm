@@ -1,3 +1,13 @@
+yggterm (2.1.38-1) unstable; urgency=medium
+
+  * Fix KDE inline session rename selection, overwrite, Ctrl+A ownership, Enter commit, and click-away commit.
+  * Make titlebar session titles clickable rename targets in both the chip and title/summary popover.
+  * Show explicit title/summary regeneration feedback and extend app-control proof for rename and titlebar targets.
+  * Reduce sidebar label density, keep idle sidebar cursors as pointers, and preserve stored Codex row targeting.
+  * Add KDE proof coverage for combined rename/titlebar flows, sidebar open/cursor behavior, terminal lifecycle, idle CPU, rounded corners, and Plasma PID stability.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sun, 26 Apr 2026 16:33:06 +0530
+
 yggterm (2.1.37-1) unstable; urgency=medium
 
   * Stop cold-start sidebar selection from auto-opening the first stored Codex transcript.
