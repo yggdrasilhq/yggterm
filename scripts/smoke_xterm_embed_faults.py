@@ -11,7 +11,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from PIL import Image, ImageStat
+from PIL import Image, ImageChops, ImageStat
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -2819,6 +2819,36 @@ def capture_root_screenshot(display: str, path: Path) -> None:
     )
 
 
+def root_screenshot_matches_app_capture(root_path: Path, app_path: Path, state: dict) -> bool:
+    if not root_path.exists() or not app_path.exists():
+        return True
+    window = state.get("window") or {}
+    outer_position = window.get("outer_position") or {}
+    outer_size = window.get("outer_size") or {}
+    left = int(round(float(outer_position.get("x") or 0.0)))
+    top = int(round(float(outer_position.get("y") or 0.0)))
+    width = int(round(float(outer_size.get("width") or 0.0)))
+    height = int(round(float(outer_size.get("height") or 0.0)))
+    if width <= 0 or height <= 0:
+        return True
+    try:
+        root = Image.open(root_path).convert("RGB")
+        app = Image.open(app_path).convert("RGB")
+    except OSError:
+        return True
+    bounds = clamp_box((left, top, left + width, top + height), root.size)
+    if bounds is None:
+        return True
+    crop = root.crop(bounds)
+    if crop.width < max(64, width // 2) or crop.height < max(64, height // 2):
+        return True
+    root_thumb = crop.resize((64, 64))
+    app_thumb = app.resize((64, 64))
+    diff = ImageStat.Stat(ImageChops.difference(root_thumb, app_thumb)).mean
+    mean_delta = sum(diff) / max(1, len(diff))
+    return mean_delta < 48.0
+
+
 def shell_corner_signature(root_screenshot_path: Path, state: dict) -> dict | None:
     window = state.get("window") or {}
     dom = state.get("dom") or {}
@@ -3099,10 +3129,17 @@ def assert_shell_corner_rounding(pid: int, screenshot_path: Path, state: dict | 
         if str(ENV.get("YGGTERM_ROOT_SCREENSHOT_FOCUS") or "").strip() == "1":
             try:
                 run("server", "app", "focus", "--pid", str(pid), "--timeout-ms", "8000")
+                try:
+                    window_id = visible_window_id_for_pid(pid)
+                    xdotool_activate_window_if_supported(pid, window_id)
+                except Exception:
+                    pass
                 time.sleep(0.35)
             except AssertionError:
                 pass
         capture_root_screenshot(display, path)
+        if not root_screenshot_matches_app_capture(path, screenshot_path, state):
+            return None, []
         signature = shell_corner_signature(path, state)
         if signature is None:
             return None, []
@@ -3953,13 +3990,77 @@ def dom_value(state: dict, key: str):
     return (state.get("dom") or {}).get(key)
 
 
+def titlebar_session_click_rect(state: dict) -> dict:
+    button_rect = dom_rect(state, "titlebar_session_button_rect")
+    if rect_is_visible(button_rect):
+        title_rect = dom_rect(state, "titlebar_title_rect")
+        if rect_is_visible(title_rect) and title_rect.get("right", 0) < button_rect.get("right", 0) - 8:
+            left = max(float(title_rect["right"]) + 2.0, float(button_rect["right"]) - 30.0)
+            right = float(button_rect["right"]) - 4.0
+            if right > left:
+                return {
+                    **button_rect,
+                    "left": left,
+                    "right": right,
+                    "width": right - left,
+                }
+        right = float(button_rect["right"])
+        left = max(float(button_rect["left"]), right - min(30.0, max(18.0, float(button_rect["width"]) * 0.22)))
+        return {
+            **button_rect,
+            "left": left,
+            "right": right,
+            "width": max(0.0, right - left),
+        }
+    shell_rect = dom_rect(state, "titlebar_session_shell_rect")
+    if rect_is_visible(shell_rect):
+        return shell_rect
+    return {}
+
+
+def titlebar_title_click_rect(state: dict) -> dict:
+    title_rect = dom_rect(state, "titlebar_title_rect")
+    if rect_is_visible(title_rect):
+        return title_rect
+    button_rect = dom_rect(state, "titlebar_session_button_rect")
+    if not rect_is_visible(button_rect):
+        button_rect = dom_rect(state, "titlebar_session_shell_rect")
+    if rect_is_visible(button_rect):
+        return {
+            **button_rect,
+            "left": button_rect["left"] + min(16.0, max(0.0, button_rect["width"] * 0.12)),
+            "right": button_rect["left"] + max(18.0, button_rect["width"] * 0.72),
+            "width": max(18.0, button_rect["width"] * 0.60),
+        }
+    return {}
+
+
+def main_surface_click_rect(state: dict) -> dict:
+    for key in ("main_surface_body_rect", "main_surface_rect", "preview_viewport_rect"):
+        rect = dom_rect(state, key)
+        if rect_is_visible(rect):
+            return rect
+    host = active_host_or_none(state) or {}
+    for key in ("viewport_rect", "host_rect", "screen_rect"):
+        rect = host.get(key)
+        if rect_is_visible(rect):
+            return rect
+    return {}
+
+
 def tree_rename_input_value(state: dict) -> str:
     dom = state.get("dom") or {}
-    if "tree_rename_input_value" in dom:
-        return str(dom.get("tree_rename_input_value") or "")
     shell = state.get("shell") or {}
+    shell_value = ""
     if str(shell.get("tree_rename_path") or "").strip():
-        return str(shell.get("tree_rename_value") or "")
+        shell_value = str(shell.get("tree_rename_value") or "")
+    if "tree_rename_input_value" in dom:
+        dom_value = str(dom.get("tree_rename_input_value") or "")
+        if dom_value or not shell_value:
+            return dom_value
+        return shell_value
+    if shell_value:
+        return shell_value
     return ""
 
 
@@ -3975,6 +4076,9 @@ def tree_rename_observation(state: dict) -> dict:
         "shell_value": shell.get("tree_rename_value"),
         "tree_rename_path": shell.get("tree_rename_path"),
         "focused": bool(dom.get("tree_rename_input_focused")),
+        "selection_start": dom.get("tree_rename_input_selection_start"),
+        "selection_end": dom.get("tree_rename_input_selection_end"),
+        "selected_token": dom.get("tree_rename_input_selected_token"),
         "degraded_reason": dom.get("degraded_reason"),
         "snapshot_mode": dom.get("snapshot_mode"),
         "active_element": active,
@@ -5015,6 +5119,7 @@ def wait_for_session_focus(pid: int, session: str, timeout_seconds: float = 12.0
     last_dismiss_attempt = 0.0
     last_focus_attempt = 0.0
     last_open_attempt = 0.0
+    last_rename_commit_attempt = 0.0
     last_open_error = ""
     while time.time() < deadline:
         last_state = app_state(pid)
@@ -5040,6 +5145,21 @@ def wait_for_session_focus(pid: int, session: str, timeout_seconds: float = 12.0
                 last_state = app_state(pid)
         active_element = (last_state.get("dom") or {}).get("active_element") or {}
         shell = last_state.get("shell") or {}
+        active_title = str(last_state.get("active_title") or "").strip()
+        rename_path = normalize_live_path(str(shell.get("tree_rename_path") or ""))
+        if (
+            rename_path == normalized_session
+            and active_title
+            and tree_rename_input_value(last_state) == active_title
+            and time.time() - last_rename_commit_attempt >= 0.75
+        ):
+            try:
+                xdotool_key_window(pid, "Return")
+                last_rename_commit_attempt = time.time()
+                time.sleep(0.18)
+                last_state = app_state(pid)
+            except Exception:
+                last_rename_commit_attempt = time.time()
         helper_active = active_element.get("class_name") == "xterm-helper-textarea"
         settings_dom_active = active_element.get("data_settings_field_key") in {
             "interface-llm",
@@ -6621,24 +6741,62 @@ def assert_titlebar_copy_regeneration_contract(pid: int) -> dict:
             baseline = close_right_panel(pid, baseline, timeout_seconds=1.5)
         app_set_search(pid, "", focused=False)
         baseline = wait_for_window_focus(pid, timeout_seconds=3.0)
-        regen_click = invoke_sidebar_context_menu_action(
+        if titlebar_transient_open(baseline):
+            baseline = dismiss_titlebar_transients(pid, baseline, timeout_seconds=1.5)
+        session_button_rect = titlebar_session_click_rect(baseline)
+        if not rect_is_visible(session_button_rect):
+            raise AssertionError(f"titlebar session button missing before regeneration probe: {baseline!r}")
+        menu_click = xdotool_click_window(
             pid,
-            created_session,
-            "regenerate-copy",
-            row_kind="Session",
+            rect_center_x(session_button_rect),
+            rect_center_y(session_button_rect),
+        )
+        opened = {}
+        regen_rect = {}
+        deadline = time.time() + 6.0
+        while time.time() < deadline:
+            opened = app_state(pid)
+            regen_rect = dom_rect(opened, "titlebar_summary_regenerate_summary_rect")
+            if (
+                rect_is_visible(dom_rect(opened, "titlebar_summary_menu_rect"))
+                and rect_is_visible(regen_rect)
+            ):
+                break
+            time.sleep(0.08)
+        else:
+            raise AssertionError(
+                "titlebar session summary menu did not expose the regenerate button: "
+                f"menu_click={menu_click!r} state={opened!r}"
+            )
+        regen_click = xdotool_click_window(
+            pid,
+            rect_center_x(regen_rect),
+            rect_center_y(regen_rect),
         )
         queued = {}
+        queued_reason = ""
         deadline = time.time() + 4.0
         while time.time() < deadline:
             queued = app_state(pid)
             last_action = str(((queued.get("shell") or {}).get("last_action") or "")).lower()
             visible = visible_notifications(queued)
+            active_title = str(queued.get("active_title") or "").strip()
+            active_summary = str(queued.get("active_summary") or "").strip()
             if (
                 "generating title" in last_action
                 or "regenerating title" in last_action
                 or "queued copy regeneration" in last_action
                 or any("generating" in str(item).lower() or "regenerating" in str(item).lower() for item in visible)
             ):
+                queued_reason = "queued"
+                break
+            if (
+                active_title
+                and (active_title != baseline_title or active_summary != baseline_summary)
+                and not contains_terminal_control_bytes(active_title)
+                and not contains_terminal_control_bytes(active_summary)
+            ):
+                queued_reason = "completed_before_queue_sample"
                 break
             time.sleep(0.08)
         else:
@@ -6679,10 +6837,213 @@ def assert_titlebar_copy_regeneration_contract(pid: int) -> dict:
             "session_path": created_session,
             "baseline_title": baseline_title,
             "baseline_summary": baseline_summary,
+            "menu_click": menu_click,
+            "regen_rect": regen_rect,
             "regen_click": regen_click,
+            "queued_reason": queued_reason,
             "queued_last_action": (queued.get("shell") or {}).get("last_action"),
             "final_title": final_title,
             "final_summary": final_summary,
+        }
+    finally:
+        if created_session:
+            try:
+                app_remove_session(pid, created_session)
+            except Exception:
+                pass
+
+
+def assert_titlebar_title_click_rename_contract(pid: int) -> dict:
+    created_session = ""
+    try:
+        baseline_title = "Titlebar Rename Baseline"
+        created = app_create_terminal(pid, title=baseline_title)
+        created_session = str(created.get("session_path") or "").strip()
+        if not created_session:
+            raise AssertionError(f"titlebar rename setup did not create a session: {created!r}")
+        initial_rename_settle: dict = {}
+        settle_deadline = time.time() + 2.5
+        while time.time() < settle_deadline:
+            initial_state = app_state(pid)
+            initial_rename_path = str(
+                ((initial_state.get("shell") or {}).get("tree_rename_path") or "")
+            ).strip()
+            initial_row = find_visible_sidebar_row_by_path(
+                initial_state,
+                created_session,
+                kind="Session",
+            )
+            if initial_rename_path == created_session and tree_rename_input_value(initial_state) == baseline_title:
+                xdotool_key_window(pid, "Return")
+                deadline = time.time() + 8.0
+                while time.time() < deadline:
+                    initial_rename_settle = app_state(pid)
+                    settled_row = find_visible_sidebar_row_by_path(
+                        initial_rename_settle,
+                        created_session,
+                        kind="Session",
+                    )
+                    if (
+                        not str(
+                            ((initial_rename_settle.get("shell") or {}).get("tree_rename_path") or "")
+                        ).strip()
+                        and settled_row is not None
+                        and str(settled_row.get("label") or "").strip() == baseline_title
+                    ):
+                        break
+                    time.sleep(0.08)
+                else:
+                    raise AssertionError(
+                        "titlebar rename setup started in inline rename mode but did not commit cleanly: "
+                        f"expected={baseline_title!r} state={initial_rename_settle!r}"
+                    )
+                break
+            if (
+                not initial_rename_path
+                and initial_row is not None
+                and str(initial_row.get("label") or "").strip() == baseline_title
+            ):
+                break
+            time.sleep(0.08)
+        wait_for_session_focus(pid, created_session, timeout_seconds=12.0)
+        baseline = wait_for_window_focus(pid, timeout_seconds=3.0)
+        if right_panel_mode(baseline) not in ("", "hidden", "none", "null"):
+            baseline = close_right_panel(pid, baseline, timeout_seconds=1.5)
+        app_set_search(pid, "", focused=False)
+        baseline = wait_for_window_focus(pid, timeout_seconds=3.0)
+        if titlebar_transient_open(baseline):
+            baseline = dismiss_titlebar_transients(pid, baseline, timeout_seconds=1.5)
+
+        def wait_for_focused_rename(expected_value: str, context: str) -> tuple[dict, list[dict]]:
+            renamed_state = {}
+            trace: list[dict] = []
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                renamed_state = app_state(pid)
+                dom = renamed_state.get("dom") or {}
+                trace.append(tree_rename_observation(renamed_state))
+                if (
+                    str(((renamed_state.get("shell") or {}).get("tree_rename_path") or "")).strip()
+                    == created_session
+                    and not rect_is_visible(dom_rect(renamed_state, "titlebar_summary_menu_rect"))
+                    and bool(dom.get("tree_rename_input_focused"))
+                    and str(dom.get("tree_rename_input_value") or "") == expected_value
+                    and dom.get("tree_rename_input_selection_start") == 0
+                    and dom.get("tree_rename_input_selection_end") == len(expected_value)
+                ):
+                    return renamed_state, trace
+                time.sleep(0.04)
+            raise AssertionError(
+                f"{context} did not enter focused sidebar rename mode: "
+                f"expected={expected_value!r} trace={trace!r} state={renamed_state!r}"
+            )
+
+        def type_and_commit(target: str, context: str) -> dict:
+            xdotool_type_window(pid, target)
+            typed = {}
+            deadline = time.time() + 2.5
+            while time.time() < deadline:
+                typed = app_state(pid)
+                if tree_rename_input_value(typed) == target:
+                    break
+                time.sleep(0.04)
+            else:
+                raise AssertionError(
+                    f"{context} typing did not replace the selected title: "
+                    f"target={target!r} state={typed!r}"
+                )
+            xdotool_key_window(pid, "Return")
+            committed_state = {}
+            deadline = time.time() + 8.0
+            while time.time() < deadline:
+                committed_state = app_state(pid)
+                row = find_visible_sidebar_row_by_path(committed_state, created_session, kind="Session")
+                active_title = str(committed_state.get("active_title") or "").strip()
+                if (
+                    not str(((committed_state.get("shell") or {}).get("tree_rename_path") or "")).strip()
+                    and row is not None
+                    and str(row.get("label") or "").strip() == target
+                    and active_title == target
+                ):
+                    return committed_state
+                time.sleep(0.08)
+            raise AssertionError(
+                f"{context} did not commit to the active title and sidebar row: "
+                f"target={target!r} state={committed_state!r}"
+            )
+
+        chip_title_rect = titlebar_title_click_rect(baseline)
+        if not rect_is_visible(chip_title_rect):
+            raise AssertionError(f"titlebar title rect missing before chip-title rename: {baseline!r}")
+        chip_title_click = xdotool_click_window(
+            pid,
+            rect_center_x(chip_title_rect),
+            rect_center_y(chip_title_rect),
+        )
+        chip_renamed, chip_focus_trace = wait_for_focused_rename(
+            baseline_title,
+            "clicking the titlebar chip title",
+        )
+        chip_target = "titlebar chip rename proof"
+        chip_committed = type_and_commit(chip_target, "titlebar chip rename")
+
+        baseline = wait_for_window_focus(pid, timeout_seconds=3.0)
+        if titlebar_transient_open(baseline):
+            baseline = dismiss_titlebar_transients(pid, baseline, timeout_seconds=1.5)
+        session_button_rect = titlebar_session_click_rect(baseline)
+        if not rect_is_visible(session_button_rect):
+            raise AssertionError(f"titlebar session button missing before modal-title rename: {baseline!r}")
+        menu_click = xdotool_click_window(
+            pid,
+            rect_center_x(session_button_rect),
+            rect_center_y(session_button_rect),
+        )
+        opened = {}
+        title_rect = {}
+        deadline = time.time() + 6.0
+        while time.time() < deadline:
+            opened = app_state(pid)
+            title_rect = dom_rect(opened, "titlebar_summary_title_rect")
+            if (
+                rect_is_visible(dom_rect(opened, "titlebar_summary_menu_rect"))
+                and rect_is_visible(title_rect)
+            ):
+                break
+            time.sleep(0.08)
+        else:
+            raise AssertionError(
+                "titlebar summary modal did not expose a clickable title for rename: "
+                f"menu_click={menu_click!r} state={opened!r}"
+            )
+
+        modal_title_click = xdotool_click_window(pid, rect_center_x(title_rect), rect_center_y(title_rect))
+        modal_renamed, modal_focus_trace = wait_for_focused_rename(
+            chip_target,
+            "clicking the titlebar summary title",
+        )
+        modal_target = "titlebar modal rename proof"
+        committed = type_and_commit(modal_target, "titlebar modal-title rename")
+
+        return {
+            "session_path": created_session,
+            "initial_rename_settle": (
+                tree_rename_observation(initial_rename_settle)
+                if initial_rename_settle
+                else {}
+            ),
+            "chip_title_rect": chip_title_rect,
+            "chip_title_click": chip_title_click,
+            "chip_focus_trace": chip_focus_trace[-3:],
+            "chip_rename_state": tree_rename_observation(chip_renamed),
+            "chip_target": chip_target,
+            "chip_final_title": str(chip_committed.get("active_title") or "").strip(),
+            "menu_click": menu_click,
+            "modal_title_rect": title_rect,
+            "modal_title_click": modal_title_click,
+            "modal_focus_trace": modal_focus_trace[-3:],
+            "modal_rename_state": tree_rename_observation(modal_renamed),
+            "modal_target": modal_target,
+            "final_title": str(committed.get("active_title") or "").strip(),
         }
     finally:
         if created_session:
@@ -9760,6 +10121,7 @@ def assert_context_menu_rename_session(pid: int) -> dict:
 
         focus_deadline = time.time() + 2.5
         focus_trace: list[dict] = []
+        initial_rename_value = "Smoke Rename Baseline"
         while time.time() < focus_deadline:
             renamed = app_state(pid)
             dom = renamed.get("dom") or {}
@@ -9773,6 +10135,8 @@ def assert_context_menu_rename_session(pid: int) -> dict:
                     "tree_rename_input_focused": bool(dom.get("tree_rename_input_focused")),
                     "tree_rename_input_rect": dom_rect(renamed, "tree_rename_input_rect"),
                     "tree_rename_input_value": str(dom.get("tree_rename_input_value") or ""),
+                    "selection_start": dom.get("tree_rename_input_selection_start"),
+                    "selection_end": dom.get("tree_rename_input_selection_end"),
                     "active_tag": str(active_element.get("tag_name") or ""),
                     "active_class": str(active_element.get("class_name") or ""),
                     "active_tree_rename_input": str(active_element.get("data_tree_rename_input") or ""),
@@ -9780,19 +10144,24 @@ def assert_context_menu_rename_session(pid: int) -> dict:
                     "input_enabled": bool((active_host_or_none(renamed) or {}).get("input_enabled")),
                 }
             )
-            if bool(dom.get("tree_rename_input_focused")):
+            if (
+                bool(dom.get("tree_rename_input_focused"))
+                and str(dom.get("tree_rename_input_value") or "") == initial_rename_value
+                and dom.get("tree_rename_input_selection_start") == 0
+                and dom.get("tree_rename_input_selection_end") == len(initial_rename_value)
+            ):
                 break
             time.sleep(0.02)
         else:
             raise AssertionError(
-                "rename mode opened without focusing the rename input: "
+                "rename mode opened without focusing the rename input and selecting the current title: "
                 f"trace={focus_trace!r} final={renamed!r}"
             )
 
-        rename_target = "htop smoke proof"
+        overwrite_target = "apt install"
         typed_progress: list[dict] = []
         typed_value = ""
-        for ch in rename_target:
+        for ch in overwrite_target:
             xdotool_type_window(pid, ch)
             typed_value += ch
             current_value = ""
@@ -9811,9 +10180,43 @@ def assert_context_menu_rename_session(pid: int) -> dict:
                 time.sleep(0.02)
             else:
                 raise AssertionError(
-                    "rename input replaced the whole value while typing instead of appending the next character: "
+                    "rename input did not overwrite the initially selected title while typing: "
                     f"expected={typed_value!r} actual={current_value!r} trace={typed_progress!r} state={renamed!r}"
                 )
+
+        ctrl_a = xdotool_key_window(pid, "ctrl+a")
+        selected_after_ctrl_a = {}
+        ctrl_a_deadline = time.time() + 2.5
+        while time.time() < ctrl_a_deadline:
+            selected_after_ctrl_a = app_state(pid)
+            dom = selected_after_ctrl_a.get("dom") or {}
+            if (
+                bool(dom.get("tree_rename_input_focused"))
+                and str(dom.get("tree_rename_input_value") or "") == overwrite_target
+                and dom.get("tree_rename_input_selection_start") == 0
+                and dom.get("tree_rename_input_selection_end") == len(overwrite_target)
+            ):
+                break
+            time.sleep(0.04)
+        else:
+            raise AssertionError(
+                "Ctrl+A in the rename input did not stay owned by the input: "
+                f"key={ctrl_a!r} state={selected_after_ctrl_a!r}"
+            )
+
+        rename_target = "htop smoke proof"
+        xdotool_type_window(pid, rename_target)
+        final_type_deadline = time.time() + 2.5
+        while time.time() < final_type_deadline:
+            renamed = app_state(pid)
+            if tree_rename_input_value(renamed) == rename_target:
+                break
+            time.sleep(0.04)
+        else:
+            raise AssertionError(
+                "typing after Ctrl+A did not replace the rename value exactly: "
+                f"expected={rename_target!r} actual={tree_rename_input_value(renamed)!r} state={renamed!r}"
+            )
 
         xdotool_key_window(pid, "Return")
         committed = {}
@@ -9844,6 +10247,72 @@ def assert_context_menu_rename_session(pid: int) -> dict:
                 "renamed session summary is still low-signal command/prompt copy after commit: "
                 f"summary={summary_before_switch!r} state={committed!r}"
             )
+
+        click_away_target = "click away proof"
+        click_away_open = invoke_sidebar_context_menu_action(
+            pid,
+            target_path,
+            "rename-session",
+            row_kind="Session",
+        )
+        click_away_focus_trace: list[dict] = []
+        click_away_state = {}
+        click_away_focus_deadline = time.time() + 2.5
+        while time.time() < click_away_focus_deadline:
+            click_away_state = app_state(pid)
+            dom = click_away_state.get("dom") or {}
+            click_away_focus_trace.append(tree_rename_observation(click_away_state))
+            if (
+                bool(dom.get("tree_rename_input_focused"))
+                and str(dom.get("tree_rename_input_value") or "") == rename_target
+                and dom.get("tree_rename_input_selection_start") == 0
+                and dom.get("tree_rename_input_selection_end") == len(rename_target)
+            ):
+                break
+            time.sleep(0.04)
+        else:
+            raise AssertionError(
+                "second rename did not select the current title before click-away proof: "
+                f"trace={click_away_focus_trace!r} state={click_away_state!r}"
+            )
+        xdotool_type_window(pid, click_away_target)
+        typed_click_away = {}
+        click_away_type_deadline = time.time() + 2.5
+        while time.time() < click_away_type_deadline:
+            typed_click_away = app_state(pid)
+            if tree_rename_input_value(typed_click_away) == click_away_target:
+                break
+            time.sleep(0.04)
+        else:
+            raise AssertionError(
+                "click-away rename setup did not replace the selected title: "
+                f"expected={click_away_target!r} state={typed_click_away!r}"
+            )
+        main_rect = main_surface_click_rect(typed_click_away)
+        if not rect_is_visible(main_rect):
+            raise AssertionError(f"main surface rect missing for click-away proof: {typed_click_away!r}")
+        click_away_click = xdotool_click_window(pid, rect_center_x(main_rect), rect_center_y(main_rect))
+        click_away_committed = {}
+        click_away_deadline = time.time() + 8.0
+        while time.time() < click_away_deadline:
+            click_away_committed = app_state(pid)
+            row = find_visible_sidebar_row_by_path(click_away_committed, target_path, kind="Session")
+            active_title = str(click_away_committed.get("active_title") or "").strip()
+            if (
+                not str(((click_away_committed.get("shell") or {}).get("tree_rename_path") or "")).strip()
+                and row is not None
+                and str(row.get("label") or "").strip() == click_away_target
+                and active_title == click_away_target
+            ):
+                break
+            time.sleep(0.08)
+        else:
+            raise AssertionError(
+                "clicking outside the rename input did not exit rename mode and commit: "
+                f"target={click_away_target!r} state={click_away_committed!r}"
+            )
+        rename_target = click_away_target
+        summary_before_switch = str(click_away_committed.get("active_summary") or "").strip()
 
         secondary = app_create_terminal(pid, title="Smoke Rename Secondary")
         secondary_session = str(secondary.get("session_path") or "").strip()
@@ -9939,7 +10408,13 @@ def assert_context_menu_rename_session(pid: int) -> dict:
             "menu_rect": dom_rect(opened, "context_menu_rect"),
             "rename_rect": rename_rect,
             "rename_click": rename_click,
+            "initial_rename_value": initial_rename_value,
+            "overwrite_target": overwrite_target,
             "typed_progress": typed_progress,
+            "ctrl_a": ctrl_a,
+            "selected_after_ctrl_a": tree_rename_observation(selected_after_ctrl_a),
+            "click_away_open": click_away_open,
+            "click_away_click": click_away_click,
             "tree_rename_input_rect": dom_rect(renamed, "tree_rename_input_rect"),
             "summary_before_switch": summary_before_switch,
             "summary_after_return": str(returned.get("active_summary") or "").strip(),
@@ -10449,12 +10924,18 @@ def assert_live_sessions_tree_contract(pid: int) -> dict:
         for row in live_group_children
         if str(row.get("kind") or "").strip() == "Session"
     }
+    live_group_child_indexes = (
+        set(range(live_group_index + 1, live_group_index + 1 + len(live_group_children)))
+        if live_group_index is not None
+        else set()
+    )
     duplicate_tree_live_rows = [
         row
-        for row in dom_rows
-        if normalize_live_path(str(row.get("path") or "")) in live_group_paths
+        for index, row in enumerate(dom_rows)
+        if index not in live_group_child_indexes
+        and normalize_live_path(str(row.get("path") or "")) in live_group_paths
         and str(row.get("kind") or "").strip() == "Session"
-        and not bool(row.get("live_member"))
+        and bool(row.get("live_member"))
     ]
     if duplicate_tree_live_rows:
         raise AssertionError(
@@ -10579,12 +11060,18 @@ def assert_sidebar_contract(pid: int, session: str) -> dict:
         for row in live_group_children
         if str(row.get("kind") or "").strip() == "Session"
     }
+    live_group_child_indexes = (
+        set(range(live_group_index + 1, live_group_index + 1 + len(live_group_children)))
+        if live_group_index is not None
+        else set()
+    )
     duplicate_tree_live_rows = [
         row
-        for row in dom_rows
-        if normalize_live_path(str(row.get("path") or "")) in live_group_paths
+        for index, row in enumerate(dom_rows)
+        if index not in live_group_child_indexes
+        and normalize_live_path(str(row.get("path") or "")) in live_group_paths
         and str(row.get("kind") or "").strip() == "Session"
-        and not bool(row.get("live_member"))
+        and bool(row.get("live_member"))
     ]
     if duplicate_tree_live_rows:
         raise AssertionError(
@@ -13270,6 +13757,7 @@ def main() -> int:
             lambda: assert_folder_create_rename_collapse_contract(args.pid),
         )
         run_check("titlebar_copy_regeneration", lambda: assert_titlebar_copy_regeneration_contract(args.pid))
+        run_check("titlebar_title_click_rename", lambda: assert_titlebar_title_click_rename_contract(args.pid))
         run_check(
             "terminal_interactive_lifecycle",
             lambda: assert_terminal_interactive_lifecycle(args.pid, args.session),

@@ -3143,20 +3143,50 @@ impl ShellState {
         let Some(rename_path) = self.tree_rename_path.clone() else {
             return false;
         };
-        self.browser.ensure_visible_path(&rename_path);
-        if let Some(rename_depth) = self
+        if self
             .browser
             .rows()
             .iter()
-            .find(|row| row.full_path == rename_path)
-            .map(|row| row.depth)
+            .any(|row| row.full_path == rename_path)
         {
-            self.tree_rename_depth = Some(rename_depth);
             self.browser.select_path(rename_path.clone());
         }
         self.selected_tree_paths.clear();
         self.selected_tree_paths.insert(rename_path.clone());
         self.selection_anchor = Some(rename_path);
+        true
+    }
+    fn active_titlebar_rename_row(&self) -> Option<BrowserRow> {
+        let active = self.server.active_session()?;
+        let active_path = normalize_live_session_path(&active.session_path);
+        let snapshot = self.snapshot();
+        if let Some(row) = selected_sidebar_row_from_rows(
+            &snapshot.rows,
+            &self.selected_tree_paths,
+            self.selection_anchor.as_deref(),
+            snapshot.selected_path.as_deref(),
+        ) && matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document)
+            && (normalize_live_session_path(&row.full_path) == active_path
+                || row.session_id.as_deref() == Some(active.id.as_str()))
+        {
+            return Some(row);
+        }
+        snapshot
+            .rows
+            .iter()
+            .find(|row| {
+                matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document)
+                    && (normalize_live_session_path(&row.full_path) == active_path
+                        || row.session_id.as_deref() == Some(active.id.as_str()))
+            })
+            .cloned()
+    }
+    fn begin_active_titlebar_rename(&mut self) -> bool {
+        let Some(row) = self.active_titlebar_rename_row() else {
+            return false;
+        };
+        self.begin_tree_rename(&row);
+        self.titlebar_session_menu_open = false;
         true
     }
     fn background_active_selection_sync_needed(&self) -> bool {
@@ -9020,7 +9050,7 @@ fn app_control_pointer_script(command: &AppControlPointerCommand) -> String {
             }}
             const element = target instanceof Element ? target : null;
             const actionable = element ? element.closest(
-              '[data-titlebar-session-button="1"], [data-titlebar-summary-action="copy"], [data-titlebar-summary-action="summary"]'
+              '[data-titlebar-session-button="1"], [data-titlebar-title="1"], [data-titlebar-summary-title="1"], [data-titlebar-summary-action="copy"], [data-titlebar-summary-action="summary"]'
             ) : null;
             if (!actionable || typeof actionable.click !== 'function') {{
               return false;
@@ -9229,6 +9259,15 @@ fn app_control_key_script(command: &AppControlKeyCommand) -> String {
             if (normalized === 'ctrl+u' || normalized === 'control+u') {{
               return {{ key: 'u', code: 'KeyU', keyCode: 85, ctrlKey: true }};
             }}
+            if (normalized === 'ctrl+a' || normalized === 'control+a' || normalized === 'meta+a' || normalized === 'cmd+a' || normalized === 'command+a') {{
+              return {{
+                key: 'a',
+                code: 'KeyA',
+                keyCode: 65,
+                ctrlKey: normalized === 'ctrl+a' || normalized === 'control+a',
+                metaKey: normalized === 'meta+a' || normalized === 'cmd+a' || normalized === 'command+a',
+              }};
+            }}
             if (raw.length === 1) {{
               const upper = raw.toUpperCase();
               return {{
@@ -9361,6 +9400,18 @@ fn app_control_key_script(command: &AppControlKeyCommand) -> String {
             if (spec.ctrlKey && String(spec.key || '').toLowerCase() === 'u') {{
               const nextValue = state.value.slice(state.end);
               applyEditableMutation(target, nextValue, 0, 0, 'deleteSoftLineBackward', null);
+              return true;
+            }}
+            if (spec.key === 'Enter') {{
+              try {{
+                if (typeof target.blur === 'function') {{
+                  target.blur();
+                }}
+              }} catch (_error) {{}}
+              return true;
+            }}
+            if ((spec.ctrlKey || spec.metaKey) && String(spec.key || '').toLowerCase() === 'a') {{
+              setSelection(target, 0, state.value.length);
               return true;
             }}
             if (spec.key === 'End') {{
@@ -14754,6 +14805,13 @@ fn queue_new_separator_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
     });
 }
 fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: String) {
+    let rename_is_current = {
+        let shell = state.read();
+        shell.tree_rename_path.as_deref() == Some(row.full_path.as_str())
+    };
+    if !rename_is_current {
+        return;
+    }
     let trimmed = label.trim().to_string();
     if trimmed.is_empty() {
         state.with_mut(|shell| shell.cancel_tree_rename());
@@ -14773,7 +14831,13 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
     state.with_mut(|shell| {
         shell.server_busy = true;
         shell.last_action = format!("renaming {}", row.label);
+        shell.tree_rename_path = None;
+        shell.tree_rename_depth = None;
+        shell.tree_rename_value.clear();
+        shell.tree_rename_started_at_ms = 0;
+        shell.tree_rename_input_focused_once = false;
     });
+    sync_active_terminal_input_policy(state);
     let settings = state.read().settings.clone();
     spawn(async move {
         let row_for_task = row.clone();
@@ -14861,11 +14925,6 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
                         .server
                         .set_session_title_hint(&row.full_path, &trimmed);
                 }
-                shell.tree_rename_path = None;
-                shell.tree_rename_depth = None;
-                shell.tree_rename_value.clear();
-                shell.tree_rename_started_at_ms = 0;
-                shell.tree_rename_input_focused_once = false;
                 shell.server_busy = false;
                 shell.last_action = format!("renamed {}", trimmed);
                 shell.refresh_tree_debug("commit_tree_rename");
@@ -17142,6 +17201,7 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                 || null;
             const titlebarSummary = titlebar?.querySelector('[data-titlebar-summary-body="1"]') || null;
             const titlebarSummaryMenu = titlebar?.querySelector('[data-titlebar-summary-menu="1"]') || null;
+            const titlebarSummaryTitle = titlebarSummaryMenu?.querySelector('[data-titlebar-summary-title="1"]') || null;
             const titlebarSummaryRegenerateSummary = titlebarSummaryMenu?.querySelector('[data-titlebar-summary-action="copy"], [data-titlebar-summary-action="summary"]') || null;
             const titlebarNewMenuOuter = titlebar?.querySelector('[data-titlebar-new-menu="1"]') || null;
             const titlebarNewMenu = titlebarNewMenuOuter?.querySelector('[data-titlebar-new-menu-shell="1"]')
@@ -18509,6 +18569,8 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                         return null;
                     }
                 }).filter((value) => value != null),
+                titlebar_title_rect: rectSummary(titlebarTitle),
+                titlebar_title_text: String(titlebarTitle?.textContent || '').trim().slice(0, 240),
                 titlebar_session_button_rect: rectSummary(titlebarButton),
                 titlebar_session_button_hit_target: elementSummaryAtPoint(rectSummary(titlebarButton)),
                 titlebar_session_button_background: titlebarButton ? String(window.getComputedStyle(titlebarButton).backgroundColor || '') : null,
@@ -18521,6 +18583,8 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                 titlebar_summary_menu_border_top_width: titlebarSummaryMenu ? String(window.getComputedStyle(titlebarSummaryMenu).borderTopWidth || '') : null,
                 titlebar_summary_menu_border_top_color: titlebarSummaryMenu ? String(window.getComputedStyle(titlebarSummaryMenu).borderTopColor || '') : null,
                 titlebar_summary_menu_border_radius: titlebarSummaryMenu ? String(window.getComputedStyle(titlebarSummaryMenu).borderRadius || '') : null,
+                titlebar_summary_title_rect: rectSummary(titlebarSummaryTitle),
+                titlebar_summary_title_text: String(titlebarSummaryTitle?.textContent || '').trim().slice(0, 240),
                 titlebar_summary_body_rect: rectSummary(titlebarSummary),
                 titlebar_summary_actions_rect: null,
                 titlebar_summary_regenerate_title_rect: null,
@@ -18558,6 +18622,9 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                 tree_rename_input_hit_target: elementSummaryAtPoint(rectSummary(treeRenameInput)),
                 tree_rename_input_focused: treeRenameInputs.some((node) => node === document.activeElement),
                 tree_rename_input_value: treeRenameInput ? String(treeRenameInput.value || '') : '',
+                tree_rename_input_selection_start: treeRenameInput && typeof treeRenameInput.selectionStart === 'number' ? Number(treeRenameInput.selectionStart) : null,
+                tree_rename_input_selection_end: treeRenameInput && typeof treeRenameInput.selectionEnd === 'number' ? Number(treeRenameInput.selectionEnd) : null,
+                tree_rename_input_selected_token: treeRenameInput ? String(treeRenameInput.getAttribute('data-tree-rename-selected-token') || '') : '',
                 tree_rename_ai_action_rect: rectSummary(treeRenameAiAction),
                 settings_endpoint_input_rect: rectSummary(settingsEndpointInput),
                 settings_api_key_input_rect: rectSummary(settingsApiKeyInput),
@@ -18799,8 +18866,8 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                 || pickLast(treeRenameInputs)
                 || null;
             const mainSurfaces = rootNode
-                ? Array.from(rootNode.querySelectorAll('[data-main-surface="1"]'))
-                : Array.from(document.querySelectorAll('[data-main-surface="1"]'));
+                ? Array.from(rootNode.querySelectorAll('[data-yggterm-main-surface="1"]'))
+                : Array.from(document.querySelectorAll('[data-yggterm-main-surface="1"]'));
             const mainSurface =
                 pickLast(visibleNodes(mainSurfaces))
                 || pickLast(mainSurfaces)
@@ -18888,6 +18955,17 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
             const titlebarSessionShell = titlebar?.querySelector('[data-titlebar-session-path]')
                 || titlebar?.querySelector('[data-titlebar-session-shell="1"]')
                 || null;
+            const titlebarButton = titlebarSessionShell?.querySelector('[data-titlebar-session-button="1"]')
+                || titlebar?.querySelector('[data-titlebar-session-button="1"]')
+                || null;
+            const titlebarTitle = titlebarButton?.querySelector('[data-titlebar-title="1"]')
+                || titlebar?.querySelector('[data-titlebar-title="1"]')
+                || null;
+            const titlebarSummaryShell = titlebar?.querySelector('[data-titlebar-summary-shell="1"]') || null;
+            const titlebarSummaryMenu = titlebar?.querySelector('[data-titlebar-summary-menu="1"]') || null;
+            const titlebarSummaryTitle = titlebarSummaryMenu?.querySelector('[data-titlebar-summary-title="1"]') || null;
+            const titlebarSummary = titlebar?.querySelector('[data-titlebar-summary-body="1"]') || null;
+            const titlebarSummaryRegenerateSummary = titlebarSummaryMenu?.querySelector('[data-titlebar-summary-action="copy"], [data-titlebar-summary-action="summary"]') || null;
             const titlebarRightGroup = titlebar?.querySelector('[data-yggterm-titlebar-right="1"]') || null;
             const titlebarConnectButton = titlebar?.querySelector('[data-titlebar-connect-button="1"]') || null;
             const titlebarNotificationsButton = titlebar?.querySelector('[data-titlebar-notifications-button="1"]') || null;
@@ -19108,6 +19186,9 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                 tree_rename_input_hit_target: elementSummaryAtPoint(rectSummary(treeRenameInput)),
                 tree_rename_input_focused: treeRenameInputs.some((node) => node === document.activeElement),
                 tree_rename_input_value: treeRenameInput ? String(treeRenameInput.value || '') : '',
+                tree_rename_input_selection_start: treeRenameInput && typeof treeRenameInput.selectionStart === 'number' ? Number(treeRenameInput.selectionStart) : null,
+                tree_rename_input_selection_end: treeRenameInput && typeof treeRenameInput.selectionEnd === 'number' ? Number(treeRenameInput.selectionEnd) : null,
+                tree_rename_input_selected_token: treeRenameInput ? String(treeRenameInput.getAttribute('data-tree-rename-selected-token') || '') : '',
                 main_surface_rect: rectSummary(mainSurface),
                 main_surface_body_rect: rectSummary(mainSurfaceBody),
                 titlebar_count: titlebars.length,
@@ -19122,6 +19203,15 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                 titlebar_search_counter_text: String(titlebarSearchCounter?.textContent || '').trim(),
                 titlebar_new_menu_shell_rect: rectSummary(titlebarNewMenuShell),
                 titlebar_session_shell_rect: rectSummary(titlebarSessionShell),
+                titlebar_title_rect: rectSummary(titlebarTitle),
+                titlebar_title_text: String(titlebarTitle?.textContent || '').trim().slice(0, 240),
+                titlebar_session_button_rect: rectSummary(titlebarButton),
+                titlebar_summary_shell_rect: rectSummary(titlebarSummaryShell),
+                titlebar_summary_menu_rect: rectSummary(titlebarSummaryMenu),
+                titlebar_summary_title_rect: rectSummary(titlebarSummaryTitle),
+                titlebar_summary_title_text: String(titlebarSummaryTitle?.textContent || '').trim().slice(0, 240),
+                titlebar_summary_body_rect: rectSummary(titlebarSummary),
+                titlebar_summary_regenerate_summary_rect: rectSummary(titlebarSummaryRegenerateSummary),
                 titlebar_right_rect: rectSummary(titlebarRightGroup),
                 titlebar_connect_button_rect: rectSummary(titlebarConnectButton),
                 titlebar_connect_button_hit_target: elementSummaryAtPoint(rectSummary(titlebarConnectButton)),
@@ -19274,6 +19364,9 @@ async fn capture_dom_debug_snapshot_action_fallback_for(
                 tree_rename_input_rect: rectSummary(treeRenameInput),
                 tree_rename_input_focused: treeRenameInputs.some((node) => node === activeElement),
                 tree_rename_input_value: treeRenameInput ? String(treeRenameInput.value || '') : '',
+                tree_rename_input_selection_start: treeRenameInput && typeof treeRenameInput.selectionStart === 'number' ? Number(treeRenameInput.selectionStart) : null,
+                tree_rename_input_selection_end: treeRenameInput && typeof treeRenameInput.selectionEnd === 'number' ? Number(treeRenameInput.selectionEnd) : null,
+                tree_rename_input_selected_token: treeRenameInput ? String(treeRenameInput.getAttribute('data-tree-rename-selected-token') || '') : '',
                 titlebar_search_active: titlebarSearchActive,
                 titlebar_search_shell_rect: rectSummary(titlebarSearchShell),
                 titlebar_search_outer_shell_rect: rectSummary(titlebarSearchOuterShell),
@@ -23639,9 +23732,6 @@ fn app() -> Element {
                                 const renamePath = {path_literal};
                                 const renameToken = {rename_token};
                                 const initialValue = {initial_value_literal};
-                                if (window.__yggtermTreeRenameSelectToken === renameToken) {{
-                                    return;
-                                }}
                                 const selector = '[data-tree-rename-input="1"][data-tree-rename-row-path='
                                     + JSON.stringify(renamePath)
                                     + ']{depth_selector}';
@@ -23656,17 +23746,35 @@ fn app() -> Element {
                                 try {{
                                     input.focus({{ preventScroll: true }});
                                     const currentValue = String(input.value || '');
+                                    const valueLength = Number(input.value ? input.value.length : 0);
+                                    const selectionStart = typeof input.selectionStart === 'number' ? Number(input.selectionStart) : -1;
+                                    const selectionEnd = typeof input.selectionEnd === 'number' ? Number(input.selectionEnd) : -1;
+                                    const fullSelection =
+                                        document.activeElement === input
+                                        && selectionStart === 0
+                                        && selectionEnd === valueLength;
+                                    const tokenAlreadyApplied =
+                                        input.getAttribute('data-tree-rename-selected-token') === renameToken
+                                        || window.__yggtermTreeRenameSelectToken === renameToken;
+                                    if (tokenAlreadyApplied && (fullSelection || currentValue !== initialValue)) {{
+                                        return;
+                                    }}
                                     const shouldSelect =
                                         currentValue === initialValue
                                         && document.activeElement === input;
                                     if (shouldSelect && input.select) {{
                                         input.select();
+                                        const selectedStart = typeof input.selectionStart === 'number' ? Number(input.selectionStart) : -1;
+                                        const selectedEnd = typeof input.selectionEnd === 'number' ? Number(input.selectionEnd) : -1;
+                                        if (selectedStart === 0 && selectedEnd === valueLength) {{
+                                            window.__yggtermTreeRenameSelectToken = renameToken;
+                                            input.setAttribute('data-tree-rename-selected-token', renameToken);
+                                        }}
                                     }} else if (typeof input.setSelectionRange === 'function') {{
-                                        const valueLength = Number(input.value ? input.value.length : 0);
                                         input.setSelectionRange(valueLength, valueLength);
+                                        window.__yggtermTreeRenameSelectToken = renameToken;
+                                        input.setAttribute('data-tree-rename-selected-token', renameToken);
                                     }}
-                                    window.__yggtermTreeRenameSelectToken = renameToken;
-                                    input.setAttribute('data-tree-rename-selected-token', renameToken);
                                 }} catch (_error) {{}}
                             }})();"#
                         ));
@@ -24258,10 +24366,25 @@ fn app() -> Element {
                             queue_new_document(state)
                             },
                             on_refresh_summary: move |_| {
-                            if let Some(session) = state.read().server.active_session().cloned() {
+                            let active_session = { state.read().server.active_session().cloned() };
+                            if let Some(session) = active_session {
+                                state.with_mut(|shell| {
+                                    shell.last_action = "queued copy regeneration for active session".to_string();
+                                    shell.push_notification(
+                                        NotificationTone::Info,
+                                        "Regenerating Session Copy",
+                                        "Queued title, precis, and summary regeneration for the active session.".to_string(),
+                                    );
+                                });
                                 queue_active_session_title_generation(state, true);
                                 spawn_precis_generation(state, session.clone(), true);
                                 spawn_summary_generation(state, session, true, true);
+                            }
+                            },
+                            on_begin_active_rename: move |_| {
+                            let renamed = state.with_mut(|shell| shell.begin_active_titlebar_rename());
+                            if renamed {
+                                sync_active_terminal_input_policy(state);
                             }
                             },
                             on_toggle_meta: move || {
@@ -24447,7 +24570,13 @@ fn app() -> Element {
                         on_update_rename: move |value: String| state.with_mut(|shell| shell.update_tree_rename_value(value)),
                         on_focus_rename: move |_| state.with_mut(|shell| shell.note_tree_rename_input_focus()),
                         on_commit_rename: move |row: BrowserRow| {
-                            let label = state.read().tree_rename_value.clone();
+                            let label = {
+                                let shell = state.read();
+                                if shell.tree_rename_path.as_deref() != Some(row.full_path.as_str()) {
+                                    return;
+                                }
+                                shell.tree_rename_value.clone()
+                            };
                             queue_tree_rename(state, row, label);
                         },
                         on_cancel_rename: move |_| {
@@ -24778,6 +24907,7 @@ fn Titlebar(
     on_start_terminal: EventHandler<()>,
     on_create_paper: EventHandler<()>,
     on_refresh_summary: EventHandler<()>,
+    on_begin_active_rename: EventHandler<()>,
     on_toggle_meta: EventHandler<()>,
     on_toggle_settings: EventHandler<()>,
     on_toggle_connect: EventHandler<()>,
@@ -24824,6 +24954,7 @@ fn Titlebar(
         active_title.clone().unwrap_or_default(),
         active_summary.clone().unwrap_or_default()
     );
+    let titlebar_session_menu_open = snapshot.titlebar_session_menu_open;
     let search_dropdown_open = titlebar_search_dropdown_open(&snapshot);
     let search_placeholder = if snapshot.command_mode_active {
         "/ Run a yggterm command"
@@ -25152,12 +25283,13 @@ fn Titlebar(
                             ondoubleclick: |evt| evt.stop_propagation(),
                             button {
                                 "data-titlebar-session-button": "1",
+                                title: if titlebar_session_menu_open { "Close session details" } else { "Session details" },
                                 style: format!(
                                     "display:flex; align-items:center; gap:8px; width:100%; height:{}px; padding:0 12px; border:none; \
                                      border-radius:{}; background:{}; color:{}; box-shadow:{}; clip-path:{}; \
                                      font-size:12px; font-weight:700; cursor:pointer; min-width:0; box-sizing:border-box; position:relative; z-index:{};",
                                     titlebar_modal_tab_height,
-                                    if snapshot.titlebar_session_menu_open {
+                                    if titlebar_session_menu_open {
                                         "11px 11px 0 0"
                                     } else {
                                         "11px"
@@ -25184,9 +25316,22 @@ fn Titlebar(
                                     evt.stop_propagation();
                                     on_toggle_session_menu.call(());
                                 },
+                                ondoubleclick: move |evt| {
+                                    evt.stop_propagation();
+                                    on_begin_active_rename.call(());
+                                },
                                 span {
                                     "data-titlebar-title": "1",
-                                    style: "min-width:0; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; text-align:left;",
+                                    title: "Rename session",
+                                    style: "min-width:0; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; text-align:left; cursor:text;",
+                                    onmousedown: |evt| {
+                                        evt.prevent_default();
+                                        evt.stop_propagation();
+                                    },
+                                    onclick: move |evt| {
+                                        evt.stop_propagation();
+                                        on_begin_active_rename.call(());
+                                    },
                                     "{active_title}"
                                 }
                                 if let Some(loading_label) = titlebar_loading_label.clone() {
@@ -25243,7 +25388,17 @@ fn Titlebar(
                                         div {
                                             style: "display:flex; align-items:flex-start; justify-content:space-between; gap:12px;",
                                             div {
-                                                style: format!("font-size:13px; font-weight:800; color:{}; min-width:0; flex:1;", snapshot.palette.text),
+                                                "data-titlebar-summary-title": "1",
+                                                title: "Rename session",
+                                                style: format!("font-size:13px; font-weight:800; color:{}; min-width:0; flex:1; cursor:text;", snapshot.palette.text),
+                                                onmousedown: |evt| {
+                                                    evt.prevent_default();
+                                                    evt.stop_propagation();
+                                                },
+                                                onclick: move |evt| {
+                                                    evt.stop_propagation();
+                                                    on_begin_active_rename.call(());
+                                                },
                                                 "{active_title}"
                                             }
                                             button {
@@ -25872,6 +26027,13 @@ fn Sidebar(
                         return;
                       }}
                       const claimOwner = (target) => {{
+                        if (
+                          target
+                          && target.closest
+                          && target.closest('[data-tree-rename-input="1"], input, textarea, [contenteditable="true"]')
+                        ) {{
+                          return;
+                        }}
                         const row = target && target.closest ? target.closest('[data-sidebar-row-path]') : null;
                         const rowPath = row
                           ? String(row.getAttribute('data-sidebar-row-path') || '')
@@ -26596,15 +26758,21 @@ fn SidebarRow(
                             },
                             oninput: move |evt| on_update_rename.call(evt.value()),
                             onfocus: move |_| on_focus_rename.call(()),
+                            onblur: move |_| on_commit_rename.call(()),
                             onkeydown: move |evt| {
+                                evt.stop_propagation();
                                 if evt.key() == Key::Enter {
-                                on_commit_rename.call(());
+                                    evt.prevent_default();
+                                    on_commit_rename.call(());
                                 } else if evt.key() == Key::Escape {
+                                    evt.prevent_default();
                                     on_cancel_rename.call(());
                                 }
                             },
                             onclick: |evt| evt.stop_propagation(),
                             onmousedown: |evt| evt.stop_propagation(),
+                            onmouseup: |evt| evt.stop_propagation(),
+                            ondoubleclick: |evt| evt.stop_propagation(),
                             oncontextmenu: |evt| {
                             evt.prevent_default();
                             evt.stop_propagation();
@@ -26613,7 +26781,7 @@ fn SidebarRow(
                 } else {
                     span {
                         style: format!(
-                            "min-width:0; font-size:12.25px; font-weight:700; letter-spacing:0.04em; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                            "min-width:0; font-size:11.25px; font-weight:700; letter-spacing:0.04em; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
                             if drop_hovered || selected { palette.accent } else { palette.muted }
                         ),
                         "{row.label}"
@@ -26787,15 +26955,21 @@ fn SidebarRow(
                                 },
                                 oninput: move |evt| on_update_rename.call(evt.value()),
                                 onfocus: move |_| on_focus_rename.call(()),
+                                onblur: move |_| on_commit_rename.call(()),
                                 onkeydown: move |evt| {
+                                    evt.stop_propagation();
                                     if evt.key() == Key::Enter {
+                                        evt.prevent_default();
                                         on_commit_rename.call(());
                                     } else if evt.key() == Key::Escape {
+                                        evt.prevent_default();
                                         on_cancel_rename.call(());
                                     }
                                 },
                                 onclick: |evt| evt.stop_propagation(),
                                 onmousedown: |evt| evt.stop_propagation(),
+                                onmouseup: |evt| evt.stop_propagation(),
+                                ondoubleclick: |evt| evt.stop_propagation(),
                                 oncontextmenu: |evt| {
                                     evt.prevent_default();
                                     evt.stop_propagation();
@@ -26818,7 +26992,7 @@ fn SidebarRow(
                     } else {
                         span {
                             style: format!(
-                                "font-size:13px; color:{}; font-weight:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                                "font-size:12px; color:{}; font-weight:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
                                 label_color,
                                 if row.kind == BrowserRowKind::Group && row.depth == 0 { 600 } else { 500 }
                             ),
@@ -26859,7 +27033,7 @@ fn SidebarRow(
                     }
                 } else if row.kind == BrowserRowKind::Group {
                     span {
-                        style: format!("font-size:10.5px; color:{};", palette.muted),
+                        style: format!("font-size:9.5px; color:{};", palette.muted),
                         "{row.descendant_sessions}"
                     }
                 }
@@ -26870,7 +27044,7 @@ fn SidebarRow(
             {
                 div {
                     style: format!(
-                        "font-size:11px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                        "font-size:10px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
                         palette.muted
                     ),
                     "{row.detail_label}"
@@ -41444,6 +41618,8 @@ mod tests {
         });
         assert!(script.contains("const titlebarClickFallback = (target) =>"));
         assert!(script.contains("[data-titlebar-session-button=\"1\"]"));
+        assert!(script.contains("[data-titlebar-title=\"1\"]"));
+        assert!(script.contains("[data-titlebar-summary-title=\"1\"]"));
         assert!(script.contains("[data-titlebar-summary-action=\"copy\"]"));
         assert!(script.contains("const usedTitlebarFallback = titlebarClickFallback(target);"));
         assert!(script.contains("if (!usedTitlebarFallback) {"));
@@ -41459,6 +41635,24 @@ mod tests {
         assert!(script.contains("const renameInput = treeRenameInput();"));
         assert!(script.contains("if (renameInput) {"));
         assert!(script.contains("return renameInput;"));
+    }
+
+    #[test]
+    fn app_control_key_script_selects_text_inside_rename_input() {
+        let script = app_control_key_script(&AppControlKeyCommand::Press {
+            keys: vec!["ctrl+a".to_string()],
+        });
+        assert!(script.contains("normalized === 'ctrl+a'"));
+        assert!(script.contains("setSelection(target, 0, state.value.length);"));
+    }
+
+    #[test]
+    fn app_control_key_script_blurs_editable_on_enter() {
+        let script = app_control_key_script(&AppControlKeyCommand::Press {
+            keys: vec!["Return".to_string()],
+        });
+        assert!(script.contains("if (spec.key === 'Enter')"));
+        assert!(script.contains("target.blur();"));
     }
 
     #[test]
