@@ -120,6 +120,14 @@ fn legacy_daemon_reap_applies_to_home(
     current_home.is_some() && daemon_home == current_home
 }
 
+#[cfg(target_os = "linux")]
+fn orphan_daemon_reap_applies_to_home(
+    current_home: Option<&Path>,
+    daemon_home: Option<&Path>,
+) -> bool {
+    current_home.is_some() && daemon_home == current_home
+}
+
 fn terminal_sidebar_snapshot_from_screen(text: &str) -> Option<(String, Vec<String>)> {
     let lines = text
         .replace('\r', "")
@@ -460,6 +468,10 @@ pub enum ServerRequest {
     },
     RemoveSession {
         path: String,
+    },
+    SetSessionKeepAlive {
+        path: String,
+        keep_alive: bool,
     },
     StartLocalSession {
         session_kind: SessionKind,
@@ -1187,9 +1199,10 @@ impl DaemonRuntime {
                     })?;
                 }
                 let stop_command = self.server.terminal_stop_command(&path);
+                let runtime_path = self.server.terminal_runtime_key_for_path(&path);
                 let removed_terminal = self
                     .terminals
-                    .remove_session(&path, stop_command.as_deref())?;
+                    .remove_session(&runtime_path, stop_command.as_deref())?;
                 let removed_session = self.server.remove_live_session(&path)?;
                 self.persist()?;
                 self.snapshot_response(Some(if removed_session {
@@ -1197,6 +1210,19 @@ impl DaemonRuntime {
                         format!("removed {path}")
                     } else {
                         format!("removed metadata for {path}")
+                    }
+                } else {
+                    format!("no live session for {path}")
+                }))
+            }
+            ServerRequest::SetSessionKeepAlive { path, keep_alive } => {
+                let updated = self.server.set_live_session_keep_alive(&path, keep_alive)?;
+                self.persist()?;
+                self.snapshot_response(Some(if updated {
+                    if keep_alive {
+                        format!("kept {path} alive")
+                    } else {
+                        format!("stopped keeping {path} alive")
                     }
                 } else {
                     format!("no live session for {path}")
@@ -1941,6 +1967,7 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::UpdateSessionCopy { .. } => "update_session_copy",
         ServerRequest::RemoveSshTarget { .. } => "remove_ssh_target",
         ServerRequest::RemoveSession { .. } => "remove_session",
+        ServerRequest::SetSessionKeepAlive { .. } => "set_session_keep_alive",
         ServerRequest::StartLocalSession { .. } => "start_local_session",
         ServerRequest::SwitchAgentSessionMode { .. } => "switch_agent_session_mode",
         ServerRequest::StartCommandSession { .. } => "start_command_session",
@@ -2217,6 +2244,20 @@ pub fn remove_session(
         endpoint,
         &ServerRequest::RemoveSession {
             path: path.to_string(),
+        },
+    )?)
+}
+
+pub fn set_session_keep_alive(
+    endpoint: &ServerEndpoint,
+    path: &str,
+    keep_alive: bool,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
+    expect_snapshot(send_request(
+        endpoint,
+        &ServerRequest::SetSessionKeepAlive {
+            path: path.to_string(),
+            keep_alive,
         },
     )?)
 }
@@ -3080,6 +3121,8 @@ fn cleanup_legacy_linux_daemon_processes(
     let mut killed_legacy = 0usize;
     let mut killed_orphan = 0usize;
     let mut killed_duplicate_same_home = 0usize;
+    let mut skipped_active_client_legacy = 0usize;
+    let mut skipped_cross_home_orphan = 0usize;
     let proc_entries = fs::read_dir("/proc").context("reading /proc for stale daemon cleanup")?;
     for entry in proc_entries {
         let entry = entry?;
@@ -3131,17 +3174,27 @@ fn cleanup_legacy_linux_daemon_processes(
         let is_legacy_binary =
             legacy_daemon_reap_applies_to_home(current_home.as_deref(), daemon_home.as_deref())
                 && daemon_binary_is_legacy(current_exe, argv0, proc_exe_target.as_deref());
-        let is_orphan_clientless = !has_clients
+        let is_legacy_reapable = is_legacy_binary && !has_clients;
+        if is_legacy_binary && has_clients {
+            skipped_active_client_legacy += 1;
+        }
+        let is_cross_home_orphan_candidate = !has_clients
             && age_ms >= reap_after_ms
             && daemon_home.as_deref() != current_home.as_deref();
+        if is_cross_home_orphan_candidate {
+            skipped_cross_home_orphan += 1;
+        }
+        let is_orphan_clientless = !has_clients
+            && age_ms >= reap_after_ms
+            && orphan_daemon_reap_applies_to_home(current_home.as_deref(), daemon_home.as_deref());
         let is_duplicate_same_home = same_home_daemon_count > 1
             && daemon_home.as_deref() == current_home.as_deref()
             && Some(pid) != oldest_same_home_pid
             && age_ms >= DUPLICATE_SAME_HOME_GRACE_MS
             && !has_clients;
-        if is_legacy_binary || is_orphan_clientless || is_duplicate_same_home {
+        if is_legacy_reapable || is_orphan_clientless || is_duplicate_same_home {
             terminate_linux_process(pid);
-            if is_legacy_binary {
+            if is_legacy_reapable {
                 killed_legacy += 1;
             } else if is_duplicate_same_home {
                 killed_duplicate_same_home += 1;
@@ -3161,6 +3214,8 @@ fn cleanup_legacy_linux_daemon_processes(
                 "killed_legacy": killed_legacy,
                 "killed_orphan": killed_orphan,
                 "killed_duplicate_same_home": killed_duplicate_same_home,
+                "skipped_active_client_legacy": skipped_active_client_legacy,
+                "skipped_cross_home_orphan": skipped_cross_home_orphan,
                 "same_home_daemon_count": same_home_daemon_count,
                 "oldest_same_home_pid": oldest_same_home_pid,
                 "reap_after_ms": reap_after_ms,
@@ -3335,6 +3390,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     use super::linux_yggterm_home_from_environ_bytes;
     use super::load_persisted_state;
+    #[cfg(target_os = "linux")]
+    use super::orphan_daemon_reap_applies_to_home;
     use super::remote_resume_stale_attach;
     use super::terminal_launch_command_for_path;
     use super::write_persisted_state;
@@ -3515,6 +3572,29 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn orphan_daemon_reap_only_applies_within_same_home() {
+        let current_home = Path::new("/home/pi/.yggterm");
+        let other_home = Path::new("/tmp/yggterm-other-home");
+        assert!(orphan_daemon_reap_applies_to_home(
+            Some(current_home),
+            Some(current_home)
+        ));
+        assert!(!orphan_daemon_reap_applies_to_home(
+            Some(current_home),
+            Some(other_home)
+        ));
+        assert!(!orphan_daemon_reap_applies_to_home(
+            Some(current_home),
+            None
+        ));
+        assert!(!orphan_daemon_reap_applies_to_home(
+            None,
+            Some(current_home)
+        ));
+    }
+
     #[test]
     fn write_persisted_state_creates_parent_and_round_trips() {
         let root = std::env::temp_dir().join(format!(
@@ -3534,6 +3614,7 @@ mod tests {
                 id: "demo".to_string(),
                 title: "Demo".to_string(),
                 kind: super::SessionKind::Codex,
+                keep_alive: true,
                 ssh_target: "jojo".to_string(),
                 prefix: None,
                 cwd: Some("/home/pi".to_string()),

@@ -27,11 +27,11 @@ pub use daemon::{
     focus_live_with_view, open_remote_session, open_remote_session_with_view, open_stored_session,
     open_stored_session_with_view, ping, raise_external_window, refresh_managed_cli,
     refresh_preview, refresh_remote_machine, remove_session, remove_ssh_target,
-    request_terminal_launch, run_daemon, set_all_preview_blocks_folded, set_view_mode, shutdown,
-    snapshot, start_command_session, start_local_session, start_local_session_at,
-    start_ssh_session_at, status, switch_agent_session_mode, sync_external_window, sync_theme,
-    terminal_ensure, terminal_read, terminal_resize, terminal_snapshot, terminal_write,
-    toggle_preview_block, update_session_copy,
+    request_terminal_launch, run_daemon, set_all_preview_blocks_folded, set_session_keep_alive,
+    set_view_mode, shutdown, snapshot, start_command_session, start_local_session,
+    start_local_session_at, start_ssh_session_at, status, switch_agent_session_mode,
+    sync_external_window, sync_theme, terminal_ensure, terminal_read, terminal_resize,
+    terminal_snapshot, terminal_write, toggle_preview_block, update_session_copy,
 };
 pub use host::{GhosttyHostKind, GhosttyHostSupport, GhosttyTerminalHostMode, detect_ghostty_host};
 pub use protocol::{
@@ -285,6 +285,31 @@ fn managed_live_session_is_recoverable(key: &str, session: &ManagedSessionView) 
             .ssh_target
             .as_deref()
             .is_some_and(|target| !is_loopback_ssh_target(target))
+}
+
+const RUNTIME_PERSISTENCE_METADATA_LABEL: &str = "Runtime Persistence";
+const RUNTIME_PERSISTENCE_KEEP_ALIVE: &str = "keep-alive";
+
+fn session_keep_alive(session: &ManagedSessionView) -> bool {
+    session
+        .metadata
+        .iter()
+        .find(|entry| entry.label == RUNTIME_PERSISTENCE_METADATA_LABEL)
+        .is_some_and(|entry| entry.value == RUNTIME_PERSISTENCE_KEEP_ALIVE)
+}
+
+fn set_session_keep_alive_metadata(session: &mut ManagedSessionView, keep_alive: bool) {
+    if keep_alive {
+        upsert_session_metadata(
+            &mut session.metadata,
+            "Runtime Persistence",
+            RUNTIME_PERSISTENCE_KEEP_ALIVE.to_string(),
+        );
+    } else {
+        session
+            .metadata
+            .retain(|entry| entry.label != RUNTIME_PERSISTENCE_METADATA_LABEL);
+    }
 }
 
 fn is_local_codex_storage_session_path(path: &str) -> bool {
@@ -706,6 +731,8 @@ pub struct PersistedLiveSession {
     pub title: String,
     #[serde(default = "default_persisted_live_kind")]
     pub kind: SessionKind,
+    #[serde(default)]
+    pub keep_alive: bool,
     pub ssh_target: String,
     pub prefix: Option<String>,
     pub cwd: Option<String>,
@@ -1329,6 +1356,26 @@ impl YggtermServer {
         Ok(true)
     }
 
+    pub fn set_live_session_keep_alive(
+        &mut self,
+        path: &str,
+        keep_alive: bool,
+    ) -> anyhow::Result<bool> {
+        let Some((resolved_key, session)) = self.resolve_live_session_entry(path) else {
+            return Ok(false);
+        };
+        if !matches!(
+            session.source,
+            SessionSource::LiveLocal | SessionSource::LiveSsh
+        ) {
+            anyhow::bail!("only live local or remote sessions can be kept alive");
+        }
+        if let Some(session) = self.sessions.get_mut(&resolved_key) {
+            set_session_keep_alive_metadata(session, keep_alive);
+        }
+        Ok(true)
+    }
+
     pub fn set_session_title_hint(&mut self, session_path: &str, title: &str) {
         if let Some(session) = self.sessions.get_mut(session_path) {
             session.title = title.to_string();
@@ -1630,6 +1677,7 @@ impl YggtermServer {
             .iter()
             .filter_map(|key| self.sessions.get(key).map(|session| (key, session)))
             .filter(|(key, session)| managed_live_session_is_recoverable(key, session))
+            .filter(|(_, session)| session_keep_alive(session))
             .filter_map(|(key, session)| {
                 session
                     .ssh_target
@@ -1639,6 +1687,7 @@ impl YggtermServer {
                         id: session.id.clone(),
                         title: session.title.clone(),
                         kind: session.kind,
+                        keep_alive: true,
                         ssh_target: ssh_target.clone(),
                         prefix: session.ssh_prefix.clone(),
                         cwd: session
@@ -2850,10 +2899,14 @@ impl YggtermServer {
             id,
             title,
             kind,
+            keep_alive,
             ssh_target,
             prefix,
             cwd,
         } = live;
+        if !keep_alive {
+            return;
+        }
         let remote_scanned_key =
             parse_remote_scanned_session_path(&key).map(|(raw_machine_key, session_id)| {
                 let machine_key = normalize_machine_key(raw_machine_key);
@@ -2907,6 +2960,7 @@ impl YggtermServer {
                 if !title.trim().is_empty() && !looks_like_generated_fallback_title(&title) {
                     session.title = title.clone();
                 }
+                set_session_keep_alive_metadata(&mut session, true);
                 self.sessions.insert(normalized_live_key.clone(), session);
                 self.live_session_order
                     .retain(|existing| existing != normalized_live_key);
@@ -2960,6 +3014,7 @@ impl YggtermServer {
                     target.cwd.as_deref(),
                     self.theme,
                 );
+                set_session_keep_alive_metadata(session, true);
             }
             return;
         }
@@ -2971,6 +3026,9 @@ impl YggtermServer {
             Some(title),
             false,
         );
+        if let Some(session) = self.sessions.get_mut(&key) {
+            set_session_keep_alive_metadata(session, true);
+        }
     }
 
     pub fn toggle_preview_block(&mut self, block_ix: usize) {
@@ -8014,7 +8072,7 @@ pub fn ensure_local_daemon_running(endpoint: &ServerEndpoint) -> anyhow::Result<
         return Ok(());
     }
     prepare_endpoint_for_spawn(endpoint)?;
-    spawn_local_daemon_process(&current_exe)?;
+    spawn_local_daemon_process(&current_exe, endpoint)?;
     wait_for_local_daemon(endpoint)
 }
 
@@ -8366,13 +8424,70 @@ pub fn local_daemon_socket_should_be_removed_for_spawn(
     )
 }
 
-fn reap_spawned_child_in_background(mut child: std::process::Child) {
-    std::thread::spawn(move || {
-        let _ = child.wait();
+fn local_spawned_child_exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
+}
+
+fn trace_local_daemon_child_event(
+    endpoint: &ServerEndpoint,
+    name: &str,
+    payload: serde_json::Value,
+) {
+    if let Ok(home) = resolve_yggterm_home() {
+        append_trace_event(
+            &home,
+            "cli",
+            "daemon_recovery",
+            name,
+            json!({
+                "endpoint": format!("{endpoint:?}"),
+                "payload": payload,
+            }),
+        );
+    }
+}
+
+fn reap_spawned_child_in_background(
+    mut child: std::process::Child,
+    endpoint: ServerEndpoint,
+    daemon_exe: PathBuf,
+) {
+    let child_pid = child.id();
+    std::thread::spawn(move || match child.wait() {
+        Ok(status) => trace_local_daemon_child_event(
+            &endpoint,
+            "spawned_daemon_exit",
+            json!({
+                "pid": child_pid,
+                "daemon_exe": daemon_exe.display().to_string(),
+                "success": status.success(),
+                "code": status.code(),
+                "signal": local_spawned_child_exit_signal(&status),
+                "status": status.to_string(),
+            }),
+        ),
+        Err(error) => trace_local_daemon_child_event(
+            &endpoint,
+            "spawned_daemon_wait_error",
+            json!({
+                "pid": child_pid,
+                "daemon_exe": daemon_exe.display().to_string(),
+                "error": error.to_string(),
+            }),
+        ),
     });
 }
 
-fn spawn_local_daemon_process(current_exe: &Path) -> anyhow::Result<()> {
+fn spawn_local_daemon_process(current_exe: &Path, endpoint: &ServerEndpoint) -> anyhow::Result<()> {
     let daemon_exe = local_headless_companion_executable_from_current(current_exe).with_context(|| {
         format!(
             "missing yggterm-headless companion next to {}; build yggterm-headless or install a release bundle that includes it",
@@ -8403,7 +8518,15 @@ fn spawn_local_daemon_process(current_exe: &Path) -> anyhow::Result<()> {
         }
     }
     let child = command.spawn().context("spawning local yggterm daemon")?;
-    reap_spawned_child_in_background(child);
+    trace_local_daemon_child_event(
+        endpoint,
+        "spawned_daemon_child",
+        json!({
+            "pid": child.id(),
+            "daemon_exe": daemon_exe.display().to_string(),
+        }),
+    );
+    reap_spawned_child_in_background(child, endpoint.clone(), daemon_exe);
     Ok(())
 }
 
@@ -10205,6 +10328,24 @@ pub fn run_app_control_create_terminal(
     Ok(())
 }
 
+pub fn run_app_control_set_session_keep_alive(
+    session_path: &str,
+    keep_alive: bool,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::SetSessionKeepAlive {
+            session_path: session_path.to_string(),
+            keep_alive,
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 fn parse_app_control_session_kind(kind: &str) -> anyhow::Result<SessionKind> {
     match kind.trim().to_ascii_lowercase().as_str() {
         "shell" | "terminal" | "plain" => Ok(SessionKind::Shell),
@@ -11590,6 +11731,7 @@ fn canonical_static_label(value: String) -> &'static str {
         "Replay" => "Replay",
         "Replay Commands" => "Replay Commands",
         "Restore" => "Restore",
+        "Runtime Persistence" => "Runtime Persistence",
         "Server Notes" => "Server Notes",
         "Session" => "Session",
         "Source" => "Source",
@@ -16358,6 +16500,7 @@ terminal_window_id: None,
                     id: "missing".to_string(),
                     title: "Stale Live".to_string(),
                     kind: SessionKind::Codex,
+                    keep_alive: true,
                     ssh_target: "dev".to_string(),
                     prefix: None,
                     cwd: Some("/home/pi".to_string()),
@@ -16422,16 +16565,17 @@ terminal_window_id: None,
             id: "abc123".to_string(),
             title: "Restore Live Remote".to_string(),
             kind: SessionKind::SshShell,
+            keep_alive: true,
             ssh_target: "dev".to_string(),
             prefix: None,
             cwd: Some("/home/pi/gh/yggterm".to_string()),
         });
-        server.start_local_session(
+        let local_shell = server.start_local_session(
             SessionKind::Shell,
             Some("/home/pi/gh/yggterm"),
             Some("Smoke Local Shell"),
         );
-        server.start_local_session(
+        let local_codex = server.start_local_session(
             SessionKind::Codex,
             Some("/home/pi/gh/codex-litellm"),
             Some("Remote Codex 019d1518"),
@@ -16441,6 +16585,15 @@ terminal_window_id: None,
             Some("/home/pi"),
             Some("local::ddf8f1ee-8e64-4201-ab3a-2b07424f9b77"),
         );
+        server
+            .set_live_session_keep_alive(&remote_path, true)
+            .expect("keep remote live session");
+        server
+            .set_live_session_keep_alive(&local_shell, true)
+            .expect("keep local shell");
+        server
+            .set_live_session_keep_alive(&local_codex, true)
+            .expect("keep local codex");
 
         let persisted = server.persisted_state();
         assert_eq!(persisted.live_sessions.len(), 3);
@@ -16468,6 +16621,103 @@ terminal_window_id: None,
                 .iter()
                 .any(|live| live.kind == SessionKind::Document)
         );
+    }
+
+    #[test]
+    fn persisted_state_only_keeps_explicitly_kept_live_sessions() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let local_shell = server.start_local_session(
+            SessionKind::Shell,
+            Some("/home/pi/gh/yggterm"),
+            Some("Ephemeral Local Shell"),
+        );
+
+        assert!(
+            server.persisted_state().live_sessions.is_empty(),
+            "fresh live terminals are ephemeral until the user marks them kept alive"
+        );
+
+        assert!(
+            server
+                .set_live_session_keep_alive(&local_shell, true)
+                .expect("mark shell keep-alive")
+        );
+        let persisted = server.persisted_state();
+        assert_eq!(persisted.live_sessions.len(), 1);
+        assert_eq!(persisted.live_sessions[0].key, local_shell);
+        assert!(persisted.live_sessions[0].keep_alive);
+
+        assert!(
+            server
+                .set_live_session_keep_alive(&local_shell, false)
+                .expect("clear shell keep-alive")
+        );
+        assert!(
+            server.persisted_state().live_sessions.is_empty(),
+            "clearing keep-alive returns the terminal to runtime-only state"
+        );
+    }
+
+    #[test]
+    fn restore_persisted_state_skips_unkept_live_sessions() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.restore_persisted_state(
+            PersistedDaemonState {
+                active_session_path: Some("local::old-shell".to_string()),
+                active_view_mode: WorkspaceViewMode::Terminal,
+                ssh_targets: Vec::new(),
+                remote_machines: Vec::new(),
+                stored_sessions: Vec::new(),
+                live_sessions: vec![PersistedLiveSession {
+                    key: "local::old-shell".to_string(),
+                    id: "old-shell".to_string(),
+                    title: "Old unkept shell".to_string(),
+                    kind: SessionKind::Shell,
+                    keep_alive: false,
+                    ssh_target: "localhost".to_string(),
+                    prefix: None,
+                    cwd: Some("/home/pi".to_string()),
+                }],
+            },
+            None,
+        );
+
+        assert!(server.live_sessions().is_empty());
+        assert!(server.active_session_path().is_none());
+        assert_eq!(server.active_view_mode(), WorkspaceViewMode::Rendered);
+        assert!(!server.sessions.contains_key("local::old-shell"));
     }
 
     #[test]
@@ -16502,6 +16752,7 @@ terminal_window_id: None,
                         id: "dead-shell".to_string(),
                         title: "Smoke Local Shell".to_string(),
                         kind: SessionKind::Shell,
+                        keep_alive: true,
                         ssh_target: "localhost".to_string(),
                         prefix: None,
                         cwd: Some("/home/pi/gh/yggterm".to_string()),
@@ -16511,6 +16762,7 @@ terminal_window_id: None,
                         id: "dead-codex".to_string(),
                         title: "Remote Codex 019d1518".to_string(),
                         kind: SessionKind::Codex,
+                        keep_alive: true,
                         ssh_target: "localhost".to_string(),
                         prefix: None,
                         cwd: Some("/home/pi/gh/codex-litellm".to_string()),
@@ -16520,6 +16772,7 @@ terminal_window_id: None,
                         id: "dead-doc".to_string(),
                         title: "local::ddf8f1ee-8e64-4201-ab3a-2b07424f9b77".to_string(),
                         kind: SessionKind::Document,
+                        keep_alive: true,
                         ssh_target: "localhost".to_string(),
                         prefix: None,
                         cwd: Some("/home/pi".to_string()),
@@ -16584,6 +16837,7 @@ terminal_window_id: None,
                         id: "first-shell".to_string(),
                         title: "First shell".to_string(),
                         kind: SessionKind::Shell,
+                        keep_alive: true,
                         ssh_target: "localhost".to_string(),
                         prefix: None,
                         cwd: Some("/tmp/one".to_string()),
@@ -16593,6 +16847,7 @@ terminal_window_id: None,
                         id: "second-shell".to_string(),
                         title: "Second shell".to_string(),
                         kind: SessionKind::Shell,
+                        keep_alive: true,
                         ssh_target: "localhost".to_string(),
                         prefix: None,
                         cwd: Some("/tmp/two".to_string()),
@@ -16703,6 +16958,7 @@ terminal_window_id: None,
                         id: "abc123".to_string(),
                         title: "First remote".to_string(),
                         kind: SessionKind::SshShell,
+                        keep_alive: true,
                         ssh_target: "dev".to_string(),
                         prefix: None,
                         cwd: Some("/srv/dev/one".to_string()),
@@ -16712,6 +16968,7 @@ terminal_window_id: None,
                         id: "def456".to_string(),
                         title: "Second remote".to_string(),
                         kind: SessionKind::SshShell,
+                        keep_alive: true,
                         ssh_target: "dev".to_string(),
                         prefix: None,
                         cwd: Some("/srv/dev/two".to_string()),
@@ -17078,6 +17335,7 @@ terminal_window_id: None,
             id: "abc123".to_string(),
             title: "Example".to_string(),
             kind: SessionKind::SshShell,
+            keep_alive: true,
             ssh_target: "jojo".to_string(),
             prefix: None,
             cwd: Some("/srv/app".to_string()),
@@ -17141,6 +17399,7 @@ terminal_window_id: None,
             id: "abc123".to_string(),
             title: "Remote Session".to_string(),
             kind: SessionKind::SshShell,
+            keep_alive: true,
             ssh_target: "definitely-not-a-real-host.invalid".to_string(),
             prefix: None,
             cwd: Some("/srv/app".to_string()),
@@ -17194,6 +17453,7 @@ terminal_window_id: None,
             id: "abc123".to_string(),
             title: "Remote session".to_string(),
             kind: SessionKind::SshShell,
+            keep_alive: true,
             ssh_target: "dev".to_string(),
             prefix: None,
             cwd: Some("/home/pi/gh".to_string()),
@@ -17272,6 +17532,7 @@ terminal_window_id: None,
             id: "live-1".to_string(),
             title: "Live 1".to_string(),
             kind: SessionKind::SshShell,
+            keep_alive: true,
             ssh_target: "jojo".to_string(),
             prefix: Some("sudo -u pi".to_string()),
             cwd: Some("/home/pi".to_string()),
@@ -17281,6 +17542,7 @@ terminal_window_id: None,
             id: "live-2".to_string(),
             title: "Live 2".to_string(),
             kind: SessionKind::SshShell,
+            keep_alive: true,
             ssh_target: "jojo".to_string(),
             prefix: Some("sudo -u pi".to_string()),
             cwd: Some("/srv/app".to_string()),
@@ -17348,6 +17610,7 @@ terminal_window_id: None,
             id: "live-2".to_string(),
             title: "Live 2".to_string(),
             kind: SessionKind::SshShell,
+            keep_alive: true,
             ssh_target: "jojo".to_string(),
             prefix: Some("sudo -u pi".to_string()),
             cwd: Some("/srv/app".to_string()),
@@ -17399,6 +17662,7 @@ terminal_window_id: None,
             id: "abc123".to_string(),
             title: "Remote session".to_string(),
             kind: SessionKind::SshShell,
+            keep_alive: true,
             ssh_target: "dev".to_string(),
             prefix: None,
             cwd: Some("/home/pi/gh".to_string()),
@@ -17432,6 +17696,7 @@ terminal_window_id: None,
             id: "codex".to_string(),
             title: "Codex".to_string(),
             kind: SessionKind::Codex,
+            keep_alive: true,
             ssh_target: String::new(),
             prefix: None,
             cwd: Some("/home/pi/gh".to_string()),
@@ -17441,6 +17706,7 @@ terminal_window_id: None,
             id: "shell".to_string(),
             title: "Shell".to_string(),
             kind: SessionKind::Shell,
+            keep_alive: true,
             ssh_target: String::new(),
             prefix: None,
             cwd: Some("/home/pi".to_string()),
@@ -17480,6 +17746,7 @@ terminal_window_id: None,
             id: "cleanup-me".to_string(),
             title: "Cleanup Me".to_string(),
             kind: SessionKind::Codex,
+            keep_alive: true,
             ssh_target: "localhost".to_string(),
             prefix: None,
             cwd: Some("/home/pi".to_string()),
