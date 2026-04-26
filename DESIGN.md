@@ -267,6 +267,8 @@ Debug-only telemetry is a design-support component, not just an engineering deta
 Yggterm should be designed for sessions that stay alive for days, weeks, or months.
 
 - A long-lived workspace must survive local daemon restarts, stale sockets, transient helper failures, and app relaunches without dropping into a dead terminal whenever recovery is still possible.
+- Live terminal runtimes and durable workspace organization are separate concepts. New terminals are ephemeral runtime attachments by default; a user must explicitly choose `Keep Alive` before a live terminal is restored across restart.
+- `Close Terminal`, `Remove From Sidebar`, and `Delete Permanently` must stay distinct. Runtime close kills the daemon-owned PTY; it must not imply stored transcript or workspace-item deletion.
 - Restore flows should prefer bounded retry and self-healing over fatal blank or frozen terminals when the underlying failure is a transient local-helper problem.
 - Performance work only counts if restore and interaction stay reliable over long runtimes. A faster shell that strands active sessions is not a win.
 - Smoke and proof coverage for terminal work should include long-running failure modes, especially daemon-loss recovery and bounded observability retention.

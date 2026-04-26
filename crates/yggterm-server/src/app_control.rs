@@ -263,6 +263,10 @@ pub enum AppControlCommand {
     RemoveSession {
         session_path: String,
     },
+    SetSessionKeepAlive {
+        session_path: String,
+        keep_alive: bool,
+    },
     SetRowExpanded {
         row_path: String,
         expanded: bool,
@@ -311,6 +315,7 @@ impl AppControlCommand {
             Self::ProbeTerminalViewportScroll { .. } => "probe_terminal_viewport_scroll",
             Self::ProbeTerminalViewportSelect { .. } => "probe_terminal_viewport_select",
             Self::RemoveSession { .. } => "remove_session",
+            Self::SetSessionKeepAlive { .. } => "set_session_keep_alive",
             Self::SetRowExpanded { .. } => "set_row_expanded",
             Self::DescribeRows => "describe_rows",
             Self::OpenPath { .. } => "open_path",
