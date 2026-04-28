@@ -1,3 +1,16 @@
+yggterm (2.1.42-1) unstable; urgency=medium
+
+  * Default KDE Wayland/Xwayland direct launches to the X11 backend unless explicitly overridden.
+  * Use the KDE/X11 transparent shell profile to remove white square corner artifacts.
+  * Keep the desktop app id stable during update handoff so KDE pinned icons/task grouping stay first-class.
+  * Prove Always on Top through KDE/X11 _NET_WM_STATE_ABOVE and _NET_WM_STATE_STAYS_ON_TOP.
+  * Close the Live Sessions Keep Alive context menu after toggles and prove the keep marker updates.
+  * Suppress optimistic busy spinner hints for plain local terminal input.
+  * Release terminal input focus while KDE windows are backgrounded/minimized to reduce idle CPU.
+  * Enforce xterm whitespace, cursor contrast, hidden-cursor TUI, slash search, rename, idle CPU, cleanup, and Plasma PID stability release gates.
+
+ -- Yggdrasil HQ <avi@gour.top>  Tue, 28 Apr 2026 15:20:46 +0530
+
 yggterm (2.1.41-1) unstable; urgency=medium
 
   * Scope stale-daemon cleanup to the matching YGGTERM_HOME and active-client state.

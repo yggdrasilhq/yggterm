@@ -275,10 +275,19 @@ def launch_env_from_session(session_info: dict, backend: str, remote_home: str) 
 
 
 def state_summary(state: dict) -> dict:
+    dom = state.get("dom") or {}
+    terminal_hosts = dom.get("terminal_hosts") or []
+    active_hosts = dom.get("active_terminal_hosts") or []
+    shell = state.get("shell") or {}
     return {
         "active_session_path": state.get("active_session_path"),
         "active_view_mode": state.get("active_view_mode"),
-        "terminal_hosts": len(((state.get("dom") or {}).get("terminal_hosts") or [])),
+        "terminal_hosts": len(terminal_hosts),
+        "active_terminal_hosts": len(active_hosts),
+        "active_terminal_input_enabled": any(
+            bool(host.get("input_enabled")) for host in active_hosts
+        ),
+        "shell_window_focused": shell.get("window_focused"),
         "window": state.get("window"),
         "metrics": (state.get("browser") or {}).get("metrics") or {},
     }
@@ -430,8 +439,10 @@ def main() -> int:
         )
         summary["state_after_background"] = state_summary(state)
         background_window = summary["state_after_background"].get("window") or {}
+        background_shell_focused = summary["state_after_background"].get("shell_window_focused")
         background_effective = (
             background_window.get("focused") is False or background_window.get("minimized") is True
+            or background_shell_focused is False
         )
         summary["background_effective"] = background_effective
         summary["cpu_terminal_background_idle"] = remote_cpu_sample(
@@ -456,12 +467,18 @@ def main() -> int:
         budgets = {
             "cpu_after_launch_idle_visible": args.visible_max_cpu,
             "cpu_terminal_focused_idle": args.focused_max_cpu,
-            "cpu_terminal_background_idle": (
-                args.background_max_cpu if background_effective else args.focused_max_cpu
-            ),
+            "cpu_terminal_background_idle": args.background_max_cpu,
             "cpu_terminal_refocused_idle": args.refocused_max_cpu,
         }
         failures = []
+        if not background_effective:
+            failures.append(
+                {
+                    "sample": "state_after_background",
+                    "error": "background_window_not_effective",
+                    "window": background_window,
+                }
+            )
         for key, max_cpu in budgets.items():
             sample = summary.get(key) or {}
             total = float(sample.get("total_cpu_percent") or 0.0)

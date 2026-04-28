@@ -2049,8 +2049,27 @@ impl YggtermServer {
                     .to_string();
                 live_session_default_title(SessionKind::SshShell, cwd.as_deref(), &fallback)
             });
+        let target_label = self
+            .ssh_targets
+            .iter()
+            .find(|existing| {
+                existing.kind == SessionKind::SshShell
+                    && existing.ssh_target == ssh_target
+                    && existing.prefix == prefix
+            })
+            .map(|existing| existing.label.trim().to_string())
+            .filter(|label| !label.is_empty())
+            .unwrap_or_else(|| {
+                ssh_machine_label(&SshConnectTarget {
+                    label: String::new(),
+                    kind: SessionKind::SshShell,
+                    ssh_target: ssh_target.clone(),
+                    prefix: prefix.clone(),
+                    cwd: cwd.clone(),
+                })
+            });
         let target = SshConnectTarget {
-            label: title.clone(),
+            label: target_label,
             kind: SessionKind::SshShell,
             ssh_target,
             prefix,
@@ -15555,6 +15574,37 @@ terminal_window_id: None,
         assert_eq!(server.active_session_path(), Some(session_path.as_str()));
         assert_eq!(server.active_view_mode, WorkspaceViewMode::Rendered);
         assert!(!server.live_session_order.contains(&session_path));
+        Ok(())
+    }
+
+    #[test]
+    fn start_ssh_session_keeps_machine_label_separate_from_session_title() -> Result<()> {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+
+        let session_key =
+            server.start_ssh_session("dev", None, Some("/home/pi"), Some("/home/pi shell"))?;
+
+        assert_eq!(server.sessions[&session_key].title, "/home/pi shell");
+        assert_eq!(server.ssh_targets().len(), 1);
+        assert_eq!(server.ssh_targets()[0].label, "dev");
+        assert_eq!(server.remote_machines().len(), 1);
+        assert_eq!(server.remote_machines()[0].label, "dev");
         Ok(())
     }
 

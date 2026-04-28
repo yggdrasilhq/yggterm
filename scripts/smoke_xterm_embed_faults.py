@@ -490,6 +490,17 @@ def assert_terminal_runtime_writable(pid: int, session: str, *, context: str) ->
     )
 
 
+def wait_for_probe(sample_fn, predicate_fn, *, timeout_seconds: float, description: str) -> dict:
+    deadline = time.time() + timeout_seconds
+    last_sample = {}
+    while time.time() < deadline:
+        last_sample = sample_fn()
+        if predicate_fn(last_sample):
+            return last_sample
+        time.sleep(0.12)
+    raise AssertionError(f"timed out waiting for {description}: last_sample={last_sample!r}")
+
+
 def clear_prompt_line(pid: int, session: str, *, timeout_seconds: float = 8.0) -> dict:
     """
     Reset the active shell prompt line without depending on flaky X11 keyboard
@@ -748,7 +759,13 @@ def app_open_raw(
     return proc.returncode == 0, payload, detail
 
 
-def app_screenshot(pid: int, path: Path, *, crop_state: dict | None = None) -> dict:
+def app_screenshot(
+    pid: int,
+    path: Path,
+    *,
+    crop_state: dict | None = None,
+    check_corners: bool = False,
+) -> dict:
     payload = run(
         "server",
         "app",
@@ -770,7 +787,7 @@ def app_screenshot(pid: int, path: Path, *, crop_state: dict | None = None) -> d
         effective_crop_state = screenshot_state
     if path.exists() and effective_crop_state and screenshot_crop_needs_root_recrop(path, effective_crop_state):
         repair_app_screenshot_from_root(path, effective_crop_state)
-    if path.exists() and effective_crop_state:
+    if path.exists() and effective_crop_state and check_corners:
         corner_rounding = assert_shell_corner_rounding(
             pid,
             path,
@@ -1736,6 +1753,33 @@ def visible_window_id_for_pid(pid: int) -> str:
             largest_area = area
             largest_window_id = window_id
     return largest_window_id
+
+
+def x11_window_state_atoms_for_pid(pid: int) -> dict:
+    env = xdotool_env_for_pid(pid)
+    window_id = visible_window_id_for_pid(pid)
+    proc = subprocess.run(
+        ["xprop", "-id", window_id, "WM_CLASS", "_NET_WM_STATE"],
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=XDO_TIMEOUT_SECONDS,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(proc.stderr.strip() or f"xprop state failed for pid {pid}")
+    stdout = proc.stdout or ""
+    return {
+        "window_id": window_id,
+        "wm_class": next(
+            (line.strip() for line in stdout.splitlines() if line.startswith("WM_CLASS")),
+            "",
+        ),
+        "net_wm_state": next(
+            (line.strip() for line in stdout.splitlines() if line.startswith("_NET_WM_STATE")),
+            "",
+        ),
+        "above": "_NET_WM_STATE_ABOVE" in stdout,
+    }
 
 
 def xdotool_activate_window_if_supported(pid: int, window_id: str) -> None:
@@ -4410,6 +4454,23 @@ def invoke_sidebar_context_menu_action(
     }
 
 
+def wait_for_context_menu_closed(
+    pid: int,
+    *,
+    timeout_seconds: float = 2.5,
+) -> dict:
+    deadline = time.time() + timeout_seconds
+    last_state = {}
+    while time.time() < deadline:
+        last_state = app_state(pid)
+        if not rect_is_visible(dom_rect(last_state, "context_menu_rect")):
+            return last_state
+        time.sleep(0.08)
+    raise AssertionError(
+        f"context menu stayed open after action click: rect={dom_rect(last_state, 'context_menu_rect')!r}"
+    )
+
+
 def create_terminal_via_sidebar_context_menu(pid: int, *, parent_path: str = "local") -> dict:
     baseline = wait_for_window_focus(pid, timeout_seconds=8.0)
     if shell_context_menu_row_path(baseline):
@@ -6245,7 +6306,7 @@ def assert_search_focus_overlay_contract(pid: int, session: str) -> dict:
 def assert_titlebar_search_typing_contract(pid: int) -> dict:
     created_paths: list[str] = []
     target_path = ""
-    target_title = "litellm search smoke"
+    target_title = "litellm/search smoke"
     try:
         created = app_create_terminal(pid, title=target_title)
         target_path = str(created.get("session_path") or created.get("active_session_path") or "").strip()
@@ -6342,7 +6403,7 @@ def assert_titlebar_search_typing_contract(pid: int) -> dict:
                     f"shortcut={shortcut!r} state={focused!r}"
                 )
 
-        query = "litellm"
+        query = "litellm/"
         typed = ""
         progress: list[dict] = []
         for ch in query:
@@ -9430,6 +9491,87 @@ def assert_titlebar_empty_lane_window_controls_contract(pid: int, out_dir: Path)
     }
 
 
+def assert_titlebar_always_on_top_contract(pid: int) -> dict:
+    baseline = wait_for_window_focus(pid, timeout_seconds=4.0)
+    if titlebar_transient_open(baseline):
+        baseline = dismiss_titlebar_transients(pid, baseline, timeout_seconds=1.5)
+    if bool((baseline.get("shell") or {}).get("titlebar_auto_hide_enabled")):
+        app_set_window_chrome_hover(pid, True)
+        baseline = wait_for_window_focus(pid, timeout_seconds=4.0)
+    button_rect = dom_rect(baseline, "titlebar_always_on_top_button_rect")
+    if not rect_is_visible(button_rect):
+        raise AssertionError(f"always-on-top button rect missing before probe: {baseline!r}")
+
+    def shell_above(state: dict) -> bool:
+        return bool((state.get("shell") or {}).get("always_on_top"))
+
+    reset_click = None
+    if shell_above(baseline):
+        reset_click = xdotool_click_window(
+            pid,
+            rect_center_x(button_rect),
+            rect_center_y(button_rect),
+        )
+        baseline = wait_for_probe(
+            lambda: app_state(pid),
+            lambda state: not shell_above(state),
+            timeout_seconds=4.0,
+            description="always-on-top reset",
+        )
+        button_rect = dom_rect(baseline, "titlebar_always_on_top_button_rect")
+        if not rect_is_visible(button_rect):
+            raise AssertionError(f"always-on-top button rect missing after reset: {baseline!r}")
+
+    before_atoms = x11_window_state_atoms_for_pid(pid)
+    enable_click = xdotool_click_window(
+        pid,
+        rect_center_x(button_rect),
+        rect_center_y(button_rect),
+    )
+    enabled = wait_for_probe(
+        lambda: app_state(pid),
+        lambda state: shell_above(state),
+        timeout_seconds=4.0,
+        description="always-on-top enabled shell state",
+    )
+    enabled_atoms = wait_for_probe(
+        lambda: x11_window_state_atoms_for_pid(pid),
+        lambda atoms: bool(atoms.get("above")),
+        timeout_seconds=4.0,
+        description="always-on-top X11 state",
+    )
+    button_rect = dom_rect(enabled, "titlebar_always_on_top_button_rect")
+    if not rect_is_visible(button_rect):
+        raise AssertionError(f"always-on-top button rect missing while enabled: {enabled!r}")
+    disable_click = xdotool_click_window(
+        pid,
+        rect_center_x(button_rect),
+        rect_center_y(button_rect),
+    )
+    disabled = wait_for_probe(
+        lambda: app_state(pid),
+        lambda state: not shell_above(state),
+        timeout_seconds=4.0,
+        description="always-on-top disabled shell state",
+    )
+    disabled_atoms = wait_for_probe(
+        lambda: x11_window_state_atoms_for_pid(pid),
+        lambda atoms: not bool(atoms.get("above")),
+        timeout_seconds=4.0,
+        description="always-on-top X11 disabled state",
+    )
+    return {
+        "reset_click": reset_click,
+        "before_atoms": before_atoms,
+        "enable_click": enable_click,
+        "enabled_shell": shell_above(enabled),
+        "enabled_atoms": enabled_atoms,
+        "disable_click": disable_click,
+        "disabled_shell": shell_above(disabled),
+        "disabled_atoms": disabled_atoms,
+    }
+
+
 def assert_theme_editor_contract(pid: int, out_dir: Path) -> dict:
     default_grain = 0.12
     baseline = app_state(pid)
@@ -9921,6 +10063,91 @@ def assert_maximize_roundtrip_layout(pid: int, out_dir: Path) -> dict:
     }
 
 
+def assert_window_corner_artifact_contract(pid: int, out_dir: Path) -> dict:
+    app_set_search(pid, "", focused=False)
+    time.sleep(0.1)
+    state = wait_for_window_focus(pid, timeout_seconds=4.0)
+    if titlebar_transient_open(state):
+        state = dismiss_titlebar_transients(pid, state, timeout_seconds=1.5)
+    if right_panel_mode(state) not in ("", "hidden", "none", "null"):
+        state = close_right_panel(pid, state, timeout_seconds=1.5)
+    state = ensure_unmaximized_window(pid, state, timeout_seconds=6.0)
+    window = state.get("window") or {}
+    position = window.get("outer_position") or {}
+    try:
+        left = float(position.get("x") or 0.0)
+        top = float(position.get("y") or 0.0)
+    except (TypeError, ValueError):
+        left = 0.0
+        top = 0.0
+    delta_x = 0.0
+    delta_y = 0.0
+    if left < 56.0:
+        delta_x = 96.0 - left
+    if top < 56.0:
+        delta_y = 84.0 - top
+    move_result = None
+    if delta_x or delta_y:
+        move_result = app_move_window_by(pid, delta_x, delta_y)
+        time.sleep(0.45)
+        state = wait_for_window_geometry_settle(pid, timeout_seconds=6.0)
+        window = state.get("window") or {}
+        position = window.get("outer_position") or {}
+    try:
+        moved_left = float(position.get("x") or 0.0)
+        moved_top = float(position.get("y") or 0.0)
+    except (TypeError, ValueError):
+        moved_left = 0.0
+        moved_top = 0.0
+    if moved_left < 12.0 or moved_top < 12.0:
+        raise AssertionError(
+            "corner artifact proof requires a moved unmaximized window away from the root-screen edge: "
+            f"position={position!r} move={move_result!r}"
+        )
+    attempts = []
+    screenshot = {}
+    corner_rounding = None
+    shot_path = out_dir / "window-corner-artifact.png"
+    for attempt in range(3):
+        if attempt:
+            app_focus(pid)
+            time.sleep(0.35)
+            state = wait_for_window_geometry_settle(pid, timeout_seconds=4.0)
+            window = state.get("window") or {}
+        attempt_path = (
+            shot_path
+            if attempt == 0
+            else out_dir / f"window-corner-artifact-retry-{attempt}.png"
+        )
+        screenshot = app_screenshot(pid, attempt_path, crop_state=state, check_corners=True)
+        data = screenshot.get("data") if isinstance(screenshot, dict) else {}
+        corner_rounding = data.get("shell_corner_rounding") if isinstance(data, dict) else None
+        attempts.append(
+            {
+                "attempt": attempt + 1,
+                "screenshot": str(attempt_path),
+                "has_corner_rounding": isinstance(corner_rounding, dict),
+                "window": window,
+            }
+        )
+        if isinstance(corner_rounding, dict):
+            shot_path = attempt_path
+            break
+        time.sleep(0.25)
+    if not isinstance(corner_rounding, dict):
+        raise AssertionError(
+            "corner artifact proof did not produce root-window corner samples after moving the window: "
+            f"attempts={attempts!r} screenshot={screenshot!r} state_window={window!r}"
+        )
+    return {
+        "window": window,
+        "move": move_result,
+        "attempts": attempts,
+        "screenshot": str(shot_path),
+        "corner_rounding": corner_rounding,
+    }
+
+
 def wait_for_terminal_zoom_contract(
     pid: int,
     session: str,
@@ -10158,6 +10385,14 @@ def assert_context_menu_rename_session(pid: int) -> dict:
             while time.time() < deadline:
                 opened = app_state(pid)
                 actions = opened.get("dom", {}).get("context_menu_action_rects") or []
+                action_names = {
+                    str(entry.get("action") or "").strip()
+                    for entry in actions
+                }
+                if "new-terminal-plan" in action_names:
+                    raise AssertionError(
+                        "session context menu still exposes the undefined New Terminal Plan action"
+                    )
                 rename_rect = next(
                     (
                         entry.get("rect")
@@ -10666,7 +10901,13 @@ def assert_live_session_keep_alive_toggle(pid: int) -> dict:
             False,
             timeout_seconds=8.0,
         )
-        keep = app_set_session_keep_alive(pid, target_path, True)
+        keep = invoke_sidebar_context_menu_action(
+            pid,
+            target_path,
+            "keep-alive",
+            row_kind="Session",
+        )
+        keep_closed_state = wait_for_context_menu_closed(pid)
         kept_state, kept_row = wait_for_live_keep_alive_state(
             pid,
             target_path,
@@ -10693,7 +10934,13 @@ def assert_live_session_keep_alive_toggle(pid: int) -> dict:
             raise AssertionError(
                 f"app-control debug did not report keep_alive=true for the kept session: {debug_entry!r}"
             )
-        unkeep = app_set_session_keep_alive(pid, target_path, False)
+        unkeep = invoke_sidebar_context_menu_action(
+            pid,
+            target_path,
+            "stop-keep-alive",
+            row_kind="Session",
+        )
+        unkeep_closed_state = wait_for_context_menu_closed(pid)
         unkept_state, unkept_row = wait_for_live_keep_alive_state(
             pid,
             target_path,
@@ -10705,11 +10952,13 @@ def assert_live_session_keep_alive_toggle(pid: int) -> dict:
             "initial_live_keep_alive": bool(initial_row.get("live_keep_alive")),
             "initial_sidebar_scroll_top": (initial_state.get("dom") or {}).get("sidebar_scroll_top"),
             "keep": keep,
+            "keep_menu_closed": not rect_is_visible(dom_rect(keep_closed_state, "context_menu_rect")),
             "kept_live_keep_alive": bool(kept_row.get("live_keep_alive")),
             "kept_live_keep_alive_rect": keep_rect,
             "kept_live_keep_alive_color": keep_color,
             "debug_keep_alive": debug_entry.get("keep_alive"),
             "unkeep": unkeep,
+            "unkeep_menu_closed": not rect_is_visible(dom_rect(unkeep_closed_state, "context_menu_rect")),
             "unkept_live_keep_alive": bool(unkept_row.get("live_keep_alive")),
             "unkept_sidebar_scroll_top": (unkept_state.get("dom") or {}).get("sidebar_scroll_top"),
         }
@@ -10845,6 +11094,8 @@ def assert_renderer_contract(state: dict) -> dict:
     screen_rect = host.get("screen_rect") or host.get("viewport_rect") or host.get("host_rect") or {}
     xterm_root_user_select = str(host.get("xterm_root_user_select") or "").strip().lower()
     rows_user_select = str(host.get("rows_user_select") or "").strip().lower()
+    rows_white_space = str(host.get("rows_white_space") or "").strip().lower()
+    rows_sample_white_space = str(host.get("rows_sample_white_space") or "").strip().lower()
     selection_range_count = int(host.get("selection_range_count") or 0)
     if renderer_mode not in ("canvas", "dom"):
         raise AssertionError(
@@ -10870,6 +11121,15 @@ def assert_renderer_contract(state: dict) -> dict:
         raise AssertionError(
             f"xterm rows user-select drifted from native terminal behavior: {rows_user_select!r}"
         )
+    if renderer_mode == "dom" and not rows_white_space.startswith("pre"):
+        raise AssertionError(
+            f"xterm DOM rows no longer preserve terminal whitespace: rows_white_space={rows_white_space!r}"
+        )
+    if renderer_mode == "dom" and rows_sample_white_space and not rows_sample_white_space.startswith("pre"):
+        raise AssertionError(
+            "xterm DOM row glyph spans no longer preserve terminal whitespace: "
+            f"rows_sample_white_space={rows_sample_white_space!r}"
+        )
     if selection_range_count != 0:
         raise AssertionError(
             f"browser DOM selection leaked into the terminal host: selection_range_count={selection_range_count} text={host.get('selection_text')!r}"
@@ -10884,6 +11144,8 @@ def assert_renderer_contract(state: dict) -> dict:
         "screen_rect": screen_rect,
         "xterm_root_user_select": xterm_root_user_select,
         "rows_user_select": rows_user_select,
+        "rows_white_space": rows_white_space,
+        "rows_sample_white_space": rows_sample_white_space,
         "selection_range_count": selection_range_count,
         "text_sample": str(host.get("text_sample") or "")[:160],
     }
@@ -13901,6 +14163,7 @@ def main() -> int:
         "theme_editor_contract",
         "active_session_copy_quality",
         "titlebar_autohide_hover",
+        "titlebar_always_on_top",
         "titlebar_centering",
         "titlebar_empty_lane_window_controls",
         "titlebar_search_typing",
@@ -13917,6 +14180,7 @@ def main() -> int:
         "live_session_metadata_consistency",
         "live_sessions_tree_contract",
         "webkit_child_rss_soak",
+        "window_corner_artifact",
     }
     needs_session_setup = not selected_checks or not selected_checks.issubset(
         no_session_setup_checks
@@ -14056,12 +14320,14 @@ def main() -> int:
             "titlebar_empty_lane_window_controls",
             lambda: assert_titlebar_empty_lane_window_controls_contract(args.pid, out_dir),
         )
+        run_check("titlebar_always_on_top", lambda: assert_titlebar_always_on_top_contract(args.pid))
         run_check("titlebar_autohide_hover", lambda: assert_titlebar_autohide_hover_contract(args.pid, out_dir))
         run_check("theme_editor_contract", lambda: assert_theme_editor_contract(args.pid, out_dir))
         run_check("terminal_zoom_live_apply", lambda: assert_terminal_zoom_live_apply(
             args.pid, args.session, out_dir
         ))
         run_check("maximize_roundtrip_layout", lambda: assert_maximize_roundtrip_layout(args.pid, out_dir))
+        run_check("window_corner_artifact", lambda: assert_window_corner_artifact_contract(args.pid, out_dir))
         run_check("webkit_child_rss_soak", lambda: assert_webkit_child_rss_soak(args.pid))
         if args.session_kind != "codex":
             run_check(
