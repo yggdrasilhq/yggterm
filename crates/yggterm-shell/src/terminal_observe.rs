@@ -992,14 +992,16 @@ fn terminal_host_geometry_problem_for_app_control(host: &Value) -> Option<&'stat
         .trim()
         .to_ascii_lowercase();
     let width_delta = (host_width - screen_width).abs();
+    let viewport_spans_host = host_width >= 240.0
+        && viewport_width >= 200.0
+        && (host_width - viewport_width).abs() <= 4.0;
     let compensated_screen_width_gap = host_width >= 240.0
         && screen_width >= 200.0
-        && helpers_width >= 200.0
         && viewport_width >= 200.0
         && width_delta > 12.0
         && width_delta <= 28.0
-        && (screen_width - helpers_width).abs() <= 4.0
-        && (host_width - viewport_width).abs() <= 4.0;
+        && viewport_spans_host
+        && (helpers_width < 1.0 || (screen_width - helpers_width).abs() <= 4.0);
     if host_width >= 240.0
         && screen_width >= 200.0
         && width_delta > 12.0
