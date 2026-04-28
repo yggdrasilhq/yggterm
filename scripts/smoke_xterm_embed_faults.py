@@ -1960,6 +1960,38 @@ def xdotool_click_window(pid: int, x: float, y: float, button: int = 1) -> dict:
     }
 
 
+def xdotool_click_window_physical(pid: int, x: float, y: float, button: int = 1) -> dict:
+    env = xdotool_env_for_pid(pid)
+    window_id = visible_window_id_for_pid(pid)
+    xdotool_activate_window_if_supported(pid, window_id)
+    screen_x, screen_y = screen_coordinates_for_window_point(pid, x, y, window_id)
+    commands = [
+        ["xdotool", "mousemove", str(screen_x), str(screen_y)],
+        ["xdotool", "mousedown", str(button)],
+        ["xdotool", "mouseup", str(button)],
+    ]
+    for command in commands:
+        proc = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=XDO_TIMEOUT_SECONDS,
+        )
+        if proc.returncode != 0:
+            raise AssertionError(proc.stderr.strip() or f"physical xdotool click failed for pid {pid}: {command!r}")
+        if command[1] == "mousedown":
+            time.sleep(0.06)
+    time.sleep(0.22)
+    return {
+        "window_id": window_id,
+        "x": screen_x,
+        "y": screen_y,
+        "button": int(button),
+        "driver": "xdotool-physical",
+    }
+
+
 def xdotool_press_window(pid: int, x: float, y: float, button: int = 1) -> dict:
     if POINTER_DRIVER == "app":
         app_pointer_command(
@@ -2392,6 +2424,14 @@ def xdotool_key_window_physical(pid: int, *keys: str) -> dict:
 
 
 def xdotool_ctrl_v_window_physical(pid: int) -> dict:
+    if KEY_DRIVER == "app":
+        app_key_command(pid, "press", "ctrl+v")
+        time.sleep(0.18)
+        return {
+            "window_id": "app",
+            "keys": ["ctrl+v"],
+            "driver": "app",
+        }
     env = xdotool_env_for_pid(pid)
     window_id = visible_window_id_for_pid(pid)
     xdotool_activate_window_if_supported(pid, window_id)
@@ -3764,10 +3804,27 @@ def assert_prompt_prefix_pixels_visible(
 ) -> dict:
     host = active_host(state)
     row_rect = host.get("cursor_row_rect") or {}
-    cursor_line_text = str(host.get("cursor_line_text") or host.get("cursor_row_text") or "").strip()
-    if not rect_is_visible(row_rect) or not cursor_line_text:
-        return {"skipped": "missing_cursor_row"}
-    row_box = rect_bounds(row_rect)
+    renderer_mode = str(host.get("xterm_renderer_mode") or "").strip().lower()
+    cursor_line_text = str(
+        host.get("cursor_line_text")
+        or host.get("cursor_row_text")
+        or host.get("text_sample")
+        or host.get("buffer_text_sample")
+        or ""
+    ).strip()
+    if not cursor_line_text:
+        return {"skipped": "missing_cursor_text"}
+    row_box_source = "cursor_row"
+    if rect_is_visible(row_rect):
+        row_box = rect_bounds(row_rect)
+    else:
+        fallback_rect = host.get("screen_rect") or host.get("viewport_rect") or host.get("host_rect") or {}
+        if renderer_mode != "canvas" or not rect_is_visible(fallback_rect):
+            return {"skipped": "missing_cursor_row"}
+        fallback_box = rect_bounds(fallback_rect)
+        fallback_height = min(28, max(18, fallback_box[3] - fallback_box[1]))
+        row_box = (fallback_box[0], fallback_box[1], fallback_box[2], fallback_box[1] + fallback_height)
+        row_box_source = "canvas_screen_top"
     prefix_width = min(220, row_box[2] - row_box[0])
     if prefix_width <= 0:
         return {"skipped": "empty_prefix_width"}
@@ -3802,15 +3859,18 @@ def assert_prompt_prefix_pixels_visible(
                 used_clamped = fallback
                 fallback_row_shift_px = row_height * shift_rows
     if non_background_pixels <= 12:
-        host_rect = host.get("host_rect") or {}
-        if rect_is_visible(host_rect):
-            host_box = rect_bounds(host_rect)
+        search_rect = host.get("screen_rect") or host.get("viewport_rect") or host.get("host_rect") or {}
+        if rect_is_visible(search_rect):
+            host_box = rect_bounds(search_rect)
+            search_height = max(row_box[3] - row_box[1], 18) * 10
+            if row_box_source == "canvas_screen_top":
+                search_height = max(search_height, 220)
             search_region = clamp_box(
                 (
                     host_box[0],
                     host_box[1],
                     min(host_box[2], host_box[0] + prefix_width),
-                    min(host_box[3], host_box[1] + max(row_box[3] - row_box[1], 18) * 10),
+                    min(host_box[3], host_box[1] + search_height),
                 ),
                 image.size,
             )
@@ -3842,6 +3902,8 @@ def assert_prompt_prefix_pixels_visible(
         "background_rgb": background,
         "non_background_pixels": non_background_pixels,
         "cursor_line_text": cursor_line_text,
+        "row_box_source": row_box_source,
+        "renderer_mode": renderer_mode,
         "fallback_row_shift_px": fallback_row_shift_px,
         "fallback_search_region": fallback_search_region,
     }
@@ -5456,6 +5518,17 @@ def wait_for_visible_cursor_session(pid: int, session: str, timeout_seconds: flo
         cursor_class_name = str(host.get("cursor_sample_class_name") or "")
         cursor_visible = cursor_sample_is_visibly_active(host)
         cursor_rect = host.get("cursor_sample_rect") or host.get("cursor_expected_rect") or {}
+        renderer_mode = str(host.get("xterm_renderer_mode") or "").strip().lower()
+        canvas_text_visible = bool(
+            str(
+                host.get("cursor_row_text")
+                or host.get("cursor_line_text")
+                or host.get("text_sample")
+                or host.get("buffer_text_sample")
+                or ""
+            ).strip()
+        )
+        canvas_surface_rect = host.get("screen_rect") or host.get("viewport_rect") or host.get("host_rect") or {}
         visible_cursor_fallback = (
             host.get("helper_textarea_focused") is True
             and host.get("host_has_active_element") is True
@@ -5466,12 +5539,20 @@ def wait_for_visible_cursor_session(pid: int, session: str, timeout_seconds: flo
                 or int(host.get("cursor_visible_row_index") or -1) >= 0
             )
         )
+        visible_canvas_cursor_fallback = (
+            renderer_mode == "canvas"
+            and host.get("helper_textarea_focused") is True
+            and host.get("host_has_active_element") is True
+            and host.get("xterm_cursor_hidden") is not True
+            and canvas_text_visible
+            and rect_is_visible(canvas_surface_rect)
+        )
         visible_block_cursor = (
             "xterm-cursor-block" in cursor_class_name
             and cursor_visible
             and rect_is_visible(cursor_rect)
             and host.get("xterm_cursor_hidden") is not True
-        ) or visible_cursor_fallback
+        ) or visible_cursor_fallback or visible_canvas_cursor_fallback
         if (
             normalize_live_path(str(last_state.get("active_session_path") or "")) == normalized_session
             and last_state.get("active_view_mode") == "Terminal"
@@ -10070,8 +10151,26 @@ def assert_terminal_delete_key_contract(pid: int, session: str, out_dir: Path) -
 
 
 def assert_keyboard_clipboard_paste_dedup_contract(pid: int, session: str, out_dir: Path) -> dict:
-    wait_for_window_focus(pid, timeout_seconds=8.0)
-    wait_for_session_focus(pid, session, timeout_seconds=12.0)
+    if AVOID_FOREGROUND:
+        window_id = visible_window_id_for_pid(pid)
+        xdotool_activate_window_if_supported(pid, window_id)
+        focus_seed_state = app_state(pid)
+        focus_seed_host = (
+            host_for_session_or_none(focus_seed_state, session)
+            or active_host_or_none(focus_seed_state)
+            or {}
+        )
+        focus_seed_rect = focus_seed_host.get("host_rect") or dom_rect(focus_seed_state, "main_surface_body_rect")
+        if rect_is_visible(focus_seed_rect):
+            xdotool_click_window_physical(
+                pid,
+                rect_center_x(focus_seed_rect),
+                rect_center_y(focus_seed_rect),
+            )
+        time.sleep(0.25)
+    else:
+        wait_for_window_focus(pid, timeout_seconds=8.0)
+    focus_terminal_helper_textarea(pid, session, timeout_seconds=12.0)
     focus_terminal_helper_textarea(pid, session, timeout_seconds=8.0)
     clear_terminal_selection(pid, session, timeout_seconds=4.0)
     wait_for_terminal_quiescent(pid, timeout_seconds=8.0)
@@ -10117,6 +10216,54 @@ def assert_keyboard_clipboard_paste_dedup_contract(pid: int, session: str, out_d
             raise AssertionError(
                 f"keyboard image paste inserted {png_count} png paths, expected exactly one: line={success_line!r} state={success_state!r}"
             )
+        success_notification_count = len(
+            [
+                notification
+                for notification in visible_notifications(success_state)
+                if str(notification.get("title") or "") == "Image Staged"
+            ]
+        )
+        duplicate_response = terminal_paste_image(pid, session)
+        duplicate_deadline = time.time() + 3.0
+        duplicate_state = {}
+        duplicate_line = success_line
+        duplicate_notification_count = success_notification_count
+        while time.time() < duplicate_deadline:
+            duplicate_state = app_state(pid)
+            duplicate_notifications = [
+                notification
+                for notification in visible_notifications(duplicate_state)
+                if str(notification.get("title") or "") == "Image Staged"
+            ]
+            duplicate_notification_count = len(duplicate_notifications)
+            host = host_for_session_or_none(duplicate_state, session) or active_host_or_none(duplicate_state) or {}
+            duplicate_line = str(host.get("cursor_line_text") or host.get("cursor_row_text") or "")
+            if duplicate_line.count(".png") == 1 and duplicate_notification_count == success_notification_count:
+                break
+            time.sleep(0.15)
+        duplicate_data = duplicate_response.get("data") or {}
+        if duplicate_data.get("accepted") is not False:
+            raise AssertionError(
+                f"delayed duplicate image paste was not rejected: response={duplicate_response!r} state={duplicate_state!r}"
+            )
+        duplicate_reason = str(duplicate_data.get("reason") or "")
+        if duplicate_reason not in {
+            "duplicate clipboard image paste",
+            "clipboard image paste already in flight",
+        }:
+            raise AssertionError(
+                f"delayed duplicate image paste had wrong reason: response={duplicate_response!r} state={duplicate_state!r}"
+            )
+        duplicate_png_count = duplicate_line.count(".png")
+        if duplicate_png_count != 1:
+            raise AssertionError(
+                f"delayed duplicate image paste inserted {duplicate_png_count} png paths, expected one: line={duplicate_line!r} state={duplicate_state!r}"
+            )
+        if duplicate_notification_count != success_notification_count:
+            raise AssertionError(
+                "delayed duplicate image paste produced an extra Image Staged notification: "
+                f"before={success_notification_count} after={duplicate_notification_count} state={duplicate_state!r}"
+            )
         if rect_is_visible(dom_rect(success_state, "delete_confirm_dialog_rect")):
             raise AssertionError(f"keyboard paste unexpectedly opened delete modal: {success_state!r}")
         shot_path = out_dir / "keyboard-clipboard-paste.png"
@@ -10129,6 +10276,9 @@ def assert_keyboard_clipboard_paste_dedup_contract(pid: int, session: str, out_d
             "success_notification": success_notification,
             "success_cursor_line": success_line,
             "png_count": png_count,
+            "duplicate_response": duplicate_response,
+            "duplicate_cursor_line": duplicate_line,
+            "duplicate_notification_count": duplicate_notification_count,
             "cleanup_probe": cleanup_probe,
             "screenshot": str(shot_path),
         }
@@ -11257,15 +11407,32 @@ def assert_renderer_contract(state: dict) -> dict:
     host = active_host(state)
     canvas_count = int(host.get("canvas_count") or 0)
     renderer_mode = str(host.get("xterm_renderer_mode") or "").strip().lower() or "unknown"
+    canvas_opt_out = (ENV.get("YGGTERM_ENABLE_XTERM_CANVAS") or "").strip().lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
     screen_rect = host.get("screen_rect") or host.get("viewport_rect") or host.get("host_rect") or {}
     xterm_root_user_select = str(host.get("xterm_root_user_select") or "").strip().lower()
     rows_user_select = str(host.get("rows_user_select") or "").strip().lower()
     rows_white_space = str(host.get("rows_white_space") or "").strip().lower()
     rows_sample_white_space = str(host.get("rows_sample_white_space") or "").strip().lower()
     selection_range_count = int(host.get("selection_range_count") or 0)
+    visible_text = (
+        str(host.get("text_sample") or "").strip()
+        or str(host.get("buffer_text_sample") or "").strip()
+        or str(host.get("cursor_line_text") or "").strip()
+        or str(host.get("cursor_row_text") or "").strip()
+    )
     if renderer_mode not in ("canvas", "dom"):
         raise AssertionError(
             f"xterm mounted the wrong renderer: renderer_mode={renderer_mode!r} canvas_count={canvas_count}"
+        )
+    if not canvas_opt_out and renderer_mode != "canvas":
+        raise AssertionError(
+            "xterm default renderer regressed to the WebKit DOM path: "
+            f"renderer_mode={renderer_mode!r} canvas_count={canvas_count}"
         )
     if renderer_mode == "canvas" and canvas_count <= 0:
         raise AssertionError(
@@ -11275,7 +11442,7 @@ def assert_renderer_contract(state: dict) -> dict:
         raise AssertionError(
             f"xterm reported dom renderer but still exposed canvas nodes: canvas_count={canvas_count}"
         )
-    if not str(host.get("text_sample") or "").strip():
+    if not visible_text:
         raise AssertionError(
             f"xterm renderer mounted without visible terminal text: renderer_mode={renderer_mode!r}"
         )
@@ -11283,7 +11450,7 @@ def assert_renderer_contract(state: dict) -> dict:
         raise AssertionError(
             f"xterm root user-select drifted from native terminal behavior: {xterm_root_user_select!r}"
         )
-    if rows_user_select != "none":
+    if renderer_mode == "dom" and rows_user_select != "none":
         raise AssertionError(
             f"xterm rows user-select drifted from native terminal behavior: {rows_user_select!r}"
         )
@@ -11307,6 +11474,7 @@ def assert_renderer_contract(state: dict) -> dict:
     return {
         "canvas_count": canvas_count,
         "renderer_mode": renderer_mode,
+        "canvas_opt_out": canvas_opt_out,
         "screen_rect": screen_rect,
         "xterm_root_user_select": xterm_root_user_select,
         "rows_user_select": rows_user_select,
@@ -11314,6 +11482,8 @@ def assert_renderer_contract(state: dict) -> dict:
         "rows_sample_white_space": rows_sample_white_space,
         "selection_range_count": selection_range_count,
         "text_sample": str(host.get("text_sample") or "")[:160],
+        "buffer_text_sample": str(host.get("buffer_text_sample") or "")[:160],
+        "cursor_line_text": str(host.get("cursor_line_text") or "")[:160],
     }
 
 
