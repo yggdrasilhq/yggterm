@@ -419,6 +419,7 @@ pub enum ServerRequest {
     Ping,
     Status,
     Snapshot,
+    PrepareUpdateRestart,
     OpenStoredSession {
         session_kind: SessionKind,
         path: String,
@@ -1013,6 +1014,15 @@ impl DaemonRuntime {
             ServerRequest::Ping => ServerResponse::Pong,
             ServerRequest::Status => ServerResponse::Status(self.status()),
             ServerRequest::Snapshot => self.snapshot_response(None),
+            ServerRequest::PrepareUpdateRestart => {
+                write_persisted_state(
+                    &self.state_path,
+                    &self.server.persisted_state_for_update_restart(),
+                )?;
+                ServerResponse::Ack {
+                    message: Some("update restart prepared".to_string()),
+                }
+            }
             ServerRequest::OpenStoredSession {
                 session_kind,
                 path,
@@ -1956,6 +1966,7 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::Ping => "ping",
         ServerRequest::Status => "status",
         ServerRequest::Snapshot => "snapshot",
+        ServerRequest::PrepareUpdateRestart => "prepare_update_restart",
         ServerRequest::OpenStoredSession { .. } => "open_stored_session",
         ServerRequest::ConnectSsh { .. } => "connect_ssh",
         ServerRequest::ConnectSshCustom { .. } => "connect_ssh_custom",
@@ -2493,6 +2504,13 @@ pub fn sync_theme(
     theme: UiTheme,
 ) -> Result<(ServerUiSnapshot, Option<String>)> {
     expect_snapshot(send_request(endpoint, &ServerRequest::SyncTheme { theme })?)
+}
+
+pub fn prepare_update_restart(endpoint: &ServerEndpoint) -> Result<Option<String>> {
+    expect_ack(send_request(
+        endpoint,
+        &ServerRequest::PrepareUpdateRestart,
+    )?)
 }
 
 pub fn shutdown(endpoint: &ServerEndpoint) -> Result<Option<String>> {
@@ -3618,6 +3636,7 @@ mod tests {
                 ssh_target: "jojo".to_string(),
                 prefix: None,
                 cwd: Some("/home/pi".to_string()),
+                restore_reason: None,
             }],
         };
 
