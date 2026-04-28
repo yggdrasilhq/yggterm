@@ -182,7 +182,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--remote-dir")
     parser.add_argument("--timeout-ms", type=int, default=20000)
     parser.add_argument("--sample-sec", type=float, default=20.0)
-    parser.add_argument("--settle-sec", type=float, default=4.0)
+    parser.add_argument("--settle-sec", type=float, default=10.0)
     parser.add_argument("--visible-max-cpu", type=float, default=2.5)
     parser.add_argument("--focused-max-cpu", type=float, default=2.5)
     parser.add_argument("--background-max-cpu", type=float, default=1.2)
@@ -416,6 +416,14 @@ def main() -> int:
             args.host, remote_bin, launch_env, pid, title="CPU Smoke Plain"
         )
         summary["created_session"] = session_path
+        focus_proc = linux_smoke.ssh_shell(
+            args.host,
+            f"{linux_smoke.remote_env_exports(launch_env)}; "
+            f"{linux_smoke.quote(remote_bin)} server app focus --pid {pid} --timeout-ms {args.timeout_ms}",
+            check=False,
+        )
+        summary["focus_after_terminal_create_returncode"] = focus_proc.returncode
+        summary["focus_after_terminal_create_stderr"] = (focus_proc.stderr or "").strip()
         time.sleep(args.settle_sec)
         state = linux_smoke.wait_for_remote_state(
             args.host, remote_bin, launch_env, pid, args.timeout_ms, timeout_seconds=30.0

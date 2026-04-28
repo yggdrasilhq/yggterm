@@ -1436,6 +1436,28 @@ impl YggtermServer {
         }
     }
 
+    pub fn set_session_title_hint_passive(&mut self, session_path: &str, title: &str) -> bool {
+        let mut applied = false;
+        if let Some(session) = self.sessions.get_mut(session_path)
+            && passive_title_hint_can_update(&session.title, title, false)
+        {
+            session.title = title.to_string();
+            applied = true;
+        }
+        for machine in &mut self.remote_machines {
+            for scanned in &mut machine.sessions {
+                if scanned.session_path == session_path {
+                    if passive_title_hint_can_update(&scanned.title_hint, title, false) {
+                        scanned.title_hint = title.to_string();
+                        applied = true;
+                    }
+                    return applied;
+                }
+            }
+        }
+        applied
+    }
+
     pub fn set_session_precis_hint(&mut self, session_path: &str, precis: &str) {
         if let Some(session) = self.sessions.get_mut(session_path) {
             upsert_session_metadata(&mut session.preview.summary, "Precis", precis.to_string());
@@ -1883,6 +1905,7 @@ impl YggtermServer {
             } else {
                 session.path.clone()
             };
+            let was_missing = !self.sessions.contains_key(&path);
             let hydration_mode = if session.kind == SessionKind::Document
                 || normalized_desired_active_path
                     .as_deref()
@@ -1924,7 +1947,9 @@ impl YggtermServer {
                 });
             }
             if let Some(title_hint) = session.title_hint.as_deref() {
-                entry.title = title_hint.to_string();
+                if passive_title_hint_can_update(&entry.title, title_hint, was_missing) {
+                    entry.title = title_hint.to_string();
+                }
             }
             if let Some(document) = document.as_ref() {
                 hydrate_document_session(entry, document);
@@ -3788,7 +3813,7 @@ impl YggtermServer {
             );
         }
         if let Some(title) = refreshed_title.as_deref() {
-            self.set_session_title_hint(&path, title);
+            self.set_session_title_hint_passive(&path, title);
         }
         if let Some(precis) = refreshed_precis.as_deref() {
             self.set_session_precis_hint(&path, precis);
@@ -3842,7 +3867,7 @@ impl YggtermServer {
                 upsert_session_metadata(&mut session.metadata, "Host", ssh_target);
                 upsert_session_metadata(&mut session.metadata, "UUID", session_id.to_string());
                 if let Some(title) = refreshed_title.as_deref() {
-                    self.set_session_title_hint(&path, title);
+                    self.set_session_title_hint_passive(&path, title);
                 }
                 if let Some(precis) = refreshed_precis.as_deref() {
                     self.set_session_precis_hint(&path, precis);
@@ -6323,7 +6348,7 @@ pub fn apply_remote_preview_payload_for_path(
     }
     if applied {
         if let Some(title) = refreshed_title.as_deref() {
-            server.set_session_title_hint(session_path, title);
+            server.set_session_title_hint_passive(session_path, title);
         }
         if let Some(precis) = refreshed_precis.as_deref() {
             server.set_session_precis_hint(session_path, precis);
@@ -13551,9 +13576,9 @@ mod tests {
         SnapshotRenderedSection, SnapshotSessionView, SshConnectTarget, StoredPreviewHydrationMode,
         TerminalBackend, TerminalLaunchPhase, UPDATE_RESTART_RESTORE_REASON, UiTheme,
         WorkspaceViewMode, YggtermServer, active_client_instance_records,
-        apply_remote_preview_payload, apply_remote_scanned_session_preview, build_session,
-        canonical_static_label, choose_app_control_pid,
-        clear_local_daemon_socket_link_escaping_home,
+        apply_remote_preview_payload, apply_remote_preview_payload_for_path,
+        apply_remote_scanned_session_preview, build_session, canonical_static_label,
+        choose_app_control_pid, clear_local_daemon_socket_link_escaping_home,
         clear_local_daemon_socket_link_for_version_mismatch, clear_session_preview_for_loading,
         clear_stale_local_daemon_socket_when_no_daemon, client_instances_dir, current_millis_u64,
         dedupe_remote_scanned_sessions, legacy_agent_launch_command,
@@ -16131,6 +16156,93 @@ terminal_window_id: None,
         );
 
         assert_eq!(session.title, "User Chosen Title");
+    }
+
+    #[test]
+    fn passive_preview_for_path_does_not_promote_generated_title_to_user_title() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let path = "remote-session://jojo/existing";
+        server.open_or_focus_session(
+            SessionKind::Codex,
+            path,
+            Some("existing"),
+            Some("/home/pi"),
+            Some("Install Yggterm Works"),
+            None,
+        );
+
+        assert!(apply_remote_preview_payload_for_path(
+            &mut server,
+            path,
+            RemotePreviewPayload {
+                title_hint: Some("Generated Hydration Title".to_string()),
+                cached_precis: None,
+                cached_summary: None,
+                preview: SnapshotPreview {
+                    summary: Vec::new(),
+                    blocks: Vec::new(),
+                },
+                rendered_sections: Vec::new(),
+            },
+        ));
+
+        assert_eq!(
+            server.sessions.get(path).expect("session").title,
+            "Install Yggterm Works"
+        );
+    }
+
+    #[test]
+    fn passive_title_hint_can_still_replace_placeholder_titles() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let path = "remote-session://jojo/placeholder";
+        server.open_or_focus_session(
+            SessionKind::Codex,
+            path,
+            Some("placeholder"),
+            Some("/home/pi"),
+            Some("Terminal"),
+            None,
+        );
+
+        assert!(server.set_session_title_hint_passive(path, "Useful Session Title"));
+
+        assert_eq!(
+            server.sessions.get(path).expect("session").title,
+            "Useful Session Title"
+        );
     }
 
     #[test]
