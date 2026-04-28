@@ -1,3 +1,13 @@
+yggterm (2.1.45-1) unstable; urgency=medium
+
+  * Wait for the old GUI PID before the update replacement claims the KDE app id.
+  * Keep terminal Delete owned by xterm instead of opening tree/live close modals.
+  * Deduplicate terminal Ctrl+V/Cmd+V image paste between browser paste events and native clipboard fallback.
+  * Preserve deliberate session titles against passive preview/generated-title hydration.
+  * Replace the generic app icon with the Yggi mascot mark and regenerated PNG asset.
+
+ -- Yggdrasil HQ <avi@gour.top>  Tue, 28 Apr 2026 21:12:34 +0530
+
 yggterm (2.1.44-1) unstable; urgency=medium
 
   * Isolate updated KDE/X11 clients when an older live client still owns the canonical app id.

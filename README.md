@@ -75,6 +75,8 @@ The short version is:
 
 The product target is not “an editor with a terminal panel.” The terminal is the center. Everything else exists to help you find, restore, explain, automate, and organize terminal work without losing momentum.
 
+The app mark is `Yggi`: a small Yggdrasil sprout growing from a warm prompt. The brand should feel like a trustworthy workspace with a little character, not a generic terminal emulator icon.
+
 This project comes from a very specific pain. Modern terminal work is not one shell doing one thing. It is many long-lived sessions, many machines, many half-finished threads of thought, AI transcripts, SSH reconnects, and a constant risk that a laptop sleep or crash will erase the mental desktop that told you what was happening. Yggterm is trying to turn that mess into a workspace you can trust.
 
 That means:
