@@ -804,6 +804,9 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
             || helper_textarea_focused
             || xterm_cursor_hidden);
     if text_sample.is_empty() {
+        if prompt_ready_surface {
+            return None;
+        }
         if blank_but_mounted_surface {
             return Some("active terminal host exists but xterm surface is empty");
         }
@@ -1568,6 +1571,33 @@ mod tests {
             terminal_host_problem_for_app_control(&host),
             Some("active terminal host exists but xterm surface is empty")
         );
+    }
+
+    #[test]
+    fn terminal_host_problem_accepts_canvas_prompt_from_buffer_when_dom_rows_absent() {
+        let host = json!({
+            "text_sample": "",
+            "cursor_line_text": "pi@jojo:~$",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 12,
+            "data_event_count": 1,
+            "blank_rows_below_cursor": 28,
+            "xterm_buffer_kind": "normal",
+            "xterm_cursor_hidden": false,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(terminal_host_problem_for_app_control(&host), None);
     }
 
     #[test]

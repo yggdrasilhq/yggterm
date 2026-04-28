@@ -1,3 +1,15 @@
+yggterm (2.1.46-1) unstable; urgency=medium
+
+  * Deduplicate terminal image paste in the shared Rust shell path so delayed browser/app-control paste events from one physical Ctrl+V cannot stage a second image.
+  * Extend the keyboard clipboard smoke to reject duplicate PNG prompt insertions and duplicate Image Staged notifications.
+  * Clear stale remote-resume notifications once a terminal session is already ready.
+  * Harden retained terminal layer isolation for live Codex sessions.
+  * Default xterm to the canvas renderer to reduce WebKit CPU on fast terminal output.
+  * Refresh vendored xterm fit/canvas assets as a matched set and load the canvas addon after terminal open.
+  * Preserve explicit terminal-focus reclaim across transient KDE/Xwayland focus-observer false events.
+
+ -- Yggdrasil HQ <avi@gour.top>  Tue, 28 Apr 2026 23:42:37 +0530
+
 yggterm (2.1.45-1) unstable; urgency=medium
 
   * Wait for the old GUI PID before the update replacement claims the KDE app id.

@@ -141,6 +141,7 @@ const UI_TELEMETRY_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const UNMAXIMIZED_SHELL_RADIUS_PX: u8 = 10;
 const APP_CONTROL_TERMINAL_INTERRUPT_SETTLE_MS: u64 = 140;
 const UPDATE_RELAUNCH_AFTER_PID_ENV: &str = "YGGTERM_RELAUNCH_AFTER_PID";
+const TERMINAL_IMAGE_PASTE_DEDUPE_MS: u64 = 3_000;
 static SIDEBAR_MERGE_CACHE: OnceCell<Mutex<SidebarMergeCache>> = OnceCell::new();
 static SIDEBAR_SEARCH_CACHE: OnceCell<Mutex<SidebarSearchCache>> = OnceCell::new();
 static CLIENT_INSTANCE: OnceCell<ClientInstanceRegistration> = OnceCell::new();
@@ -453,6 +454,7 @@ struct ShellState {
     title_autogen_retry_pending: HashSet<String>,
     native_clipboard_owner: Option<Rc<RefCell<NativeClipboardOwner>>>,
     terminal_image_paste_in_flight: HashSet<String>,
+    terminal_recent_image_pastes: HashMap<String, RecentTerminalImagePaste>,
     terminal_attach_in_flight: HashSet<String>,
     terminal_bootstrap_owner_by_session: HashMap<String, String>,
     terminal_bootstrap_lease_by_session: HashMap<String, String>,
@@ -521,6 +523,28 @@ struct NativeClipboardOwner {
     clipboard: NativeClipboard,
     kind: NativeClipboardOwnerKind,
     updated_at_ms: u64,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RecentTerminalImagePaste {
+    fingerprint: u64,
+    at_ms: u64,
+    path: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TerminalImagePasteClaim {
+    Claimed,
+    InFlight,
+    Duplicate { path: String },
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TerminalImagePasteResult {
+    Staged {
+        path: String,
+    },
+    Skipped {
+        reason: &'static str,
+        path: Option<String>,
+    },
 }
 #[derive(Debug, Clone, PartialEq)]
 struct PendingTreeDrag {
@@ -1324,6 +1348,7 @@ impl ShellState {
             title_autogen_retry_pending: HashSet::new(),
             native_clipboard_owner: None,
             terminal_image_paste_in_flight: HashSet::new(),
+            terminal_recent_image_pastes: HashMap::new(),
             terminal_attach_in_flight: HashSet::new(),
             terminal_bootstrap_owner_by_session: HashMap::new(),
             terminal_bootstrap_lease_by_session: HashMap::new(),
@@ -1911,6 +1936,9 @@ impl ShellState {
                 "query": self.search_query,
             }),
         );
+    }
+    fn set_window_focused(&mut self, focused: bool) {
+        self.window_focused = focused;
     }
     fn dismiss_titlebar_transients(&mut self) {
         self.search_focused = false;
@@ -5088,7 +5116,8 @@ fn upsert_terminal_resume_notification(
             shell.server.active_view_mode(),
             shell.server.active_session_path(),
             &session_path,
-        ) {
+        ) || !shell.terminal_session_resume_notification_should_stay_visible(&session_path)
+        {
             shell.clear_job_notification(&job_key_for_write);
             return;
         }
@@ -9557,6 +9586,15 @@ fn app_control_key_script(command: &AppControlKeyCommand) -> String {
                 metaKey: normalized === 'meta+a' || normalized === 'cmd+a' || normalized === 'command+a',
               }};
             }}
+            if (normalized === 'ctrl+v' || normalized === 'control+v' || normalized === 'meta+v' || normalized === 'cmd+v' || normalized === 'command+v') {{
+              return {{
+                key: 'v',
+                code: 'KeyV',
+                keyCode: 86,
+                ctrlKey: normalized === 'ctrl+v' || normalized === 'control+v',
+                metaKey: normalized === 'meta+v' || normalized === 'cmd+v' || normalized === 'command+v',
+              }};
+            }}
             if (raw.length === 1) {{
               const upper = raw.toUpperCase();
               return {{
@@ -13206,6 +13244,63 @@ fn read_native_clipboard_text(state: Signal<ShellState>) -> Result<String> {
     })
 }
 
+fn terminal_clipboard_png_fingerprint(png_bytes: &[u8]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    png_bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn prune_recent_terminal_image_pastes(
+    recent: &mut HashMap<String, RecentTerminalImagePaste>,
+    now_ms: u64,
+) {
+    recent.retain(|_, paste| now_ms.saturating_sub(paste.at_ms) <= TERMINAL_IMAGE_PASTE_DEDUPE_MS);
+}
+
+fn claim_terminal_image_paste(
+    in_flight: &mut HashSet<String>,
+    recent: &mut HashMap<String, RecentTerminalImagePaste>,
+    session_path: &str,
+    fingerprint: u64,
+    now_ms: u64,
+) -> TerminalImagePasteClaim {
+    prune_recent_terminal_image_pastes(recent, now_ms);
+    if in_flight.contains(session_path) {
+        return TerminalImagePasteClaim::InFlight;
+    }
+    if let Some(previous) = recent.get(session_path)
+        && previous.fingerprint == fingerprint
+    {
+        return TerminalImagePasteClaim::Duplicate {
+            path: previous.path.clone(),
+        };
+    }
+    in_flight.insert(session_path.to_string());
+    TerminalImagePasteClaim::Claimed
+}
+
+fn finish_terminal_image_paste_claim(
+    in_flight: &mut HashSet<String>,
+    recent: &mut HashMap<String, RecentTerminalImagePaste>,
+    session_path: &str,
+    fingerprint: u64,
+    at_ms: u64,
+    path: Option<String>,
+) {
+    in_flight.remove(session_path);
+    prune_recent_terminal_image_pastes(recent, at_ms);
+    if let Some(path) = path {
+        recent.insert(
+            session_path.to_string(),
+            RecentTerminalImagePaste {
+                fingerprint,
+                at_ms,
+                path,
+            },
+        );
+    }
+}
+
 fn set_native_clipboard_contents(
     state: Signal<ShellState>,
     contents: &YgguiClipboardContents,
@@ -13307,9 +13402,9 @@ fn stage_terminal_clipboard_image(
     stage_local_clipboard_png(&home, png_bytes)
 }
 async fn stage_and_paste_terminal_clipboard_image(
-    state: Signal<ShellState>,
+    mut state: Signal<ShellState>,
     session_path: &str,
-) -> Result<String> {
+) -> Result<TerminalImagePasteResult> {
     let (endpoint, runtime_session_path, trace_home) = state.with(|shell| {
         (
             shell.bootstrap.server_endpoint.clone(),
@@ -13318,23 +13413,74 @@ async fn stage_and_paste_terminal_clipboard_image(
         )
     });
     let png_bytes = read_native_clipboard_png(state)?;
-    let path = stage_terminal_clipboard_image(state, session_path, &png_bytes)?;
-    terminal_write_with_local_runtime_retry_async(
-        endpoint,
-        runtime_session_path,
-        format!("{path} "),
-        trace_home.as_path(),
-    )
-    .await?;
-    Ok(path)
+    let fingerprint = terminal_clipboard_png_fingerprint(&png_bytes);
+    let claim = state.with_mut(|shell| {
+        claim_terminal_image_paste(
+            &mut shell.terminal_image_paste_in_flight,
+            &mut shell.terminal_recent_image_pastes,
+            session_path,
+            fingerprint,
+            current_millis(),
+        )
+    });
+    match claim {
+        TerminalImagePasteClaim::Claimed => {}
+        TerminalImagePasteClaim::InFlight => {
+            return Ok(TerminalImagePasteResult::Skipped {
+                reason: "clipboard image paste already in flight",
+                path: None,
+            });
+        }
+        TerminalImagePasteClaim::Duplicate { path } => {
+            return Ok(TerminalImagePasteResult::Skipped {
+                reason: "duplicate clipboard image paste",
+                path: Some(path),
+            });
+        }
+    }
+    let paste_result = match stage_terminal_clipboard_image(state, session_path, &png_bytes) {
+        Ok(path) => {
+            match terminal_write_with_local_runtime_retry_async(
+                endpoint,
+                runtime_session_path,
+                format!("{path} "),
+                trace_home.as_path(),
+            )
+            .await
+            {
+                Ok(()) => Ok(path),
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    };
+    let path_for_recent = paste_result.as_ref().ok().cloned();
+    state.with_mut(|shell| {
+        finish_terminal_image_paste_claim(
+            &mut shell.terminal_image_paste_in_flight,
+            &mut shell.terminal_recent_image_pastes,
+            session_path,
+            fingerprint,
+            current_millis(),
+            path_for_recent,
+        );
+    });
+    let path = paste_result?;
+    Ok(TerminalImagePasteResult::Staged { path })
 }
 enum NativeClipboardPaste {
     Text,
-    Image { path: String },
+    Image {
+        path: String,
+    },
+    ImageSkipped {
+        reason: &'static str,
+        path: Option<String>,
+    },
 }
 
 async fn paste_terminal_native_clipboard(
-    state: Signal<ShellState>,
+    mut state: Signal<ShellState>,
     session_path: &str,
 ) -> Result<NativeClipboardPaste> {
     let (endpoint, runtime_session_path, trace_home) = state.with(|shell| {
@@ -13346,14 +13492,60 @@ async fn paste_terminal_native_clipboard(
     });
     match read_native_clipboard_png(state) {
         Ok(png_bytes) => {
-            let path = stage_terminal_clipboard_image(state, session_path, &png_bytes)?;
-            terminal_write_with_local_runtime_retry_async(
-                endpoint,
-                runtime_session_path,
-                format!("{path} "),
-                trace_home.as_path(),
-            )
-            .await?;
+            let fingerprint = terminal_clipboard_png_fingerprint(&png_bytes);
+            let claim = state.with_mut(|shell| {
+                claim_terminal_image_paste(
+                    &mut shell.terminal_image_paste_in_flight,
+                    &mut shell.terminal_recent_image_pastes,
+                    session_path,
+                    fingerprint,
+                    current_millis(),
+                )
+            });
+            match claim {
+                TerminalImagePasteClaim::Claimed => {}
+                TerminalImagePasteClaim::InFlight => {
+                    return Ok(NativeClipboardPaste::ImageSkipped {
+                        reason: "clipboard image paste already in flight",
+                        path: None,
+                    });
+                }
+                TerminalImagePasteClaim::Duplicate { path } => {
+                    return Ok(NativeClipboardPaste::ImageSkipped {
+                        reason: "duplicate clipboard image paste",
+                        path: Some(path),
+                    });
+                }
+            }
+            let paste_result = match stage_terminal_clipboard_image(state, session_path, &png_bytes)
+            {
+                Ok(path) => {
+                    match terminal_write_with_local_runtime_retry_async(
+                        endpoint,
+                        runtime_session_path,
+                        format!("{path} "),
+                        trace_home.as_path(),
+                    )
+                    .await
+                    {
+                        Ok(()) => Ok(path),
+                        Err(error) => Err(error),
+                    }
+                }
+                Err(error) => Err(error),
+            };
+            let path_for_recent = paste_result.as_ref().ok().cloned();
+            state.with_mut(|shell| {
+                finish_terminal_image_paste_claim(
+                    &mut shell.terminal_image_paste_in_flight,
+                    &mut shell.terminal_recent_image_pastes,
+                    session_path,
+                    fingerprint,
+                    current_millis(),
+                    path_for_recent,
+                );
+            });
+            let path = paste_result?;
             Ok(NativeClipboardPaste::Image { path })
         }
         Err(_png_error) => {
@@ -19348,6 +19540,41 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
             const titlebarOverflowMenu = titlebar?.querySelector('[data-titlebar-overflow-menu="1"]') || null;
             const activeElement = document.activeElement;
             const terminalRegistry = window.__yggtermXtermHosts || {};
+            const readTerminalBufferSample = (term) => {
+                try {
+                    if (!term || !term.buffer || !term.buffer.active) {
+                        return "";
+                    }
+                    const active = term.buffer.active;
+                    const rows = Math.max(1, Number(term.rows || 18));
+                    const viewportY = Math.max(0, Number(active.viewportY || 0));
+                    const visibleStart = Math.min(Math.max(0, active.length - 1), viewportY);
+                    const visibleEnd = Math.min(active.length, visibleStart + rows);
+                    const collect = (start, end) => {
+                        const lines = [];
+                        for (let index = start; index < end; index += 1) {
+                            const line = active.getLine(index);
+                            if (!line || !line.translateToString) {
+                                continue;
+                            }
+                            lines.push(String(line.translateToString(true) || ""));
+                        }
+                        return lines.join("\n");
+                    };
+                    let sample = collect(visibleStart, visibleEnd).trim();
+                    if (sample) {
+                        return sample.slice(0, 4096);
+                    }
+                    const trailingStart = Math.max(0, active.length - Math.max(rows, 18));
+                    sample = collect(trailingStart, active.length).trim();
+                    if (sample) {
+                        return sample.slice(0, 4096);
+                    }
+                    return collect(0, Math.min(active.length, Math.max(rows, 18))).trim().slice(0, 4096);
+                } catch (_error) {
+                    return "";
+                }
+            };
             const terminalHostNodes = rootNode
                 ? Array.from(rootNode.querySelectorAll('[data-terminal-session-path]'))
                 : Array.from(document.querySelectorAll('[data-terminal-session-path]'));
@@ -19502,6 +19729,8 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                     })();
                     const canvasCount = host.querySelectorAll('canvas').length;
                     const hostText = String(host.innerText || '').trim();
+                    const bufferText = readTerminalBufferSample(term).trim();
+                    const terminalText = bufferText || hostText;
                     return {
                         host_id: hostId,
                         session_path: String(host.getAttribute('data-terminal-session-path') || '').trim(),
@@ -19511,8 +19740,10 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         viewport_present: Boolean(viewport),
                         rows_present: Boolean(rowsLayer),
                         canvas_count: canvasCount,
-                        text_sample: hostText.slice(0, 240),
-                        text_tail: hostText.slice(-8192),
+                        text_sample: terminalText.slice(0, 240),
+                        text_tail: terminalText.slice(-8192),
+                        dom_text_sample: hostText.slice(0, 240),
+                        buffer_text_sample: bufferText.slice(0, 240),
                         host_rect: rectSummary(host),
                         host_content_width: rectSummary(host)?.width || null,
                         host_content_height: rectSummary(host)?.height || null,
@@ -21340,7 +21571,10 @@ async fn process_pending_app_control_requests(
         }
         AppControlCommand::BackgroundWindow => match background_app_window(&desktop) {
             Ok(data) => {
-                state.with_mut(|shell| shell.window_focused = false);
+                state.with_mut(|shell| {
+                    shell.set_window_focused(false);
+                    shell.terminal_input_override_active = false;
+                });
                 sync_active_terminal_input_policy(state);
                 AppControlResponse {
                     request_id: request.request_id.clone(),
@@ -21892,6 +22126,23 @@ async fn process_pending_app_control_requests(
                         error: None,
                     }
                 }
+                Ok(NativeClipboardPaste::ImageSkipped { reason, path }) => {
+                    refocus_terminal_session_input(&session_path);
+                    AppControlResponse {
+                        request_id: request.request_id.clone(),
+                        handled_by_pid: std::process::id(),
+                        completed_at_ms: current_millis() as u128,
+                        output_path: None,
+                        data: Some(json!({
+                            "accepted": false,
+                            "session_path": session_path,
+                            "kind": "image",
+                            "reason": reason,
+                            "path": path,
+                        })),
+                        error: None,
+                    }
+                }
                 Err(error) => {
                     safe_push_notification(
                         state,
@@ -21915,81 +22166,77 @@ async fn process_pending_app_control_requests(
             }
         }
         AppControlCommand::PasteTerminalClipboardImage { session_path } => {
-            let should_handle = state.with_mut(|shell| {
-                shell
-                    .terminal_image_paste_in_flight
-                    .insert(session_path.clone())
-            });
-            if !should_handle {
-                AppControlResponse {
-                    request_id: request.request_id.clone(),
-                    handled_by_pid: std::process::id(),
-                    completed_at_ms: current_millis() as u128,
-                    output_path: None,
-                    data: Some(json!({
-                        "accepted": false,
-                        "session_path": session_path,
-                        "reason": "clipboard image paste already in flight",
-                    })),
-                    error: Some("clipboard image paste already in flight".to_string()),
-                }
-            } else {
-                let paste_result =
-                    stage_and_paste_terminal_clipboard_image(state, &session_path).await;
-                state.with_mut(|shell| {
-                    shell.terminal_image_paste_in_flight.remove(&session_path);
-                });
-                match paste_result {
-                    Ok(path) => {
-                        safe_push_notification(
-                            state,
-                            NotificationTone::Success,
-                            "Image Staged",
-                            format!(
-                                "Staged clipboard image at {path} and pasted its path into the terminal."
-                            ),
-                        );
-                        let _ = document::eval(&terminal_set_input_enabled_script_for_session(
-                            &session_path,
-                            true,
-                            true,
-                        ));
-                        AppControlResponse {
-                            request_id: request.request_id.clone(),
-                            handled_by_pid: std::process::id(),
-                            completed_at_ms: current_millis() as u128,
-                            output_path: None,
-                            data: Some(json!({
-                                "accepted": true,
-                                "session_path": session_path,
-                                "path": path,
-                            })),
-                            error: None,
-                        }
+            let paste_result = stage_and_paste_terminal_clipboard_image(state, &session_path).await;
+            match paste_result {
+                Ok(TerminalImagePasteResult::Staged { path }) => {
+                    safe_push_notification(
+                        state,
+                        NotificationTone::Success,
+                        "Image Staged",
+                        format!(
+                            "Staged clipboard image at {path} and pasted its path into the terminal."
+                        ),
+                    );
+                    let _ = document::eval(&terminal_set_input_enabled_script_for_session(
+                        &session_path,
+                        true,
+                        true,
+                    ));
+                    AppControlResponse {
+                        request_id: request.request_id.clone(),
+                        handled_by_pid: std::process::id(),
+                        completed_at_ms: current_millis() as u128,
+                        output_path: None,
+                        data: Some(json!({
+                            "accepted": true,
+                            "session_path": session_path,
+                            "path": path,
+                        })),
+                        error: None,
                     }
-                    Err(error) => {
-                        safe_push_notification(
-                            state,
-                            NotificationTone::Error,
-                            "Image Paste Failed",
-                            error.to_string(),
-                        );
-                        let _ = document::eval(&terminal_set_input_enabled_script_for_session(
-                            &session_path,
-                            true,
-                            true,
-                        ));
-                        AppControlResponse {
-                            request_id: request.request_id.clone(),
-                            handled_by_pid: std::process::id(),
-                            completed_at_ms: current_millis() as u128,
-                            output_path: None,
-                            data: Some(json!({
-                                "accepted": false,
-                                "session_path": session_path,
-                            })),
-                            error: Some(error.to_string()),
-                        }
+                }
+                Ok(TerminalImagePasteResult::Skipped { reason, path }) => {
+                    let _ = document::eval(&terminal_set_input_enabled_script_for_session(
+                        &session_path,
+                        true,
+                        true,
+                    ));
+                    AppControlResponse {
+                        request_id: request.request_id.clone(),
+                        handled_by_pid: std::process::id(),
+                        completed_at_ms: current_millis() as u128,
+                        output_path: None,
+                        data: Some(json!({
+                            "accepted": false,
+                            "session_path": session_path,
+                            "reason": reason,
+                            "path": path,
+                        })),
+                        error: None,
+                    }
+                }
+                Err(error) => {
+                    safe_push_notification(
+                        state,
+                        NotificationTone::Error,
+                        "Image Paste Failed",
+                        error.to_string(),
+                    );
+                    let _ = document::eval(&terminal_set_input_enabled_script_for_session(
+                        &session_path,
+                        true,
+                        true,
+                    ));
+                    AppControlResponse {
+                        request_id: request.request_id.clone(),
+                        handled_by_pid: std::process::id(),
+                        completed_at_ms: current_millis() as u128,
+                        output_path: None,
+                        data: Some(json!({
+                            "accepted": false,
+                            "session_path": session_path,
+                        })),
+                        error: Some(error.to_string()),
                     }
                 }
             }
@@ -22282,7 +22529,7 @@ async fn process_pending_app_control_requests(
         }
         AppControlCommand::FocusWindow => match focus_app_window(&desktop) {
             Ok(data) => {
-                state.with_mut(|shell| shell.window_focused = true);
+                state.with_mut(|shell| shell.set_window_focused(true));
                 sync_active_terminal_input_policy(state);
                 AppControlResponse {
                     request_id: request.request_id.clone(),
@@ -23712,7 +23959,7 @@ fn app() -> Element {
                 DesktopWindowEvent::Focused(focused) => {
                     state.with_mut(|shell| {
                         sync_window_frame_state(shell);
-                        shell.window_focused = *focused;
+                        shell.set_window_focused(*focused);
                     });
                     sync_active_terminal_input_policy(state);
                     window_epoch.with_mut(|epoch| *epoch += 1);
@@ -28175,10 +28422,16 @@ fn MainSurface(
                                         == Some(terminal_session.session_path.as_str());
                                 let terminal_canvas_style = format!(
                                     "position:absolute; inset:0; display:flex; flex-direction:column; flex:1 1 auto; min-width:0; min-height:0; width:100%; \
-                                     opacity:{}; visibility:{}; pointer-events:{};",
+                                     overflow:hidden; contain:strict; z-index:{}; opacity:{}; visibility:{}; pointer-events:{}; transform:{};",
+                                    if terminal_visible { "2" } else { "0" },
                                     if terminal_visible { "1" } else { "0" },
                                     if terminal_visible { "visible" } else { "hidden" },
                                     if terminal_visible { "auto" } else { "none" },
+                                    if terminal_visible {
+                                        "translate3d(0,0,0)"
+                                    } else {
+                                        "translate3d(-200vw,0,0)"
+                                    },
                                 );
                                 rsx! {
                                     div {
@@ -31818,6 +32071,10 @@ fn TerminalCanvas(
                                         );
                                         refocus_terminal_session_input(&session_path);
                                     }
+                                    Ok(NativeClipboardPaste::ImageSkipped { reason, path }) => {
+                                        warn!(session=%session_path, reason=%reason, path=?path, "terminal clipboard image paste skipped");
+                                        refocus_terminal_session_input(&session_path);
+                                    }
                                     Err(error) => {
                                         warn!(session=%session_path, error=%error, "terminal clipboard paste failed");
                                         safe_push_notification(
@@ -31831,25 +32088,27 @@ fn TerminalCanvas(
                                 }
                             }
                             Ok(TerminalJsEvent::ClipboardImageRequest) => {
-                                let should_handle = state.with_mut(|shell| {
-                                    shell
-                                        .terminal_image_paste_in_flight
-                                        .insert(session_path.clone())
-                                });
-                                if !should_handle {
-                                    continue;
-                                }
                                 let paste_result =
                                     stage_and_paste_terminal_clipboard_image(state, &session_path)
                                         .await;
                                 match paste_result {
-                                    Ok(path) => {
+                                    Ok(TerminalImagePasteResult::Staged { path }) => {
                                         safe_push_notification(
                                             state,
                                             NotificationTone::Success,
                                             "Image Staged",
                                             format!("Staged clipboard image at {path} and pasted its path into the terminal."),
                                         );
+                                        let _ = document::eval(
+                                            &terminal_set_input_enabled_script_for_session(
+                                                &session_path,
+                                                true,
+                                                true,
+                                            ),
+                                        );
+                                    }
+                                    Ok(TerminalImagePasteResult::Skipped { reason, path }) => {
+                                        warn!(session=%session_path, reason=%reason, path=?path, "terminal clipboard image paste skipped");
                                         let _ = document::eval(
                                             &terminal_set_input_enabled_script_for_session(
                                                 &session_path,
@@ -31874,9 +32133,6 @@ fn TerminalCanvas(
                                         );
                                     }
                                 }
-                                state.with_mut(|shell| {
-                                    shell.terminal_image_paste_in_flight.remove(&session_path);
-                                });
                             }
                             Ok(TerminalJsEvent::ClipboardError { action, message }) => {
                                 let title = if action == "cut" {
@@ -34026,7 +34282,7 @@ fn trace_env_flag_truthy(name: &str) -> bool {
 fn terminal_xterm_canvas_renderer_enabled() -> bool {
     std::env::var(XTERM_CANVAS_RENDERER_ENV)
         .ok()
-        .is_some_and(|value| env_value_truthy(&value))
+        .map_or(true, |value| env_value_truthy(&value))
 }
 fn env_value_truthy(value: &str) -> bool {
     matches!(
@@ -35296,7 +35552,8 @@ fn terminal_runtime_input_policy(
         titlebar_transient_open,
         tree_rename_active,
     );
-    let allow_input = window_focused && terminal_selected && right_panel_allows_input;
+    let focus_context_allows_input = window_focused || terminal_input_override_active;
+    let allow_input = focus_context_allows_input && terminal_selected && right_panel_allows_input;
     let focus_input = allow_input;
     (allow_input, focus_input)
 }
@@ -35581,9 +35838,9 @@ fn terminal_eval_script_with_canvas_renderer(
                 brightWhite: {bright_white},
             }},
         }});
-        // Canvas renderer is still under investigation. Keep it runtime-gated
-        // so jojo/KDE CPU probes can compare it against the DOM renderer
-        // without changing the default path for every user.
+        // Canvas is the default renderer for heavy terminal output. Keep the
+        // environment gate so field tests can still force the DOM renderer
+        // while isolating compositor-specific WebKit behavior.
         const canvasRendererEnabled = {canvas_renderer_enabled};
         let preferredCanvasRenderer = false;
         const fitAddon = new window.FitAddon.FitAddon();
@@ -37014,6 +37271,7 @@ fn terminal_eval_script_with_canvas_renderer(
         }};
         attachHostInteractions(host);
         let pendingClipboardPasteToken = 0;
+        const terminalNativePasteDedupeMs = 2500;
         const handleClipboardPaste = (event) => {{
             if (!inputEnabled || !event) {{
                 return;
@@ -37097,7 +37355,7 @@ fn terminal_eval_script_with_canvas_renderer(
                             return;
                         }}
                         const lastPasteEventAt = Number(window.__yggtermLastPasteEventAtMs || 0);
-                        if (lastPasteEventAt > 0 && Date.now() - lastPasteEventAt < 180) {{
+                        if (lastPasteEventAt > 0 && Date.now() - lastPasteEventAt < terminalNativePasteDedupeMs) {{
                             return;
                         }}
                         dioxus.send({{ kind: "clipboard_paste_request" }});
@@ -41526,6 +41784,65 @@ mod tests {
         assert_eq!(settings.terminal_font_size, 12.0);
     }
     #[test]
+    fn terminal_image_paste_claim_dedupes_same_session_fingerprint() {
+        let mut in_flight = HashSet::new();
+        let mut recent = HashMap::new();
+        assert_eq!(
+            claim_terminal_image_paste(&mut in_flight, &mut recent, "local://one", 42, 1_000),
+            TerminalImagePasteClaim::Claimed
+        );
+        finish_terminal_image_paste_claim(
+            &mut in_flight,
+            &mut recent,
+            "local://one",
+            42,
+            1_100,
+            Some("/tmp/clipboard.png".to_string()),
+        );
+        assert_eq!(
+            claim_terminal_image_paste(&mut in_flight, &mut recent, "local://one", 42, 2_000),
+            TerminalImagePasteClaim::Duplicate {
+                path: "/tmp/clipboard.png".to_string()
+            }
+        );
+        assert!(in_flight.is_empty());
+    }
+
+    #[test]
+    fn terminal_image_paste_claim_allows_new_session_or_expired_fingerprint() {
+        let mut in_flight = HashSet::new();
+        let mut recent = HashMap::from([(
+            "local://one".to_string(),
+            RecentTerminalImagePaste {
+                fingerprint: 42,
+                at_ms: 1_000,
+                path: "/tmp/clipboard.png".to_string(),
+            },
+        )]);
+        assert_eq!(
+            claim_terminal_image_paste(&mut in_flight, &mut recent, "local://two", 42, 2_000),
+            TerminalImagePasteClaim::Claimed
+        );
+        finish_terminal_image_paste_claim(
+            &mut in_flight,
+            &mut recent,
+            "local://two",
+            42,
+            2_050,
+            Some("/tmp/other.png".to_string()),
+        );
+        assert_eq!(
+            claim_terminal_image_paste(
+                &mut in_flight,
+                &mut recent,
+                "local://one",
+                42,
+                1_000 + TERMINAL_IMAGE_PASTE_DEDUPE_MS + 1,
+            ),
+            TerminalImagePasteClaim::Claimed
+        );
+    }
+    #[test]
     fn set_rendered_zoom_updates_only_rendered_font_size() {
         let mut settings = AppSettings::default();
         settings.rendered_font_size = 10.0;
@@ -42130,6 +42447,39 @@ mod tests {
         );
     }
     #[test]
+    fn terminal_runtime_input_policy_allows_explicit_reclaim_when_focus_observer_lags() {
+        assert_eq!(
+            terminal_runtime_input_policy(
+                WorkspaceViewMode::Terminal,
+                Some("local://shell"),
+                "local://shell",
+                RightPanelMode::Hidden,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+            ),
+            (true, true)
+        );
+        assert_eq!(
+            terminal_runtime_input_policy(
+                WorkspaceViewMode::Terminal,
+                Some("local://shell"),
+                "local://shell",
+                RightPanelMode::Hidden,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true,
+            ),
+            (false, false)
+        );
+    }
+    #[test]
     fn terminal_input_override_defaults_to_settings_panel_only() {
         assert!(terminal_input_override_for_right_panel_mode(
             RightPanelMode::Settings
@@ -42532,6 +42882,16 @@ mod tests {
         assert!(script.contains("injectScript(\"yggterm-xterm-canvas-script\""));
         assert!(script.contains("window.CanvasAddon && window.CanvasAddon.CanvasAddon"));
         assert!(script.contains("const canvasAddon = new window.CanvasAddon.CanvasAddon();"));
+        let canvas_load = script
+            .find("term.loadAddon(canvasAddon);")
+            .expect("canvas addon load present");
+        let terminal_open = script
+            .find("term.open(host);")
+            .expect("terminal open present");
+        assert!(
+            terminal_open < canvas_load,
+            "xterm canvas addon must load after open on WebKitGTK so the terminal surface mounts readable rows"
+        );
     }
 
     #[test]
@@ -42543,6 +42903,13 @@ mod tests {
             terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true);
         assert!(disabled.contains("const canvasRendererEnabled = false;"));
         assert!(enabled.contains("const canvasRendererEnabled = true;"));
+    }
+
+    #[test]
+    fn terminal_eval_script_defaults_to_canvas_renderer() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(script.contains("const canvasRendererEnabled = true;"));
     }
 
     #[test]
@@ -42594,9 +42961,11 @@ mod tests {
         assert!(script.contains("if (event.__yggtermHandledPaste) {"));
         assert!(script.contains("event.__yggtermHandledPaste = true;"));
         assert!(script.contains("let pendingClipboardPasteToken = 0;"));
+        assert!(script.contains("const terminalNativePasteDedupeMs = 2500;"));
         assert!(script.contains("const pasteToken = pendingClipboardPasteToken + 1;"));
         assert!(script.contains("if (pasteToken !== pendingClipboardPasteToken) {"));
         assert!(script.contains("window.__yggtermLastPasteEventAtMs = Date.now();"));
+        assert!(script.contains("Date.now() - lastPasteEventAt < terminalNativePasteDedupeMs"));
         assert!(script.contains("host.addEventListener('paste', handleClipboardPaste, true);"));
         assert!(script.contains("document.addEventListener('paste', handleClipboardPaste, true);"));
         assert!(!script.contains("const handlePasteShortcut = () => {"));
@@ -42708,6 +43077,17 @@ mod tests {
         });
         assert!(script.contains("normalized === 'ctrl+a'"));
         assert!(script.contains("setSelection(target, 0, state.value.length);"));
+    }
+
+    #[test]
+    fn app_control_key_script_dispatches_terminal_paste_shortcut() {
+        let script = app_control_key_script(&AppControlKeyCommand::Press {
+            keys: vec!["ctrl+v".to_string()],
+        });
+        assert!(script.contains("normalized === 'ctrl+v'"));
+        assert!(script.contains("key: 'v'"));
+        assert!(script.contains("code: 'KeyV'"));
+        assert!(script.contains("ctrlKey: normalized === 'ctrl+v'"));
     }
 
     #[test]
