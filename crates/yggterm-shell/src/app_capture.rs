@@ -128,7 +128,6 @@ pub fn focus_app_window(desktop: &DesktopContext) -> Result<Value> {
 
 pub fn background_app_window(desktop: &DesktopContext) -> Result<Value> {
     desktop.set_always_on_bottom(true);
-    desktop.set_minimized(false);
     #[cfg(target_os = "linux")]
     {
         use gtk::prelude::*;
