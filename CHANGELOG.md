@@ -4,6 +4,18 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.46
+
+### Fixed
+
+- move terminal image-paste deduplication into the Rust shell path shared by browser paste events, shortcut fallback, and app-control paste requests, so a delayed duplicate event from one physical `Ctrl+V` cannot stage a second image or paste a second path
+- extend the keyboard clipboard smoke to force the delayed duplicate paste path and reject any second `.png` prompt insertion or second `Image Staged` notification
+- stop re-upserting the `Resuming Remote Terminal` toast once a terminal session already has a ready open attempt or completed visual resume, preventing live Codex surfaces from staying dimmed behind stale resume state
+- isolate hidden retained terminal canvases with strict containment, z-order, and offscreen transforms so inactive live Codex hosts cannot visually bleed into the active terminal surface
+- default the embedded xterm surface to the canvas renderer, with `YGGTERM_ENABLE_XTERM_CANVAS=0` retained as a field-test escape hatch, so fast terminal output does not burn the WebKit DOM renderer path
+- refresh the vendored xterm fit/canvas assets as a matched set and load the canvas addon after opening the terminal, preserving readable WebKitGTK rows while keeping the canvas renderer active
+- keep explicit terminal-focus reclaim active across transient KDE/Xwayland focus-observer false events while still clearing it on app-control background, so automation and viewport reclaim do not drop input before paste/typing
+
 ## 2.1.45
 
 ### Fixed
