@@ -202,7 +202,7 @@ That means:
 
 - open at the cursor
 - modest radius
-- clean light surface
+- clean theme-aware surface
 - subtle shadow
 - compact but breathable row sizing
 - strong label clarity
@@ -212,6 +212,7 @@ Avoid:
 - giant floating glass blobs
 - top-left fallback placement
 - labels that invent confusing product language
+- hard-coded light styling in dark mode
 
 ### Motion and interaction
 
@@ -244,6 +245,8 @@ Update UX is a reusable shell concern, not project-specific glue.
 
 - Direct-install update flows should reuse the notification and chrome systems.
 - Installing an update must not immediately tear down a running productive workspace.
+- Restarting into an update must temporarily protect every recoverable live runtime, whether or not the user explicitly marked it Keep Alive.
+- This temporary protection is not the same as Keep Alive. Keep Alive is durable cold-start restore. Update protection is a one-restart safety net.
 - Preferred behavior is:
   - install in the background
   - notify that the update is ready
@@ -411,6 +414,67 @@ This section is intentionally project-specific.
 ### Main artifact
 
 - daemon-owned terminal and session canvas
+
+### Stability-first product rules
+
+Yggterm is in a stability freeze. New terminal/session features must wait until the existing shell can be daily-driven without losing work, mutating titles unexpectedly, or making terminal input feel unreliable.
+
+The product has three separate identities that must not be conflated:
+
+- `Workspace row`: the durable place in the sidebar tree.
+- `Runtime`: the daemon-owned PTY or SSH session that receives bytes.
+- `Display copy`: title, precis, summary, preview text, and generated labels.
+
+Selecting a row may focus or hydrate already-cached data. It must not rename, regenerate, relaunch, or move a runtime unless the user took an explicit action for that side effect.
+
+### Live sessions and updates
+
+`Live Sessions` is a runtime monitor, not the user's only home for a session.
+
+- Every live local and SSH runtime should appear there while it is alive.
+- The original workspace row remains the user's visual bookmark.
+- The `X` affordance in `Live Sessions` kills the runtime after confirmation. It does not delete stored transcript history.
+- Keep Alive means durable restore after a normal cold restart.
+- Update restart protection temporarily treats all recoverable live runtimes as restorable. It must not silently turn unkept sessions into durable Keep Alive sessions.
+
+### Preview and copy
+
+Preview mode is read-only by default.
+
+- Switching Terminal -> Preview -> Terminal must preserve session identity, title, summary, runtime, scroll intent, and input routing.
+- Preview hydration may update the preview body from existing cache.
+- Preview hydration must not rewrite a user title or start LLM copy generation.
+- Generated copy is an explicit background job with visible state and a bounded budget, not an incidental selection effect.
+
+Terminal recipes are experimental. They should not be created implicitly from drag/drop or ordinary session movement unless an explicit development flag enables that behavior.
+
+### Clipboard and media paste
+
+Image paste is a first-class terminal operation.
+
+- The desktop clipboard is read by the local shell/server, not by brittle terminal text hacks.
+- Local sessions receive staged files under the local Yggterm home.
+- SSH sessions receive staged files through the remote Yggterm helper when available, with the resulting remote path inserted into the terminal.
+- Text paste and image paste share the same intentional paste path so `Ctrl+V`/`Cmd+V` behaves predictably across Linux, Windows, and macOS.
+
+### Terminal control
+
+Terminal focus, input, scroll, selection, and retained-host recovery must have one active controller.
+
+- A terminal that can scroll but cannot type is a broken state.
+- A terminal that can type but cannot scroll while the user is reading scrollback is also broken.
+- Retained terminal hosts may stay mounted only while their active session identity and input policy match the shell state.
+- Activity indicators represent real work: `idle`, `running`, `recent-output`, `recovering`, or `kept`. They should not spin for cosmetic debounce after a blank Enter or already-rendered keypress.
+- App-control typing proofs should use the same viewport keyboard path a user exercises. Direct PTY writes are still useful for controlled setup, but interrupt bytes such as `Ctrl-C` must not be batched with later line-editing or command bytes.
+
+### Codex-class sessions
+
+Codex and LiteLLM sessions are terminal sessions with extra semantic state.
+
+- The shell should expose whether the session is waiting, thinking, streaming output, running a tool, complete, or recovering.
+- Completion should produce a notification and optional sound when notifications are enabled.
+- Terminal bell/OSC notifications should flow through the reusable notification system instead of being ignored.
+- Codex semantic state must never replace the daemon runtime identity as the input target.
 
 ### Navigation model
 
