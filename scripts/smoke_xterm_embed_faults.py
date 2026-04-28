@@ -2370,6 +2370,58 @@ def xdotool_key_window(pid: int, *keys: str) -> dict:
     }
 
 
+def xdotool_key_window_physical(pid: int, *keys: str) -> dict:
+    env = xdotool_env_for_pid(pid)
+    window_id = visible_window_id_for_pid(pid)
+    xdotool_activate_window_if_supported(pid, window_id)
+    proc = subprocess.run(
+        ["xdotool", "key", "--clearmodifiers", *keys],
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=XDO_TIMEOUT_SECONDS,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(proc.stderr.strip() or f"physical xdotool key failed for pid {pid}: {keys!r}")
+    time.sleep(0.18)
+    return {
+        "window_id": window_id,
+        "keys": list(keys),
+        "driver": "xdotool",
+    }
+
+
+def xdotool_ctrl_v_window_physical(pid: int) -> dict:
+    env = xdotool_env_for_pid(pid)
+    window_id = visible_window_id_for_pid(pid)
+    xdotool_activate_window_if_supported(pid, window_id)
+    commands = [
+        ["xdotool", "keyup", "Control_L", "Control_R", "v"],
+        ["xdotool", "keydown", "Control_L"],
+        ["xdotool", "key", "v"],
+        ["xdotool", "keyup", "Control_L"],
+    ]
+    for command in commands:
+        proc = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=XDO_TIMEOUT_SECONDS,
+        )
+        if proc.returncode != 0:
+            raise AssertionError(
+                proc.stderr.strip()
+                or f"physical xdotool Ctrl+V sequence failed for pid {pid}: {command!r}"
+            )
+    time.sleep(0.18)
+    return {
+        "window_id": window_id,
+        "keys": ["ctrl+v"],
+        "driver": "xdotool-sequence",
+    }
+
+
 def xdotool_key_focused(pid: int, *keys: str) -> dict:
     if KEY_DRIVER == "app":
         app_key_command(pid, "press", *keys)
@@ -9970,6 +10022,120 @@ def assert_clipboard_image_contract(pid: int, session: str, out_dir: Path) -> di
         stop_clipboard_owner(success_owner)
 
 
+def assert_terminal_delete_key_contract(pid: int, session: str, out_dir: Path) -> dict:
+    wait_for_session_focus(pid, session, timeout_seconds=12.0)
+    clear_terminal_selection(pid, session, timeout_seconds=4.0)
+    wait_for_terminal_quiescent(pid, timeout_seconds=8.0)
+    clear_probe = clear_prompt_line(pid, session, timeout_seconds=8.0)
+    focus_state = focus_terminal_helper_textarea(pid, session, timeout_seconds=8.0)
+    focus_host = host_for_session_or_none(focus_state, session) or active_host_or_none(focus_state) or {}
+    before_active_element = (focus_state.get("dom") or {}).get("active_element") or {}
+    delete_key = xdotool_key_window(pid, "Delete")
+    time.sleep(0.45)
+    after_delete = app_state(pid)
+    pending_delete = (after_delete.get("shell") or {}).get("pending_delete")
+    if pending_delete or rect_is_visible(dom_rect(after_delete, "delete_confirm_dialog_rect")):
+        raise AssertionError(f"terminal-owned Delete opened a delete/close modal: {after_delete!r}")
+    after_host = host_for_session_or_none(after_delete, session) or active_host_or_none(after_delete) or {}
+    if after_host.get("input_enabled") is not True:
+        raise AssertionError(f"terminal lost input after Delete: host={after_host!r} state={after_delete!r}")
+    type_probe = probe_type(pid, session, "delete-key-proof", mode="keyboard", retries=2)
+    after_type = app_state(pid)
+    if rect_is_visible(dom_rect(after_type, "delete_confirm_dialog_rect")):
+        raise AssertionError(f"delete modal appeared after terminal type recovery: {after_type!r}")
+    typed_host = host_for_session_or_none(after_type, session) or active_host_or_none(after_type) or {}
+    typed_line = str(typed_host.get("cursor_line_text") or typed_host.get("cursor_row_text") or "")
+    if "delete-key-proof" not in typed_line:
+        raise AssertionError(
+            f"terminal did not remain writable after Delete: line={typed_line!r} probe={type_probe!r} state={after_type!r}"
+        )
+    shot_path = out_dir / "terminal-delete-key.png"
+    app_screenshot(pid, shot_path)
+    cleanup_probe = clear_prompt_line(pid, session, timeout_seconds=8.0)
+    return {
+        "clear_probe": clear_probe,
+        "focus_active_element": before_active_element,
+        "focus_host": {
+            "input_enabled": focus_host.get("input_enabled"),
+            "helper_textarea_focused": focus_host.get("helper_textarea_focused"),
+            "host_has_active_element": focus_host.get("host_has_active_element"),
+        },
+        "delete_key": delete_key,
+        "pending_delete_after_key": pending_delete,
+        "type_probe": type_probe,
+        "typed_line": typed_line,
+        "cleanup_probe": cleanup_probe,
+        "screenshot": str(shot_path),
+    }
+
+
+def assert_keyboard_clipboard_paste_dedup_contract(pid: int, session: str, out_dir: Path) -> dict:
+    wait_for_window_focus(pid, timeout_seconds=8.0)
+    wait_for_session_focus(pid, session, timeout_seconds=12.0)
+    focus_terminal_helper_textarea(pid, session, timeout_seconds=8.0)
+    clear_terminal_selection(pid, session, timeout_seconds=4.0)
+    wait_for_terminal_quiescent(pid, timeout_seconds=8.0)
+    clear_probe = clear_prompt_line(pid, session, timeout_seconds=8.0)
+    owner = None
+    try:
+        owner = set_clipboard_png_for_pid(pid)
+        focus_state = focus_terminal_helper_textarea(pid, session, timeout_seconds=8.0)
+        focus_host = host_for_session_or_none(focus_state, session) or active_host_or_none(focus_state) or {}
+        focus_rect = focus_host.get("host_rect") or dom_rect(focus_state, "main_surface_body_rect")
+        if rect_is_visible(focus_rect):
+            xdotool_click_window(
+                pid,
+                rect_center_x(focus_rect),
+                rect_center_y(focus_rect),
+            )
+            focus_state = focus_terminal_helper_textarea(pid, session, timeout_seconds=4.0)
+        paste_key = xdotool_ctrl_v_window_physical(pid)
+        deadline = time.time() + 8.0
+        success_state = {}
+        success_notification = None
+        success_line = ""
+        while time.time() < deadline:
+            success_state = app_state(pid)
+            current_success_notifications = [
+                notification
+                for notification in visible_notifications(success_state)
+                if str(notification.get("title") or "") == "Image Staged"
+            ]
+            if current_success_notifications:
+                success_notification = current_success_notifications[-1]
+            host = host_for_session_or_none(success_state, session) or active_host_or_none(success_state) or {}
+            current_line = str(host.get("cursor_line_text") or host.get("cursor_row_text") or "")
+            if ".png" in current_line:
+                success_line = current_line
+            if success_notification and success_line:
+                break
+            time.sleep(0.15)
+        if success_notification is None:
+            raise AssertionError(f"keyboard image paste did not surface success notification: {success_state!r}")
+        png_count = success_line.count(".png")
+        if png_count != 1:
+            raise AssertionError(
+                f"keyboard image paste inserted {png_count} png paths, expected exactly one: line={success_line!r} state={success_state!r}"
+            )
+        if rect_is_visible(dom_rect(success_state, "delete_confirm_dialog_rect")):
+            raise AssertionError(f"keyboard paste unexpectedly opened delete modal: {success_state!r}")
+        shot_path = out_dir / "keyboard-clipboard-paste.png"
+        app_screenshot(pid, shot_path)
+        cleanup_probe = clear_prompt_line(pid, session, timeout_seconds=8.0)
+        return {
+            "clear_probe": clear_probe,
+            "focus_active_element": (focus_state.get("dom") or {}).get("active_element") or {},
+            "paste_key": paste_key,
+            "success_notification": success_notification,
+            "success_cursor_line": success_line,
+            "png_count": png_count,
+            "cleanup_probe": cleanup_probe,
+            "screenshot": str(shot_path),
+        }
+    finally:
+        stop_clipboard_owner(owner)
+
+
 def wait_for_window_maximized(pid: int, enabled: bool, timeout_seconds: float = 10.0) -> dict | None:
     deadline = time.time() + timeout_seconds
     last_state = {}
@@ -14131,6 +14297,8 @@ def main() -> int:
         "selection",
         "terminal_interaction_latency",
         "terminal_interactive_lifecycle",
+        "terminal_delete_key",
+        "keyboard_clipboard_paste",
         "clipboard_image",
         "partial_input",
         "scroll",
@@ -14309,6 +14477,11 @@ def main() -> int:
         run_check(
             "terminal_interactive_lifecycle",
             lambda: assert_terminal_interactive_lifecycle(args.pid, args.session),
+        )
+        run_check("terminal_delete_key", lambda: assert_terminal_delete_key_contract(args.pid, args.session, out_dir))
+        run_check(
+            "keyboard_clipboard_paste",
+            lambda: assert_keyboard_clipboard_paste_dedup_contract(args.pid, args.session, out_dir),
         )
         run_check("context_menu_rename_session", lambda: assert_context_menu_rename_session(args.pid))
         run_check("context_menu_delete_session", lambda: assert_context_menu_delete_session(args.pid))
