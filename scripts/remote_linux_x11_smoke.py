@@ -1463,9 +1463,11 @@ def main() -> int:
             only_check_args = "".join(
                 f" --only-check {quote(check_name)}" for check_name in args.only_check
             )
+            avoid_foreground = "0" if "keyboard_clipboard_paste" in args.only_check else "1"
+            metadata["smoke_avoid_foreground"] = avoid_foreground == "1"
             smoke_proc = ssh_shell(
                 args.host,
-                f"{exports}; YGGTERM_BIN={quote(remote_bin)} YGGTERM_SMOKE_AVOID_FOREGROUND=1 "
+                f"{exports}; YGGTERM_BIN={quote(remote_bin)} YGGTERM_SMOKE_AVOID_FOREGROUND={avoid_foreground} "
                 f"{quote(python_cmd)} {quote(remote_smoke_script)} "
                 f"--bin {quote(remote_bin)} --pid {pid} --session {quote(smoke_session)} "
                 f"--session-kind {quote(args.session_kind)} --out {quote(remote_out)} --home {quote(remote_home)}"
