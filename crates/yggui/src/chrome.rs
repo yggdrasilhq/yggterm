@@ -241,6 +241,32 @@ fn WindowControlButton(
     on_press: EventHandler<MouseEvent>,
 ) -> Element {
     let is_close = hover_tone == HoveredChromeControl::Close;
+    let control_name = match hover_tone {
+        HoveredChromeControl::AlwaysOnTop => "always-on-top",
+        HoveredChromeControl::Minimize => "minimize",
+        HoveredChromeControl::Maximize => "maximize",
+        HoveredChromeControl::Fullscreen => "fullscreen",
+        HoveredChromeControl::Close => "close",
+    };
+    let label = match hover_tone {
+        HoveredChromeControl::AlwaysOnTop => "Always on top",
+        HoveredChromeControl::Minimize => "Minimize",
+        HoveredChromeControl::Maximize => {
+            if active {
+                "Restore"
+            } else {
+                "Maximize"
+            }
+        }
+        HoveredChromeControl::Fullscreen => {
+            if active {
+                "Exit fullscreen"
+            } else {
+                "Fullscreen"
+            }
+        }
+        HoveredChromeControl::Close => "Close",
+    };
     let background = if hovered {
         if is_close {
             palette.close_hover
@@ -280,6 +306,8 @@ fn WindowControlButton(
     };
     rsx! {
         button {
+            "aria-label": label,
+            "data-yggterm-window-control": control_name,
             style: button_style,
             onmousedown: |evt| evt.stop_propagation(),
             ondoubleclick: |evt| evt.stop_propagation(),
