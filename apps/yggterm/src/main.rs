@@ -49,6 +49,7 @@ const DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT_ENV: &str =
     "YGGTERM_DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT";
 const ENV_YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF: &str = "YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF";
 const ENV_YGGTERM_ENABLE_ACCESSIBILITY: &str = "YGGTERM_ENABLE_ACCESSIBILITY";
+const ENV_YGGTERM_ALLOW_WAYLAND_BACKEND: &str = "YGGTERM_ALLOW_WAYLAND_BACKEND";
 const ENV_YGGTERM_ENABLE_WEBKIT_COMPOSITING: &str = "YGGTERM_ENABLE_WEBKIT_COMPOSITING";
 const ENV_YGGTERM_ALLOW_MULTI_WINDOW: &str = "YGGTERM_ALLOW_MULTI_WINDOW";
 const ENV_YGGTERM_ENABLE_TRANSPARENT_WINDOW: &str = "YGGTERM_ENABLE_TRANSPARENT_WINDOW";
@@ -388,6 +389,7 @@ fn ensure_local_server_ready_for_cli(store: &SessionStore) -> Result<()> {
 
 fn main() -> Result<()> {
     configure_linux_allocator_limits()?;
+    configure_linux_desktop_backend();
     configure_linux_accessibility_bridge();
     configure_linux_webkit_compositing();
     configure_linux_webkit_memory_policy();
@@ -414,6 +416,20 @@ fn main() -> Result<()> {
         "startup",
         "main_enter",
         serde_json::json!({ "args": args.clone() }),
+    );
+    #[cfg(target_os = "linux")]
+    append_trace_event(
+        &startup_home,
+        "gui",
+        "startup",
+        "linux_desktop_backend_policy",
+        serde_json::json!({
+            "gdk_backend": std::env::var("GDK_BACKEND").ok(),
+            "winit_unix_backend": std::env::var("WINIT_UNIX_BACKEND").ok(),
+            "policy": std::env::var("YGGTERM_LINUX_BACKEND_POLICY").ok(),
+            "wayland_display_present": std::env::var_os("WAYLAND_DISPLAY").is_some(),
+            "display_present": std::env::var_os("DISPLAY").is_some(),
+        }),
     );
     let startup_span = PerfSpan::start(&startup_home, "startup", "gui_main");
     let pending_update_restart = None;
@@ -1377,8 +1393,118 @@ struct LinuxWindowProfileInput {
     wayland_display_present: bool,
     display_present: bool,
     gdk_backend_x11: bool,
+    kde_session: bool,
     xrpd_session: bool,
 }
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinuxDesktopBackendPolicyInput {
+    allow_wayland_backend: bool,
+    gdk_backend_set: bool,
+    winit_backend_set: bool,
+    kde_session: bool,
+    wayland_display_present: bool,
+    display_present: bool,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinuxDesktopBackendPolicy {
+    force_x11_backend: bool,
+    set_gdk_backend: bool,
+    set_winit_backend: bool,
+    reason: &'static str,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_desktop_backend_policy_from_input(
+    input: LinuxDesktopBackendPolicyInput,
+) -> LinuxDesktopBackendPolicy {
+    if input.allow_wayland_backend {
+        return LinuxDesktopBackendPolicy {
+            force_x11_backend: false,
+            set_gdk_backend: false,
+            set_winit_backend: false,
+            reason: "wayland_backend_explicitly_allowed",
+        };
+    }
+    if input.gdk_backend_set {
+        return LinuxDesktopBackendPolicy {
+            force_x11_backend: false,
+            set_gdk_backend: false,
+            set_winit_backend: false,
+            reason: "gdk_backend_explicit",
+        };
+    }
+    if !(input.kde_session && input.wayland_display_present && input.display_present) {
+        return LinuxDesktopBackendPolicy {
+            force_x11_backend: false,
+            set_gdk_backend: false,
+            set_winit_backend: false,
+            reason: "no_kde_wayland_x11_pair",
+        };
+    }
+    LinuxDesktopBackendPolicy {
+        force_x11_backend: true,
+        set_gdk_backend: true,
+        set_winit_backend: !input.winit_backend_set,
+        reason: "kde_wayland_x11_default",
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_env_flag_truthy(name: &str) -> bool {
+    std::env::var(name).ok().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_session_env_looks_like_kde_plasma() -> bool {
+    [
+        std::env::var("XDG_CURRENT_DESKTOP").ok(),
+        std::env::var("XDG_SESSION_DESKTOP").ok(),
+        std::env::var("DESKTOP_SESSION").ok(),
+        std::env::var("KDE_FULL_SESSION").ok(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| {
+        let normalized = value.trim().to_ascii_lowercase();
+        normalized.contains("kde")
+            || normalized.contains("plasma")
+            || matches!(normalized.as_str(), "true" | "1")
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn configure_linux_desktop_backend() {
+    let policy = linux_desktop_backend_policy_from_input(LinuxDesktopBackendPolicyInput {
+        allow_wayland_backend: linux_env_flag_truthy(ENV_YGGTERM_ALLOW_WAYLAND_BACKEND),
+        gdk_backend_set: std::env::var_os("GDK_BACKEND").is_some(),
+        winit_backend_set: std::env::var_os("WINIT_UNIX_BACKEND").is_some(),
+        kde_session: linux_session_env_looks_like_kde_plasma(),
+        wayland_display_present: std::env::var_os("WAYLAND_DISPLAY").is_some(),
+        display_present: std::env::var_os("DISPLAY").is_some(),
+    });
+    if !policy.force_x11_backend {
+        return;
+    }
+    if policy.set_gdk_backend {
+        unsafe { std::env::set_var("GDK_BACKEND", "x11") };
+    }
+    if policy.set_winit_backend {
+        unsafe { std::env::set_var("WINIT_UNIX_BACKEND", "x11") };
+    }
+    unsafe { std::env::set_var("YGGTERM_LINUX_BACKEND_POLICY", policy.reason) };
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_linux_desktop_backend() {}
 
 fn linux_window_profile_from_input(input: LinuxWindowProfileInput) -> LinuxWindowProfile {
     if input.transparent_opt_in {
@@ -1393,6 +1519,15 @@ fn linux_window_profile_from_input(input: LinuxWindowProfileInput) -> LinuxWindo
             transparent: false,
             xrpd_session: true,
             reason: "xrdp_opaque_profile",
+        };
+    }
+    if input.kde_session
+        && (input.gdk_backend_x11 || (input.display_present && !input.wayland_display_present))
+    {
+        return LinuxWindowProfile {
+            transparent: true,
+            xrpd_session: false,
+            reason: "kde_x11_transparent_profile",
         };
     }
     if input.gdk_backend_x11 || (input.display_present && !input.wayland_display_present) {
@@ -1436,6 +1571,7 @@ fn detect_linux_window_profile() -> LinuxWindowProfile {
             wayland_display_present,
             display_present,
             gdk_backend_x11,
+            kde_session: linux_session_env_looks_like_kde_plasma(),
             xrpd_session,
         });
     }
@@ -2267,6 +2403,7 @@ mod tests {
             wayland_display_present: false,
             display_present: true,
             gdk_backend_x11: false,
+            kde_session: false,
             xrpd_session: false,
         });
         assert!(!profile.transparent);
@@ -2280,10 +2417,25 @@ mod tests {
             wayland_display_present: true,
             display_present: true,
             gdk_backend_x11: true,
+            kde_session: false,
             xrpd_session: false,
         });
         assert!(!profile.transparent);
         assert_eq!(profile.reason, "x11_native_shape_profile");
+    }
+
+    #[test]
+    fn linux_kde_x11_window_profile_uses_transparent_corners() {
+        let profile = linux_window_profile_from_input(LinuxWindowProfileInput {
+            transparent_opt_in: false,
+            wayland_display_present: true,
+            display_present: true,
+            gdk_backend_x11: true,
+            kde_session: true,
+            xrpd_session: false,
+        });
+        assert!(profile.transparent);
+        assert_eq!(profile.reason, "kde_x11_transparent_profile");
     }
 
     #[test]
@@ -2293,6 +2445,7 @@ mod tests {
             wayland_display_present: false,
             display_present: true,
             gdk_backend_x11: true,
+            kde_session: true,
             xrpd_session: true,
         });
         assert!(!profile.transparent);
@@ -2306,10 +2459,59 @@ mod tests {
             wayland_display_present: true,
             display_present: true,
             gdk_backend_x11: false,
+            kde_session: false,
             xrpd_session: false,
         });
         assert!(!profile.transparent);
         assert_eq!(profile.reason, "wayland_opaque_default");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_kde_wayland_defaults_to_x11_backend_when_xwayland_exists() {
+        use super::{LinuxDesktopBackendPolicyInput, linux_desktop_backend_policy_from_input};
+
+        let policy = linux_desktop_backend_policy_from_input(LinuxDesktopBackendPolicyInput {
+            allow_wayland_backend: false,
+            gdk_backend_set: false,
+            winit_backend_set: false,
+            kde_session: true,
+            wayland_display_present: true,
+            display_present: true,
+        });
+        assert!(policy.force_x11_backend);
+        assert!(policy.set_gdk_backend);
+        assert!(policy.set_winit_backend);
+        assert_eq!(policy.reason, "kde_wayland_x11_default");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_kde_wayland_backend_policy_respects_explicit_env() {
+        use super::{LinuxDesktopBackendPolicyInput, linux_desktop_backend_policy_from_input};
+
+        let explicit_gdk =
+            linux_desktop_backend_policy_from_input(LinuxDesktopBackendPolicyInput {
+                allow_wayland_backend: false,
+                gdk_backend_set: true,
+                winit_backend_set: false,
+                kde_session: true,
+                wayland_display_present: true,
+                display_present: true,
+            });
+        assert!(!explicit_gdk.force_x11_backend);
+        assert_eq!(explicit_gdk.reason, "gdk_backend_explicit");
+
+        let opt_in = linux_desktop_backend_policy_from_input(LinuxDesktopBackendPolicyInput {
+            allow_wayland_backend: true,
+            gdk_backend_set: false,
+            winit_backend_set: false,
+            kde_session: true,
+            wayland_display_present: true,
+            display_present: true,
+        });
+        assert!(!opt_in.force_x11_backend);
+        assert_eq!(opt_in.reason, "wayland_backend_explicitly_allowed");
     }
 
     #[cfg(unix)]

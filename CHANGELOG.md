@@ -4,6 +4,22 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.42
+
+### Fixed
+
+- default KDE sessions with Wayland and Xwayland available to the X11 desktop backend unless explicitly overridden, avoiding the compositor/restart path that was still crashing Plasma after update restarts on jojo
+- use a KDE/X11 transparent shell profile for direct launches so the rounded Yggterm frame no longer leaves small white square artifacts at the four window corners
+- keep the direct-install desktop app id stable during update handoff, so KDE pinned icons and task grouping do not split into a second-class smoke/update icon
+- make the Always on Top titlebar control set and clear KDE/X11 `_NET_WM_STATE_ABOVE` and `_NET_WM_STATE_STAYS_ON_TOP`, with app-control proof for both states
+- close the Live Sessions Keep Alive context menu immediately after toggling and prove the keep marker changes without leaving the menu stuck open
+- keep plain local-terminal input from showing an optimistic busy spinner after blank Enter while preserving real remote/activity indicators
+- release terminal input focus when the app window is backgrounded/minimized, cutting idle terminal work on KDE while keeping refocus fast
+- enforce xterm row whitespace and cursor contrast contracts so terminal spaces, TUIs, resize/redraw, and light-theme cursors stay readable in the embedded surface
+- keep titlebar search typing literal slash characters while focused and keep inline rename ownership stable through slow real keyboard input
+- preserve SSH machine labels separately from per-session titles so opening a session no longer mutates the machine name in the sidebar
+- extend the KDE release gate with corner-pixel sampling, always-on-top X11 state proof, keep-alive menu proof, hidden-cursor TUI proof, slash search, rename, renderer whitespace, spinner, idle CPU, cleanup, and Plasma PID stability checks
+
 ## 2.1.41
 
 ### Fixed
