@@ -3917,19 +3917,19 @@ def host_has_live_codex_prompt(host: dict) -> bool:
         return False
     if "Update available!" in host_text and "Press enter to continue" in host_text:
         return False
-    return terminal_chunk_has_codex_prompt_output(cursor_line_text) or terminal_chunk_has_codex_prompt_output(
-        text_sample
+    return any(
+        terminal_chunk_has_codex_prompt_output(chunk)
+        for chunk in (
+            cursor_line_text,
+            str(host.get("cursor_row_text") or ""),
+            str(host.get("text_tail") or ""),
+            text_sample,
+        )
     )
 
 
 def host_has_shell_status_failure(host: dict) -> bool:
-    haystack = "\n".join(
-        [
-            str(host.get("text_sample") or ""),
-            str(host.get("cursor_line_text") or ""),
-            str(host.get("cursor_row_text") or ""),
-        ]
-    )
+    haystack = terminal_host_text(host)
     recent = haystack[-400:].lower()
     return "bash: /status" in recent or (
         "/status" in recent and "no such file or directory" in recent
@@ -3938,7 +3938,7 @@ def host_has_shell_status_failure(host: dict) -> bool:
 
 def terminal_host_text(host: dict) -> str:
     samples: list[str] = []
-    for key in ("text_sample", "cursor_line_text", "cursor_row_text"):
+    for key in ("text_sample", "text_tail", "cursor_line_text", "cursor_row_text"):
         value = str(host.get(key) or "").strip()
         if value:
             samples.append(value)
@@ -13464,9 +13464,7 @@ def wait_for_status_panel(pid: int, timeout_seconds: float = 12.0) -> dict:
             raise AssertionError(
                 "Codex status probe fell back to the shell and ran /status there instead of inside a live Codex runtime"
             )
-        text_sample = str(host.get("text_sample") or "")
-        cursor_line_text = str(host.get("cursor_line_text") or "")
-        haystack = text_sample + "\n" + cursor_line_text
+        haystack = terminal_host_text(host)
         if any(marker in haystack for marker in markers):
             return last_state
         if any(marker in haystack for marker in transcript_only_markers):
@@ -13997,16 +13995,16 @@ def assert_status_command(pid: int, session: str, out_dir: Path) -> dict:
     cleared_cursor_line = str(
         cleared_host.get("cursor_line_text") or cleared_host.get("cursor_row_text") or ""
     )
-    cleared_text_sample = str(cleared_host.get("text_sample") or "")
-    if "/status" in cleared_cursor_line or "/status" in cleared_text_sample:
+    cleared_text = terminal_host_text(cleared_host)
+    if "/status" in cleared_cursor_line or "/status" in cleared_text:
         raise AssertionError(
             "status command prompt was not clean before typing: "
-            f"cursor_line={cleared_cursor_line!r} text_tail={cleared_text_sample[-200:]!r}"
+            f"cursor_line={cleared_cursor_line!r} text_tail={cleared_text[-200:]!r}"
         )
     if not host_has_live_codex_prompt(cleared_host):
         raise AssertionError(
             "status command prompt cleanup did not leave a live Codex prompt active: "
-            f"cursor_line={cleared_cursor_line!r} text_tail={cleared_text_sample[-300:]!r}"
+            f"cursor_line={cleared_cursor_line!r} text_tail={cleared_text[-300:]!r}"
         )
     typed_probe = type_with_cursor_artifact_checks(
         pid,
@@ -14026,11 +14024,11 @@ def assert_status_command(pid: int, session: str, out_dir: Path) -> dict:
     shot_path = out_dir / "after-status.png"
     app_screenshot(pid, shot_path)
     host = active_host(state)
-    text_sample = str(host.get("text_sample") or "")
+    host_text = terminal_host_text(host)
     cursor_line_text = str(host.get("cursor_line_text") or "")
     if host_has_shell_status_failure(host):
         raise AssertionError("Codex status probe typed /status into the shell instead of the live Codex runtime")
-    if "OpenAI Codex" not in text_sample and "Session:" not in text_sample:
+    if "OpenAI Codex" not in host_text and "Session:" not in host_text:
         raise AssertionError("Codex status panel is not visible after /status<Enter>")
     assert_cursor_alignment(state)
     cursor_glyph = assert_cursor_glyph_visibility(state)
@@ -14051,7 +14049,7 @@ def assert_status_command(pid: int, session: str, out_dir: Path) -> dict:
         "cursor_glyph": cursor_glyph,
         "cursor_cell_pixels": cursor_cell_pixels,
         "prompt_anchor": prompt_anchor,
-        "text_tail": text_sample[-400:],
+        "text_tail": host_text[-400:],
     }
 
 
