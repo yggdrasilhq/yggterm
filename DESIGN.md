@@ -415,6 +415,18 @@ This section is intentionally project-specific.
 
 - daemon-owned terminal and session canvas
 
+### Brand and mascot
+
+The Yggterm app icon should not read as a generic black terminal square, but it also should not look like a spooky character.
+
+- Mascot name: `Yggi`.
+- Role: a small Yggdrasil sprout that keeps sessions alive, protects context, and guides work across machines.
+- Personality: alert, warm, capable, and calm. The mark should never feel childish, ominous, or creature-like.
+- Core icon shape: rounded desktop tile, warm terminal prompt, soft Yggdrasil sprout, green/teal leaves, subtle root arc. Do not put eyes, faces, claws, teeth, or dark character silhouettes in the app icon.
+- The icon must still read at 16px and 32px in KDE panels, Windows taskbar, and macOS Dock. At those sizes the prompt and sprout silhouette are the primary signals.
+- Keep the app icon full-color and characterful. Keep internal tree/workspace glyphs restrained and mostly grayscale unless a state needs color.
+- Maintain one canonical SVG source under `assets/brand/yggterm-icon.svg`; regenerate raster assets instead of hand-editing PNG, ICO, or ICNS outputs.
+
 ### Stability-first product rules
 
 Yggterm is in a stability freeze. New terminal/session features must wait until the existing shell can be daily-driven without losing work, mutating titles unexpectedly, or making terminal input feel unreliable.

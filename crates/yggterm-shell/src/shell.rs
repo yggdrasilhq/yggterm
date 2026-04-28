@@ -140,6 +140,7 @@ const UI_TELEMETRY_ROTATED_FILENAME: &str = "ui-telemetry.previous.jsonl";
 const UI_TELEMETRY_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const UNMAXIMIZED_SHELL_RADIUS_PX: u8 = 10;
 const APP_CONTROL_TERMINAL_INTERRUPT_SETTLE_MS: u64 = 140;
+const UPDATE_RELAUNCH_AFTER_PID_ENV: &str = "YGGTERM_RELAUNCH_AFTER_PID";
 static SIDEBAR_MERGE_CACHE: OnceCell<Mutex<SidebarMergeCache>> = OnceCell::new();
 static SIDEBAR_SEARCH_CACHE: OnceCell<Mutex<SidebarSearchCache>> = OnceCell::new();
 static CLIENT_INSTANCE: OnceCell<ClientInstanceRegistration> = OnceCell::new();
@@ -1458,6 +1459,10 @@ impl ShellState {
                 }
             }
         }
+    }
+    fn delete_shortcut_should_target_tree(&self) -> bool {
+        self.tree_rename_path.is_none()
+            && self.server.active_view_mode() != WorkspaceViewMode::Terminal
     }
     fn overlay_live_terminal_sidebar_sample(&self, session: &mut ManagedSessionView) {
         let Some(sample) = self
@@ -3373,9 +3378,8 @@ impl ShellState {
             .collect::<Vec<_>>();
         for (session_path, title_hint, precis, summary) in cached {
             if !title_hint.trim().is_empty() && !looks_like_generated_fallback_title(&title_hint) {
-                remember_session_title_override(self, &session_path, &title_hint);
                 self.server
-                    .set_session_title_hint(&session_path, &title_hint);
+                    .set_session_title_hint_passive(&session_path, &title_hint);
             }
             if let Some(precis) = precis {
                 self.generated_precis
@@ -6251,10 +6255,12 @@ fn restart_into_pending_update(mut state: Signal<ShellState>) {
         let next_exe = update.executable.clone();
         let next_version = update.version.clone();
         let endpoint = state.read().bootstrap.server_endpoint.clone();
+        let current_pid = std::process::id().to_string();
         let launched = task::spawn_blocking(move || -> Result<()> {
             prepare_update_restart(&endpoint)
                 .context("protecting live sessions before update restart")?;
             Command::new(&next_exe)
+                .env(UPDATE_RELAUNCH_AFTER_PID_ENV, &current_pid)
                 .spawn()
                 .with_context(|| format!("launching {}", next_exe.display()))?;
             Ok(())
@@ -23691,7 +23697,7 @@ fn app() -> Element {
                     if event.state == ElementState::Pressed
                         && (event.logical_key == TaoKey::Delete
                             || event.physical_key == TaoKeyCode::Delete)
-                        && state.read().tree_rename_path.is_none()
+                        && state.read().delete_shortcut_should_target_tree()
                     {
                         queue_delete_selected_items(state, false);
                     }
@@ -24668,7 +24674,7 @@ fn app() -> Element {
                         return;
                     }
                 }
-                if evt.key() == Key::Delete && state.read().tree_rename_path.is_none() {
+                if evt.key() == Key::Delete && state.read().delete_shortcut_should_target_tree() {
                     evt.prevent_default();
                     queue_delete_selected_items(state, evt.modifiers().contains(Modifiers::SHIFT));
                     return;
@@ -26709,6 +26715,31 @@ fn Sidebar(
                             return;
                           }}
                           if (String(event.key || '') !== 'Delete') {{
+                            return;
+                          }}
+                          const target = event.target;
+                          const active = document.activeElement;
+                          const terminalOwnsKey = (node) => Boolean(
+                            node
+                            && (
+                              (node.classList && node.classList.contains('xterm-helper-textarea'))
+                              || (node.closest && node.closest('[id^="yggterm-terminal-"]'))
+                            )
+                          );
+                          const editableOwnsKey = (node) => Boolean(
+                            node
+                            && (
+                              node.isContentEditable
+                              || ['input', 'textarea', 'select'].includes(String(node.tagName || '').toLowerCase())
+                            )
+                          );
+                          if (
+                            terminalOwnsKey(active)
+                            || terminalOwnsKey(target)
+                            || editableOwnsKey(active)
+                            || editableOwnsKey(target)
+                          ) {{
+                            window.__yggtermSidebarKeyboardOwner = false;
                             return;
                           }}
                           const buttonId = event.shiftKey
@@ -34640,6 +34671,31 @@ fn claim_sidebar_focus_by_path(path: Option<&str>) {
               if (String(event.key || '') !== 'Delete') {{
                 return;
               }}
+              const target = event.target;
+              const active = document.activeElement;
+              const terminalOwnsKey = (node) => Boolean(
+                node
+                && (
+                  (node.classList && node.classList.contains('xterm-helper-textarea'))
+                  || (node.closest && node.closest('[id^="yggterm-terminal-"]'))
+                )
+              );
+              const editableOwnsKey = (node) => Boolean(
+                node
+                && (
+                  node.isContentEditable
+                  || ['input', 'textarea', 'select'].includes(String(node.tagName || '').toLowerCase())
+                )
+              );
+              if (
+                terminalOwnsKey(active)
+                || terminalOwnsKey(target)
+                || editableOwnsKey(active)
+                || editableOwnsKey(target)
+              ) {{
+                window.__yggtermSidebarKeyboardOwner = false;
+                return;
+              }}
               const buttonId = event.shiftKey
                 ? {TREE_HARD_DELETE_BUTTON_ID:?}
                 : {TREE_DELETE_BUTTON_ID:?};
@@ -35534,6 +35590,21 @@ fn terminal_eval_script_with_canvas_renderer(
         term.loadAddon(fitAddon);
         term.attachCustomKeyEventHandler((event) => {{
             try {{
+                const active = document.activeElement;
+                const target = event && event.target ? event.target : null;
+                const terminalOwnsDelete = Boolean(
+                    active
+                    && active.classList
+                    && active.classList.contains('xterm-helper-textarea')
+                ) || Boolean(
+                    target
+                    && target.closest
+                    && target.closest('[id^="yggterm-terminal-"]')
+                );
+                if (terminalOwnsDelete) {{
+                    window.__yggtermSidebarKeyboardOwner = false;
+                    return true;
+                }}
                 if (!window.__yggtermSidebarKeyboardOwner) {{
                     return true;
                 }}
@@ -36942,6 +37013,7 @@ fn terminal_eval_script_with_canvas_renderer(
             }} catch (_error) {{}}
         }};
         attachHostInteractions(host);
+        let pendingClipboardPasteToken = 0;
         const handleClipboardPaste = (event) => {{
             if (!inputEnabled || !event) {{
                 return;
@@ -36951,6 +37023,8 @@ fn terminal_eval_script_with_canvas_renderer(
                     return;
                 }}
                 event.__yggtermHandledPaste = true;
+                pendingClipboardPasteToken += 1;
+                window.__yggtermLastPasteEventAtMs = Date.now();
                 const clipboardData = event.clipboardData || null;
                 const items = clipboardData && clipboardData.items
                     ? Array.from(clipboardData.items)
@@ -37015,7 +37089,20 @@ fn terminal_eval_script_with_canvas_renderer(
                 if (event.stopPropagation) {{
                     event.stopPropagation();
                 }}
-                dioxus.send({{ kind: "clipboard_paste_request" }});
+                const pasteToken = pendingClipboardPasteToken + 1;
+                pendingClipboardPasteToken = pasteToken;
+                window.setTimeout(() => {{
+                    try {{
+                        if (pasteToken !== pendingClipboardPasteToken) {{
+                            return;
+                        }}
+                        const lastPasteEventAt = Number(window.__yggtermLastPasteEventAtMs || 0);
+                        if (lastPasteEventAt > 0 && Date.now() - lastPasteEventAt < 180) {{
+                            return;
+                        }}
+                        dioxus.send({{ kind: "clipboard_paste_request" }});
+                    }} catch (_error) {{}}
+                }}, 90);
                 window.setTimeout(() => {{
                     if (inputEnabled) {{
                         focusTerminal();
@@ -42506,6 +42593,10 @@ mod tests {
         assert!(script.contains("const handleClipboardPaste = (event) => {"));
         assert!(script.contains("if (event.__yggtermHandledPaste) {"));
         assert!(script.contains("event.__yggtermHandledPaste = true;"));
+        assert!(script.contains("let pendingClipboardPasteToken = 0;"));
+        assert!(script.contains("const pasteToken = pendingClipboardPasteToken + 1;"));
+        assert!(script.contains("if (pasteToken !== pendingClipboardPasteToken) {"));
+        assert!(script.contains("window.__yggtermLastPasteEventAtMs = Date.now();"));
         assert!(script.contains("host.addEventListener('paste', handleClipboardPaste, true);"));
         assert!(script.contains("document.addEventListener('paste', handleClipboardPaste, true);"));
         assert!(!script.contains("const handlePasteShortcut = () => {"));
@@ -42520,6 +42611,16 @@ mod tests {
         assert!(!script.contains("const pasteTextIntoTerminal = (text) => {"));
         assert!(!script.contains("navigator.clipboard.readText()"));
         assert!(!script.contains("navigator.clipboard.read()"));
+    }
+
+    #[test]
+    fn terminal_eval_script_keeps_delete_key_owned_by_terminal_input() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(script.contains("const terminalOwnsDelete = Boolean("));
+        assert!(script.contains("return true;"));
+        assert!(script.contains("window.__yggtermSidebarKeyboardOwner = false;"));
+        assert!(script.contains("target.closest('[id^=\"yggterm-terminal-\"]')"));
     }
     #[test]
     fn terminal_eval_script_hides_accessibility_selection_artifacts() {
@@ -46270,6 +46371,19 @@ mod tests {
             preferred_open_mode_for_row(&shell, &test_sidebar_row(session_path)),
             WorkspaceViewMode::Terminal
         );
+    }
+    #[test]
+    fn delete_shortcut_does_not_target_tree_while_terminal_is_active() {
+        let session_path = "local://delete-key";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+
+        assert!(!shell.delete_shortcut_should_target_tree());
+
+        shell.server.set_view_mode(WorkspaceViewMode::Rendered);
+        assert!(shell.delete_shortcut_should_target_tree());
+        shell.tree_rename_path = Some(session_path.to_string());
+        assert!(!shell.delete_shortcut_should_target_tree());
     }
     #[test]
     fn preferred_open_mode_for_preview_only_document_keeps_rendered_view() {
