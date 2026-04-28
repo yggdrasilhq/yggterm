@@ -9,7 +9,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use yggterm_core::{
     ENV_YGGTERM_DIRECT_INSTALL_ROOT, ENV_YGGTERM_HOME, InstallContext, PerfSpan, SessionNode,
     SessionNodeKind, SessionStore, UpdatePolicy, WorkspaceDocumentKind, WorkspaceGroupKind,
@@ -60,6 +60,9 @@ const ENV_YGGTERM_WEBKIT_MEMORY_CONSERVATIVE_THRESHOLD: &str =
 const ENV_YGGTERM_WEBKIT_MEMORY_STRICT_THRESHOLD: &str = "YGGTERM_WEBKIT_MEMORY_STRICT_THRESHOLD";
 const ENV_YGGTERM_WEBKIT_MEMORY_POLL_INTERVAL_SEC: &str = "YGGTERM_WEBKIT_MEMORY_POLL_INTERVAL_SEC";
 const ENV_MALLOC_ARENA_MAX: &str = "MALLOC_ARENA_MAX";
+const ENV_YGGTERM_RELAUNCH_AFTER_PID: &str = "YGGTERM_RELAUNCH_AFTER_PID";
+const ENV_YGGTERM_RELAUNCH_WAIT_TIMEOUT_MS: &str = "YGGTERM_RELAUNCH_WAIT_TIMEOUT_MS";
+const DEFAULT_RELAUNCH_WAIT_TIMEOUT_MS: u64 = 15_000;
 
 fn app_control_client_for_pid(payload: &serde_json::Value, pid: u32) -> Option<serde_json::Value> {
     payload
@@ -115,6 +118,29 @@ fn app_control_state_launch_summary(
             "error": dom.get("error").cloned().unwrap_or(serde_json::Value::Null),
         },
     }))
+}
+
+fn maybe_wait_for_update_relaunch_parent_exit() {
+    let Some(pid) = std::env::var(ENV_YGGTERM_RELAUNCH_AFTER_PID)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+    else {
+        return;
+    };
+    unsafe {
+        std::env::remove_var(ENV_YGGTERM_RELAUNCH_AFTER_PID);
+    }
+    if pid == 0 || pid == std::process::id() {
+        return;
+    }
+    let timeout_ms = std::env::var(ENV_YGGTERM_RELAUNCH_WAIT_TIMEOUT_MS)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_RELAUNCH_WAIT_TIMEOUT_MS);
+    let started = Instant::now();
+    while signal_process_is_alive(pid) && started.elapsed() < Duration::from_millis(timeout_ms) {
+        std::thread::sleep(Duration::from_millis(80));
+    }
 }
 
 fn configure_linux_allocator_limits() -> Result<()> {
@@ -388,6 +414,7 @@ fn ensure_local_server_ready_for_cli(store: &SessionStore) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    maybe_wait_for_update_relaunch_parent_exit();
     configure_linux_allocator_limits()?;
     configure_linux_desktop_backend();
     configure_linux_accessibility_bridge();
@@ -1914,7 +1941,25 @@ fn signal_process_is_alive(pid: u32) -> bool {
         .is_some_and(|code| code == libc::EPERM)
 }
 
-#[cfg(not(unix))]
+#[cfg(target_os = "windows")]
+fn signal_process_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let filter = format!("PID eq {pid}");
+    let Ok(output) = Command::new("tasklist")
+        .args(["/FI", filter.as_str(), "/NH"])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+}
+
+#[cfg(all(not(unix), not(target_os = "windows")))]
 fn signal_process_is_alive(pid: u32) -> bool {
     pid != 0
 }
