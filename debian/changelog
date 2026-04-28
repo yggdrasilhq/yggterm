@@ -1,3 +1,15 @@
+yggterm (2.1.43-1) unstable; urgency=medium
+
+  * Lock stability-first GUI and terminal-control design rules into docs.
+  * Protect recoverable live sessions during direct-install update restarts without changing Keep Alive choices.
+  * Preserve deliberate session title/summary metadata against passive preview/open hints.
+  * Route native Ctrl+V/Cmd+V through desktop clipboard paste for terminal text and images.
+  * Make context menus, live-session close buttons, and keep-alive markers theme-aware and observable.
+  * Split app-control terminal input around Ctrl+C and require real-keyboard /status proof.
+  * Expose terminal host text tails so app-control can prove bottom-of-viewport status panels.
+
+ -- Yggdrasil HQ <avi@gour.top>  Tue, 28 Apr 2026 18:21:00 +0530
+
 yggterm (2.1.42-1) unstable; urgency=medium
 
   * Default KDE Wayland/Xwayland direct launches to the X11 backend unless explicitly overridden.

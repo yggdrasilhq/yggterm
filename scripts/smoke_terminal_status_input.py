@@ -44,6 +44,43 @@ def terminal_send(pid: int, session: str, data: str) -> dict:
     )
 
 
+def terminal_probe_type(
+    pid: int,
+    session: str,
+    data: str,
+    *,
+    press_enter: bool = False,
+    press_ctrl_c: bool = False,
+    press_ctrl_e: bool = False,
+    press_ctrl_u: bool = False,
+) -> dict:
+    args = [
+        "server",
+        "app",
+        "terminal",
+        "probe-type",
+        "--pid",
+        str(pid),
+        session,
+        "--mode",
+        "keyboard",
+        "--data",
+        data,
+        "--timeout-ms",
+        "15000",
+    ]
+    if press_enter:
+        args.append("--enter")
+    if press_ctrl_c:
+        args.append("--ctrl-c")
+    if press_ctrl_e:
+        args.append("--ctrl-e")
+    if press_ctrl_u:
+        args.append("--ctrl-u")
+    response = run(*args)
+    return response.get("data") or response
+
+
 def terminal_hosts(state: dict) -> list[dict]:
     viewport_hosts = ((state.get("viewport") or {}).get("terminal_hosts") or [])
     if isinstance(viewport_hosts, list) and viewport_hosts:
@@ -100,25 +137,35 @@ def host_has_live_codex_prompt(host: dict) -> bool:
     input_ready = host.get("input_enabled") is True or host.get("helper_textarea_focused") is True
     if not input_ready:
         return False
-    text_sample = str(host.get("text_sample") or "")
-    cursor_line_text = str(host.get("cursor_line_text") or host.get("cursor_row_text") or "")
-    return terminal_chunk_has_codex_prompt_output(text_sample) or terminal_chunk_has_codex_prompt_output(
-        cursor_line_text
+    return any(
+        terminal_chunk_has_codex_prompt_output(chunk)
+        for chunk in terminal_host_text_chunks(host)
     )
 
 
 def host_has_shell_status_failure(host: dict) -> bool:
-    haystack = "\n".join(
-        [
-            str(host.get("text_sample") or ""),
-            str(host.get("cursor_line_text") or ""),
-            str(host.get("cursor_row_text") or ""),
-        ]
-    )
+    haystack = terminal_host_text(host)
     recent = haystack[-400:].lower()
     return "bash: /status" in recent or (
         "/status" in recent and "no such file or directory" in recent
     )
+
+
+def terminal_host_text(host: dict) -> str:
+    return "\n".join(terminal_host_text_chunks(host))
+
+
+def terminal_host_text_chunks(host: dict) -> list[str]:
+    samples: list[str] = []
+    for key in ("text_sample", "text_tail", "cursor_line_text", "cursor_row_text"):
+        value = str(host.get(key) or "").strip()
+        if value:
+            samples.append(value)
+    for row in list(host.get("visible_row_samples_head") or []) + list(host.get("visible_row_samples_tail") or []):
+        value = str(row.get("text") or "").strip()
+        if value:
+            samples.append(value)
+    return samples
 
 
 def host_problem(state: dict) -> str | None:
@@ -171,9 +218,16 @@ def ensure_live_codex_runtime(pid: int, session: str) -> dict:
             "action": "noop",
             "state": current,
         }
-    prepare = terminal_send(pid, session, "\u0003\u0005\u0015")
+    prepare = terminal_probe_type(
+        pid,
+        session,
+        "",
+        press_ctrl_c=True,
+        press_ctrl_e=True,
+        press_ctrl_u=True,
+    )
     time.sleep(0.4)
-    launch = terminal_send(pid, session, "codex\r")
+    launch = terminal_probe_type(pid, session, "codex", press_enter=True)
     state = wait_for_live_codex_prompt(pid, timeout_seconds=30.0)
     return {
         "action": "launch_codex",
@@ -184,11 +238,11 @@ def ensure_live_codex_runtime(pid: int, session: str) -> dict:
 
 
 def clear_prompt(pid: int, session: str) -> dict:
-    return terminal_send(pid, session, "\u0005\u0015")
+    return terminal_probe_type(pid, session, "", press_ctrl_e=True, press_ctrl_u=True)
 
 
 def run_status_probe(pid: int, session: str) -> dict:
-    return terminal_send(pid, session, "/status\r")
+    return terminal_probe_type(pid, session, "/status", press_enter=True)
 
 
 def main() -> int:
@@ -243,15 +297,11 @@ def main() -> int:
     time.sleep(1.0)
     after = app_state(args.pid)
     after_host = active_host(after)
-    after_text_sample = str(after_host.get("text_sample") or "")
-    after_cursor_line_text = str(after_host.get("cursor_line_text") or "")
+    after_terminal_text = terminal_host_text(after_host)
     if (
-        "/status" not in after_text_sample
-        and "OpenAI Codex" not in after_text_sample
-        and "Session:" not in after_text_sample
-        and "/status" not in after_cursor_line_text
-        and "OpenAI Codex" not in after_cursor_line_text
-        and "Session:" not in after_cursor_line_text
+        "/status" not in after_terminal_text
+        and "OpenAI Codex" not in after_terminal_text
+        and "Session:" not in after_terminal_text
     ):
         after = wait_for_terminal_interactive(args.pid, timeout_seconds=20.0)
         retry_probe = run_status_probe(args.pid, args.session)
@@ -290,7 +340,9 @@ def main() -> int:
     host = active_host(after)
     notifications = (after.get("shell") or {}).get("notifications") or []
     text_sample = host.get("text_sample") or ""
+    text_tail = host.get("text_tail") or ""
     cursor_line_text = host.get("cursor_line_text") or ""
+    terminal_text = terminal_host_text(host)
     selected_text_length = (((select.get("data") or {}).get("selected_text_length")) or 0)
 
     if viewport.get("ready") is not True or viewport.get("interactive") is not True:
@@ -309,14 +361,9 @@ def main() -> int:
             "no visible native cursor after /status: "
             f"raw={host.get('cursor_sample_rect')!r} hidden={host.get('xterm_cursor_hidden')!r}"
         )
-    if "/status" not in text_sample and "/status" not in cursor_line_text:
+    if "/status" not in terminal_text:
         raise AssertionError("typed /status did not appear in terminal text sample")
-    if (
-        "OpenAI Codex" not in text_sample
-        and "Session:" not in text_sample
-        and "OpenAI Codex" not in cursor_line_text
-        and "Session:" not in cursor_line_text
-    ):
+    if "OpenAI Codex" not in terminal_text and "Session:" not in terminal_text:
         raise AssertionError("Codex status panel did not appear after /status")
     if selected_text_length <= 0:
         raise AssertionError(f"selection probe did not capture visible text: {select!r}")
@@ -334,6 +381,7 @@ def main() -> int:
         "rows_sample_color": host.get("rows_sample_color"),
         "dim_sample_color": host.get("dim_sample_color"),
         "low_contrast_span_count": host.get("low_contrast_span_count"),
+        "text_tail": str(text_tail)[-400:],
     }
     with (out_dir / "summary.json").open("w") as fh:
         json.dump(summary, fh, indent=2)
