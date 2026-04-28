@@ -1,3 +1,12 @@
+yggterm (2.1.44-1) unstable; urgency=medium
+
+  * Isolate updated KDE/X11 clients when an older live client still owns the canonical app id.
+  * Add the update-restart close watchdog so hidden old GUI processes cannot linger indefinitely.
+  * Stop stale-daemon version recovery from sending daemon shutdown requests.
+  * Reuse versioned daemon socket aliases only when the daemon version matches the current app.
+
+ -- Yggdrasil HQ <avi@gour.top>  Tue, 28 Apr 2026 20:12:26 +0530
+
 yggterm (2.1.43-1) unstable; urgency=medium
 
   * Lock stability-first GUI and terminal-control design rules into docs.

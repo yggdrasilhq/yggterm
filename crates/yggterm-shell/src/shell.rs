@@ -82,7 +82,7 @@ use yggterm_core::{
     SessionStore, WorkspaceDocumentInput, WorkspaceDocumentKind, WorkspaceGroupKind,
     YGGTERM_DESKTOP_APP_ID, append_bounded_jsonl_record, append_perf_event, append_trace_event,
     best_effort_precis_from_context, best_effort_summary_from_context,
-    best_effort_title_from_context, check_for_update, install_mode_summary,
+    best_effort_title_from_context, check_for_update, current_version, install_mode_summary,
     install_release_update_with_progress, looks_like_generated_fallback_title,
     looks_like_low_signal_generated_copy, read_codex_session_identity_fields, resolve_yggterm_home,
     save_settings_file, unique_session_short_ids_for_pairs, update_command_hint,
@@ -99,13 +99,14 @@ use yggterm_server::{
     ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionPreviewBlock,
     SessionRenderedSection, SessionSource, SshConnectTarget, TerminalBackend, WorkspaceViewMode,
     YGG_LOADING_NOTIFICATION_AFTER_MS, YggOperationPriority, YggRequestMeta, YggSurface, YggTarget,
-    YggtermServer, app_control_requests_pending, cleanup_legacy_daemons,
-    complete_app_control_request, connect_ssh_custom, fetch_remote_generation_context,
-    focus_live_with_view, local_headless_companion_executable_from_current,
-    managed_cli_refresh_ttl_ms, open_remote_session_with_view, open_stored_session,
-    open_stored_session_with_view, persist_remote_generated_copy, ping, prepare_update_restart,
-    refresh_local_managed_cli_now, refresh_managed_cli, refresh_preview, refresh_remote_machine,
-    remove_session, remove_ssh_target, request_terminal_launch, set_all_preview_blocks_folded,
+    YggtermServer, active_client_instance_records as server_active_client_instance_records,
+    app_control_requests_pending, cleanup_legacy_daemons, complete_app_control_request,
+    connect_ssh_custom, default_endpoint, fetch_remote_generation_context, focus_live_with_view,
+    local_headless_companion_executable_from_current, managed_cli_refresh_ttl_ms,
+    open_remote_session_with_view, open_stored_session, open_stored_session_with_view,
+    persist_remote_generated_copy, ping, prepare_update_restart, refresh_local_managed_cli_now,
+    refresh_managed_cli, refresh_preview, refresh_remote_machine, remove_session,
+    remove_ssh_target, request_terminal_launch, set_all_preview_blocks_folded,
     set_session_keep_alive, set_view_mode as daemon_set_view_mode, shutdown as daemon_shutdown,
     snapshot as daemon_snapshot, snapshot_session_view_for_ui, stage_remote_clipboard_png,
     start_command_session, start_local_session_at, start_ssh_session_at, status,
@@ -6311,6 +6312,7 @@ fn close_window_after_update_restart(mut state: Signal<ShellState>) {
         shell.closing_app = true;
         shell.last_action = "restarting yggterm".to_string();
     });
+    spawn_close_force_exit_watchdog();
     spawn(async move {
         if detach_terminal_before_close {
             window().set_decorations(true);
@@ -6892,6 +6894,114 @@ fn clear_current_endpoint_link_escaping_home(endpoint: &ServerEndpoint) {
 }
 #[cfg(not(unix))]
 fn clear_current_endpoint_link_escaping_home(_endpoint: &ServerEndpoint) {}
+
+fn runtime_status_matches_current_app(runtime_status: &ServerRuntimeStatus) -> bool {
+    let expected_version = current_version();
+    runtime_status.server_version.as_str() == expected_version.as_str()
+}
+
+fn current_daemon_is_reachable(endpoint: &ServerEndpoint, stage: &'static str) -> bool {
+    match status(endpoint) {
+        Ok(runtime_status) if runtime_status_matches_current_app(&runtime_status) => true,
+        Ok(runtime_status) => {
+            trace_daemon_step(
+                endpoint,
+                "stale_daemon_version_detected",
+                json!({
+                    "stage": stage,
+                    "current_version": current_version(),
+                    "stale_version": runtime_status.server_version,
+                    "stale_build_id": runtime_status.server_build_id,
+                }),
+            );
+            clear_current_endpoint_link_for_version_mismatch(endpoint, &runtime_status, stage);
+            false
+        }
+        Err(_) => false,
+    }
+}
+
+fn shutdown_current_daemon_if_reachable(endpoint: &ServerEndpoint, stage: &'static str) {
+    match status(endpoint) {
+        Ok(runtime_status) if runtime_status_matches_current_app(&runtime_status) => {
+            let _ = daemon_shutdown(endpoint);
+        }
+        Ok(runtime_status) => {
+            trace_daemon_step(
+                endpoint,
+                "skip_shutdown_for_stale_daemon",
+                json!({
+                    "stage": stage,
+                    "current_version": current_version(),
+                    "stale_version": runtime_status.server_version,
+                    "stale_build_id": runtime_status.server_build_id,
+                }),
+            );
+            clear_current_endpoint_link_for_version_mismatch(endpoint, &runtime_status, stage);
+        }
+        Err(error) => {
+            trace_daemon_step(
+                endpoint,
+                "skip_shutdown_daemon_unreachable",
+                json!({
+                    "stage": stage,
+                    "error": error.to_string(),
+                }),
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+fn clear_current_endpoint_link_for_version_mismatch(
+    endpoint: &ServerEndpoint,
+    runtime_status: &ServerRuntimeStatus,
+    stage: &'static str,
+) -> bool {
+    let ServerEndpoint::UnixSocket(path) = endpoint else {
+        return false;
+    };
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.file_type().is_symlink() {
+        trace_daemon_step(
+            endpoint,
+            "preserve_stale_daemon_socket_path",
+            json!({
+                "stage": stage,
+                "current_path": path.display().to_string(),
+                "stale_version": runtime_status.server_version,
+                "reason": "not_symlink",
+            }),
+        );
+        return false;
+    }
+    let removed = fs::remove_file(path).is_ok();
+    trace_daemon_step(
+        endpoint,
+        "remove_stale_daemon_socket_alias",
+        json!({
+            "stage": stage,
+            "current_path": path.display().to_string(),
+            "current_version": current_version(),
+            "stale_version": runtime_status.server_version,
+            "stale_build_id": runtime_status.server_build_id,
+            "removed": removed,
+        }),
+    );
+    removed
+}
+
+#[cfg(not(unix))]
+fn clear_current_endpoint_link_for_version_mismatch(
+    _endpoint: &ServerEndpoint,
+    _runtime_status: &ServerRuntimeStatus,
+    _stage: &'static str,
+) -> bool {
+    false
+}
+
 #[cfg(unix)]
 fn parse_versioned_server_socket_name(path: &Path) -> Option<(u64, u64, u64)> {
     let file_name = path.file_name()?.to_str()?;
@@ -6956,7 +7066,20 @@ fn maybe_alias_current_endpoint_to_reachable_versioned_socket(
             continue;
         }
         let candidate_endpoint = ServerEndpoint::UnixSocket(candidate.clone());
-        if ping(&candidate_endpoint).is_err() {
+        let Ok(candidate_status) = status(&candidate_endpoint) else {
+            continue;
+        };
+        if !runtime_status_matches_current_app(&candidate_status) {
+            trace_daemon_step(
+                endpoint,
+                "skip_stale_versioned_socket_candidate",
+                json!({
+                    "candidate_path": candidate.display().to_string(),
+                    "current_version": current_version(),
+                    "candidate_version": candidate_status.server_version,
+                    "candidate_build_id": candidate_status.server_build_id,
+                }),
+            );
             continue;
         }
         if server_socket_path_lexists(current_path) && ping(endpoint).is_err() {
@@ -6971,7 +7094,7 @@ fn maybe_alias_current_endpoint_to_reachable_versioned_socket(
                 )
             })?;
         }
-        if ping(endpoint).is_ok() {
+        if current_daemon_is_reachable(endpoint, "versioned_socket_alias") {
             trace_daemon_step(
                 endpoint,
                 "aliased_to_reachable_versioned_socket",
@@ -7051,7 +7174,7 @@ fn acquire_process_local_daemon_ensure_guard(
             };
         }
         drop(guard);
-        if ping(endpoint).is_ok() {
+        if current_daemon_is_reachable(endpoint, "process_guard_existing") {
             trace_daemon_step(
                 endpoint,
                 "process_guard_reused_existing",
@@ -7084,9 +7207,13 @@ fn ensure_daemon_running(endpoint: &ServerEndpoint) -> Result<()> {
         json!({ "path": current_exe.display().to_string() }),
     );
     clear_current_endpoint_link_escaping_home(endpoint);
-    if ping(endpoint).is_ok() {
+    if current_daemon_is_reachable(endpoint, "existing_before_cleanup") {
         note_recent_daemon_start(endpoint);
-        trace_daemon_step(endpoint, "ping_ok_existing_before_cleanup", json!({}));
+        trace_daemon_step(
+            endpoint,
+            "current_daemon_existing_before_cleanup",
+            json!({}),
+        );
         return Ok(());
     }
     #[cfg(unix)]
@@ -7117,7 +7244,7 @@ fn ensure_daemon_running(endpoint: &ServerEndpoint) -> Result<()> {
         );
         for wait_attempt in 0..15 {
             thread::sleep(Duration::from_millis(80));
-            if ping(endpoint).is_ok() {
+            if current_daemon_is_reachable(endpoint, "recent_start_wait") {
                 note_recent_daemon_start(endpoint);
                 trace_daemon_step(
                     endpoint,
@@ -7142,10 +7269,10 @@ fn ensure_daemon_running(endpoint: &ServerEndpoint) -> Result<()> {
             "spawn_lock_acquired",
             json!({ "attempt": attempt + 1 }),
         );
-        if ping(endpoint).is_ok() {
+        if current_daemon_is_reachable(endpoint, "after_spawn_lock") {
             trace_daemon_step(
                 endpoint,
-                "ping_ok_after_lock",
+                "current_daemon_after_lock",
                 json!({ "attempt": attempt + 1 }),
             );
             return Ok(());
@@ -7201,7 +7328,7 @@ fn ensure_daemon_running(endpoint: &ServerEndpoint) -> Result<()> {
                     return Ok(());
                 }
                 last_error = Some(error);
-                let _ = daemon_shutdown(endpoint);
+                shutdown_current_daemon_if_reachable(endpoint, "wait_for_daemon_error_cleanup");
                 drop(spawn_lock);
                 thread::sleep(Duration::from_millis(250));
             }
@@ -7333,7 +7460,7 @@ fn spawn_daemon_process(endpoint: &ServerEndpoint) -> Result<()> {
 fn wait_for_daemon(endpoint: &ServerEndpoint) -> Result<()> {
     for _ in 0..100 {
         thread::sleep(Duration::from_millis(150));
-        if ping(endpoint).is_ok() {
+        if current_daemon_is_reachable(endpoint, "wait_for_daemon") {
             return Ok(());
         }
     }
@@ -40437,17 +40564,26 @@ fn linux_force_native_decorations() -> bool {
 #[cfg(target_os = "linux")]
 fn linux_desktop_app_id() -> String {
     let explicit_suffix = std::env::var("YGGTERM_DESKTOP_APP_ID_SUFFIX").ok();
+    let home_seed = std::env::var("YGGTERM_HOME").ok().or_else(|| {
+        resolve_yggterm_home()
+            .ok()
+            .map(|path| path.to_string_lossy().to_string())
+    });
+    let stale_client_isolation =
+        linux_stale_client_requires_desktop_app_id_isolation(home_seed.as_deref());
     linux_desktop_app_id_for_context(
         explicit_suffix.as_deref(),
         env_flag_truthy("YGGTERM_ALLOW_MULTI_WINDOW")
             || env_flag_truthy("YGGTERM_REMOTE_SMOKE_TAG"),
-        std::env::var("YGGTERM_HOME").ok().as_deref(),
+        stale_client_isolation,
+        home_seed.as_deref(),
     )
 }
 #[cfg(target_os = "linux")]
 fn linux_desktop_app_id_for_context(
     explicit_suffix: Option<&str>,
     isolated_multi_window: bool,
+    stale_client_isolation: bool,
     home_seed: Option<&str>,
 ) -> String {
     if let Some(suffix) = explicit_suffix
@@ -40456,18 +40592,70 @@ fn linux_desktop_app_id_for_context(
     {
         return format!("{YGGTERM_DESKTOP_APP_ID}.{suffix}");
     }
-    if isolated_multi_window {
+    if isolated_multi_window || stale_client_isolation {
         let seed = home_seed
             .map(str::to_string)
             .unwrap_or_else(|| format!("pid-{}", std::process::id()));
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         seed.hash(&mut hasher);
+        let isolation_kind = if stale_client_isolation {
+            "handoff"
+        } else {
+            "multi"
+        };
         return format!(
             "{YGGTERM_DESKTOP_APP_ID}.{}",
-            linux_app_id_component(&format!("multi{:x}", hasher.finish()))
+            linux_app_id_component(&format!("{isolation_kind}{:x}", hasher.finish()))
         );
     }
     YGGTERM_DESKTOP_APP_ID.to_string()
+}
+#[cfg(target_os = "linux")]
+fn linux_stale_client_requires_desktop_app_id_isolation(home_seed: Option<&str>) -> bool {
+    let home = home_seed
+        .map(PathBuf::from)
+        .or_else(|| resolve_yggterm_home().ok());
+    let Some(home) = home else {
+        return false;
+    };
+    let current_exe = current_client_executable_path();
+    let endpoint = default_endpoint(&home);
+    let Ok(records) = server_active_client_instance_records(&home, &endpoint) else {
+        return false;
+    };
+    records.iter().any(|record| {
+        linux_client_record_requires_app_id_isolation(
+            record.pid,
+            record.executable_path.as_deref(),
+            std::process::id(),
+            current_exe.as_deref(),
+        )
+    })
+}
+#[cfg(target_os = "linux")]
+fn linux_client_record_requires_app_id_isolation(
+    record_pid: u32,
+    record_executable_path: Option<&str>,
+    current_pid: u32,
+    current_executable_path: Option<&str>,
+) -> bool {
+    if record_pid == current_pid {
+        return false;
+    }
+    let Some(record_executable_path) = record_executable_path.and_then(non_empty_trimmed_string)
+    else {
+        return false;
+    };
+    let Some(current_executable_path) = current_executable_path.and_then(non_empty_trimmed_string)
+    else {
+        return false;
+    };
+    record_executable_path != current_executable_path
+}
+#[cfg(target_os = "linux")]
+fn non_empty_trimmed_string(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value.is_empty() { None } else { Some(value) }
 }
 #[cfg(target_os = "linux")]
 fn linux_app_id_component(value: &str) -> String {
@@ -42583,17 +42771,54 @@ mod tests {
     #[test]
     fn linux_desktop_app_id_stays_stable_for_update_handoff() {
         assert_eq!(
-            linux_desktop_app_id_for_context(None, false, Some("/home/pi/.yggterm")),
+            linux_desktop_app_id_for_context(None, false, false, Some("/home/pi/.yggterm")),
             YGGTERM_DESKTOP_APP_ID
         );
         assert!(
-            linux_desktop_app_id_for_context(None, true, Some("/tmp/yggterm-smoke"))
+            linux_desktop_app_id_for_context(None, true, false, Some("/tmp/yggterm-smoke"))
+                .starts_with(&format!("{YGGTERM_DESKTOP_APP_ID}."))
+        );
+        assert!(
+            linux_desktop_app_id_for_context(None, false, true, Some("/home/pi/.yggterm"))
                 .starts_with(&format!("{YGGTERM_DESKTOP_APP_ID}."))
         );
         assert_eq!(
-            linux_desktop_app_id_for_context(Some("Smoke Test!"), false, Some("/home/pi/.yggterm")),
+            linux_desktop_app_id_for_context(
+                Some("Smoke Test!"),
+                false,
+                true,
+                Some("/home/pi/.yggterm")
+            ),
             format!("{YGGTERM_DESKTOP_APP_ID}.ismoketest")
         );
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_app_id_isolates_only_different_live_executables() {
+        assert!(!linux_client_record_requires_app_id_isolation(
+            100,
+            Some("/home/pi/.local/share/yggterm/versions/2.1.44/yggterm"),
+            100,
+            Some("/home/pi/.local/share/yggterm/versions/2.1.44/yggterm")
+        ));
+        assert!(!linux_client_record_requires_app_id_isolation(
+            100,
+            Some("/home/pi/.local/share/yggterm/versions/2.1.44/yggterm"),
+            200,
+            Some("/home/pi/.local/share/yggterm/versions/2.1.44/yggterm")
+        ));
+        assert!(linux_client_record_requires_app_id_isolation(
+            100,
+            Some("/home/pi/.local/share/yggterm/versions/2.1.41/yggterm"),
+            200,
+            Some("/home/pi/.local/share/yggterm/versions/2.1.44/yggterm")
+        ));
+        assert!(!linux_client_record_requires_app_id_isolation(
+            100,
+            None,
+            200,
+            Some("/home/pi/.local/bin/yggterm")
+        ));
     }
     #[test]
     fn opaque_shell_root_uses_filled_background_to_avoid_native_corner_artifacts() {
