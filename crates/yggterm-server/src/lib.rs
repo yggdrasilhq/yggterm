@@ -8260,15 +8260,74 @@ fn handle_mismatched_local_daemon(
             }),
         );
     }
-    let stale_version = runtime_status.server_version.clone();
-    let _ = shutdown(endpoint);
-    for _ in 0..20 {
-        std::thread::sleep(Duration::from_millis(100));
-        match status(endpoint) {
-            Ok(status) if status.server_version == stale_version => {}
-            _ => return,
+    clear_local_daemon_socket_link_for_version_mismatch(endpoint, runtime_status, stage);
+}
+
+#[cfg(unix)]
+fn clear_local_daemon_socket_link_for_version_mismatch(
+    endpoint: &ServerEndpoint,
+    runtime_status: &ServerRuntimeStatus,
+    stage: &'static str,
+) -> bool {
+    let Some(home) = daemon_home_for_endpoint(endpoint) else {
+        return false;
+    };
+    let ServerEndpoint::UnixSocket(path) = endpoint else {
+        return false;
+    };
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.file_type().is_symlink() {
+        if let Some(trace_home) = daemon_trace_home_for_endpoint(endpoint) {
+            append_trace_event(
+                &trace_home,
+                "server",
+                "daemon_lifecycle",
+                "preserve_stale_daemon_socket_path",
+                json!({
+                    "stage": stage,
+                    "endpoint": path.display().to_string(),
+                    "home": home.display().to_string(),
+                    "stale_version": runtime_status.server_version,
+                    "reason": "not_symlink",
+                }),
+            );
         }
+        return false;
     }
+    if !socket_symlink_chain_stays_in_home(path, &home) {
+        clear_local_daemon_socket_link_escaping_home(endpoint);
+        return false;
+    }
+    let removed = fs::remove_file(path).is_ok();
+    if let Some(trace_home) = daemon_trace_home_for_endpoint(endpoint) {
+        append_trace_event(
+            &trace_home,
+            "server",
+            "daemon_lifecycle",
+            "remove_stale_daemon_socket_alias",
+            json!({
+                "stage": stage,
+                "endpoint": path.display().to_string(),
+                "home": home.display().to_string(),
+                "current_version": daemon::SERVER_PROTOCOL_VERSION,
+                "stale_version": runtime_status.server_version,
+                "stale_build_id": runtime_status.server_build_id,
+                "removed": removed,
+            }),
+        );
+    }
+    removed
+}
+
+#[cfg(not(unix))]
+fn clear_local_daemon_socket_link_for_version_mismatch(
+    _endpoint: &ServerEndpoint,
+    _runtime_status: &ServerRuntimeStatus,
+    _stage: &'static str,
+) -> bool {
+    false
 }
 
 fn daemon_trace_home_for_endpoint(endpoint: &ServerEndpoint) -> Option<PathBuf> {
@@ -13487,14 +13546,15 @@ mod tests {
         PersistedDaemonState, PersistedLiveSession, PersistedStoredSession, PreviewTone,
         REMOTE_OUTPUT_SENTINEL, RemoteCommandCacheEntry, RemoteDeployState, RemoteMachineHealth,
         RemoteMachineSnapshot, RemotePreviewPayload, RemoteScannedSession, ServerEndpoint,
-        ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionNode, SessionPreview,
-        SessionPreviewBlock, SessionSource, SnapshotPreview, SnapshotPreviewBlock,
+        ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionNode,
+        SessionPreview, SessionPreviewBlock, SessionSource, SnapshotPreview, SnapshotPreviewBlock,
         SnapshotRenderedSection, SnapshotSessionView, SshConnectTarget, StoredPreviewHydrationMode,
         TerminalBackend, TerminalLaunchPhase, UPDATE_RESTART_RESTORE_REASON, UiTheme,
         WorkspaceViewMode, YggtermServer, active_client_instance_records,
         apply_remote_preview_payload, apply_remote_scanned_session_preview, build_session,
         canonical_static_label, choose_app_control_pid,
-        clear_local_daemon_socket_link_escaping_home, clear_session_preview_for_loading,
+        clear_local_daemon_socket_link_escaping_home,
+        clear_local_daemon_socket_link_for_version_mismatch, clear_session_preview_for_loading,
         clear_stale_local_daemon_socket_when_no_daemon, client_instances_dir, current_millis_u64,
         dedupe_remote_scanned_sessions, legacy_agent_launch_command,
         legacy_remote_tmux_session_name, load_remote_machine_sessions_from_mirror,
@@ -18404,6 +18464,67 @@ terminal_window_id: None,
         );
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mismatched_local_daemon_removes_only_socket_alias() {
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-stale-daemon-alias-{}-{}",
+            std::process::id(),
+            current_millis_u64()
+        ));
+        fs::create_dir_all(&home).expect("create temp home");
+        let legacy_socket = home.join("server-2-1-41.sock");
+        fs::write(&legacy_socket, b"legacy socket placeholder").expect("write legacy socket");
+        let current_socket = home.join("server-2-1-44.sock");
+        std::os::unix::fs::symlink(&legacy_socket, &current_socket).expect("link current socket");
+        let endpoint = ServerEndpoint::UnixSocket(current_socket.clone());
+        let status = ServerRuntimeStatus {
+            server_version: "2.1.41".to_string(),
+            server_build_id: 41,
+            host_kind: "xterm".to_string(),
+            host_detail: String::new(),
+            embedded_surface_supported: true,
+            bridge_enabled: false,
+            restored_from_persisted_state: false,
+            restored_stored_sessions: 0,
+            restored_live_sessions: 0,
+            restored_remote_machines: 0,
+            terminal_session_count: 0,
+            terminal_session_keys: Vec::new(),
+            terminal_retained_chunks: 0,
+            terminal_retained_bytes: 0,
+            terminal_session_buffer_limit_bytes: 0,
+            terminal_idle_buffer_limit_bytes: 0,
+            managed_session_count: 0,
+            session_metadata_entries: 0,
+            session_metadata_bytes: 0,
+            session_preview_block_count: 0,
+            session_preview_line_count: 0,
+            session_preview_bytes: 0,
+            session_rendered_section_count: 0,
+            session_rendered_line_count: 0,
+            session_rendered_bytes: 0,
+            session_terminal_line_count: 0,
+            session_terminal_bytes: 0,
+            session_payload_total_bytes: 0,
+        };
+
+        assert!(clear_local_daemon_socket_link_for_version_mismatch(
+            &endpoint, &status, "test"
+        ));
+
+        assert!(
+            fs::symlink_metadata(&current_socket).is_err(),
+            "current-version alias should be removed"
+        );
+        assert!(
+            legacy_socket.exists(),
+            "old daemon socket path must be left alone so live sessions survive"
+        );
+
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[cfg(unix)]
