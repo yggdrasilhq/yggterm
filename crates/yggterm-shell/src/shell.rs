@@ -103,7 +103,7 @@ use yggterm_server::{
     complete_app_control_request, connect_ssh_custom, fetch_remote_generation_context,
     focus_live_with_view, local_headless_companion_executable_from_current,
     managed_cli_refresh_ttl_ms, open_remote_session_with_view, open_stored_session,
-    open_stored_session_with_view, persist_remote_generated_copy, ping,
+    open_stored_session_with_view, persist_remote_generated_copy, ping, prepare_update_restart,
     refresh_local_managed_cli_now, refresh_managed_cli, refresh_preview, refresh_remote_machine,
     remove_session, remove_ssh_target, request_terminal_launch, set_all_preview_blocks_folded,
     set_session_keep_alive, set_view_mode as daemon_set_view_mode, shutdown as daemon_shutdown,
@@ -138,6 +138,7 @@ const UI_TELEMETRY_FILENAME: &str = "ui-telemetry.jsonl";
 const UI_TELEMETRY_ROTATED_FILENAME: &str = "ui-telemetry.previous.jsonl";
 const UI_TELEMETRY_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const UNMAXIMIZED_SHELL_RADIUS_PX: u8 = 10;
+const APP_CONTROL_TERMINAL_INTERRUPT_SETTLE_MS: u64 = 140;
 static SIDEBAR_MERGE_CACHE: OnceCell<Mutex<SidebarMergeCache>> = OnceCell::new();
 static SIDEBAR_SEARCH_CACHE: OnceCell<Mutex<SidebarSearchCache>> = OnceCell::new();
 static CLIENT_INSTANCE: OnceCell<ClientInstanceRegistration> = OnceCell::new();
@@ -222,6 +223,7 @@ const BACKGROUND_COPY_CONTINUE_MS: u64 = 15_000;
 const BACKGROUND_COPY_IDLE_MS: u64 = 120_000;
 const ACTIVE_TITLE_AUTOGEN_RETRY_MS: u64 = 15_000;
 const PASSIVE_COPY_GENERATION_ENV: &str = "YGGTERM_ENABLE_PASSIVE_COPY_GENERATION";
+const TERMINAL_RECIPE_DRAG_ENV: &str = "YGGTERM_ENABLE_TERMINAL_RECIPE_DRAG";
 const BACKGROUND_REFRESH_NOTICE_MS: u64 = 12_000;
 const BACKGROUND_REFRESH_STARTUP_DEFER_MS: u64 = 120_000;
 const BACKGROUND_REFRESH_INTERACTIVE_DEFER_MS: u64 = 15_000;
@@ -1043,6 +1045,10 @@ fn env_copy_generation_enabled(value: Option<&str>) -> bool {
 }
 fn implicit_copy_generation_enabled() -> bool {
     let value = std::env::var(PASSIVE_COPY_GENERATION_ENV).ok();
+    env_copy_generation_enabled(value.as_deref())
+}
+fn terminal_recipe_drag_enabled() -> bool {
+    let value = std::env::var(TERMINAL_RECIPE_DRAG_ENV).ok();
     env_copy_generation_enabled(value.as_deref())
 }
 fn copy_generation_start_allowed(force: bool, announce: bool, implicit_enabled: bool) -> bool {
@@ -3483,7 +3489,7 @@ impl ShellState {
             return;
         }
         self.settings.auto_hide_titlebar = enabled;
-        self.persist_settings();
+        self.persist_settings_async("titlebar_auto_hide");
         self.last_action = if enabled {
             "titlebar auto-hide enabled".to_string()
         } else {
@@ -4568,6 +4574,22 @@ impl ShellState {
     }
     fn persist_settings(&self) {
         let _ = save_settings_file(&self.bootstrap.settings_path, &self.settings);
+    }
+    fn persist_settings_async(&self, reason: &'static str) {
+        let settings_path = self.bootstrap.settings_path.clone();
+        let settings = self.settings.clone();
+        spawn(async move {
+            match task::spawn_blocking(move || save_settings_file(&settings_path, &settings)).await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    warn!(reason, error = %error, "failed to persist settings asynchronously");
+                }
+                Err(error) => {
+                    warn!(reason, error = %error, "settings persistence task failed");
+                }
+            }
+        });
     }
     fn sync_browser_settings(&mut self) {
         self.settings.show_tree = self.sidebar_open;
@@ -6227,27 +6249,34 @@ fn restart_into_pending_update(mut state: Signal<ShellState>) {
     spawn(async move {
         let next_exe = update.executable.clone();
         let next_version = update.version.clone();
-        let launched = task::spawn_blocking(move || Command::new(&next_exe).spawn()).await;
+        let endpoint = state.read().bootstrap.server_endpoint.clone();
+        let launched = task::spawn_blocking(move || -> Result<()> {
+            prepare_update_restart(&endpoint)
+                .context("protecting live sessions before update restart")?;
+            Command::new(&next_exe)
+                .spawn()
+                .with_context(|| format!("launching {}", next_exe.display()))?;
+            Ok(())
+        })
+        .await;
         let mut close_after_launch = false;
         state.with_mut(|shell| match launched {
-            Ok(Ok(_)) => {
+            Ok(Ok(())) => {
                 close_after_launch = true;
             }
             Ok(Err(error)) => {
-                shell.pending_update_restart = None;
                 shell.last_action = format!("restart failed: {error}");
                 shell.push_notification(
                     NotificationTone::Error,
-                    "Update Restart Failed",
+                    "Update Restart Blocked",
                     error.to_string(),
                 );
             }
             Err(error) => {
-                shell.pending_update_restart = None;
                 shell.last_action = format!("restart task failed: {error}");
                 shell.push_notification(
                     NotificationTone::Error,
-                    "Update Restart Failed",
+                    "Update Restart Blocked",
                     error.to_string(),
                 );
             }
@@ -6255,12 +6284,13 @@ fn restart_into_pending_update(mut state: Signal<ShellState>) {
         if close_after_launch {
             close_window_after_update_restart(state);
         }
-        if state
-            .read()
-            .pending_update_restart
-            .as_ref()
-            .map(|u| u.version.as_str())
-            == Some(next_version.as_str())
+        if close_after_launch
+            && state
+                .read()
+                .pending_update_restart
+                .as_ref()
+                .map(|u| u.version.as_str())
+                == Some(next_version.as_str())
         {
             state.with_mut(|shell| {
                 shell.pending_update_restart = None;
@@ -11405,6 +11435,49 @@ fn is_placeholder_rendered_section_title(title: &str) -> bool {
 fn palette_is_dark(palette: Palette) -> bool {
     palette.panel == "#161c22"
 }
+fn live_session_close_button_style(palette: Palette, selected: bool) -> String {
+    let dark = palette_is_dark(palette);
+    let (background, color, shadow) = if dark {
+        if selected {
+            (
+                "rgba(124,200,255,0.18)",
+                palette.text,
+                "inset 0 0 0 1px rgba(124,200,255,0.24)",
+            )
+        } else {
+            (
+                "rgba(221,232,243,0.10)",
+                "rgba(221,232,243,0.78)",
+                "inset 0 0 0 1px rgba(221,232,243,0.08)",
+            )
+        }
+    } else if selected {
+        (
+            "rgba(255,255,255,0.94)",
+            palette.text,
+            "inset 0 0 0 1px rgba(16,24,40,0.10)",
+        )
+    } else {
+        ("rgba(44,53,70,0.08)", palette.muted, "none")
+    };
+    format!(
+        "display:inline-flex; align-items:center; justify-content:center; width:18px; min-width:18px; height:18px; \
+         border:none; border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:800; \
+         line-height:1; cursor:pointer; padding:0; box-shadow:{};",
+        background, color, shadow
+    )
+}
+fn live_session_keep_alive_dot_style(palette: Palette) -> String {
+    let shadow = if palette_is_dark(palette) {
+        "0 0 0 1.5px rgba(22,28,34,0.88)"
+    } else {
+        "0 0 0 1.5px rgba(255,255,255,0.86)"
+    };
+    format!(
+        "display:inline-flex; width:7px; min-width:7px; height:7px; border-radius:999px; background:#22c55e; box-shadow:{};",
+        shadow
+    )
+}
 fn preview_block_cache() -> &'static Mutex<PreviewBlockCache> {
     PREVIEW_BLOCK_CACHE.get_or_init(|| Mutex::new(PreviewBlockCache::default()))
 }
@@ -15968,7 +16041,9 @@ fn build_workspace_reorder_plan(
         .iter()
         .all(|row| row.kind == BrowserRowKind::Session)
     {
-        return build_session_drop_plan(rows, selected_rows, placement);
+        return terminal_recipe_drag_enabled()
+            .then(|| build_session_drop_plan(rows, selected_rows, placement))
+            .flatten();
     }
     let items = rows
         .iter()
@@ -16189,6 +16264,28 @@ fn context_menu_position_style(placement: ContextMenuPlacement) -> String {
         parts.push(format!("bottom:{bottom}px;"));
     }
     parts.join(" ")
+}
+fn context_menu_surface_style(
+    palette: Palette,
+    placement_style: &str,
+    backdrop_filter: &str,
+) -> String {
+    let dark = palette_is_dark(palette);
+    let background = if dark {
+        "rgba(22,28,34,0.98)"
+    } else {
+        "rgba(248,249,252,0.98)"
+    };
+    let shadow = if dark {
+        "0 18px 42px rgba(0,0,0,0.42), inset 0 0 0 1px rgba(86,103,120,0.72)"
+    } else {
+        "0 18px 38px rgba(57,78,98,0.18), inset 0 0 0 1px rgba(214,220,228,0.9)"
+    };
+    format!(
+        "position:absolute; {}; min-width:188px; max-width:220px; max-height:calc(100vh - 24px); overflow:auto; padding:6px; border-radius:10px; \
+         background:{}; box-shadow:{}; color:{}; backdrop-filter:{}; -webkit-backdrop-filter:{};",
+        placement_style, background, shadow, palette.text, backdrop_filter, backdrop_filter
+    )
 }
 fn group_session_cwd(row: &BrowserRow) -> Option<String> {
     if row.full_path.starts_with("__live_") {
@@ -18082,6 +18179,11 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                         .filter((entry) => entry.text || entry.class_name || entry.style_attr)
                     : [];
                 const bufferTextSample = readTerminalBufferSample(term);
+                const hostText = String(host.innerText || "");
+                const terminalText = bufferTextSample || hostText;
+                const terminalTextTail = hostText.trim()
+                    ? hostText.trim().slice(-8192)
+                    : terminalText.trim().slice(-8192);
                 const hostRect = host.getBoundingClientRect();
                 const helpersRect = helpers ? helpers.getBoundingClientRect() : null;
                 const helperTextareaRect = helperTextarea ? helperTextarea.getBoundingClientRect() : null;
@@ -18193,7 +18295,8 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     resume_overlay_phase: String(host.getAttribute('data-terminal-resume-overlay-phase') || '').trim(),
                     resume_overlay_effective_failed: host.getAttribute('data-terminal-resume-overlay-effective-failed') === 'true',
                     child_count: host.childElementCount,
-                    text_sample: bufferTextSample || String(host.innerText || "").slice(0, 4096),
+                    text_sample: terminalText.slice(0, 4096),
+                    text_tail: terminalTextTail,
                     host_rect: {
                         left: Number(hostRect.left.toFixed(2)),
                         top: Number(hostRect.top.toFixed(2)),
@@ -19265,6 +19368,7 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         }
                     })();
                     const canvasCount = host.querySelectorAll('canvas').length;
+                    const hostText = String(host.innerText || '').trim();
                     return {
                         host_id: hostId,
                         session_path: String(host.getAttribute('data-terminal-session-path') || '').trim(),
@@ -19274,7 +19378,8 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         viewport_present: Boolean(viewport),
                         rows_present: Boolean(rowsLayer),
                         canvas_count: canvasCount,
-                        text_sample: String(host.innerText || '').trim().slice(0, 240),
+                        text_sample: hostText.slice(0, 240),
+                        text_tail: hostText.slice(-8192),
                         host_rect: rectSummary(host),
                         host_content_width: rectSummary(host)?.width || null,
                         host_content_height: rectSummary(host)?.height || null,
@@ -19959,7 +20064,7 @@ fn terminal_probe_input_script(
                         helper_textarea_focused: Boolean(helperTextarea && document.activeElement === helperTextarea),
                         host_has_active_element: Boolean(host && document.activeElement && host.contains(document.activeElement)),
                         input_enabled: Boolean(entry.inputEnabled),
-                        text_tail: String(host.innerText || "").trim().slice(-240),
+                        text_tail: String(host.innerText || "").trim().slice(-8192),
                     }};
                 }};
                 const focusTarget = () => {{
@@ -20310,7 +20415,7 @@ async fn probe_terminal_viewport_scroll_for(session_path: &str, lines: i32) -> V
                         data_event_count: Number(entry.dataEventCount || 0),
                         render_event_count: Number(entry.renderEventCount || 0),
                         text_head: String(host.innerText || "").trim().slice(0, 240),
-                        text_tail: String(host.innerText || "").trim().slice(-240),
+                        text_tail: String(host.innerText || "").trim().slice(-8192),
                     }};
                 }};
                 const before = snapshot();
@@ -21499,7 +21604,7 @@ async fn process_pending_app_control_requests(
                     perf_home_dir(&shell.bootstrap.settings_path),
                 )
             });
-            match terminal_write_with_local_runtime_retry_async(
+            match terminal_write_app_control_input_async(
                 endpoint,
                 runtime_session_path,
                 data.clone(),
@@ -26828,6 +26933,29 @@ fn terminal_input_busy_hint_decision(data: &str, mut pending_line_has_text: bool
 fn terminal_input_should_show_stateless_busy_hint(data: &str) -> bool {
     terminal_input_busy_hint_decision(data, false).0
 }
+fn codex_completion_notification_should_fire(
+    enabled: bool,
+    busy_since_input: bool,
+    already_notified: bool,
+    runtime_running: bool,
+    saw_generic_idle_output: bool,
+    tail_generic_idle_output: bool,
+    saw_generic_idle_footer_output: bool,
+    tail_generic_idle_footer_output: bool,
+    saw_prompt_output: bool,
+    tail_prompt_only_output: bool,
+) -> bool {
+    enabled
+        && busy_since_input
+        && !already_notified
+        && !runtime_running
+        && (saw_generic_idle_output
+            || tail_generic_idle_output
+            || saw_generic_idle_footer_output
+            || tail_generic_idle_footer_output
+            || saw_prompt_output
+            || tail_prompt_only_output)
+}
 fn terminal_input_uses_optimistic_busy_hint(session_path: &str) -> bool {
     !normalize_live_session_path(session_path).starts_with("local://")
 }
@@ -27425,21 +27553,14 @@ fn SidebarRow(
                     span {
                         "data-sidebar-live-session-keep-alive": "1",
                         title: "Keep alive",
-                        style: "display:inline-flex; width:7px; min-width:7px; height:7px; border-radius:999px; background:#22c55e; box-shadow:0 0 0 1.5px rgba(255,255,255,0.86);",
+                        style: live_session_keep_alive_dot_style(palette),
                     }
                 }
                 if show_live_close {
                     button {
                         "data-sidebar-live-session-close": "1",
                         title: "Close terminal",
-                        style: format!(
-                            "display:inline-flex; align-items:center; justify-content:center; width:18px; min-width:18px; height:18px; \
-                             border:none; border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:800; \
-                             line-height:1; cursor:pointer; padding:0; box-shadow:{};",
-                            if selected { "rgba(255,255,255,0.94)" } else { "rgba(44, 53, 70, 0.08)" },
-                            if selected { palette.text } else { palette.muted },
-                            if selected { "inset 0 0 0 1px rgba(16,24,40,0.10)" } else { "none" }
-                        ),
+                        style: live_session_close_button_style(palette, selected),
                         onmousedown: |evt| {
                             evt.prevent_default();
                             evt.stop_propagation();
@@ -29920,6 +30041,7 @@ fn TerminalCanvas(
         local_terminal_prefill_text(&session)
     };
     let session_host_label = session.host_label.clone();
+    let session_kind = session.kind;
     let mount_identity = format!("{session_path}:{mount_epoch}");
     let mut terminal_resume_overlay_excerpt = use_signal(|| initial_resume_overlay_excerpt.clone());
     let bootstrap_owner_instance_id = use_hook(next_terminal_bootstrap_owner_id);
@@ -30344,6 +30466,7 @@ fn TerminalCanvas(
         let title = terminal_title.clone();
         let theme = future_theme.clone();
         let placeholder = terminal_resume_prefill.clone();
+        let session_kind = session_kind;
         let trace_home = trace_home.clone();
         let delayed_recovery_trace_home = trace_home.clone();
         let state = state;
@@ -30702,6 +30825,10 @@ fn TerminalCanvas(
             let mut last_host_health_rows = 0_u16;
             let mut last_host_health_blank_rows_below_cursor = 0_u16;
             let mut pending_terminal_input_has_text = false;
+            let codex_completion_notifications_enabled =
+                matches!(session_kind, SessionKind::Codex | SessionKind::CodexLiteLlm);
+            let mut codex_busy_since_input = false;
+            let mut codex_completion_notified = false;
             let mut last_window_focused_for_read = state.with(|shell| shell.window_focused);
             loop {
                 let window_focused_for_read = state.with(|shell| shell.window_focused);
@@ -31099,6 +31226,10 @@ fn TerminalCanvas(
                                             pending_terminal_input_has_text,
                                         );
                                     pending_terminal_input_has_text = next_pending_input_has_text;
+                                    if codex_completion_notifications_enabled && show_busy_hint {
+                                        codex_busy_since_input = true;
+                                        codex_completion_notified = false;
+                                    }
                                     if show_busy_hint
                                         && terminal_input_uses_optimistic_busy_hint(&session_path)
                                     {
@@ -31762,6 +31893,39 @@ fn TerminalCanvas(
                                         && !tail_generic_idle_footer_output;
                                 let saw_prompt_only_surface =
                                     saw_shell_prompt_output && !saw_meaningful_output;
+                                if codex_completion_notifications_enabled
+                                    && runtime_running
+                                    && saw_meaningful_output
+                                    && !saw_generic_idle_output
+                                    && !tail_generic_idle_output
+                                    && !saw_generic_idle_footer_output
+                                    && !tail_generic_idle_footer_output
+                                    && !saw_prompt_only_surface
+                                {
+                                    codex_busy_since_input = true;
+                                    codex_completion_notified = false;
+                                }
+                                if codex_completion_notification_should_fire(
+                                    codex_completion_notifications_enabled,
+                                    codex_busy_since_input,
+                                    codex_completion_notified,
+                                    runtime_running,
+                                    saw_generic_idle_output,
+                                    tail_generic_idle_output,
+                                    saw_generic_idle_footer_output,
+                                    tail_generic_idle_footer_output,
+                                    saw_prompt_output,
+                                    tail_prompt_only_output,
+                                ) {
+                                    safe_push_notification(
+                                        state,
+                                        NotificationTone::Success,
+                                        "Codex Session Ready",
+                                        format!("{title} is waiting for input."),
+                                    );
+                                    codex_completion_notified = true;
+                                    codex_busy_since_input = false;
+                                }
                                 let has_transport_error = batched_output
                                     .as_deref()
                                     .is_some_and(terminal_chunk_is_transport_error);
@@ -33842,6 +34006,54 @@ async fn terminal_write_with_local_runtime_retry_async(
         Err(error) => Err(error),
     }
 }
+
+fn app_control_terminal_input_write_chunks(data: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut start_ix = 0usize;
+    for (ix, ch) in data.char_indices() {
+        if ch == '\u{3}' && ix + ch.len_utf8() < data.len() {
+            if start_ix < ix {
+                chunks.push(data[start_ix..ix].to_string());
+            }
+            chunks.push(ch.to_string());
+            start_ix = ix + ch.len_utf8();
+        }
+    }
+    if start_ix < data.len() {
+        chunks.push(data[start_ix..].to_string());
+    }
+    if chunks.is_empty() {
+        chunks.push(data.to_string());
+    }
+    chunks
+}
+
+async fn terminal_write_app_control_input_async(
+    endpoint: ServerEndpoint,
+    session_path: String,
+    data: String,
+    trace_home: &Path,
+) -> Result<()> {
+    let chunks = app_control_terminal_input_write_chunks(&data);
+    let mut chunks = chunks.into_iter().peekable();
+    while let Some(chunk) = chunks.next() {
+        terminal_write_with_local_runtime_retry_async(
+            endpoint.clone(),
+            session_path.clone(),
+            chunk.clone(),
+            trace_home,
+        )
+        .await?;
+        if chunk.ends_with('\u{3}') && chunks.peek().is_some() {
+            sleep(Duration::from_millis(
+                APP_CONTROL_TERMINAL_INTERRUPT_SETTLE_MS,
+            ))
+            .await;
+        }
+    }
+    Ok(())
+}
+
 async fn terminal_resize_async(
     endpoint: ServerEndpoint,
     session_path: String,
@@ -36666,6 +36878,24 @@ fn terminal_eval_script_with_canvas_renderer(
             if (!accel) {{
                 return true;
             }}
+            if (key === 'v' && !event.shiftKey && !event.altKey) {{
+                if (event.preventDefault) {{
+                    event.preventDefault();
+                }}
+                if (event.stopImmediatePropagation) {{
+                    event.stopImmediatePropagation();
+                }}
+                if (event.stopPropagation) {{
+                    event.stopPropagation();
+                }}
+                dioxus.send({{ kind: "clipboard_paste_request" }});
+                window.setTimeout(() => {{
+                    if (inputEnabled) {{
+                        focusTerminal();
+                    }}
+                }}, 0);
+                return false;
+            }}
             if (!event.shiftKey || (key !== 'c' && key !== 'x')) {{
                 return true;
             }}
@@ -38412,14 +38642,7 @@ fn ContextMenuOverlay(
             div {
                 "data-context-menu": "1",
                 "data-yggterm-menu-surface": "1",
-                style: format!(
-                    "position:absolute; {}; min-width:188px; max-width:220px; max-height:calc(100vh - 24px); overflow:auto; padding:6px; border-radius:10px; \
-                     background:rgba(248,249,252,0.98); box-shadow: 0 18px 38px rgba(57,78,98,0.18), inset 0 0 0 1px rgba(214,220,228,0.9); \
-                     backdrop-filter: {}; -webkit-backdrop-filter: {};",
-                    placement_style,
-                    menu_blur,
-                    menu_blur
-                ),
+                style: context_menu_surface_style(palette, &placement_style, menu_blur),
                 onmousedown: |evt| evt.stop_propagation(),
                 onclick: |evt| evt.stop_propagation(),
                 div {
@@ -42081,7 +42304,7 @@ mod tests {
             "-webkit-text-fill-color: var(--yggterm-term-cursor-block-text) !important;"
         ));
         assert!(script.contains(".xterm-rows .xterm-cursor.xterm-cursor-outline {"));
-        assert!(script.contains(".xterm-cursor.xterm-cursor-block.xterm-dim {"));
+        assert!(script.contains(".xterm-cursor.xterm-cursor-block.xterm-dim,"));
         assert!(script.contains(".xterm-cursor.xterm-cursor-outline.xterm-dim {"));
         assert!(!script.contains("cursorWidth: 2"));
         assert!(!script.contains("yggterm-hidden-raw-cursor"));
@@ -42102,8 +42325,8 @@ mod tests {
         assert!(
             !script.contains("document.addEventListener('keydown', handleDocumentKeydown, true);")
         );
-        assert!(!script.contains("if (!event.shiftKey && key === 'v') {"));
-        assert!(!script.contains("dioxus.send({ kind: \"clipboard_paste_request\" });"));
+        assert!(script.contains("if (key === 'v' && !event.shiftKey && !event.altKey) {"));
+        assert!(script.contains("dioxus.send({ kind: \"clipboard_paste_request\" });"));
         assert!(script.contains("if (hasImage) {"));
         assert!(script.contains("dioxus.send({ kind: \"clipboard_image_request\" });"));
         assert!(!script.contains("const pasteTextIntoTerminal = (text) => {"));
@@ -42393,6 +42616,35 @@ mod tests {
         } else {
             assert!(style.contains(light.gradient));
         }
+    }
+    #[test]
+    fn context_menu_surface_and_live_close_button_are_dark_theme_aware() {
+        let dark = palette(UiTheme::ZedDark);
+        let menu_style = context_menu_surface_style(dark, "left:10px; top:10px;", "none");
+        assert!(menu_style.contains("rgba(22,28,34,0.98)"));
+        assert!(!menu_style.contains("rgba(248,249,252,0.98)"));
+
+        let close_style = live_session_close_button_style(dark, false);
+        assert!(close_style.contains("rgba(221,232,243,0.10)"));
+        assert!(!close_style.contains("rgba(255,255,255,0.94)"));
+
+        let keep_alive_style = live_session_keep_alive_dot_style(dark);
+        assert!(keep_alive_style.contains("rgba(22,28,34,0.88)"));
+    }
+    #[test]
+    fn codex_completion_notification_only_fires_after_busy_session_becomes_idle() {
+        assert!(!codex_completion_notification_should_fire(
+            true, false, false, false, true, false, false, false, false, false,
+        ));
+        assert!(!codex_completion_notification_should_fire(
+            true, true, false, true, true, false, false, false, false, false,
+        ));
+        assert!(codex_completion_notification_should_fire(
+            true, true, false, false, true, false, false, false, false, false,
+        ));
+        assert!(!codex_completion_notification_should_fire(
+            true, true, true, false, true, false, false, false, false, false,
+        ));
     }
     #[test]
     fn active_request_session_target_path_prefers_explicit_session_path() {
@@ -42952,7 +43204,7 @@ mod tests {
     }
 
     #[test]
-    fn reorder_plan_allows_session_rows_to_drop_into_workspace_folders() {
+    fn reorder_plan_does_not_create_terminal_recipes_without_feature_flag() {
         let folder = BrowserRow {
             kind: BrowserRowKind::Group,
             full_path: "/home/pi/gh/0000-notes".to_string(),
@@ -42994,18 +43246,13 @@ mod tests {
             },
         )
         .expect("folder should accept session drops");
-        let plan = build_workspace_reorder_plan(&rows, std::slice::from_ref(&session), &placement)
-            .expect("session move should produce a plan");
-        assert_eq!(plan.len(), 1);
-        let session_plan = plan
-            .iter()
-            .find(|item| item.from_path == session.full_path)
-            .expect("session plan item");
-        assert_eq!(session_plan.kind, BrowserRowKind::Session);
-        assert_eq!(
-            session_plan.final_path,
-            "/home/pi/gh/0000-notes/0000-local-shell"
-        );
+        if !terminal_recipe_drag_enabled() {
+            assert!(
+                build_workspace_reorder_plan(&rows, std::slice::from_ref(&session), &placement)
+                    .is_none(),
+                "session drag/drop must not implicitly create terminal recipes"
+            );
+        }
     }
 
     #[test]
@@ -50887,6 +51134,29 @@ Waiting for the remote terminal to paint...\n";
             true,
             &generic_error
         ));
+    }
+    #[test]
+    fn app_control_terminal_input_splits_interrupt_from_following_bytes() {
+        assert_eq!(
+            app_control_terminal_input_write_chunks("\u{3}\u{5}\u{15}"),
+            vec!["\u{3}".to_string(), "\u{5}\u{15}".to_string()]
+        );
+        assert_eq!(
+            app_control_terminal_input_write_chunks("echo ok\r"),
+            vec!["echo ok\r".to_string()]
+        );
+        assert_eq!(
+            app_control_terminal_input_write_chunks("before\u{3}after\r"),
+            vec![
+                "before".to_string(),
+                "\u{3}".to_string(),
+                "after\r".to_string()
+            ]
+        );
+        assert_eq!(
+            app_control_terminal_input_write_chunks("\u{3}"),
+            vec!["\u{3}".to_string()]
+        );
     }
     #[test]
     fn terminal_attach_blocks_background_work_for_active_ssh_restore() {
