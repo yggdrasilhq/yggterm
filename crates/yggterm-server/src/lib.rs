@@ -2048,6 +2048,13 @@ impl YggtermServer {
     pub fn focus_live_session(&mut self, key: &str) {
         let resolved_key = self.resolve_live_session_key(key);
         if let Some(resolved_key) = resolved_key {
+            if self.sessions.get(&resolved_key).is_some_and(|session| {
+                managed_session_is_promoted_live_session(&resolved_key, session)
+            }) {
+                self.live_session_order
+                    .retain(|existing| existing != &resolved_key);
+                self.live_session_order.insert(0, resolved_key.clone());
+            }
             self.active_session_path = Some(resolved_key);
             self.active_view_mode = WorkspaceViewMode::Terminal;
             self.request_terminal_launch_for_active();
@@ -2540,7 +2547,7 @@ impl YggtermServer {
         }
         let cached_remote_launch =
             self.cached_remote_launch_for_target(&target.ssh_target, target.prefix.as_deref());
-        let resolved_remote_launch = if launch_terminal {
+        let resolved_remote_launch = if launch_terminal && cached_remote_launch.is_none() {
             resolve_remote_yggterm_binary(&target.ssh_target, target.prefix.as_deref()).ok()
         } else {
             None
@@ -3208,6 +3215,29 @@ impl YggtermServer {
                     "resolved_key": path,
                 }),
             );
+        }
+        let remote_stored_session =
+            parse_remote_scanned_session_path(&path).and_then(|(machine_key, session_id)| {
+                self.sessions.get(&path).and_then(|session| {
+                    (session.source == SessionSource::Stored).then(|| {
+                        (
+                            machine_key.to_string(),
+                            session_id.to_string(),
+                            session_metadata_value(session, "Cwd"),
+                            (!session.title.trim().is_empty()).then(|| session.title.clone()),
+                        )
+                    })
+                })
+            });
+        if let Some((machine_key, session_id, cwd, title_hint)) = remote_stored_session {
+            let _ = self.open_remote_scanned_session_with_view(
+                &machine_key,
+                &session_id,
+                cwd.as_deref(),
+                title_hint.as_deref(),
+                Some(WorkspaceViewMode::Terminal),
+            );
+            return;
         }
         let cached_live_ssh_launch = self.sessions.get(&path).and_then(|session| {
             if !live_session_uses_remote_runtime(session) {
@@ -11951,13 +11981,20 @@ fn canonical_static_label(value: String) -> &'static str {
 
 fn managed_session_from_snapshot(session: SnapshotSessionView) -> ManagedSessionView {
     let preview_blocks = sanitize_snapshot_preview_blocks(session.preview.blocks);
+    let source = if parse_remote_scanned_session_path(&session.session_path).is_some()
+        && session.source == SessionSource::LiveLocal
+    {
+        SessionSource::LiveSsh
+    } else {
+        session.source
+    };
     ManagedSessionView {
         id: session.id,
         session_path: session.session_path,
         title: session.title,
         kind: session.kind,
         host_label: session.host_label,
-        source: session.source,
+        source,
         backend: session.backend,
         bridge_available: session.bridge_available,
         launch_phase: session.launch_phase,
@@ -15865,6 +15902,67 @@ terminal_window_id: None,
         assert_eq!(server.active_view_mode, WorkspaceViewMode::Rendered);
         assert!(!server.live_session_order.contains(&session_path));
         Ok(())
+    }
+
+    #[test]
+    fn request_terminal_launch_promotes_stored_remote_preview_as_live_ssh() -> Result<()> {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server
+            .remote_machines
+            .push(remote_machine_with_scanned_session("dev", "abc123", true));
+        let session_path = server.open_remote_scanned_session_with_view(
+            "dev",
+            "abc123",
+            Some("/home/pi/gh/yggterm"),
+            Some("Jyas"),
+            Some(WorkspaceViewMode::Rendered),
+        )?;
+
+        assert_eq!(
+            server
+                .sessions
+                .get(&session_path)
+                .map(|session| session.source),
+            Some(SessionSource::Stored)
+        );
+
+        server.request_terminal_launch_for_path(&session_path);
+
+        let session = server.sessions.get(&session_path).expect("session");
+        assert_eq!(session.source, SessionSource::LiveSsh);
+        assert_eq!(server.active_session_path(), Some(session_path.as_str()));
+        assert_eq!(server.active_view_mode, WorkspaceViewMode::Terminal);
+        assert!(server.live_session_order.contains(&session_path));
+        assert!(session.launch_command.contains("resume-codex"));
+        assert!(session.launch_command.contains("abc123"));
+        Ok(())
+    }
+
+    #[test]
+    fn managed_session_from_snapshot_repairs_remote_livelocal_source() {
+        let path = remote_scanned_session_path("dev", "abc123");
+        let mut snapshot = snapshot_session(&path, SessionSource::LiveLocal);
+        snapshot.ssh_target = Some("dev".to_string());
+
+        let session = managed_session_from_snapshot(snapshot);
+
+        assert_eq!(session.source, SessionSource::LiveSsh);
     }
 
     #[test]
