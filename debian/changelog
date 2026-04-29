@@ -1,3 +1,12 @@
+yggterm (2.1.49-1) unstable; urgency=medium
+
+  * Scan every reachable same-home versioned daemon socket for live remote Codex runtimes during update handoff.
+  * Bridge remote resume-codex --require-existing to the older daemon that still owns codex-runtime://<session-id>.
+  * Allow restored LiveSsh rows to reconnect while the latest remote scan is temporarily stale.
+  * Add regression coverage for old-daemon remote-runtime bridging and stale remote-scan recovery.
+
+ -- Yggdrasil HQ <avi@gour.top>  Wed, 29 Apr 2026 20:30:58 +0530
+
 yggterm (2.1.48-1) unstable; urgency=medium
 
   * Make yggterm server status read-only so diagnostics cannot spawn or sweep daemons.

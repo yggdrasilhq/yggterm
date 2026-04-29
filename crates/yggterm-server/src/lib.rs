@@ -605,14 +605,6 @@ pub fn validate_server_ui_snapshot(snapshot: &ServerUiSnapshot) -> Vec<String> {
                     live.session_path
                 ));
             }
-            if snapshot_remote_live_runtime(&snapshot.remote_machines, &live.session_path)
-                .is_some_and(|live_runtime| !live_runtime)
-            {
-                violations.push(format!(
-                    "remote scanned live session is not marked live by the remote scan: {}",
-                    live.session_path
-                ));
-            }
         }
     }
 
@@ -660,14 +652,6 @@ pub fn validate_server_ui_snapshot(snapshot: &ServerUiSnapshot) -> Vec<String> {
                             active.session_path
                         ));
                     }
-                    if snapshot_remote_live_runtime(&snapshot.remote_machines, &active.session_path)
-                        .is_some_and(|live_runtime| !live_runtime)
-                    {
-                        violations.push(format!(
-                            "remote scanned terminal session is not marked live by the remote scan: {}",
-                            active.session_path
-                        ));
-                    }
                 }
             }
         }
@@ -711,23 +695,6 @@ fn snapshot_document_has_terminal_recipe(session: &SnapshotSessionView) -> bool 
             .rendered_sections
             .iter()
             .any(|section| section.title == "Replay Commands" && !section.lines.is_empty())
-}
-
-fn snapshot_remote_live_runtime(
-    remote_machines: &[RemoteMachineSnapshot],
-    session_path: &str,
-) -> Option<bool> {
-    let (raw_machine_key, session_id) = parse_remote_scanned_session_path(session_path)?;
-    let machine_key = normalize_machine_key(raw_machine_key);
-    remote_machines
-        .iter()
-        .find(|machine| machine.machine_key == machine_key)
-        .and_then(|machine| {
-            machine.sessions.iter().find(|session| {
-                session.session_path == session_path || session.session_id == session_id
-            })
-        })
-        .map(|session| session.live_runtime)
 }
 
 fn managed_session_supports_terminal_view(session: &ManagedSessionView) -> bool {
@@ -8185,7 +8152,21 @@ pub fn run_remote_resume_codex(
         }
     };
     let _ = ensure_local_managed_cli(ManagedCliTool::Codex)?;
-    let endpoint = default_endpoint(&resolve_yggterm_home()?);
+    let home = resolve_yggterm_home()?;
+    let runtime_key = remote_runtime_codex_session_key(session_id);
+    if require_existing
+        && let Some(endpoint) = endpoint_with_live_remote_runtime(&home, &runtime_key)
+    {
+        finish_span(serde_json::json!({
+            "session_id": session_id,
+            "cwd": cwd,
+            "path": runtime_key,
+            "mode": "existing_daemon_runtime_bridge",
+            "require_existing": require_existing,
+        }));
+        return bridge_remote_runtime_session_stdio(&endpoint, &runtime_key);
+    }
+    let endpoint = default_endpoint(&home);
     ensure_local_daemon_running(&endpoint)?;
     let key =
         daemon_ensure_remote_runtime_codex_session(&endpoint, session_id, cwd, require_existing)?;
@@ -8197,6 +8178,18 @@ pub fn run_remote_resume_codex(
         "require_existing": require_existing,
     }));
     bridge_remote_runtime_session_stdio(&endpoint, &key)
+}
+
+fn endpoint_with_live_remote_runtime(home: &Path, runtime_key: &str) -> Option<ServerEndpoint> {
+    daemon::reachable_versioned_daemon_statuses(home)
+        .into_iter()
+        .find(|(_, runtime)| {
+            runtime
+                .terminal_session_keys
+                .iter()
+                .any(|key| key == runtime_key)
+        })
+        .map(|(endpoint, _)| endpoint)
 }
 
 pub fn ensure_local_daemon_running(endpoint: &ServerEndpoint) -> anyhow::Result<()> {
@@ -11477,14 +11470,10 @@ pub fn run_remote_scan(codex_home: Option<&str>) -> anyhow::Result<()> {
 }
 
 fn live_remote_runtime_codex_session_ids(yggterm_home: &Path) -> HashSet<String> {
-    let endpoint = default_endpoint(yggterm_home);
-    let Ok(runtime_status) = daemon::status(&endpoint) else {
-        return HashSet::new();
-    };
-    runtime_status
-        .terminal_session_keys
+    daemon::reachable_versioned_daemon_statuses(yggterm_home)
         .into_iter()
-        .filter_map(|key| parse_remote_runtime_codex_session_key(&key).map(ToOwned::to_owned))
+        .flat_map(|(_, runtime_status)| runtime_status.terminal_session_keys)
+        .filter_map(|key| parse_remote_runtime_codex_session_key(&key).map(str::to_string))
         .collect()
 }
 
@@ -13757,6 +13746,96 @@ mod tests {
         }
     }
 
+    fn minimal_runtime_status(terminal_session_keys: Vec<String>) -> ServerRuntimeStatus {
+        ServerRuntimeStatus {
+            server_version: "2.1.46".to_string(),
+            server_build_id: 0,
+            host_kind: "test".to_string(),
+            host_detail: "test".to_string(),
+            embedded_surface_supported: false,
+            bridge_enabled: false,
+            restored_from_persisted_state: true,
+            restored_stored_sessions: 0,
+            restored_live_sessions: 0,
+            restored_remote_machines: 0,
+            terminal_session_count: terminal_session_keys.len(),
+            terminal_session_keys,
+            terminal_retained_chunks: 0,
+            terminal_retained_bytes: 0,
+            terminal_session_buffer_limit_bytes: 0,
+            terminal_idle_buffer_limit_bytes: 0,
+            managed_session_count: 0,
+            session_metadata_entries: 0,
+            session_metadata_bytes: 0,
+            session_preview_block_count: 0,
+            session_preview_line_count: 0,
+            session_preview_bytes: 0,
+            session_rendered_section_count: 0,
+            session_rendered_line_count: 0,
+            session_rendered_bytes: 0,
+            session_terminal_line_count: 0,
+            session_terminal_bytes: 0,
+            session_payload_total_bytes: 0,
+        }
+    }
+
+    #[cfg(unix)]
+    fn spawn_one_status_socket(
+        path: PathBuf,
+        terminal_session_keys: Vec<String>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+            let listener = std::os::unix::net::UnixListener::bind(&path)
+                .unwrap_or_else(|error| panic!("bind {}: {error}", path.display()));
+            let (mut stream, _) = listener.accept().expect("accept status request");
+            let mut line = String::new();
+            std::io::BufReader::new(stream.try_clone().expect("clone status stream"))
+                .read_line(&mut line)
+                .expect("read status request");
+            let request: super::ServerRequest =
+                serde_json::from_str(line.trim_end()).expect("parse status request");
+            assert!(matches!(request, super::ServerRequest::Status));
+            let response =
+                super::ServerResponse::Status(minimal_runtime_status(terminal_session_keys));
+            serde_json::to_writer(&mut stream, &response).expect("write status response");
+            stream.write_all(b"\n").expect("write response terminator");
+            stream.flush().expect("flush status response");
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_resume_endpoint_finds_live_runtime_on_reachable_old_daemon_socket() {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-remote-runtime-old-daemon-{}-{}",
+            std::process::id(),
+            current_millis_u64()
+        ));
+        let home = root.join(".yggterm");
+        fs::create_dir_all(&home).expect("create temp yggterm home");
+        let legacy_socket = home.join("server-2-1-46.sock");
+        let runtime_key = "codex-runtime://old-live-session";
+        let handle = spawn_one_status_socket(legacy_socket.clone(), vec![runtime_key.to_string()]);
+        for _ in 0..100 {
+            if legacy_socket.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(legacy_socket.exists(), "legacy socket did not become ready");
+
+        let endpoint = super::endpoint_with_live_remote_runtime(&home, runtime_key);
+
+        assert_eq!(
+            endpoint,
+            Some(ServerEndpoint::UnixSocket(legacy_socket)),
+            "remote resume must bridge to the reachable old daemon that still owns the live runtime"
+        );
+        handle.join().expect("status socket thread");
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn snapshot_contract_rejects_stale_remote_preview_in_terminal_mode() {
         let path = remote_scanned_session_path("dev", "abc123");
@@ -13776,10 +13855,10 @@ mod tests {
             "{violations:#?}"
         );
         assert!(
-            violations
+            !violations
                 .iter()
                 .any(|violation| violation.contains("not marked live by the remote scan")),
-            "{violations:#?}"
+            "remote scan liveness is a recovery hint, not a terminal-mode veto: {violations:#?}"
         );
     }
 
@@ -13794,6 +13873,24 @@ mod tests {
             WorkspaceViewMode::Terminal,
             vec![active],
             vec![remote_machine_with_scanned_session("dev", "abc123", true)],
+        );
+
+        let violations = validate_server_ui_snapshot(&snapshot);
+
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[test]
+    fn snapshot_contract_accepts_restored_remote_terminal_before_remote_scan_catches_up() {
+        let path = remote_scanned_session_path("dev", "abc123");
+        let mut active = snapshot_session(&path, SessionSource::LiveSsh);
+        active.ssh_target = Some("dev".to_string());
+        let snapshot = snapshot_with_active(
+            Some(path.clone()),
+            Some(active.clone()),
+            WorkspaceViewMode::Terminal,
+            vec![active],
+            vec![remote_machine_with_scanned_session("dev", "abc123", false)],
         );
 
         let violations = validate_server_ui_snapshot(&snapshot);
