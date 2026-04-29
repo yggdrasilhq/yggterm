@@ -11557,6 +11557,36 @@ def sidebar_dom_row(state: dict, session: str) -> dict | None:
     )
 
 
+def terminal_sample_has_codex_working_status(text: str) -> bool:
+    if "Working (" not in text:
+        return False
+    lowered = text.lower()
+    if "worked for" in lowered:
+        return False
+    return (
+        "esc to interrupt" in lowered
+        or "/stop to close" in lowered
+        or "background terminal running" in lowered
+    )
+
+
+def state_allows_codex_working_busy_row(state: dict, row_path: str) -> bool:
+    if normalize_live_path(str(state.get("active_session_path") or "")) != normalize_live_path(row_path):
+        return False
+    host = active_host(state)
+    sample = "\n".join(
+        str(host.get(key) or "")
+        for key in (
+            "text_tail",
+            "text_sample",
+            "buffer_text_sample",
+            "cursor_line_text",
+            "cursor_row_text",
+        )
+    )
+    return terminal_sample_has_codex_working_status(sample)
+
+
 def assert_busy_icon_lifecycle(pid: int, session: str, *, sleep_seconds: int = 8) -> dict:
     def row_from_app_rows() -> dict | None:
         normalized = normalize_live_path(session)
@@ -11823,6 +11853,7 @@ def assert_live_sessions_tree_contract(pid: int) -> dict:
             f"live session close affordances are present but not visibly readable: {live_close_low_visibility!r}"
         )
     invalid_busy_live_rows = []
+    active_state_for_busy = state
     for row in live_group_children:
         row_path = normalize_live_path(str(row.get("path") or ""))
         session_entry = snapshot_live_sessions.get(row_path)
@@ -11830,7 +11861,8 @@ def assert_live_sessions_tree_contract(pid: int) -> dict:
             continue
         row_busy = bool(row.get("busy")) or str(row.get("icon_kind") or "") == "busy"
         terminal_foreground_active = session_entry.get("terminal_foreground_active")
-        if row_busy and terminal_foreground_active is not True:
+        codex_working_allowed = state_allows_codex_working_busy_row(active_state_for_busy, row_path)
+        if row_busy and terminal_foreground_active is not True and not codex_working_allowed:
             invalid_busy_live_rows.append(
                 {
                     "row": row,
@@ -11839,6 +11871,7 @@ def assert_live_sessions_tree_contract(pid: int) -> dict:
                         "source": session_entry.get("source"),
                         "status_line": session_entry.get("status_line"),
                         "terminal_foreground_active": terminal_foreground_active,
+                        "codex_working_allowed": codex_working_allowed,
                     },
                 }
             )
@@ -11986,7 +12019,8 @@ def assert_sidebar_contract(pid: int, session: str) -> dict:
             continue
         row_busy = bool(row.get("busy")) or str(row.get("icon_kind") or "") == "busy"
         terminal_foreground_active = session_entry.get("terminal_foreground_active")
-        if row_busy and terminal_foreground_active is not True:
+        codex_working_allowed = state_allows_codex_working_busy_row(state, row_path)
+        if row_busy and terminal_foreground_active is not True and not codex_working_allowed:
             invalid_busy_live_rows.append(
                 {
                     "row": row,
@@ -11995,6 +12029,7 @@ def assert_sidebar_contract(pid: int, session: str) -> dict:
                         "source": session_entry.get("source"),
                         "status_line": session_entry.get("status_line"),
                         "terminal_foreground_active": terminal_foreground_active,
+                        "codex_working_allowed": codex_working_allowed,
                     },
                 }
             )
@@ -12652,6 +12687,155 @@ def assert_hot_session_switch(pid: int, session: str, session_kind: str, out_dir
         "partner_screenshot": str(partner_shot),
         "return_screenshot": str(final_shot),
         "final_text_sample": final_text[-240:],
+    }
+
+
+def assert_sidebar_session_switch_focus_space_scroll(pid: int, session: str, out_dir: Path) -> dict:
+    target_path = normalize_live_path(str(session or "").strip())
+    if not target_path:
+        raise AssertionError("sidebar switch focus smoke requires a session path")
+
+    app_open(pid, target_path, view="terminal")
+    wait_for_session_focus(pid, target_path, timeout_seconds=12.0)
+    wait_for_terminal_quiescent(pid, timeout_seconds=8.0)
+    target_clear = clear_prompt_line(pid, target_path, timeout_seconds=8.0)
+
+    partner_create = app_create_terminal(pid, title="Smoke Sidebar Focus Partner")
+    partner_path = normalize_live_path(str(partner_create.get("session_path") or "").strip())
+    if not partner_path:
+        raise AssertionError(f"sidebar switch focus partner was not created: {partner_create!r}")
+    wait_for_interactive_session(pid, partner_path, timeout_seconds=20.0)
+    clear_prompt_line(pid, partner_path, timeout_seconds=8.0)
+    app_open(pid, partner_path, view="terminal")
+    wait_for_session_focus(pid, partner_path, timeout_seconds=12.0)
+
+    try:
+        target_row = wait_for_visible_sidebar_row(pid, target_path, kind="Session", timeout_seconds=3.0)
+    except AssertionError:
+        app_open(pid, target_path, view="terminal")
+        wait_for_visible_sidebar_row(pid, target_path, kind="Session", timeout_seconds=5.0)
+        app_open(pid, partner_path, view="terminal")
+        wait_for_session_focus(pid, partner_path, timeout_seconds=12.0)
+        target_row = wait_for_visible_sidebar_row(pid, target_path, kind="Session", timeout_seconds=5.0)
+
+    before_click = app_state(pid)
+    click = xdotool_click_window(
+        pid,
+        sidebar_row_click_x(before_click),
+        rect_center_y(sidebar_row_rect(target_row)),
+    )
+
+    def switched_and_focused(sample: dict) -> bool:
+        viewport = viewport_state(sample)
+        host = host_for_session_or_none(sample, target_path)
+        active_path = normalize_live_path(str(sample.get("active_session_path") or ""))
+        active_mode = str(viewport.get("active_view_mode") or sample.get("active_view_mode") or "").strip()
+        dom = sample.get("dom") or {}
+        return (
+            active_path == target_path
+            and active_mode == "Terminal"
+            and host is not None
+            and host.get("input_enabled") is True
+            and host.get("helper_textarea_focused") is True
+            and host.get("host_has_active_element") is True
+            and dom.get("sidebar_keyboard_owner") is not True
+            and not visible_notifications(sample)
+            and not ((viewport.get("active_terminal_surface") or {}).get("problem"))
+        )
+
+    focused_state = wait_for_probe(
+        lambda: app_state(pid),
+        switched_and_focused,
+        timeout_seconds=5.0,
+        description=f"sidebar click to focus terminal {target_path}",
+    )
+
+    marker = f"YGG_SWITCH_SPACE_{int(time.time() * 1000)}"
+    expected_output = f"{marker} A B C"
+    type_command = f"printf '{expected_output}\\n'"
+    typed = xdotool_type_focused(pid, type_command)
+    enter_key = xdotool_key_focused(pid, "Return")
+    typed_state = {}
+    typed_host = {}
+    typed_text = ""
+    deadline = time.time() + 8.0
+    while time.time() < deadline:
+        typed_state = app_state(pid)
+        typed_host = host_for_session_or_none(typed_state, target_path) or active_host_or_none(typed_state) or {}
+        typed_text = terminal_host_text(typed_host)
+        if expected_output in typed_text:
+            break
+        if marker in typed_text and expected_output not in typed_text:
+            collapsed = f"{marker}ABC" in typed_text or f"{marker}A B C" in typed_text
+            if collapsed:
+                raise AssertionError(
+                    f"sidebar switch typing collapsed or dropped spaces: expected={expected_output!r} text={typed_text[-800:]!r}"
+                )
+        time.sleep(0.15)
+    else:
+        raise AssertionError(
+            f"sidebar switch did not deliver typed command with spaces to terminal: expected={expected_output!r} text={typed_text[-800:]!r} state={typed_state!r}"
+        )
+
+    delete_key = xdotool_key_focused(pid, "Delete")
+    time.sleep(0.35)
+    after_delete = app_state(pid)
+    if (
+        (after_delete.get("shell") or {}).get("pending_delete")
+        or rect_is_visible(dom_rect(after_delete, "delete_confirm_dialog_rect"))
+    ):
+        raise AssertionError(
+            f"sidebar-switched terminal-owned Delete opened the close/delete modal: {after_delete!r}"
+        )
+    delete_host = host_for_session_or_none(after_delete, target_path) or active_host_or_none(after_delete) or {}
+    if delete_host.get("input_enabled") is not True:
+        raise AssertionError(
+            f"terminal lost input after sidebar switch Delete: host={delete_host!r} state={after_delete!r}"
+        )
+    post_delete_clear = clear_prompt_line(pid, target_path, timeout_seconds=8.0)
+
+    scroll_seed = terminal_send(
+        pid,
+        target_path,
+        "for i in $(seq 1 80); do printf 'YGG_SWITCH_SCROLL_%03d A B C\\n' \"$i\"; done\r",
+    )
+    wait_for_terminal_quiescent(pid, timeout_seconds=10.0)
+    scroll_probe = probe_scroll(pid, target_path, -5, retries=1)
+    scroll_before = scroll_probe.get("before") or {}
+    scroll_after = scroll_probe.get("after") or {}
+    scroll_moved = (
+        scroll_before.get("viewport_y") != scroll_after.get("viewport_y")
+        or scroll_before.get("viewport_scroll_top") != scroll_after.get("viewport_scroll_top")
+        or scroll_before.get("text_head") != scroll_after.get("text_head")
+        or scroll_before.get("text_tail") != scroll_after.get("text_tail")
+        or int(scroll_after.get("wheel_event_count") or 0) > int(scroll_before.get("wheel_event_count") or 0)
+        or int(scroll_after.get("scroll_event_count") or 0) > int(scroll_before.get("scroll_event_count") or 0)
+    )
+    if scroll_after.get("input_enabled") is not True:
+        raise AssertionError(f"sidebar switch scroll probe left terminal input disabled: {scroll_probe!r}")
+    if not scroll_moved:
+        raise AssertionError(f"sidebar switch scroll probe did not reach or move terminal: {scroll_probe!r}")
+
+    shot_path = out_dir / "sidebar-switch-focus-space-scroll.png"
+    app_screenshot(pid, shot_path)
+    cleanup_probe = clear_prompt_line(pid, target_path, timeout_seconds=8.0)
+    return {
+        "target_path": target_path,
+        "partner_path": partner_path,
+        "partner_create": partner_create,
+        "target_clear": target_clear,
+        "sidebar_click": click,
+        "focused_active_element": (focused_state.get("dom") or {}).get("active_element"),
+        "typed": typed,
+        "enter_key": enter_key,
+        "typed_output": expected_output,
+        "delete_key": delete_key,
+        "pending_delete_after_key": (after_delete.get("shell") or {}).get("pending_delete"),
+        "post_delete_clear": post_delete_clear,
+        "scroll_seed": scroll_seed.get("data") or scroll_seed,
+        "scroll_probe": scroll_probe,
+        "cleanup_probe": cleanup_probe,
+        "screenshot": str(shot_path),
     }
 
 
@@ -14480,6 +14664,7 @@ def main() -> int:
         "live_session_metadata",
         "local_runtime",
         "hot_session_switch",
+        "sidebar_switch_focus_space_scroll",
     }
     no_session_setup_checks = {
         "background_blur",
@@ -14719,6 +14904,9 @@ def main() -> int:
                 args.pid, late_phase_session, out_dir
             ))
             run_check("partial_input", lambda: assert_partial_input_flow(args.pid, late_phase_session, out_dir))
+            run_check("sidebar_switch_focus_space_scroll", lambda: assert_sidebar_session_switch_focus_space_scroll(
+                args.pid, late_phase_session, out_dir
+            ))
             run_check("scroll", lambda: assert_scroll(args.pid, late_phase_session, state))
             run_check("hidden_cursor_tui", lambda: assert_hidden_cursor_tui(args.pid, late_phase_session, out_dir))
             if late_phase_session.startswith("local://"):
