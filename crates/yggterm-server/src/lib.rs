@@ -1436,6 +1436,43 @@ impl YggtermServer {
         }
     }
 
+    pub fn remote_copy_target_for_session_path(
+        &self,
+        session_path: &str,
+    ) -> Option<(RemoteMachineSnapshot, String, String)> {
+        let (raw_machine_key, session_id) = parse_remote_scanned_session_path(session_path)?;
+        let machine_key = normalize_machine_key(raw_machine_key);
+        let machine = self
+            .remote_machines
+            .iter()
+            .find(|machine| machine.machine_key == machine_key)?;
+        let cwd = self
+            .sessions
+            .get(session_path)
+            .and_then(|session| {
+                session
+                    .metadata
+                    .iter()
+                    .find(|entry| entry.label == "Cwd")
+                    .map(|entry| entry.value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            })
+            .or_else(|| {
+                machine
+                    .sessions
+                    .iter()
+                    .find(|scanned| scanned.session_id == session_id)
+                    .map(|scanned| scanned.cwd.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            })
+            .unwrap_or_default();
+        Some((
+            remote_shutdown_machine_ref(machine),
+            session_id.to_string(),
+            cwd,
+        ))
+    }
+
     pub fn set_session_title_hint_passive(&mut self, session_path: &str, title: &str) -> bool {
         let mut applied = false;
         if let Some(session) = self.sessions.get_mut(session_path)
@@ -3028,21 +3065,29 @@ impl YggtermServer {
         };
         self.upsert_ssh_target(&target);
         if let Some((machine_key, session_id, normalized_live_key)) = remote_scanned_key.as_ref() {
-            let machine = self
+            let machine_ix = self
                 .remote_machines
                 .iter()
-                .find(|machine| machine.machine_key == *machine_key)
-                .cloned();
-            if let Some(machine) = machine.as_ref()
-                && let Some(scanned) = machine
+                .position(|machine| machine.machine_key == *machine_key);
+            if let Some(machine_ix) = machine_ix
+                && let Some(session_ix) = self.remote_machines[machine_ix]
                     .sessions
                     .iter()
-                    .find(|session| session.session_id == session_id.as_str())
-                    .cloned()
+                    .position(|session| session.session_id == session_id.as_str())
             {
-                if !scanned.live_runtime {
-                    return;
+                {
+                    let scanned = &mut self.remote_machines[machine_ix].sessions[session_ix];
+                    // A persisted live record is the authoritative update-handoff signal.
+                    // Fresh remote scans intentionally reload cached sessions with
+                    // `live_runtime=false`, so treating that bit as a veto drops kept
+                    // terminals during restart before the remote runtime can reattach.
+                    scanned.live_runtime = true;
+                    if !title.trim().is_empty() && !looks_like_generated_fallback_title(&title) {
+                        scanned.title_hint = title.clone();
+                    }
                 }
+                let machine = self.remote_machines[machine_ix].clone();
+                let scanned = machine.sessions[session_ix].clone();
                 let mut session = synthesize_remote_scanned_session_view(
                     &machine,
                     &scanned,
@@ -3063,7 +3108,10 @@ impl YggtermServer {
                     .insert(0, normalized_live_key.clone());
                 return;
             }
-            if kind != SessionKind::SshShell {
+            if !matches!(
+                kind,
+                SessionKind::SshShell | SessionKind::Codex | SessionKind::CodexLiteLlm
+            ) {
                 return;
             }
             let resolved_title =
@@ -3072,7 +3120,12 @@ impl YggtermServer {
                 } else {
                     short_session_id(session_id)
                 };
-            let (remote_binary, remote_deploy_state) = machine
+            let cached_machine = self
+                .remote_machines
+                .iter()
+                .find(|machine| machine.machine_key == *machine_key)
+                .cloned();
+            let (remote_binary, remote_deploy_state) = cached_machine
                 .as_ref()
                 .and_then(|machine| {
                     machine
@@ -3083,7 +3136,7 @@ impl YggtermServer {
                 .unwrap_or_else(|| {
                     (
                         preferred_remote_binary_fallback(),
-                        machine
+                        cached_machine
                             .as_ref()
                             .map(|machine| machine.remote_deploy_state)
                             .unwrap_or(RemoteDeployState::Planned),
@@ -16793,7 +16846,7 @@ terminal_window_id: None,
     }
 
     #[test]
-    fn restore_persisted_state_skips_stale_remote_live_sessions_missing_from_scan() {
+    fn restore_persisted_state_keeps_remote_live_sessions_missing_from_scan_as_resume_targets() {
         let tree = SessionNode {
             kind: SessionNodeKind::Group,
             name: "sessions".to_string(),
@@ -16843,8 +16896,11 @@ terminal_window_id: None,
             None,
         );
 
-        assert!(server.live_sessions().is_empty());
-        assert!(!server.sessions.contains_key(&stale_path));
+        let live_sessions = server.live_sessions();
+        assert_eq!(live_sessions.len(), 1);
+        assert_eq!(live_sessions[0].session_path.as_str(), stale_path.as_str());
+        assert_eq!(live_sessions[0].source, SessionSource::LiveSsh);
+        assert!(server.sessions.contains_key(&stale_path));
         assert_eq!(server.ssh_targets().len(), 1);
         assert_eq!(server.ssh_targets()[0].ssh_target, "dev");
     }
@@ -17322,7 +17378,7 @@ terminal_window_id: None,
     }
 
     #[test]
-    fn restore_persisted_state_skips_stale_remote_live_sessions_present_in_scan() {
+    fn restore_persisted_state_keeps_remote_live_sessions_present_in_scan() {
         let tree = SessionNode {
             kind: SessionNodeKind::Group,
             name: "sessions".to_string(),
@@ -17426,18 +17482,38 @@ terminal_window_id: None,
         );
 
         let live_sessions = server.live_sessions();
-        assert!(live_sessions.is_empty());
+        assert_eq!(live_sessions.len(), 2);
+        assert!(
+            live_sessions
+                .iter()
+                .any(|session| session.session_path == first_path
+                    && session.title == "First remote"
+                    && session.source == SessionSource::LiveSsh)
+        );
+        assert!(
+            live_sessions
+                .iter()
+                .any(|session| session.session_path == second_path
+                    && session.title == "Second remote"
+                    && session.source == SessionSource::LiveSsh)
+        );
         assert_eq!(server.active_session_path(), Some(second_path.as_str()));
-        assert_eq!(server.active_view_mode(), WorkspaceViewMode::Rendered);
-        assert!(!server.sessions.contains_key(&first_path));
+        assert_eq!(server.active_view_mode(), WorkspaceViewMode::Terminal);
+        assert!(server.sessions.contains_key(&first_path));
         assert!(server.sessions.contains_key(&second_path));
         assert_eq!(
             server
                 .sessions
                 .get(&second_path)
                 .map(|session| session.source),
-            Some(SessionSource::Stored)
+            Some(SessionSource::LiveSsh)
         );
+        let machine = server
+            .remote_machines()
+            .iter()
+            .find(|machine| machine.machine_key == "dev")
+            .expect("remote machine");
+        assert!(machine.sessions.iter().all(|session| session.live_runtime));
     }
 
     #[test]

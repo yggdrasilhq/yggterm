@@ -1175,6 +1175,7 @@ impl DaemonRuntime {
                 precis,
                 summary,
             } => {
+                let remote_copy_target = self.server.remote_copy_target_for_session_path(&path);
                 if let Some(title) = title.as_deref() {
                     self.server.set_session_title_hint(&path, title);
                 }
@@ -1185,6 +1186,24 @@ impl DaemonRuntime {
                     self.server.set_session_summary_hint(&path, summary);
                 }
                 self.persist()?;
+                if let Some((machine, session_id, cwd)) = remote_copy_target {
+                    if let Err(error) = persist_remote_generated_copy(
+                        &machine,
+                        &session_id,
+                        &cwd,
+                        title.as_deref(),
+                        precis.as_deref(),
+                        summary.as_deref(),
+                        "manual",
+                    ) {
+                        warn!(
+                            machine_key=%machine.machine_key,
+                            session_id=%session_id,
+                            error=%error,
+                            "failed to persist remote session copy hints"
+                        );
+                    }
+                }
                 ServerResponse::Ack { message: None }
             }
             ServerRequest::RemoveSshTarget { machine_key } => {
