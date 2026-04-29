@@ -42,7 +42,7 @@
 
   <g filter="url(#shadow)">
     <path
-      d="M33 95C42 86 53 82 64 84C75 82 86 86 95 95"
+      d="M30 95C40 83 52 78 64 81C76 78 88 83 98 95"
       fill="none"
       stroke="#28424B"
       stroke-width="7"
@@ -50,7 +50,7 @@
       opacity="0.74"
     />
     <path
-      d="M43 101C51 93 58 90 64 90C70 90 77 93 85 101"
+      d="M39 101C49 90 57 86 64 87C71 86 79 90 89 101"
       fill="none"
       stroke="#79C996"
       stroke-width="4"
@@ -59,25 +59,28 @@
     />
 
     <path
-      d="M64 88C63 73 63 58 66 43"
+      d="M64 54C64 47 65 40 68 31"
       fill="none"
       stroke="url(#stem)"
-      stroke-width="8"
+      stroke-width="5.5"
       stroke-linecap="round"
+      opacity="0.86"
     />
     <path
-      d="M65 54C56 46 49 39 43 27"
+      d="M64 45C57 39 51 34 45 25"
       fill="none"
       stroke="url(#stem)"
-      stroke-width="6"
+      stroke-width="4"
       stroke-linecap="round"
+      opacity="0.82"
     />
     <path
-      d="M66 53C76 44 85 35 91 23"
+      d="M66 43C75 36 83 29 91 19"
       fill="none"
       stroke="url(#stem)"
-      stroke-width="6"
+      stroke-width="4"
       stroke-linecap="round"
+      opacity="0.82"
     />
 
     <path
@@ -99,21 +102,21 @@
     />
 
     <path
-      d="M36 79H92C96 79 99 82 99 86V94C99 98 96 101 92 101H36C32 101 29 98 29 94V86C29 82 32 79 36 79Z"
+      d="M35 52H93C99 52 103 56 103 62V82C103 88 99 92 93 92H35C29 92 25 88 25 82V62C25 56 29 52 35 52Z"
       fill="#0B161D"
-      opacity="0.62"
+      opacity="0.72"
     />
   </g>
 
   <g filter="url(#prompt-glow)">
     <path
-      d="M43 81L55 93L43 105"
+      d="M42 57L56 71L42 85"
       fill="none"
       stroke="url(#prompt)"
-      stroke-width="8.5"
+      stroke-width="9.5"
       stroke-linecap="round"
       stroke-linejoin="round"
     />
-    <path d="M66 105H86" stroke="url(#prompt)" stroke-width="8.5" stroke-linecap="round" />
+    <path d="M68 85H90" stroke="url(#prompt)" stroke-width="9.5" stroke-linecap="round" />
   </g>
 </svg>
