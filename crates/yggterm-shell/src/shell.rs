@@ -10079,10 +10079,9 @@ fn is_live_sidebar_row(row: &BrowserRow) -> bool {
 
 fn session_is_hot_terminal_row(shell: &ShellState, row: &BrowserRow) -> bool {
     shell.terminal_session_is_retained_live(&row.full_path)
-        || shell
-            .server
-            .active_session_path()
-            .is_some_and(|active_path| active_path == row.full_path)
+        || shell.server.active_session().is_some_and(|session| {
+            session.session_path == row.full_path && is_promoted_live_session(session)
+        })
 }
 fn is_remote_scanned_sidebar_row(row: &BrowserRow) -> bool {
     row.full_path.starts_with("remote-session://")
@@ -52561,6 +52560,54 @@ Waiting for the remote terminal to paint...\n";
         assert!(!is_hot_terminal_sidebar_path(&litellm_row.full_path));
         assert!(is_live_sidebar_row(&test_sidebar_row("codex://abc")));
         assert!(is_live_sidebar_row(&test_sidebar_row("local://abc")));
+    }
+
+    #[test]
+    fn active_stored_remote_row_is_not_hot_terminal_fast_path() {
+        let session_path = "remote-session://dev/abc123";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://seed"));
+        let mut session = test_live_shell_session(session_path);
+        session.id = "abc123".to_string();
+        session.kind = SessionKind::Codex;
+        session.source = SessionSource::Stored;
+        session.ssh_target = Some("dev".to_string());
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(session_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(session)),
+            active_view_mode: WorkspaceViewMode::Rendered,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: Vec::new(),
+        });
+
+        assert!(!session_is_hot_terminal_row(
+            &shell,
+            &test_sidebar_row(session_path)
+        ));
+    }
+
+    #[test]
+    fn active_live_remote_row_is_hot_terminal_fast_path() {
+        let session_path = "remote-session://dev/abc123";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://seed"));
+        let mut session = test_live_shell_session(session_path);
+        session.id = "abc123".to_string();
+        session.kind = SessionKind::Codex;
+        session.source = SessionSource::LiveSsh;
+        session.ssh_target = Some("dev".to_string());
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(session_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(session.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![snapshot_session_view_for_ui(session)],
+        });
+
+        assert!(session_is_hot_terminal_row(
+            &shell,
+            &test_sidebar_row(session_path)
+        ));
     }
     #[test]
     fn shell_snapshot_keeps_retained_stored_codex_sessions_out_of_live_retention() {
