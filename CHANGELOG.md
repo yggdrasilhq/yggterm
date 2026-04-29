@@ -4,6 +4,15 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.49
+
+### Fixed
+
+- scan all reachable same-home versioned daemon sockets when detecting live remote Codex runtimes, so update handoff can see sessions still owned by an older daemon instead of reporting them dead
+- bridge `server remote resume-codex --require-existing` directly to the older daemon that still owns `codex-runtime://<session-id>`, preventing duplicate Codex runtimes after a direct-install restart
+- relax the app-control session/view contract so a restored `LiveSsh` terminal row is allowed to reconnect while the latest remote scan is temporarily stale
+- add regression coverage for old-daemon remote-runtime bridging and stale remote-scan recovery during update handoff
+
 ## 2.1.48
 
 ### Fixed
