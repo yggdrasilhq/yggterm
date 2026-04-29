@@ -1,3 +1,15 @@
+yggterm (2.1.47-1) unstable; urgency=medium
+
+  * Preserve remote live-session records across update restart even when remote scans are late.
+  * Persist manual SSH session renames into the remote metadata mirror.
+  * Keep KDE on the canonical dev.yggterm.Yggterm app id and terminate superseded same-home GUI clients.
+  * Reclaim terminal focus after clicking live/session rows so typing, spaces, Delete, paste, and scroll stay owned by xterm.
+  * Show Live Sessions busy spinners for active Codex Working status without reviving stale blank-Enter activity.
+  * Add a KDE/X11 sidebar-switch smoke covering focus, spaces, Delete ownership, and scrollback.
+  * Center the app icon prompt mark and regenerate the packaged PNG asset.
+
+ -- Yggdrasil HQ <avi@gour.top>  Wed, 29 Apr 2026 13:35:09 +0530
+
 yggterm (2.1.46-1) unstable; urgency=medium
 
   * Deduplicate terminal image paste in the shared Rust shell path so delayed browser/app-control paste events from one physical Ctrl+V cannot stage a second image.

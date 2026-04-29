@@ -4,6 +4,18 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.47
+
+### Fixed
+
+- preserve remote live-session records across update restart even when the remote scan is late, so SSH Codex sessions stay in `Live Sessions` as resumable runtime sessions instead of disappearing after relaunch
+- persist manual SSH session renames into the remote session metadata mirror, preventing restart-time title hydration from reverting renamed sessions back to generated or original labels
+- keep KDE on the canonical `dev.yggterm.Yggterm` app id after update handoff and terminate superseded same-home GUI clients, so pinned task grouping does not split into a second Yggterm icon
+- reclaim terminal focus after clicking a live/session row, including already-selected rows, so typing, spaces, Delete, paste, and scroll stay owned by the xterm viewport instead of the sidebar
+- show the Live Sessions busy spinner for active Codex sessions whose terminal status line says `Working`, without reviving the stale blank-Enter/activity-spinner regression
+- add a focused KDE/X11 smoke that switches sidebar sessions and proves terminal focus, literal spaces, Delete-key ownership, and scrollback after the switch
+- center the app icon's warm `>_` prompt mark, regenerate the packaged PNG asset, and lock the prompt-first icon rule into `DESIGN.md`
+
 ## 2.1.46
 
 ### Fixed
