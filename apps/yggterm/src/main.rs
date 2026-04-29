@@ -18,22 +18,23 @@ use yggterm_core::{
 };
 use yggterm_platform::configure_gui_entry_process;
 use yggterm_server::{
-    AppControlPreviewLayout, AppControlRightPanelMode, AppControlViewMode, PersistedDaemonState,
-    ProbeTerminalViewportInputMode, SessionKind, YggtermServer, active_client_instance_records,
-    default_endpoint, detect_ghostty_host, ensure_local_daemon_running,
-    local_headless_companion_executable_from_current, ping, run_app_control_background_window,
-    run_app_control_close_window, run_app_control_create_terminal, run_app_control_describe_rows,
-    run_app_control_describe_state, run_app_control_drag, run_app_control_dump_state,
-    run_app_control_focus_window, run_app_control_key, run_app_control_list_clients,
-    run_app_control_move_window_by, run_app_control_open_path,
-    run_app_control_paste_terminal_clipboard, run_app_control_paste_terminal_clipboard_image,
-    run_app_control_pointer, run_app_control_probe_terminal_viewport_input,
-    run_app_control_probe_terminal_viewport_scroll, run_app_control_probe_terminal_viewport_select,
-    run_app_control_reclaim_terminal_focus, run_app_control_remove_session,
-    run_app_control_reset_theme_editor, run_app_control_restart_pending_update,
-    run_app_control_scroll_preview, run_app_control_send_terminal_input,
-    run_app_control_set_clipboard_png_base64, run_app_control_set_clipboard_text,
-    run_app_control_set_fullscreen, run_app_control_set_main_zoom, run_app_control_set_maximized,
+    AppControlCommand, AppControlPreviewLayout, AppControlRightPanelMode, AppControlViewMode,
+    ClientInstanceRecord, PersistedDaemonState, ProbeTerminalViewportInputMode, SessionKind,
+    YggtermServer, active_client_instance_records, default_endpoint, detect_ghostty_host,
+    ensure_local_daemon_running, local_headless_companion_executable_from_current, ping,
+    request_app_control, run_app_control_background_window, run_app_control_close_window,
+    run_app_control_create_terminal, run_app_control_describe_rows, run_app_control_describe_state,
+    run_app_control_drag, run_app_control_dump_state, run_app_control_focus_window,
+    run_app_control_key, run_app_control_list_clients, run_app_control_move_window_by,
+    run_app_control_open_path, run_app_control_paste_terminal_clipboard,
+    run_app_control_paste_terminal_clipboard_image, run_app_control_pointer,
+    run_app_control_probe_terminal_viewport_input, run_app_control_probe_terminal_viewport_scroll,
+    run_app_control_probe_terminal_viewport_select, run_app_control_reclaim_terminal_focus,
+    run_app_control_remove_session, run_app_control_reset_theme_editor,
+    run_app_control_restart_pending_update, run_app_control_scroll_preview,
+    run_app_control_send_terminal_input, run_app_control_set_clipboard_png_base64,
+    run_app_control_set_clipboard_text, run_app_control_set_fullscreen,
+    run_app_control_set_main_zoom, run_app_control_set_maximized,
     run_app_control_set_preview_layout, run_app_control_set_right_panel_mode,
     run_app_control_set_row_expanded, run_app_control_set_search,
     run_app_control_set_session_keep_alive, run_app_control_set_theme_editor_open,
@@ -437,6 +438,7 @@ fn main() -> Result<()> {
     install_panic_logging(store.home_dir());
     let startup_home = store.home_dir().to_path_buf();
     maybe_focus_existing_client(store.home_dir(), &args, &current_exe)?;
+    maybe_retire_superseded_same_home_clients(store.home_dir(), &args, &current_exe)?;
     append_trace_event(
         &startup_home,
         "gui",
@@ -1861,6 +1863,149 @@ fn maybe_focus_existing_client(
     Ok(())
 }
 
+fn maybe_retire_superseded_same_home_clients(
+    home_dir: &std::path::Path,
+    args: &[String],
+    current_exe: &std::path::Path,
+) -> Result<()> {
+    if !args.is_empty() || std::env::var_os(ENV_YGGTERM_ALLOW_MULTI_WINDOW).is_some() {
+        return Ok(());
+    }
+    let endpoint = default_endpoint(home_dir);
+    let active_records = active_client_instance_records(home_dir, &endpoint)?;
+    let current_pid = std::process::id();
+    let current_scope = current_signal_client_scope();
+    for record in active_records {
+        if !should_retire_superseded_client(&record, current_pid, current_exe, &current_scope) {
+            continue;
+        }
+        append_trace_event(
+            home_dir,
+            "gui",
+            "startup",
+            "retire_superseded_client_begin",
+            serde_json::json!({
+                "pid": record.pid,
+                "executable_path": record.executable_path.as_deref(),
+                "display": record.display.as_deref(),
+                "wayland_display": record.wayland_display.as_deref(),
+                "xdg_session_id": record.xdg_session_id.as_deref(),
+            }),
+        );
+        let close_ok = request_close_client_pid(home_dir, record.pid, 1_500).is_ok();
+        if !close_ok || signal_process_is_alive(record.pid) {
+            terminate_gui_client_process(record.pid);
+        }
+        let exited = wait_for_process_exit(record.pid, Duration::from_millis(2_500));
+        append_trace_event(
+            home_dir,
+            "gui",
+            "startup",
+            "retire_superseded_client_end",
+            serde_json::json!({
+                "pid": record.pid,
+                "close_ok": close_ok,
+                "exited": exited,
+            }),
+        );
+    }
+    Ok(())
+}
+
+fn should_retire_superseded_client(
+    record: &ClientInstanceRecord,
+    current_pid: u32,
+    current_exe: &std::path::Path,
+    current_scope: &SignalClientScope,
+) -> bool {
+    if record.pid == current_pid {
+        return false;
+    }
+    if !signal_client_record_scope_matches(record, current_scope) {
+        return false;
+    }
+    !record
+        .executable_path
+        .as_deref()
+        .is_some_and(|path| record_matches_executable(Some(path), current_exe))
+}
+
+fn signal_client_record_scope_matches(
+    record: &ClientInstanceRecord,
+    current: &SignalClientScope,
+) -> bool {
+    let candidate = SignalClientScope {
+        display: record.display.clone(),
+        wayland_display: record.wayland_display.clone(),
+        xdg_session_id: record.xdg_session_id.clone(),
+        xdg_runtime_dir: record.xdg_runtime_dir.clone(),
+        xauthority: record.xauthority.clone(),
+    };
+    signal_client_scope_matches(&candidate, current)
+}
+
+fn request_close_client_pid(home_dir: &std::path::Path, pid: u32, timeout_ms: u64) -> Result<()> {
+    let previous = std::env::var_os("YGGTERM_APP_CONTROL_PID");
+    unsafe {
+        std::env::set_var("YGGTERM_APP_CONTROL_PID", pid.to_string());
+    }
+    let result = request_app_control(home_dir, AppControlCommand::CloseWindow, timeout_ms);
+    match previous {
+        Some(value) => unsafe {
+            std::env::set_var("YGGTERM_APP_CONTROL_PID", value);
+        },
+        None => unsafe {
+            std::env::remove_var("YGGTERM_APP_CONTROL_PID");
+        },
+    }
+    result.map(|_| ())
+}
+
+fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !signal_process_is_alive(pid) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(unix)]
+fn terminate_gui_client_process(pid: u32) {
+    if pid == 0 || pid == std::process::id() {
+        return;
+    }
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    if wait_for_process_exit(pid, Duration::from_millis(800)) {
+        return;
+    }
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn terminate_gui_client_process(pid: u32) {
+    if pid == 0 || pid == std::process::id() {
+        return;
+    }
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(all(not(unix), not(target_os = "windows")))]
+fn terminate_gui_client_process(_pid: u32) {}
+
 fn canonical_executable_for_match(path: &std::path::Path) -> std::path::PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
@@ -2421,12 +2566,12 @@ mod tests {
     use super::{
         BuiltinCliCommand, LinuxWindowProfileInput, SignalClientScope,
         classify_builtin_cli_command, compatible_signal_client_count,
-        linux_window_profile_from_input, record_matches_executable, signal_client_instances_dir,
-        signal_client_scope_matches, signal_parse_process_start_ticks_from_stat,
-        signal_process_start_ticks,
+        linux_window_profile_from_input, record_matches_executable,
+        should_retire_superseded_client, signal_client_instances_dir, signal_client_scope_matches,
+        signal_parse_process_start_ticks_from_stat, signal_process_start_ticks,
     };
     use std::fs;
-    use yggterm_server::ServerEndpoint;
+    use yggterm_server::{ClientInstanceRecord, ServerEndpoint};
 
     #[test]
     fn classify_builtin_cli_command_detects_help_and_snapshot() {
@@ -2650,5 +2795,80 @@ mod tests {
             &current
         ));
         assert!(!record_matches_executable(None, &current));
+    }
+
+    #[test]
+    fn superseded_client_retire_filter_targets_old_same_scope_gui() {
+        let current = std::env::current_exe().expect("current exe");
+        let scope = SignalClientScope {
+            display: Some(":1".to_string()),
+            wayland_display: Some("wayland-0".to_string()),
+            xdg_session_id: None,
+            xdg_runtime_dir: Some("/run/user/1000".to_string()),
+            xauthority: Some("/run/user/1000/xauth".to_string()),
+        };
+        let old = ClientInstanceRecord {
+            pid: 1234,
+            started_at_ms: 1,
+            process_start_ticks: Some(77),
+            executable_path: Some(
+                "/home/pi/.local/share/yggterm/direct/versions/2.1.49/yggterm".to_string(),
+            ),
+            display: Some(":1".to_string()),
+            wayland_display: Some("wayland-0".to_string()),
+            xdg_session_id: None,
+            xdg_runtime_dir: Some("/run/user/1000".to_string()),
+            xauthority: Some("/run/user/1000/xauth".to_string()),
+        };
+        assert!(should_retire_superseded_client(
+            &old, 9999, &current, &scope
+        ));
+    }
+
+    #[test]
+    fn superseded_client_retire_filter_keeps_current_or_other_scope_gui() {
+        let current = std::env::current_exe().expect("current exe");
+        let current_text = current.to_string_lossy().to_string();
+        let scope = SignalClientScope {
+            display: Some(":1".to_string()),
+            wayland_display: None,
+            xdg_session_id: None,
+            xdg_runtime_dir: None,
+            xauthority: Some("/run/user/1000/xauth".to_string()),
+        };
+        let same_exe = ClientInstanceRecord {
+            pid: 1234,
+            started_at_ms: 1,
+            process_start_ticks: Some(77),
+            executable_path: Some(current_text),
+            display: Some(":1".to_string()),
+            wayland_display: None,
+            xdg_session_id: None,
+            xdg_runtime_dir: None,
+            xauthority: Some("/run/user/1000/xauth".to_string()),
+        };
+        assert!(!should_retire_superseded_client(
+            &same_exe, 9999, &current, &scope
+        ));
+
+        let other_display = ClientInstanceRecord {
+            pid: 5678,
+            started_at_ms: 1,
+            process_start_ticks: Some(88),
+            executable_path: Some(
+                "/home/pi/.local/share/yggterm/direct/versions/2.1.49/yggterm".to_string(),
+            ),
+            display: Some(":99".to_string()),
+            wayland_display: None,
+            xdg_session_id: None,
+            xdg_runtime_dir: None,
+            xauthority: Some("/tmp/xvfb/Xauthority".to_string()),
+        };
+        assert!(!should_retire_superseded_client(
+            &other_display,
+            9999,
+            &current,
+            &scope
+        ));
     }
 }
