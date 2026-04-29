@@ -1,3 +1,13 @@
+yggterm (2.1.50-1) unstable; urgency=medium
+
+  * Keep active stored remote-session rows out of the local hot-terminal focus path.
+  * Promote stored remote previews through the LiveSsh resume path when Terminal view is requested.
+  * Normalize legacy remote-session snapshots that incorrectly persisted as LiveLocal.
+  * Avoid redundant SSH binary probes when a healthy cached remote launch is already known.
+  * Retire superseded same-home GUI clients before GTK/Dioxus launch so KDE app-id ownership cannot block the updated window.
+
+ -- Yggdrasil HQ <avi@gour.top>  Wed, 29 Apr 2026 21:35:00 +0530
+
 yggterm (2.1.49-1) unstable; urgency=medium
 
   * Scan every reachable same-home versioned daemon socket for live remote Codex runtimes during update handoff.
