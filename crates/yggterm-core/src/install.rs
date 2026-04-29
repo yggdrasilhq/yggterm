@@ -385,6 +385,9 @@ fn should_repair_linux_launcher(context: &InstallContext) -> bool {
     if context.channel == InstallChannel::Direct {
         return true;
     }
+    if !non_direct_install_channel_may_repair_linux_launcher(context.channel) {
+        return false;
+    }
 
     let data_dir = match dirs::data_local_dir() {
         Some(path) => path,
@@ -411,6 +414,11 @@ fn should_repair_linux_launcher(context: &InstallContext) -> bool {
 #[cfg(not(target_os = "linux"))]
 fn should_repair_linux_launcher(_context: &InstallContext) -> bool {
     false
+}
+
+#[cfg(target_os = "linux")]
+fn non_direct_install_channel_may_repair_linux_launcher(channel: InstallChannel) -> bool {
+    !matches!(channel, InstallChannel::Direct | InstallChannel::Unknown)
 }
 
 #[cfg(target_os = "linux")]
@@ -1223,6 +1231,7 @@ fn launcher_file_looks_stale(path: &Path, contents: &str) -> bool {
         || contents.contains("/tmp/yggterm-update-check")
         || contents.contains("/tmp/yggterm-auto-update")
         || contents.contains("/tmp/yggterm-install-")
+        || contents.contains("/target/debug/yggterm")
 }
 
 #[cfg(target_os = "windows")]
@@ -1281,5 +1290,25 @@ mod tests {
             "/tmp/yggterm-auto-update-207/home/.local/bin/yggterm"
         )));
         assert!(!launcher_target_looks_stale(Path::new("/bin/sh")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unknown_dev_builds_do_not_repair_user_launcher() {
+        assert!(!non_direct_install_channel_may_repair_linux_launcher(
+            InstallChannel::Unknown
+        ));
+        assert!(non_direct_install_channel_may_repair_linux_launcher(
+            InstallChannel::Deb
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launcher_file_detects_dev_build_fallback_as_stale() {
+        let path = Path::new("/tmp/yggterm-launcher");
+        let contents =
+            "# yggterm-direct-launcher-v2\nexec '/home/pi/gh/yggterm/target/debug/yggterm'\n";
+        assert!(launcher_file_looks_stale(path, contents));
     }
 }

@@ -623,8 +623,6 @@ impl DaemonRuntime {
             // Do not block daemon boot on active terminal launch. Bind the control socket first,
             // then let explicit terminal-open requests or later recovery drive runtime startup.
             server.restore_persisted_state_with_launch_policy(saved, Some(&store), false);
-            // Rewrite migrated state immediately so stale unrecoverable sessions do not linger on disk.
-            write_persisted_state(&state_path, &server.persisted_state())?;
         }
         let runtime = Self {
             support,
@@ -2958,7 +2956,6 @@ fn cleanup_legacy_unix_daemons(endpoint: &ServerEndpoint) -> Result<()> {
                 .with_context(|| format!("reading daemon socket dir {}", home_dir.display()));
         }
     };
-    let mut shutdown_paths = Vec::new();
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
@@ -2969,38 +2966,16 @@ fn cleanup_legacy_unix_daemons(endpoint: &ServerEndpoint) -> Result<()> {
             continue;
         }
 
-        let mut removed_stale = false;
         match std::os::unix::net::UnixStream::connect(&path) {
-            Ok(mut stream) => {
-                let _ = stream.write_all(br#"{"kind":"shutdown"}"#);
-                let _ = stream.write_all(b"\n");
-                let _ = stream.flush();
-                shutdown_paths.push(path);
+            Ok(_) => {
+                // A reachable versioned daemon may own live terminal runtimes that the
+                // freshly started app has not reclaimed yet. Leave it running; Linux
+                // process cleanup applies the stricter ownership checks below.
             }
             Err(_) => {
                 let _ = fs::remove_file(&path);
-                removed_stale = true;
             }
         }
-
-        if removed_stale {
-            continue;
-        }
-    }
-
-    if shutdown_paths.is_empty() {
-        return Ok(());
-    }
-
-    for _ in 0..3 {
-        shutdown_paths.retain(|path| path.exists());
-        if shutdown_paths.is_empty() {
-            return Ok(());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    for path in shutdown_paths {
-        let _ = fs::remove_file(path);
     }
     Ok(())
 }
@@ -3057,6 +3032,106 @@ fn linux_yggterm_home_from_environ_bytes(environ: &[u8]) -> Option<PathBuf> {
 fn linux_proc_yggterm_home(proc_path: &Path) -> Option<PathBuf> {
     let environ = fs::read(proc_path.join("environ")).ok()?;
     linux_yggterm_home_from_environ_bytes(&environ)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_yggterm_server_process_is_live_bridge(parts: &[String]) -> bool {
+    parts.first().is_some_and(|argv0| argv0.contains("yggterm"))
+        && parts.windows(3).any(|window| {
+            window[0] == "server" && window[1] == "remote" && window[2] == "resume-codex"
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_home_has_live_bridge_process(home: &Path) -> bool {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid_str) = name.to_str() else {
+            continue;
+        };
+        if !pid_str.chars().all(|ch| ch.is_ascii_digit()) {
+            continue;
+        }
+        let proc_path = entry.path();
+        if linux_proc_state(&proc_path) == Some('Z') {
+            continue;
+        }
+        if linux_proc_yggterm_home(&proc_path).as_deref() != Some(home) {
+            continue;
+        }
+        let Ok(bytes) = fs::read(proc_path.join("cmdline")) else {
+            continue;
+        };
+        let parts = bytes
+            .split(|byte| *byte == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).to_string())
+            .collect::<Vec<_>>();
+        if linux_yggterm_server_process_is_live_bridge(&parts) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn linux_home_has_reachable_terminal_runtime(home: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(home) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let socket_path = entry.path();
+        if parse_versioned_server_socket_name(&socket_path).is_none() {
+            continue;
+        }
+        let endpoint = ServerEndpoint::UnixSocket(socket_path);
+        if status(&endpoint)
+            .ok()
+            .is_some_and(|runtime| runtime.terminal_session_count > 0)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn linux_home_has_recoverable_runtime_activity(home: &Path) -> bool {
+    linux_home_has_live_bridge_process(home)
+        || linux_home_has_versioned_daemon_socket_file(home)
+        || linux_home_has_reachable_daemon_socket(home)
+        || linux_home_has_reachable_terminal_runtime(home)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_home_has_versioned_daemon_socket_file(home: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(home) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .any(|path| parse_versioned_server_socket_name(&path).is_some())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_home_has_reachable_daemon_socket(home: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(home) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let socket_path = entry.path();
+        if parse_versioned_server_socket_name(&socket_path).is_none() {
+            continue;
+        }
+        if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(target_os = "linux")]
@@ -3206,7 +3281,10 @@ fn cleanup_legacy_linux_daemon_processes(
         let has_clients = daemon_home
             .as_deref()
             .and_then(|home| active_client_instance_records(home, &default_endpoint(home)).ok())
-            .is_some_and(|records| !records.is_empty());
+            .is_some_and(|records| !records.is_empty())
+            || daemon_home
+                .as_deref()
+                .is_some_and(linux_home_has_recoverable_runtime_activity);
         let age_ms = linux_proc_pid_age_ms(pid).unwrap_or_default();
         let is_legacy_binary =
             legacy_daemon_reap_applies_to_home(current_home.as_deref(), daemon_home.as_deref())
@@ -3531,6 +3609,31 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn cleanup_legacy_unix_daemons_keeps_reachable_legacy_socket() {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-reachable-legacy-socket-{}-{}",
+            std::process::id(),
+            super::current_millis()
+        ));
+        let sockets_dir = root.join("home").join(".yggterm");
+        fs::create_dir_all(&sockets_dir).expect("create socket dir");
+        let current = sockets_dir.join("server-2-1-48.sock");
+        let legacy = sockets_dir.join("server-2-1-47.sock");
+        let _listener =
+            std::os::unix::net::UnixListener::bind(&legacy).expect("bind legacy socket");
+        let endpoint = super::ServerEndpoint::UnixSocket(current);
+
+        cleanup_legacy_unix_daemons(&endpoint).expect("cleanup should keep reachable legacy");
+
+        assert!(
+            legacy.exists(),
+            "reachable legacy socket must not be unlinked"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn versioned_server_socket_alias_candidates_include_client_instance_versions() {
         let root = std::env::temp_dir().join(format!(
             "yggterm-daemon-alias-test-{}-{}",
@@ -3583,6 +3686,31 @@ mod tests {
             current,
             "/tmp/old-yggterm",
             Some(Path::new("/tmp/old-yggterm")),
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_bridge_process_detection_matches_remote_resume_stdio_bridges() {
+        let parts = vec![
+            "/home/pi/.yggterm/bin/yggterm".to_string(),
+            "server".to_string(),
+            "remote".to_string(),
+            "resume-codex".to_string(),
+            "019dbddf".to_string(),
+            "/home/pi/gh/yggterm".to_string(),
+            "--require-existing".to_string(),
+        ];
+        assert!(super::linux_yggterm_server_process_is_live_bridge(&parts));
+        let short_lived_probe = vec![
+            "/home/pi/.yggterm/bin/yggterm".to_string(),
+            "server".to_string(),
+            "remote".to_string(),
+            "saved-codex-session-exists".to_string(),
+            "019dbddf".to_string(),
+        ];
+        assert!(!super::linux_yggterm_server_process_is_live_bridge(
+            &short_lived_probe
         ));
     }
 
