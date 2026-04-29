@@ -4,6 +4,16 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.50
+
+### Fixed
+
+- prevent active stored remote-session rows from taking the local hot-terminal focus path, which could corrupt a restored SSH Codex session into `LiveLocal` and block app-control terminal open with a session/view contract violation
+- promote stored remote previews through the remote `LiveSsh` resume path when Terminal view is requested, keeping the session in `Live Sessions` and preserving the remote runtime handoff
+- repair legacy remote-session snapshots that already carry the impossible `LiveLocal` source, so v2.1.49-corrupted update state normalizes back to `LiveSsh` on the next launch
+- skip redundant synchronous remote binary probing when a healthy cached remote launch expression is already present, avoiding unnecessary SSH work on terminal open
+- retire superseded same-home GUI clients on the same display before the replacement desktop shell reaches GTK/Dioxus launch, so old v2.1.45-v2.1.49 windows cannot keep the canonical KDE app id and leave the updated client registered but invisible
+
 ## 2.1.49
 
 ### Fixed
