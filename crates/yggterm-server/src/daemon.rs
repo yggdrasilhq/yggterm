@@ -2087,6 +2087,63 @@ pub fn status(endpoint: &ServerEndpoint) -> Result<ServerRuntimeStatus> {
     }
 }
 
+#[cfg(unix)]
+pub fn reachable_versioned_daemon_statuses(
+    home_dir: &Path,
+) -> Vec<(ServerEndpoint, ServerRuntimeStatus)> {
+    let mut seen = HashSet::<PathBuf>::new();
+    let mut paths = Vec::<PathBuf>::new();
+
+    let current_endpoint = default_endpoint(home_dir);
+    if let ServerEndpoint::UnixSocket(current_path) = current_endpoint {
+        if seen.insert(current_path.clone()) {
+            paths.push(current_path.clone());
+        }
+        for candidate in versioned_server_socket_alias_candidates(&current_path) {
+            if seen.insert(candidate.clone()) {
+                paths.push(candidate);
+            }
+        }
+    }
+
+    if let Ok(entries) = fs::read_dir(home_dir) {
+        let mut home_paths = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| parse_versioned_server_socket_name(path).is_some())
+            .collect::<Vec<_>>();
+        home_paths.sort_by(|a, b| {
+            parse_versioned_server_socket_name(b)
+                .cmp(&parse_versioned_server_socket_name(a))
+                .then_with(|| a.cmp(b))
+        });
+        for path in home_paths {
+            if seen.insert(path.clone()) {
+                paths.push(path);
+            }
+        }
+    }
+
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let endpoint = ServerEndpoint::UnixSocket(path);
+            status(&endpoint).ok().map(|runtime| (endpoint, runtime))
+        })
+        .collect()
+}
+
+#[cfg(not(unix))]
+pub fn reachable_versioned_daemon_statuses(
+    home_dir: &Path,
+) -> Vec<(ServerEndpoint, ServerRuntimeStatus)> {
+    let endpoint = default_endpoint(home_dir);
+    status(&endpoint)
+        .ok()
+        .map(|runtime| vec![(endpoint, runtime)])
+        .unwrap_or_default()
+}
+
 pub fn snapshot(endpoint: &ServerEndpoint) -> Result<(ServerUiSnapshot, Option<String>)> {
     expect_snapshot(send_request(endpoint, &ServerRequest::Snapshot)?)
 }
