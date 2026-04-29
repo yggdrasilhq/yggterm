@@ -1,3 +1,14 @@
+yggterm (2.1.48-1) unstable; urgency=medium
+
+  * Make yggterm server status read-only so diagnostics cannot spawn or sweep daemons.
+  * Preserve server-state.json on daemon startup until an explicit transition owns persistence.
+  * Keep reachable older versioned daemon sockets alive during startup cleanup.
+  * Treat same-home terminal runtimes and remote-resume bridge processes as active Linux daemon ownership.
+  * Avoid repairing user direct launchers from unknown/dev-channel launches while still detecting stale target/debug fallbacks.
+  * Add regression coverage for read-only status, reachable legacy sockets, bridge detection, stale launcher detection, and old-daemon runtime preservation.
+
+ -- Yggdrasil HQ <avi@gour.top>  Wed, 29 Apr 2026 18:55:15 +0530
+
 yggterm (2.1.47-1) unstable; urgency=medium
 
   * Preserve remote live-session records across update restart even when remote scans are late.
