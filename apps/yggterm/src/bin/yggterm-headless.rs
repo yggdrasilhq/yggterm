@@ -678,10 +678,17 @@ fn main() -> Result<()> {
         return Ok(());
     }
     if args.as_slice() == ["server", "status"] {
-        ensure_local_server_ready_for_cli(&store)?;
         let endpoint = default_endpoint(store.home_dir());
-        let runtime = status(&endpoint)?;
-        println!("{}", serde_json::to_string_pretty(&runtime)?);
+        match status(&endpoint) {
+            Ok(runtime) => println!("{}", serde_json::to_string_pretty(&runtime)?),
+            Err(error) => println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "running": false,
+                    "error": error.to_string(),
+                }))?
+            ),
+        }
         return Ok(());
     }
     if args.first().is_some_and(|arg| arg == "server") {

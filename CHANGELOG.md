@@ -4,6 +4,17 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.48
+
+### Fixed
+
+- make `yggterm server status` read-only again, so status checks cannot spawn a replacement daemon, sweep older daemons, or rewrite live-session state while diagnosing an update
+- stop daemon startup from immediately rewriting restored `server-state.json`, preserving recoverable live-session records until an explicit open/focus/update action owns the transition
+- keep reachable older versioned daemon sockets alive during startup cleanup, so a freshly installed client no longer sends `shutdown` to the daemon still holding live terminal runtimes
+- treat same-home terminal runtimes and `server remote resume-codex` bridge processes as active ownership in the Linux daemon sweep, preventing update probes from killing live Codex/SSH sessions
+- prevent unknown/dev-channel launches from repairing the user direct launcher, while still detecting old launchers that fell back to a repo `target/debug/yggterm` binary
+- add regression coverage for read-only status, reachable legacy sockets, remote-resume bridge detection, stale debug launcher detection, and old-daemon terminal-runtime preservation
+
 ## 2.1.47
 
 ### Fixed
