@@ -6,6 +6,25 @@ param(
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
+function Prune-OldVersions {
+  param(
+    [string]$Root,
+    [string]$KeepVersion
+  )
+  if ([string]::IsNullOrWhiteSpace($KeepVersion)) {
+    return
+  }
+  $versionsRoot = Join-Path $Root "versions"
+  if (-not (Test-Path $versionsRoot)) {
+    return
+  }
+  Get-ChildItem -Path $versionsRoot -Directory -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -ne $KeepVersion } |
+    ForEach-Object {
+      Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 $apiUrl = "https://api.github.com/repos/$Repo/releases/latest"
 $release = Invoke-RestMethod -Uri $apiUrl -Headers @{ "User-Agent" = "yggterm-installer" }
 
@@ -81,6 +100,7 @@ try {
   [System.IO.File]::WriteAllText((Join-Path $InstallRoot "install-state.json"), $state, $utf8NoBom)
 
   & $installedExe install integrate | Out-Null
+  Prune-OldVersions -Root $InstallRoot -KeepVersion $version
 
   Write-Host "installed yggterm $version"
   Write-Host "binary: $installedExe"
