@@ -4,6 +4,14 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.66
+
+### Fixed
+
+- clamp xterm canvas row fitting on WebKit/KDE so the restored Codex prompt row cannot fall below the visible terminal host after scroll/redraw
+- schedule a bounded repaint repair for the first retained-session and bulk terminal writes, avoiding half-painted restored terminals until the user manually scrolls
+- expand app-control terminal diagnostics with row/column, viewport/base, cursor overflow, canvas layer, fit-guard, and retained-paint-repair fields so redraw and prompt clipping incidents are directly observable
+
 ## 2.1.65
 
 ### Added
