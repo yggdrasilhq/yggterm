@@ -1,3 +1,13 @@
+yggterm (2.1.51-1) unstable; urgency=medium
+
+  * Add a low-power TUI render path for high-volume full-screen terminal output so WebKit stays inside CPU budget.
+  * Restore xterm newline conversion and add a regression assertion for sidebar-switch row drift.
+  * Wait for real Codex prompt output before marking agent terminals ready.
+  * Keep remote Codex New Session on the server remote start-codex launch contract across restart/scan hydration.
+  * Refresh the packaged icon assets around a centered friendly terminal prompt mark.
+
+ -- Yggdrasil HQ <avi@gour.top>  Thu, 30 Apr 2026 07:32:38 +0530
+
 yggterm (2.1.50-1) unstable; urgency=medium
 
   * Keep active stored remote-session rows out of the local hot-terminal focus path.
